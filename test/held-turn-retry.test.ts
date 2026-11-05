@@ -501,7 +501,6 @@ test("a conversation agent's start assembling its deferred pushes under a provid
       const view = internal as unknown as { pushCoalescer: unknown; assembling: Set<string>; upcomingWakesFor(agentName: string): Array<{ certain: boolean; what: string }> };
       let assembled!: () => void;
       const assembly = new Promise<undefined>((resolve) => { assembled = () => resolve(undefined); });
-      // pendingBatches() counts every agent's deferred batches, so a fork's start assembles while any other agent's batch is pending.
       view.pushCoalescer = { pendingBatches: () => 1, assemble: () => assembly, isRendering: () => false, identity: () => undefined, suspend: () => {} };
       const started = internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       await waitFor(fw, () => view.assembling.has('resident'), 'the start to assemble');

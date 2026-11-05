@@ -4210,8 +4210,8 @@ export class EventGate {
   /**
    * Send one of a judge rule's batches to the reply judge. While a resident's
    * turn runs or the host is quiesced the batch is held instead, merged with
-   * any the rule already holds, and judged once both are clear and, under
-   * `"skip"`, no refusal holds it (flushJudgeHeldIfClear): the judge then
+   * any the rule already holds, and goes back to the judge once both are
+   * clear and, under `"skip"`, no refusal holds it (flushJudgeHeldIfClear): the judge then
    * reads the context the turn left, which may already have answered it.
    * While the judge decides one of the rule's batches, a later one waits for
    * that verdict (finishJudging), so the judge never decides two of a rule's
@@ -4522,20 +4522,23 @@ export class EventGate {
         + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
     }
-    this.emitTrace({
-      type: 'gate:judge-verdict',
-      policyName,
-      verdict: outcome,
-      woke: wake,
-      eventCount: state.events.length,
-      durationMs,
-      ...(!failed && verdict.model ? { model: verdict.model } : {}),
-      ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
-      ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
-      ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
-    });
+    try {
+      this.emitTrace({
+        type: 'gate:judge-verdict',
+        policyName,
+        verdict: outcome,
+        woke: wake,
+        eventCount: state.events.length,
+        durationMs,
+        ...(!failed && verdict.model ? { model: verdict.model } : {}),
+        ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
+        ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
+        ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
+      });
+    } finally {
+      if (wasRefused && !this.disposed) this.flushJudgeHeldIfClear();
+    }
     if (this.disposed) return;
-    if (wasRefused) this.flushJudgeHeldIfClear();
     const judge = this.currentJudge(policyName, state.judge);
     if (wake) {
       this.deliverOrBuffer([...state.events, ...state.queued]);
@@ -4652,7 +4655,7 @@ export class EventGate {
    * at its end, by the refusal's timer, and a hold its host extended then
    * refuses again with its new end; one that stated no time left, or no end,
    * waits for this. Under "wake" nothing is held for it.)
-   * Batches held for a refused judge call are judged now, unless a turn or the
+   * Batches held for a refused judge call go back to the judge now, unless a turn or the
    * host's quiesce still holds them; one refused again is held again. A
    * refusal of a call asked before this, reported after it, doesn't stand.
    */
@@ -5275,12 +5278,12 @@ export class EventGate {
       return `A reply judge call was refused by a hold with no time left on it: ${refusal.hold}. `
         + (wakes
           ? "Each judge rule's batch is still asked about, and is delivered without being judged if the call is refused, unless it waits behind a call of its rule, when it goes with that call's batch unless the judge answers that call WAIT."
-          : `The refusal sets no time to ask again: judge rules' held batches (${events} now) are judged once a judge call made after this gets a REPLY or WAIT, or when the hold on the agent's calls ends, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
+          : `The refusal sets no time to ask again: judge rules' held batches (${events} now) go back to the judge once a judge call made after this gets a REPLY or WAIT, or when the hold on the agent's calls ends, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
     }
     return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
       + (wakes
         ? "Each judge rule's batch is still asked about, and is delivered without being judged if the call is refused, unless it waits behind a call of its rule, when it goes with that call's batch unless the judge answers that call WAIT."
-        : `The refusal sets no time to ask again: judge rules' held batches (${events} now) are judged once a judge call made after this gets a REPLY or WAIT, or when the hold is released, as an operator's release of a provider wait or a surgery's end does, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
+        : `The refusal sets no time to ask again: judge rules' held batches (${events} now) go back to the judge once a judge call made after this gets a REPLY or WAIT, or when the hold is released, as an operator's release of a provider wait or a surgery's end does, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
   }
 
   // =========================================================================

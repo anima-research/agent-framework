@@ -368,8 +368,8 @@ export interface ReplyJudgeOptions {
    * refused, when it goes to the judge. Under `"skip"`, the batch is held in memory while the judge's
    * calls are refused. While a refusal's
    * stated wait lasts, batches that arrive are held with it, a rule keeping
-   * its newest 100 events as it does while a turn holds them, and they're
-   * judged once the wait ends or the hold is released, and no turn that
+   * its newest 100 events as it does while a turn holds them, and they go
+   * back to the judge once the wait ends or the hold is released, and no turn that
    * changes what the judge reads runs and the host isn't quiesced. A
    * refusal that states no end, or no time left, keeps them held until a later batch's call,
    * which takes in its own rule's held batch, gets a REPLY or WAIT, or the gate is
