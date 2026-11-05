@@ -162,9 +162,10 @@ export type TraceEvent =
        * logical turn stays open, unless a listener of the hold's
        * `context-hold` alert ended it, whose `inference:aborted` then comes
        * first; `inference:hold_ended` follows, and then, unless the turn was
-       * stopped while held, its fresh compile. After a
-       * hold that ended without a fit, a refusal of that compile takes the
-       * error policy's path.
+       * stopped while held, its fresh compile. After a hold that ended
+       * because compression had nothing left to do, a refusal of that compile
+       * takes the error policy's path; after one whose check failed, a
+       * refusal while compression is pending holds the turn again.
        */
       type: 'inference:held';
       agentName: string;

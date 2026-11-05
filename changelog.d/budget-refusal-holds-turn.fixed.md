@@ -60,9 +60,12 @@
     the context still doesn't fit. The turn then compiles once more: it runs
     if that compile fits, and otherwise its refusal takes the error policy's
     path, as a refused compile did, its reason saying when it was first held.
-    The hold has no time limit, since the turn can't run before its context
-    fits. Compression can stay pending without moving, and the turn stays
-    held through that, and runs once a check finds its context fits:
+    A check that fails for a reason other than the budget ends the hold too,
+    and the turn compiles again; a refusal of that compile while compression
+    is pending holds the turn again. The hold has no time limit, since the
+    turn can't run before its context fits. Compression can stay pending
+    without moving, and the turn stays held through that, and runs once a
+    check finds its context fits:
     - **Calls that keep failing:** with context-manager 0.24.1, when every
       compression call fails for a reason that says nothing about the
       request, as in an outage of its model's provider or with bad
