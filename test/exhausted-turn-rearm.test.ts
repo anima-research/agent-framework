@@ -679,7 +679,6 @@ for (const silent of [false, true]) {
   });
 }
 
-
 for (const said of [false, true]) {
   test(`the turn a wake starts while the agent waits is the wake's own, with the error policy's retries; the next re-arm ${said ? 'starts the count again, since a message was said' : 'follows it'}`, async (t) => {
     const membrane = new ScriptedMembrane((n) => (n <= 6 ? serverError : undefined));
