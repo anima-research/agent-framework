@@ -14,4 +14,6 @@
   and a host that runs its own judges the drop itself from each line's
   `after`.
   Unchanged: a host that gives the gate no `isNewestEntry` still has every
-  batched wake's line written when the batch fires.
+  batched wake's line written when the batch is delivered: when it fires,
+  when a judge rule's judging ends in a wake, or, if a turn or the host's
+  quiesce holds it, when that ends.

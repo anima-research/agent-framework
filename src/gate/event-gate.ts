@@ -2412,8 +2412,10 @@ export class EventGate {
      *  the window a batched wake's line would be written to, with nothing
      *  waiting to be written there. A batched wake for that one message, or
      *  one whose every event `evaluate` was given a write for (`after`,
-     *  naming the agent it went to by the time the batch fires), doesn't
-     *  write its line when it fires: it hands the line to the wake
+     *  naming the agent it went to by the time the batch is delivered: when
+     *  it fires, when a judge rule's judging ends in a wake, or, if a turn or
+     *  the host's quiesce holds it, when that ends), doesn't write its line
+     *  when it's delivered: it hands the line to the wake
      *  (WakeProvenance.lines), for a turn's start to decide (WakeLine).
      *  Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
@@ -3390,8 +3392,10 @@ export class EventGate {
   // =========================================================================
 
   /** `after`: where the host put the event's own message, which it may fill
-   *  in after this call, before the batch fires. For a host that places
-   *  handed lines (`isNewestEntry`), a debounced batch whose every event has
+   *  in after this call, before the batch is delivered: when it fires, when a
+   *  judge rule's judging ends in a wake, or, if a turn or the host's quiesce
+   *  holds it, when that ends. For a host that places handed lines
+   *  (`isNewestEntry`), a debounced batch whose every event has
    *  a write hands its lines to the wake with those writes (WakeLine.after),
    *  for the host's scheduler to drop the wake once the agent has read and
    *  answered them, as AgentFramework's does for a request with
