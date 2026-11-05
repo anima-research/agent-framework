@@ -32,7 +32,8 @@
  * the newest stay byte-identical from one request to the next, and a cache
  * breakpoint after the last full one lets every later request read them from
  * the prompt cache. Only when the window outgrows its budget does the anchor
- * move, to leave the window a share of the budget to grow into again.
+ * move, to leave the window a share of the budget to grow into again, or,
+ * for a request refused as too long, does the retry go without it.
  *
  * The judge reads; it never writes into the agent's context and never speaks.
  */
@@ -100,10 +101,13 @@ export interface ReplyJudgeDeps {
    *  timers the request carries: wakes the framework has queued or holds. A
    *  provider that throws counts as knowing of none. */
   upcomingWakes?: (agentName: string) => UpcomingWake[] | Promise<UpcomingWake[]>;
-  /** The agent's last turn, when it failed and no turn has started since:
-   *  the judge then says what woke it may be unanswered. A provider that
-   *  throws counts as no failed turn. */
-  failedLastTurn?: (agentName: string) => FailedLastTurn | undefined;
+  /** In one call, what else will wake the agent, as `upcomingWakes` gives
+   *  it, and its last turn, when it failed and no turn has started since:
+   *  the judge then says what woke it may be unanswered. Both come from one
+   *  reading, so they can't disagree. When given, the judge reads it in place
+   *  of `upcomingWakes`. A provider that throws counts as knowing of no wake
+   *  and no failed turn. */
+  wakeReading?: (agentName: string) => { upcomingWakes: UpcomingWake[]; failedLastTurn?: FailedLastTurn };
 }
 
 /** One message of the agent's context, rendered. */
@@ -378,7 +382,7 @@ export class ReplyJudge {
   private readonly preview: ReplyJudgeDeps['preview'];
   private readonly recordUsage: ReplyJudgeDeps['recordUsage'];
   private readonly extraWakes: ReplyJudgeDeps['upcomingWakes'];
-  private readonly failedLastTurn: ReplyJudgeDeps['failedLastTurn'];
+  private readonly wakeReading: ReplyJudgeDeps['wakeReading'];
   /** Characters per token, corrected from each response's reported input. */
   private charsPerToken = INITIAL_CHARS_PER_TOKEN;
   private readonly anchors = new Map<string, Anchor>();
@@ -406,7 +410,7 @@ export class ReplyJudge {
     this.preview = deps.preview;
     this.recordUsage = deps.recordUsage;
     this.extraWakes = deps.upcomingWakes;
-    this.failedLastTurn = deps.failedLastTurn;
+    this.wakeReading = deps.wakeReading;
   }
 
   /** The gate's judge function. */
@@ -437,16 +441,22 @@ export class ReplyJudge {
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
 
     let pending: UpcomingWake[] | Promise<UpcomingWake[]> | undefined;
-    try {
-      pending = this.extraWakes?.(agentName);
-    } catch {
-      pending = undefined;
-    }
     let failed: FailedLastTurn | undefined;
-    try {
-      failed = this.failedLastTurn?.(agentName);
-    } catch {
-      failed = undefined;
+    if (this.wakeReading) {
+      try {
+        const reading = this.wakeReading(agentName);
+        pending = reading.upcomingWakes;
+        failed = reading.failedLastTurn;
+      } catch {
+        pending = undefined;
+        failed = undefined;
+      }
+    } else {
+      try {
+        pending = this.extraWakes?.(agentName);
+      } catch {
+        pending = undefined;
+      }
     }
     let extra: UpcomingWake[] = [];
     try {

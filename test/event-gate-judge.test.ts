@@ -879,6 +879,15 @@ describe('judge rules: timing', () => {
   const decidingWake = 'rule "deciding"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time or, if the judge is still deciding the rule\'s batch then, once it decides, unless the judge answers WAIT when its calls are no longer refused, which sends it to the judge';
   const decidingSkip = 'rule "deciding"\'s batch of 1 event, held for the judge while its calls are refused, unless the judge\'s REPLY to the rule\'s batch it is deciding delivers it first';
 
+  it("under onError 'wake', a batch of a rule the judge is deciding, while another agent's turn runs, is listed as delivered once the judge decides and once no turn runs, since it needs both", async () => {
+    const { gate } = await deciding('wake', 'wake-both');
+    gate.onInferenceStarted('zz-other');
+    const listed = gate.upcomingWakes(['agent']).find((w) => w.what.startsWith('rule "deciding"\'s batch'));
+    assert.ok(listed?.what.includes("if the judge is still deciding the rule's batch then, once it decides and, if a turn is still running then, once none is"), listed?.what);
+    gate.onInferenceEnded('zz-other');
+    gate.dispose();
+  });
+
   for (const order of ['fired first', 'decided first'] as const) {
     it(`under onError 'wake', while a refusal's stated wait lasts, a batch of a rule the judge is deciding is listed as one that may be delivered at its due time or once the judge decides, and is delivered so when the call is decided before that wait ends (${order})`, async () => {
       const { gate, judge, internal, listed, due, delivered } = await deciding('wake', `wake-${order.replace(' ', '-')}`);
@@ -1506,6 +1515,31 @@ describe('judge rules: timing', () => {
     judge.fail(refusal("scout's provider calls are held", 1e16));
     await until(() => judgeState(gate).heldCount === 1, 'the batch held again');
     assert.ok(gate.getStatus().errors.some((e) => e.includes('stated no end')), JSON.stringify(gate.getStatus().errors));
+    gate.dispose();
+  });
+
+  it("a batch whose send reads a host clock that throws leaves its rule's held batch held, so the log counts only the batch it drops", async () => {
+    let throwing = false;
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-throwing-clock.json', JUDGED), {
+      judge: judge.fn, judgeOnError: 'skip',
+      now: () => {
+        if (throwing) throw new Error('zz clock');
+        return Date.now();
+      },
+    });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 60_000));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    const internal = gate as unknown as { judgeBatch(policyName: string, events: unknown[], judge: unknown): void };
+    throwing = true;
+    try {
+      assert.throws(() => internal.judgeBatch('ambient', [], { debounceMs: 100, instructions: 'Wake me for questions.' }), /zz clock/, "premise: the send reads the host's clock");
+    } finally {
+      throwing = false;
+    }
+    assert.strictEqual(judgeState(gate).heldCount, 1, 'the held batch is still held');
     gate.dispose();
   });
 
@@ -2604,6 +2638,13 @@ describe('the framework wires the reply judge', () => {
       parkedContinuations: Set<unknown>;
       recordProviderWait(agentName: string, model: string, error: Error): unknown;
       holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown): boolean;
+      wakesOnTheirWay(agentName: string): unknown;
+    };
+    const read = internal.wakesOnTheirWay.bind(framework);
+    let readings = 0;
+    internal.wakesOnTheirWay = (agentName: string) => {
+      readings++;
+      return read(agentName);
     };
     const judged = (n: number) => until(() => membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').length === n, `judge call ${n}`);
     const question = () => {
@@ -2623,8 +2664,10 @@ describe('the framework wires the reply judge', () => {
       assert.strictEqual(internal.pendingRequests.length, 0, 'premise: nothing re-arms it');
 
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      readings = 0;
       eventGate.evaluate(chat('lol'));
       await judged(2);
+      assert.strictEqual(readings, 1, 'the wake list and the failed-turn line come from one reading');
       assert.match(question(), opening);
       assert.ok(question().includes('Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes scout.'), question());
 
@@ -2915,6 +2958,53 @@ describe('the framework wires the reply judge', () => {
     assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake held by a provider hold, when it ends']);
     await internal.processInferenceRequests();
     assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')?.heldRequests.length, 1, 'premise: a scheduler pass holds the wake until the hold ends');
+  });
+
+  it("doesn't list as held a wake a hold keeps whose message the agent has already read and answered, which the hold's release drops with no turn", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework } = await judgeFramework(t, {}, { providerHold: () => ({ holdMs: 60_000, reason: 'weekly quota spent' }) });
+    const internal = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      providerAccelerationCooldowns: Map<string, { heldRequests: unknown[]; auxiliaryOrigin?: boolean }>;
+      storedMessageDone(agent: unknown, messageId: string, to: unknown): boolean;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    await assert.rejects(internal.withAuxiliaryAdmission('scout', async () => {
+      throw new MembraneError({ type: 'rate_limit', retryable: true, message: 'quota spent', rawError: { status: 429 } });
+    }), /quota spent/);
+    internal.storedMessageDone = () => false;
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'zz an answered wake', source: 'test', timestamp: Date.now(), readsStoredMessage: 'zz-message' });
+    await internal.processInferenceRequests();
+    const hold = internal.providerAccelerationCooldowns.get('scout');
+    assert.deepStrictEqual([hold?.auxiliaryOrigin, hold?.heldRequests.length], [true, 1], 'premise: an auxiliary call\'s hold keeps the wake');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake held by a provider hold, when it ends'], 'premise: while its message is unanswered, the held wake is listed');
+    internal.storedMessageDone = (_agent, messageId) => messageId === 'zz-message';
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
+  });
+
+  it("lists a wake queued after the agent's model changed as queued, though a wait holds its old model, since the scheduler lets that turn go", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      agents: Map<string, { model: string }>;
+      pendingRequests: Array<Record<string, unknown>>;
+      providerAccelerationCooldowns: Map<string, { waitModel?: string }>;
+      holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown): boolean;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    const wait = new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 3_600_000, message: 'slow down', rawError: { status: 429 } });
+    assert.strictEqual(internal.holdProviderAcceleration(framework.getAgent('scout'), wait), true, 'premise: scout is held');
+    const original = internal.agents.get('scout')!;
+    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')?.waitModel, original.model, "premise: the hold is the wait on scout's model");
+    internal.agents.set('scout', Object.assign(Object.create(Object.getPrototypeOf(original)) as { model: string }, original, { model: 'zz-other-model' }));
+    try {
+      internal.pendingRequests.push({ agentName: 'scout', reason: 'a wake after the change', source: 'test', timestamp: Date.now() });
+      assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake already queued (a wake after the change)']);
+    } finally {
+      internal.agents.set('scout', original);
+    }
   });
 
   it('lists a start that waits behind an auxiliary call, with nothing else queued, as a wake on its way', async (t) => {

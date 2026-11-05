@@ -433,7 +433,7 @@ export interface UpcomingWake {
    *  hold only a release or another call ends); given without `at`, and
    *  shown in its place. */
   when?: string;
-  /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
+  /** False when it only may wake the agent, as a judge rule's batch that goes, or may yet go, to the judge does. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;

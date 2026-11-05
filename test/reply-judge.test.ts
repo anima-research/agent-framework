@@ -577,7 +577,7 @@ describe('reply judge: the document', () => {
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
-      failedLastTurn: () => ({ at: now - 125_000, again: { kind: 'none' } }),
+      wakeReading: () => ({ upcomingWakes: [], failedLastTurn: { at: now - 125_000, again: { kind: 'none' } } }),
     });
     await judge.judge(judgeRequest());
     const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
@@ -588,24 +588,29 @@ describe('reply judge: the document', () => {
     ].join('\n')), last);
   });
 
-  it('reads the failed-turn line in the same step as the wake list, so the two describe one moment', async () => {
+  it('reads the wake list and the failed-turn line in one call, so the two come from one reading', async () => {
     const { membrane, requests } = fakeMembrane();
     const now = Date.now();
-    let queued = false;
+    let readings = 0;
+    let listed = false;
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
       upcomingWakes: () => {
-        queueMicrotask(() => { queued = true; });
+        listed = true;
         return [];
       },
-      failedLastTurn: () => ({ at: now - 30_000, again: queued ? { kind: 'queued' as const } : { kind: 'none' as const } }),
+      wakeReading: () => {
+        readings++;
+        return { upcomingWakes: [{ certain: true, what: 'a wake already queued (zz a test wake)' }], failedLastTurn: { at: now - 30_000, again: { kind: 'queued' } } };
+      },
     });
     await judge.judge(judgeRequest());
-    assert.ok(queued, 'premise: the wake list was read');
+    assert.strictEqual(readings, 1, 'one call gives both');
+    assert.strictEqual(listed, false, 'upcomingWakes is read only in its place');
     const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
-    assert.ok(last.includes('Nothing runs it again'), last);
-    assert.ok(!last.includes('already queued'), last);
+    assert.ok(last.includes('A wake for Scout is already queued.'), last);
+    assert.ok(last.includes('- as soon as it is free: a wake already queued (zz a test wake)'), last);
   });
 
   it("says beside a queued or held wake that nothing else is scheduled, not that nothing wakes the agent", () => {
@@ -666,7 +671,7 @@ describe('reply judge: the document', () => {
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
-      failedLastTurn: () => { throw new Error('boom'); },
+      wakeReading: () => { throw new Error('boom'); },
     });
     await judge.judge(judgeRequest());
     assert.ok(!(requests[0]!.messages.at(-1)!.content[0] as { text: string }).text.includes('last turn'));
