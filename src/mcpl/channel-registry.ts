@@ -979,7 +979,7 @@ interface ChannelRegistryOptions {
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
   /** Required-only receipt replay, without a new admission decision. */
-  replayCoalescedIncoming?: (serverId: string, message: ChannelIncomingMessage) => Promise<ChannelIncomingMessageResult> | undefined;
+  replayCoalescedIncoming?: (serverId: string, message: ChannelIncomingMessage, check?: RequiredIngress['check']) => Promise<ChannelIncomingMessageResult> | undefined;
   /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
@@ -1923,11 +1923,6 @@ export class ChannelRegistry {
       for (const [index, message] of params.messages.entries()) {
         tickets[index - 1]?.retire();
         const ticket = tickets[index];
-        if (ticket?.overloaded) {
-          this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', 'admission_denied', message);
-          results.push({ messageId: message.messageId, accepted: false, reason: 'admission_denied' });
-          continue;
-        }
         if (!message || typeof message.channelId !== 'string' || !message.channelId
           || typeof message.messageId !== 'string' || !message.messageId) {
           // The same gate as admission below: with no coalescer wired, a
@@ -1998,10 +1993,14 @@ export class ChannelRegistry {
             this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', reason, message);
             results.push({ messageId: message.messageId, accepted: false, reason });
           };
+          const entry = this.channels.get(incomingKey)!;
+          const target = entry.descriptor;
+          checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
           const replay = () => {
-            const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message) : undefined;
+            const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message, checkAdmission) : undefined;
             return receipt?.then(result => {
               const { firstView: _firstView, ...wire } = result as ChannelIncomingMessageResult & { firstView?: true };
+              if (!wire.accepted) this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', wire.reason as import('./inbound-admission.js').RefusalCode, message);
               results.push(wire);
             }, error => { coalesceFailure(message, error); });
           };
@@ -2012,11 +2011,13 @@ export class ChannelRegistry {
             if (requestError) break;
             continue;
           }
+          if (ticket?.overloaded) {
+            this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', 'admission_ticket_capacity', message);
+            results.push({ messageId: message.messageId, accepted: false, reason: 'admission_denied' });
+            continue;
+          }
           const before = admission.check();
           if (before) { await ticket?.ready; refuse(before); continue; }
-          const entry = this.channels.get(incomingKey)!;
-          const target = entry.descriptor;
-          checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
           const verdict = await admission.admit('channels/incoming', message);
           await ticket?.ready;
           const concurrentReceipt = replay();
@@ -2171,10 +2172,10 @@ export class ChannelRegistry {
           try {
             const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event, checkAdmission);
             if (admission && !result.accepted) {
-              this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', result.reason as import('./inbound-admission.js').RefusalCode, message);
+              this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', result.reason as import('./inbound-admission.js').AdmissionDiagnosticCode, message);
             }
             if (result.accepted) markAccepted(firstView === true);
-            results.push(result);
+            results.push(result.reason === 'admission_module_capacity' ? { ...result, reason: 'admission_denied' } : result);
           } catch (error) {
             if (coalesceFailure(message, error)) break;
           }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
-import { frameworkAdmissionConfig, McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { RequiredAdmission, type InboundAdmissionConfig } from '../src/mcpl/inbound-admission.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 
@@ -175,10 +175,25 @@ test('#10 inherited stdio inboundAdmission survives the framework environment co
   assert.equal(r.result.reason, 'admission_denied'); assert.equal(calls, 1);
 });
 
-for (const factory of ['connect', 'connectWithReconnect'] as const) test(`#3 framework-internal wrapping does not authorize reuse of the public config through ${factory}`, async () => {
-  const original = { id: 'direct', command: '/must/not/spawn', inboundAdmission: cfg() };
-  const internal = frameworkAdmissionConfig(original);
-  assert.notEqual(internal, original);
-  assert.equal(internal.inboundAdmission, original.inboundAdmission);
-  await assert.rejects(McplServerConnection[factory](original, { version: '0.5' }), /inboundAdmission is supported only through AgentFramework/);
+
+test('R3-3 required WebSocket retains caller config identity', async t => {
+  const f = await fixture({ server: { inboundAdmission: cfg() } }); t.after(f.close);
+  const inner = f.framework as any;
+  const config = inner.mcplServerConfigs.get('editor');
+  const c = inner.mcplServerRegistry.getServer('editor');
+  assert.equal(c.config, config);
+  for (const factory of ['connect', 'connectWithReconnect'] as const)
+    await assert.rejects(McplServerConnection[factory](config, { version: '0.5' }), /inboundAdmission is supported only through AgentFramework/);
+});
+
+test('R3-3 framework server-text trace redacts the accessProvider dial token', async t => {
+  const token = 'synthetic-provider-secret-R3';
+  const f = await fixture({ server: { inboundAdmission: cfg(), accessProvider: () => token } }); t.after(f.close);
+  const inner = f.framework as any; const traces: any[] = []; f.framework.onTrace(e => traces.push(e));
+  inner.mcplServerRegistry.getServer('editor').emit('orphaned-response', {
+    id: 123, method: 'tools/call', hadState: false, hadCheckpoint: false, error: { code: -32000, message: `quoted ${token}` },
+  });
+  const record = traces.find(e => e.type === 'mcpl:orphaned-response');
+  assert(record); assert(!JSON.stringify(record).includes(token));
+  assert(record.error.includes('quoted'), 'the server text was recorded, not discarded');
 });

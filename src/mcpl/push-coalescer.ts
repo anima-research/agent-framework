@@ -600,13 +600,15 @@ export class PushCoalescer<E = unknown> {
 
   /** Replay only work already admitted. Pin a live receipt before queueing,
    * then retain the ordinary durability barrier without repeating effects. */
-  replayReceipt(occurrence: Pick<CoalescedOccurrence<E>, 'serverId' | 'binding' | 'eventId' | 'scope' | 'key'>): Promise<PushEventResult> | undefined {
+  replayReceipt(occurrence: Pick<CoalescedOccurrence<E>, 'serverId' | 'binding' | 'eventId' | 'scope' | 'key'>, authority?: () => string | undefined): Promise<PushEventResult> | undefined {
     const key = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
     const entry = this.receiptEntry(key);
     if (!entry) return undefined;
     const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     return this.locked(() => {
       if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000, { admitted: true });
+      const reason = authority?.();
+      if (reason) return Promise.resolve({ accepted: false, reason });
       return this.acknowledge(key, entry, subject, occurrence.eventId);
     });
   }
@@ -659,14 +661,17 @@ export class PushCoalescer<E = unknown> {
    * Admit an occurrence that has already passed the lane's ordinary checks and
    * the coalesce-member validation. Returns the wire result, performing the
    * host effects (replace / remove / deliver) synchronously so a create, edit
-   * and delete cannot overtake one another.
+   * and delete cannot overtake one another. `check` gates fresh effects
+   * (including capacity); `authority` alone gates duplicate receipts.
    */
-  accept(occurrence: CoalescedOccurrence<E>, check?: () => string | undefined): Promise<PushEventResult> {
+  accept(occurrence: CoalescedOccurrence<E>, check?: () => string | undefined, authority?: () => string | undefined): Promise<PushEventResult> {
     if (!check) return this.locked(() => this.admit(occurrence));
     return this.locked(() => {
       // A concurrent acceptance may have created the receipt since the
       // lane's lookup. Already-admitted work must not be refused as fresh.
       if (this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId))) {
+        const reason = authority?.();
+        if (reason) return Promise.resolve({ accepted: false, reason });
         return this.admit(occurrence);
       }
       // Required admission may have waited behind a render or another

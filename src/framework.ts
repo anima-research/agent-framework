@@ -965,7 +965,7 @@ import {
 import { SuppressionReview, type ReviewRuleInfo, type SuppressionReviewSummary } from './gate/suppression-review.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { frameworkAdmissionConfig, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { FRAMEWORK_INBOUND_ADMISSION, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
 import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-presentation.js';
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
@@ -19008,7 +19008,7 @@ export class AgentFramework {
     check?: RequiredIngress['check'],
   ): Promise<ChannelIncomingMessageResult> {
     return this.admitCoalesced(async () => {
-      const replay = check && this.replayCoalescedIncoming(serverId, message);
+      const replay = check && this.replayCoalescedIncoming(serverId, message, check);
       if (replay) return replay;
       const reason = check?.();
       if (reason) return { messageId: message.messageId, accepted: false, reason };
@@ -19054,12 +19054,12 @@ export class AgentFramework {
     });
   }
 
-  private replayCoalescedIncoming(serverId: string, message: ChannelIncomingMessage): Promise<ChannelIncomingMessageResult> | undefined {
+  private replayCoalescedIncoming(serverId: string, message: ChannelIncomingMessage, check?: RequiredIngress['check']): Promise<ChannelIncomingMessageResult> | undefined {
     if (typeof message.eventId !== 'string') return undefined;
     return this.pushCoalescer?.replayReceipt({
       serverId, binding: this.coalescingBinding(serverId), eventId: message.eventId,
       scope: { kind: 'channel', id: message.channelId }, key: message.coalesce?.key ?? '',
-    })?.then(result => this.finishCoalescedIncoming(serverId, message, result));
+    }, check)?.then(result => result.accepted ? this.finishCoalescedIncoming(serverId, message, result) : { messageId: message.messageId, ...result });
   }
 
   private finishCoalescedIncoming(serverId: string, message: ChannelIncomingMessage, result: PushEventResult): ChannelIncomingMessageResult & { firstView?: true } {
@@ -19082,14 +19082,14 @@ export class AgentFramework {
     return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
   }
 
-  private replayCoalescedPush(serverId: string, params: PushEventParams): Promise<PushEventResult> | undefined {
+  private replayCoalescedPush(serverId: string, params: PushEventParams, check?: RequiredIngress['check']): Promise<PushEventResult> | undefined {
     if (typeof params.eventId !== 'string') return undefined;
     const c = params.coalesce;
     return this.pushCoalescer?.replayReceipt({
       serverId, binding: this.coalescingBinding(serverId), eventId: params.eventId,
       scope: c?.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet },
       key: c?.key ?? '',
-    });
+    }, check);
   }
 
   private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']): Promise<PushEventResult> {
@@ -19097,7 +19097,7 @@ export class AgentFramework {
       // A required replay must pass current channel authorization too,
       // including when it waited behind another coalesced effect.
       if (check && params.coalesce?.channelId) this.assertChannelScopedPush(serverId, params.coalesce.channelId);
-      const replay = check && this.replayCoalescedPush(serverId, params);
+      const replay = check && this.replayCoalescedPush(serverId, params, check);
       if (replay) return replay;
       const reason = check?.();
       if (reason) return { accepted: false, reason };
@@ -19336,7 +19336,11 @@ export class AgentFramework {
           if (!slot) {
             const key = JSON.stringify([occ.serverId, occ.binding, occ.scope]);
             let queue = this.requiredModuleQueues.get(key);
-            if (queue && queue.pending.length + (queue.running ? 1 : 0) >= MAX_PENDING_REQUIRED_MODULE_WORK) return 'admission_denied';
+            if (queue && queue.pending.length + (queue.running ? 1 : 0) >= MAX_PENDING_REQUIRED_MODULE_WORK) {
+              // Removal must stand; only a delivered notice's module work may
+              // be dropped. Never reserve beyond the bound.
+              return occ.retract ? undefined : 'admission_module_capacity';
+            }
             if (!queue) {
               queue = { key, pending: [] };
               this.requiredModuleQueues.set(key, queue);
@@ -19345,7 +19349,7 @@ export class AgentFramework {
             queue.pending.push(slot);
             this.requiredModuleReservations.set(occ.event.event, slot);
           }
-        });
+        }, check);
       } finally {
         this.requiredModuleReservations.delete(occ.event.event);
         if (slot && !slot.dropped) {
@@ -19367,6 +19371,11 @@ export class AgentFramework {
    * explicitly clearable array. Starting modules is deferred past acceptance. */
   private scheduleRequiredCoalescedModules(event: ProcessEvent, occ: CoalescedOccurrence<CoalescedDelivery>): void {
     const slot = this.requiredModuleReservations.get(occ.event.event);
+    if (!slot && occ.retract) {
+      console.error(`[mcpl:module-work-dropped] server=${logValue(occ.serverId)} count=1 reason=admission_module_capacity`);
+      this.emitTrace({ type: 'mcpl:module-work-dropped', serverId: occ.serverId, count: 1, reason: 'admission_module_capacity' });
+      return;
+    }
     if (!slot) throw new Error('Required coalesced delivery has no module reservation');
     if (!slot.dropped) slot.event = event;
   }
@@ -19385,9 +19394,9 @@ export class AgentFramework {
       if (this.requiredModuleQueues.get(queue.key) !== queue || queue.running) return;
       const slot = queue.pending[0];
       if (!slot?.ready) return;
-      const connection = this.mcplServerRegistry?.getServer(slot.connection.connectionId);
-      if (this.stopHasBegun() || !connection?.requiredAdmission?.isCurrent(slot.connection)) {
-        this.dropRequiredModuleWork(this.stopHasBegun() ? 'host_stopped' : 'connection_closed', slot.connection.instance);
+      // Already-acknowledged local content needs no transport authority.
+      if (this.stopHasBegun()) {
+        this.dropRequiredModuleWork('host_stopped');
         return;
       }
       queue.pending.shift();
@@ -19407,11 +19416,11 @@ export class AgentFramework {
   /** Drop only not-yet-started work. Keep the running slot counted across
    * epochs, so reconnects cannot accumulate new hanging calls for this scope.
    * Its completion sees the cleared array, never a retained promise chain. */
-  private dropRequiredModuleWork(reason: 'host_stopped' | 'connection_closed' | 'reconnected' | 'disconnected', instance?: symbol): void {
+  private dropRequiredModuleWork(reason: 'host_stopped' | 'disconnected', serverId?: string): void {
     const dropped = new Map<string, number>();
     for (const queue of this.requiredModuleQueues.values()) {
       queue.pending = queue.pending.filter(slot => {
-        if (instance !== undefined && slot.connection.instance !== instance) return true;
+        if (serverId !== undefined && slot.connection.connectionId !== serverId) return true;
         slot.dropped = true;
         slot.event = undefined;
         const id = slot.connection.connectionId;
@@ -33053,7 +33062,7 @@ export class AgentFramework {
         this.noteInboundAccepted(source);
         return source;
       },
-      (serverId, params) => this.replayCoalescedPush(serverId, params),
+      (serverId, params, check) => this.replayCoalescedPush(serverId, params, check),
       (serverId, channelId) => this.assertChannelScopedPush(serverId, channelId),
     );
 
@@ -33078,7 +33087,7 @@ export class AgentFramework {
       (event) => this.emitTrace(event),
       {
         store: this.store,
-        replayCoalescedIncoming: (serverId, message) => this.replayCoalescedIncoming(serverId, message),
+        replayCoalescedIncoming: (serverId, message, check) => this.replayCoalescedIncoming(serverId, message, check),
         handleCoalescedIncoming: (serverId, message, event, check) =>
           this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, check),
         // An ordinary channels/incoming message: freeze its envelope and
@@ -34415,7 +34424,7 @@ export class AgentFramework {
       // staged open) passes the connection by, so nothing opens its planes
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
-        frameworkAdmissionConfig(connectionConfig),
+        connectionConfig,
         this.mcplHostCapabilitiesFor(config, hints),
         abort.signal,
         (registering) => {
@@ -34426,6 +34435,7 @@ export class AgentFramework {
           // first message, so the tap is on before any I/O can deliver one.
           if (hints) this.toolsets().controllerFor(config).attach(registering);
         },
+        FRAMEWORK_INBOUND_ADMISSION,
       );
     } catch (error) {
       // Ended by stop() or by a disconnect of its id (its abort): said as a
@@ -35185,8 +35195,8 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
     const registry = this.mcplServerRegistry;
-    const instance = this.requiredModuleQueues?.size ? registry.getServer(id)?.requiredAdmission?.instance : undefined;
-    if (instance) this.dropRequiredModuleWork('disconnected', instance);
+    // Work can outlive a closed transport already removed from the registry.
+    this.dropRequiredModuleWork('disconnected', id);
     const hold = this.holdMcpServerId(id, 'disconnect');
     try {
       // Channel entries go first: removing them cancels the server's queued
@@ -36107,7 +36117,6 @@ export class AgentFramework {
     // preserved across the transient close are resumed by idempotent
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
-      if (connection.requiredAdmission) this.dropRequiredModuleWork('reconnected', connection.requiredAdmission.instance);
       // The connection closed both planes before wiring the fresh transport.
       // Re-establish the grant first: the §5.3 policy Request must be
       // answered before either plane opens — otherwise the first
@@ -36278,7 +36287,6 @@ export class AgentFramework {
     // a SIGKILL preserves them. Permanent removal is owned solely by
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null, info?: McplConnectionCloseInfo) => {
-      if (connection.requiredAdmission) this.dropRequiredModuleWork('connection_closed', connection.requiredAdmission.instance);
       // First here, and synchronously: the closed transport's channel
       // confirmations go with it before anything else this handler does, so
       // a registration on the next transport can't come first and lose its

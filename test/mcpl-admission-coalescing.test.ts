@@ -2,6 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { admissionOf, type AdmissionVerdict } from '../src/mcpl/inbound-admission.js';
 
 const allow = { store: true, mayWake: false } as const;
@@ -162,7 +163,7 @@ for (const lane of lanes) {
     assert.equal(calls, 2); assert.equal(f.context(), before);
   });
 
-  test(`required ${lane}: receipt wins over a stale mutex recheck without repeating effects`, async t => {
+  test(`required ${lane}: receipt wins over a fresh-work check without repeating effects`, async t => {
     const f = await fixture({ server: { inboundAdmission: config(() => allow) } });
     t.after(f.close); await f.register();
     const coalescer = (f.framework as any).pushCoalescer;
@@ -172,7 +173,7 @@ for (const lane of lanes) {
     const first = await send(f, lane, 'mutex-retry', 'visible_before_recheck', { initial: true });
     assert(occurrence);
     const before = f.context();
-    const retry = await coalescer.accept(occurrence, () => 'admission_stale');
+    const retry = await coalescer.accept(occurrence, () => 'admission_denied');
     assert.equal(retry.accepted, true); assert.deepEqual(retry.coalesce, first.coalesce);
     assert.equal(f.context(), before);
   });
@@ -200,3 +201,64 @@ for (const lane of lanes) {
     assert.equal(calls, 1); assert.equal(f.context(), before);
   });
 }
+
+for (const lane of lanes) {
+  test(`R3-1 required ${lane}: live receipt replays while all admission tickets are occupied`, async t => {
+    let release!: (v: AdmissionVerdict) => void;
+    let calls = 0;
+    const held = new Promise<AdmissionVerdict>(r => { release = r; });
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      calls++;
+      return input.item.eventId.startsWith('held-') ? held : allow;
+    }) } });
+    const pending: Promise<unknown>[] = [];
+    t.after(async () => { release(deny); await Promise.all(pending); await f.close(); });
+    await f.register();
+    const first = await send(f, lane, 'receipt', 'stored_receipt', { initial: true });
+    for (let i = 0; i < 64; i++) pending.push(send(f, lane, `held-${i}`, 'held_body', { initial: true, key: `held-${i}` }));
+    await eventually(() => calls === 65);
+    assert.equal((f.framework as any).coalescingTicketCounts.get('editor'), 64);
+    assert.deepEqual(await send(f, lane, 'receipt', 'never_store_retry', { initial: true }), first);
+    assert.equal(calls, 65, 'replay does not invoke policy');
+    const traces: any[] = []; f.framework.onTrace(e => traces.push(e));
+    assert.equal((await send(f, lane, 'overflow', 'never_store_overflow', { initial: true, key: 'overflow' })).reason, 'admission_denied');
+    assert(traces.some(e => e.reason === 'admission_ticket_capacity'));
+    assert(f.context().includes('stored_receipt')); assert(!f.context().includes('never_store'));
+  });
+
+  for (const authority of (lane === 'push/event' ? ['registration', 'grant', 'readiness', 'featureSet'] : ['registration', 'grant', 'readiness']))
+  test(`R3-4 required ${lane}: waiting receipt rechecks revoked ${authority} under the mutex`, async t => {
+    const f = await fixture({ server: { inboundAdmission: config(() => allow) } }); t.after(f.close); await f.register();
+    await send(f, lane, 'receipt', 'stored_once', { initial: true });
+    const inner = f.framework as any;
+    let unlock!: () => void; let waiting = false;
+    const lock = inner.pushCoalescer.locked(() => new Promise<void>(r => { unlock = r; }));
+    await eventually(() => !!unlock);
+    const replay = inner.pushCoalescer.replayReceipt.bind(inner.pushCoalescer);
+    inner.pushCoalescer.replayReceipt = (...args: any[]) => { waiting = true; return replay(...args); };
+    const pending = send(f, lane, 'receipt', 'must_not_store', { initial: true });
+    await eventually(() => waiting);
+    const entries: Map<string, any> = inner.channelRegistry.channels;
+    const [key, entry] = [...entries].find(([, e]) => e.descriptor.id === 'chat')!;
+    const connection = inner.mcplServerRegistry.getServer('editor');
+    if (authority === 'registration') entries.set(key, { ...entry, descriptor: { ...entry.descriptor } });
+    else if (authority === 'grant') connection.grant = CapabilityGrant.empty();
+    else if (authority === 'readiness') connection.pauseDataPlane();
+    else inner.featureSetManager.disable('editor', ['doc']);
+    unlock(); await lock;
+    assert.equal((await pending).reason, authority === 'readiness' ? 'admission_not_ready' : 'admission_stale');
+    assert(f.context().includes('stored_once')); assert(!f.context().includes('must_not_store'));
+  });
+}
+
+test('R3-4 duplicate accept rechecks authority, not fresh-work capacity', async t => {
+  const f = await fixture({ server: { inboundAdmission: config(() => allow) } }); t.after(f.close);
+  const coalescer = (f.framework as any).pushCoalescer;
+  let occurrence: any;
+  const accepted = coalescer.host.accepted;
+  coalescer.host.accepted = (value: any) => { occurrence = value; accepted?.(value); };
+  await f.send('push/event', f.params('receipt', 'stored_once', { initial: true }));
+  assert(occurrence);
+  const retry = await coalescer.accept(occurrence, () => 'admission_denied', () => 'admission_stale');
+  assert.deepEqual(retry, { accepted: false, reason: 'admission_stale' });
+});

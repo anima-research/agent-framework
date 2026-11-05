@@ -865,11 +865,11 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /** Accepted content remains stored; only not-yet-started module work
-       * is discarded at the connection/host lifecycle boundary. */
+       * is discarded on stop/disconnect, or for a withdrawal notice at capacity. */
       type: 'mcpl:module-work-dropped';
       serverId: string;
       count: number;
-      reason: 'host_stopped' | 'connection_closed' | 'reconnected' | 'disconnected';
+      reason: 'host_stopped' | 'disconnected' | 'admission_module_capacity';
     })
   | (TraceEventBase & {
       type: 'mcpl:server-reconnected';

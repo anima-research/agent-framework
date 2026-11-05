@@ -399,17 +399,9 @@ function unmatchedResponse(
 
 /** @internal Only AgentFramework installs the lane adapters that enforce admission.
  * Not exported from the package entry point; this is not a direct-consumer API. */
-const frameworkAdmissionConfigs = new WeakSet<McplServerConfig>();
-export function frameworkAdmissionConfig<T extends McplServerConfig>(config: T): T {
-  if (config.inboundAdmission === undefined) return config;
-  // Do not mark the host's original config: reusing it through a direct
-  // factory must still fail. Inherit fields/getters without a lossy spread.
-  const internal = Object.create(config) as T;
-  frameworkAdmissionConfigs.add(internal);
-  return internal;
-}
-function requireFrameworkAdmission(config: McplServerConfig): void {
-  if (config.inboundAdmission !== undefined && !frameworkAdmissionConfigs.has(config)) {
+export const FRAMEWORK_INBOUND_ADMISSION = Symbol('framework inbound admission');
+function requireFrameworkAdmission(config: McplServerConfig, capability?: typeof FRAMEWORK_INBOUND_ADMISSION): void {
+  if (config.inboundAdmission !== undefined && capability !== FRAMEWORK_INBOUND_ADMISSION) {
     throw new Error('inboundAdmission is supported only through AgentFramework; direct McplServerConnection consumers have no authorized admission dispatcher');
   }
 }
@@ -1406,9 +1398,11 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    /** @internal Only the framework installs authorized lane adapters. */
+    admissionCapability?: typeof FRAMEWORK_INBOUND_ADMISSION,
   ): Promise<McplServerConnection> {
     McplServerConnection.checkConfig(config);
-    requireFrameworkAdmission(config);
+    requireFrameworkAdmission(config, admissionCapability);
     return McplServerConnection.connectChecked(config, hostCapabilities, signal);
   }
 
@@ -1753,10 +1747,12 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    /** @internal Only the framework installs authorized lane adapters. */
+    admissionCapability?: typeof FRAMEWORK_INBOUND_ADMISSION,
   ): Promise<McplServerConnection> {
     // Outside the retry path below: a configuration error is never retried.
     McplServerConnection.checkConfig(config);
-    requireFrameworkAdmission(config);
+    requireFrameworkAdmission(config, admissionCapability);
     try {
       return await McplServerConnection.connectChecked(config, hostCapabilities, signal);
     } catch (error) {

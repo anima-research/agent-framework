@@ -132,7 +132,7 @@ export class PushHandler {
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
-    private readonly replayCoalesced?: (serverId: string, params: PushEventParams) => Promise<PushEventResult> | undefined,
+    private readonly replayCoalesced?: (serverId: string, params: PushEventParams, check?: RequiredIngress['check']) => Promise<PushEventResult> | undefined,
     private readonly assertChannelScopedPush?: (serverId: string, channelId: string) => void,
   ) {
     this.featureSetManager = featureSetManager;
@@ -161,11 +161,6 @@ export class PushHandler {
       ? admission.orderCoalesced?.(c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet }, c.key)
       : undefined;
     try {
-      if (ticket?.overloaded) {
-        this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', 'admission_denied', params);
-        responder?.respond({ accepted: false, reason: 'admission_denied' });
-        return;
-      }
       try {
         this.featureSetManager.validateInbound(serverId, params.featureSet);
       } catch (err) {
@@ -178,6 +173,12 @@ export class PushHandler {
       const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
         this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', reason, params);
         responder?.respond({ accepted: false, reason });
+      };
+      const check = () => {
+        let reason = admission.check();
+        try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
+        try { if (params.coalesce?.channelId) this.assertChannelScopedPush?.(serverId, params.coalesce.channelId); } catch { reason ??= 'admission_stale'; }
+        return reason;
       };
       const replay = () => {
         // A channel-scoped push needs channel authority before host callbacks
@@ -194,9 +195,10 @@ export class PushHandler {
             return Promise.resolve();
           }
         }
-        const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params) : undefined;
+        const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params, check) : undefined;
         return receipt?.then(async result => {
           await ticket?.ready;
+          if (!result.accepted) { refuse(result.reason as import('./inbound-admission.js').RefusalCode); return; }
           this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
           responder?.respond(result);
         }, async error => {
@@ -219,6 +221,11 @@ export class PushHandler {
       }
       const receipt = replay();
       if (receipt) { await ticket?.ready; await receipt; return; }
+      if (ticket?.overloaded) {
+        this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', 'admission_ticket_capacity', params);
+        responder?.respond({ accepted: false, reason: 'admission_denied' });
+        return;
+      }
       const before = admission.check();
       if (before) { await ticket?.ready; refuse(before); return; }
       const verdict = await admission.admit('push/event', params);
@@ -227,12 +234,6 @@ export class PushHandler {
       // callback ran. Its receipt wins even over a refusal or a stale verdict.
       const concurrentReceipt = replay();
       if (concurrentReceipt) { await concurrentReceipt; return; }
-      const check = () => {
-        let reason = admission.check();
-        try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
-        try { if (params.coalesce?.channelId) this.assertChannelScopedPush?.(serverId, params.coalesce.channelId); } catch { reason ??= 'admission_stale'; }
-        return reason;
-      };
       const reason = check();
       if (reason || !verdict.store) {
         refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
@@ -370,8 +371,8 @@ export class PushHandler {
       try {
         const result = await this.handleCoalesced!(serverId, params, pushEvent, check);
         if (envelope && !result.accepted) {
-          this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', result.reason as import('./inbound-admission.js').RefusalCode, params);
-          responder?.respond(result);
+          this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', result.reason as import('./inbound-admission.js').AdmissionDiagnosticCode, params);
+          responder?.respond(result.reason === 'admission_module_capacity' ? { ...result, reason: 'admission_denied' } : result);
           return;
         }
         this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });

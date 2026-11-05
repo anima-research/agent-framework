@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { AgentFramework } from '../src/framework.js';
 import { StdioTransport } from '../src/mcpl/transport.js';
 import { admissionConnectErrorOf, AdmissionConnectError } from '../src/mcpl/inbound-admission.js';
-import { frameworkAdmissionConfig, McplServerConnection } from '../src/mcpl/server-connection.js';
+import { FRAMEWORK_INBOUND_ADMISSION, McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplFeatureSetError } from '../src/mcpl/feature-set-manager.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { RequiredAdmission, MAX_PENDING_ADMISSIONS, type InboundAdmissionConfig, type AdmissionVerdict } from '../src/mcpl/inbound-admission.js';
@@ -119,8 +119,8 @@ for (const outcome of ['match', 'absent', 'mismatch', 'throw', 'timeout', 'malfo
       initializeAttestation: { read: (result: any) => { read++; if (outcome === 'throw') throw Error('secret'); if (outcome === 'timeout') { const until = performance.now() + 5; while (performance.now() < until) {} } if (outcome === 'malformed') return () => {}; return outcome === 'absent' ? undefined : result.proof; }, matches: () => outcome !== 'mismatch' },
     };
     const transcript = join(dir, 'wire');
-    const connecting = McplServerConnection.connectWithReconnect(frameworkAdmissionConfig({ id: 'endpoint-a', command: process.execPath, args: [peer], reconnect: true,
-      env: { TRANSCRIPT: transcript, ...(outcome === 'protocol' ? { PROTOCOL: 'wrong' } : {}) }, inboundAdmission: admission }), { version: '0.5' });
+    const connecting = McplServerConnection.connectWithReconnect({ id: 'endpoint-a', command: process.execPath, args: [peer], reconnect: true,
+      env: { TRANSCRIPT: transcript, ...(outcome === 'protocol' ? { PROTOCOL: 'wrong' } : {}) }, inboundAdmission: admission }, { version: '0.5' }, undefined, FRAMEWORK_INBOUND_ADMISSION);
     if (outcome === 'match') { const c = await connecting; t.after(() => c.close()); await c.sendToolsCall('seen', {}); assert.equal(binds, 1); }
     else {
       await assert.rejects(connecting, e => outcome === 'protocol' ? /protocolVersion/.test(String(e)) : /^(AdmissionConnectError: (initialize_attestation_refused|admission_missing))$/.test(String(e)));
@@ -430,10 +430,10 @@ test('required generic result taps remain usable by an explicitly attached contr
 
 test('required handshake drops null, refuses all data lanes, and buffers a same-chunk ping', async t => {
   let hooks = 0;
-  const connection = await McplServerConnection.connect(frameworkAdmissionConfig({
+  const connection = await McplServerConnection.connect({
     id: 'endpoint-a', command: process.execPath, args: [peer], env: { EARLY: '1' },
     inboundAdmission: config(() => { hooks++; return allow; }),
-  }), { version: '0.5' });
+  }, { version: '0.5' }, undefined, FRAMEWORK_INBOUND_ADMISSION);
   t.after(() => connection.close());
   const answers = await connection.sendToolsCall('answers', {}) as any;
   for (const method of ['channels/incoming', 'push/event', 'inference/request']) {
@@ -447,7 +447,7 @@ test('required handshake drops null, refuses all data lanes, and buffers a same-
 
 test('required startup-staged push waits for ready and a current grant before admission', async t => {
   let calls = 0;
-  const connection = await McplServerConnection.connect(frameworkAdmissionConfig({ id: 'endpoint-a', command: process.execPath, args: [peer], inboundAdmission: config(() => { calls++; return allow; }) }), { version: '0.5' });
+  const connection = await McplServerConnection.connect({ id: 'endpoint-a', command: process.execPath, args: [peer], inboundAdmission: config(() => { calls++; return allow; }) }, { version: '0.5' }, undefined, FRAMEWORK_INBOUND_ADMISSION);
   t.after(() => connection.close());
   connection.on('push-event', async (params, responder) => {
     const verdict = await connection.admissionFor(params).admit('push/event', params);

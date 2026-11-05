@@ -195,10 +195,12 @@ export class RequiredAdmission {
 
 /** Fixed refusal codes only: never log payload, callback errors or private intent.
  * Every refusal is traced; repeated lines are bounded per server/lane/code. */
+export type AdmissionDiagnosticCode = RefusalCode | 'admission_ticket_capacity' | 'admission_module_capacity';
+
 export class AdmissionRefusals {
   private readonly lines = new RefusalLines();
   report(emitTrace: (event: import('../types/trace.js').TraceEventInput) => void,
-    serverId: string, lane: AdmissionLane, reason: RefusalCode, item: unknown): void {
+    serverId: string, lane: AdmissionLane, reason: AdmissionDiagnosticCode, item: unknown): void {
     const p = item !== null && typeof item === 'object' ? item as Record<string, unknown> : {};
     const id = (key: string): string => typeof p[key] === 'string' ? p[key] as string : '';
     const name = lane === 'channels/incoming' ? 'channel-incoming' : lane === 'push/event' ? 'push-event' : 'inference-request';
