@@ -362,15 +362,16 @@ export interface ReplyJudgeOptions {
    * stopping framework), which isn't counted as a failure. Under `"wake"`,
    * the refused call's batch is delivered, and while a refusal's stated
    * wait lasts each judge rule's batch is delivered without the judge being
-   * asked, unless a running turn or the host's quiesce holds the batch past
-   * the wait's end, or it waits behind a call of its rule that the judge
-   * answers WAIT when its calls are no longer refused, when it goes to the
-   * judge. Under `"skip"`, the batch is held in memory while the judge's
+   * asked, unless a turn that changes what the judge reads, or the host's
+   * quiesce, holds the batch past the wait's end, or it waits behind a call
+   * of its rule that the judge answers WAIT when its calls are no longer
+   * refused, when it goes to the judge. Under `"skip"`, the batch is held in memory while the judge's
    * calls are refused. While a refusal's
    * stated wait lasts, batches that arrive are held with it, a rule keeping
    * its newest 100 events as it does while a turn holds them, and they're
-   * judged once the wait ends or the hold is released. A refusal that states
-   * no end, or no time left, keeps them held until a later batch's call,
+   * judged once the wait ends or the hold is released, and no turn that
+   * changes what the judge reads runs and the host isn't quiesced. A
+   * refusal that states no end, or no time left, keeps them held until a later batch's call,
    * which takes in its own rule's held batch, gets a REPLY or WAIT, or the gate is
    * told the hold ended or was released (`EventGate.providerCallsReleased`).
    * A later call that fails lets its batch go, with the held events it took
