@@ -6273,16 +6273,15 @@ export class AgentFramework {
     const ends = (until: number | null | undefined): { until?: number } =>
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    const otherModel = cooldown?.waitModel !== undefined && cooldown.waitModel !== model;
     const expired = cooldown !== undefined && !cooldown.hostHoldError && cooldown.until <= Date.now();
-    const letGo = cooldown !== undefined && (cooldown.rearm !== undefined || otherModel || expired) && arriving.length + parkedCount > 0;
+    const letGo = cooldown !== undefined && (cooldown.rearm !== undefined || expired) && arriving.length + parkedCount > 0;
     if (letGo) queued.unshift(...cooldown.heldRequests.filter(unread).map((r) => String(r.reason)));
     const waiting = queued.length + batchOnly.length;
     if (cooldown && !letGo) {
       const atRelease = [...cooldown.heldRequests, ...arriving];
       const releaseWakes = atRelease.some(unread) || (atRelease.length === 0 && !(cooldown.auxiliaryOrigin || cooldown.emptiedBy));
       if (releaseWakes || waiting > 0) {
-        const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
+        const waitHold = cooldown.waitModel !== undefined;
         const until = cooldown.hostHoldError ? undefined
           : wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
         return { queued: passed, batchOnly: passedMaybe, held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}), ...(!releaseWakes && queued.length === 0 ? { maybe: true as const } : {}) } };
@@ -7100,7 +7099,7 @@ export class AgentFramework {
     throw Object.assign(new MembraneError({
       type: 'rate_limit',
       retryable: true,
-      ...(wait.until !== null ? { retryAfterMs: wait.until - now } : {}),
+      ...(wait.until !== null ? { retryAfterMs: Math.max(0, wait.until - now) } : {}),
       message: providerWaitText(agentName, model ?? EVERY_MODEL, wait),
       rawError: undefined,
     }), { providerAdmission: 'deferred' as const });

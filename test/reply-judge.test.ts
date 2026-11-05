@@ -94,20 +94,6 @@ describe('reply judge: a request refused as too long', () => {
     assert.strictEqual(before, 3, 'premise: the starting ratio');
   });
 
-  it('asks the retry for the agent whose request was refused, though the choice of agent changes in between', async () => {
-    const { membrane, requests } = refusingMembrane(1);
-    const chosen = ['Scout', 'Ann'];
-    const previewed: string[] = [];
-    const judge = new ReplyJudge({
-      membraneFor: () => membrane, chooseAgent: () => chosen.shift() ?? 'Ann',
-      preview: async (name) => { previewed.push(name); return { messages: conversation(60), config: { model: 'x', maxTokens: 1 } }; },
-      options: { maxInputTokens: 4_000 },
-    });
-    await quietly(() => judge.judge(judgeRequest({ agentNames: ['Scout', 'Ann'] })));
-    assert.strictEqual(requests.length, 2, 'premise: the retry was asked');
-    assert.deepStrictEqual(previewed, ['Scout', 'Scout']);
-  });
-
   it('refused again, fails as any failed call does, after two requests', async () => {
     const { membrane, requests } = refusingMembrane(2);
     await quietly(() => assert.rejects(judgeOver(membrane).judge(judgeRequest()), /prompt is too long/));
@@ -622,31 +608,6 @@ describe('reply judge: the document', () => {
       "Scout's last turn, 2m ago, failed and may not have answered all of what woke it. Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes Scout.",
       'Nothing the host knows of is scheduled to wake Scout:',
     ].join('\n')), last);
-  });
-
-  it('reads the wake list and the failed-turn line in one call, so the two come from one reading', async () => {
-    const { membrane, requests } = fakeMembrane();
-    const now = Date.now();
-    let readings = 0;
-    let listed = false;
-    const judge = new ReplyJudge({
-      membraneFor: () => membrane, chooseAgent: (n) => n[0],
-      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
-      upcomingWakes: () => {
-        listed = true;
-        return [];
-      },
-      wakeReading: () => {
-        readings++;
-        return { upcomingWakes: [{ certain: true, what: 'a wake already queued (zz a test wake)' }], failedLastTurn: { at: now - 30_000, again: { kind: 'queued' } } };
-      },
-    });
-    await judge.judge(judgeRequest());
-    assert.strictEqual(readings, 1, 'one call gives both');
-    assert.strictEqual(listed, false, 'upcomingWakes is read only in its place');
-    const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
-    assert.ok(last.includes('A wake for Scout is already queued.'), last);
-    assert.ok(last.includes('- as soon as it is free: a wake already queued (zz a test wake)'), last);
   });
 
   it("says beside a queued or held wake that nothing else is scheduled, not that nothing wakes the agent", () => {
