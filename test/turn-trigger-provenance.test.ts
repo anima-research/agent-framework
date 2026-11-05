@@ -273,7 +273,7 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("two parked pushes with one key, a silent heartbeat's and a plain one, each carrying channels as a release's first member would, name only the plain push's at resume", async () => {
+  it("three parked pushes with one key, a plain one, a silent heartbeat's and another plain one, name both plain pushes' channels at resume, the first's carried on by the silent push the park kept between them", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
     const framework = await makeFramework();
     const i = internals(framework);
@@ -283,8 +283,9 @@ describe('Turn trigger provenance', () => {
     await framework.quiesce({ reason: 'test window' });
     const t = Date.now();
     i.pendingRequests.push(
-      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t, wakeChannels: [room], suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } },
-      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 1, addressed: false, wakeChannels: [general] },
+      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t, addressed: false, wakeChannels: [room] },
+      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 1, suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } },
+      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 2, addressed: false, wakeChannels: [general] },
     );
     await i.processInferenceRequests();
     assert.equal(membrane.calls.length, 0, 'premise: parked while quiesced');
@@ -292,7 +293,7 @@ describe('Turn trigger provenance', () => {
     await framework.resume();
     await framework.runUntilIdle();
     assert.ok(captured.exposed, 'the turn started at resume');
-    assert.deepEqual(captured.exposed.wakeChannels, [general]);
+    assert.deepEqual(captured.exposed.wakeChannels, [room, general]);
     await framework.stop();
   });
 

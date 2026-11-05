@@ -716,8 +716,8 @@ export interface InferenceRequest {
    * requests carries every one's channels, or, when any of them comes from
    * outside the framework, isn't a silent heartbeat tick and brought
    * channels, only those requests' channels. A request a quiesce keeps in
-   * another's place carries the two requests' channels by the same rule, and
-   * one a provider hold takes another into carries both requests' channels.
+   * another's place, and one a provider hold takes another into, carry both
+   * requests' channels.
    * The framework's own wakes that continue a
    * turn with no locus (a restart, a re-inference, a continuation, a retry,
    * a bounce, a re-arm), unless its own wake named a channel that resolves

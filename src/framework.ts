@@ -20090,7 +20090,7 @@ export class AgentFramework {
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
           const pair = prev ? [prev, request] : undefined;
-          const channels = pair ? wakeChannelsOf(pair.some(bringsOwnChannels) ? pair.filter(hasOwnCauseForRun) : pair) : undefined;
+          const channels = pair ? wakeChannelsOf(pair) : undefined;
           if (channels) kept.wakeChannels = channels;
           newestByKey.set(key, kept);
         }
