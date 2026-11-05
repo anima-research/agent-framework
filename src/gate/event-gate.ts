@@ -4218,6 +4218,7 @@ export class EventGate {
    * batches at once.
    */
   private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
+    const refusing = this.judgeRefusing();
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
     if (deciding) {
@@ -4229,7 +4230,6 @@ export class EventGate {
       this.holdForJudge(policyName, events, judge);
       return;
     }
-    const refusing = this.judgeRefusing();
     const held = this.judgeHeld.get(policyName);
     if (held) {
       this.judgeHeld.delete(policyName);
@@ -4347,7 +4347,10 @@ export class EventGate {
    * that under onError "wake", while a refusal's stated wait lasts, it's
    * delivered without the judge being asked, and one due before that wait
    * ends is listed so, counting only its events whose channel isn't held now,
-   * and left out when none is.
+   * and left out when none is, unless a turn, the host's quiesce or the
+   * judge's call on the rule's batch may send it to the judge, when it's
+   * listed at the wait's end as a batch that only may go to the judge then,
+   * or sooner if the refusal ends first.
    * A running turn or the host's quiesce can hold it past the wait's end, when
    * it goes to the judge, so while a judged turn runs or the host is quiesced
    * the entry says so and only may; otherwise it's certain. Each entry names
@@ -4416,6 +4419,8 @@ export class EventGate {
         const unless = toJudge.length > 0 ? `, unless ${toJudge.join(' or ')}, which sends it to the judge` : '';
         if (delivered > 0) {
           wakes.push({ at: state.dueAt, certain: toJudge.length === 0, what: `${rule} batch of ${count(delivered)}, delivered without the judge while its calls are refused${later}${unless}` });
+        } else if (toJudge.length > 0) {
+          wakes.push({ at: statedEnd, certain: false, what: `${rule} batch of ${count(state.events.length)}, whose every event's channel is held now, goes to the judge if ${toJudge.join(' or ')}` });
         }
       }
     }

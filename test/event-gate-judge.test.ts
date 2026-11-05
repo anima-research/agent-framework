@@ -786,6 +786,65 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
+  it("under onError 'wake', while a refusal's stated wait lasts and a turn runs, a batch whose every event's channel is held is listed as one that may go to the judge at the wait's end, and goes to it when the turn holds it past that end", async () => {
+    const judge = scriptedJudge();
+    let tunedOut = false;
+    const { gate } = makeGate(writeConfig('refused-wake-held-turn.json', {
+      policies: [
+        { name: 'soon', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } },
+        { name: 'quiet', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 100 } } },
+      ],
+    }), { judge: judge.fn, residents: ['agent'], isHeld: (serverId, channelId) => tunedOut && serverId === 'discord' && channelId === 'c-held' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 1_000));
+    await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
+    gate.onInferenceStarted('agent');
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c-held' });
+    tunedOut = true;
+    const end = refusalEnd(gate);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]), [
+      [`rule "quiet"'s batch of 1 event, whose every event's channel is held now, goes to the judge if a turn holds it past the refusal's end`, false, end],
+    ]);
+    await advance(end - Date.now() + STEP_MS);
+    assert.strictEqual(judge.requests.length, 1, 'premise: not asked while the turn holds it');
+    gate.onInferenceEnded('agent');
+    await until(() => judge.requests.length === 2, 'the batch goes to the judge');
+    assert.deepStrictEqual(judge.requests[1]!.events.map((e) => e.content), ['hi']);
+    gate.dispose();
+  });
+
+  it("a host clock that starts a judged turn when the gate reads it, as a batch goes to the judge, has the batch held for that turn rather than asked about", async () => {
+    const judge = scriptedJudge();
+    let startsTurn = false;
+    let made: ReturnType<typeof makeGate> | undefined;
+    const now = (): number => {
+      if (!startsTurn || !made) return Date.now();
+      startsTurn = false;
+      made.gate.onInferenceStarted('agent');
+      return refusalEnd(made.gate) + 1;
+    };
+    made = makeGate(writeConfig('refused-clock-starts-turn.json', {
+      policies: [
+        { name: 'soon', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } },
+        { name: 'quiet', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 100 } } },
+      ],
+    }), { judge: judge.fn, residents: ['agent'], now });
+    const { gate } = made;
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 60_000));
+    await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    startsTurn = true;
+    await until(() => !startsTurn, 'the clock read as the batch goes to the judge');
+    const quiet = () => gate.getStatus().policies.find((p) => p.name === 'quiet')!.judgeState!;
+    assert.strictEqual(judge.requests.length, 1, 'not asked while the turn the clock started runs');
+    assert.strictEqual(quiet().heldCount, 1, 'held for that turn');
+    gate.onInferenceEnded('agent');
+    gate.dispose();
+  });
+
   it("under onError 'skip', while a refusal's stated wait lasts, the wake list gives a judge rule's batch due before the wait ends as held for the judge until the end, and one due after it as going to the judge", async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('refused-skip-listed.json', {
@@ -903,9 +962,8 @@ describe('judge rules: timing', () => {
       } else {
         judge.answer({ reply: false, reason: 'nothing to answer' });
         await until(() => !internal.judging.has('deciding'), 'the deciding call done');
-        assert.strictEqual(delivered(), false, 'premise: not yet due');
-        await until(delivered, 'delivered at its due time');
-        assert.ok(Date.now() >= due);
+        await lastMillisecond(due, () => assert.strictEqual(delivered(), false, 'not delivered a millisecond before its due time'));
+        assert.strictEqual(delivered(), true, 'delivered at its due time');
       }
       assert.strictEqual(judge.requests.length, 2, 'without the judge');
       gate.dispose();
@@ -920,6 +978,8 @@ describe('judge rules: timing', () => {
       if (order === 'decided first') {
         await until(() => !internal.judging.has('deciding'), 'the deciding call done');
         assert.ok(internal.debounceTimers.has('deciding') && Date.now() < due, 'premise: the call is decided before the later batch fires');
+        await lastMillisecond(due, () => assert.strictEqual(held(), 0, 'not held a millisecond before its due time'));
+        assert.strictEqual(held(), 1, 'held at its due time');
       }
       await until(() => held() === 1, 'held for the judge');
       assert.strictEqual(delivered(), false);
