@@ -4216,7 +4216,7 @@ describe('the framework wires the reply judge', () => {
     }
   });
 
-  it("the judge's reading of a wake for a deferred write settles no write's landing and logs nothing, and counts a doubt as unread, leaving both to the scheduler", async (t) => {
+  it("the judge's reading of a wake for a deferred write settles no write's landing and logs nothing, and counts a doubt as unread", async (t) => {
     const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
     const internal = framework as unknown as {
       pendingRequests: Array<Record<string, unknown>>;
