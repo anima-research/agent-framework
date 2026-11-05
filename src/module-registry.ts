@@ -135,8 +135,7 @@ function speechPlace(named: unknown): string | undefined {
 export class ModuleRegistry {
   /** Each module's tool-batch hook still running, past its bound or not. */
   private batchHooksRunning = new Map<string, Promise<unknown>>();
-  /** Each module's speech-routed ask still running past its bound. */
-  private speechAsksOverdue = new Map<string, Promise<unknown>>();
+  private speechAsksOverdue = new Map<string, Set<Promise<unknown>>>();
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
@@ -766,7 +765,11 @@ export class ModuleRegistry {
       const timer = setTimeout(() => {
         settled = true;
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
-        if (call && this.moduleContexts.get(module.name) === registration) this.speechAsksOverdue.set(module.name, call);
+        if (call && this.moduleContexts.get(module.name) === registration) {
+          const overdue = this.speechAsksOverdue.get(module.name);
+          if (overdue) overdue.add(call);
+          else this.speechAsksOverdue.set(module.name, new Set([call]));
+        }
         resolve(undefined);
       }, SPEECH_RECEIPT_WAIT_MS);
       try {
@@ -776,7 +779,8 @@ export class ModuleRegistry {
       }
       const asking = call;
       const overdueEnds = (): void => {
-        if (this.speechAsksOverdue.get(module.name) === asking) this.speechAsksOverdue.delete(module.name);
+        const overdue = this.speechAsksOverdue.get(module.name);
+        if (overdue?.delete(asking) && overdue.size === 0) this.speechAsksOverdue.delete(module.name);
       };
       asking.then(overdueEnds, overdueEnds);
       const fail = (error: unknown): void => {

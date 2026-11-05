@@ -218,8 +218,8 @@ export interface Module {
    * speech with no channel, which is its caller's result. A module that throws, or
    * hasn't answered within `SPEECH_RECEIPT_WAIT_MS` of its call, names no
    * place, as `{}` does, and so does a module removed or replaced before it
-   * answers. A module still answering an earlier ask past that bound isn't
-   * asked again until that answer comes, and names no place meanwhile, as a
+   * answers. A module still answering earlier asks past that bound isn't
+   * asked again until each of those answers comes, and names no place meanwhile, as a
    * wedged `onToolBatchComplete` isn't called again. A hook that blocks
    * synchronously past that bound
    * and returns its answer still has it taken, since no timer runs while it
@@ -850,7 +850,8 @@ export interface SpeechSent {
   /**
    * Where it showed the text, as the agent reads it in its `[delivered]`
    * receipt: "sent to <sentTo>", such as "the terminal that sent this turn".
-   * Whitespace runs read as one space, and a long place is cut. Left out
+   * Whitespace runs read as one space, with none at either end, and a long
+   * place reads whole. Left out
    * (`{}`) when the module can't say the text reached someone.
    */
   sentTo?: string;

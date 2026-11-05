@@ -9,8 +9,8 @@
   since it's named as a draft. Modules are asked together, and their answers
   about each piece are waited for at most `SPEECH_RECEIPT_WAIT_MS` (5 s,
   exported) from each hook's call; a hook that blocks synchronously past it
-  and returns its answer still has it taken, and a module still answering an
-  earlier ask past it isn't asked again until that answer comes. A piece with a channel posts without waiting for its own answers;
+  and returns its answer still has it taken, and a module still answering
+  earlier asks past it isn't asked again until each of those answers comes. A piece with a channel posts without waiting for its own answers;
   since a turn's pieces route in order, a post after a routed piece with no
   channel waits behind that piece's answers, only while a module hasn't answered. The
   turn's `[delivered]` receipt waits up to the same bound for answers still

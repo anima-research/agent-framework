@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework, SPEECH_RECEIPT_WAIT_MS } from '../src/index.js';
-import type { Module, ModuleContext, ProcessEvent, SpeechRoutedContext, SpeechSent, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { Module, ModuleContext, ProcessEvent, SpeechContext, SpeechRoutedContext, SpeechSent, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
@@ -23,6 +23,7 @@ class Surface {
   messagesPerEvent = 1;
   onAsked: () => void = () => {};
   release: () => void = () => {};
+  held: Array<() => void> = [];
   heldAnswer: unknown = {};
   ctx: ModuleContext | null = null;
   constructor(readonly name = 'console') {}
@@ -51,7 +52,12 @@ class Surface {
     const answer = this.answer;
     if (answer === 'throw') throw new Error(`${this.name} broke`);
     if (answer === 'hang') return new Promise(() => {});
-    if (answer === 'held') return new Promise((resolve) => { this.release = () => resolve(this.heldAnswer); });
+    if (answer === 'held') {
+      return new Promise((resolve) => {
+        this.release = () => resolve(this.heldAnswer);
+        this.held.push(this.release);
+      });
+    }
     if (answer === 'late') return new Promise((resolve) => setTimeout(() => resolve({ sentTo: SENT_TO }), SPEECH_RECEIPT_WAIT_MS + 1_000));
     if (answer === 'late-throw') return new Promise((_, reject) => setTimeout(() => reject(new Error(`${this.name} broke late`)), SPEECH_RECEIPT_WAIT_MS + 1_000));
     if (typeof answer === 'object') return answer;
@@ -261,8 +267,11 @@ const afterLook = (said: string, trailing: string, id = 'c1'): NormalizedRespons
 describe('plain speech a module says it showed', () => {
   let dir: string | undefined;
   let framework: AgentFramework | undefined;
+  let surfaces: Surface[] = [];
 
   afterEach(async () => {
+    for (const surface of surfaces) for (const release of surface.held) release();
+    surfaces = [];
     await framework?.stop();
     framework = undefined;
     if (dir) rmSync(dir, { recursive: true, force: true });
@@ -271,6 +280,7 @@ describe('plain speech a module says it showed', () => {
 
   async function host(modules: Surface[], membrane: MockMembrane, agent: Record<string, unknown> = {}, channels = true, config: Record<string, unknown> = {}) {
     dir = mkdtempSync(join(tmpdir(), 'speech-routed-'));
+    surfaces = modules;
     framework = await AgentFramework.create({
       storePath: join(dir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
@@ -530,6 +540,11 @@ describe('plain speech a module says it showed', () => {
     membrane.pushResponse(lookRound('Looking around.'));
     membrane.pushResponse(afterLook('Looking around.', 'Nothing here.'));
     const f = await host([surface], membrane);
+    const spoken: Array<number | undefined> = [];
+    (surface as unknown as { onAgentSpeech(agent: string, content: unknown, context: SpeechContext): Promise<void> }).onAgentSpeech = async (_agent, _content, context) => {
+      spoken.push(context.turnId);
+    };
+    surface.ctx!.registerSpeechHandler('*');
     await turn(f);
     assert.deepEqual(askedTexts(surface), [
       { text: 'Looking around.', final: false },
@@ -539,6 +554,8 @@ describe('plain speech a module says it showed', () => {
     const turnIds = surface.asked.map((a) => a.context.turnId);
     assert.equal(typeof turnIds[0], 'number');
     assert.equal(turnIds[1], turnIds[0], "one turn's pieces name one turn");
+    assert.ok(spoken.length > 0, 'premise: the speech handler was told the turn');
+    assert.deepEqual([...new Set(spoken)], [turnIds[0]], "the turn onAgentSpeech's SpeechContext names");
     assert.deepEqual(notices(f), []);
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
   });
@@ -738,7 +755,7 @@ describe('plain speech a module says it showed', () => {
     const published = await channelTurn(f, true);
     const run = f.runUntilIdle();
     await until(() => ended, 'the turn to end');
-    await new Promise((resolve) => setImmediate(resolve));
+    await until(() => (internals(f).routingOf('resident') as { asksSettled?: string }).asksSettled === 'receipt', 'the receipt to wait for the answers');
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about before the turn ended");
     assert.equal(receipt(f), undefined, 'no receipt while the answer is due');
     release();
@@ -1422,6 +1439,31 @@ describe('plain speech a module says it showed', () => {
     surface.answer = 'sent';
     assert.deepEqual(await registry.askSpeechRouted('resident', 'Third.', { final: true }), [SENT_TO]);
     assert.equal(surface.asked.length, 2, 'asked again once that answer came');
+  });
+
+  it("a module two of whose asks outlast the bound together isn't asked again until both answers come", async (t) => {
+    const surface = new Surface();
+    surface.answer = 'held';
+    const f = await host([surface], new MockMembrane());
+    const registry = (f as unknown as { moduleRegistry: { askSpeechRouted(agent: string, text: string, context: SpeechRoutedContext): Promise<string[]> } }).moduleRegistry;
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    void registry.askSpeechRouted('resident', 'First.', { final: false });
+    const releaseFirst = surface.release;
+    void registry.askSpeechRouted('scout', 'Second.', { final: false });
+    const releaseSecond = surface.release;
+    assert.equal(surface.asked.length, 2, 'premise: both were asked before either ran out its bound');
+    t.mock.timers.tick(SPEECH_RECEIPT_WAIT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseSecond();
+    await new Promise((resolve) => setImmediate(resolve));
+    void registry.askSpeechRouted('resident', 'Third.', { final: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(surface.asked.length, 2, 'not asked again while the first answer is due');
+    releaseFirst();
+    await new Promise((resolve) => setImmediate(resolve));
+    surface.answer = 'sent';
+    assert.deepEqual(await registry.askSpeechRouted('resident', 'Fourth.', { final: true }), [SENT_TO]);
+    assert.equal(surface.asked.length, 3, 'asked again once both answers came');
   });
 
   it("a module replaced under its name while its ask was due doesn't hold back the next module of that name once the ask outlasts the bound", async (t) => {
@@ -2281,7 +2323,14 @@ describe('plain speech a module says it showed', () => {
     const first = surface.asked.find((a) => a.text === 'Answer 1.');
     assert.ok(first, JSON.stringify(askedTexts(surface)));
     assert.deepEqual(openingTexts(surface, first!), ['the opening message'], 'premise: the opening message started the run');
+    const held = () => (i.providerAccelerationCooldowns.get('resident')?.heldRequests ?? []) as unknown[];
+    const before = held().length;
     push(f, 'the second message');
+    while (held().length === before) {
+      assert.ok(Date.now() < deadline + 5_000, `premise: the second message's wake is held (held: ${held().length})`);
+      void f.runUntilIdle();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     (f as unknown as { releaseProviderWait(agent: string): void }).releaseProviderWait('resident');
     await f.runUntilIdle();
     const retried = surface.asked.find((a) => a.text === 'Answer 3.');
