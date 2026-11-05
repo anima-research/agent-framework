@@ -159,6 +159,11 @@ it('conversation-template inheritance omits notices before metadata is lost, wit
   assert.deepEqual(x.membrane.calls[0]!.messages.slice(0, expected.length).map(m => m.content), expected);
   assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
   assert.equal(JSON.stringify(await x.request()), before);
+  child.getContextManager().addMessage('user', [text('child notice')], flags);
+  child.getContextManager().addMessage('user', [text('child quote')]);
+  const next = await child.buildActivationRequest([]);
+  assert.ok(!JSON.stringify(next.messages).includes('child notice'), 'conversation contexts filter their own new rows too');
+  assert.ok(JSON.stringify(next.messages).includes('child quote'));
 });
 
 class LastMarker extends PassthroughStrategy {
@@ -181,10 +186,10 @@ it('places a cache marker on the surviving prefix when the last stored row is a 
 });
 
 it('strips signed thinking minted under the legacy notice prefix before sending the changed prefix', async () => {
-  const x = await fixture(false, { thinkingBinding: { binds: true } });
+  const x = await fixture(false, { thinkingBinding: { binds: true, dropBlock: true } });
   const legacy = await ContextManager.open({ store: x.framework.getStore(), namespace: 'agents/assistant', strategy: new MarkedPrefix() });
   cleanups.push(async () => { legacy.close(); });
-  const old = new Agent({ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', thinkingBinding: { binds: true } }, legacy, x.membrane.asMembrane());
+  const old = new Agent({ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', thinkingBinding: { binds: true, dropBlock: true } }, legacy, x.membrane.asMembrane());
   legacy.addMessage('user', [text('before')]);
   legacy.addMessage('user', [text(notice)], flags);
   const start = await old.startStream([]);
@@ -283,4 +288,20 @@ it('applies the same exclusion to an isolated ephemeral context', async () => {
   isolated.contextManager.addMessage('user', [text(notice)], flags);
   assert.deepEqual((await isolated.agent.buildActivationRequest([])).messages.map(m => m.content), [[text('before')]]);
   assert.equal((await isolated.agent.compileContext()).messages.length, 1);
+});
+
+it('documents the native wire shape when omission makes two signed assistant turns adjacent', async () => {
+  const x = await fixture();
+  await x.add('user', [text('start')]);
+  await x.add('assistant', [{ type: 'thinking', thinking: 'first', signature: 'T1' }, text('first reply')]);
+  await x.add('user', [text(notice)], flags);
+  await x.add('assistant', [{ type: 'thinking', thinking: 'second', signature: 'T2' }, text('second reply')]);
+  const request = await x.request();
+  assert.deepEqual(request.messages.map(m => m.participant), ['user', 'assistant', 'assistant', 'user']);
+  const built = wire(request);
+  assert.deepEqual(built.map(m => m.role), ['user', 'assistant', 'user']);
+  assert.deepEqual(built[1]!.content.map(b => b.type), ['thinking', 'text', 'thinking', 'text']);
+  assert.deepEqual(built[1]!.content.filter(b => b.type === 'thinking').map(b => b.signature), ['T1', 'T2']);
+  // No binding setting in this case: preserve the formatter's existing merge,
+  // including T2 after text. This is a wire-shape assertion, not provider validation.
 });
