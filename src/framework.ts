@@ -1290,6 +1290,8 @@ function gotPartway(routing: TurnRouting): boolean {
 
 const REARM_REASON = 'exhausted-turn-rearm';
 
+type WakesOnTheirWay = { queued: string[]; held?: { until?: number; rearm?: { number: number; of: number } } };
+
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
   return (request as MarkedRequest)[MERGED_BATCH];
 }
@@ -4876,8 +4878,11 @@ export class AgentFramework {
         // What else wakes the agent with no new event, beside the gate's own
         // timers: a wake already queued for it, and a turn a provider cooldown
         // holds until it ends.
-        upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
-        failedLastTurn: (agentName) => framework.failedLastTurnFor(agentName),
+        wakeReading: (agentName) => {
+          const onTheirWay = framework.wakesOnTheirWay(agentName);
+          const failedLastTurn = framework.failedLastTurnFor(agentName, onTheirWay);
+          return { upcomingWakes: framework.upcomingWakesFor(agentName, onTheirWay), ...(failedLastTurn ? { failedLastTurn } : {}) };
+        },
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
@@ -6216,9 +6221,9 @@ export class AgentFramework {
    * ends. The reply judge is told of them beside the gate's own timers, so it
    * can weigh what waiting costs.
    */
-  private upcomingWakesFor(agentName: string): import('./gate/types.js').UpcomingWake[] {
+  private upcomingWakesFor(agentName: string, onTheirWay = this.wakesOnTheirWay(agentName)): import('./gate/types.js').UpcomingWake[] {
     const wakes: import('./gate/types.js').UpcomingWake[] = [];
-    const { queued, held } = this.wakesOnTheirWay(agentName);
+    const { queued, held } = onTheirWay;
     if (queued.length > 0) {
       wakes.push({
         certain: true,
@@ -6236,10 +6241,10 @@ export class AgentFramework {
     return wakes;
   }
 
-  private wakesOnTheirWay(agentName: string): { queued: string[]; held?: { until?: number; rearm?: { number: number; of: number } } } {
+  private wakesOnTheirWay(agentName: string): WakesOnTheirWay {
     const agent = this.agents.get(agentName);
-    const mine = (r: InferenceRequest): boolean => r.agentName === agentName
-      && !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m)));
+    const unread = (r: InferenceRequest): boolean => !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m)));
+    const mine = (r: InferenceRequest): boolean => r.agentName === agentName && unread(r);
     const requests = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
     for (const pass of this.passRequests) for (const taken of pass.values()) requests.push(...taken.filter(mine));
     const queued = requests.map((r) => String(r.reason));
@@ -6249,8 +6254,9 @@ export class AgentFramework {
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
     const model = this.agents.get(agentName)?.model;
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    if (cooldown && !(cooldown.rearm && queued.length > 0)) {
-      const releaseWakes = cooldown.heldRequests.length > 0 || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
+    const otherModel = cooldown?.waitModel !== undefined && cooldown.waitModel !== model;
+    if (cooldown && !((cooldown.rearm || otherModel) && queued.length > 0)) {
+      const releaseWakes = cooldown.heldRequests.some(unread) || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
       if (releaseWakes || queued.length > 0) {
         const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
         const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
@@ -6263,11 +6269,11 @@ export class AgentFramework {
     return { queued };
   }
 
-  private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
+  private failedLastTurnFor(agentName: string, onTheirWay?: WakesOnTheirWay): import('./gate/types.js').FailedLastTurn | undefined {
     const agent = this.agents.get(agentName);
     const at = agent && this.lastStartFailed.get(agent);
     if (at === undefined) return undefined;
-    const { queued, held } = this.wakesOnTheirWay(agentName);
+    const { queued, held } = onTheirWay ?? this.wakesOnTheirWay(agentName);
     if (queued.length > 0) return { at, again: { kind: 'queued' } };
     return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}) } : { kind: 'none' } };
   }

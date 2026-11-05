@@ -4210,11 +4210,12 @@ export class EventGate {
   /**
    * Send one of a judge rule's batches to the reply judge. While a resident's
    * turn runs or the host is quiesced the batch is held instead, merged with
-   * any the rule already holds, and judged once both are clear
-   * (flushJudgeHeldIfClear): the judge then reads the context the turn left,
-   * which may already have answered it. While the judge decides one of the
-   * rule's batches, a later one waits for that verdict (finishJudging), so the
-   * judge never decides two of a rule's batches at once.
+   * any the rule already holds, and judged once both are clear and, under
+   * `"skip"`, no refusal holds it (flushJudgeHeldIfClear): the judge then
+   * reads the context the turn left, which may already have answered it.
+   * While the judge decides one of the rule's batches, a later one waits for
+   * that verdict (finishJudging), so the judge never decides two of a rule's
+   * batches at once.
    */
   private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
     if (this.disposed) return;
@@ -4228,13 +4229,14 @@ export class EventGate {
       this.holdForJudge(policyName, events, judge);
       return;
     }
+    const refusing = this.judgeRefusing();
     const held = this.judgeHeld.get(policyName);
     if (held) {
       this.judgeHeld.delete(policyName);
       events = [...held.events, ...events];
       this.capJudgeEvents(events);
     }
-    if (this.judgeRefusing()) {
+    if (refusing) {
       if (this.judgeOnError === 'skip') this.holdForJudge(policyName, events, judge);
       else this.deliverOrBuffer(events);
       return;
@@ -4408,7 +4410,7 @@ export class EventGate {
           ...(deciding ? ["if the judge is still deciding the rule's batch then, once it decides"] : []),
           ...(holdingNow.length > 0 ? [`if ${holdingNow.join(' or ')} then, once ${once}`] : []),
         ];
-        const later = alternatives.length > 0 ? `, at its due time or, ${alternatives.join(', or, ')}` : '';
+        const later = alternatives.length > 0 ? `, at its due time or, ${alternatives.join(' and, ')}` : '';
         const unless = toJudge.length > 0 ? `, unless ${toJudge.join(' or ')}, which sends it to the judge` : '';
         if (delivered > 0) {
           wakes.push({ at: state.dueAt, certain: toJudge.length === 0, what: `${rule} batch of ${count(delivered)}, delivered without the judge while its calls are refused${later}${unless}` });
