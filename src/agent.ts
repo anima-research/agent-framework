@@ -34,7 +34,7 @@ import {
 } from './tool-result-history.js';
 
 /** ContextManager.compile's own budget when it is given none. */
-const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: 100_000, reserveForResponse: 4_000 };
+const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = Object.freeze({ maxTokens: 100_000, reserveForResponse: 4_000 });
 
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */

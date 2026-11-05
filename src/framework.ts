@@ -1311,9 +1311,6 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
-/** The budget hold whose release pushed this request. Copies keep it, as
- *  they keep TURN_RETRY and TURN_CARRY, so a provider hold that keeps the
- *  start and later lets it go can tell that hold (noteProviderTookRelease). */
 const BUDGET_RELEASED: unique symbol = Symbol('budget-released');
 interface TurnCarry {
   silence: TurnSilence | null;
@@ -2700,22 +2697,14 @@ interface BudgetHold {
   budget: number | undefined;
   actual: number | undefined;
   recheck?: ReturnType<typeof setInterval>;
-  checking: Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null }> | undefined;
+  checking: Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null; cause?: string }> | undefined;
   managerCalls: number;
   lookedAt?: string;
-  /** The last snapshot of compression's own work the hold saw
-   *  (budgetHoldProgressKey: the summaries it has made and whether a call is
-   *  in flight, or a whole progress snapshot without those fields), and when
-   *  it last changed: the hold's start until then. Traffic, settings and pins
-   *  move the verdict's signature, not this. */
   compressionSeen?: string;
   compressionChangedAt: number;
-  /** While the hold's start is announced (its alert and inference:held), the
-   *  reports of an end that came meanwhile, given once it's announced. */
   announcing?: Array<() => void>;
-  /** A provider hold took the start this record released, so that start's
-   *  later run waited on the provider, not on compression. */
   providerTook?: true;
+  phase: number;
   checkpoint: RecordedTurnCheckpoint | undefined;
   checkQueued?: boolean;
   drainKicked?: boolean;
@@ -6943,9 +6932,10 @@ export class AgentFramework {
     const hold: BudgetHold = existing ?? {
       state: 'holding', startedAt: now, heldRequests: [],
       errorType, reason: '', budget: undefined, actual: undefined, checking: undefined, managerCalls: 0, checkpoint: undefined,
-      compressionChangedAt: now,
+      compressionChangedAt: now, compressionSeen: this.budgetHoldProgressKey(agent), phase: 0,
     };
     hold.state = 'holding';
+    hold.phase++;
     delete hold.providerTook;
     hold.checkpoint = checkpoint;
     hold.heldRequests = [own];
@@ -6961,11 +6951,6 @@ export class AgentFramework {
     }
     this.budgetHolds.set(agent.name, hold);
     endStart();
-    // Every turn into holding, a fresh hold or a released turn held again,
-    // raises the alert, as every end raises its clear (budgetHoldEnded). A
-    // listener of either may end the hold at once; its end takes effect, and
-    // its report waits until the start is announced, so both the trace and
-    // the webhook read start, held, ended, clear.
     hold.announcing = [];
     try {
       this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
@@ -7046,16 +7031,18 @@ export class AgentFramework {
     const preview = this.budgetHoldPreview(agent);
     let verdict = preview?.verdict;
     let note: string | null = null;
+    let cause = preview?.cause;
     if (verdict === undefined) {
       if (hold.checking) return;
+      const phase = hold.phase;
       const check = this.budgetHoldDryRun(agent, hold);
       hold.checking = check;
       try {
-        ({ verdict, note = null } = await check);
+        ({ verdict, note = null, cause } = await check);
       } finally {
         if (hold.checking === check) hold.checking = undefined;
       }
-      if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding') return;
+      if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding' || hold.phase !== phase) return;
       if (this.agents.get(agentName) !== agent) return;
       if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
     } else if (verdict === 'fit') {
@@ -7067,7 +7054,7 @@ export class AgentFramework {
       this.releaseBudgetHold(agentName, 'nothing_pending', null);
     } else {
       hold.lookedAt = signature;
-      this.releaseBudgetHold(agentName, verdict, verdict === 'fit' ? note : null);
+      this.releaseBudgetHold(agentName, verdict, verdict === 'fit' ? note : null, cause);
     }
   }
 
@@ -7109,7 +7096,7 @@ export class AgentFramework {
     }
   }
 
-  private budgetHoldPreview(agent: Agent): { verdict: 'fit' | 'refused' | 'check_failed'; plan?: { finalTokens: number; budgetTokens: number } } | undefined {
+  private budgetHoldPreview(agent: Agent): { verdict: 'fit' | 'refused' | 'check_failed'; plan?: { finalTokens: number; budgetTokens: number }; cause?: string } | undefined {
     const cm = agent.getContextManager() as unknown as {
       previewContext?: (budget: TokenBudget, overrides?: undefined, opts?: { thinkingBinding?: ThinkingBinding }) => { fits?: unknown; finalTokens?: unknown; budgetTokens?: unknown } | null;
     };
@@ -7132,21 +7119,19 @@ export class AgentFramework {
       // that fits: context-manager 0.23.0 throws, 0.23.1 returns null. Its dry
       // compile refuses as its compile does.
       if (error instanceof Error && error.message.includes('requires adaptiveResolution')) return undefined;
-      return { verdict: this.budgetHoldThrownVerdict(error) };
+      return this.budgetHoldThrownVerdict(error);
     }
   }
 
-  private async budgetHoldDryRun(agent: Agent, hold: BudgetHold): Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null }> {
+  private async budgetHoldDryRun(agent: Agent, hold: BudgetHold): Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null; cause?: string }> {
     try {
       await this.previewActivation(agent.name);
     } catch (error) {
-      return { verdict: this.budgetHoldThrownVerdict(error) };
+      return this.budgetHoldThrownVerdict(error);
     }
     const priced = this.budgetHoldNotePrice(agent, hold);
     if (!priced) return { verdict: 'fit', note: null };
     const budget = agent.nextCompileBudget();
-    // previewActivation's budget goes through the agent's compileBudget,
-    // which adds the tool-result guard's reserve to it again.
     const reserve = agent.toolResultGuard.pendingWireReserveTokens;
     try {
       await this.previewActivation(agent.name, {
@@ -7158,9 +7143,11 @@ export class AgentFramework {
     }
   }
 
-  private budgetHoldThrownVerdict(error: unknown): 'refused' | 'check_failed' {
+  private budgetHoldThrownVerdict(error: unknown): { verdict: 'refused' } | { verdict: 'check_failed'; cause: string } {
     const { errorType } = this.classifyInferenceError(error instanceof Error ? error : new Error(String(error)));
-    return errorType === 'over_budget' || errorType === 'context_refusal' ? 'refused' : 'check_failed';
+    return errorType === 'over_budget' || errorType === 'context_refusal'
+      ? { verdict: 'refused' }
+      : { verdict: 'check_failed', cause: boundFailureText(error instanceof Error ? String(error.message) : failureDescription(error)) };
   }
 
   private budgetHoldSignature(agent: Agent, pending = this.compressionPending(agent)): string | undefined {
@@ -7210,10 +7197,9 @@ export class AgentFramework {
       cm.onMessage((event) => {
         if (event.type === 'add'
           && (storedInjectionMarkOf(event.message.metadata) !== undefined || clockStampOf(event.message.metadata) !== undefined
-            // A suppressed row is never rendered, so it can't move a verdict.
             || suppressedRow(event.message.metadata as Record<string, unknown> | undefined))) return;
-        // An edit's event names only the row; a suppressed row's edit is no
-        // change either. (A removed row can't be read, so a removal counts.)
+        // context-manager's edit event names only the row's id, and a removed
+        // row can't be read, so a removal still counts.
         if (event.type === 'edit'
           && suppressedRow(cm.getMessage(event.messageId)?.metadata as Record<string, unknown> | undefined)) return;
         counted.count++;
@@ -7242,7 +7228,7 @@ export class AgentFramework {
     if (kicked === 'kicking') hold.drainKicked = true;
   }
 
-  private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>, note: string | null): void {
+  private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>, note: string | null, cause?: string): void {
     const hold = this.budgetHolds?.get(agentName);
     if (hold?.state !== 'holding') return;
     this.clearBudgetHoldRecheck(hold);
@@ -7256,15 +7242,17 @@ export class AgentFramework {
     hold.outcome = outcome;
     hold.note = note;
     hold.heldRequests = [];
-    console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms; ` +
-      `${released.length} held request(s) queued for one fresh compile`);
-    this.budgetHoldEnded(hold, agentName, outcome, waitedMs, released.length);
+    console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}${cause !== undefined ? `: ${cause}` : ''}) ` +
+      `after ${waitedMs}ms; ${released.length} held request(s) queued for one fresh compile`);
+    this.budgetHoldEnded(hold, agentName, outcome, waitedMs, released.length, cause);
   }
 
-  /** A hold's end, however it ended: its trace, and the clear of the
-   *  `context-hold` alert its start raised. An end while the start is still
-   *  being announced is reported once it is (holdForBudgetRefusal). */
-  private budgetHoldEnded(hold: BudgetHold, agentName: string, outcome: BudgetHoldOutcome, waitedMs: number, heldRequests: number): void {
+  private budgetHoldEnded(hold: BudgetHold, agentName: string, outcome: BudgetHoldOutcome, waitedMs: number, heldRequests: number, cause?: string): void {
+    const after = describeWait(waitedMs);
+    const words = outcome === 'fit' ? `the held turn's context fits, after ${after}: the turn runs`
+      : outcome === 'nothing_pending' ? `compression had nothing left to do after ${after}: the turn compiles again, and a refusal now takes the error policy's path`
+        : outcome === 'check_failed' ? `the hold's check failed after ${after}: the turn compiles again`
+          : `the held turn was ended after ${after}`;
     const report = (): void => {
       this.emitTrace({
         type: 'inference:hold_ended',
@@ -7273,19 +7261,16 @@ export class AgentFramework {
         waitedMs,
         heldRequests,
       });
-      this.opsAlert('context-hold-clear', agentName, `the held turn's hold ended (${outcome}) after ${describeWait(waitedMs)}`, {
+      this.opsAlert('context-hold-clear', agentName, cause !== undefined ? `${words} (${cause})` : words, {
         skipLog: true,
         everyTime: true,
-        data: { outcome, waitedMs },
+        data: { outcome, waitedMs, ...(cause !== undefined ? { cause } : {}) },
       });
     };
     if (hold.announcing) hold.announcing.push(report);
     else report();
   }
 
-  /** The `context-hold` alert's words: what holds the turn, the refusal,
-   *  bounded so the whole stays within FAILURE_TEXT_MAX_CHARS, and the way
-   *  on that surgery's refusal names. */
   private contextHoldText(wholeReason: string): string {
     const head = 'turn held until compression makes room, since its compile was refused for budget: ';
     const tail = `; ${heldTurnWayOn(false)}`;
@@ -7323,18 +7308,11 @@ export class AgentFramework {
     };
   }
 
-  /** Whether the start now running is one the agent's budget hold released,
-   *  and so waited for compression: a record that isn't holding and that no
-   *  provider hold has taken the start of. */
   private releasedByBudgetHold(agentName: string): boolean {
     const hold = this.budgetHolds?.get(agentName);
     return hold !== undefined && hold.state !== 'holding' && hold.providerTook !== true;
   }
 
-  /** A provider hold lets `requests` go: where one of them, or one its
-   *  merged batch was made from, is a start the agent's budget hold released
-   *  (BUDGET_RELEASED), that start waited on the provider. The record and
-   *  its note stay. */
   private noteProviderTookRelease(agentName: string, requests: readonly InferenceRequest[]): void {
     const hold = this.budgetHolds?.get(agentName);
     if (hold === undefined || hold.state === 'holding') return;
@@ -7508,8 +7486,6 @@ export class AgentFramework {
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
       reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
     this.pendingRequests.push(...requests);
-    // A start a budget hold released and this hold then kept waited on the
-    // provider when it runs, not on compression.
     this.noteProviderTookRelease(agentName, requests);
     console.error(cooldown.rearm
       ? `[inference-rearm] agent=${agentName} turn queued again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
@@ -20612,8 +20588,6 @@ export class AgentFramework {
         }
         const recovery = this.providerAccelerationRecoveries.get(agentName);
         if (recovery) recovery.releasedAt = now;
-        // A start a budget hold released and this hold kept waited on the
-        // provider, as at the hold's own release (noteProviderTookRelease).
         this.noteProviderTookRelease(agentName, providerCooldown.heldRequests);
         requests = [...providerCooldown.heldRequests, ...requests];
       }
@@ -33013,8 +32987,8 @@ export class AgentFramework {
    *     (agent, kind) per cooldown window — a persistent failure re-posts
    *     every ~15 min instead of flooding the channel on every occurrence.
    *     The budget hold's state alerts, `context-hold` and its clear, post at
-   *     every transition instead, so the webhook's last word for an agent is
-   *     whether its turn is held.
+   *     every transition instead: sent start then clear, each a post of its
+   *     own, which a webhook may receive out of order.
    * See connectome docs/observability.md.
    */
   /**
@@ -33138,9 +33112,6 @@ export class AgentFramework {
       /** Tells this alert apart from others of its agent and kind for the
        *  webhook's cooldown, such as the batch a retirement names. */
       key?: string;
-      /** Posts to the webhook at every call, outside its cooldown: for an
-       *  alert that reports a state, whose last post must stay true, as
-       *  `context-hold` and its clear do. */
       everyTime?: boolean;
     },
   ): void {

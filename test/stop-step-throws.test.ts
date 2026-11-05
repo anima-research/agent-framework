@@ -169,7 +169,6 @@ const ROWS: Row[] = [
   {
     step: "a budget hold's drop",
     inject: (fw, e) => {
-      // Two turns' hold records: the first one's drop throws.
       const holds = internals(fw).budgetHolds as Map<string, unknown>;
       holds.set('first', { state: 'released', heldRequests: [] });
       holds.set('second', { state: 'released', heldRequests: [] });
