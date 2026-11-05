@@ -2306,6 +2306,27 @@ describe('private wins, one way', () => {
       }
     });
 
+    it("a private surface's message a start answered, after the host moves its branch back to before that answer, keeps the next channel turn out of every channel", async () => {
+      const rig = await surfaceRig({ quietSources: ['console'] });
+      try {
+        await firstTurn(rig, false);
+        rig.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+        await rig.until(() => stored(rig).includes('for your eyes only'), 'the private message stored');
+        const { channelTurn } = restarted(rig);
+        assert.deepEqual(await channelTurn(), [], 'control: the start that reads it speaks in no channel');
+        const cm = rig.framework.getAgent('scout')!.getContextManager();
+        const asked = cm.queryMessages({}).messages.find((m) => JSON.stringify(m.content).includes('for your eyes only'))!;
+        await cm.switchBranch(cm.branchAt(asked.id, `undo-${Date.now()}`));
+        const rows = cm.getAllMessages();
+        const at = rows.findIndex((m) => JSON.stringify(m.content).includes('for your eyes only'));
+        assert.ok(at >= 0 && !rows.slice(at + 1).some((m) => m.participant === 'scout'), 'control: the move took the answer off the branch, and kept the message');
+        assert.deepEqual(await channelTurn(), [], 'the next start, which reads it unanswered, speaks in no channel');
+        assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+      } finally {
+        await rig.close();
+      }
+    });
+
     it("a store from before this release, holding a private surface's message no start read, keeps the next run's first start out of every channel, across a further restart with a /puppet pair stored between", async () => {
       const storeDir = mkdtempSync(join(tmpdir(), 'older-store-private-restart-'));
       try {

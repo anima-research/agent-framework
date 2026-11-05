@@ -25008,6 +25008,7 @@ export class AgentFramework {
     //    With no turn open, the start opens one.
     // A new object doesn't clear the previous turn's: prose that turn left
     // queued still reads and writes its own.
+    if (this.readPrivateInputRecord(agent.name)) this.privateInputStored.add(agent.name);
     const privateInput = this.privateInputStored.has(agent.name);
     let routing: TurnRouting;
     let opensTurn = false;
