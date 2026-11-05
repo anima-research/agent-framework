@@ -2031,7 +2031,7 @@ export class ChannelRegistry {
             refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
             continue;
           }
-          envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+          envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, afterResponse: admission.afterResponse, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
         }
 
         // ACCEPTED from here down: semantic processing only for admitted

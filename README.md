@@ -1044,7 +1044,7 @@ Required inbound admission is supported only through `AgentFramework`; direct
 `McplServerConnection` factories reject `inboundAdmission`. Required coalesced
 content is stored and acknowledged without awaiting module `onProcess`; module
 dispatch runs per channel in acceptance order (callback-completion order across subjects)
-and may run after acknowledgement. Its 64-slot queued+running backlog refuses
+after acceptance and after the acknowledgement is sent. Its 64-slot queued+running backlog refuses
 new deliveries before storage/acceptance, but never refuses a withdrawal at that cap: at
 capacity only a delivered withdrawal notice's module work is dropped, with
 diagnostics. Stop/disconnect discard queued work; close/reconnect preserve it.

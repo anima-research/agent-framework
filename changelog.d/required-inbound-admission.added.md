@@ -1,8 +1,9 @@
 - **Host applications:** opt into bounded, connection/epoch-bound inbound admission
   with `McplServerConfig.inboundAdmission` through AgentFramework only (direct
   connection factories reject it). Required coalesced content acknowledgement
-  does not await module processing; per-channel module dispatch runs
-  in acceptance order (callback-completion order across subjects). Channel messages, pushes and inference
+  does not await module processing; per-channel module dispatch starts after
+  acceptance and after the acknowledgement is sent, in acceptance order
+  (callback-completion order across subjects). Channel messages, pushes and inference
   requests are authorized before an asynchronous, fail-closed host callback.
   Unconfigured connections retain their existing behaviour without a preflight.
   Required traffic is held during startup staging and quiesce, then admitted at

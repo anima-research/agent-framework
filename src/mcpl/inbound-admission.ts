@@ -72,7 +72,7 @@ class InvalidData extends Error {}
 
 /** A receipt is private runtime state, never metadata, persistence or a peer result. */
 export const admittedEnvelope = Symbol('admitted inbound');
-export type AdmittedEnvelope = Readonly<{ connection: ConnectionKey; mayWake: boolean; replyIntent?: unknown }>;
+export type AdmittedEnvelope = Readonly<{ connection: ConnectionKey; mayWake: boolean; replyIntent?: unknown; afterResponse?: RequiredIngress['afterResponse'] }>;
 export function attachAdmission(event: object, envelope: AdmittedEnvelope): void {
   Object.defineProperty(event, admittedEnvelope, { value: envelope, enumerable: true });
 }
@@ -85,6 +85,8 @@ export function wakeForbidden(event: object): boolean {
 }
 export interface RequiredIngress {
   readonly key: ConnectionKey;
+  /** Host-only continuation after the lane's response (or notification completion). */
+  afterResponse?(work: () => void): void;
   /** Reserve at arrival, before callbacks; both lanes share the subject queue. */
   orderCoalesced?(scope: CoalescingScope, key: string): { ready: Promise<void>; retire(): void; overloaded?: boolean };
   check(): RefusalCode | undefined;

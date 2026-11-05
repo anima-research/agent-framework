@@ -19354,8 +19354,15 @@ export class AgentFramework {
         this.requiredModuleReservations.delete(occ.event.event);
         if (slot && !slot.dropped) {
           if (slot.event) {
-            slot.ready = true;
-            this.pumpRequiredModuleQueue(slot.queue);
+            // Acceptance alone is not the lane's wire response: a channel
+            // batch may still be awaiting later siblings. Keep this FIFO
+            // position ineligible until that response boundary has passed.
+            const acceptedSlot = slot;
+            admissionOf(occ.event.event)!.afterResponse!(() => {
+              if (acceptedSlot.dropped) return;
+              acceptedSlot.ready = true;
+              this.pumpRequiredModuleQueue(acceptedSlot.queue);
+            });
           } else {
             // No delivery (e.g. pure withdrawal) or a pre-storage failure.
             slot.queue.pending.splice(slot.queue.pending.indexOf(slot), 1);
@@ -19368,7 +19375,8 @@ export class AgentFramework {
   }
 
   /** No promise chains per event: pending payloads live only in this bounded,
-   * explicitly clearable array. Starting modules is deferred past acceptance. */
+   * explicitly clearable array. Starting modules is deferred past acceptance
+   * and the lane response, outside the coalescer lock. */
   private scheduleRequiredCoalescedModules(event: ProcessEvent, occ: CoalescedOccurrence<CoalescedDelivery>): void {
     const slot = this.requiredModuleReservations.get(occ.event.event);
     if (!slot && occ.retract) {
@@ -35664,11 +35672,17 @@ export class AgentFramework {
   private containedInboundHandler<T>(
     serverId: string,
     event: string,
-    handler: (params: T, responder?: InboundResponder) => void | Promise<void>,
+    handler: (params: T, responder?: InboundResponder, afterResponse?: RequiredIngress['afterResponse']) => void | Promise<void>,
     recorded: (text: unknown) => string = asText,
     trackCompletion?: (params: T, completion: Promise<void>) => void,
   ): (params: T, responder?: InboundResponder) => void {
     return (params: T, responder?: InboundResponder) => {
+      // Required coalesced reservations register only delivered work here.
+      // Completion includes the actual lane response and the containment
+      // layer's fallback error response. Notifications have no reply to send.
+      const responseWork: Array<() => void> = [];
+      const afterResponse: RequiredIngress['afterResponse'] = work => { responseWork.push(work); };
+      const responseComplete = () => { for (const work of responseWork.splice(0)) work(); };
       // Whether the handler wrote a reply. A reply counts once its write
       // returns: a write that throws has sent nothing, since the connection
       // encodes a reply before it writes it, and neither transport's write
@@ -35802,7 +35816,7 @@ export class AgentFramework {
       try {
         // Invoke immediately: control-plane responses must retain their
         // ACK-before-reconcile ordering.
-        const result = handler(params, tracked);
+        const result = handler(params, tracked, afterResponse);
         if (result) {
           // On this path the report runs as a rejection handler, where a
           // throw would be an unhandled rejection, which ends the host. The
@@ -35811,15 +35825,19 @@ export class AgentFramework {
           // and logs it on a line of its own, printed through log-value as
           // the report's line is. Nothing catches the backstop, so a failure
           // of its own log is swallowed.
-          const completion = Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
+          // Make bounded module slots eligible only after response/error
+          // handling; the pump runs modules separately and contains errors.
+          const completion = Promise.resolve(result).then(succeeded, failed).finally(responseComplete).catch((reportFailure: unknown) => {
             try {
               console.error(`[mcpl] ${serverId} ${event}: the handler failure's report threw: ${logDetail(describeCause(reportFailure))}`);
             } catch { /* nothing is left to log it to */ }
           });
           trackCompletion?.(params, completion);
-        } else succeeded();
+        } else {
+          try { succeeded(); } finally { responseComplete(); }
+        }
       } catch (error) {
-        failed(error);
+        try { failed(error); } finally { responseComplete(); }
       }
     };
   }
@@ -35838,7 +35856,7 @@ export class AgentFramework {
     // sent.
     const onRequest = <T>(
       event: string,
-      handler: (params: T, responder?: Responder) => void | Promise<void>,
+      handler: (params: T, responder?: Responder, afterResponse?: RequiredIngress['afterResponse']) => void | Promise<void>,
     ): void => {
       const trackCompletion = connection.requiredAdmission && ['push-event', 'channels-incoming', 'inference-request'].includes(event)
         ? (_params: T, completion: Promise<void>) => connection.trackHeldHandler(event, completion)
@@ -35866,6 +35884,7 @@ export class AgentFramework {
     onRequest('push-event', async (
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+      afterResponse?: RequiredIngress['afterResponse'],
     ) => {
       // Checked before anything records the push as accepted: a stopped
       // host refuses it.
@@ -35880,6 +35899,7 @@ export class AgentFramework {
           : undefined;
         const admission: RequiredIngress = {
           ...original,
+          afterResponse,
           orderCoalesced: (scope, key) => this.takeCoalescingTicket(connection.id, scope, key),
           check: () => this.queue?.isClosed ? 'admission_not_ready' :
             this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' :
@@ -36064,6 +36084,7 @@ export class AgentFramework {
     onRequest('channels-incoming', async (
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
+      afterResponse?: RequiredIngress['afterResponse'],
     ) => {
       if (this.queue?.isClosed) {
         this.refuseServerItem('channels/incoming', connection.id, responder);
@@ -36073,6 +36094,7 @@ export class AgentFramework {
         const original = connection.admissionFor(params);
         const admission: RequiredIngress = {
           ...original,
+          afterResponse,
           orderCoalesced: (scope, key) => this.takeCoalescingTicket(connection.id, scope, key),
           check: () => this.queue?.isClosed ? 'admission_not_ready' :
             this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),

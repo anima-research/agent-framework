@@ -1,7 +1,7 @@
 /** Production-path coverage for the bounded, lifecycle-owned module backlog. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { fixture, eventually, settles } from './helpers/coalescing-fixture.js';
 import { MAX_PENDING_REQUIRED_MODULE_WORK } from '../src/index.js';
 
 const allow = { store: true, mayWake: false } as const;
@@ -139,5 +139,127 @@ for (const lane of ['push/event', 'channels/incoming'] as const) {
     assert(traces.some(e => e.type === 'mcpl:module-work-dropped' && e.reason === 'admission_module_capacity' && e.count === 1));
     held.release(); await eventually(() => (f.framework as any).requiredModuleQueues.size === 0);
     assert.equal(seen.length, 64); assert(!seen.includes('delete'));
+  });
+}
+
+for (const lane of ['push/event', 'channels/incoming'] as const) {
+  test(`required ${lane}: wire acknowledgement precedes the synchronous module prefix`, async t => {
+    const order: string[] = [];
+    const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: any) {
+      if (['mcpl:push-event', 'mcpl:channel-incoming'].includes(e.type)) order.push(`module:${e.eventId}`);
+      return {};
+    } };
+    const f = await fixture({ server: { inboundAdmission: admission }, framework: { modules: [spy] } as never });
+    t.after(() => f.close()); await f.register();
+    const inner = f.framework as any;
+    const connection = inner.mcplServerRegistry.getServer('editor');
+    const sendResponse = connection.sendResponse.bind(connection);
+    connection.sendResponse = (id: unknown, result: any, ...rest: any[]) => {
+      const sent = sendResponse(id, result, ...rest);
+      order.push('wire-ack');
+      return sent;
+    };
+    const item = lane === 'push/event' ? f.params('one', 'body', { initial: true }) : f.channel('one', 'body', { initial: true });
+    const params = lane === 'push/event' ? item : { messages: [item] };
+    const response = await f.send(lane, params);
+    assert.equal((response.result.results?.[0] ?? response.result).accepted, true);
+    await eventually(() => order.includes('module:one'));
+    assert.deepEqual(order, ['wire-ack', 'module:one']);
+    // Receipt replay and refusal must not reserve/retain module slots.
+    await f.send(lane, params);
+    const invalid = { ...item, eventId: 'refused', coalesce: { ...item.coalesce, deferred: true } };
+    const refused = await f.send(lane, lane === 'push/event' ? invalid : { messages: [invalid] });
+    assert.equal((refused.result.results?.[0] ?? refused.result).accepted, false);
+    await eventually(() => inner.requiredModuleQueues.size === 0);
+    const withdrawal = { ...item, eventId: 'withdraw', coalesce: { ...item.coalesce, initial: false, retract: true } };
+    const withdrawn = await f.send(lane, lane === 'push/event' ? withdrawal : { messages: [withdrawal] });
+    assert.equal((withdrawn.result.results?.[0] ?? withdrawn.result).accepted, true);
+    await eventually(() => inner.requiredModuleQueues.size === 0);
+    assert.deepEqual(order, ['wire-ack', 'module:one', 'wire-ack', 'wire-ack', 'wire-ack'], 'pure withdrawal releases its unused reservation');
+  });
+
+  test(`required ${lane}: notifications dispatch modules and release reservations without a responder`, async t => {
+    const seen: string[] = [];
+    const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: any) {
+      if (['mcpl:push-event', 'mcpl:channel-incoming'].includes(e.type)) seen.push(e.eventId);
+      return {};
+    } };
+    const f = await fixture({ server: { inboundAdmission: admission }, framework: { modules: [spy] } as never });
+    t.after(() => f.close()); await f.register();
+    const item = lane === 'push/event' ? f.params('notice', 'body', { initial: true }) : f.channel('notice', 'body', { initial: true });
+    f.notify(lane, lane === 'push/event' ? item : { messages: [item] });
+    await eventually(() => seen.length === 1);
+    await eventually(() => (f.framework as any).requiredModuleQueues.size === 0);
+    assert.deepEqual(seen, ['notice']);
+  });
+}
+
+test('required channel batch: no module prefix before the batch response; later responses cannot overtake acceptance FIFO', async t => {
+  const held = deferred(); const entered = deferred(); const order: string[] = [];
+  const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: any) {
+    if (e.type === 'mcpl:channel-incoming') order.push(`module:${e.eventId}`);
+    return {};
+  } };
+  const f = await fixture({ server: { inboundAdmission: { ...admission, bind: (connection: any) => ({ connection, admit: async ({ item }: any) => {
+    if (item.eventId === 'two') { entered.release(); await held.promise; }
+    return allow;
+  } }) } }, framework: { modules: [spy] } as never });
+  t.after(async () => { held.release(); await f.close(); }); await f.register();
+  const inner = f.framework as any;
+  const connection = inner.mcplServerRegistry.getServer('editor');
+  const sendResponse = connection.sendResponse.bind(connection);
+  connection.sendResponse = (id: unknown, result: any, ...rest: any[]) => {
+    const sent = sendResponse(id, result, ...rest);
+    order.push(`ack:${result.results?.map((r: any) => r.messageId).join(',')}`);
+    return sent;
+  };
+  const batch = f.send('channels/incoming', { messages: [
+    f.channel('one', 'one', { initial: true, key: 'one' }, 'chat', 'one'),
+    f.channel('two', 'two', { initial: true, key: 'two' }, 'chat', 'two'),
+  ] });
+  await settles(entered.promise, 'second batch callback');
+  const later = await f.send('channels/incoming', { messages: [f.channel('three', 'three', { initial: true, key: 'three' }, 'chat', 'three')] });
+  assert.equal(later.result.results[0].accepted, true);
+  const beforeBatchAck = [...order];
+  held.release(); await batch;
+  await eventually(() => inner.requiredModuleQueues.size === 0);
+  assert.deepEqual(beforeBatchAck, ['ack:three'], 'even ready later work waits behind the unacknowledged head');
+  assert.deepEqual(order, ['ack:three', 'ack:one,two', 'module:one', 'module:three', 'module:two']);
+});
+
+for (const lane of ['push/event', 'channels/incoming'] as const) {
+  test(`required ${lane}: a failed acceptance reply releases modules only after the error response; module errors do not strand slots`, async t => {
+    const order: string[] = [];
+    const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: any) {
+      if (!['mcpl:push-event', 'mcpl:channel-incoming'].includes(e.type)) return {};
+      order.push(`module:${e.eventId}`);
+      if (e.eventId === 'first') throw new Error('module synchronous prefix failed');
+      return {};
+    } };
+    const f = await fixture({ server: { inboundAdmission: admission }, framework: { modules: [spy] } as never });
+    t.after(() => f.close()); await f.register();
+    const inner = f.framework as any;
+    const connection = inner.mcplServerRegistry.getServer('editor');
+    const sendResponse = connection.sendResponse.bind(connection);
+    const sendErrorResponse = connection.sendErrorResponse.bind(connection);
+    let failWrite = true;
+    connection.sendResponse = (...args: any[]) => {
+      if (failWrite) { failWrite = false; throw new Error('acceptance reply write failed'); }
+      const sent = sendResponse(...args); order.push('wire-ack'); return sent;
+    };
+    connection.sendErrorResponse = (...args: any[]) => {
+      const sent = sendErrorResponse(...args); order.push('wire-error'); return sent;
+    };
+    const send = (id: string) => {
+      const item = lane === 'push/event' ? f.params(id, id, { initial: true, key: id }) : f.channel(id, id, { initial: true, key: id });
+      return f.send(lane, lane === 'push/event' ? item : { messages: [item] });
+    };
+    assert.equal((await send('first')).error.code, -32603);
+    await eventually(() => inner.requiredModuleQueues.size === 0);
+    assert.deepEqual(order, ['wire-error', 'module:first']);
+    const next = await send('next');
+    assert.equal((next.result.results?.[0] ?? next.result).accepted, true);
+    await eventually(() => inner.requiredModuleQueues.size === 0);
+    assert.deepEqual(order, ['wire-error', 'module:first', 'wire-ack', 'module:next']);
   });
 }

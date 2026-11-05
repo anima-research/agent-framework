@@ -239,7 +239,7 @@ export class PushHandler {
         refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
         return;
       }
-      const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+      const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, afterResponse: admission.afterResponse, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
       // No await between the final check and the admitted continuation's first effect.
       return await this.handlePushEvent(serverId, params, responder, envelope, check);
     } finally {
