@@ -2570,9 +2570,10 @@ export class DefaultErrorPolicy implements ErrorPolicy {
   }
 }
 
-/** Default sync interval in milliseconds */
 /** How many upcoming wakes healthSnapshot lists per agent: an agent can hold any number of reminders. */
 const HEALTH_UPCOMING_WAKES = 8;
+
+/** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
 /** Total time one withheld batch may spend awaiting workspace writes.
  *  At the deadline its unfinished write is named as such, and later
@@ -6249,15 +6250,19 @@ export class AgentFramework {
   /**
    * What will wake `agentName` with no new event, as healthSnapshot reports
    * it: soonest first, the first HEALTH_UPCOMING_WAKES of them, each with its
-   * time, kind and whether the agent's rules let it wake the agent. A wake's
-   * `what` stays out: it can quote a reminder or a queue reason, and health
-   * goes to observers granted nothing else. A read that throws leaves the
-   * field out, so that it isn't taken for an agent with nothing due.
+   * time, kind and whether the rule table lets it wake the agent (a probe:
+   * gate.js isn't asked). A wake's `what` stays out: it can quote a reminder or
+   * a queue reason, and health goes to observers granted nothing else.
+   *
+   * The field is left out when this can't say, so that it isn't taken for an
+   * agent with nothing due: when a read throws, and when the heartbeat is
+   * heartbeat-mcpl, whose next tick only its own process knows.
    */
   private upcomingWakesHealth(agentName: string): {
     upcomingWakes?: Array<{ at?: number; kind?: import('./gate/types.js').UpcomingWakeKind; certain: boolean }>;
   } {
     try {
+      if (!this.heartbeat && [...this.mcplServerConfigs.values()].some(isHeartbeatMcplServer)) return {};
       const wakes = [...this.upcomingWakesFor(agentName), ...(this.eventGate?.upcomingWakes([agentName]) ?? [])];
       return {
         upcomingWakes: wakes
@@ -6265,7 +6270,8 @@ export class AgentFramework {
           .slice(0, HEALTH_UPCOMING_WAKES)
           .map(({ at, kind, certain }) => ({ ...(at !== undefined ? { at } : {}), kind, certain })),
       };
-    } catch {
+    } catch (err) {
+      console.error(`[health] could not read upcoming wakes for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
       return {};
     }
   }

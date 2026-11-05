@@ -32,6 +32,7 @@ async function frameworkWith(t: { after(fn: () => Promise<void> | void): void },
       setSleep(seconds: number, note?: string, agent?: string): unknown;
     };
     pendingRequests: Array<{ agentName: string; reason: string }>;
+    mcplServerConfigs: Map<string, { id: string }>;
     upcomingWakesFor(agentName: string): unknown;
   };
   if (heartbeat !== undefined) internals.heartbeat.start();
@@ -51,11 +52,12 @@ describe('healthSnapshot: upcomingWakes', () => {
   it("lists the heartbeat's tick and reminders, soonest first, with no reminder text", async (t) => {
     const secret = 'the words only the agent should read';
     const { framework, internals, wakes } = await frameworkWith(t, { defaults: { intervalSeconds: 600 } });
-    assert.equal(internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: secret, inMinutes: 5 }).success, true);
     const before = Date.now();
+    assert.equal(internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: secret, inMinutes: 5 }).success, true);
+    const after = Date.now();
     const listed = wakes()!;
     assert.deepEqual(listed.map((w) => [w.kind, w.certain]), [['reminder', true], ['heartbeat', true]]);
-    assert.ok(Math.abs(listed[0]!.at! - (before + 300_000)) < 5_000, 'the reminder is due in five minutes');
+    assert.ok(listed[0]!.at! >= before + 300_000 && listed[0]!.at! <= after + 300_000, 'the reminder is due in five minutes');
     assert.ok(listed[0]!.at! < listed[1]!.at!, 'soonest first');
     for (const wake of listed) assert.deepEqual(Object.keys(wake).sort(), ['at', 'certain', 'kind']);
     assert.ok(!JSON.stringify(framework.healthSnapshot()).includes(secret));
@@ -89,18 +91,31 @@ describe('healthSnapshot: upcomingWakes', () => {
 
   it('lists at most eight, the soonest', async (t) => {
     const { internals, wakes } = await frameworkWith(t, { defaults: { intervalSeconds: 3600 } });
-    for (let i = 1; i <= 12; i++) {
+    const before = Date.now();
+    for (let i = 12; i >= 1; i--) {
       assert.equal(internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: `r${i}`, inMinutes: i }).success, true);
     }
     const listed = wakes()!;
-    assert.equal(listed.length, 8);
-    assert.deepEqual(listed.map((w) => w.at), [...listed.map((w) => w.at!)].sort((a, b) => a - b));
+    assert.deepEqual(listed.map((w) => Math.round((w.at! - before) / 60_000)), [1, 2, 3, 4, 5, 6, 7, 8]);
     assert.ok(listed.every((w) => w.kind === 'reminder'), 'the hourly tick comes after all of them');
   });
 
-  it('leaves the field out when the read throws, so it reads as unknown and not as nothing due', async (t) => {
+  it('leaves the field out when the read throws, says why, and so reads as unknown and not as nothing due', async (t) => {
     const { internals, wakes } = await frameworkWith(t, { defaults: { intervalSeconds: 3600 } });
     internals.upcomingWakesFor = () => { throw new Error('the read failed'); };
+    const logged = t.mock.method(console, 'error', () => {});
     assert.equal(wakes(), undefined);
+    assert.ok(logged.mock.calls.some((call) => String(call.arguments[0]).includes('scout') && String(call.arguments[0]).includes('the read failed')));
+  });
+
+  it("leaves the field out when the heartbeat is heartbeat-mcpl, whose next tick it can't see", async (t) => {
+    const { internals, wakes } = await frameworkWith(t);
+    internals.eventGate.armSelfWake('scout', 60);
+    assert.equal(wakes()!.length, 1, 'premise: it reports without the server');
+    internals.mcplServerConfigs.set('heartbeat', { id: 'heartbeat' });
+    assert.equal(wakes(), undefined);
+    internals.mcplServerConfigs.delete('heartbeat');
+    internals.mcplServerConfigs.set('another', { id: 'another' });
+    assert.equal(wakes()!.length, 1, 'another server is no heartbeat');
   });
 });

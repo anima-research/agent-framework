@@ -4294,7 +4294,8 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires; a judge rule's goes to the judge, so it only may).
+   * when it fires; a judge rule's goes to the judge, so it only may). A batch,
+   * and a sleep with no agent named, reach the gate's recipients alone.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4305,11 +4306,13 @@ export class EventGate {
         wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
       }
     }
-    if (this.sleepUntil > now && (this.sleepAgent === undefined || agentNames.includes(this.sleepAgent))) {
+    const recipients = this.getAgentNamesFn();
+    const recipient = agentNames.some((name) => recipients.includes(name));
+    if (this.sleepUntil > now && (this.sleepAgent === undefined ? recipient : agentNames.includes(this.sleepAgent))) {
       wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep' });
     }
     for (const [name, state] of this.debounceTimers) {
-      if (name === exceptPolicy || state.events.length === 0) continue;
+      if (!recipient || name === exceptPolicy || state.events.length === 0) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
