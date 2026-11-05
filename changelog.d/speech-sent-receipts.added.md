@@ -15,8 +15,9 @@
   turn's `[delivered]` receipt waits up to the same bound for answers still
   due. Private envelopes and words kept private, explicit sends (prefixed
   envelopes included) and their own words held as drafts, turns under explicit
-  routing, which write no receipt, and an ephemeral run's unheld speech with
-  no channel, which is its caller's result, are never asked about. Answer
+  routing, which write no receipt, and an ephemeral run's speech with no
+  channel that it doesn't try to hold as a draft, which is its caller's
+  result, are never asked about. Answer
   from what the module already holds: for a turn that ends with its reply or
   a tool, the turn's receipt and the agent's next turn wait for every answer,
   each piece's up to the bound, and a routed piece with no channel waits for
@@ -38,7 +39,7 @@
   wake, or a retry on a history rewound after a refusal, an unstick or an
   inference failure), the messages that opened that turn, as stored ids or
   held-write handles that a module context's `getMessage` reads; a turn that
-  took a cause of its own beside such a continuation before it ran a round
-  names that cause's messages instead, and a cause that joins a turn already
-  under way is named beside the turn's own. A message a
+  took a cause of its own beside such a continuation before any of its rounds
+  reached its tool calls names that cause's messages instead, and a cause that
+  joins a turn already under way is named beside the turn's own. A message a
   rewind removed is still named, and `getMessage` returns `null` for it.

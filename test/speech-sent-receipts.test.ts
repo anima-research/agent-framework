@@ -767,7 +767,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(askedTexts(surface), [{ text: 'Looking around.', final: false }], 'premise: the round was asked about');
     const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
     assert.equal(failed.length, 1, texts(f).join('\n'));
-    assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
+    assert.ok(failed[0]!.includes('Some plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
     assert.deepEqual(notices(f), []);
   });
 
@@ -782,7 +782,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(openDrafts(f).map((d) => d.text), ['Looking around.'], 'premise: the round was held as a draft');
     const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
     assert.equal(failed.length, 1, texts(f).join('\n'));
-    assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
+    assert.ok(failed[0]!.includes('Some plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
   });
 
   it("a turn that fails while a module's answer is due logs the place it names when it answers", async (t) => {
@@ -1035,7 +1035,7 @@ describe('plain speech a module says it showed', () => {
     const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
     assert.equal(failed.length, 1, texts(f).join('\n'));
     assert.ok(!errors.some((e) => e.includes("Speech-routed module terminal (agent resident) hadn't answered")), 'the other module was still due when the turn failed');
-    assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
+    assert.ok(failed[0]!.includes('Some plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
   });
 
   it("an ask made after the turn's receipt was written is logged, and not kept for a receipt", async (t) => {
@@ -1209,6 +1209,99 @@ describe('plain speech a module says it showed', () => {
       assert.deepEqual(surface.asked, [], 'no module is asked about it');
       assert.deepEqual(published, [], "it isn't posted");
       assert.ok(errors.includes(`[routeSpeech] resident: replaced before this piece was routed; ${text.length} chars not routed for the replacement`), errors.join('\n'));
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+
+  for (const hold of ['locked', 'heartbeat'] as const) it(`a ${hold} turn's piece that a replaced agent holds as a draft after another agent took its name is held, and no module is asked about it`, async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane());
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      routingOf(name: string): { locked?: true; heartbeat?: true; drafts: Array<{ id: string }> };
+      routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: null): Promise<unknown>;
+    };
+    const original = internal.agents.get('resident');
+    const routing = internal.routingOf('resident');
+    routing[hold] = true;
+    const text = 'Held after the swap.';
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      const result = await internal.routeLocusSpeech(original, { routing, notice: 'later' }, text, null);
+      assert.equal(result, null);
+      assert.equal(routing.drafts.length, 1, `it's held as a draft, as before: ${errors.join('\n')}`);
+      assert.deepEqual(surface.asked, [], 'no module is asked about it');
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+
+  it("a piece with no channel that a replaced agent with no fallback routes after another agent took its name isn't routed", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane());
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      usedEphemeralAgentNames: Map<string, string>;
+      routingOf(name: string): unknown;
+      routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: null): Promise<unknown>;
+    };
+    const routed: string[] = [];
+    const registry = internals(f).channelRegistry as unknown as { routeSpeech(name: string, text: string): unknown };
+    t.mock.method(registry, 'routeSpeech', (name: string, text: string) => { routed.push(`${name}: ${text}`); return null; });
+    const original = internal.agents.get('resident');
+    internal.usedEphemeralAgentNames.set('resident', 'run');
+    const text = 'Said after the swap.';
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      const result = await internal.routeLocusSpeech(original, { routing: internal.routingOf('resident') }, text, null);
+      assert.equal(result, null);
+      assert.deepEqual(routed, [], "it isn't routed under the name");
+      assert.deepEqual(surface.asked, [], 'no module is asked about it');
+      assert.ok(errors.includes(`[routeSpeech] resident: replaced before this piece was routed; ${text.length} chars not routed for the replacement`), errors.join('\n'));
+    } finally {
+      internal.agents.set('resident', original);
+      internal.usedEphemeralAgentNames.delete('resident');
+    }
+  });
+
+  it("a hybrid reply whose agent is replaced holds as drafts the words it had already set aside for a send, and asks no module about them", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    const f = await host([surface], new MockMembrane(), { proseRouting: 'hybrid' });
+    const { server, published } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    registry.ensureChannelRegistered('srv', 'elsewhere', 'elsewhere');
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      routingOf(name: string): { drafts: Array<{ id: string }> };
+      routeSilencedHybrid(agent: unknown, segments: string[], sends: unknown, draftsCause: boolean, round: unknown, locus: null, when: number): Promise<boolean>;
+    };
+    const original = internal.agents.get('resident');
+    const elsewhere = { serverId: 'srv', channelId: 'elsewhere' };
+    const sends = { places: new Map([[JSON.stringify(['srv', 'elsewhere']), { to: elsewhere, tool: 'channel_publish', delivered: true, round: 0 }]]) };
+    const routing = internal.routingOf('resident');
+    const routed = internal.routeSilencedHybrid(original, ['Said before the swap.\n>>>elsewhere Set aside for there.\n>>>room Posted after it.'], sends, false, { routing, notice: 'later' }, null, 0);
+    await until(() => surface.asked.length > 0, "the plain piece's ask");
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      surface.release();
+      assert.equal(await routed, true, `the words set aside are held as a draft: ${errors.join('\n')}`);
+      assert.equal(routing.drafts.length, 1, 'one draft');
+      assert.deepEqual(published, [], 'nothing is posted for the replacement');
+      assert.deepEqual(askedTexts(surface).map((a) => a.text), ['Said before the swap.'], 'no module is asked about the words set aside');
+      assert.ok(errors.includes(`[prose] resident: replaced while its reply was routed; ${'>>>room Posted after it.'.length} chars not routed for the replacement`), errors.join('\n'));
     } finally {
       internal.agents.set('resident', original);
     }
@@ -1975,6 +2068,30 @@ describe('plain speech a module says it showed', () => {
     await f.runUntilIdle();
     assert.deepEqual(askedTexts(surface), [{ text: 'Both.', final: true }], 'premise: one start took both');
     assert.equal(surface.asked[0]!.context.openedBy?.reason, 'external-message', 'premise: the turn already under way opened it');
+    assert.deepEqual([...(surface.asked[0]!.context.openedBy?.messages ?? [])].sort(), ['m-joined', 'm-opener']);
+  });
+
+  it("a start that takes a module's wake into a turn that began a round whose results it didn't flush names the turn's opening message too", async () => {
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Both.' }]));
+    const f = await host([surface], membrane);
+    const internal = f as unknown as {
+      routingOf(name: string): { roundsRan?: true; unflushedRounds?: number; openingMessages?: string[]; openedBy?: Record<string, unknown> };
+      openLogical: Map<string, unknown>;
+    };
+    const t0 = Date.now();
+    const routing = internal.routingOf('resident');
+    routing.openedBy = { agentName: 'resident', reason: 'external-message', source: 'console', timestamp: t0 - 10, openingMessages: ['m-opener'] };
+    routing.openingMessages = ['m-opener'];
+    routing.unflushedRounds = 1;
+    assert.equal(routing.roundsRan, undefined, 'premise: no round of it was flushed');
+    internal.openLogical.set('resident', routing);
+    const pending = internals(f).pendingRequests;
+    pending.push({ agentName: 'resident', reason: 'tool_results_ready', source: 'framework', timestamp: t0 });
+    pending.push({ agentName: 'resident', reason: 'external-message', source: 'console', timestamp: t0 + 1, openingMessages: ['m-joined'] });
+    await f.runUntilIdle();
+    assert.deepEqual(askedTexts(surface), [{ text: 'Both.', final: true }], 'premise: one start took both');
     assert.deepEqual([...(surface.asked[0]!.context.openedBy?.messages ?? [])].sort(), ['m-joined', 'm-opener']);
   });
 

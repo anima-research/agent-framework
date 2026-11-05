@@ -1182,6 +1182,30 @@ test("a held turn's retry the hold folds into an equal held wake gives it the tu
   });
 });
 
+test("a held turn's retry the hold folds an equal retry with another carry into keeps its own carry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      const own = retry[carry!];
+      held.push(retry as unknown as Request);
+      const other: Record<string | symbol, unknown> = { ...retry, [carry!]: { silence: null, sends: null } };
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, other);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal retry into the held one');
+      assert.equal(held[0], retry, 'premise: the held retry is the one kept');
+      assert.equal((held[0] as unknown as Record<symbol, unknown>)[carry!], own);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a held turn's retry with no carry the hold folds into an equal held wake leaves it none, though the wake kept one from an exhausted retry", async (t) => {
   await withStoreDir(async (path) => {
     holdClock(t);
@@ -1207,7 +1231,7 @@ test("a held turn's retry with no carry the hold folds into an equal held wake l
   });
 });
 
-test("a held wake that a held turn's merged retry, led by an equal wake, folds into still runs after abortInference() ends the turn", async (t) => {
+test("a held wake that a held turn's merged retry, led by an equal wake, folds into is that retry's event, as at main: abortInference() puts back the start's own wake once, and it runs", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
     const wait = 400;
@@ -1217,18 +1241,24 @@ test("a held wake that a held turn's merged retry, led by an equal wake, folds i
     try {
       const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again', 'wake');
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
-      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
+      const start = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const symbols = Object.getOwnPropertySymbols(start);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const own = (start[batchKey] as Array<Record<string | symbol, unknown>>).find((member) => member[retryKey] !== true)!;
+      own.zzOwn = true;
       const wake: Record<string, unknown> = { zzInserted: true };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
       held.push(wake as unknown as Request);
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
       assert.equal(held.length, 1, 'premise: the hold folds the merged retry into the held wake');
-      assert.equal(held[0], wake as unknown as Request, 'the held wake is the one kept');
+      assert.equal(held[0], wake as unknown as Request, 'premise: the held wake is the one kept');
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
-      assert.ok((internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests.some((r) => r.zzInserted === true),
-        'the abort puts back the wake the hold took in, not only the start\'s own');
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzInserted === true).length, 0, "the held wake is the turn's retry's event, which the abort ends");
+      assert.equal(back.filter((r) => r.zzOwn === true).length, 1, "the start's own wake comes back, once");
       go();
-      await waitFor(fw, () => membrane.primary >= 3, 'the held wake, as a turn of its own');
+      await waitFor(fw, () => membrane.primary >= 3, "the start's own wake, as a turn of its own");
       assert.match(texts(membrane.calls[2]), /zz-during the hold/);
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1285,38 +1315,7 @@ test("a held wake that an equal merged start folds into keeps its opening messag
   });
 });
 
-test("a wake folded into a held merged start that equals one of its wakes counts once", async (t) => {
-  await withStoreDir(async (path) => {
-    const clock = holdClock(t);
-    const wait = 400;
-    const log = silence();
-    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
-    const { fw, internal } = await framework(path, membrane);
-    try {
-      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again', 'wake');
-      const before = fw.getHostModeStatus().gatedRequests;
-      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
-      const start = held[0] as unknown as Record<string, unknown>;
-      const batchKey = Object.getOwnPropertySymbols(start).find((key) => key.description === 'merged-batch')!;
-      const retryKey = Object.getOwnPropertySymbols(start).find((key) => key.description === 'turn-retry')!;
-      const batchWake = (start as unknown as Record<symbol, Array<Record<symbol, unknown>>>)[batchKey].find((member) => member[retryKey] !== true);
-      assert.ok(batchWake, "premise: the batch holds a wake beside the turn's retry");
-      const wake: Record<string, unknown> = { openingMessages: ['zz-again'] };
-      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
-      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
-      assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
-      assert.equal(fw.getHostModeStatus().gatedRequests, before, 'the wake it equals already counts');
-      const members = (start as unknown as Record<symbol, Array<{ openingMessages?: string[] } & Record<symbol, unknown>>>)[batchKey];
-      assert.ok(members.some((member) => member[retryKey] === true), "premise: the batch holds the turn's retry");
-      const keeping = members.filter((member) => member.openingMessages?.includes('zz-again'));
-      assert.equal(keeping.length, 1, "one member keeps the wake's opening message");
-      assert.equal(keeping[0], batchWake, "it's the batch's own wake, the one the wake equals");
-      go();
-    } finally { await fw.stop(); log.restore(); }
-  });
-});
-
-test("a merged start the hold folds into an equal held merged start folds its members into their equals, so its wakes count once", async (t) => {
+test("an equal merged start the hold folds into a held one keeps its members beside the held start's, as at main: gatedRequests counts each wake, and abortInference() puts back each once", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
     const wait = 400;
@@ -1328,25 +1327,28 @@ test("a merged start the hold folds into an equal held merged start folds its me
       const before = fw.getHostModeStatus().gatedRequests;
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
       const start = held[0] as unknown as Record<string | symbol, unknown>;
-      const batchKey = Object.getOwnPropertySymbols(start).find((key) => key.description === 'merged-batch')!;
+      const symbols = Object.getOwnPropertySymbols(start);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
       const members = start[batchKey] as Array<Record<string | symbol, unknown>>;
       assert.equal(members.length, 2, 'premise: the merged start stands for the retry and the wake');
-      const retryKey = Object.getOwnPropertySymbols(start).find((key) => key.description === 'turn-retry')!;
-      assert.equal(members.filter((member) => member[retryKey] === true).length, 1, "premise: one member is the turn's retry");
-      const again: Record<string | symbol, unknown> = { ...start, [batchKey]: members.map((member) => member[retryKey] === true ? { ...member }
-        : { ...member, openingMessages: [...((member.openingMessages as string[] | undefined) ?? []), 'zz-incoming-only'] }) };
+      const own = members.find((member) => member[retryKey] !== true)!;
+      own.zzOwn = true;
+      const again: Record<string | symbol, unknown> = { ...start, [batchKey]: members.map((member) => ({ ...member, zzOwn: false, zzAgain: member[retryKey] !== true })) };
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, again);
       assert.equal(held.length, 1, 'premise: the hold folds the equal merged start into the held one');
-      assert.equal((start[batchKey] as unknown[]).length, 2, 'each member folds into its equal');
-      const wake = (start[batchKey] as Array<Record<string | symbol, unknown>>).find((member) => member[retryKey] !== true);
-      assert.ok((wake?.openingMessages as string[] | undefined)?.includes('zz-incoming-only'), "the held wake takes what its incoming equal carries");
-      assert.equal(fw.getHostModeStatus().gatedRequests, before, 'its wakes already count');
+      assert.equal((start[batchKey] as unknown[]).length, 4, "each start's members are kept");
+      assert.equal(fw.getHostModeStatus().gatedRequests, before + 1, "the incoming start's wake counts too");
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzOwn === true).length, 1, "the held start's wake comes back, once");
+      assert.equal(back.filter((r) => r.zzAgain === true).length, 1, "the incoming start's equal wake comes back too, once");
       go();
     } finally { await fw.stop(); log.restore(); }
   });
 });
 
-for (const joins of ['a wake', 'a merged start holding it'] as const) for (const own of ['an opening message of its own', 'none of its own'] as const) test(`${joins}, equal to a held merged start's retry member, with ${own}, stays a member of its own: abortInference() puts it back`, async (t) => {
+for (const joins of ['a merged start holding it'] as const) for (const own of ['an opening message of its own', 'none of its own'] as const) test(`${joins}, equal to a held merged start's retry member, with ${own}, stays a member of its own: abortInference() puts it back`, async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
     const wait = 400;
@@ -1366,7 +1368,7 @@ for (const joins of ['a wake', 'a merged start holding it'] as const) for (const
         "premise: the start is led by its batch's retry member, so a wake equal to the start equals that member");
       const wake: Record<string, unknown> = { ...(own === 'none of its own' ? {} : { openingMessages: ['zz-own message'] }), zzJoined: true };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
-      const joining: Record<string | symbol, unknown> = joins === 'a wake' ? wake : { ...wake, [batchKey]: [wake] };
+      const joining: Record<string | symbol, unknown> = { ...wake, [batchKey]: [wake] };
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, joining);
       assert.equal(held.length, 1, 'premise: the hold folds it into the held start');
       assert.equal((start[batchKey] as unknown[]).filter((member) => member === wake).length, 1, 'the wake is a member of its own');
@@ -1374,6 +1376,32 @@ for (const joins of ['a wake', 'a merged start holding it'] as const) for (const
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
       const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
       assert.equal(back.filter((r) => r.zzJoined === true).length, 1, 'the abort puts the wake back, once');
+      go();
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+for (const own of ['an opening message of its own', 'none of its own'] as const) test(`a wake, equal to a held merged start's retry member, with ${own}, is taken into the start, as at main: abortInference() ends it with the turn${own === 'none of its own' ? '' : ', and the start keeps its message'}`, async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held[0] as unknown as Record<string | symbol, unknown>;
+      const batchKey = Object.getOwnPropertySymbols(start).find((key) => key.description === 'merged-batch')!;
+      const wake: Record<string, unknown> = { ...(own === 'none of its own' ? {} : { openingMessages: ['zz-own message'] }), zzJoined: true };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
+      assert.equal(held.length, 1, 'premise: the hold takes it into the held start');
+      assert.equal((start[batchKey] as unknown[]).includes(wake), false, "it isn't a member of the start's batch");
+      if (own !== 'none of its own') assert.ok((start.openingMessages as string[] | undefined)?.includes('zz-own message'), 'the start keeps its message');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzJoined === true).length, 0, 'the abort ends it with the turn');
       go();
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1439,6 +1467,78 @@ test("a wake held on its own, that an equal start led by the turn's retry folds 
       const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
       assert.equal(back.filter((r) => r.zzHeld === true).length, 0, "the held wake's event is the retry's, which the abort ends");
       assert.equal(back.filter((r) => r.zzOther === true).length, 1, "the start's other wake comes back, once");
+      go();
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a wake held on its own, that an equal start with no retry folds into, keeps that start's members, as at main, and stays held through abortInference()", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests as unknown as Array<Record<string | symbol, unknown>>;
+      const symbols = Object.getOwnPropertySymbols(held[0]!);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const batchWake = (held[0]![batchKey] as Array<Record<string | symbol, unknown>>).find((member) => member[retryKey] !== true)!;
+      const identity: Record<string | symbol, unknown> = {};
+      for (const key of identityKeys) if (batchWake[key] !== undefined) identity[key] = batchWake[key];
+      const hold = (request: unknown) => (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, request);
+      const wake: Record<string | symbol, unknown> = { ...identity, zzHeld: true };
+      const equal = { ...identity, zzEqual: true };
+      const restart = { ...identity, reason: 'context_budget_restart', timestamp: (identity.timestamp as number) + 3, zzRestart: true };
+      const other = { ...identity, timestamp: (identity.timestamp as number) + 7, zzOther: true };
+      held.length = 0;
+      held.push(wake);
+      hold({ ...identity, [batchKey]: [equal, restart, other] });
+      assert.equal(held.length, 1, 'premise: the start folds into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.deepEqual(wake[batchKey], [equal, restart, other], "the start's members, each kept");
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), false, 'nothing held carries the turn on');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests[0], wake as unknown as Request, 'the wake stays held');
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzHeld === true || r.zzEqual === true || r.zzRestart === true || r.zzOther === true).length, 0, 'nothing is put back');
+      go();
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+for (const start of ['a wake equal to it', 'no member equal to it'] as const) test(`a wake held on its own, that an equal start with ${start} and no retry, then an equal retry, fold into, is that retry's event, as at main: abortInference() puts back the start's wakes once each`, async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests as unknown as Array<Record<string | symbol, unknown>>;
+      const symbols = Object.getOwnPropertySymbols(held[0]!);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const batchWake = (held[0]![batchKey] as Array<Record<string | symbol, unknown>>).find((member) => member[retryKey] !== true)!;
+      const identity: Record<string | symbol, unknown> = {};
+      for (const key of identityKeys) if (batchWake[key] !== undefined) identity[key] = batchWake[key];
+      const hold = (request: unknown) => (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, request);
+      const wake = { ...identity, zzHeld: true };
+      const equal = { ...identity, zzEqual: true };
+      const other = { ...identity, timestamp: (identity.timestamp as number) + 7, zzOther: true };
+      held.length = 0;
+      held.push(wake);
+      hold({ ...identity, [batchKey]: start === 'a wake equal to it' ? [equal, other] : [other] });
+      hold({ ...identity, [retryKey]: true, zzRetry: true });
+      assert.equal(held.length, 1, 'premise: both fold into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzHeld === true).length, 0, "the held wake is the retry's event, which the abort ends");
+      assert.equal(back.filter((r) => r.zzOther === true).length, 1, "the start's other wake comes back, once");
+      assert.equal(back.filter((r) => r.zzEqual === true).length, start === 'a wake equal to it' ? 1 : 0, "the start's equal wake comes back, once");
       go();
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1665,6 +1765,40 @@ for (const how of ['parked', 'held again'] as const) test(`a coalesced wake merg
       internal.cancelCoalescedWakes('zz-subject');
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
       assert.deepEqual(internal.pendingRequests.filter((r) => r.agentName === 'resident'), [], 'the withdrawn wake stays withdrawn');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a context-budget restart held on its own, that an equal start holding an equal restart and a wake folds into, ends with abortInference(), which puts back the wake once", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests as unknown as Array<Record<string | symbol, unknown>>;
+      const symbols = Object.getOwnPropertySymbols(held[0]!);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const batchWake = (held[0]![batchKey] as Array<Record<string | symbol, unknown>>).find((member) => member[retryKey] !== true)!;
+      const restart: Record<string | symbol, unknown> = { reason: 'context_budget_restart' };
+      for (const key of identityKeys) if (key !== 'reason' && batchWake[key] !== undefined) restart[key] = batchWake[key];
+      const kept = { ...restart, zzKept: true };
+      const equal = { ...restart, zzEqual: true };
+      const wake = { ...batchWake, timestamp: (batchWake.timestamp as number) + 7, zzWake: true };
+      held.length = 0;
+      held.push(kept);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, { ...restart, [batchKey]: [equal, wake] });
+      assert.equal(held.length, 1, 'premise: the start folds into the held restart');
+      assert.equal(held[0], kept, 'premise: the held restart is the one kept');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true, 'the abort ends the held restart');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0, 0, 'nothing stays held');
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzKept === true || r.zzEqual === true).length, 0, 'neither restart comes back');
+      assert.equal(back.filter((r) => r.zzWake === true).length, 1, "the start's wake comes back, once");
+      go();
     } finally { await fw.stop(); log.restore(); }
   });
 });

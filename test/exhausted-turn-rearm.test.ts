@@ -1469,4 +1469,8 @@ test("a provider hold that folds a wake into an equal re-arm keeps it re-armed o
   internal.holdRequest(second, marked());
   assert.equal(second.length, 1, 'premise: the hold folds the equal re-arm into the wake');
   assert.equal(second[0]![key], undefined, "not re-armed, since the wake it folded into wasn't");
+  const neither = [unmarked()];
+  internal.holdRequest(neither, unmarked());
+  assert.equal(neither.length, 1, 'premise: the hold folds the equal wake into the wake');
+  assert.equal(neither[0]![key], undefined, 'not re-armed, since neither was');
 });

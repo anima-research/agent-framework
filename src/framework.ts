@@ -1916,7 +1916,7 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
 
 const CALLS_CUT_OFF = "A round's tool calls were started, but its stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
 const SPEECH_STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
-const LIVE_SPEECH_UNRECEIPTED = `Plain speech of its rounds was handed on for delivery or shown as written, and no [${NOTICE_TAG.delivered}] line was written for it.`;
+const LIVE_SPEECH_UNRECEIPTED = `Some plain speech of its rounds was handed on for delivery or shown as written, and no [${NOTICE_TAG.delivered}] line was written for it.`;
 
 /** The reason on the inference:aborted that ends a turn whose retry stop()
  *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
@@ -6692,30 +6692,19 @@ export class AgentFramework {
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
    *  already held marks that one, so the hold still keeps the turn alive. */
-  private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
-    const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
+  private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
+    const same = held.find((r) => this.sameInferenceRequest(r, request));
     if (!same) {
       held.push(request);
       return;
     }
-    // A merged start's batch (MERGED_BATCH) stays recorded on the request
-    // kept in its place, which then stands for it, as the start did.
-    // Copy the held request and read the kept one's carry before marking it.
-    const into = mergedBatch(same);
-    const batch = mergedBatch(request);
-    if (into || batch) {
-      const copy = into ? undefined : { ...same };
-      const members = into ? [...into] : [copy!];
-      const joining = batch ?? [request];
-      // Fold the members that carry the turn on before the wakes, so a wake
-      // never joins the copy a retry then takes.
-      for (const member of [...joining.filter(continuesTurn), ...joining.filter((m) => !continuesTurn(m))]) {
-        this.holdRequest(members, member, (kept) => continuesTurn(member) ? continuesTurn(kept) || kept === copy : !continuesTurn(kept));
-      }
-      (same as MarkedRequest)[MERGED_BATCH] = members;
-    }
+    // Read the kept request's carry before marking it.
     const keptCarry = turnCarryOf(same);
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    // A merged start's batch (MERGED_BATCH) stays recorded on the request
+    // kept in its place, which then stands for it, as the start did.
+    const batch = mergedBatch(request);
+    if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
     const carry = keptCarry ?? turnCarryOf(request);
     if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
     else delete (same as MarkedRequest)[TURN_CARRY];
@@ -20067,7 +20056,12 @@ export class AgentFramework {
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
-        requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
+        requests = requests.flatMap((r) => {
+          const batch = mergedBatch(r);
+          if (!batch?.length) return [r];
+          const opening = mergedOpeningMessages([batch[0], r]);
+          return opening ? [{ ...batch[0]!, openingMessages: opening }, ...batch.slice(1)] : batch;
+        });
       }
 
       // A provider's stated wait on this agent's primary model, including one
@@ -20639,7 +20633,7 @@ export class AgentFramework {
     };
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
-    for (const [segmentIndex, segment] of segments.entries()) {
+    segmentLoop: for (const [segmentIndex, segment] of segments.entries()) {
       const segmentRound = segmentIndex < finalFrom ? notFinal(round) : round;
       const written = splitHybridEnvelopes(segment);
       const trimmed = splitHybridEnvelopes(segment.trim());
@@ -20661,7 +20655,7 @@ export class AgentFramework {
           if (!sendHold) {
             if (await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound)) continue;
             this.logReplacedRouting(agent, written.slice(index).join('').length + segments.slice(segmentIndex + 1).join('').length);
-            return false;
+            break segmentLoop;
           }
           if (to) {
             routing.pin = to;
@@ -20687,7 +20681,7 @@ export class AgentFramework {
           if (!sendHold) {
             if (await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound)) continue;
             this.logReplacedRouting(agent, written.slice(index).join('').length + segments.slice(segmentIndex + 1).join('').length);
-            return false;
+            break segmentLoop;
           }
           delete routing.pin;
           routing.hybridHold = 'failed';
@@ -20700,7 +20694,7 @@ export class AgentFramework {
           if (!sendHold) {
             if (await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound)) continue;
             this.logReplacedRouting(agent, written.slice(index).join('').length + segments.slice(segmentIndex + 1).join('').length);
-            return false;
+            break segmentLoop;
           }
           hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}), ...(segmentIndex < finalFrom ? { final: false } : {}) });
         }
@@ -20771,7 +20765,8 @@ export class AgentFramework {
         : { text: t.text, note: t.note ?? opts.note, inheritedRisk: t.inheritedRisk }))
       .filter((t) => t.text.trim().length > 0);
     if (segments.length === 0) return [];
-    if (opts.ask !== false) {
+    const holder = this.agents.get(agent.name);
+    if (opts.ask !== false && !(holder && holder !== agent)) {
       for (const t of texts) {
         const plain = typeof t === 'string' ? t : t.deliberate ? '' : t.text;
         const final = typeof t === 'string' ? opts.final : t.final ?? opts.final;
@@ -21508,13 +21503,13 @@ export class AgentFramework {
       this.holdHeartbeatProse(agent, [text], round);
       return null;
     }
-    if (locus === null && !this.takesGlobalFallback(agent.name)) {
-      return this.channelRegistry!.routeSpeech(agent.name, text, locus);
-    }
     const now = this.agents.get(agent.name);
     if (now && now !== agent) {
       console.error(`[routeSpeech] ${agent.name}: replaced before this piece was routed; ${text.length} chars not routed for the replacement`);
       return null;
+    }
+    if (locus === null && !this.takesGlobalFallback(agent.name)) {
+      return this.channelRegistry!.routeSpeech(agent.name, text, locus);
     }
     const asked = this.askSpeechRouted(agent, round, text);
     this.trackSpeechAsk(agent, round.routing, asked);
@@ -25042,7 +25037,7 @@ export class AgentFramework {
         this.noticeAddressedArrivals(agent, routing, arrivals, when);
       }
     }
-    const opening = ownCause && !routing.roundsRan ? trigger?.openingMessages : mergedOpeningMessages([routing, trigger]);
+    const opening = ownCause && !gotPartway(routing) ? trigger?.openingMessages : mergedOpeningMessages([routing, trigger]);
     if (opening) routing.openingMessages = [...opening];
     else delete routing.openingMessages;
     // A silent start, or a disabled agent's, has no locus to show, whatever a

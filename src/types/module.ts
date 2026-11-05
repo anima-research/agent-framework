@@ -817,9 +817,10 @@ export interface SpeechRoutedContext {
    * the messages that opened that turn, each as its stored id or a held
    * write's handle, either of which a module context's `getMessage` takes.
    * A turn that took a cause of its own beside such a continuation, such as
-   * a module answer's wake, before it ran a round names that cause's
-   * messages, not those the continuation carried; a cause that joins a turn
-   * already under way is named beside the turn's own. A message a rewind
+   * a module answer's wake, before any of its rounds reached its tool
+   * calls names that cause's messages, not those the continuation carried;
+   * a cause that joins a turn already under way is named beside the turn's
+   * own. A message a rewind
    * removed is still named, and `getMessage` returns `null` for it. A wake
    * an event gate debounced carries none, so the messages of the module
    * answers it stands for aren't named.
