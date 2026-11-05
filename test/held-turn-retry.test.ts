@@ -1622,6 +1622,7 @@ for (const routing of ["holds a later batch's channels in its routing", 'has no 
       const rearm = held.find((r) => Object.getOwnPropertySymbols(r).some((key) => key.description === 'rearmed' && r[key] === true));
       assert.ok(rearm, 'premise: the turn is re-armed into a hold');
       assert.deepEqual(rearm.wakeChannels, routing === 'has no channel' ? undefined : [first, later]);
+      assert.deepEqual((internal as unknown as { wakeChannelsMark(routing: unknown): unknown }).wakeChannelsMark({ ...turn, locus: first }), {}, "a turn with a locus carries none of its routing's channels");
     } finally { await fw.stop(); log.restore(); }
   });
 });
