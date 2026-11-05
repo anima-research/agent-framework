@@ -881,3 +881,17 @@ test("pin: the all-except hold excepting a channel doesn't make a bare name of t
     assert.match(byEpoch.get(w) ?? '', /The cancel of it you asked for with your note "Look\."/);
   } finally { h.stopAll(); }
 }));
+
+test("pin: cancelAsksIn reads a guard's placeholder result from the archived original, and a settled row's own answer first", () => {
+  const use = (id: string): WindowRow => ({ participant: SUB, content: [{ type: 'tool_use', id, name: 'cancel_tuneout', input: { channelId: 'noisy' } } as ContentBlock], sequence: 1 });
+  const result = (id: string, content: unknown): WindowRow => ({ participant: 'user', content: [{ type: 'tool_result', toolUseId: id, content } as unknown as ContentBlock], sequence: 2 });
+  const archived = new Map<string, unknown>([
+    ['held', '{"waiting":true,"serverId":"other"}'],
+    ['settled', '{"waiting":true,"serverId":"archived"}'],
+  ]);
+  const asks = cancelAsksIn([
+    use('held'), result('held', 'Tool result withheld by the guard. The tool has already executed.'),
+    use('settled'), result('settled', '{"cancelled":true}'),
+  ], SUB, archived);
+  assert.deepEqual(asks.map((a) => [a.waiting, a.serverId]), [[true, 'other'], [false, undefined]]);
+});
