@@ -714,8 +714,8 @@ export interface InferenceRequest {
    * from (a `chat:system` notice names none, unless it's a coalesced
    * render's latest occurrence), each once. A start merged from several
    * requests carries every one's channels, or, when any of them comes from
-   * outside the framework and isn't a silent heartbeat tick, only those
-   * requests' channels. A request a provider hold takes another into
+   * outside the framework, isn't a silent heartbeat tick and brought
+   * channels, only those requests' channels. A request a provider hold takes another into
    * carries the channels of both. The framework's own wakes that continue a
    * turn with no locus (a restart, a re-inference, a continuation, a retry,
    * a bounce, a re-arm), unless its own wake named a channel that resolves

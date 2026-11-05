@@ -1906,6 +1906,10 @@ function hasOwnCauseForRun(r: InferenceRequest): boolean {
   return !FRAMEWORK_WAKE_SOURCES.has(r.source) && r.suppressProse !== true;
 }
 
+function bringsOwnChannels(r: InferenceRequest): boolean {
+  return hasOwnCauseForRun(r) && (r.wakeChannels?.length ?? 0) > 0;
+}
+
 /** Whether a wake carries an autoContinue continuation: its own wake, or a
  *  requeued turn trigger that kept the mark (InferenceRequest.autoContinueRun). */
 function carriesContinuation(r: InferenceRequest): boolean {
@@ -20379,7 +20383,7 @@ export class AgentFramework {
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
         channelServerId: channelReq?.channelServerId,
-        wakeChannels: wakeChannelsOf(requests.some(hasOwnCauseForRun) ? requests.filter(hasOwnCauseForRun) : requests),
+        wakeChannels: wakeChannelsOf(requests.some(bringsOwnChannels) ? requests.filter(hasOwnCauseForRun) : requests),
         // Only the mark this batch decided, never one requests[0] carried.
         autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,
