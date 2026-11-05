@@ -12,9 +12,12 @@
     `abandon: true`. Its data carries the refusal's type and figures, and when
     the hold began; the clear's carries the hold's outcome and how long it
     lasted.
-  - Neither is written to failures.log. The ops webhook's cooldown runs per
-    kind, so a webhook can receive a clear whose start the cooldown held back;
-    the `ops:alert` trace carries both every time.
+  - Neither is written to failures.log. Both post to the ops webhook at
+    every transition, outside the cooldown that thins a repeating failure's
+    posts, so the webhook's last post of the pair says whether the turn is
+    held. A listener of either that ends the hold at once still sees the
+    start, then `inference:held`, then the end and its clear, in that order,
+    on the trace and on the webhook.
   - A host that maps alert kinds to where it posts them needs an entry for
     `context-hold` to post it; one that treats an unlisted kind as silent
     posts nothing for it.

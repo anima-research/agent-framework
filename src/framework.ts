@@ -2703,12 +2703,16 @@ interface BudgetHold {
   checking: Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null }> | undefined;
   managerCalls: number;
   lookedAt?: string;
-  /** The last snapshot of compression's own state the hold saw
-   *  (budgetHoldProgressKey), and when it last changed: the hold's start
-   *  until then. Traffic, settings and pins move the verdict's signature,
-   *  not this. */
+  /** The last snapshot of compression's own work the hold saw
+   *  (budgetHoldProgressKey: the summaries it has made and whether a call is
+   *  in flight, or a whole progress snapshot without those fields), and when
+   *  it last changed: the hold's start until then. Traffic, settings and pins
+   *  move the verdict's signature, not this. */
   compressionSeen?: string;
   compressionChangedAt: number;
+  /** While the hold's start is announced (its alert and inference:held), the
+   *  reports of an end that came meanwhile, given once it's announced. */
+  announcing?: Array<() => void>;
   /** A provider hold took the start this record released, so that start's
    *  later run waited on the provider, not on compression. */
   providerTook?: true;
@@ -6958,28 +6962,37 @@ export class AgentFramework {
     this.budgetHolds.set(agent.name, hold);
     endStart();
     // Every turn into holding, a fresh hold or a released turn held again,
-    // raises the alert, as every end raises its clear (budgetHoldEnded). It
-    // comes before the trace, whose listener may end the hold at once, so a
-    // start always comes before its clear.
-    this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
-      skipLog: true,
-      data: {
+    // raises the alert, as every end raises its clear (budgetHoldEnded). A
+    // listener of either may end the hold at once; its end takes effect, and
+    // its report waits until the start is announced, so both the trace and
+    // the webhook read start, held, ended, clear.
+    hold.announcing = [];
+    try {
+      this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
+        skipLog: true,
+        everyTime: true,
+        data: {
+          errorType,
+          since: hold.startedAt,
+          ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
+          ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
+        },
+      });
+      this.emitTrace({
+        type: 'inference:held',
+        agentName: agent.name,
         errorType,
-        since: hold.startedAt,
+        error: hold.reason,
         ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
         ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
-      },
-    });
-    this.emitTrace({
-      type: 'inference:held',
-      agentName: agent.name,
-      errorType,
-      error: hold.reason,
-      ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
-      ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
-      since: hold.startedAt,
-      heldRequests: hold.heldRequests.length,
-    });
+        since: hold.startedAt,
+        heldRequests: hold.heldRequests.length,
+      });
+    } finally {
+      const ends = hold.announcing ?? [];
+      delete hold.announcing;
+      for (const end of ends) end();
+    }
     if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
     if (!existing) this.logBudgetHold(agent, hold);
     else {
@@ -7023,7 +7036,7 @@ export class AgentFramework {
     const agent = this.agents.get(agentName);
     if (hold?.state !== 'holding' || !agent) return;
     const pending = this.compressionPending(agent);
-    const progress = this.budgetHoldProgressKey(agent, pending);
+    const progress = this.budgetHoldProgressKey(agent);
     if (progress !== undefined && progress !== hold.compressionSeen) {
       if (hold.compressionSeen !== undefined) hold.compressionChangedAt = Date.now();
       hold.compressionSeen = progress;
@@ -7170,13 +7183,21 @@ export class AgentFramework {
     }
   }
 
-  /** Compression's own state: its progress snapshot, whether work is
-   *  pending, and its description of that work. */
-  private budgetHoldProgressKey(agent: Agent, pending = this.compressionPending(agent)): string | undefined {
+  /** Compression's own work, from its progress snapshot: the summaries it
+   *  has made (`chunksCompressed`, `summaryCounts`) and whether a call is in
+   *  flight (`pending`), as context-manager's AutobiographicalProgressSnapshot
+   *  documents them. Its other fields, and readiness, move with traffic: a
+   *  stored message can close or queue a chunk. A snapshot without those
+   *  three fields is taken whole. */
+  private budgetHoldProgressKey(agent: Agent): string | undefined {
     try {
-      const cm = agent.getContextManager();
-      const readiness = this.contextReadiness(cm);
-      return JSON.stringify([this.contextProgress(cm) ?? null, pending, 'pending' in readiness ? readiness.pending ?? null : null]);
+      const progress = this.contextProgress(agent.getContextManager());
+      if (progress === undefined) return JSON.stringify(null);
+      const { chunksCompressed, summaryCounts, pending } = progress;
+      return JSON.stringify(typeof chunksCompressed === 'number' && typeof pending === 'boolean'
+        && summaryCounts !== null && typeof summaryCounts === 'object'
+        ? [chunksCompressed, summaryCounts, pending]
+        : progress);
     } catch {
       return undefined;
     }
@@ -7191,6 +7212,10 @@ export class AgentFramework {
           && (storedInjectionMarkOf(event.message.metadata) !== undefined || clockStampOf(event.message.metadata) !== undefined
             // A suppressed row is never rendered, so it can't move a verdict.
             || suppressedRow(event.message.metadata as Record<string, unknown> | undefined))) return;
+        // An edit's event names only the row; a suppressed row's edit is no
+        // change either. (A removed row can't be read, so a removal counts.)
+        if (event.type === 'edit'
+          && suppressedRow(cm.getMessage(event.messageId)?.metadata as Record<string, unknown> | undefined)) return;
         counted.count++;
       });
       this.storeChanges.set(cm, counted);
@@ -7233,23 +7258,29 @@ export class AgentFramework {
     hold.heldRequests = [];
     console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms; ` +
       `${released.length} held request(s) queued for one fresh compile`);
-    this.budgetHoldEnded(agentName, outcome, waitedMs, released.length);
+    this.budgetHoldEnded(hold, agentName, outcome, waitedMs, released.length);
   }
 
   /** A hold's end, however it ended: its trace, and the clear of the
-   *  `context-hold` alert its start raised. */
-  private budgetHoldEnded(agentName: string, outcome: BudgetHoldOutcome, waitedMs: number, heldRequests: number): void {
-    this.emitTrace({
-      type: 'inference:hold_ended',
-      agentName,
-      outcome,
-      waitedMs,
-      heldRequests,
-    });
-    this.opsAlert('context-hold-clear', agentName, `the held turn's hold ended (${outcome}) after ${describeWait(waitedMs)}`, {
-      skipLog: true,
-      data: { outcome, waitedMs },
-    });
+   *  `context-hold` alert its start raised. An end while the start is still
+   *  being announced is reported once it is (holdForBudgetRefusal). */
+  private budgetHoldEnded(hold: BudgetHold, agentName: string, outcome: BudgetHoldOutcome, waitedMs: number, heldRequests: number): void {
+    const report = (): void => {
+      this.emitTrace({
+        type: 'inference:hold_ended',
+        agentName,
+        outcome,
+        waitedMs,
+        heldRequests,
+      });
+      this.opsAlert('context-hold-clear', agentName, `the held turn's hold ended (${outcome}) after ${describeWait(waitedMs)}`, {
+        skipLog: true,
+        everyTime: true,
+        data: { outcome, waitedMs },
+      });
+    };
+    if (hold.announcing) hold.announcing.push(report);
+    else report();
   }
 
   /** The `context-hold` alert's words: what holds the turn, the refusal,
@@ -7287,7 +7318,7 @@ export class AgentFramework {
         const others = requests.filter((r) => !continuesTurn(r)).length;
         console.error(`[budget-hold] agent=${agentName} hold ended (stopped) after ${waitedMs}ms with its turn; ` +
           `${others} other held request(s) ${wakes}`);
-        this.budgetHoldEnded(agentName, 'stopped', waitedMs, requests.length);
+        this.budgetHoldEnded(hold, agentName, 'stopped', waitedMs, requests.length);
       },
     };
   }
@@ -32981,6 +33012,9 @@ export class AgentFramework {
    * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
    *     (agent, kind) per cooldown window — a persistent failure re-posts
    *     every ~15 min instead of flooding the channel on every occurrence.
+   *     The budget hold's state alerts, `context-hold` and its clear, post at
+   *     every transition instead, so the webhook's last word for an agent is
+   *     whether its turn is held.
    * See connectome docs/observability.md.
    */
   /**
@@ -33104,6 +33138,10 @@ export class AgentFramework {
       /** Tells this alert apart from others of its agent and kind for the
        *  webhook's cooldown, such as the batch a retirement names. */
       key?: string;
+      /** Posts to the webhook at every call, outside its cooldown: for an
+       *  alert that reports a state, whose last post must stay true, as
+       *  `context-hold` and its clear do. */
+      everyTime?: boolean;
     },
   ): void {
     // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
@@ -33128,10 +33166,12 @@ export class AgentFramework {
     const hook = process.env.CONNECTOME_OPS_WEBHOOK;
     if (!hook) return;
     const key = opts?.key === undefined ? `${agentName}:${kind}` : `${agentName}:${kind}:${opts.key}`;
-    const now = Date.now();
-    if (now - (this.opsAlertLastSent.get(key) ?? 0) < this.opsAlertCooldownMs) return;
-    // Stamp BEFORE the async post so a burst can't race past the cooldown.
-    this.opsAlertLastSent.set(key, now);
+    if (!opts?.everyTime) {
+      const now = Date.now();
+      if (now - (this.opsAlertLastSent.get(key) ?? 0) < this.opsAlertCooldownMs) return;
+      // Stamp BEFORE the async post so a burst can't race past the cooldown.
+      this.opsAlertLastSent.set(key, now);
+    }
     fetch(hook, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
