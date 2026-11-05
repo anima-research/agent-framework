@@ -16,8 +16,8 @@
     every transition, outside the cooldown that thins a repeating failure's
     posts, so the webhook's last post of the pair says whether the turn is
     held. A listener of either that ends the hold at once still sees the
-    start, then `inference:held`, then the end and its clear, in that order,
-    on the trace and on the webhook.
+    start, then `inference:held`, then the end and its clear, in that order
+    on the trace, and the start then the clear on the webhook.
   - A host that maps alert kinds to where it posts them needs an entry for
     `context-hold` to post it; one that treats an unlisted kind as silent
     posts nothing for it.
