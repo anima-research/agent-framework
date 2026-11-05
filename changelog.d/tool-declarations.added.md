@@ -60,14 +60,14 @@
   declares, prices them for consolidation, and they're the rows a move of
   its head takes out of its own branch. On `'head'` they're taken out when
   a recorded head is cleared or its compile holds them, and an agent with
-  neither, such as a derived agent started on `'head'`, leaves them in
-  place. Where its compile leaves them out, as the framework's does on
-  `'head'` for every agent but the subconscious, a compile refused over
-  budget takes none of them. A shared child `deriveAgent` makes already
-  counts its parent's, since its parent is among its `selfParticipants`; a
-  host's shared child, whose `selfParticipants` needn't name its parent,
-  counts them through the owners the framework gives it as it's created or
-  resumed.
+  neither, such as a derived agent started on `'head'` at a checkpoint,
+  leaves them in place. Where its compile leaves them out, as the
+  framework's does on `'head'` for every agent but the subconscious, a
+  compile refused over budget takes none of them. A shared child
+  `deriveAgent` makes already counts its parent's, since its parent is
+  among its `selfParticipants`; a host's shared child, whose
+  `selfParticipants` needn't name its parent, counts them through the owners
+  the framework gives it as it's created or resumed.
 - A subconscious on another model than its resident, as the persistent
   reader or as a reader fork, declares its tools and system text on its
   head, whatever the resident's `toolDeclarations`. A reader fork on the
