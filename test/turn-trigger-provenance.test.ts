@@ -279,6 +279,44 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it("two parked wakes with one key, one silent, coalesced while the host is quiesced, name the channels the merge's rule gives at resume", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    const general = { serverId: 'discord', channelId: 'discord:g:general' };
+    await framework.quiesce({ reason: 'test window' });
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t, wakeChannels: [room], suppressProse: true },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [general] },
+    );
+    await i.processInferenceRequests();
+    assert.equal(membrane.calls.length, 0, 'premise: parked while quiesced');
+    assert.equal(i.pendingRequests.length, 1, 'premise: coalesced into one');
+    await framework.resume();
+    await framework.runUntilIdle();
+    assert.ok(captured.exposed, 'the turn started at resume');
+    assert.deepEqual(captured.exposed.wakeChannels, [general]);
+    await framework.stop();
+  });
+
+  for (const first of ['the silent one', 'the other'] as const) it(`a provider hold that takes one of two equal requests, one silent, into the other keeps the channels the merge's rule gives, ${first} held first`, async () => {
+    const framework = await makeFramework();
+    const hold = internals(framework) as unknown as { holdRequest(held: unknown[], request: unknown): void };
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    const general = { serverId: 'discord', channelId: 'discord:g:general' };
+    const t = Date.now();
+    const silent = { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t, wakeChannels: [room], suppressProse: true };
+    const other = { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t, wakeChannels: [general] };
+    const held: Array<{ wakeChannels?: unknown }> = [first === 'the silent one' ? silent : other];
+    hold.holdRequest(held, first === 'the silent one' ? other : silent);
+    assert.equal(held.length, 1, 'premise: the hold took one into the other');
+    assert.deepEqual(held[0]!.wakeChannels, [general]);
+    await framework.stop();
+  });
+
   it("a context-budget restart of a batch's turn carries the batch's channels", async () => {
     class SequentialStreamMembrane extends MockMembrane {
       private streamIdx = 0;

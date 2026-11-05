@@ -6665,7 +6665,8 @@ export class AgentFramework {
     if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
     else delete (same as MarkedRequest)[TURN_CARRY];
     if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
-    const channels = wakeChannelsOf([same, request]);
+    const pair = [same, request];
+    const channels = wakeChannelsOf(pair.some(bringsOwnChannels) ? pair.filter(hasOwnCauseForRun) : pair);
     if (channels) same.wakeChannels = channels;
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
@@ -20089,7 +20090,8 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
-          const channels = prev ? wakeChannelsOf([prev, request]) : undefined;
+          const pair = prev ? [prev, request] : undefined;
+          const channels = pair ? wakeChannelsOf(pair.some(bringsOwnChannels) ? pair.filter(hasOwnCauseForRun) : pair) : undefined;
           if (channels) kept.wakeChannels = channels;
           newestByKey.set(key, kept);
         }
