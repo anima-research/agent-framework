@@ -804,7 +804,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     surface.release();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn stopped while a module's answer is due logs the place it names when it answers", async (t) => {
@@ -823,7 +823,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     surface.release();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn whose continuation is dropped while a module's answer is due logs the place it names when it answers", async (t) => {
@@ -850,7 +850,7 @@ describe('plain speech a module says it showed', () => {
     surface.release();
     await routed;
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn whose retry's wait stop() ends logs the place a module named before it", async (t) => {
@@ -876,7 +876,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     await f.stop();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn whose held failure stop() ends, once it has closed admission, logs the place a module named before it", async (t) => {
@@ -899,7 +899,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     assert.ok(ends.some((r) => r.includes('dropped before it sends anything')), 'premise: the turn ended as a retry the stop cancels: ' + JSON.stringify(ends));
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn whose retry's start fails, and whose wait to try again stop() ends, logs the place a module named before it", async (t) => {
@@ -928,7 +928,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     await f.stop();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn whose agent is released while a module's answer is due logs the place it names when it answers", async (t) => {
@@ -948,7 +948,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     surface.release();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("an ephemeral run its watchdog ends while a module's answer is due logs the place it names when it answers", async (t) => {
@@ -983,7 +983,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about once");
     surface.release();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
-    assert.ok(errors.includes('[routeSpeech] run-1: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    assert.ok(errors.includes('[speechRouted] run-1: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("an ephemeral run that completes keeps its asks for its own receipt, which can come after the run returns", async () => {
@@ -1065,7 +1065,7 @@ describe('plain speech a module says it showed', () => {
     await internal.routeLocusSpeech(f.getAgent('resident'), { routing }, 'Said late.', null);
     assert.equal(surface.asked.length, 2, 'premise: the late piece was asked about');
     assert.equal(routing!.asking, undefined);
-    assert.ok(errors.includes(`[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn" after the turn's receipt took its asks, which doesn't name it`), errors.join('\n'));
+    assert.ok(errors.includes(`[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn" after the turn's receipt took its asks, which doesn't name it`), errors.join('\n'));
   });
 
   it("a context-budget restart that takes a routing whose receipt took its asks keeps its own asks for its receipt", async (t) => {

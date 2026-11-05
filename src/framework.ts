@@ -1664,7 +1664,7 @@ function notFinal(round: ProseRound): ProseRound {
 function logLateAsk(agentName: string, settled: 'receipt' | 'no receipt', asked: Promise<string[]>): void {
   void asked.then((places) => {
     if (places.length === 0) return;
-    console.error(`[routeSpeech] ${agentName}: shown by ${places.map(logValue).join(' · ')}` +
+    console.error(`[speechRouted] ${agentName}: shown by ${places.map(logValue).join(' · ')}` +
       (settled === 'receipt' ? " after the turn's receipt took its asks, which doesn't name it" : ', for speech of a turn that ended without a receipt'));
   });
 }
@@ -21542,7 +21542,7 @@ export class AgentFramework {
         if (!round.final) round.routing.liveSpeech = true;
       });
     } catch (err) {
-      console.error(`[routeSpeech] ${agent.name}: asking the modules where speech went failed:`, err);
+      console.error(`[speechRouted] ${agent.name}: asking the modules where speech went failed:`, err);
       return [];
     }
   }
