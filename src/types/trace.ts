@@ -254,9 +254,11 @@ export type TraceEvent =
        * (`wont_fit`, with the preview's `finalTokens`, `budgetTokens` and `clearedBy`), the preview threw an
        * `UncoveredDropError` (`uncovered_drop`), or it failed otherwise (`preview_error`, also logged).
        * `previewed` is false where the boundary took an earlier boundary's `wont_fit` on the same stream, one a
-       * newer message couldn't clear, with nothing it rested on changed since (the budget, the compression holds,
-       * the live context settings, the strategy's compression state, the pins and document marks other than the
-       * turn's own, or a stored row edited or removed), and ran no preview; its figures are that earlier preview's.
+       * newer message couldn't clear, with none of these changed since: the budget, the compression holds, the
+       * live context settings, the strategy's compression state, the pins and document marks other than the
+       * turn's own, or a stored row edited or removed. It ran no preview, and its figures are that earlier
+       * preview's. Rows added to the store, the stream's own among them, and context-manager's calibration
+       * multiplier aren't in that list, so such a decline isn't previewed again when only those change.
        */
       type: 'inference:restart_declined';
       agentName: string;

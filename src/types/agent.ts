@@ -98,12 +98,15 @@ export interface AgentConfig {
    *  `inference:restart_declined` trace; a preview that fails other than
    *  with an `UncoveredDropError` is also logged. The stream goes on, and
    *  the next tool boundary over this budget considers the restart again.
-   *  It previews anew only once what the last preview rested on has
-   *  changed (the budget, the compression holds, the live context settings,
-   *  the strategy's compression state, the pins and document marks other than
-   *  the turn's own, or a stored row edited or removed),
-   *  unless that preview said a newer message could make room, failed, or
-   *  met a drop no summary covers: each of those every boundary previews.
+   *  It previews anew only once one of these has changed: the budget, the
+   *  compression holds, the live context settings, the strategy's
+   *  compression state, the pins and document marks other than the turn's
+   *  own, or a stored row edited or removed. Rows added to the store, the
+   *  stream's own among them, and context-manager's calibration multiplier
+   *  aren't in that list, so a remembered decline isn't previewed again when
+   *  only those change. That holds unless the preview said a newer message
+   *  could make room, failed, or met a drop no summary covers: each of those
+   *  every boundary previews.
    *  With `toolResultGuard` on, no remembered decline is taken: the guard
    *  holds each round's stored results from compression and edits them as
    *  it settles them, so what a preview rests on changes at every round,
