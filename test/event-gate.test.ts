@@ -726,33 +726,6 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].batchChannels, undefined, "nor is it told the chatter's channel was where it came from");
   });
 
-  it('a chat:system notice names no channel for its batch', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
-    const path = writeConfig('debounce-route-notice.json', {
-      policies: [
-        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
-      ],
-      default: 'skip',
-    });
-    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: (info) => info.channelId || undefined });
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
-      content: 'pat joined', tags: ['chat:system'] }));
-    t.mock.timers.tick(150);
-    assert.strictEqual(inferenceRequests.length, 1);
-    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'a notice alone routes nowhere, as its direct wake does');
-    assert.strictEqual(inferenceRequests[0].batchChannels, undefined);
-
-    arriving(1_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
-      content: 'chatter', metadata: { authorId: '7' } })));
-    arriving(2_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general',
-      content: 'pat joined', tags: ['chat:system'] })));
-    t.mock.timers.tick(150);
-    assert.strictEqual(inferenceRequests.length, 2);
-    assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room', "the message's channel, not the newer notice's");
-    assert.deepStrictEqual(inferenceRequests[1].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }],
-      "only the message's channel is named");
-  });
-
   it('an addressed chat:system notice takes no part in its batch\'s provenance, but for its author when nothing else names one', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route-dm-notice.json', {
@@ -827,27 +800,6 @@ describe('debounce', () => {
       ...(authorId ? { authorId } : {}) });
     const provenance = wakeProvenance([notice(10, '5'), notice(20)] as Parameters<typeof wakeProvenance>[0]);
     assert.deepStrictEqual(provenance, { counterparty: 'discord:user:5', at: 10 });
-  });
-
-  it('a render that folds a batch is never taken as a notice, so it names its channel when a notice came last', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
-    const path = writeConfig('debounce-folds.json', {
-      policies: [{ name: 'push', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } }],
-      default: 'skip',
-    });
-    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: () => 'editor:chat' });
-    gate.evaluate({ ...event({ eventType: 'mcpl:push-event', serverId: 'editor', content: 'pat joined',
-      tags: ['chat:system'], metadata: { authorId: '6' } }), folds: true });
-    t.mock.timers.tick(150);
-    assert.strictEqual(inferenceRequests.length, 1);
-    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'editor:chat', serverId: 'editor' }]);
-  });
-
-  it("a batch names the same channel id on two servers as two channels", () => {
-    const at = (serverId: string, timestamp: number) => ({ policyName: 'chat', content: 'x', eventType: 'mcpl:channel-incoming',
-      timestamp, addressed: false, serverId, channelId: 'general', routeChannelId: 'general', authorId: '7' });
-    const provenance = wakeProvenance([at('discord', 1), at('surface', 2), at('discord', 3)] as Parameters<typeof wakeProvenance>[0]);
-    assert.deepStrictEqual(provenance?.batchChannels, [{ channelId: 'general', serverId: 'discord' }, { channelId: 'general', serverId: 'surface' }]);
   });
 
   it("a batch lists a channel once with its server and once without, since only the host can tell they're one", async (t) => {

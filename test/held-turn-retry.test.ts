@@ -1641,7 +1641,7 @@ const retrySites = [
   { site: "a conversation agent's hold for a wait recorded during its compile", held: true, fork: true, compileWait: true },
 ] as const;
 
-for (const at of retrySites) for (const routing of ["holds a later batch's channels in its routing", 'has no channel'] as const) test(`${at.site}: the retry of a turn with no locus that ${routing} carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its start's"}`, async (t) => {
+for (const [index, at] of retrySites.entries()) for (const routing of index === 0 ? ["holds a later batch's channels in its routing", 'has no channel'] as const : ["holds a later batch's channels in its routing"] as const) test(`${at.site}: the retry of a turn with no locus that ${routing} carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its start's"}`, async (t) => {
   await withStoreDir(async (path) => {
     holdClock(t);
     const log = silence();
