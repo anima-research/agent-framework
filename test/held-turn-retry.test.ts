@@ -487,6 +487,32 @@ test("a conversation agent's turn a wait recorded during its compile holds is al
   });
 });
 
+test("a conversation agent's start assembling its deferred pushes under a provider wait on its model is listed as a maybe, since the wait holds it after its compile", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
+      const agent = fw.getAgent('resident')!;
+      agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
+      const view = internal as unknown as { pushCoalescer: unknown; assembling: Set<string>; upcomingWakesFor(agentName: string): Array<{ certain: boolean; what: string }> };
+      let assembled!: () => void;
+      const assembly = new Promise<undefined>((resolve) => { assembled = () => resolve(undefined); });
+      // pendingBatches() counts every agent's deferred batches, so a fork's start assembles while any other agent's batch is pending.
+      view.pushCoalescer = { pendingBatches: () => 1, assemble: () => assembly, isRendering: () => false, identity: () => undefined, suspend: () => {} };
+      const started = internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      await waitFor(fw, () => view.assembling.has('resident'), 'the start to assemble');
+      internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz wait while it assembles');
+      assert.deepEqual(view.upcomingWakesFor('resident').filter((w) => w.what.startsWith('a start assembling')).map((w) => [w.certain, w.what]),
+        [[false, 'a start assembling its deferred pushes, which a provider wait on its model holds after its compile if the wait still stands then']]);
+      assembled();
+      await started;
+      assert.ok(log.lines.some((line) => line.includes('binds after the compile')), 'premise: the wait holds it after its compile');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test('on a host already quiesced, a quiesce with abandon ends a held turn at once', async (t) => {
   await withStoreDir(async (path) => {
     // Under the held clock a drain wait never runs out: a quiesce that waited

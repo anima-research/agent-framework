@@ -453,11 +453,12 @@ export interface JudgeRequest {
   events: JudgeEventSummary[];
   /** The agents the batch would wake. */
   agentNames: string[];
-  /** The gate's own timers that will wake those agents with no new event
-   *  (upcomingWakes): their self-wakes, a sleep's end, every pending batch
-   *  but this one, and events buffered while a turn runs or the host is
-   *  quiesced. The framework's own judge adds what the framework knows
-   *  besides. */
+  /** The gate's own timers that will wake those agents with no new event, or
+   *  may (`certain` false) (upcomingWakes): their self-wakes, a sleep's end,
+   *  every pending batch but this one, save one delivered without the judge
+   *  under a refusal whose every event's channel is held now, and events
+   *  buffered while a turn runs or the host is quiesced. The framework's own
+   *  judge adds what the framework knows besides. */
   upcomingWakes?: UpcomingWake[];
   /** Aborted when the judge's time is up or the gate is disposed. */
   signal: AbortSignal;
