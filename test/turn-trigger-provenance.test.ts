@@ -148,20 +148,20 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("a turn merged from an autoContinue wake and a heartbeat names the continued turn's channels, since the heartbeat brought none", async () => {
+  for (const first of ['the autoContinue wake', 'the heartbeat'] as const) it(`a turn merged from an autoContinue wake and a heartbeat, ${first} first, names the continued turn's channels, since the heartbeat brought none`, async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
     const framework = await makeFramework();
     const i = internals(framework);
     const captured = spy(framework);
     const t = Date.now();
     const earlier = { serverId: 'discord', channelId: 'discord:g:earlier' };
-    i.pendingRequests.push(
-      { agentName: 'scout', reason: 'auto-continue', source: 'framework', timestamp: t, wakeChannels: [earlier] },
-      { agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: t + 1 },
-    );
+    const continued = { agentName: 'scout', reason: 'auto-continue', source: 'framework', timestamp: t, wakeChannels: [earlier] };
+    const heartbeat = { agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: t };
+    i.pendingRequests.push(...(first === 'the heartbeat' ? [heartbeat, continued] : [continued, heartbeat]));
     await i.processInferenceRequests();
     await framework.runUntilIdle();
     assert.ok(captured.exposed, 'premise: the merged turn started');
+    assert.equal(captured.exposed.reason, first === 'the heartbeat' ? 'heartbeat' : 'auto-continue', 'premise: the merge spread the request that came first');
     assert.deepEqual(captured.exposed.wakeChannels, [earlier]);
     await framework.stop();
   });

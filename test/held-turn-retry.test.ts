@@ -1088,6 +1088,12 @@ async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membra
     for (const resolve of gate.idleWaiters.splice(0)) resolve();
     await waitFor(fw, () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length === 1, 'the merged start held again');
     assert.equal(membrane.primary, 2);
+    const start = internal.providerAccelerationCooldowns.get('resident')!.heldRequests[0] as unknown as Record<string | symbol, unknown>;
+    const symbols = Object.getOwnPropertySymbols(start);
+    const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+    const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+    const leader = (start[batchKey] as Array<Record<string | symbol, unknown>>).find((member) => (member[retryKey] === true) === (leads === 'retry'));
+    assert.ok(leader && identityKeys.every((key) => JSON.stringify(leader[key]) === JSON.stringify(start[key])), `premise: the merged start is led by its ${leads}`);
   }
   return () => {
     if (how === 'parked') {
