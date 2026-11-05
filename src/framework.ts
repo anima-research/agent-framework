@@ -20059,7 +20059,8 @@ export class AgentFramework {
         requests = requests.flatMap((r) => {
           const batch = mergedBatch(r);
           if (!batch?.length) return [r];
-          const opening = mergedOpeningMessages([batch[0], r]);
+          const own = r.openingMessages?.filter((id) => !batch.some((m) => m.openingMessages?.includes(id)));
+          const opening = own?.length ? mergedOpeningMessages([batch[0], { openingMessages: own }]) : undefined;
           return opening ? [{ ...batch[0]!, openingMessages: opening }, ...batch.slice(1)] : batch;
         });
       }

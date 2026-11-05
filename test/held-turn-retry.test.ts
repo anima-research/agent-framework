@@ -1315,6 +1315,37 @@ test("a held wake that an equal merged start folds into keeps its opening messag
   });
 });
 
+test("a held merged start's release gives its first member none of the other members' opening messages, so a member the read check drops leaves its message off the turn", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const start = internal.providerAccelerationCooldowns.get('resident')!.heldRequests[0] as unknown as Record<string | symbol, unknown>;
+      const symbols = Object.getOwnPropertySymbols(start);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const members = start[batchKey] as Array<Record<string | symbol, unknown>>;
+      const first = members[0]!;
+      const other = members.find((member) => member !== first)!;
+      assert.equal(first[retryKey], true, "premise: the batch's first member is the turn's retry");
+      first.openingMessages = ['zz-kept'];
+      other.openingMessages = ['zz-dropped'];
+      other.readsStoredMessage = 'zz-no-such-message';
+      start.openingMessages = ['zz-kept', 'zz-dropped'];
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      assert.ok(log.lines.some((line) => line.startsWith('[wake] resident: dropped 1 wake(s)')), `premise: the read check dropped the other member: ${log.lines.join('\n')}`);
+      const routing = (internal as unknown as { turnRouting: Map<string, { openingMessages?: string[] }> }).turnRouting.get('resident');
+      assert.ok(routing?.openingMessages?.includes('zz-kept'), `premise: the first member's message: ${JSON.stringify(routing?.openingMessages)}`);
+      assert.ok(!routing?.openingMessages?.includes('zz-dropped'), `the dropped member's message: ${JSON.stringify(routing?.openingMessages)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("an equal merged start the hold folds into a held one keeps its members beside the held start's, as at main: gatedRequests counts each wake, and abortInference() puts back each once", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
