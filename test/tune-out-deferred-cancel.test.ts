@@ -581,3 +581,38 @@ describe("what a boot after an unrecorded stop can tell of a waiting note (AF #8
     }
   });
 });
+
+describe("a release that tells a waiting note's loss leaves the subconscious a turn that outlives a stop (AF #844 review, round 8, Ivy-3594)", () => {
+  for (const answered of [false, true]) it(answered
+    ? "control: a turn of the subconscious's after the release, before the stop, leaves no turn asked for again at the start"
+    : "the loss-carrying release stored and synced, an orderly stop, and a start on the same store: the subconscious has a turn asked for to read it", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, fw, sub, release } = await noteWaitingAfterFailedRelease();
+    try {
+      const add = fw.addMessage.bind(fw);
+      let refuse = true;
+      fw.addMessage = (participant, content, metadata, opts) => {
+        if (refuse && metadata?.kind === 'subconscious-note') throw new Error('EACCES: the store refused the note (test)');
+        return add(participant, content, metadata, opts);
+      };
+      assert.deepEqual(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'agent request'), { ok: true },
+        "the resident's cancel ends the hold, its release telling the note's loss");
+      refuse = false;
+      assert.ok(presentedTo(f, sub).some((t) => t.includes('This cancel ended that tune-out while that one waited')),
+        "premise: shown to the subconscious at rest before the stop, its turn asked for in memory only");
+      // Its turn, read: a row of its own after the release in its window.
+      if (answered) fw.addMessage(sub, [{ type: 'text', text: 'Noted: my note was lost.' }], {}, { forAgent: sub });
+      await f.framework.stop();
+      await f.create();
+      const window = presentedTo(f, sub);
+      assert.equal(window.filter((t) => t.includes('This cancel ended that tune-out while that one waited')).length, 1,
+        "premise: the subconscious's presented context holds the release with the loss");
+      assert.equal(internals(f).pendingRequests.some((r) => r.agentName === sub && r.reason === 'tune-out note not delivered: noisy'), !answered,
+        `${answered ? 'no turn is asked again' : 'a turn is asked for the subconscious to read it'}: ${JSON.stringify(internals(f).pendingRequests)}`);
+    } finally {
+      errors.mock.restore();
+      release();
+      await f.close();
+    }
+  });
+});

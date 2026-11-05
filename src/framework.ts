@@ -17984,6 +17984,26 @@ export class AgentFramework {
   }
 
   /**
+   * The rows of the persistent subconscious's window that `keep` keeps and
+   * that come after its last row of its own (the coordinator's
+   * unansweredBySubconscious): shown to it, and no turn of its since, as
+   * the window, written down, says across a restart, where the turn the
+   * row asked for, in memory, doesn't. A note it left that a cancel
+   * delivered is a row under its name but no turn of it, so isn't its own
+   * here. None with no subconscious, or where its window can't be read.
+   */
+  private unansweredBySubconscious(keep: (m: Pick<StoredMessage, 'metadata'>) => boolean): Array<Pick<StoredMessage, 'metadata'>> {
+    const sub = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+    if (!sub || !this.presents(sub)) return [];
+    const window = sub.getContextManager().getPresentedMessages();
+    let after = 0;
+    window.forEach((m, at) => {
+      if (m.participant === sub.name && (m.metadata as { kind?: unknown } | undefined)?.kind !== 'subconscious-note') after = at + 1;
+    });
+    return window.slice(after).filter((m) => (m.shardIndex ?? 0) === 0 && keep(m));
+  }
+
+  /**
    * One reader invocation: derive a fork of the resident at its head with
    * the resident's refusals, hand it the held traffic since the last look
    * as ordinary framing, and run it. It reports through `deliver_summary`
@@ -39067,6 +39087,7 @@ export class AgentFramework {
         subconsciousWindowOrdinals: () => this.presents(
           this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined),
         unseenBySubconscious: (keep) => this.unseenBySubconscious(keep),
+        unansweredBySubconscious: (keep) => this.unansweredBySubconscious(keep),
         isForkBound: (channel) =>
           this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
         isPrivilegedAuthor: (authorId) =>

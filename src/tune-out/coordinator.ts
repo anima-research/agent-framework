@@ -622,6 +622,13 @@ export interface TuneOutFrameworkHooks {
    * Left out, none are.
    */
   unseenBySubconscious?: (keep: (m: Pick<StoredMessage, 'metadata'>) => boolean) => number;
+  /**
+   * The rows `keep` keeps that the persistent subconscious's window shows
+   * after its last row of its own: shown to it, with no turn of its since.
+   * A boot reads it for the losses told to it whose turn a stop lost
+   * (askTurnsForUnreadLosses). Left out, none are.
+   */
+  unansweredBySubconscious?: (keep: (m: Pick<StoredMessage, 'metadata'>) => boolean) => Array<Pick<StoredMessage, 'metadata'>>;
   /** True when a channel is bound to a conversation-fork agent. */
   isForkBound: (channel: ChannelRef) => boolean;
   /** Gate privileged-users list (#77: privileged authors wake, like mentions). */
@@ -892,9 +899,11 @@ export class TuneOutCoordinator {
       this.rebuildTally(serverId, channelId);
     }
     this.pruneLooks();
-    // A loss notice for the subconscious a stop left kept in the store is
-    // written now, the holds' state above restored first, which it reads;
-    // then those for the holds the last stop didn't stamp.
+    // A loss told to the subconscious before the stop whose turn the stop
+    // lost is given its turn again; then a loss notice a stop left kept in
+    // the store is written, the holds' state above restored first, which it
+    // reads; then those for the holds the last stop didn't stamp.
+    this.askTurnsForUnreadLosses();
     this.restoreLossNotices();
     this.noteUnstampedStop(onRecord);
   }
@@ -1829,6 +1838,42 @@ export class TuneOutCoordinator {
       if (this.lossNotices.size > 0) this.armDeferredRetry();
     } catch (err) {
       console.error(`[tune-out] whether the last stop recorded the holds on record could not be checked at boot: ${thrownReason(err)}`);
+    }
+  }
+
+  /**
+   * At boot (resumeActiveEpochs), before this boot writes any notice: a
+   * loss told to the persistent subconscious before the stop, by a notice
+   * (`tune-out-note-undelivered`) or in a release (`lostNote`,
+   * queuedNoteFirst), asked for a turn to read it, which was kept in memory
+   * only. Shown to it at rest, such a row is in its window, so the boot's
+   * wake for rows its window is still owed doesn't count it; one with no
+   * turn of the subconscious's after it in its window
+   * (unansweredBySubconscious) gets that turn asked for again, once per
+   * hold. Never throws.
+   */
+  private askTurnsForUnreadLosses(): void {
+    try {
+      const author = this.hooks.subconsciousName();
+      if (!author || !this.hooks.unansweredBySubconscious) return;
+      const unread = this.hooks.unansweredBySubconscious((m) => {
+        const meta = m.metadata as { kind?: unknown; lostNote?: unknown } | undefined;
+        return meta?.kind === 'tune-out-note-undelivered' || (meta?.kind === 'tune-out-cancel' && meta.lostNote === true);
+      });
+      const asked = new Set<string>();
+      for (const m of unread) {
+        const meta = m.metadata as { channelId?: unknown; serverId?: unknown; scope?: unknown } | undefined;
+        const where = meta?.scope === 'all-except' ? 'all-except'
+          : typeof meta?.channelId === 'string' ? this.shown(typeof meta.serverId === 'string' ? meta.serverId : '', meta.channelId) : 'a tune-out';
+        if (asked.has(where)) continue;
+        asked.add(where);
+        this.hooks.requestInference(author, `tune-out note not delivered: ${where}`, 'tune-out');
+      }
+      if (asked.size > 0) {
+        console.error(`[tune-out] ${author} was told of a lost note before the stop and has had no turn since, so a turn to read it is asked for again (${[...asked].join(', ')})`);
+      }
+    } catch (err) {
+      console.error(`[tune-out] the losses told to the subconscious before the stop could not be checked for a turn at boot: ${thrownReason(err)}`);
     }
   }
 
