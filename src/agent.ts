@@ -2707,7 +2707,8 @@ export class Agent {
     if (dryRun) return { compiled, head: recorded, declared };
     try {
       this.contextManager.addMessage(declared.participant, declared.content, systemChangeMetadata(this.name) as never);
-    } catch {
+    } catch (error) {
+      console.error(`[head-declarations] ${this.name}: a system change could not be stored, so the request goes on the recorded head, and the first later request that can store a change declares what differs then:`, error);
       return { compiled, head: recorded };
     }
     this.onHeadEvent?.({
