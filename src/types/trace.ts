@@ -1106,7 +1106,8 @@ export type TraceEvent =
       agentName: string;
       /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record),
+      /** Kind-specific structured payload (mirrors the failures.log record,
+       *  where the alert has one: `context-hold` and its clear have none),
        *  bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
