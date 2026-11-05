@@ -1015,17 +1015,21 @@ describe('plain speech a module says it showed', () => {
     t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
     const surface = new Surface();
     const slow = new Surface('terminal');
-    slow.answer = 'hang';
+    slow.answer = 'held';
     const membrane = new FailsAfterFirstRound();
     membrane.pushResponse(lookRound('Looking around.'));
     const f = await host([surface, slow], membrane);
-    await turn(f);
-    assert.deepEqual(askedTexts(slow), [{ text: 'Looking around.', final: false }], 'premise: the other module was asked too');
-    assert.deepEqual(askedTexts(surface), [{ text: 'Looking around.', final: false }], 'premise: the module that answered at once was asked');
-    const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
-    assert.equal(failed.length, 1, texts(f).join('\n'));
-    assert.ok(!errors.some((e) => e.includes("Speech-routed module terminal (agent resident) hadn't answered")), 'the other module was still due when the turn failed');
-    assert.ok(failed[0]!.includes('Some plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
+    try {
+      await turn(f);
+      assert.deepEqual(askedTexts(slow), [{ text: 'Looking around.', final: false }], 'premise: the other module was asked too');
+      assert.deepEqual(askedTexts(surface), [{ text: 'Looking around.', final: false }], 'premise: the module that answered at once was asked');
+      const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
+      assert.equal(failed.length, 1, texts(f).join('\n'));
+      assert.ok(!errors.some((e) => e.includes("Speech-routed module terminal (agent resident) hadn't answered")), 'the other module was still due when the turn failed');
+      assert.ok(failed[0]!.includes('Some plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
+    } finally {
+      slow.release();
+    }
   });
 
   it("an ask made after the turn's receipt was written is logged, and not kept for a receipt", async (t) => {
