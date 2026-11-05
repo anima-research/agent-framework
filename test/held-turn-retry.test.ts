@@ -1444,6 +1444,41 @@ test("a wake held on its own, that an equal start led by the turn's retry folds 
   });
 });
 
+for (const order of ['its equal wake ahead of its retry', 'its retry ahead of its equal wake'] as const) test(`a wake held on its own, that an equal start led by the turn's retry folds into with ${order}, is that retry's event, as at main: abortInference() puts back the start's own wakes`, async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests as unknown as Array<Record<string | symbol, unknown>>;
+      const symbols = Object.getOwnPropertySymbols(held[0]!);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const batchWake = (held[0]![batchKey] as Array<Record<string | symbol, unknown>>).find((member) => member[retryKey] !== true)!;
+      const wake: Record<string | symbol, unknown> = { zzHeld: true };
+      const retry: Record<string | symbol, unknown> = { [retryKey]: true };
+      for (const key of identityKeys) if (batchWake[key] !== undefined) wake[key] = retry[key] = batchWake[key];
+      const equal = { ...wake, zzHeld: false, zzEqual: true };
+      const other = { ...wake, timestamp: (wake.timestamp as number) + 7, zzHeld: false, zzOther: true };
+      held.length = 0;
+      held.push(wake);
+      const joining = order === 'its equal wake ahead of its retry' ? [equal, retry, other] : [retry, equal, other];
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, { ...retry, [batchKey]: joining });
+      assert.equal(held.length, 1, 'premise: the start folds into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzHeld === true).length, 0, "the held wake's event is the retry's, which the abort ends");
+      assert.equal(back.filter((r) => r.zzEqual === true).length, 1, "the start's wake equal to it comes back, once");
+      assert.equal(back.filter((r) => r.zzOther === true).length, 1, "the start's other wake comes back, once");
+      go();
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a merged start its released wait puts back in the queue counts as the wakes merged into it there, until the next pass takes it", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
