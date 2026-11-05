@@ -3033,7 +3033,7 @@ describe('the framework wires the reply judge', () => {
     await auxiliary;
   });
 
-  async function parkedBehindAuxiliary(t: Parameters<typeof frameworkWith>[0]) {
+  async function parkedBehindAuxiliary(t: Parameters<typeof frameworkWith>[0], request: Record<string, unknown> = {}) {
     const { createMockResponse } = await import('./helpers/mock-membrane.js');
     const { framework, membrane } = await frameworkWith(t, { config: JUDGED, judge: {} });
     const internal = framework as unknown as {
@@ -3047,7 +3047,7 @@ describe('the framework wires the reply judge', () => {
     let finish!: () => void;
     const auxiliary = internal.withAuxiliaryAdmission('scout', () => new Promise<void>((resolve) => { finish = resolve; }));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
-    internal.pendingRequests.push({ agentName: 'scout', reason: 'a test wake', source: 'test', timestamp: Date.now() });
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a test wake', source: 'test', timestamp: Date.now(), ...request });
     await internal.processInferenceRequests();
     const gate = internal.providerGates.get('scout')!;
     assert.deepStrictEqual([gate.auxiliaryInFlight, gate.primaryDepth, internal.pendingRequests.length], [1, 1, 0], 'premise: the start waits behind the auxiliary call');
@@ -3081,6 +3081,14 @@ describe('the framework wires the reply judge', () => {
     await done();
   });
 
+  it('lists a start parked behind an auxiliary call whose only causes are deferred batches as a maybe, since it starts no turn if they give it nothing to read', async (t) => {
+    const { internal, done } = await parkedBehindAuxiliary(t, { coalescingBatch: true, coalescingSubject: 'zz-batch' });
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
+      [false, 'a start waiting for an auxiliary call to finish, which starts no turn if its deferred pushes give it nothing to read'],
+    ]);
+    await done();
+  });
+
   it('lists a start that waits for its deferred pushes to be assembled as a wake on its way', async (t) => {
     const { createMockResponse } = await import('./helpers/mock-membrane.js');
     const { framework, membrane } = await frameworkWith(t, { config: JUDGED, judge: {} });
@@ -3101,6 +3109,31 @@ describe('the framework wires the reply judge', () => {
     await until(() => internal.assembling.has('scout'), 'the start to wait on its assembly');
     assert.deepStrictEqual([internal.pendingRequests.length, internal.activeTurnTokens.has('scout')], [0, true], 'premise: nothing queued, the turn token taken');
     assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake already queued (a start assembling its deferred pushes)']);
+    assembled();
+    await pass;
+    await until(() => !internal.assembling.has('scout'), 'the assembly to end');
+  });
+
+  it('lists a start assembling its deferred pushes, when they are its only causes, as a maybe, since it starts no turn if they give it nothing to read', async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      pushCoalescer: unknown;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      assembling: Set<string>;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    let assembled!: () => void;
+    const assembly = new Promise<undefined>((resolve) => { assembled = () => resolve(undefined); });
+    internal.pushCoalescer = { pendingBatches: () => 1, assemble: () => assembly, isRendering: () => false, identity: () => undefined, suspend: () => {} };
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a deferred batch', source: 'test', timestamp: Date.now(), coalescingBatch: true, coalescingSubject: 'zz-batch' });
+    const pass = internal.processInferenceRequests();
+    await until(() => internal.assembling.has('scout'), 'the start to wait on its assembly');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
+      [false, 'a start assembling its deferred pushes, which starts no turn if they give it nothing to read'],
+    ]);
     assembled();
     await pass;
     await until(() => !internal.assembling.has('scout'), 'the assembly to end');

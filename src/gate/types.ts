@@ -408,7 +408,8 @@ export interface JudgeEventSummary {
  * before its stream) and no turn has started since, as the reply judge is told it: when it failed, and whether
  * a wake of the agent's is on its way with no new event, already queued or
  * held until a provider hold ends (`until`, absent when it states no end). Neither says the wake starts a turn: the host's inference
- * policy can still decline it.
+ * policy can still decline it, and a start whose only causes are deferred
+ * batches starts none if they give it nothing to read.
  */
 export interface FailedLastTurn {
   at: number;
@@ -433,7 +434,7 @@ export interface UpcomingWake {
    *  hold only a release or another call ends); given without `at`, and
    *  shown in its place. */
   when?: string;
-  /** False when it only may wake the agent, as a judge rule's batch that goes, or may yet go, to the judge does. */
+  /** False when it only may wake the agent, such as a judge rule's batch that goes, or may yet go, to the judge, or a start whose only causes are deferred batches, which starts no turn if they give it nothing to read. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
