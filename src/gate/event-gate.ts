@@ -42,6 +42,7 @@ import type {
   JudgeConfig,
   JudgeEventSummary,
   JudgeFn,
+  JudgeRequest,
   JudgeVerdict,
   UpcomingWake,
 } from './types.js';
@@ -4075,7 +4076,7 @@ export class EventGate {
     const one = events.length === 1;
     console.error(
       `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be ${as} `
-      + `(${errorText(err)}), so the batch is dropped`,
+      + `(${quotedValue(errorText(err))}), so the batch is dropped`,
     );
   }
 
@@ -4256,27 +4257,30 @@ export class EventGate {
       this.logUnsent(policyName, events, 'sent to the judge', err);
       return;
     }
-    const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [], ask: ++this.judgeAsks };
+    const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [], ask: 0 };
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
-        abort.abort();
         reject(new Error(`the judge took more than ${this.judgeTimeoutMs} ms`));
+        abort.abort();
       }, this.judgeTimeoutMs);
       // Never keep the process alive on the judge's account.
       state.timer.unref?.();
     });
     let asked: Promise<JudgeVerdict>;
     try {
-      asked = fn({
+      const request: JudgeRequest = {
         policyName,
         ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
         events: events.map((e) => this.judgeEventSummary(e)),
         agentNames,
         upcomingWakes: this.upcomingWakesBut(agentNames, { batch: state }),
         signal: abort.signal,
-      });
+      };
+      state.ask = ++this.judgeAsks;
+      asked = fn(request);
     } catch (err) {
+      if (state.ask === 0) state.ask = ++this.judgeAsks;
       asked = Promise.reject(err);
     }
     Promise.race([asked, timedOut]).then(
@@ -4395,17 +4399,24 @@ export class EventGate {
     for (const [name, state] of this.debounceTimers) {
       if (name === leftOut.policy || state.events.length === 0) continue;
       const rule = `rule ${quotedValue(name)}'s`;
+      const toTheJudge = (): UpcomingWake => {
+        const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : '';
+        return { at: state.dueAt, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} goes to the judge` };
+      };
       if (!state.judge || !this.judgeFn) {
         wakes.push({ at: state.dueAt, certain: true, what: `${rule} debounced batch of ${count(state.events.length)}` });
       } else if (statedEnd === undefined || state.dueAt >= statedEnd) {
-        const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : '';
-        wakes.push({ at: state.dueAt, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} goes to the judge` });
+        wakes.push(toTheJudge());
       } else if (this.judgeOnError === 'skip') {
         const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : ',';
         const reply = this.judging.has(name) ? ", unless the judge's REPLY to the rule's batch it is deciding delivers it first" : '';
         wakes.push({ at: statedEnd, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} held for the judge while its calls are refused${pastEnd}${reply}` });
       } else {
         const delivered = state.events.filter((e) => !this.heldNow(e)).length;
+        if (this.judgeRefusal === null) {
+          wakes.push(toTheJudge());
+          continue;
+        }
         const deciding = this.judging.has(name);
         const toJudge = [
           ...(deciding ? ['the judge answers WAIT when its calls are no longer refused'] : []),
@@ -4563,33 +4574,39 @@ export class EventGate {
     if (this.judgeFailStreak > 0) this.judgeStreakRefused = true;
     const hold = cutToFit(suppliedValue(errorText(err)), 300);
     const stated = (err as { retryAfterMs?: unknown }).retryAfterMs;
-    let now: number;
-    try {
-      now = this.now();
-    } catch (clockErr) {
-      if (state.ask > this.judgeNewestOutcome) this.judgeNewestOutcome = state.ask;
-      this.logUnsent(policyName, [...state.events, ...state.queued], this.judgeOnError === 'wake' ? 'delivered' : 'held for the judge', clockErr);
-      this.recordRefusal(policyName, state.events.length, hold, durationMs, false);
-      return;
-    }
-    const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
-    const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
-    if (state.ask > this.judgeNewestOutcome) {
-      this.judgeNewestOutcome = state.ask;
-      this.judgeRefusal = { hold, ...(until === undefined ? {} : until > now ? { until } : { noTimeLeft: true }) };
-    }
+    const newest = state.ask > this.judgeNewestOutcome;
     const wakes = this.judgeOnError === 'wake';
+    let now: number | undefined;
+    if (typeof stated === 'number' || (!newest && !wakes && this.judgeRefusal?.until !== undefined)) {
+      try {
+        now = this.now();
+      } catch (clockErr) {
+        if (newest) this.judgeNewestOutcome = state.ask;
+        this.logUnsent(policyName, [...state.events, ...state.queued], wakes ? 'delivered' : 'held for the judge', clockErr);
+        this.recordRefusal(policyName, state.events.length, hold, durationMs, false);
+        return;
+      }
+    }
+    const end = typeof stated === 'number' && now !== undefined ? now + Math.max(0, stated) : undefined;
+    const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
+    if (newest) {
+      this.judgeNewestOutcome = state.ask;
+      this.judgeRefusal = { hold, ...(until === undefined || now === undefined ? {} : until > now ? { until } : { noTimeLeft: true }) };
+    }
+    const dropsBefore = this.droppedJudgeEvents;
     if (!this.disposed && !wakes) {
       this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge);
       if (this.judgeRefusal) this.armJudgeRefusalTimer(now);
       else this.flushJudgeHeldIfClear();
     }
+    const dropped = this.droppedJudgeEvents - dropsBefore;
     const n = state.events.length;
     const behind = state.queued.length;
     const went = wakes ? 'goes to delivery without the judge' : this.judgeHeldForRefusal(now) ? "is held while the judge's calls are refused" : 'goes back to the judge';
     console.error(
       `[gate] Rule ${quotedValue(policyName)}: the reply judge's call was refused (${hold}), so its batch of ${n} `
-      + `${n === 1 ? 'event' : 'events'}${behind > 0 ? `, with ${behind} more queued behind the call,` : ''} ${went} (judge onError "${this.judgeOnError}")`,
+      + `${n === 1 ? 'event' : 'events'}${behind > 0 ? `, with ${behind} more queued behind the call,` : ''} ${went}`
+      + `${dropped > 0 ? `, the rule's oldest ${dropped} ${dropped === 1 ? 'event' : 'events'} dropped at the cap` : ''} (judge onError "${this.judgeOnError}")`,
     );
     this.recordRefusal(policyName, n, hold, durationMs, wakes, until);
     if (this.disposed) return;
@@ -4613,12 +4630,12 @@ export class EventGate {
     });
   }
 
-  private armJudgeRefusalTimer(now: number): void {
+  private armJudgeRefusalTimer(now: number | undefined): void {
     if (this.judgeRefusalTimer) clearTimeout(this.judgeRefusalTimer);
     this.judgeRefusalTimer = null;
     const until = this.judgeRefusal?.until;
     if (until === undefined || this.disposed) return;
-    const delay = Math.max(0, until - now);
+    const delay = Math.max(0, until - (now ?? this.now()));
     this.judgeRefusalTimer = setTimeout(() => {
       this.judgeRefusalTimer = null;
       let at: number;
@@ -4691,7 +4708,7 @@ export class EventGate {
       const one = events.length === 1;
       console.error(
         `[gate] a judge rule's batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
+        + `(${quotedValue(errorText(err))}), so the batch is dropped`,
       );
     }
   }
@@ -5287,12 +5304,12 @@ export class EventGate {
       return `A reply judge call was refused by a hold with no time left on it: ${refusal.hold}. `
         + (wakes
           ? "Each judge rule's batch is still asked about, and is delivered without being judged if the call is refused, unless it waits behind a call of its rule, when it goes with that call's batch unless the judge answers that call WAIT."
-          : `The refusal sets no time to ask again: judge rules' held batches (${events} now) go back to the judge once a judge call made after this gets a REPLY or WAIT, or when the hold on the agent's calls ends, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
+          : `The refusal sets no time to ask again: judge rules' held batches (${events} now) go back to the judge with their rule's next batch, or once a judge call made after this gets a REPLY or WAIT, or when the hold on the agent's calls ends, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
     }
     return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
       + (wakes
         ? "Each judge rule's batch is still asked about, and is delivered without being judged if the call is refused, unless it waits behind a call of its rule, when it goes with that call's batch unless the judge answers that call WAIT."
-        : `The refusal sets no time to ask again: judge rules' held batches (${events} now) go back to the judge once a judge call made after this gets a REPLY or WAIT, or when the hold is released, as an operator's release of a provider wait or a surgery's end does, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
+        : `The refusal sets no time to ask again: judge rules' held batches (${events} now) go back to the judge with their rule's next batch, or once a judge call made after this gets a REPLY or WAIT, or when the hold is released, as an operator's release of a provider wait or a surgery's end does, and no turn that changes what the judge reads runs and the host isn't quiesced. A new batch whose call fails is dropped without waking the agent, and so are the held events it took in.`);
   }
 
   // =========================================================================

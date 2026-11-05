@@ -641,7 +641,7 @@ test("a turn that fails for good as its stream is set up, after its agent's name
     return make(request);
   };
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
-  const internal = r.fw as unknown as { agents: Map<string, object>; failedLastTurnFor(agentName: string): unknown };
+  const internal = r.fw as unknown as { agents: Map<string, object>; failedLastTurnFor(agentName: string): unknown; lastStartFailed: WeakMap<object, number> };
   const original = internal.agents.get('resident')!;
   rebind = () => {
     rebind = () => {};
@@ -656,6 +656,7 @@ test("a turn that fails for good as its stream is set up, after its agent's name
   try {
     r.say('zz-question');
     await waitFor(() => r.count('inference:exhausted') === 1, 'the turn to fail for good');
+    assert.ok(internal.lastStartFailed.has(original), 'premise: the failing frame marked its own agent');
     assert.strictEqual(marked, false, 'not marked as the turn failed');
     assert.strictEqual(internal.failedLastTurnFor('resident'), undefined);
   } finally {
@@ -672,6 +673,7 @@ for (const [how, failsAt] of [['reported by its stream', 'event'], ['thrown by i
       agents: Map<string, object>;
       failedLastTurnFor(agentName: string): unknown;
       releaseAgentRuntime(agent: object): void;
+      lastStartFailed: WeakMap<object, number>;
     };
     const original = internal.agents.get('resident')!;
     let ended = false;
@@ -689,6 +691,7 @@ for (const [how, failsAt] of [['reported by its stream', 'event'], ['thrown by i
       console.error = errors;
     }
     assert.ok(ended, "premise: a listener of the turn's failure ended its agent");
+    assert.ok(internal.lastStartFailed.has(original), 'premise: the failing frame marked its own agent');
     internal.agents.set('resident', Object.assign(Object.create(Object.getPrototypeOf(original)), original));
     try {
       assert.strictEqual(internal.failedLastTurnFor('resident'), undefined);
@@ -744,16 +747,20 @@ test("a silent start that throws before its stream, at the turn's checkpoint, is
   const internal = r.fw as unknown as {
     recordTurnCheckpoint(agentName: string): void;
     failedLastTurnFor(agentName: string): { at: number; again: { kind: string } } | undefined;
+    activeTurnTriggers: Map<string, { suppressProse?: boolean }>;
   };
   const record = internal.recordTurnCheckpoint.bind(r.fw);
+  let silent: boolean | undefined;
   internal.recordTurnCheckpoint = () => {
     internal.recordTurnCheckpoint = record;
+    silent = internal.activeTurnTriggers.get('resident')?.suppressProse;
     throw new Error('zz checkpoint refused');
   };
   const before = Date.now();
   queue(r, { reason: 'zz-silent-tick', suppressProse: true });
   await waitFor(() => internal.failedLastTurnFor('resident') !== undefined, 'the judge to be told the silent start failed');
   assert.ok(internal.failedLastTurnFor('resident')!.at >= before);
+  assert.equal(silent, true, "premise: the failing start's trigger kept suppressProse");
   assert.equal(membrane.sends.length, 0, 'premise: the start threw before sending anything');
 });
 
