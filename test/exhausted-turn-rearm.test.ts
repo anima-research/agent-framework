@@ -761,6 +761,7 @@ test("a silent start that throws before its stream, at the turn's checkpoint, is
   await waitFor(() => internal.failedLastTurnFor('resident') !== undefined, 'the judge to be told the silent start failed');
   assert.ok(internal.failedLastTurnFor('resident')!.at >= before);
   assert.equal(silent, true, "premise: the failing start's trigger kept suppressProse");
+  assert.equal(internal.failedLastTurnFor('resident')!.again.kind, 'none', 'nothing queued or held runs it again');
   assert.equal(membrane.sends.length, 0, 'premise: the start threw before sending anything');
 });
 

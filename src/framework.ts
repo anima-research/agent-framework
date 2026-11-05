@@ -6249,7 +6249,7 @@ export class AgentFramework {
     const agent = this.agents.get(agentName);
     const model = agent?.model;
     const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
-    const unread = (r: InferenceRequest): boolean => !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m)));
+    const unread = (r: InferenceRequest): boolean => !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m, true)));
     const mine = (r: InferenceRequest): boolean => r.agentName === agentName;
     const arriving = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
     for (const pass of this.passRequests) for (const taken of pass.values()) arriving.push(...taken.filter(mine));
@@ -31544,14 +31544,14 @@ export class AgentFramework {
     );
   }
 
-  private alreadyRead(agent: Agent, r: InferenceRequest): boolean {
+  private alreadyRead(agent: Agent, r: InferenceRequest, readOnly = false): boolean {
     // A chat:system notice asks nothing either, ambient or not, and no
     // speech is routed by it, so waiting for one in its channel would
     // keep its wake forever.
     const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
       ? undefined : { serverId: r.source, channelId: r.channelId };
-    return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to)
-      : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to);
+    return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to, readOnly)
+      : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to, readOnly);
   }
 
   /** Whether a wake for a deferred write has nothing left for the agent to
@@ -31571,10 +31571,10 @@ export class AgentFramework {
    *  another branch, or a store that can't be read: a turn that finds
    *  nothing new costs less than a write no wake brings the agent to read
    *  or answer. */
-  private deferredWriteDone(agent: Agent, writeId: string, to: PublishDestination | undefined): boolean {
+  private deferredWriteDone(agent: Agent, writeId: string, to: PublishDestination | undefined, readOnly = false): boolean {
     // Settled first, so a write that landed is judged by its stored row; one
     // still a doubt stays queued, which keeps the wake.
-    this.settleUnknownLandings((m) => m.id === writeId);
+    if (!readOnly) this.settleUnknownLandings((m) => m.id === writeId);
     if (this.deferredMessages.some((m) => m.id === writeId)) return false;
     try {
       const cm = agent.getContextManager();
@@ -31584,19 +31584,19 @@ export class AgentFramework {
       if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
       return this.writeAnswered(agent, cm, row, to);
     } catch (error) {
-      console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
+      if (!readOnly) console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
       return false;
     }
   }
 
-  private storedMessageDone(agent: Agent, messageId: string, to: PublishDestination | undefined): boolean {
+  private storedMessageDone(agent: Agent, messageId: string, to: PublishDestination | undefined, readOnly = false): boolean {
     try {
       const cm = agent.getContextManager();
       const row = cm.getMessage(messageId);
       if (!row) return true;
       return this.writeAnswered(agent, cm, row, to);
     } catch (error) {
-      console.error(`[wake] ${agent.name}: could not read whether stored message ${messageId} was read, so its wake stays:`, error);
+      if (!readOnly) console.error(`[wake] ${agent.name}: could not read whether stored message ${messageId} was read, so its wake stays:`, error);
       return false;
     }
   }

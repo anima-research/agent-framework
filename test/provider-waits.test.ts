@@ -849,6 +849,39 @@ test('auxiliary admission: the same model is refused without a call; another mod
   });
 });
 
+test('auxiliary admission: the wait a refused call states is the one its single clock reading found binding', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, 60_000);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      const waits = internal.providerWaits;
+      const until = waits.active('resident', 'zz-model')?.until;
+      assert.ok(typeof until === 'number', 'premise: a wait with an end binds the model');
+      const active = waits.active.bind(waits);
+      const readAt: Array<number | undefined> = [];
+      (waits as unknown as { active: (agent: string, model: string, at?: number) => unknown }).active = (agent, model, at) => {
+        readAt.push(at);
+        return active(agent, model, at);
+      };
+      const realNow = Date.now;
+      let clock = realNow();
+      Date.now = () => (clock += 7);
+      let refused: unknown;
+      try {
+        refused = await internal.auxiliaryMembraneFor('resident').complete(auxRequest('zz-model')).then(() => undefined, (e: unknown) => e);
+      } finally {
+        Date.now = realNow;
+      }
+      assert.ok(refused instanceof MembraneError);
+      const stated = refused.retryAfterMs;
+      assert.ok(readAt.some((at) => at !== undefined && stated === until - at), `stated ${stated}, read at ${JSON.stringify(readAt)}, until ${until}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("an auxiliary call's stated wait binds that model only", async () => {
   await withStoreDir(async (path) => {
     const log = silence();

@@ -191,12 +191,12 @@ function renderBlock(block: ContentBlock): string {
     case 'video':
       return '[video]';
     case 'tool_use':
-      return `[calls ${block.name}] ${cut(safeJson(block.input), MAX_TOOL_CHARS)}`;
+      return `[calls ${oneLine(block.name)}] ${cut(safeJson(block.input), MAX_TOOL_CHARS)}`;
     case 'tool_result': {
       const body = typeof block.content === 'string'
         ? unlabelled(block.content)
         : block.content.map((b) => (b.type === 'text' ? unlabelled(b.text) : `[${b.type}]`)).join('\n');
-      return `[${block.toolName ?? 'tool'} ${block.isError ? 'failed' : 'returned'}] ${cut(body, MAX_TOOL_CHARS)}`;
+      return `[${oneLine(block.toolName ?? 'tool')} ${block.isError ? 'failed' : 'returned'}] ${cut(body, MAX_TOOL_CHARS)}`;
     }
     default:
       // thinking, redacted thinking, system changes: not the conversation.
@@ -435,9 +435,9 @@ export class ReplyJudge {
   }
 
   private async build(
-    request: JudgeRequest, now: number | undefined, atRatio?: number, fresh = false,
+    request: JudgeRequest, now: number | undefined, atRatio?: number, fresh = false, forAgent?: string,
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
-    const agentName = this.chooseAgent(request.agentNames);
+    const agentName = forAgent ?? this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
     const preview = await this.preview(agentName);
@@ -619,7 +619,7 @@ export class ReplyJudge {
       this.anchors.delete(built.agentName);
       const refused = built;
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
-      built = await this.build(request, undefined, MIN_CHARS_PER_TOKEN, true);
+      built = await this.build(request, undefined, MIN_CHARS_PER_TOKEN, true, refused.agentName);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request on rule ${quotedValue(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
