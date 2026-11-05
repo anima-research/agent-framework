@@ -6715,7 +6715,7 @@ export class AgentFramework {
     // failure streak), and the wait applies to the calls that follow it.
     if (!acceleration && !hostHold) {
       return wait !== undefined && isMembraneError(error) && error.retryable === true
-        && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(trigger)] : [], true);
+        && this.holdForProviderWait(agent, wait, trigger ? [this.turnRetryOf(trigger, this.turnRouting.get(agent.name))] : [], true);
     }
     // As in holdForProviderWait: once stop() has closed admission, nothing is
     // held, and nothing started.
@@ -6727,7 +6727,7 @@ export class AgentFramework {
     const held = existing?.heldRequests ?? [];
     // The failed turn's own request, kept as its retry (TURN_RETRY). An
     // auxiliary call's failure passes no trigger: it holds no turn of its own.
-    if (trigger) this.holdRequest(held, asTurnRetry(trigger));
+    if (trigger) this.holdRequest(held, this.turnRetryOf(trigger, this.turnRouting.get(agent.name)));
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(delayMs, MAX_TIMER_DELAY_MS)); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
@@ -6841,7 +6841,7 @@ export class AgentFramework {
     if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number') return undefined;
     if (this.registry.homeChannel(agent.name) !== undefined) {
       const wait = this.recordProviderWait(agent.name, agent.model, error);
-      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(trigger)] : [], true)
+      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [this.turnRetryOf(trigger, this.turnRouting.get(agent.name))] : [], true)
         ? 'held'
         : undefined;
     }
@@ -20005,7 +20005,8 @@ export class AgentFramework {
         requests = requests.flatMap((r) => {
           const batch = mergedBatch(r);
           if (!batch?.length) return [r];
-          const channels = wakeChannelsOf([batch[0], r]);
+          const own = r.wakeChannels?.filter((c) => !batch.some((m) => m.wakeChannels?.some((x) => sameChannel(x, c))));
+          const channels = own?.length ? wakeChannelsOf([batch[0], { wakeChannels: own }]) : undefined;
           return channels ? [{ ...batch[0]!, wakeChannels: channels }, ...batch.slice(1)] : batch;
         });
       }
@@ -21462,6 +21463,12 @@ export class AgentFramework {
 
   private wakeChannelsMark(routing: TurnRouting | undefined): { wakeChannels?: ChannelRef[] } {
     return routing && !routing.locus && !routing.noChannel && routing.wakeChannels ? { wakeChannels: routing.wakeChannels } : {};
+  }
+
+  private turnRetryOf(trigger: InferenceRequest, routing: TurnRouting | undefined): InferenceRequest {
+    const retry: MarkedRequest = asTurnRetry(trigger);
+    delete retry.wakeChannels;
+    return Object.assign(retry, this.wakeChannelsMark(routing));
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
@@ -25112,7 +25119,7 @@ export class AgentFramework {
       if (this.registry.homeChannel(agent.name) !== undefined) {
         const wait = this.providerWaits?.active(agent.name, agent.model);
         // The turn has begun (inference:started), so the hold keeps its retry.
-        if (wait && this.holdForProviderWait(agent, wait, trigger ? [asTurnRetry(withTurnCarry(trigger, carry))] : [], false, () => {
+        if (wait && this.holdForProviderWait(agent, wait, trigger ? [this.turnRetryOf(withTurnCarry(trigger, carry), routing)] : [], false, () => {
           // The stream the compile made won't be sent: it's cancelled, and
           // this start's window closes, before the hold is reported, so a stop
           // made while inference:failed is delivered finds neither, and the
@@ -25282,7 +25289,7 @@ export class AgentFramework {
         // once the retry is held finds the held retry (abortInference's
         // drop), not a window nothing will collect.
         if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-        await this.startAgentStream(agent, retry && asTurnRetry(retry), attempt + 1);
+        await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
       } else {
         this.noteFailedTurnEnd(agent, routing);
         // Terminal failure with no driveStream: this frame owns teardown.
@@ -27133,7 +27140,7 @@ export class AgentFramework {
                   return;
                 }
                 // Marked as its turn's retry, as at the start's failure.
-                await this.startAgentStream(agent, retry && asTurnRetry(retry), attempt + 1);
+                await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1);
               } else {
                 // The turn ends here, and its inference:failed doesn't say so,
                 // since a retry usually follows one: an inference:aborted
