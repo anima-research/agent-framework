@@ -1290,7 +1290,7 @@ function gotPartway(routing: TurnRouting): boolean {
 
 const REARM_REASON = 'exhausted-turn-rearm';
 
-type WakesOnTheirWay = { queued: string[]; held?: { until?: number; rearm?: { number: number; of: number } } };
+type WakesOnTheirWay = { queued: string[]; batchOnly?: string[]; held?: { until?: number; rearm?: { number: number; of: number } } };
 
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
   return (request as MarkedRequest)[MERGED_BATCH];
@@ -4110,7 +4110,7 @@ export class AgentFramework {
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
    *  its admission back; the park, woken, then finds it gone. */
   private parkedContinuations: Set<InferenceRequest> = new Set();
-  private parkedStarts: Set<{ agent: Agent }> = new Set();
+  private parkedStarts: Set<{ agent: Agent; batchOnly: boolean }> = new Set();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
    *  token, and a turn that has ended isn't live (liveTurns). A later start
@@ -6223,13 +6223,14 @@ export class AgentFramework {
    */
   private upcomingWakesFor(agentName: string, onTheirWay = this.wakesOnTheirWay(agentName)): import('./gate/types.js').UpcomingWake[] {
     const wakes: import('./gate/types.js').UpcomingWake[] = [];
-    const { queued, held } = onTheirWay;
+    const { queued, batchOnly = [], held } = onTheirWay;
     if (queued.length > 0) {
       wakes.push({
         certain: true,
         what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(queued[0]), 0, 80)})`,
       });
     }
+    for (const what of batchOnly) wakes.push({ certain: false, what });
     if (held) {
       wakes.push(held.until === undefined
         ? { when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }
@@ -6248,33 +6249,42 @@ export class AgentFramework {
     const requests = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
     for (const pass of this.passRequests) for (const taken of pass.values()) requests.push(...taken.filter(mine));
     const queued = requests.map((r) => String(r.reason));
-    for (const parked of this.parkedStarts) if (parked.agent === agent) queued.push('a start waiting for an auxiliary call to finish');
-    if (this.assembling.has(agentName)) queued.push('a start assembling its deferred pushes');
+    const batchOnly: string[] = [];
+    for (const parked of this.parkedStarts) {
+      if (parked.agent !== agent) continue;
+      if (parked.batchOnly) batchOnly.push('a start waiting for an auxiliary call to finish, which starts no turn if its deferred pushes give it nothing to read');
+      else queued.push('a start waiting for an auxiliary call to finish');
+    }
+    if (this.assembling.has(agentName)) {
+      if (this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length) batchOnly.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
+      else queued.push('a start assembling its deferred pushes');
+    }
+    const waiting = queued.length + batchOnly.length;
     const ends = (until: number | null | undefined): { until?: number } =>
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
     const model = this.agents.get(agentName)?.model;
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     const otherModel = cooldown?.waitModel !== undefined && cooldown.waitModel !== model;
-    if (cooldown && !((cooldown.rearm || otherModel) && queued.length > 0)) {
+    if (cooldown && !((cooldown.rearm || otherModel) && waiting > 0)) {
       const releaseWakes = cooldown.heldRequests.some(unread) || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
-      if (releaseWakes || queued.length > 0) {
+      if (releaseWakes || waiting > 0) {
         const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
         const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
         const until = wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
         return { queued: [], held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
       }
     }
-    const wait = queued.length > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
+    const wait = waiting > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
     if (wait) return { queued: [], held: ends(wait.until) };
-    return { queued };
+    return { queued, batchOnly };
   }
 
   private failedLastTurnFor(agentName: string, onTheirWay?: WakesOnTheirWay): import('./gate/types.js').FailedLastTurn | undefined {
     const agent = this.agents.get(agentName);
     const at = agent && this.lastStartFailed.get(agent);
     if (at === undefined) return undefined;
-    const { queued, held } = onTheirWay ?? this.wakesOnTheirWay(agentName);
-    if (queued.length > 0) return { at, again: { kind: 'queued' } };
+    const { queued, batchOnly = [], held } = onTheirWay ?? this.wakesOnTheirWay(agentName);
+    if (queued.length > 0 || batchOnly.length > 0) return { at, again: { kind: 'queued' } };
     return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}) } : { kind: 'none' } };
   }
 
@@ -23590,7 +23600,7 @@ export class AgentFramework {
         // owned and the continuation receives it after the in-flight call settles.
         const parkedContinuation = trigger !== undefined && continuesTurn(trigger);
         if (parkedContinuation) this.parkedContinuations.add(trigger);
-        const parkedStart = parkedContinuation ? undefined : { agent };
+        const parkedStart = parkedContinuation ? undefined : { agent, batchOnly: Boolean(trigger?.coalescingBatchSubjects?.length) };
         if (parkedStart) this.parkedStarts.add(parkedStart);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
           if (parkedStart) this.parkedStarts.delete(parkedStart);
