@@ -257,7 +257,7 @@ function inWhile(at: number | undefined, now: number): string {
 
 export function failedTurnLine(failed: FailedLastTurn, agentName: string, now: number): string {
   const opening = `${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`;
-  const maybe = failed.again.kind !== 'none' && failed.again.maybe ? ', which starts no turn if its deferred pushes give it nothing to read' : '';
+  const maybe = failed.again.kind !== 'none' && failed.again.maybe ? ', which may not start a turn' : '';
   switch (failed.again.kind) {
     case 'queued':
       return `${opening} A wake for ${agentName} is already queued${maybe}.`;

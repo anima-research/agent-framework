@@ -17,6 +17,8 @@ import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, 
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
+import { ifYouWait } from '../src/gate/reply-judge.js';
+import type { FailedLastTurn, UpcomingWake } from '../src/gate/types.js';
 
 function withStoreDir<T>(fn: (path: string) => Promise<T> | T): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), 'held-turn-retry-'));
@@ -509,6 +511,36 @@ test("a conversation agent's start assembling its deferred pushes under a provid
       assembled();
       await started;
       assert.ok(log.lines.some((line) => line.includes('binds after the compile')), 'premise: the wait holds it after its compile');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a conversation agent's failed last turn beside its start assembling under a provider wait on its model tells the judge only that the wake may not start a turn, as the wake list gives the wait as its reason", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
+      const agent = fw.getAgent('resident')!;
+      agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
+      const view = internal as unknown as {
+        pushCoalescer: unknown; assembling: Set<string>; lastStartFailed: WeakMap<object, number>;
+        upcomingWakesFor(agentName: string): UpcomingWake[]; failedLastTurnFor(agentName: string): FailedLastTurn | undefined;
+      };
+      let assembled!: () => void;
+      const assembly = new Promise<undefined>((resolve) => { assembled = () => resolve(undefined); });
+      view.pushCoalescer = { pendingBatches: () => 1, assemble: () => assembly, isRendering: () => false, identity: () => undefined, suspend: () => {} };
+      const started = internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      await waitFor(fw, () => view.assembling.has('resident'), 'the start to assemble');
+      internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz wait while it assembles');
+      const now = Date.now();
+      view.lastStartFailed.set(agent, now - 30_000);
+      const lines = ifYouWait(view.upcomingWakesFor('resident'), 'resident', now, view.failedLastTurnFor('resident')).split('\n');
+      assert.equal(lines[1], "resident's last turn, 30s ago, failed and may not have answered all of what woke it. A wake for resident is already queued, which may not start a turn.");
+      assert.ok(lines.includes('- as soon as it is free, maybe: a start assembling its deferred pushes, which a provider wait on its model holds after its compile if the wait still stands then'), lines.join('\n'));
+      assembled();
+      await started;
     } finally { await fw.stop(); log.restore(); }
   });
 });
