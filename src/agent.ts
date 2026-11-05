@@ -2753,16 +2753,22 @@ export class Agent {
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
-      const own = ownSystemChanges(shown, (name) => this.ownsChange(name));
-      const kept = (_: unknown, index: number) => !own.has(index);
-      const provenance = shown.provenance && { ...shown.provenance, messages: shown.provenance.messages.filter(kept) };
-      return { compiled: { ...shown, messages: shown.messages.filter(kept), ...(provenance ? { provenance } : {}) }, head: current };
+      return { compiled: this.withoutOwnChanges(shown), head: current };
     }
-    if (!this.headDeclarations.write(this.name, copyHead(current))) return { compiled, head: recorded ?? current };
+    if (!this.headDeclarations.write(this.name, copyHead(current))) {
+      return recorded ? { compiled, head: recorded } : { compiled: this.withoutOwnChanges(compiled), head: current };
+    }
     const removed = this.removeOwnChanges();
     this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
     const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
+  }
+
+  private withoutOwnChanges(compiled: CompileResult): CompileResult {
+    const own = ownSystemChanges(compiled, (name) => this.ownsChange(name));
+    const kept = (_: unknown, index: number) => !own.has(index);
+    const provenance = compiled.provenance && { ...compiled.provenance, messages: compiled.provenance.messages.filter(kept) };
+    return { ...compiled, messages: compiled.messages.filter(kept), ...(provenance ? { provenance } : {}) };
   }
 
   // context-manager: `firstChanged` is the first compiled message whose bytes
