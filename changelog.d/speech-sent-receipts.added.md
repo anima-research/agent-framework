@@ -4,7 +4,10 @@
   or locked, on a host with a channel registry). Resolve to a `SpeechSent`, `{
   sentTo }`, when the module showed that text to someone; the turn names the
   place in its receipt and, with no channel, writes no undeliverable notice
-  for it. Resolve to `{}` otherwise: the notice then still says another
+  for it. The place reads as one line, each whitespace run as one space and
+  none at either end, and an opening of one of the framework's notice tags
+  in it, such as `[routing]`, reads with a backslash before it. Resolve to
+  `{}` otherwise: the notice then still says another
   surface may have shown it. A piece held as a draft gets no such notice,
   since it's named as a draft. Modules are asked together, and their answers
   about each piece are waited for at most `SPEECH_RECEIPT_WAIT_MS` (5 s,

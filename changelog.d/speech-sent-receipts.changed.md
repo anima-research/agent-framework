@@ -7,7 +7,9 @@
   when the turn tried a channel post, such as a hybrid `>>>` envelope). A turn
   whose speech went to a channel also has its receipt name where a module
   showed the speech, beside the channel; one whose channel post failed names
-  that place in its receipt, and the failed post keeps its own notice. This
+  that place in its receipt, and the failed post keeps its own notice. An
+  ephemeral run that a tool ends writes no receipt, as before, and a place a
+  module names for its speech is logged instead. This
   holds under prose routing by locus, hybrid and locked, for each tool round's
   prose as it routes and for the final reply.
 - **Hosts:** a routed piece of speech with no channel that a module says it
@@ -17,7 +19,21 @@
   module showed emits it as before, except an ephemeral run's, which emits
   none, as before. `ChannelRegistry`'s `onRouteFailure` info now
   carries `text`, the words routed, so a host that logs that info logs the
-  agent's speech.
+  agent's speech. `text` is optional in the info's type: the registry sets
+  it on every failure it reports, and a no-channel notice for an info
+  without it, or for speech that's only whitespace, names the speech by its
+  length alone.
+- **Hosts:** a turn's receipt that can't be recorded logs `[delivered]
+  <agent>: its receipt couldn't be recorded; it named <places>: <error>`,
+  where it logged `delivery receipt append failed: <error>`. A module's answer
+  that names a place after its turn's receipt, or for a turn that ended with
+  none, logs `[speechRouted] <agent>: shown by <places> …`, and a failure to
+  ask the modules logs `[speechRouted] <agent>: asking the modules where
+  speech went failed:`. Each module asked logs `Speech-routed module <name>
+  (agent <agent>) …` when its hook can't be read or errors, hasn't answered
+  within the wait, answers after it, or isn't asked while it's still
+  answering an earlier ask, and when the framework's callback for a place it
+  names throws.
 - **Hosts:** once another agent holds an agent's name, plain speech the
   replaced agent routes after that, under locus, locked, hybrid or explicit
   prose routing, a piece with a channel and an envelope's named target
