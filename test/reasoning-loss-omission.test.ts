@@ -18,11 +18,12 @@ class MarkedPrefix extends PassthroughStrategy {
   }
 }
 const flags = { system: true, kind: 'reasoning-loss' };
-async function fixture(conversations = false, settings: Partial<AgentConfig> = {}, membrane = new MockMembrane(), modules: Module[] = []) {
+async function fixture(conversations = false, settings: Partial<AgentConfig> = {}, membrane = new MockMembrane(), modules: Module[] = [], subconscious = false) {
   const dir = mkdtempSync(join(tmpdir(), 'af-reasoning-loss-'));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(), syncIntervalMs: 0, maintenanceIntervalMs: 0, modules,
     ...(conversations ? { conversations: { templateAgent: 'assistant' } } : {}),
+    ...(subconscious ? { subconscious: { enabled: true, reader: 'persistent' as const, systemPrompt: 'Read held traffic.' } } : {}),
     agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', strategy: new MarkedPrefix(), ...settings }],
   });
   cleanups.push(async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); });
@@ -31,7 +32,7 @@ async function fixture(conversations = false, settings: Partial<AgentConfig> = {
   const cm = agent.getContextManager();
   const add = (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => cm.addMessage(participant, content, metadata);
   const request = () => agent.buildActivationRequest([]);
-  return { framework, agent, cm, add, request, membrane };
+  return { framework, agent, cm, add, request, membrane, storePath: join(dir, 'store') };
 }
 const wire = (r: NormalizedRequest) => new NativeFormatter().buildMessages(r.messages, {
   participantMode: 'multiuser', assistantParticipant: 'assistant', promptCaching: true,
@@ -304,4 +305,77 @@ it('documents the native wire shape when omission makes two signed assistant tur
   assert.deepEqual(built[1]!.content.filter(b => b.type === 'thinking').map(b => b.signature), ['T1', 'T2']);
   // No binding setting in this case: preserve the formatter's existing merge,
   // including T2 after text. This is a wire-shape assertion, not provider validation.
+});
+
+it('omits stored shared-slot notices from a subconscious provider request', async () => {
+  const x = await fixture(false, {}, new MockMembrane(), [], true);
+  await x.add('user', [text('before')]);
+  await x.add('user', [text(notice)], flags);
+  await x.add('user', [text('after')]);
+  const subconscious = x.framework.getAgent('Subconscious')!;
+  assert.ok(subconscious);
+  assert.ok(x.cm.getAllMessages().some(m => m.metadata?.kind === 'reasoning-loss'),
+    'the flagged row is stored in the resident shared slot');
+  x.membrane.pushResponse(createMockResponse([text('reply')]));
+  await subconscious.runInference([]);
+  assert.deepEqual(x.membrane.calls.at(-1)!.messages.map(m => m.content), [[text('before')], [text('after')]]);
+  assert.ok(x.cm.getAllMessages().some(m => m.metadata?.kind === 'reasoning-loss'), 'the stored notice remains');
+});
+
+it('omits stored notices when an ended isolated agent resumes', async () => {
+  const x = await fixture();
+  const config = { model: 'test-model', systemPrompt: 'Test.' };
+  const first = await x.framework.createEphemeralAgent({ name: 'isolated', ...config });
+  cleanups.push(async () => first.cleanup());
+  first.contextManager.addMessage('user', [text('before')]);
+  first.contextManager.addMessage('user', [text(notice)], flags);
+  first.contextManager.addMessage('user', [text('after')]);
+  x.membrane.pushResponse(createMockResponse([text('first reply')]));
+  await x.framework.runEphemeralToCompletion(first.agent, first.contextManager);
+  const ended = x.framework.getAgentRecord('isolated')!;
+  assert.equal(ended.ended?.reason, 'completed');
+  assert.equal(ended.readsSharedSlot, false);
+  const resumed = await x.framework.resumeAgent('isolated', config);
+  cleanups.push(async () => resumed.cleanup());
+  assert.ok(resumed.contextManager.getAllMessages().some(m => m.metadata?.kind === 'reasoning-loss'),
+    'resume reopens the stored notice, not a filtered copy');
+  x.membrane.pushResponse(createMockResponse([text('resumed reply')]));
+  await x.framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+  const contents = x.membrane.calls.at(-1)!.messages.map(m => m.content);
+  assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('before')])));
+  assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('after')])));
+  assert.ok(!JSON.stringify(contents).includes(notice));
+  assert.equal(x.framework.getAgentRecord('isolated')!.incarnation, 2);
+});
+
+it('omits persisted notices from a reopened resident after a framework restart', async () => {
+  const x = await fixture();
+  await x.add('user', [text('before')]);
+  await x.add('user', [text(notice)], flags);
+  await x.add('user', [text('after')]);
+  await x.framework.stop();
+  // Leaving the original resident out of the next configuration ends it;
+  // inspection must reopen its shared-slot context rather than derive a live one.
+  const restarted = await AgentFramework.create({
+    storePath: x.storePath, membrane: x.membrane.asMembrane(), syncIntervalMs: 0, maintenanceIntervalMs: 0, modules: [],
+    agents: [{ name: 'replacement', model: 'test-model', systemPrompt: 'Test.', strategy: new PassthroughStrategy() }],
+  });
+  cleanups.push(async () => restarted.stop());
+  const ended = restarted.getAgentRecord('assistant')!;
+  assert.ok(ended.ended);
+  assert.equal(ended.readsSharedSlot, true);
+  assert.equal(restarted.getAgent('assistant'), null);
+  const reopened = await restarted.inspectAgentContext('assistant');
+  cleanups.push(async () => { reopened.close(); });
+  assert.ok(reopened.getAllMessages().some(m => m.metadata?.kind === 'reasoning-loss'),
+    'the flagged row survived a real store close and reopen');
+  const stored = structuredClone(reopened.getAllMessages());
+  const agent = new Agent({ name: 'assistant', model: 'test-model', systemPrompt: 'Test.' }, reopened, x.membrane.asMembrane());
+  x.membrane.pushResponse(createMockResponse([text('reply')]));
+  await agent.runInference([]);
+  const contents = x.membrane.calls.at(-1)!.messages.map(m => m.content);
+  assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('before')])));
+  assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('after')])));
+  assert.ok(!JSON.stringify(contents).includes(notice));
+  assert.deepEqual(reopened.getAllMessages().slice(0, stored.length), stored, 'inference leaves existing stored rows untouched');
 });
