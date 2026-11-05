@@ -203,7 +203,8 @@ describe('reply judge: a request refused as too long', () => {
     assert.ok(size(requests[2]!) < size(requests[1]!), `${size(requests[2]!)} < ${size(requests[1]!)}`);
   });
 
-  it('asks a refused request once more at one character a token and leaves the estimate as it was, and asks one built at one character a token only once', async () => {
+  it('asks a refused request once more at one character a token and leaves the estimate as it was, and asks one built at one character a token only once', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
     const { membrane, requests, size } = refusingMembrane(() => true);
     const judge = judgeOver(membrane);
     const asked: number[] = [];

@@ -6269,7 +6269,7 @@ export class AgentFramework {
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     const otherModel = cooldown?.waitModel !== undefined && cooldown.waitModel !== model;
     if (cooldown && !((cooldown.rearm || otherModel) && waiting > 0)) {
-      const releaseWakes = cooldown.heldRequests.some(unread) || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
+      const releaseWakes = cooldown.heldRequests.some(unread) || (cooldown.heldRequests.length === 0 && !(cooldown.auxiliaryOrigin || cooldown.emptiedBy));
       if (releaseWakes || waiting > 0) {
         const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
         const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
