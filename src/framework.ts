@@ -6694,9 +6694,12 @@ export class AgentFramework {
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
    *  already held marks that one, so the hold still keeps the turn alive.
-   *  In a merged start's batch, a member that carries the turn on takes an
-   *  equal wake only when it has all of the wake's opening messages: a wake
-   *  with others stays a member of its own, which an abort puts back. */
+   *  In a merged start's batch, a member folds only into an equal member of
+   *  its own kind: a wake in a batch and a member that carries the turn on
+   *  never fold into each other, so the wake stays a member of its own,
+   *  which an abort puts back. The copy of a request held on its own is the
+   *  exception: a member that carries the turn on takes it, as the mark above
+   *  takes that request. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
     const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
     if (!same) {
@@ -6710,10 +6713,10 @@ export class AgentFramework {
     const into = mergedBatch(same);
     const batch = mergedBatch(request);
     if (into || batch) {
-      const members = [...(into ?? [{ ...same }])];
+      const copy = into ? undefined : { ...same };
+      const members = into ? [...into] : [copy!];
       for (const member of batch ?? [request]) {
-        this.holdRequest(members, member, (kept) => continuesTurn(member) || !continuesTurn(kept) ||
-          (member.openingMessages ?? []).every((id) => kept.openingMessages?.includes(id)));
+        this.holdRequest(members, member, (kept) => continuesTurn(member) ? continuesTurn(kept) || kept === copy : !continuesTurn(kept));
       }
       (same as MarkedRequest)[MERGED_BATCH] = members;
     }
@@ -20662,8 +20665,9 @@ export class AgentFramework {
           const to = resolved && !('error' in resolved) ? { serverId: resolved.serverId, channelId: resolved.channelId } : null;
           const sendHold = sendHoldAt(sends, to);
           if (!sendHold) {
-            await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound);
-            continue;
+            if (await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound)) continue;
+            this.logReplacedRouting(agent, written.slice(index).join('').length + segments.slice(segmentIndex + 1).join('').length);
+            return false;
           }
           if (to) {
             routing.pin = to;
@@ -20687,8 +20691,9 @@ export class AgentFramework {
           // Malformed: an attempted destination that names none.
           const sendHold = sendHoldAt(sends, null);
           if (!sendHold) {
-            await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound);
-            continue;
+            if (await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound)) continue;
+            this.logReplacedRouting(agent, written.slice(index).join('').length + segments.slice(segmentIndex + 1).join('').length);
+            return false;
           }
           delete routing.pin;
           routing.hybridHold = 'failed';
@@ -20699,8 +20704,9 @@ export class AgentFramework {
           const target = routing.hybridHold === 'failed' ? null : routing.pin ?? locus;
           const sendHold = sendHoldAt(sends, target);
           if (!sendHold) {
-            await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound);
-            continue;
+            if (await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound)) continue;
+            this.logReplacedRouting(agent, written.slice(index).join('').length + segments.slice(segmentIndex + 1).join('').length);
+            return false;
           }
           hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}), ...(segmentIndex < finalFrom ? { final: false } : {}) });
         }
@@ -21510,6 +21516,11 @@ export class AgentFramework {
     }
     if (locus === null && !this.takesGlobalFallback(agent.name)) {
       return this.channelRegistry!.routeSpeech(agent.name, text, locus);
+    }
+    const now = this.agents.get(agent.name);
+    if (now && now !== agent) {
+      console.error(`[routeSpeech] ${agent.name}: replaced before this piece was routed; ${text.length} chars not routed for the replacement`);
+      return null;
     }
     const asked = this.askSpeechRouted(agent, round, text);
     this.trackSpeechAsk(agent, round.routing, asked);
@@ -23566,6 +23577,11 @@ export class AgentFramework {
     return draft ? draftState(draft) : 'let go';
   }
 
+  /** Says that `chars` of a reply weren't routed, since another agent now holds its agent's name. */
+  private logReplacedRouting(agent: Agent, chars: number): void {
+    console.error(`[prose] ${agent.name}: replaced while its reply was routed; ${chars} chars not routed for the replacement`);
+  }
+
   /** Locus-preserving explicit publication. Source remains byte-identical in Chronicle. */
   private async deliverHybridProse(
     agent: Agent,
@@ -23576,22 +23592,23 @@ export class AgentFramework {
   ): Promise<void> {
     const envelopes = splitHybridEnvelopes(rawText);
     for (const [i, envelope] of envelopes.entries()) {
-      const current = this.agents.get(agent.name);
-      if (current && current !== agent) {
-        console.error(`[prose] ${agent.name}: replaced while its reply was routed; ${envelopes.slice(i).join('').length} chars not routed for the replacement`);
+      if (!await this.deliverHybridEnvelope(agent, envelope, locus, allowLocus, round)) {
+        this.logReplacedRouting(agent, envelopes.slice(i).join('').length);
         return;
       }
-      await this.deliverHybridEnvelope(agent, envelope, locus, allowLocus, round);
     }
   }
 
+  /** Route one hybrid envelope; false, routing nothing, once another agent holds its agent's name. */
   private async deliverHybridEnvelope(
     agent: Agent,
     envelope: string,
     locus: ChannelRef | null,
     allowLocus: boolean,
     round: ProseRound,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const current = this.agents.get(agent.name);
+    if (current && current !== agent) return false;
     const routing = round.routing;
     routing.lastEnvelopeBounced = false;
     const normalized = envelope;
@@ -23604,7 +23621,7 @@ export class AgentFramework {
       // `>>>skip_reply {{unsent}}`: the resident sets the bounced draft aside.
       if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
       console.error(`[prose] ${agent.name}: >>>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
-      return;
+      return true;
     }
     if (parsed.kind === 'target') {
       const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!, { forSpeech: true, own: this.ownChannels(routing) });
@@ -23612,7 +23629,7 @@ export class AgentFramework {
         delete routing.pin;
         routing.hybridHold = 'failed';
         this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>', round);
-        return;
+        return true;
       }
       let body = parsed.body;
       const usedClipboard = body.includes('{{unsent}}');
@@ -23620,7 +23637,7 @@ export class AgentFramework {
       if (unsent.refused) {
         delete routing.pin;
         routing.hybridHold = 'failed';
-        return;
+        return true;
       }
       // A function replacement: a draft's words go in exactly, `$&` and `$$` included.
       if (usedClipboard) body = body.replaceAll('{{unsent}}', () => unsent.draft?.text ?? '');
@@ -23629,7 +23646,7 @@ export class AgentFramework {
       delete routing.hybridHold;
       if (!body.trim()) {
         console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
-        return;
+        return true;
       }
       try {
         routing.postTried = true;
@@ -23654,22 +23671,22 @@ export class AgentFramework {
         routing.hybridHold = 'failed';
         this.bounceProse(agent, parsed.body, `sending to ${this.channelRegistry?.nameShown(resolved) ?? suppliedValue(resolved.channelId)} threw: ${suppliedValue(err instanceof Error ? err.message : String(err))}`, undefined, '>>>', round, { substituted: unsent.draft, outcome: 'unknown' });
       }
-      return;
+      return true;
     }
     if (attempted) {
       delete routing.pin;
       routing.hybridHold = 'failed';
       this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>', round);
-      return;
+      return true;
     }
     if (routing.hybridHold === 'private') {
       routing.keptPrivate++;
-      return;
+      return true;
     }
     const sticky = routing.pin;
     if (routing.hybridHold === 'failed' || (!allowLocus && !sticky)) {
       this.holdProseDrafts(agent, [envelope], 'no-destination', round.draftsRound ? { ...round, notice: 'later' } : round);
-      return;
+      return true;
     }
     const target = sticky ?? locus;
     try {
@@ -23682,6 +23699,7 @@ export class AgentFramework {
     } catch (err) {
       console.error('hybrid locus delivery failed:', err);
     }
+    return true;
   }
 
   /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce

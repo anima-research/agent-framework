@@ -18,14 +18,20 @@
   none, as before. `ChannelRegistry`'s `onRouteFailure` info now
   carries `text`, the words routed, so a host that logs that info logs the
   agent's speech.
+- **Hosts:** once another agent holds an agent's name, plain speech the
+  replaced agent routes after that, under prose routing by locus or hybrid,
+  a piece with a channel and a `>>>` envelope's target included, is neither
+  asked about nor routed under that name, where it was routed; each stop is
+  logged with the agent's name and how many characters weren't routed for
+  the replacement.
 - **Hosts:** under a provider hold, a merged start and an equal wake keep each
   of their wakes once at the hold's release: a wake equal to one already in
   the start's batch folds into it, as a held turn's equal wakes fold, where
   two equal members of equal merged starts were both kept and
-  `getHostModeStatus().gatedRequests` counted both. A wake equal to a member
-  that carries the turn on, but naming messages that member doesn't, stays a
-  member of its own: it counts on its own, and an abort of the turn puts it
-  back.
+  `getHostModeStatus().gatedRequests` counted both. A wake and an equal
+  request that carries the turn on never fold into each other in the batch,
+  whichever joins: the wake stays a member of its own, counts on its own, and
+  an abort of the turn puts it back.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, except an ephemeral run's, which gets
   none, as before; the notice now names the piece by its opening words,

@@ -304,12 +304,13 @@ describe('plain speech a module says it showed', () => {
   };
   const askedTexts = (s: Surface) => s.asked.map((a) => ({ text: a.text, final: a.context.final }));
   /** A run whose turn speaks in `room`, as channel_open's result leaves its
-   *  routing, on a server whose posts take `postMs`. */
-  const runSpeaksIn = (f: AgentFramework, membrane: AtEachStream, name: string, postMs = 0) => {
+   *  routing, on a server whose posts wait for `post`: that many
+   *  milliseconds, or until it settles. */
+  const runSpeaksIn = (f: AgentFramework, membrane: AtEachStream, name: string, post: number | Promise<void> = 0) => {
     const { server, published } = channelServer(true);
     const publish = server.sendChannelsPublish;
     server.sendChannelsPublish = async (params) => {
-      await new Promise((resolve) => setTimeout(resolve, postMs));
+      await (typeof post === 'number' ? new Promise((resolve) => setTimeout(resolve, post)) : post);
       return publish(params);
     };
     const registry = internals(f).channelRegistry;
@@ -433,7 +434,7 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     const lines = errors.filter((e) => e.startsWith('[routeSpeech]'));
     assert.equal(lines.length, 1, lines.join('\n'));
-    assert.ok(lines[0]!.startsWith('[routeSpeech] resident: turn has no locus'), lines[0]);
+    assert.equal(lines[0], '[routeSpeech] resident: turn has no locus (no home/trigger channel; nothing to deliver into) — speech NOT routed (9 chars stay in chronicle)');
   });
 
   it("a place a module names reaches the receipt as one line, a notice's opening in it marked as text", async () => {
@@ -989,7 +990,8 @@ describe('plain speech a module says it showed', () => {
     const surface = new Surface();
     const membrane = new AtEachStream();
     const f = await host([surface], membrane);
-    const published = runSpeaksIn(f, membrane, 'run-1', 50);
+    let post!: () => void;
+    const published = runSpeaksIn(f, membrane, 'run-1', new Promise<void>((resolve) => { post = resolve; }));
     const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting: 'locus' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
@@ -997,6 +999,9 @@ describe('plain speech a module says it showed', () => {
     f.start();
     assert.equal((await run).speech, 'Done.');
     const runReceipt = () => created.contextManager.getAllMessages().map((m) => textOf(m.content)).find((text) => text.startsWith('[delivered]'));
+    assert.equal(runReceipt(), undefined, 'premise: the run returned before its post, so before its receipt');
+    assert.deepEqual(surface.asked.map((a) => a.text), ['Done.'], 'premise: its reply was asked about');
+    post();
     await until(() => runReceipt() !== undefined, "the run's receipt");
     assert.deepEqual(published.map((p) => p.text), ['Done.'], 'premise: its reply posted to its channel');
     assert.ok(runReceipt()!.includes(`sent to ${SENT_TO}`), runReceipt());
@@ -1017,7 +1022,7 @@ describe('plain speech a module says it showed', () => {
     }) as typeof manager.addMessage;
     await turn(f);
     assert.equal(receipt(f), undefined, 'premise: no receipt was recorded');
-    assert.ok(errors.some((e) => e.startsWith('[delivered] resident: its receipt couldn\'t be recorded; it named "sent\\u0020to\\u0020the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn": Error: zz-store full')), errors.join('\n'));
+    assert.ok(errors.includes('[delivered] resident: its receipt couldn\'t be recorded; it named "sent\\u0020to\\u0020the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn": Error: zz-store full'), errors.join('\n'));
   });
 
   it("a turn that fails after a round one module showed, while another hadn't answered, says that round's speech was handed on", async (t) => {
@@ -1114,7 +1119,7 @@ describe('plain speech a module says it showed', () => {
       surface.release();
       assert.equal(await result, null);
       assert.deepEqual(routed, []);
-      assert.ok(errors.some((e) => e.includes('[routeSpeech] resident: replaced while its modules were asked')), errors.join('\n'));
+      assert.ok(errors.includes(`[routeSpeech] resident: replaced while its modules were asked; ${'Said before the swap.'.length} chars not routed for the replacement`), errors.join('\n'));
     } finally {
       internal.agents.set('resident', original);
     }
@@ -1143,9 +1148,72 @@ describe('plain speech a module says it showed', () => {
     try {
       surface.release();
       await delivered;
-      assert.ok(errors.some((e) => e.includes('[routeSpeech] resident: replaced while its modules were asked')), `premise: the plain piece met the replacement: ${errors.join('\n')}`);
+      assert.ok(errors.includes(`[routeSpeech] resident: replaced while its modules were asked; ${'Said before the swap.'.length} chars not routed for the replacement`), `premise: the plain piece met the replacement: ${errors.join('\n')}`);
       assert.deepEqual(published, [], "the >>> envelope isn't posted for the replacement");
-      assert.ok(errors.some((e) => /^\[prose\] resident: replaced while its reply was routed; \d+ chars not routed for the replacement$/.test(e)), errors.join('\n'));
+      assert.ok(errors.includes(`[prose] resident: replaced while its reply was routed; ${'>>>room Posted after it.'.length} chars not routed for the replacement`), errors.join('\n'));
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+
+  it("a hybrid reply that a send in its turn didn't hold stops routing its later envelopes once another agent has replaced its own under its name", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    const f = await host([surface], new MockMembrane(), { proseRouting: 'hybrid' });
+    const { server, published } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      routingOf(name: string): unknown;
+      routeSilencedHybrid(agent: unknown, segments: string[], sends: unknown, draftsCause: boolean, round: unknown, locus: null, when: number): Promise<boolean>;
+    };
+    const original = internal.agents.get('resident');
+    const elsewhere = { serverId: 'srv', channelId: 'elsewhere' };
+    const sends = { places: new Map([['srv/elsewhere', { to: elsewhere, tool: 'channel_publish', delivered: true, round: 0 }]]) };
+    const routed = internal.routeSilencedHybrid(original, ['Said before the swap.\n>>>room Posted after it.'], sends, false, { routing: internal.routingOf('resident'), notice: 'later' }, null, 0);
+    await until(() => surface.asked.length > 0, "the plain piece's ask");
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      surface.release();
+      assert.equal(await routed, false, 'nothing was held as a draft');
+      assert.ok(errors.includes(`[routeSpeech] resident: replaced while its modules were asked; ${'Said before the swap.'.length} chars not routed for the replacement`), `premise: the plain piece met the replacement: ${errors.join('\n')}`);
+      assert.deepEqual(published, [], "the >>> envelope isn't posted for the replacement");
+      assert.deepEqual(askedTexts(surface).map((a) => a.text), ['Said before the swap.'], 'no module is asked about it either');
+      assert.ok(errors.includes(`[prose] resident: replaced while its reply was routed; ${'>>>room Posted after it.'.length} chars not routed for the replacement`), errors.join('\n'));
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+
+  for (const where of ['a channel', 'no channel'] as const) it(`a piece with ${where} that a replaced agent routes after another agent took its name is neither asked about nor routed`, async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane());
+    const { server, published } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      routingOf(name: string): unknown;
+      routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: { serverId: string; channelId: string } | null): Promise<unknown>;
+    };
+    const original = internal.agents.get('resident');
+    const text = 'Said after the swap.';
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      const result = await internal.routeLocusSpeech(original, { routing: internal.routingOf('resident') }, text, where === 'a channel' ? { serverId: 'srv', channelId: 'room' } : null);
+      assert.equal(result, null);
+      assert.deepEqual(surface.asked, [], 'no module is asked about it');
+      assert.deepEqual(published, [], "it isn't posted");
+      assert.ok(errors.includes(`[routeSpeech] resident: replaced before this piece was routed; ${text.length} chars not routed for the replacement`), errors.join('\n'));
     } finally {
       internal.agents.set('resident', original);
     }
@@ -1189,7 +1257,7 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.deepEqual(notices(f), []);
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
-    assert.ok(errors.some((e) => e.includes('Speech-routed module broken (agent resident) error reading its onSpeechRouted')), errors.join('\n'));
+    assert.ok(errors.includes('Speech-routed module broken (agent resident) error reading its onSpeechRouted: Error: broken accessor'), errors.join('\n'));
   });
 
   it("a place's callback that throws is logged, and the ask still settles with the place", async (t) => {
@@ -1201,7 +1269,7 @@ describe('plain speech a module says it showed', () => {
     const asked = registry.askSpeechRouted('resident', 'Hi.', { final: true }, () => { throw new Error('zz-callback broke'); });
     const settled = await Promise.race([asked, new Promise((resolve) => setTimeout(() => resolve('unsettled'), 1_000))]);
     assert.deepEqual(settled, [SENT_TO]);
-    assert.ok(errors.some((e) => e.includes("Speech-routed module console (agent resident) place's callback error")), errors.join('\n'));
+    assert.ok(errors.includes("Speech-routed module console (agent resident) place's callback error: Error: zz-callback broke"), errors.join('\n'));
   });
 
   it("a ' !' continuation names the messages of the turn that asked for it", async () => {
@@ -1294,6 +1362,7 @@ describe('plain speech a module says it showed', () => {
     const f = await host([surface], membrane, {}, false);
     await turn(f);
     assert.equal(membrane.calls.length, 1, 'premise: the turn ran');
+    assert.ok(f.getAgent('resident')!.getContextManager().getAllMessages().some((m) => textOf(m.content) === 'Hi there.'), "premise: the turn's reply was taken in");
     assert.deepEqual(surface.asked, []);
     assert.deepEqual(notices(f), []);
     assert.equal(receipt(f), undefined);
@@ -1377,6 +1446,7 @@ describe('plain speech a module says it showed', () => {
     membrane.pushResponse(afterLook('Looking around.', '>>>skip_reply kept to myself'));
     const f = await host([surface], membrane, { proseRouting: 'hybrid' });
     await turn(f);
+    assert.ok(f.getAgent('resident')!.getContextManager().getAllMessages().some((m) => textOf(m.content).includes('>>>skip_reply kept to myself')), "premise: the final round's reply was taken in");
     assert.deepEqual(askedTexts(surface), [{ text: 'Looking around.', final: false }]);
     assert.ok(!surface.asked.some((a) => a.text.includes('kept to myself')), 'the private envelope is never asked about');
     assert.deepEqual(notices(f), []);
@@ -1594,7 +1664,7 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.equal(notices(f).length, 1);
     assert.ok(notices(f)[0]!.includes('if another surface showed it'), 'a module that failed may have shown it');
-    assert.ok(errors.some((e) => e.startsWith('Speech-routed module console (agent resident) error:') && e.includes('console broke')), errors.join('\n'));
+    assert.ok(errors.includes('Speech-routed module console (agent resident) error: Error: console broke'), errors.join('\n'));
   });
 
   it("a module whose answer throws when its place is read counts as having shown nothing, and another module's place still counts", async (t) => {
@@ -1609,7 +1679,7 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.deepEqual(notices(f), []);
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
-    assert.ok(errors.some((e) => e.startsWith('Speech-routed module console (agent resident) error:') && e.includes('console broke')), errors.join('\n'));
+    assert.ok(errors.includes('Speech-routed module console (agent resident) error: Error: console broke'), errors.join('\n'));
   });
 
   it("modules that haven't answered are waited for together until the bound and no longer, and count as having shown nothing", async (t) => {
@@ -1673,8 +1743,8 @@ describe('plain speech a module says it showed', () => {
       assert.equal(receipt(f), undefined, 'and no receipt names its place');
       const line = late === 'late'
         ? 'Speech-routed module console (agent resident) answered after the 5 s wait: its answer counts for nothing'
-        : 'Speech-routed module console (agent resident) error after the wait:';
-      assert.ok(errors.some((e) => e.startsWith(line)), errors.join('\n'));
+        : 'Speech-routed module console (agent resident) error after the wait: Error: console broke late';
+      assert.ok(errors.includes(line), errors.join('\n'));
     });
   }
 
