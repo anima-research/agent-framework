@@ -1272,6 +1272,8 @@ function announcedDomainsOf(announce: unknown): string[] {
   return Array.isArray(domains) ? domains.filter((domain): domain is string => typeof domain === 'string') : [];
 }
 
+// A strategy from another context-manager copy can't be matched by class: its refusal is matched by name
+// (NoFoldPlanToPreviewError, from 0.23.1 on) or by 0.23.0's plain Error message, verbatim.
 const HIERARCHICAL_PREVIEW_REFUSAL = 'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview';
 
 function isNoFoldPlanRefusal(error: unknown): boolean {
