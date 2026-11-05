@@ -4302,19 +4302,19 @@ export class EventGate {
     for (const name of agentNames) {
       const due = this.selfWakeDue.get(name);
       if (due && this.selfWakeTimers.has(name)) {
-        wakes.push({ at: due.at, certain: true, what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
+        wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
       }
     }
     if (this.sleepUntil > now && (this.sleepAgent === undefined || agentNames.includes(this.sleepAgent))) {
-      wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
+      wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep' });
     }
     for (const [name, state] of this.debounceTimers) {
       if (name === exceptPolicy || state.events.length === 0) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
+        : { at: state.dueAt, certain: true, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
