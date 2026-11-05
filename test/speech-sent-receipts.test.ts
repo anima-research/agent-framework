@@ -1268,20 +1268,17 @@ describe('plain speech a module says it showed', () => {
     const surface = new Surface();
     surface.answer = 'held';
     const f = await host([surface], new MockMembrane());
-    const registry = (f as unknown as { moduleRegistry: { moduleContexts: Map<string, unknown>; askSpeechRouted(agent: string, text: string, context: SpeechRoutedContext): Promise<string[]> } }).moduleRegistry;
-    const registration = registry.moduleContexts.get('console');
+    const registry = (f as unknown as { moduleRegistry: { askSpeechRouted(agent: string, text: string, context: SpeechRoutedContext): Promise<string[]> } }).moduleRegistry;
     t.mock.timers.enable({ apis: ['setTimeout'] });
     void registry.askSpeechRouted('resident', 'First.', { final: false });
-    registry.moduleContexts.set('console', { zzReplacement: true });
-    try {
-      t.mock.timers.tick(SPEECH_RECEIPT_WAIT_MS);
-      await new Promise((resolve) => setImmediate(resolve));
-      void registry.askSpeechRouted('resident', 'Second.', { final: true });
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(surface.asked.length, 2, 'the module now registered under the name is asked');
-    } finally {
-      registry.moduleContexts.set('console', registration);
-    }
+    await f.removeModule('console');
+    const next = new Surface();
+    await f.addModule(next as unknown as Module);
+    t.mock.timers.tick(SPEECH_RECEIPT_WAIT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.reset();
+    assert.deepEqual(await registry.askSpeechRouted('resident', 'Second.', { final: true }), [SENT_TO]);
+    assert.equal(next.asked.length, 1, 'the module now registered under the name is asked');
   });
 
   it("a module removed once its ask outlasts the bound doesn't hold back the next module of that name", async (t) => {
