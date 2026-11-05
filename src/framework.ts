@@ -24946,7 +24946,6 @@ export class AgentFramework {
         : undefined;
       noteTurnChannel(routing, routing.triggerChannel);
       if (trigger) routing.openedBy = trigger;
-      delete routing.openingMessages;
       const unresolvedTrigger = !!trigger?.channelId && routing.triggerChannel === undefined;
       if (unresolvedTrigger) routing.noChannel = true;
       else delete routing.noChannel;
@@ -25040,7 +25039,6 @@ export class AgentFramework {
     }
     const opening = ownCause && !gotPartway(routing) ? trigger?.openingMessages : mergedOpeningMessages([routing, trigger]);
     if (opening) routing.openingMessages = [...opening];
-    else delete routing.openingMessages;
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.
     const turnLocus = turnProseRouting === 'disabled' ? undefined
