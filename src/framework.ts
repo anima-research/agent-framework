@@ -20143,11 +20143,8 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
-          if (prev) {
-            const pair = [prev, request];
-            const opening = mergedOpeningMessages(pair.some(bringsOwnMessages) ? pair.filter(hasOwnCauseForRun) : pair);
-            if (opening) kept.openingMessages = opening;
-          }
+          const opening = prev ? mergedOpeningMessages([prev, request]) : undefined;
+          if (opening) kept.openingMessages = opening;
           newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
