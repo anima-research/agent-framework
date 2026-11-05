@@ -2414,9 +2414,10 @@ export class EventGate {
      *  one whose every event `evaluate` was given a write for (`after`,
      *  naming the agent it went to by the time the batch is delivered: when
      *  it fires, when a judge rule's judging ends in a wake, or, if a turn or
-     *  the host's quiesce holds it, when that ends), doesn't write its line
-     *  when it's delivered: it hands the line to the wake
-     *  (WakeProvenance.lines), for a turn's start to decide (WakeLine).
+     *  the host's quiesce holds it, once no agent's turn is running and the
+     *  host isn't quiesced), doesn't write its line when it's delivered: it
+     *  hands the line to the wake (WakeProvenance.lines), for a turn's start
+     *  to decide (WakeLine).
      *  Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
     /** Whether the agent an event's write went to (`after`, as `evaluate`
@@ -3394,11 +3395,11 @@ export class EventGate {
   /** `after`: where the host put the event's own message, which it may fill
    *  in after this call, before the batch is delivered: when it fires, when a
    *  judge rule's judging ends in a wake, or, if a turn or the host's quiesce
-   *  holds it, when that ends. For a host that places handed lines
-   *  (`isNewestEntry`), a debounced batch whose every event has
-   *  a write hands its lines to the wake with those writes (WakeLine.after),
-   *  for the host's scheduler to drop the wake once the agent has read and
-   *  answered them, as AgentFramework's does for a request with
+   *  holds it, once no agent's turn is running and the host isn't quiesced.
+   *  For a host that places handed lines (`isNewestEntry`), a debounced batch
+   *  whose every event has a write hands its lines to the wake with those
+   *  writes (WakeLine.after), for the host's scheduler to drop the wake once
+   *  the agent has read and answered them, as AgentFramework's does for a request with
    *  `readsWakeLines`; absent, the event keeps its batch's wake. */
   evaluate(info: GateEventInfo, after?: WritePlacement): GateDecision {
     this.reloadIfChanged();

@@ -2,16 +2,16 @@
   whose every event the host wrote to the delivery agent's window (`after`,
   with its message's id), is written at the first fresh start after the
   batch is delivered (when it fires, when a judge rule's judging ends in a
-  wake, or, if a turn or the host's quiesce holds it, when that ends) of any
-  agent that reads that window, whatever woke that agent, not when the batch
-  is delivered, and it names only the events not yet answered then. A batch
-  answered by then leaves no line, and residents who share the window still
-  wake for it and find none, where a line was written when the batch was
-  delivered before. The lines owed to one start are written as one
-  `[Gate: N events matched]` line: its quoted events, those owed to the
-  window in the order their batches were delivered and then the start's own
-  wake's, then each channel's
-  messages, counted together under each name the channel was shown by, where
+  wake, or, if a turn or the host's quiesce holds it, once no agent's turn is
+  running and the host isn't quiesced) of any agent that reads that window,
+  whatever woke that agent, not when the batch is delivered, and it names
+  only the events not yet answered then. A batch answered by then leaves no
+  line, and residents who share the window still wake for it and find none,
+  where a line was written when the batch was delivered before. The lines
+  owed to one start are written as one `[Gate: N events matched]` line: its
+  quoted events, those owed to the window in the order their batches were
+  delivered and then the start's own wake's, then each channel's messages,
+  counted together under each name the channel was shown by, where
   each batch's line was written on its own. A start that finds the host
   quiesced or another reader of the window with a turn alive writes none, and
   the next start of any reader decides them again. A line left out because its one
