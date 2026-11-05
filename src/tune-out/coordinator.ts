@@ -568,29 +568,38 @@ export interface CancelAsk {
   scope?: string;
 }
 
+/** A tool result's content as an answer's JSON object, or undefined where it isn't one (a guard's placeholder, say). */
+function answerIn(content: unknown): Record<string, unknown> | undefined {
+  const raw = typeof content === 'string' ? content
+    : Array.isArray(content) ? content.map((c) => ((c as { type?: unknown }).type === 'text' ? String((c as { text?: unknown }).text ?? '') : '')).join('')
+    : '';
+  try {
+    const answer = JSON.parse(raw) as unknown;
+    return answer && typeof answer === 'object' && !Array.isArray(answer) ? answer as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The `cancel_tuneout` calls a window (`window`, the persistent
  * subconscious's, `author`) holds, its own rows', each with what its
  * result, where the window holds it, answered: waiting or not, and the
- * server and scope it names. A result that isn't there, or isn't JSON of an
- * answer, isn't waiting.
+ * server and scope it names. A result row that isn't an answer's JSON (the
+ * tool-result guard's placeholder, its batch not settled) is read from
+ * `archived`, the original results by tool use id (the guard's audit,
+ * subconsciousGuardedResults), where it holds one. A result that isn't
+ * there, or isn't an answer, isn't waiting.
  */
-export function cancelAsksIn(window: readonly WindowRow[], author: string): CancelAsk[] {
+export function cancelAsksIn(window: readonly WindowRow[], author: string, archived?: ReadonlyMap<string, unknown>): CancelAsk[] {
   const results = new Map<string, Record<string, unknown>>();
   for (const m of window) {
     for (const b of m.content as Array<{ type: string; toolUseId?: unknown; tool_use_id?: unknown; content?: unknown }>) {
       if (b.type !== 'tool_result') continue;
       const id = typeof b.toolUseId === 'string' ? b.toolUseId : b.tool_use_id;
       if (typeof id !== 'string') continue;
-      const raw = typeof b.content === 'string' ? b.content
-        : Array.isArray(b.content) ? b.content.map((c) => ((c as { type?: unknown }).type === 'text' ? String((c as { text?: unknown }).text ?? '') : '')).join('')
-        : '';
-      try {
-        const answer = JSON.parse(raw) as unknown;
-        if (answer && typeof answer === 'object' && !Array.isArray(answer)) results.set(id, answer as Record<string, unknown>);
-      } catch {
-        // Not an answer's JSON: not waiting.
-      }
+      const answer = answerIn(b.content) ?? (archived?.has(id) ? answerIn(archived.get(id)) : undefined);
+      if (answer) results.set(id, answer);
     }
   }
   const asks: CancelAsk[] = [];
@@ -755,6 +764,14 @@ export interface TuneOutFrameworkHooks {
    * (noteUnstampedStop). Left out, or with no subconscious, none.
    */
   subconsciousWindow?: () => readonly WindowRow[];
+  /**
+   * The persistent subconscious's tool results as the tool-result guard
+   * archived them before it stored their placeholders (its audit's staged
+   * batches), by tool use id: a boot reads one where a crash before the
+   * guard settled left the placeholder for the result (cancelAsksIn). Left
+   * out, or with no guard's audit, none.
+   */
+  subconsciousGuardedResults?: () => ReadonlyMap<string, unknown>;
   /** True when a channel is bound to a conversation-fork agent. */
   isForkBound: (channel: ChannelRef) => boolean;
   /** Gate privileged-users list (#77: privileged authors wake, like mentions). */
@@ -1996,7 +2013,13 @@ export class TuneOutCoordinator {
       } catch (err) {
         console.error(`[tune-out] the subconscious's window could not be read at boot, so a cancel it asked for isn't named: ${thrownReason(err)}`);
       }
-      const asks = cancelAsksIn(window, author);
+      let archived: ReadonlyMap<string, unknown> | undefined;
+      try {
+        archived = this.hooks.subconsciousGuardedResults?.();
+      } catch (err) {
+        console.error(`[tune-out] the tool-result guard's audit could not be read at boot, so a result it withheld isn't read from it: ${thrownReason(err)}`);
+      }
+      const asks = cancelAsksIn(window, author, archived);
       // What it was told of a hold's unrecorded stop already, and when: its
       // rows (by their sequence), and notices kept to be written (by the
       // store's head when kept; one kept with none counts as told now).

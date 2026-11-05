@@ -163,7 +163,7 @@ import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import { Refusal, errnoCode, errnoWayOn, systemWords } from './modules/workspace/answers.js';
-import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
+import { TOOL_RESULT_GUARD_AUDIT_STATE, type ToolResultGuard, type WithheldSpill } from './tool-result-guard.js';
 import {
   goesNative,
   nonErrorResultText,
@@ -17998,6 +17998,41 @@ export class AgentFramework {
     // A subconscious whose window isn't presented (a legacy one) has its
     // stored rows for its record (#844 round 8, Weft).
     return this.presents(sub) ? sub.getContextManager().getPresentedMessages() : sub.getContextManager().getAllMessages();
+  }
+
+  /**
+   * The persistent subconscious's tool results as its tool-result guard
+   * archived them (the coordinator's subconsciousGuardedResults): each
+   * `staged` record of its audit (TOOL_RESULT_GUARD_AUDIT_STATE, under the
+   * subconscious's name) holds its batch's original content, inline or as a
+   * blob, written and synced before the placeholder row's results went out,
+   * by tool use id, the placeholders' own. A crash before the guard settles
+   * the batch leaves the placeholder for the result in its record; the
+   * original is here. None with no subconscious, or no audit.
+   */
+  private subconsciousGuardedResults(): Map<string, unknown> {
+    const out = new Map<string, unknown>();
+    const name = this.subconsciousAgentName;
+    if (!name) return out;
+    const records = this.store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as unknown;
+    if (!Array.isArray(records)) return out;
+    for (const record of records as Array<{ type?: unknown; agentName?: unknown; content?: unknown }>) {
+      if (record?.type !== 'staged' || record.agentName !== name) continue;
+      let content = record.content;
+      if (content && typeof content === 'object' && !Array.isArray(content) && typeof (content as { blobId?: unknown }).blobId === 'string') {
+        const blob = this.store.getBlob((content as { blobId: string }).blobId);
+        try {
+          content = blob ? JSON.parse(blob.toString()) as unknown : undefined;
+        } catch {
+          content = undefined;
+        }
+      }
+      if (!Array.isArray(content)) continue;
+      for (const block of content as Array<{ type?: unknown; toolUseId?: unknown; content?: unknown }>) {
+        if (block?.type === 'tool_result' && typeof block.toolUseId === 'string') out.set(block.toolUseId, block.content);
+      }
+    }
+    return out;
   }
 
   /**
@@ -39088,6 +39123,7 @@ export class AgentFramework {
           this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined),
         unseenBySubconscious: (keep) => this.unseenBySubconscious(keep),
         subconsciousWindow: () => this.subconsciousWindow(),
+        subconsciousGuardedResults: () => this.subconsciousGuardedResults(),
         isForkBound: (channel) =>
           this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
         isPrivilegedAuthor: (authorId) =>

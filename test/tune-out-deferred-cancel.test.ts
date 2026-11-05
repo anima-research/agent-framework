@@ -762,6 +762,48 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
     }
   });
 
+  for (const guarded of [true, false]) it(guarded
+    ? "with the tool-result guard on, a crash before the guard settles leaves a placeholder for the result: the boot reads the original from the guard's audit and names the cancel"
+    : "control, the guard off: the same turn and crash name the cancel from the result row", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub, epochId } = await heldWithPrimer();
+    try {
+      const guard = (f.framework.getAgent(sub) as unknown as { toolResultGuard: { setOverride(v: boolean): void; settle?: unknown } }).toolResultGuard;
+      guard.setOverride(guarded);
+      // The process dies before the guard settles the batch: its placeholder stays the result row.
+      (guard as unknown as { settle: () => void }).settle = () => {};
+      holdCoordinatorWrites(f);
+      const membrane = f.membrane as unknown as { responses: unknown[]; responseIndex: number; pushResponse(r: unknown): void };
+      membrane.responses.length = 0;
+      membrane.responseIndex = 0;
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'sub-cancel', name: 'cancel_tuneout', input: { channelId: 'noisy', text: NOTE } },
+      ] as never, 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Waiting for the cancel.' }] as never));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: sub, reason: 'test', source: 'test', timestamp: Date.now() });
+      void f.framework.runUntilIdle();
+      const result = (): string | undefined => {
+        for (const m of f.framework.getAgent(sub)!.getContextManager().getAllMessages() as unknown as Array<{ content: Array<{ type: string; toolUseId?: string; content?: unknown }> }>) {
+          for (const b of m.content) if (b.type === 'tool_result' && b.toolUseId === 'sub-cancel') return String(b.content);
+        }
+        return undefined;
+      };
+      await eventually(() => result() !== undefined, "the subconscious's cancel_tuneout's result row is stored");
+      if (guarded) assert.match(result()!, /withheld by the guard/, 'premise: the result row is the guard\'s placeholder');
+      else assert.match(result()!, /"waiting":true/, 'premise: the result row is the answer');
+      await crashLosingStopWrites(f);
+      await f.create();
+      assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [
+        `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${epochId}). The cancel of it you `
+        + 'asked for with your note "Antra asked for you in #noisy." had not run when the host stopped: it was lost, and the note you '
+        + 'left with it. That tune-out is still in force.]',
+      ]);
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
   it("control: the same cancel through executeToolCall, which stores no turn's rows, then a crash: the row stays conditional", async () => {
     const errors = mock.method(console, 'error', () => {});
     const { f, sub, epochId } = await heldWithPrimer();
