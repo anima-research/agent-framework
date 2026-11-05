@@ -408,13 +408,15 @@ export interface JudgeEventSummary {
  * The agent's last turn, when it failed (its retries spent, or by a throw
  * before its stream) and no turn has started since, as the reply judge is told it: when it failed, and whether
  * a wake of the agent's is on its way with no new event, already queued or
- * held until a provider hold ends (`until`, absent when it states no end). Neither says the wake starts a turn: the host's inference
+ * held until a provider hold ends (`until`, absent when it states no end, or
+ * when it's the host's, which the host is asked about again then). Neither says the wake starts a turn: the host's inference
  * policy can still decline it, and a start whose only causes are deferred
- * batches starts none if they give it nothing to read.
+ * batches starts none if they give it nothing to read. `maybe` marks a wake
+ * that is only such a start, or a hold that holds only such starts.
  */
 export interface FailedLastTurn {
   at: number;
-  again: { kind: 'none' } | { kind: 'queued' } | { kind: 'held'; until?: number };
+  again: { kind: 'none' } | { kind: 'queued'; maybe?: true } | { kind: 'held'; until?: number; maybe?: true };
 }
 
 /**

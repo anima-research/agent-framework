@@ -257,11 +257,12 @@ function inWhile(at: number | undefined, now: number): string {
 
 export function failedTurnLine(failed: FailedLastTurn, agentName: string, now: number): string {
   const opening = `${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`;
+  const maybe = failed.again.kind !== 'none' && failed.again.maybe ? ', which starts no turn if its deferred pushes give it nothing to read' : '';
   switch (failed.again.kind) {
     case 'queued':
-      return `${opening} A wake for ${agentName} is already queued.`;
+      return `${opening} A wake for ${agentName} is already queued${maybe}.`;
     case 'held':
-      return `${opening} A wake for ${agentName} is held, ${failed.again.until !== undefined ? `due to be let go ${inWhile(failed.again.until, now)}` : 'and is let go when the hold on it is released'}.`;
+      return `${opening} A wake for ${agentName} is held, ${failed.again.until !== undefined ? `due to be let go ${inWhile(failed.again.until, now)}` : 'and is let go when the hold on it is released'}${maybe}.`;
     default:
       return `${opening} Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes ${agentName}.`;
   }

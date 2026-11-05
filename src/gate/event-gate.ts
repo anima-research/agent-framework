@@ -4567,14 +4567,15 @@ export class EventGate {
     const wakes = this.judgeOnError === 'wake';
     if (!this.disposed && !wakes) {
       this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge);
-      if (this.judgeRefusal) this.armJudgeRefusalTimer();
+      if (this.judgeRefusal) this.armJudgeRefusalTimer(now);
       else this.flushJudgeHeldIfClear();
     }
     const n = state.events.length;
-    const went = wakes ? 'goes to delivery without the judge' : this.judgeHeldForRefusal() ? "is held while the judge's calls are refused" : 'goes back to the judge';
+    const behind = state.queued.length;
+    const went = wakes ? 'goes to delivery without the judge' : this.judgeHeldForRefusal(now) ? "is held while the judge's calls are refused" : 'goes back to the judge';
     console.error(
       `[gate] Rule ${quotedValue(policyName)}: the reply judge's call was refused (${hold}), so its batch of ${n} `
-      + `${n === 1 ? 'event' : 'events'} ${went} (judge onError "${this.judgeOnError}")`,
+      + `${n === 1 ? 'event' : 'events'}${behind > 0 ? `, with ${behind} more queued behind the call,` : ''} ${went} (judge onError "${this.judgeOnError}")`,
     );
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, refused: 0 } };
     record.verdicts.refused++;
@@ -4594,15 +4595,22 @@ export class EventGate {
     if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
   }
 
-  private armJudgeRefusalTimer(): void {
+  private armJudgeRefusalTimer(now: number): void {
     if (this.judgeRefusalTimer) clearTimeout(this.judgeRefusalTimer);
     this.judgeRefusalTimer = null;
     const until = this.judgeRefusal?.until;
     if (until === undefined || this.disposed) return;
-    const delay = Math.max(0, until - this.now());
+    const delay = Math.max(0, until - now);
     this.judgeRefusalTimer = setTimeout(() => {
       this.judgeRefusalTimer = null;
-      if (this.judgeRefusing()) this.armJudgeRefusalTimer();
+      let at: number;
+      try {
+        at = this.now();
+      } catch (err) {
+        this.dropJudgeHeld(err);
+        return;
+      }
+      if (this.judgeRefusing(at)) this.armJudgeRefusalTimer(at);
       else this.flushJudgeHeldIfClear();
     }, Math.min(delay, MAX_TIMER_MS));
     this.judgeRefusalTimer.unref?.();
@@ -4614,13 +4622,18 @@ export class EventGate {
     this.judgeRefusalTimer = null;
   }
 
-  private judgeRefusing(): boolean {
+  private judgeRefusing(now?: number): boolean {
     const until = this.judgeRefusal?.until;
-    return until !== undefined && until > this.now();
+    return until !== undefined && until > (now ?? this.now());
   }
 
-  private judgeHeldForRefusal(): boolean {
-    return this.judgeOnError === 'skip' && this.judgeRefusal !== null && (this.judgeRefusal.until === undefined || this.judgeRefusing());
+  private judgeHeldForRefusal(now?: number): boolean {
+    return this.judgeOnError === 'skip' && this.judgeRefusal !== null && (this.judgeRefusal.until === undefined || this.judgeRefusing(now));
+  }
+
+  private dropJudgeHeld(err: unknown): void {
+    for (const [policyName, held] of this.judgeHeld) this.logUnsent(policyName, held.events, 'sent to the judge', err);
+    this.judgeHeld.clear();
   }
 
   /**
@@ -4685,12 +4698,22 @@ export class EventGate {
     // Deferred, as the inference buffer's flush is, to stay out of the
     // turn-end callback that called this.
     queueMicrotask(() => {
-      if (this.disposed || this.judgeHeldForRefusal()) return;
+      if (this.disposed) return;
+      try {
+        if (this.judgeHeldForRefusal()) return;
+      } catch (err) {
+        this.dropJudgeHeld(err);
+        return;
+      }
       for (const policyName of [...this.judgeHeld.keys()]) {
         const held = this.judgeHeld.get(policyName);
         if (!held) continue;
         this.judgeHeld.delete(policyName);
-        this.judgeBatch(policyName, held.events, held.judge);
+        try {
+          this.judgeBatch(policyName, held.events, held.judge);
+        } catch (err) {
+          this.logUnsent(policyName, held.events, 'sent to the judge', err);
+        }
       }
     });
   }

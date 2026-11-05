@@ -640,6 +640,15 @@ describe('reply judge: the document', () => {
       `${opening} A wake for Scout is held, and is let go when the hold on it is released.`);
   });
 
+  it("says a queued or held wake that is only a start whose causes are deferred batches may start no turn, as the list does", () => {
+    const now = 1_000_000;
+    const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'queued', maybe: true } }, 'Scout', now),
+      `${opening} A wake for Scout is already queued, which starts no turn if its deferred pushes give it nothing to read.`);
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'held', until: now + 180_000, maybe: true } }, 'Scout', now),
+      `${opening} A wake for Scout is held, due to be let go in 3 min, which starts no turn if its deferred pushes give it nothing to read.`);
+  });
+
   it("shows a wake due at no nameable time by its words, quoted, after every wake with a time", () => {
     const now = 1_000_000;
     const text = ifYouWait([
