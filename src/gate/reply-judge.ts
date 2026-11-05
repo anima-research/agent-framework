@@ -41,7 +41,7 @@
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { safeSlice } from '../safe-slice.js';
-import { SKIPPED, normalizeLineBreaks, oneLine } from '../supplied-text.js';
+import { SKIPPED, normalizeLineBreaks, oneLine, quotedValue } from '../supplied-text.js';
 import type { FailedLastTurn, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
 /** The judge's model when the host names none. */
@@ -620,7 +620,7 @@ export class ReplyJudge {
       built = await this.build(request, undefined, MIN_CHARS_PER_TOKEN, true);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
-        `[gate] the reply judge's request on rule ${JSON.stringify(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
+        `[gate] the reply judge's request on rule ${quotedValue(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
         + `was refused as too long, so the batch is asked once more at ${MIN_CHARS_PER_TOKEN} character a token`,
       );
       response = await this.ask(built, request.signal);

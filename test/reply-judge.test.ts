@@ -152,6 +152,22 @@ describe('reply judge: a request refused as too long', () => {
     }
   });
 
+  it("quotes the rule's name in its log line as the gate's lines do, so a line separator in the name starts no line", async () => {
+    const { membrane } = refusingMembrane(1);
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      await judgeOver(membrane).judge(judgeRequest({ policyName: 'zz\u2028[gate] forged\u0085line' }));
+    } finally {
+      console.error = original;
+    }
+    const line = logged.find((l) => l.includes('asked once more'));
+    assert.ok(line, JSON.stringify(logged));
+    assert.ok(!/[\u0085\u2028\u2029]/.test(line), JSON.stringify(line));
+    assert.ok(line.includes('rule "zz\\u2028'), JSON.stringify(line));
+  });
+
   it('sends nothing when the gate stops the judge while an asynchronous wake provider answers', async () => {
     const stop = new AbortController();
     const { membrane, requests } = refusingMembrane(0);
@@ -173,11 +189,13 @@ describe('reply judge: a request refused as too long', () => {
 
   it('is asked smaller though the window from the last request still fits, by starting a fresh window', async () => {
     const { membrane, requests, size } = refusingMembrane((n) => n === 2);
-    const judge = judgeOver(membrane, 50, 20_000);
+    const judge = judgeOver(membrane, 50, 35_000);
     await quietly(() => judge.judge(judgeRequest()));
     await quietly(() => judge.judge(judgeRequest()));
     assert.strictEqual(requests.length, 3);
     assert.strictEqual(size(requests[1]!), size(requests[0]!), 'premise: the refused request is the answered one again');
+    const whole = String(requests[1]!.system ?? '').length + size(requests[1]!);
+    assert.ok(whole <= 35_000 - 3_000, `premise: the refused request, its window from the last request's anchor and all, is ${whole} characters, within the retry's budget at one character a token less its 3,000-token reserve`);
     assert.ok(size(requests[2]!) < size(requests[1]!), `${size(requests[2]!)} < ${size(requests[1]!)}`);
   });
 

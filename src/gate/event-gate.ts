@@ -4218,7 +4218,7 @@ export class EventGate {
    * batches at once.
    */
   private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
-    const refusing = this.judgeRefusing();
+    const refusedWhenRead = this.judgeRefusing();
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
     if (deciding) {
@@ -4230,6 +4230,7 @@ export class EventGate {
       this.holdForJudge(policyName, events, judge);
       return;
     }
+    const refusing = refusedWhenRead && this.judgeRefusal !== null;
     const held = this.judgeHeld.get(policyName);
     if (held) {
       this.judgeHeld.delete(policyName);
@@ -4386,8 +4387,9 @@ export class EventGate {
       wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
     }
     const count = (n: number): string => `${n} ${n === 1 ? 'event' : 'events'}`;
-    const statedEnd = this.judgeRefusing() ? this.judgeRefusal?.until : undefined;
+    const refusedWhenRead = this.judgeRefusing();
     const holders = [...(this.judgedTurnRunning() ? ['a turn'] : []), ...(this.quiesced ? ["the host's quiesce"] : [])].join(' or ');
+    const statedEnd = refusedWhenRead ? this.judgeRefusal?.until : undefined;
     const turnHolds = holders !== '';
     const pastEnd = turnHolds ? ` and, past the refusal's end, while ${holders} holds it` : '';
     for (const [name, state] of this.debounceTimers) {
@@ -4565,6 +4567,7 @@ export class EventGate {
     try {
       now = this.now();
     } catch (clockErr) {
+      if (state.ask > this.judgeNewestOutcome) this.judgeNewestOutcome = state.ask;
       this.logUnsent(policyName, [...state.events, ...state.queued], this.judgeOnError === 'wake' ? 'delivered' : 'held for the judge', clockErr);
       this.recordRefusal(policyName, state.events.length, hold, durationMs, false);
       return;
@@ -4622,6 +4625,7 @@ export class EventGate {
       try {
         at = this.now();
       } catch (err) {
+        this.clearJudgeRefusal();
         this.dropJudgeHeld(err);
         return;
       }
