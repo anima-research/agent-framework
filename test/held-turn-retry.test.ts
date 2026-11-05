@@ -489,7 +489,6 @@ test("a conversation agent's turn a wait recorded during its compile holds is al
   });
 });
 
-
 test("a conversation agent's start assembling under a provider wait on its model, which the wait holds after its compile, is listed as a maybe, and its failed last turn tells the judge only that the wake may not start a turn, as the wake list gives the wait as its reason", async () => {
   await withStoreDir(async (path) => {
     const log = silence();

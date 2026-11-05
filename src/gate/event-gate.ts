@@ -4571,7 +4571,7 @@ export class EventGate {
       + `${n === 1 ? 'event' : 'events'}${behind > 0 ? `, with ${behind} more queued behind the call,` : ''} ${went}`
       + `${dropped > 0 ? `, the rule's oldest ${dropped} ${dropped === 1 ? 'event' : 'events'} dropped at the cap` : ''} (judge onError "${this.judgeOnError}")`,
     );
-    if (wakes && !this.disposed) this.deliverOrBuffer(policyName, [...state.events, ...state.queued]);
+    if (wakes) this.deliverOrBuffer(policyName, [...state.events, ...state.queued]);
     this.recordRefusal(policyName, n, hold, durationMs, wakes, until);
   }
 
@@ -4596,7 +4596,7 @@ export class EventGate {
     if (this.judgeRefusalTimer) clearTimeout(this.judgeRefusalTimer);
     this.judgeRefusalTimer = null;
     const until = this.judgeRefusal?.until;
-    if (until === undefined || this.disposed) return;
+    if (until === undefined) return;
     const delay = Math.max(0, until - now);
     this.judgeRefusalTimer = setTimeout(() => {
       this.judgeRefusalTimer = null;

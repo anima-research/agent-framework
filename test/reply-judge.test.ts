@@ -572,7 +572,7 @@ describe('reply judge: the document', () => {
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
   });
 
-  it("says first that the agent's last turn failed, then what runs it again: nothing, or a queued or held wake, which may not start a turn, beside which nothing else is scheduled", async () => {
+  it("says first that the agent's last turn failed, then what runs it again: nothing, or a queued or held wake, which may not start a turn, beside which nothing else is scheduled, read from the wake reading in place of upcomingWakes", async () => {
     const now = 1_000_000;
     const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
     const beside = 'Beside that wake, nothing the host knows of is scheduled to wake Scout';
@@ -592,24 +592,24 @@ describe('reply judge: the document', () => {
       if (again.kind !== 'none') assert.ok(!text.includes("isn't woken until a new event arrives"), text);
     }
     const { membrane, requests } = fakeMembrane();
+    let listed = false;
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
       wakeReading: () => ({ upcomingWakes: [], failedLastTurn: { at: Date.now() - 125_000, again: { kind: 'none' } } }),
+      upcomingWakes: () => { listed = true; return []; },
     });
     await judge.judge(judgeRequest());
     const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
     assert.ok(last.includes("<if_you_wait>\nScout's last turn, 2m ago, failed and may not have answered all of what woke it. Nothing runs it again"), last);
+    assert.strictEqual(listed, false, 'the wake reading is read in place of upcomingWakes');
   });
-
 
   it("tells the judge that what was stored as it arrived stays stored for when something next wakes the agent, not that the events stay in its context", () => {
     const prompt = judgeSystemPrompt('Scout');
     assert.ok(prompt.includes("letting the events go by means it won't act on them until something else wakes it (what was stored as it\narrived stays stored for then)."), prompt);
     assert.ok(!prompt.includes('stay in its context'), prompt);
   });
-
-
 
   it("shows a wake due at no nameable time by its words, quoted, after every wake with a time", () => {
     const now = 1_000_000;
@@ -619,7 +619,6 @@ describe('reply judge: the document', () => {
     ], 'Scout', now);
     assert.ok(text.includes('- in 60 s: its own skip_reply timer\n- when the hold &lt;on it&gt; is released: a wake held by a provider hold'), text);
   });
-
 
   it("shows each upcoming wake's words on one line, escaped, and says how many past the eighth are only maybe, when all are or some are", () => {
     const now = 1_000_000;
@@ -806,11 +805,9 @@ describe('reply judge: the document', () => {
     assert.ok(question.includes('- 0s ago (addresses the agent) in "#garden" from "u1": hi'), question);
   });
 
-
   it('keeps a value to one line whatever form its line breaks take', () => {
     assert.strictEqual(oneLine('a\r\nb\rc\nd\u000be\u000cf\u0085g\u2028h\u2029i\n\n\nj'), 'a b c d e f g h i j');
   });
-
 
   it('reads the primary agent its chooser names', async () => {
     const { membrane } = fakeMembrane();

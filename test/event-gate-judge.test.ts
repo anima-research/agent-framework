@@ -118,10 +118,8 @@ function scriptedJudge() {
 
 function makeGate(configPath: string, opts: {
   judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[];
-  changesJudgedContext?: (name: string) => boolean;
   isHeld?: (serverId: string | undefined, channelId: string | undefined) => boolean;
   onTrace?: (trace: { type: string; [k: string]: unknown }) => void;
-  getAgentNames?: () => string[];
 } = {}) {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
@@ -134,13 +132,12 @@ function makeGate(configPath: string, opts: {
     },
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
     requestInference: (a, r) => wakes.push({ agentName: a, reason: r }),
-    getAgentNames: opts.getAgentNames ?? (() => ['agent']),
+    getAgentNames: () => ['agent'],
     ...(opts.judge ? { judge: opts.judge } : {}),
     ...(opts.judgeTimeoutMs !== undefined ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
     ...(opts.judgeOnError ? { judgeOnError: opts.judgeOnError } : {}),
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.residents ? { changesJudgedContext: (name: string) => opts.residents!.includes(name) } : {}),
-    ...(opts.changesJudgedContext ? { changesJudgedContext: opts.changesJudgedContext } : {}),
     ...(opts.isHeld ? { isHeld: opts.isHeld } : {}),
   });
   return { gate, traces, messages, wakes };
@@ -1507,8 +1504,6 @@ describe('judge rules: timing', () => {
     }
   });
 
-
-
   it("under onError 'wake', a refusal that states no end says each batch is still asked about", async () => {
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('refused-wake-no-end.json', JUDGED), { judge: judge.fn });
@@ -1558,7 +1553,6 @@ describe('judge rules: timing', () => {
     assert.ok(gate.getStatus().errors.some((e) => e.includes('stated no end')), JSON.stringify(gate.getStatus().errors));
     gate.dispose();
   });
-
 
   it("a batch held for a refusal is never judged once the gate is disposed", async () => {
     const judge = scriptedJudge();
