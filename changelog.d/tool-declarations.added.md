@@ -13,11 +13,12 @@
   can't be stored moves nothing: the request goes on the recorded head with
   its changes (with none recorded, on what's current, without the agent's
   change rows, which stay stored), and a later request moves it again. A
-  change row the store refuses to write is declared later, as one that would
-  part a call from its result is. A request carrying a change that ends with a 400 membrane
-  doesn't file as `context_length` or `auth`, or with a refusal membrane
-  recognises, goes again on the agent's current head, which it keeps to until
-  it's built again. Until then it compiles as it's configured, so a host's
+  change row the store refuses to write is logged, and the first later
+  request that can store a change declares what differs then. A request
+  carrying a change that ends with a 400 membrane doesn't file as
+  `context_length` or `auth`, or with a refusal membrane recognises, goes
+  again on the agent's current head, which it keeps to until it's built
+  again. Until then it compiles as it's configured, so a host's
   change rows stay in its compile, unsent. A consolidation waits for a compile
   that already rewrites the changes, which `thinkingBinding.binds` narrows for
   a model that binds its thinking: left out, it counts as one here, and only
