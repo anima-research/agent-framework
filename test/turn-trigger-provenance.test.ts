@@ -192,7 +192,7 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("a `!` continuation of a turn whose wake named a channel this host couldn't resolve carries no batch channel, though a batch's wake joined it", async () => {
+  it("a `!` continuation of a turn whose wake named a channel this host couldn't resolve carries no batch channel, though its routing holds one", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'nowhere to say this' }]));
     const framework = await makeFramework();
     const i = internals(framework) as unknown as ReturnType<typeof internals> & {

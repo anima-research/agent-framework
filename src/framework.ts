@@ -6644,9 +6644,12 @@ export class AgentFramework {
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
    *  already held marks that one, so the hold still keeps the turn alive.
-   *  In a merged start's batch, a member that carries the turn on takes an
-   *  equal wake only when it has all of the wake's channels: a wake with
-   *  others stays a member of its own, which an abort puts back. */
+   *  In a merged start's batch, a member folds only into an equal member of
+   *  its own kind: a wake in a batch and a member that carries the turn on
+   *  never fold into each other, so the wake stays a member of its own,
+   *  which an abort puts back. The copy of a request held on its own is the
+   *  exception: a member that carries the turn on takes it, as the mark above
+   *  takes that request. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
     const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
     if (!same) {
@@ -6660,10 +6663,10 @@ export class AgentFramework {
     const into = mergedBatch(same);
     const batch = mergedBatch(request);
     if (into || batch) {
-      const members = [...(into ?? [{ ...same }])];
+      const copy = into ? undefined : { ...same };
+      const members = into ? [...into] : [copy!];
       for (const member of batch ?? [request]) {
-        this.holdRequest(members, member, (kept) => continuesTurn(member) || !continuesTurn(kept) ||
-          (member.wakeChannels ?? []).every((channel) => kept.wakeChannels?.some((c) => sameChannel(c, channel))));
+        this.holdRequest(members, member, (kept) => continuesTurn(member) ? continuesTurn(kept) || kept === copy : !continuesTurn(kept));
       }
       (same as MarkedRequest)[MERGED_BATCH] = members;
     }
