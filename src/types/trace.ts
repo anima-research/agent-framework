@@ -1170,6 +1170,32 @@ export type TraceEvent =
       error?: string;
     })
   /**
+   * At boot, a hold on record (`epochId`; the all-except hold with `scope`,
+   * its channel the excepted one) that the last stop's stamp
+   * (`tune-out/<primary>/stop-stamp`) doesn't cover: the host crashed, or
+   * the store refused the stop's writes. `found`, from that run's rows:
+   * `ran`, a release of that epoch was stored after the cancel was asked,
+   * its end not recorded; `delivered`, a waiting cancel's note was written
+   * to the resident, with no release since; `asked`, the subconscious's
+   * own call of that cancel, answered as waiting, is in its window;
+   * `unknown`, nothing says whether a cancel waited. The persistent
+   * subconscious (`noteAuthor`) is told which, by a loss notice kept and
+   * tried again as the others are (`tune-out:note-loss-untold` where its
+   * write fails). Not traced: a hold no stamp covers because none was ever
+   * written (a first start on a version that stamps its stops), one whose
+   * release already told a waiting note's loss, one whose loss the stop
+   * kept, and one already told as much.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:stop-unrecorded';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      noteAuthor: string;
+      found: 'delivered' | 'ran' | 'asked' | 'unknown';
+    })
+  /**
    * The notice telling a lost note's author (`noteAuthor`) of the loss (a
    * `tune-out:deferred-cancel-dropped` with `noteLost`) was not written.
    * `write-failed`: writing it threw (`error`). It is kept, and tried again
@@ -1183,29 +1209,6 @@ export type TraceEvent =
    * notice is not kept. For the all-except hold (`scope`), the channel is
    * its excepted one.
    */
-  /**
-   * At boot, a hold on record (`epochId`; the all-except hold with `scope`,
-   * its channel the excepted one) that the last stop's stamp
-   * (`tune-out/<primary>/stop-stamp`) doesn't cover: the host crashed, or
-   * the store refused the stop's writes. `found`, from that run's rows:
-   * `delivered`, a waiting cancel's note was written to the resident before
-   * the stop, the cancel's end not recorded; `asked`, the subconscious's own
-   * call of that cancel, answered as waiting, is in its window; `unknown`,
-   * nothing says whether a cancel waited. The persistent subconscious (`noteAuthor`) is
-   * told which, by a loss notice kept and tried again as the others are
-   * (`tune-out:note-loss-untold` where its write fails). A hold whose
-   * release already told a waiting note's loss is not traced: nothing more
-   * is told.
-   */
-  | (TraceEventBase & {
-      type: 'tune-out:stop-unrecorded';
-      serverId: string;
-      channelId: string;
-      epochId: string;
-      scope?: 'all-except';
-      noteAuthor: string;
-      found: 'delivered' | 'asked' | 'unknown';
-    })
   | (TraceEventBase & {
       type: 'tune-out:note-loss-untold';
       serverId: string;
