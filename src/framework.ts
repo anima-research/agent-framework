@@ -6247,6 +6247,8 @@ export class AgentFramework {
 
   private wakesOnTheirWay(agentName: string): WakesOnTheirWay {
     const agent = this.agents.get(agentName);
+    const model = agent?.model;
+    const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
     const unread = (r: InferenceRequest): boolean => !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m)));
     const mine = (r: InferenceRequest): boolean => r.agentName === agentName;
     const arriving = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
@@ -6262,9 +6264,8 @@ export class AgentFramework {
     }
     const passed: string[] = [];
     const passedMaybe: string[] = [];
-    const model = this.agents.get(agentName)?.model;
     if (this.assembling.has(agentName)) {
-      const heldAfterCompile = this.registry.homeChannel(agentName) !== undefined && model !== undefined && this.providerWaits?.active(agentName, model) !== undefined;
+      const heldAfterCompile = this.registry.homeChannel(agentName) !== undefined && wait !== undefined;
       if (this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length) passedMaybe.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
       else if (heldAfterCompile) passedMaybe.push('a start assembling its deferred pushes, which a provider wait on its model holds after its compile if the wait still stands then');
       else passed.push('a start assembling its deferred pushes');
@@ -6281,15 +6282,13 @@ export class AgentFramework {
       const atRelease = [...cooldown.heldRequests, ...arriving];
       const releaseWakes = atRelease.some(unread) || (atRelease.length === 0 && !(cooldown.auxiliaryOrigin || cooldown.emptiedBy));
       if (releaseWakes || waiting > 0) {
-        const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
         const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
         const until = cooldown.hostHoldError ? undefined
           : wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
         return { queued: passed, batchOnly: passedMaybe, held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}), ...(!releaseWakes && queued.length === 0 ? { maybe: true as const } : {}) } };
       }
     }
-    const wait = waiting > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
-    if (wait) return { queued: passed, batchOnly: passedMaybe, held: { ...ends(wait.until), ...(queued.length === 0 ? { maybe: true as const } : {}) } };
+    if (waiting > 0 && wait) return { queued: passed, batchOnly: passedMaybe, held: { ...ends(wait.until), ...(queued.length === 0 ? { maybe: true as const } : {}) } };
     return { queued: [...queued, ...passed], batchOnly: [...batchOnly, ...passedMaybe] };
   }
 
