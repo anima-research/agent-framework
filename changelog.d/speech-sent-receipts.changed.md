@@ -31,7 +31,11 @@
   `getHostModeStatus().gatedRequests` counted both. A wake and an equal
   request that carries the turn on never fold into each other in the batch,
   whichever joins: the wake stays a member of its own, counts on its own, and
-  an abort of the turn puts it back.
+  an abort of the turn puts it back. The exception is a request held on its
+  own, in no batch: an equal start that joins it records its copy in the
+  batch, and the start's equal members that carry the turn on fold into that
+  copy, so with the turn's retry among them the held request stands for that
+  retry, as before, and an abort drops it with the turn.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, except an ephemeral run's, which gets
   none, as before; the notice now names the piece by its opening words,
