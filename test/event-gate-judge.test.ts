@@ -2993,6 +2993,42 @@ describe('the framework wires the reply judge', () => {
     assert.deepStrictEqual(internal.upcomingWakesFor('scout'), [{ when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }]);
   });
 
+  it("lists a turn held while the recorded provider waits couldn't be read at the recorded wait's end once they read again, though the hold made then stands until released", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      recordProviderWait(agentName: string, model: string, error: Error): { until: number | null } | undefined;
+      holdForProviderWait(agent: unknown, wait: unknown, requests: unknown[]): boolean;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+      providerAccelerationCooldowns: Map<string, { until: number }>;
+      providerWaits: { active(agent: string, model: string): { until: number | null } | undefined; journal: { load(): unknown }; unreadable: { lastTry: number } | null; load(): boolean };
+      getAgent(name: string): unknown;
+    };
+    const recorded = internal.recordProviderWait('scout', 'test-model', new MembraneError({
+      type: 'rate_limit', retryable: true, retryAfterMs: 60_000, message: 'slow down', rawError: { status: 429 },
+    }));
+    assert.ok(typeof recorded?.until === 'number', 'premise: a recorded wait with an end');
+    const waits = internal.providerWaits;
+    const load = waits.journal.load;
+    waits.journal.load = () => { throw new Error('zz the records could not be read'); };
+    const original = console.error;
+    console.error = () => {};
+    try {
+      waits.load();
+    } finally {
+      console.error = original;
+      waits.journal.load = load;
+    }
+    const standIn = waits.active('scout', 'test-model');
+    assert.strictEqual(standIn?.until, null, 'premise: while the records are unreadable, the wait stands with no end');
+    assert.ok(internal.holdForProviderWait(internal.getAgent('scout'), standIn, [{ agentName: 'scout', reason: 'held', source: 'test', timestamp: Date.now() }]));
+    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')!.until, Number.POSITIVE_INFINITY, 'premise: held until released');
+    waits.unreadable!.lastTry = Number.NEGATIVE_INFINITY;
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), [{ at: recorded!.until, certain: true, what: 'a wake held by a provider hold, when it ends' }]);
+    assert.strictEqual(waits.unreadable, null, 'premise: the records read again as the wake list read the wait');
+    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')!.until, Number.POSITIVE_INFINITY, "premise: the hold's own end is still none");
+  });
+
   it('lists no wake for a provider hold whose held wakes were all withdrawn, since its end starts no turn', async (t) => {
     const { MembraneError } = await import('@animalabs/membrane');
     const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
@@ -3058,6 +3094,50 @@ describe('the framework wires the reply judge', () => {
     assert.deepStrictEqual([hold?.auxiliaryOrigin, hold?.heldRequests.length], [true, 1], 'premise: an auxiliary call\'s hold keeps the wake');
     assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake held by a provider hold'], 'premise: while its message is unanswered, the held wake is listed');
     internal.storedMessageDone = (_agent, messageId) => messageId === 'zz-message';
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
+  });
+
+  it("doesn't list as held a merged start a hold took in whole after its auxiliary call, once the agent has already read every wake it stands for", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      parkedStarts: Set<unknown>;
+      providerAccelerationCooldowns: Map<string, { heldRequests: Array<Record<string | symbol, unknown>> }>;
+      holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean;
+      storedMessageDone(agent: unknown, messageId: string, to: unknown): boolean;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    internal.storedMessageDone = () => false;
+    let finish!: () => void;
+    const auxiliary = internal.withAuxiliaryAdmission('scout', () => new Promise<void>((resolve) => { finish = resolve; }));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    for (const id of ['zz-one', 'zz-two']) {
+      internal.pendingRequests.push({ agentName: 'scout', reason: `a wake for ${id}`, source: 'test', timestamp: Date.now(), readsStoredMessage: id });
+    }
+    await internal.processInferenceRequests();
+    assert.strictEqual(internal.parkedStarts.size, 1, 'premise: the merged start waits behind the auxiliary call');
+    internal.holdProviderAcceleration(framework.getAgent('scout'), new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 60_000, message: 'slow down', rawError: { status: 429 } }));
+    const original = console.error;
+    console.error = () => {};
+    try {
+      finish();
+      await auxiliary;
+      await until(() => internal.pendingRequests.length === 1, 'the merged start requeued, since a provider hold stands');
+    } finally {
+      console.error = original;
+    }
+    await internal.processInferenceRequests();
+    const hold = internal.providerAccelerationCooldowns.get('scout')!;
+    assert.strictEqual(hold.heldRequests.length, 1, 'premise: the hold took the merged start in whole');
+    const start = hold.heldRequests[0]!;
+    const members = Object.getOwnPropertySymbols(start).map((k) => start[k]).find(Array.isArray) as unknown[] | undefined;
+    assert.strictEqual(members?.length, 2, 'premise: it stands for both wakes');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake held by a provider hold, when it ends'], 'premise: while its wakes are unread, the hold is listed');
+    internal.storedMessageDone = (_agent, messageId) => messageId === 'zz-one' || messageId === 'zz-two';
     assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
   });
 
@@ -3134,13 +3214,14 @@ describe('the framework wires the reply judge', () => {
     assert.strictEqual(internal.providerAccelerationCooldowns.has('scout'), false, 'premise: the queued wake lets the re-arm go');
   });
 
-  it("lists a wake queued behind a hold whose end has passed but whose timer hasn't fired as queued, with the hold's own requests, since the scheduler lets that hold go at once", async (t) => {
+  it("lists a wake queued behind a hold whose end has passed but whose timer hasn't fired as queued, with the hold's own requests but one whose message the agent has already read, since the scheduler lets that hold go at once", async (t) => {
     const { createMockResponse } = await import('./helpers/mock-membrane.js');
     const { framework, membrane } = await frameworkWith(t, { config: JUDGED, judge: {} });
     const internal = framework as unknown as {
       pendingRequests: Array<Record<string, unknown>>;
       processInferenceRequests(): Promise<void>;
       providerAccelerationCooldowns: Map<string, unknown>;
+      storedMessageDone(agent: unknown, messageId: string, to: unknown): boolean;
       upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
     };
     const now = Date.now();
@@ -3148,11 +3229,14 @@ describe('the framework wires the reply judge', () => {
     t.after(() => clearTimeout(timer));
     internal.providerAccelerationCooldowns.set('scout', {
       startedAt: now - 60_000, until: now - 1, timer, failures: 1, reason: 'zz a hold whose timer is late',
-      heldRequests: [{ agentName: 'scout', reason: 'zz a held wake', source: 'test', timestamp: now - 60_000 }],
+      heldRequests: [{ agentName: 'scout', reason: 'zz a held wake', source: 'test', timestamp: now - 60_000, readsStoredMessage: 'zz-held' }],
     });
+    internal.storedMessageDone = () => false;
     assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.at, w.what]), [[now - 1, 'a wake held by a provider hold, when it ends']], 'premise: alone, the hold is listed at its passed end');
     internal.pendingRequests.push({ agentName: 'scout', reason: 'zz a later wake', source: 'test', timestamp: now });
     assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.at, w.what]), [[undefined, '2 wakes already queued (zz a held wake)']]);
+    internal.storedMessageDone = (_agent, messageId) => messageId === 'zz-held';
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.at, w.what]), [[undefined, 'a wake already queued (zz a later wake)']], "the held wake whose message the agent has read isn't counted");
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     await internal.processInferenceRequests();
     assert.strictEqual(internal.providerAccelerationCooldowns.has('scout'), false, 'premise: the queued wake lets the hold go at once');
@@ -3178,6 +3262,13 @@ describe('the framework wires the reply judge', () => {
     assert.deepStrictEqual(internal.upcomingWakesFor('scout'), [{ when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }]);
     internal.lastStartFailed.set(framework.getAgent('scout')!, Date.now());
     assert.deepStrictEqual(internal.failedLastTurnFor('scout')?.again, { kind: 'held' });
+    // Its slice past, its timer not yet fired: still held, since the scheduler asks the host again rather than let it go.
+    hold!.until = Date.now() - 1;
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'zz a later wake', source: 'test', timestamp: Date.now() });
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), [{ when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }], 'a late timer');
+    await internal.processInferenceRequests();
+    const extended = internal.providerAccelerationCooldowns.get('scout')!;
+    assert.ok(extended === hold && extended.until > Date.now() && extended.heldRequests.length === 2, "premise: the host was asked again and extended the hold, which holds the later wake too");
   });
 
   it("reads the provider wait before the hold, so a wake whose hold an alert's listener releases as the wait is read is listed as queued", async (t) => {
