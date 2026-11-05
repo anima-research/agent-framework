@@ -1420,6 +1420,26 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 2, 'asked again once that answer came');
   });
 
+  it("a module replaced under its name while its ask was due doesn't hold back the next module of that name once the ask outlasts the bound", async (t) => {
+    const surface = new Surface();
+    surface.answer = 'held';
+    const f = await host([surface], new MockMembrane());
+    const registry = (f as unknown as { moduleRegistry: { moduleContexts: Map<string, unknown>; askSpeechRouted(agent: string, text: string, context: SpeechRoutedContext): Promise<string[]> } }).moduleRegistry;
+    const registration = registry.moduleContexts.get('console');
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    void registry.askSpeechRouted('resident', 'First.', { final: false });
+    registry.moduleContexts.set('console', { zzReplacement: true });
+    try {
+      t.mock.timers.tick(SPEECH_RECEIPT_WAIT_MS);
+      await new Promise((resolve) => setImmediate(resolve));
+      void registry.askSpeechRouted('resident', 'Second.', { final: true });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(surface.asked.length, 2, 'the module now registered under the name is asked');
+    } finally {
+      registry.moduleContexts.set('console', registration);
+    }
+  });
+
   it("a module's place counts when it was registered as it answered, though its removal completes before the next reaction", async () => {
     const surface = new Surface();
     const f = await host([surface], new MockMembrane());

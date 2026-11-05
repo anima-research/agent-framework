@@ -766,7 +766,7 @@ export class ModuleRegistry {
       const timer = setTimeout(() => {
         settled = true;
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
-        if (call) this.speechAsksOverdue.set(module.name, call);
+        if (call && this.moduleContexts.get(module.name) === registration) this.speechAsksOverdue.set(module.name, call);
         resolve(undefined);
       }, SPEECH_RECEIPT_WAIT_MS);
       try {
