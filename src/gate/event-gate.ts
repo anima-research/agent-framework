@@ -2960,13 +2960,7 @@ export class EventGate {
   }
 
   private fireCleared(names: string[]): void {
-    for (const name of names) {
-      try {
-        this.fireDebounce(name);
-      } catch (err) {
-        console.error(`[gate] Rule ${quotedValue(name)}: handing on its pending batch as the rules changed threw (${quotedValue(errorText(err))}), which may have come after the batch was delivered`);
-      }
-    }
+    for (const name of names) this.fireDebounce(name);
   }
 
   private reloadIfChanged(): void {
@@ -4526,22 +4520,19 @@ export class EventGate {
         + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
     }
-    try {
-      this.emitTrace({
-        type: 'gate:judge-verdict',
-        policyName,
-        verdict: outcome,
-        woke: wake,
-        eventCount: state.events.length,
-        durationMs,
-        ...(!failed && verdict.model ? { model: verdict.model } : {}),
-        ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
-        ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
-        ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
-      });
-    } finally {
-      if (wasRefused && !this.disposed) this.flushJudgeHeldIfClear();
-    }
+    this.emitTrace({
+      type: 'gate:judge-verdict',
+      policyName,
+      verdict: outcome,
+      woke: wake,
+      eventCount: state.events.length,
+      durationMs,
+      ...(!failed && verdict.model ? { model: verdict.model } : {}),
+      ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
+      ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
+      ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
+    });
+    if (wasRefused && !this.disposed) this.flushJudgeHeldIfClear();
     if (this.disposed) return;
     const judge = this.currentJudge(policyName, state.judge);
     if (wake) {

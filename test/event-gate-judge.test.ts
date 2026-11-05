@@ -791,22 +791,6 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
-  it("under onError 'wake', a refused call's batch is delivered though the refusal's trace throws", async () => {
-    const judge = scriptedJudge();
-    const { gate, wakes } = makeGate(writeConfig('refused-wake-trace.json', JUDGED), {
-      judge: judge.fn, judgeOnError: 'wake',
-      onTrace: (t) => { if (t.type === 'gate:judge-verdict' && t.verdict === 'refused') throw new Error('zz trace'); },
-    });
-    gate.evaluate(chat('first'));
-    await until(() => judge.waiting() === 1, 'the judge call');
-    await logDuring(async () => {
-      judge.fail(refusal("scout's provider calls are held", 60_000));
-      await settle();
-    });
-    assert.strictEqual(wakes.length, 1, 'delivered');
-    gate.dispose();
-  });
-
   const deciding = async (onError: 'wake' | 'skip', name: string, waitMs = 60_000, laterChannel = 'c2') => {
     const judge = scriptedJudge();
     const made = makeGate(writeConfig(`refused-deciding-${name}.json`, {
@@ -1310,36 +1294,6 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
-  it("under 'skip', a verdict that ends a refusal sends another rule's held batch back to the judge though the host's trace of the verdict throws", async () => {
-    const judge = scriptedJudge();
-    let throwOnce = false;
-    const { gate } = makeGate(writeConfig('refused-verdict-trace-throws.json', TWO_RULES), {
-      judge: judge.fn, judgeOnError: 'skip',
-      onTrace: (t) => {
-        if (throwOnce && t.type === 'gate:judge-verdict' && t.verdict === 'wait') {
-          throwOnce = false;
-          throw new Error('zz trace refused');
-        }
-      },
-    });
-    gate.evaluate(chat('hello'));
-    await until(() => judge.waiting() === 1, "first's call");
-    judge.fail(refusal('a live surgery for scout holds the store'));
-    await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, "first's batch held");
-    gate.evaluate(elsewhere('hi'));
-    await until(() => judge.waiting() === 1, "second's call");
-    throwOnce = true;
-    const logged = await logDuring(async () => {
-      judge.answer({ reply: false, reason: 'chatter' });
-      await until(() => judge.waiting() === 1, "first's held batch asked again");
-    });
-    assert.strictEqual(throwOnce, false, "premise: the verdict's trace threw");
-    assert.ok(logged.some((l) => l.includes("the judge's verdict couldn't be applied") && l.includes('zz trace refused')), logged.join('\n'));
-    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['hello']);
-    judge.answer({ reply: false, reason: 'chatter' });
-    gate.dispose();
-  });
-
   it("a verdict on a call asked before a refusal leaves the refusal standing", async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('refused-older-call.json', {
@@ -1740,44 +1694,6 @@ describe('judge rules changed or removed while a batch waits', () => {
     await until(() => judge.requests.length === 1, 'the changed rule\'s pending batch to go to the judge');
     assert.strictEqual(judge.requests[0]!.instructions, 'Wake me for jokes.');
     assert.deepStrictEqual(judge.requests[0]!.events.map((e) => e.content), ['lol']);
-    gate.dispose();
-  });
-
-  it("a reload whose first cleared batch's delivery trace throws still sends the rest, and logs the throw with the rule's name", async () => {
-    const both = (debounce: number) => ({
-      policies: [
-        { name: 'first', match: { scope: ['mcpl:push-event'] }, behavior: { debounce } },
-        { name: 'second', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce } },
-      ],
-    });
-    const path = writeConfig('reload-trace-throws.json', both(60_000));
-    let throwing = false;
-    const { gate, messages } = makeGate(path, {
-      onTrace: (t) => {
-        if (throwing && t.type === 'gate:debounce-delivered') {
-          throwing = false;
-          throw new Error('zz trace\n[gate] a forged line');
-        }
-      },
-    });
-    gate.evaluate(chat('lol'));
-    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
-    assert.strictEqual(messages.length, 0, 'premise: both batches wait on their debounce');
-    writeFileSync(path, JSON.stringify(both(59_000), null, 2));
-    (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
-    throwing = true;
-    const logged: string[] = [];
-    const original = console.error;
-    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
-    try {
-      gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
-      await settle();
-    } finally {
-      console.error = original;
-    }
-    assert.strictEqual(throwing, false, "premise: the first batch's trace threw");
-    assert.strictEqual(messages.length, 2, 'both batches delivered');
-    assert.ok(logged.includes('[gate] Rule "first": handing on its pending batch as the rules changed threw ("zz trace\\n\\u005bgate] a forged line"), which may have come after the batch was delivered'), logged.join('\n'));
     gate.dispose();
   });
 
