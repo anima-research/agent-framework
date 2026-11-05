@@ -18,11 +18,20 @@
   own wake may still wait in a gate window, or the message woke nothing, and
   for an ordinary resident whose view keeps the message, whichever resident
   of its shared slot it was stored for. So is a resident's first start in a
-  framework made on its store, as after a restart, when, in what its view
-  keeps, no row of the resident's own, other than a silent heartbeat tick's,
-  follows a private surface's message, a result or mail from a private turn's
-  work, or a report from a script a turn started, whichever turn it was: what
-  the earlier run had noted went with it. So is
+  framework made on its store, as after a restart, when the earlier run left
+  private input stored for it that no start has answered. The framework keeps
+  that note in the store, beside the messages: it's written before the
+  input's row, and cleared only once a start has stored a row of the
+  resident's own after taking the input in (a silent heartbeat tick's row
+  doesn't count, and neither do the rows `puppetToolCall` stores). So
+  whatever part of the store a crash keeps, a stored input whose answer it
+  lost still counts as unanswered. A store from a release before this one
+  holds no such note, so there the first run reads it from the store, as the
+  release before did, and keeps it from then on: the start is private when, in
+  what the resident's view keeps, no row of its own, other than a silent
+  heartbeat tick's, follows a private surface's message, a result or mail
+  from a private turn's work, or a report from a script a turn started,
+  whichever turn it was. So is
   the turn of its own that a wake starts after waiting beside a private
   turn's own continuation: a budget restart or a held retry that started
   alone, or one that passed a quiesce in the same pass that parked the wake.
@@ -32,7 +41,9 @@
   private input stays private for the rest of it: a start that continues it
   with a private wake or stored private input, or a tool boundary that injects
   a private surface's message, removes its locus, its trigger channel and its
-  sticky `>>` or `>>>` destination, and a `[routing]` notice says why,
+  sticky `>>` or `>>>` destination, stops the typing indicator it showed, and
+  from there its `inference:tokens` and `inference:content_block` traces name
+  no channel, in every mode; a `[routing]` notice says why,
   whatever destination the turn had, unless the turn is a silent heartbeat
   tick, which has no speech to place. A heartbeat's turn that takes in private
   input is private too: its plain speech is kept private rather than held as
@@ -180,8 +191,10 @@
   first drop from each server is logged.
 
 - **A report from a script a turn started, deferred across a restart,** such
-  as an update's, counts as private input in the next run, whichever turn it
-  was, since that run can't know the turn: the start that reads it is
-  private, failing closed, as is the first start after a restart when such a
-  report stored before it is unanswered. Later turns and retakes don't count
-  it.
+  as an update's, counts as private input in the next run when that turn was
+  private as the queue was last written, and the framework writes the queue
+  again when a turn with a report in it turns private. A queue entry that
+  names its turn but doesn't say whether it was private, which only damage or
+  a hand edit leaves, counts as private, failing closed. A report stored
+  before a restart counts as the run that stored it counted it. Later turns
+  and retakes don't count it.

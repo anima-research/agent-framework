@@ -70,7 +70,10 @@ export type TraceEvent =
        * channel. Observability only, like every trace field; lets external
        * taps (e.g. a TTS relay) tag the whole activation with its channel
        * without re-deriving routing. A turn that turns private later emits
-       * no new event, so such a tag keeps this channel until the turn ends.
+       * no new event, and from the boundary that made it private its
+       * `inference:tokens` and `inference:content_block` traces name no
+       * channel, so a tap that voices or relays the turn's text follows each
+       * chunk's `channelId`, not this one.
        */
       channelId?: string;
       /**
@@ -182,7 +185,10 @@ export type TraceEvent =
        *  came from, or, at a start whose wake names none, such as a budget
        *  restart, the one the turn already shows. Disabled mode, and a silent
        *  turn in any mode: none, though the turn may show typing, since its
-       *  text is never sent to a channel. */
+       *  text is never sent to a channel. A turn that holds private input,
+       *  from its start or from the boundary that made it private: none, in
+       *  every mode; a turn made private part-way stops its indicator at that
+       *  boundary. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -209,7 +215,10 @@ export type TraceEvent =
        *  came from, or, at a start whose wake names none, such as a budget
        *  restart, the one the turn already shows. Disabled mode, and a silent
        *  turn in any mode: none, though the turn may show typing, since its
-       *  text is never sent to a channel. */
+       *  text is never sent to a channel. A turn that holds private input,
+       *  from its start or from the boundary that made it private: none, in
+       *  every mode; a turn made private part-way stops its indicator at that
+       *  boundary. */
       channelId?: string;
     })
   | (TraceEventBase & {

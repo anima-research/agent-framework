@@ -43,12 +43,20 @@
     (`callerTurnId`) and names no channel now gets a failed result, and so does one carrying either of two kinds of
     turn id the framework can't place: one given out in this process before
     the framework was created, and one no newer than a private turn it has
-    dropped from its record of the latest 4,096.
+    dropped from its record of the latest 4,096. A trace tap that voices or
+    relays a turn's text under the channel the turn started in, as
+    connectome-host's TTS relay adopts the first `channelId` it sees on
+    `inference:started` or `inference:tokens` for the whole activation,
+    voices the rest of a turn made private part-way there: from that boundary
+    the turn's `inference:tokens` and `inference:content_block` traces name no
+    channel, while `inference:started` named one.
   - **Migration:** a speech handler that publishes posts nothing when
     `SpeechContext.nonChannelOrigin` is set, a bridge names each message's
     channel in `metadata.channelId`, and a host's `executeToolCall` or a
     module's `ctx.callTool` of `channel_publish` that carries a private
     turn's id, or either kind of id the framework can't place, names its
+    channel, and a trace tap that voices or relays a turn's text follows each
+    `inference:tokens` chunk's `channelId`, sending a chunk with none to no
     channel.
     Otherwise nothing changes in code: the resident answers such a message
     with an explicit send, as the notice says.

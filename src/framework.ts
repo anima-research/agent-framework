@@ -1697,16 +1697,18 @@ function isMarkedPrivateInput(metadata: unknown): boolean {
   return (metadata as { dendrite?: { privateTurn?: unknown } } | undefined)?.dendrite?.privateTurn === true;
 }
 
-function holdsUnansweredPrivateInput(cm: ContextManager, agentName: string, sees: (metadata: unknown) => boolean): boolean {
+function* rowsNewestFirst(cm: ContextManager, sees: (metadata: unknown) => boolean) {
   for (let end = cm.getMessageCount(); end > 0; end -= TURN_INPUTS_SCAN) {
     const { messages } = cm.getMessageWindow(Math.max(0, end - TURN_INPUTS_SCAN), Math.min(TURN_INPUTS_SCAN, end), { resolveBlobs: false });
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      if (!sees(message.metadata)) continue;
-      if (isMarkedPrivateInput(message.metadata)) return true;
-      if (typeof (message.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number') return true;
-      if (message.participant === agentName && !silentHeartbeatOf(message.metadata)) return false;
-    }
+    for (let i = messages.length - 1; i >= 0; i--) if (sees(messages[i].metadata)) yield messages[i];
+  }
+}
+
+function holdsUnansweredPrivateInput(cm: ContextManager, agentName: string, sees: (metadata: unknown) => boolean): boolean {
+  for (const message of rowsNewestFirst(cm, sees)) {
+    if (isMarkedPrivateInput(message.metadata)) return true;
+    if (typeof (message.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number') return true;
+    if (message.participant === agentName && !silentHeartbeatOf(message.metadata)) return false;
   }
   return false;
 }
@@ -3976,6 +3978,7 @@ export class AgentFramework {
    *  rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
   private privateInputStored: Set<string> = new Set();
+  private privateInputRecords = new Map<string, boolean | undefined>();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). Kept in the store as well
@@ -9789,8 +9792,12 @@ export class AgentFramework {
     // split: a re-deferred entry must not jump the queue.
     const durable = this.durableDeferredWrites();
     if ((quiesced || this.deferredWritesPersisted) && durable.length > 0) {
-      if (JSON.stringify(durable).length > DEFERRED_WRITES_PERSIST_CAP_CHARS) return 'over-cap';
-      const queue = { version: 2, pending: durable, scanFrom: Object.fromEntries(this.deferredScanFrom) };
+      const pending = durable.map((m) => {
+        const turn = (m.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY];
+        return typeof turn === 'number' ? { ...m, callerTurnPrivate: this.isPrivateTurn(turn) } : m;
+      });
+      if (JSON.stringify(pending).length > DEFERRED_WRITES_PERSIST_CAP_CHARS) return 'over-cap';
+      const queue = { version: 2, pending, scanFrom: Object.fromEntries(this.deferredScanFrom) };
       if (this.deferredWritesPath) {
         this.writeRecoveryFile(this.deferredWritesPath, queue);
       } else {
@@ -10114,13 +10121,17 @@ export class AgentFramework {
         { cause: error },
       );
     }
-    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({
-      ...m,
-      seq: i + 1,
-      ...(typeof (m.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number'
-        ? { metadata: { ...m.metadata, [CALLER_TURN_KEY]: 0 } as MessageMetadata }
-        : {}),
-    }));
+    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((entry, i) => {
+      const { callerTurnPrivate, ...m } = entry as typeof entry & { callerTurnPrivate?: unknown };
+      const metadata = m.metadata as Record<string, unknown> | undefined;
+      if (typeof metadata?.[CALLER_TURN_KEY] !== 'number') return { ...m, seq: i + 1 };
+      const { [CALLER_TURN_KEY]: _turn, ...rest } = metadata;
+      return {
+        ...m,
+        seq: i + 1,
+        metadata: (callerTurnPrivate === false ? rest : { ...metadata, [CALLER_TURN_KEY]: 0 }) as MessageMetadata,
+      };
+    });
     this.deferredSeq = Math.max(this.deferredSeq, restored.length);
     if (landed.size > 0) {
       console.error(
@@ -16181,7 +16192,10 @@ export class AgentFramework {
   }
 
   private retakeIsPrivate(agent: Agent): boolean {
-    return agent.getContextManager().getAllMessages().some((m) => isMarkedPrivateInput(m.metadata));
+    for (const message of rowsNewestFirst(agent.getContextManager(), (metadata) => this.agentSees(agent, metadata))) {
+      if (isMarkedPrivateInput(message.metadata)) return true;
+    }
+    return false;
   }
 
   /**
@@ -16350,7 +16364,11 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    if (holdsUnansweredPrivateInput(contextManager, config.name, sees)) this.privateInputStored.add(config.name);
+    const recorded = this.readPrivateInputRecord(config.name);
+    const waiting = recorded ?? holdsUnansweredPrivateInput(contextManager, config.name, sees);
+    if (waiting) this.privateInputStored.add(config.name);
+    this.privateInputRecords.set(config.name, recorded);
+    this.recordPrivateInput(config.name, waiting);
     this.sharedSlotAgents.add(agent);
     // The first resident declared owns default delivery.
     this.announceAgentCreated(
@@ -16883,7 +16901,7 @@ export class AgentFramework {
           const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
           let replyId: MessageId | undefined;
           if (pendingBlocks) {
-            replyId = agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
+            replyId = this.storeTurnReply(agent, pendingBlocks);
             this.pendingAssistantBlocks.delete(agent.name);
           }
           const replySent = pendingBlocks ? this.pendingRoundSent.get(pendingBlocks) : undefined;
@@ -16997,8 +17015,10 @@ export class AgentFramework {
             // a sharded body read back from its store is injected as later
             // compiles join it, and a write that threw after storing, which
             // counts as stored, as what landed of it (writeDrainedInOrder).
-            const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
-              agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
+            const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) => {
+              this.recordPrivateInputAhead(agent, msg.metadata);
+              return agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+            });
             for (const [msg, { id, content }] of stored) {
               this.releaseLandedMail(msg.metadata, agent.name);
               this.noteSpokenTo(agent.name, msg.metadata);
@@ -22485,15 +22505,18 @@ export class AgentFramework {
    * its own agent, so no boundary of another resident's turn weighs it.
    */
   private noteForOtherResidents(agent: Agent, metadata: MessageMetadata | undefined, messageId: MessageId): void {
-    if (!this.isOrdinaryResident(agent)) return;
-    for (const name of this.registry.sharedSlotReaders()) {
-      const reader = this.agents.get(name);
-      if (reader && reader !== agent && this.isOrdinaryResident(reader)) {
-        this.noteSpokenTo(reader.name, metadata);
-        this.noteArrival(reader.name, metadata, messageId);
-        if (this.agentSees(reader, metadata)) this.notePrivateInput(reader.name, metadata);
-      }
+    for (const reader of this.otherResidents(agent)) {
+      this.noteSpokenTo(reader.name, metadata);
+      this.noteArrival(reader.name, metadata, messageId);
+      if (this.agentSees(reader, metadata)) this.notePrivateInput(reader.name, metadata);
     }
+  }
+
+  private otherResidents(agent: Agent): Agent[] {
+    if (!this.isOrdinaryResident(agent)) return [];
+    return this.registry.sharedSlotReaders()
+      .map((name) => this.agents.get(name))
+      .filter((reader): reader is Agent => !!reader && reader !== agent && this.isOrdinaryResident(reader));
   }
 
   /**
@@ -22597,6 +22620,8 @@ export class AgentFramework {
   private notePrivateTurn(turnId: number): void {
     if (turnId <= this.privateTurnsFloor || this.privateTurnIds.has(turnId)) return;
     this.privateTurnIds.add(turnId);
+    if (this.deferredWritesPersisted && this.durableDeferredWrites().some((m) =>
+      (m.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === turnId)) this.persistDeferredWrites();
     if (this.privateTurnIds.size <= PRIVATE_TURNS_KEPT) return;
     let lowest = turnId;
     for (const id of this.privateTurnIds) if (id < lowest) lowest = id;
@@ -22621,6 +22646,10 @@ export class AgentFramework {
     delete routing.pin;
     delete routing.triggerChannel;
     delete routing.locked;
+    if (routing.typing) {
+      this.channelRegistry?.stopTyping(routing.typing);
+      delete routing.typing;
+    }
     if (wasPrivate || silent) return undefined;
     const notice = this.storePrivateTurnNotice(agent);
     if (notice) console.error(`[routing] ${agent.name}: private input made the turn private (${had ? qualifiedChannelName(had) : 'no destination'} -> none)`);
@@ -24379,7 +24408,6 @@ export class AgentFramework {
     let tokenHandedOff = false;
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
-      if (tokenHandedOff && !trigger?.suppressProse) this.privateInputStored.delete(agent.name);
     } catch (error) {
       // A throw outside the stream's own failure handling (the checkpoint,
       // locus resolution, the typing indicator) drops this start's trigger,
@@ -25426,6 +25454,7 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+      if (!trigger?.suppressProse) this.privateInputStored.delete(agent.name);
       const handle = this.driveStream(
         agent,
         stream,
@@ -25984,7 +26013,7 @@ export class AgentFramework {
       typingChannel = locus;
     };
     const tracedChannelId = (): string | undefined =>
-      (turnProseRouting === 'disabled' ? undefined : typingChannel?.channelId);
+      (turnProseRouting === 'disabled' || streamRouting.nonChannelOrigin ? undefined : typingChannel?.channelId);
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
     // finally below (the one block every exit path shares). Which terminal
@@ -26666,7 +26695,7 @@ export class AgentFramework {
               // Flush pending assistant blocks
               const pending = this.pendingAssistantBlocks.get(agent.name);
               if (pending) {
-                const pendingId = agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
+                const pendingId = this.storeTurnReply(agent, pending);
                 this.pendingAssistantBlocks.delete(agent.name);
                 const pendingSent = this.pendingRoundSent.get(pending);
                 // The stream's last reply, stored: its final row.
@@ -26775,7 +26804,7 @@ export class AgentFramework {
               this.noteStreamEnd(agent, stream, { kind: 'reply', id: undefined, sent: terminalSent }, false);
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                const terminalId = this.storeTurnReply(agent, terminalContent);
                 if (response.stopReason === 'refusal') refusedReplyId = terminalId;
                 this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
               } else {
@@ -26785,7 +26814,7 @@ export class AgentFramework {
             } else if (cut?.unnamed && terminalContent.length === 0) {
               this.noteStreamEnd(agent, stream, undefined, false);
             } else {
-              const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              const terminalId = this.storeTurnReply(agent, terminalContent);
               if (response.stopReason === 'refusal') refusedReplyId = terminalId;
               this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
             }
@@ -30884,6 +30913,7 @@ export class AgentFramework {
     if (takesClockBefore(participant, content, metadata, agent.name) && !suppressedRow(metadata as Record<string, unknown> | undefined)) {
       this.storeDueClock(agent, 'event');
     }
+    this.recordPrivateInputAhead(agent, metadata);
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
@@ -31054,6 +31084,43 @@ export class AgentFramework {
 
   private notePrivateInput(agentName: string, metadata: MessageMetadata | undefined): void {
     if (this.isPrivateInput(metadata)) this.privateInputStored.add(agentName);
+  }
+
+  private recordPrivateInputAhead(agent: Agent, metadata: MessageMetadata | undefined): void {
+    if (!this.isPrivateInput(metadata)) return;
+    this.recordPrivateInput(agent.name, true);
+    for (const reader of this.otherResidents(agent)) {
+      if (this.agentSees(reader, metadata)) this.recordPrivateInput(reader.name, true);
+    }
+  }
+
+  private storeTurnReply(agent: Agent, content: ContentBlock[]): MessageId | undefined {
+    const id = agent.addAssistantResponse(content, this.silentTurnRowMetadata(agent.name));
+    if (id === undefined || this.activeTurnTriggers.get(agent.name)?.suppressProse || this.privateInputStored.has(agent.name)) return id;
+    try {
+      this.recordPrivateInput(agent.name, false);
+    } catch (error) {
+      console.error(
+        `[routing] ${agent.name}: the record that its private input was answered couldn't be written (${thrownText(error)}); ` +
+          `after a restart its first start speaks in no channel`,
+      );
+    }
+    return id;
+  }
+
+  private readPrivateInputRecord(agentName: string): boolean | undefined {
+    const state = this.store.getStateJson(FRAMEWORK_STATE_ID) as { privateInputWaiting?: Record<string, unknown> } | null;
+    const value = state?.privateInputWaiting?.[agentName];
+    return typeof value === 'boolean' ? value : undefined;
+  }
+
+  private recordPrivateInput(agentName: string, waiting: boolean): void {
+    if (!this.privateInputRecords.has(agentName) || this.privateInputRecords.get(agentName) === waiting) return;
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+    state.privateInputWaiting = { ...(state.privateInputWaiting as Record<string, boolean> | undefined), [agentName]: waiting };
+    this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    this.privateInputRecords.set(agentName, waiting);
   }
 
   private isPrivateInput(metadata: MessageMetadata | undefined): boolean {
@@ -31539,8 +31606,10 @@ export class AgentFramework {
    * the agent.
    */
   private flushForStart(agent: Agent, occasion: 'turn-start' | 'assembly'): boolean {
-    const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `${occasion} flush for ${agent.name}`, (msg) =>
-      agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
+    const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `${occasion} flush for ${agent.name}`, (msg) => {
+      this.recordPrivateInputAhead(agent, msg.metadata);
+      return agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+    });
     for (const [msg, { id }] of stored) {
       // Held mail whose message just landed is released (Dendrite).
       this.releaseLandedMail(msg.metadata, agent.name);
