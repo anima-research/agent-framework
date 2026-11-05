@@ -1,0 +1,1 @@
+- Omit legacy stored reasoning-loss notices from requests only when both `metadata.kind` is `reasoning-loss` and `metadata.system` is `true` (#973). Stored history and quoted notice text remain unchanged; #938 already stopped writing new notices.
