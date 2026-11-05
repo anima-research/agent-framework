@@ -403,6 +403,14 @@ describe('plain speech a module says it showed', () => {
     assert.ok(notices(f)[0]!.endsWith(HEDGE), notices(f)[0]);
   });
 
+  it("a no-channel notice whose words its host didn't pass names the speech by its length alone", async () => {
+    const f = await host([], new MockMembrane());
+    const registry = internals(f).channelRegistry as unknown as { onRouteFailure(info: Record<string, unknown>): void };
+    registry.onRouteFailure({ conversationId: 'resident', channelId: null, reason: 'no channel was chosen for it', textLen: 50, outcome: 'failed' });
+    assert.equal(notices(f).length, 1, notices(f).join('\n'));
+    assert.ok(notices(f)[0]!.startsWith('[send-undeliverable] Your plain speech (50 chars) had no channel to go to'), notices(f)[0]);
+  });
+
   it("the line for a reply a module showed names where, and never says 'no locus', which connectome-doctor reads as not delivered", async (t) => {
     const errors: string[] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
