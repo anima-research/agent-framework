@@ -1,4 +1,3 @@
-import { reasoningLossRows } from './reasoning-loss.js';
 import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
@@ -1450,9 +1449,8 @@ export class Agent {
   /**
    * A host's hook, called with each committing compile's `thinkingStrip` (never a dry run's) and the key of the
    * branch it read (`branchKey`), as the compile returns, whether or not its request is then sent, since the
-   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets it
-   * at the agent's first stream unless a host has set one, so a host's own observer stands in for the framework's,
-   * whose `[reasoning]` line for the agent then isn't told.
+   * context manager's binding record takes the strip either way. One that throws is logged. It is observational only;
+   * the framework does not write agent-facing reasoning-loss notices.
    */
   onThinkingStrip?: (strip: ThinkingStrip, branch: string) => void;
 
@@ -1751,9 +1749,7 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const omitted = reasoningLossRows(compiled, this.contextManager);
-      const messages = this.presentOwnTurns(withoutTokenEstimates(
-        compiled.messages.filter((_, i) => !omitted.has(i))));
+      const messages = this.presentOwnTurns(withoutTokenEstimates(compiled.messages));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1968,10 +1964,6 @@ export class Agent {
       origin = [...origin.slice(0, at), ...appended.map(() => null), ...origin.slice(at)];
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
     }
-    const omitted = reasoningLossRows(compiledResult, this.contextManager);
-    const kept = origin.map((from) => from === null || !omitted.has(from));
-    messages = messages.filter((_, i) => kept[i]);
-    origin = origin.filter((_, i) => kept[i]);
     // The stored context injections the request ends on, counted over the
     // messages the sanitizer below keeps (hasRenderedContent), since it drops
     // a message it leaves empty, a placed blank injection among them.

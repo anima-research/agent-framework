@@ -1,4 +1,4 @@
-import { reasoningLossRows } from './reasoning-loss.js';
+import { isReasoningLoss } from './reasoning-loss.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -2923,12 +2923,13 @@ const SUPPRESSED_PROBE: Record<string, unknown> = Object.freeze({ suppressed: Ob
 
 /**
  * What a reader of the residents' shared message slot does not see: held
- * messages and suppressed ones. Used by every resident, and by a context
- * derived from one when it is reopened.
+ * messages, suppressed rows and legacy reasoning-loss notices. Used by every
+ * resident, and by a context derived from one when it is reopened.
  */
 const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
   !heldFromResidents(message.metadata as Record<string, unknown> | undefined)
-  && !suppressedRow(message.metadata as Record<string, unknown> | undefined);
+  && !suppressedRow(message.metadata as Record<string, unknown> | undefined)
+  && !isReasoningLoss(message.metadata);
 
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
 interface DerivingContextManager {
@@ -10995,6 +10996,7 @@ export class AgentFramework {
           store: this.store,
           namespace,
           isolate: true,
+          viewFilter: (message) => !isReasoningLoss(message.metadata),
           strategy: config.strategy ?? new PassthroughStrategy(),
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -11002,6 +11004,7 @@ export class AgentFramework {
       }
       // Either manager is the run's to release (main's manager release), the derived one included.
       this.trackManager(contextManager);
+      if (!this.storeSees.has(contextManager)) this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
       release.manager = contextManager;
 
       const agent = new Agent(config, contextManager, this.membrane);
@@ -11154,9 +11157,7 @@ export class AgentFramework {
         // The historical copy: the parent's compiled view, its turns renamed
         // so the child reads its inheritance as its own history.
         const compiled = await parent.getContextManager().compile();
-        const omitted = reasoningLossRows(compiled, parent.getContextManager());
-        for (const [i, message] of compiled.messages.entries()) {
-          if (omitted.has(i)) continue;
+        for (const message of compiled.messages) {
           created.contextManager.addMessage(
             parent.isOwnParticipant(message.participant) ? options.name : message.participant,
             message.content,
@@ -11426,7 +11427,7 @@ export class AgentFramework {
       walked.add(from.name);
       const sourceRecord = this.registry.inspect(source);
       const sourceSees = sourceRecord ? derivedSees(sourceRecord, walked) : residentSees(source);
-      return (metadata) => sourceSees(metadata) || isOwnInjection(metadata, from.name);
+      return (metadata) => !isReasoningLoss(metadata) && (sourceSees(metadata) || isOwnInjection(metadata, from.name));
     };
     // The predicate is the manager's view filter, and is recorded beside it,
     // so main's checks of whether an agent sees a row (agentSees) ask what its
@@ -11445,16 +11446,16 @@ export class AgentFramework {
         );
       }
       // A context derived from a reader of the shared slot keeps the view it had.
-      const sees = derivation.slots?.messageNamespace === null ? derivedSees(record) : undefined;
+      const sees = derivation.slots?.messageNamespace === null ? derivedSees(record) : (metadata: unknown) => !isReasoningLoss(metadata);
       const reopened = await reopen.call(ContextManager, {
         store: this.store,
         derivation,
         strategy: strategy ?? new PassthroughStrategy(),
         membrane,
-        ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+        viewFilter: (message) => sees(message.metadata),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
-      return sees ? seen(reopened, sees) : reopened;
+      return seen(reopened, sees);
     }
     if (!record.namespace) {
       throw new Error(`Agent "${record.name}": its record names no context to reopen`);
@@ -11463,16 +11464,17 @@ export class AgentFramework {
     // configuration, say) is reopened as createAgent opened it: on the
     // shared slot, through the residents' view. Isolated, its namespace
     // holds none of what it read (nissa's #546 review, round 2).
-    const sees = record.readsSharedSlot === true ? residentSees(record.name) : undefined;
+    const sees = record.readsSharedSlot === true ? residentSees(record.name) : (metadata: unknown) => !isReasoningLoss(metadata);
     const opened = await ContextManager.open({
       store: this.store,
       namespace: record.namespace,
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : { isolate: true }),
+      viewFilter: (message) => sees(message.metadata),
+      ...(record.readsSharedSlot === true ? {} : { isolate: true }),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    return sees ? seen(opened, sees) : opened;
+    return seen(opened, sees);
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -11513,13 +11515,11 @@ export class AgentFramework {
     // reads through it, and is recorded beside the manager (storeSees), so
     // main's checks of whether an agent sees a row (agentSees: a tool
     // boundary's injection, an arrival, a reader of an unread message) ask
-    // what its compile shows. A source with no view recorded has no filter
-    // (an isolated run's): it sees every row, so its fork keeps none, and
-    // sees its own.
+    // what its compile shows. The global legacy-notice exclusion applies
+    // even when the source has no additional view recorded.
     const sourceSees = this.storeSees.get(source);
-    const sees = sourceSees
-      ? (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name)
-      : undefined;
+    const sees = (metadata: unknown): boolean => !isReasoningLoss(metadata)
+      && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name));
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -11529,10 +11529,10 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+      viewFilter: (message) => sees(message.metadata),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    if (sees) this.storeSees.set(contextManager, sees);
+    this.storeSees.set(contextManager, sees);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
@@ -16169,7 +16169,7 @@ export class AgentFramework {
     const sees = (metadata: unknown): boolean =>
       !heldFromResidents(metadata as Record<string, unknown> | undefined)
       && !suppressedRow(metadata as Record<string, unknown> | undefined)
-      && !isAnotherAgentsInjection(metadata, config.name);
+      && !isAnotherAgentsInjection(metadata, config.name) && !isReasoningLoss(metadata);
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -16268,20 +16268,21 @@ export class AgentFramework {
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
-    // Suppressed rows (suppressedRow) are never rendered for anyone, the
-    // reader of held traffic included.
+    // Suppressed rows and legacy reasoning-loss notices are never rendered
+    // for anyone, the reader of held traffic included.
     const sees = (metadata: unknown): boolean =>
-      !suppressedRow(metadata as Record<string, unknown> | undefined) && !isAnotherAgentsInjection(metadata, name);
+      !suppressedRow(metadata as Record<string, unknown> | undefined)
+      && !isAnotherAgentsInjection(metadata, name) && !isReasoningLoss(metadata);
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,
       isolate: true,
       // The residents' shared un-namespaced slot, merged read-only, with the
       // tune-out's stamped messages included. The filter, which context-
-      // manager applies to the merged view too, leaves out only the
-      // residents' stored context injections (stored-injections.ts): their
-      // context, which this agent never saw while they were placed unstored,
-      // and suppressed rows.
+      // manager applies to the merged view too, leaves out suppressed rows,
+      // legacy notices and the residents' stored context injections
+      // (stored-injections.ts): their context, which this agent never saw
+      // while they were placed unstored.
       auxiliaryMessageViews: [{}],
       viewFilter: (message) => sees(message.metadata),
       strategy,
@@ -17997,6 +17998,7 @@ export class AgentFramework {
         store: this.store,
         namespace: `conversations/${name}`,
         isolate: true,
+        viewFilter: (message) => !isReasoningLoss(message.metadata),
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
         // Provider cooldown ownership belongs to the persistent resident only;
@@ -18007,6 +18009,7 @@ export class AgentFramework {
       });
       release.manager = contextManager;
       this.trackManager(contextManager);
+      this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
 
       // Seed with the template's compiled context, renaming the template
       // participant so the fork reads its inheritance as its own history.
@@ -18067,8 +18070,9 @@ export class AgentFramework {
         // annotations has finished.
         const compiledResult = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        // Legacy reasoning-loss rows are already outside the compiled view,
+        // not seed-time omissions counted by logSeedOmissions.
         const { messages: compiledWhole, provenance } = compiledResult;
-        const omitted = reasoningLossRows(compiledResult, template.getContextManager());
         const templateRows = template.getContextManager().getAllMessages();
         // The template's stored context injections (stored-injections.ts) are
         // its context, not the conversation, so the seed leaves them out, as
@@ -18077,7 +18081,6 @@ export class AgentFramework {
         // account of where each message came from.
         const injectionRows = new Set(templateRows.filter((m) => storedInjectionMarkOf(m.metadata)).map((m) => m.id));
         const compiled = compiledWhole.filter((_, i) => {
-          if (omitted.has(i)) return false;
           const source = provenance?.messages[i];
           return !(source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId)));
         });
@@ -18085,7 +18088,7 @@ export class AgentFramework {
         const withoutNotices = withoutPrimaryNotices(
           withoutReasoning, primaryNoticeTexts(templateRows));
         const seed = stripUnpairedToolBlocks(withoutNotices);
-        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length - omitted.size, compiled, withoutReasoning, withoutNotices, seed);
+        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -22238,7 +22241,7 @@ export class AgentFramework {
 
   private agentSees(agent: Agent, metadata: unknown): boolean {
     const sees = this.storeSees.get(agent.getContextManager());
-    return !sees || sees(metadata);
+    return !isReasoningLoss(metadata) && (!sees || sees(metadata));
   }
 
   /**

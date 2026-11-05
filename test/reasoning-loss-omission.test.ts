@@ -4,8 +4,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NativeFormatter, type ContentBlock, type NormalizedRequest } from '@animalabs/membrane';
-import { AgentFramework, type ProcessEvent } from '../src/index.js';
-import { PassthroughStrategy } from '@animalabs/context-manager';
+import { Agent, AgentFramework, type AgentConfig, type Module, type ProcessEvent } from '../src/index.js';
+import { ContextManager, PassthroughStrategy, AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -18,13 +18,12 @@ class MarkedPrefix extends PassthroughStrategy {
   }
 }
 const flags = { system: true, kind: 'reasoning-loss' };
-async function fixture(conversations = false) {
+async function fixture(conversations = false, settings: Partial<AgentConfig> = {}, membrane = new MockMembrane(), modules: Module[] = []) {
   const dir = mkdtempSync(join(tmpdir(), 'af-reasoning-loss-'));
-  const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
-    storePath: join(dir, 'store'), membrane: membrane.asMembrane(), syncIntervalMs: 0, modules: [],
+    storePath: join(dir, 'store'), membrane: membrane.asMembrane(), syncIntervalMs: 0, maintenanceIntervalMs: 0, modules,
     ...(conversations ? { conversations: { templateAgent: 'assistant' } } : {}),
-    agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', strategy: new MarkedPrefix() }],
+    agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', strategy: new MarkedPrefix(), ...settings }],
   });
   cleanups.push(async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); });
   await framework.start();
@@ -135,7 +134,7 @@ for (const mode of ['copy', 'shared'] as const) {
     assert.deepEqual(request.messages.map(m => m.content), expected);
     assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
     assert.equal(JSON.stringify(await x.request()), before);
-    assert.equal((await x.agent.compileContext()).messages.length, 7, 'debug compiles still show stored history');
+    assert.equal((await x.agent.compileContext()).messages.length, 5, 'compiled views exclude notices; raw history remains available');
     if (mode === 'copy') assert.deepEqual(fork.contextManager.getAllMessages().map(m => m.content), expected);
   });
 }
@@ -160,4 +159,128 @@ it('conversation-template inheritance omits notices before metadata is lost, wit
   assert.deepEqual(x.membrane.calls[0]!.messages.slice(0, expected.length).map(m => m.content), expected);
   assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
   assert.equal(JSON.stringify(await x.request()), before);
+});
+
+class LastMarker extends PassthroughStrategy {
+  override select(...args: Parameters<PassthroughStrategy['select']>) {
+    const entries = super.select(...args);
+    return entries.map((entry, i) => i === entries.length - 1 ? { ...entry, cacheMarker: true } : entry);
+  }
+}
+it('places a cache marker on the surviving prefix when the last stored row is a notice, and after it', async () => {
+  const x = await fixture(false, { strategy: new LastMarker() });
+  await x.add('user', [text('before')]);
+  await x.add('user', [text(notice)], flags);
+  const prefix = await x.request();
+  assert.deepEqual(prefix.messages, [{ participant: 'user', content: [text('before')], cacheBreakpoint: true }]);
+  assert.ok(wire(prefix)[0]!.content.at(-1)!.cache_control, 'the surviving prefix is cacheable on the wire');
+  await x.add('user', [text('after')]);
+  const request = await x.request();
+  assert.equal(request.messages.at(-1)!.cacheBreakpoint, true);
+  assert.deepEqual(request.messages.at(-1)!.content, [text('after')]);
+});
+
+it('strips signed thinking minted under the legacy notice prefix before sending the changed prefix', async () => {
+  const x = await fixture(false, { thinkingBinding: { binds: true } });
+  const legacy = await ContextManager.open({ store: x.framework.getStore(), namespace: 'agents/assistant', strategy: new MarkedPrefix() });
+  cleanups.push(async () => { legacy.close(); });
+  const old = new Agent({ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', thinkingBinding: { binds: true } }, legacy, x.membrane.asMembrane());
+  legacy.addMessage('user', [text('before')]);
+  legacy.addMessage('user', [text(notice)], flags);
+  const start = await old.startStream([]);
+  const reply = old.addAssistantResponse([{ type: 'thinking', thinking: 'private', signature: 'signed' }, text('reply')])!;
+  assert.equal(start.noteRequestSent!([reply]), true);
+  const original = await old.buildActivationRequest([]);
+  assert.ok(original.messages.some(m => m.content.some(b => b.type === 'thinking')), 'legacy prefix really retained the signature');
+  const strips: unknown[] = [];
+  x.agent.onThinkingStrip = (strip) => strips.push(strip);
+  const seen: unknown[][] = [];
+  x.agent.onCompiledToSend = (rows) => seen.push([...rows]);
+  const request = await x.request();
+  assert.ok(!request.messages.some(m => m.content.some(b => b.type === 'thinking')));
+  assert.ok(!JSON.stringify(request.messages).includes(notice));
+  assert.equal(strips.length, 1);
+  assert.ok(!JSON.stringify(seen).includes(notice), 'sent-context observer sees the same filtered compile');
+  assert.ok(legacy.getAllMessages().some(m => m.content.some(b => b.type === 'thinking')), 'stored signed blocks remain untouched');
+});
+
+class CompressionRecorder extends MockMembrane {
+  auxiliary: NormalizedRequest[] = [];
+  override async complete(request: NormalizedRequest) {
+    this.auxiliary.push(request);
+    return createMockResponse([text('A summary of the ordinary conversation.')]);
+  }
+}
+const folding = () => new AutobiographicalStrategy({
+  compressionModel: 'test-compression-model', adaptiveResolution: true, targetChunkTokens: 50,
+  headWindowTokens: 0, recentWindowTokens: 0, autoTickOnNewMessage: false, minChunkCharsForLLM: 0, l1HoldbackChunks: 0,
+});
+it('excludes real sharded notices from selection and auxiliary compression without altering stored shards', async () => {
+  const membrane = new CompressionRecorder();
+  const x = await fixture(false, { strategy: folding() }, membrane);
+  const id = await x.add('user', [text((notice + ' ').repeat(300))], flags);
+  const shards = x.cm.getAllMessages().filter(m => m.id === id || m.bodyGroupId === x.cm.getMessage(id)!.bodyGroupId);
+  assert.ok(shards.length > 1, 'real adaptive ingress split the notice');
+  assert.ok(shards.every(m => m.metadata?.kind === 'reasoning-loss' && m.metadata.system === true));
+  for (let i = 0; i < 10; i++) await x.add(i % 2 ? 'assistant' : 'user', [text('ordinary conversation '.repeat(40))]);
+  const stored = JSON.stringify(x.cm.getAllMessages());
+  for (let i = 0; i < 100 && (!membrane.auxiliary.length || !x.cm.isReady()); i++) await x.cm.tick();
+  assert.ok(membrane.auxiliary.length > 0, 'actual compression reached the fake auxiliary membrane');
+  assert.ok(!JSON.stringify(membrane.auxiliary).includes(notice));
+  assert.ok(!JSON.stringify((await x.agent.compileContext()).messages).includes(notice));
+  assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
+});
+
+it('stores genuine deferred notices but never injects them at the next tool boundary', async () => {
+  let framework: AgentFramework;
+  let queued = 0;
+  const module: Module = {
+    name: 'defer', async start() {}, async stop() {},
+    getTools: () => [{ name: 'step', description: 'step', inputSchema: { type: 'object', properties: {} } }],
+    async handleToolCall() {
+      const before = (framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length;
+      (framework as unknown as { addMessage(p: string, c: ContentBlock[], m?: Record<string, unknown>): void }).addMessage('user', [text(notice)], flags);
+      (framework as unknown as { addMessage(p: string, c: ContentBlock[], m?: Record<string, unknown>): void }).addMessage('user', [text(notice)]);
+      queued = (framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length - before;
+      return { success: true, data: 'ok' };
+    },
+    async onProcess(event) { return event.type === 'external-message' ? { addMessages: [{ participant: 'user', content: [text('start')] }], requestInference: true } : {}; },
+  };
+  const x = await fixture(false, {}, new MockMembrane(), [module]);
+  framework = x.framework;
+  x.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'call', name: 'defer--step', input: {} }], 'tool_use'));
+  x.membrane.pushResponse(createMockResponse([text('reply')]));
+  framework.pushEvent({ type: 'external-message', source: 'test' } as ProcessEvent);
+  await framework.runUntilIdle();
+  assert.equal(queued, 2, 'both writes were really queued during the tool call');
+  const stored = x.cm.getAllMessages().filter(m => m.metadata?.kind === 'reasoning-loss');
+  assert.equal(stored.length, 1);
+  assert.equal(typeof stored[0]!.metadata?.deferredWriteId, 'string');
+  const injected = x.membrane.lastStream!.receivedToolResultOptions.flatMap(o => o?.injectedMessages ?? []);
+  assert.equal(injected.filter(m => JSON.stringify(m.content).includes(notice)).length, 1, 'only the unflagged identical quote is injected');
+  assert.equal((await x.request()).messages.filter(m => JSON.stringify(m.content).includes(notice)).length, 1);
+});
+
+it('excludes notices before a strategy composites ordinary and notice rows', async () => {
+  class Composite extends PassthroughStrategy {
+    override select(...args: Parameters<PassthroughStrategy['select']>) {
+      const entries = super.select(...args);
+      return entries.length ? [{ ...entries[0]!, content: entries.flatMap(e => e.content) }] : [];
+    }
+  }
+  const x = await fixture(false, { strategy: new Composite() });
+  await x.add('user', [text('before')]);
+  await x.add('user', [text('flagged arbitrary body')], flags);
+  await x.add('user', [text('after')]);
+  assert.deepEqual((await x.request()).messages.map(m => m.content), [[text('before'), text('after')]]);
+});
+
+it('applies the same exclusion to an isolated ephemeral context', async () => {
+  const x = await fixture();
+  const isolated = await x.framework.createEphemeralAgent({ name: 'isolated', model: 'test-model', systemPrompt: 'Test.' });
+  cleanups.push(async () => isolated.cleanup());
+  isolated.contextManager.addMessage('user', [text('before')]);
+  isolated.contextManager.addMessage('user', [text(notice)], flags);
+  assert.deepEqual((await isolated.agent.buildActivationRequest([])).messages.map(m => m.content), [[text('before')]]);
+  assert.equal((await isolated.agent.compileContext()).messages.length, 1);
 });
