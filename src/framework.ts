@@ -6665,8 +6665,7 @@ export class AgentFramework {
     if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
     else delete (same as MarkedRequest)[TURN_CARRY];
     if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
-    const pair = [same, request];
-    const channels = wakeChannelsOf(pair.some(bringsOwnChannels) ? pair.filter(hasOwnCauseForRun) : pair);
+    const channels = wakeChannelsOf([same, request]);
     if (channels) same.wakeChannels = channels;
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {

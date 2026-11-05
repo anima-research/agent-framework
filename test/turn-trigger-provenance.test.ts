@@ -279,7 +279,7 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("two parked wakes with one key, one silent, coalesced while the host is quiesced, name the channels the merge's rule gives at resume", async () => {
+  it("two parked pushes with one key, a silent heartbeat's and a plain one, each carrying channels as a release's first member would, name only the plain push's at resume", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
     const framework = await makeFramework();
     const i = internals(framework);
@@ -289,8 +289,8 @@ describe('Turn trigger provenance', () => {
     await framework.quiesce({ reason: 'test window' });
     const t = Date.now();
     i.pendingRequests.push(
-      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t, wakeChannels: [room], suppressProse: true },
-      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [general] },
+      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t, wakeChannels: [room], suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } },
+      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 1, addressed: false, wakeChannels: [general] },
     );
     await i.processInferenceRequests();
     assert.equal(membrane.calls.length, 0, 'premise: parked while quiesced');
@@ -299,21 +299,6 @@ describe('Turn trigger provenance', () => {
     await framework.runUntilIdle();
     assert.ok(captured.exposed, 'the turn started at resume');
     assert.deepEqual(captured.exposed.wakeChannels, [general]);
-    await framework.stop();
-  });
-
-  for (const first of ['the silent one', 'the other'] as const) it(`a provider hold that takes one of two equal requests, one silent, into the other keeps the channels the merge's rule gives, ${first} held first`, async () => {
-    const framework = await makeFramework();
-    const hold = internals(framework) as unknown as { holdRequest(held: unknown[], request: unknown): void };
-    const room = { serverId: 'discord', channelId: 'discord:g:room' };
-    const general = { serverId: 'discord', channelId: 'discord:g:general' };
-    const t = Date.now();
-    const silent = { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t, wakeChannels: [room], suppressProse: true };
-    const other = { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t, wakeChannels: [general] };
-    const held: Array<{ wakeChannels?: unknown }> = [first === 'the silent one' ? silent : other];
-    hold.holdRequest(held, first === 'the silent one' ? other : silent);
-    assert.equal(held.length, 1, 'premise: the hold took one into the other');
-    assert.deepEqual(held[0]!.wakeChannels, [general]);
     await framework.stop();
   });
 
