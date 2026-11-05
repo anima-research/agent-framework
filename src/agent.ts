@@ -388,6 +388,7 @@ export class Agent {
   /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
   private readonly ownParticipants: ReadonlySet<string>;
   private sourceChangeOwners: ReadonlySet<string> = new Set();
+  private compileHoldsChanges = true;
   private readonly deniedAtDispatch: ReadonlySet<string>;
 
   private _state: AgentState = { status: 'idle' };
@@ -604,6 +605,16 @@ export class Agent {
    */
   setSourceChangeOwners(owners: Iterable<string>): void {
     this.sourceChangeOwners = new Set([...owners].filter((owner) => !this.ownParticipants.has(owner)));
+  }
+
+  /**
+   * Whether this agent's compile can hold change rows: false where its host
+   * opens its context manager with a view that leaves every change row out,
+   * as the framework does for an agent on `'head'`. A compile refused over
+   * budget then takes none out, since taking them can't help it fit.
+   */
+  setCompileHoldsChanges(holds: boolean): void {
+    this.compileHoldsChanges = holds;
   }
 
   /** Whether a change row stamped with this participant is one of this agent's own. */
@@ -2714,7 +2725,7 @@ export class Agent {
     const refusal = (error as { name?: unknown } | null)?.name;
     if (refusal !== 'OverBudgetError' && refusal !== 'UncoveredDropError') throw error;
     if (!entries) {
-      const rows = this.ownChangeRows();
+      const rows = this.compileHoldsChanges ? this.ownChangeRows() : [];
       if (rows.length === 0 || !this.headDeclarations.delete(this.name)) throw error;
       const removed = this.removeOwnChanges(rows);
       this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });

@@ -11159,6 +11159,7 @@ export class AgentFramework {
 
       const agent = new Agent(config, contextManager, this.membrane);
       agent.setSourceChangeOwners(sourceChangeOwners);
+      agent.setCompileHoldsChanges(config.toolDeclarations === 'entries');
       const heads = memoryHeadDeclarations();
       if (seedHead) heads.write(config.name, seedHead);
       this.attachHeads(agent, heads);
@@ -11515,6 +11516,7 @@ export class AgentFramework {
       }
       agent = new Agent(fullConfig, contextManager, this.membrane);
       agent.setSourceChangeOwners(this.sourceChangeOwnersOf(record));
+      agent.setCompileHoldsChanges(fullConfig.toolDeclarations === 'entries');
       this.attachHeads(agent, memoryHeadDeclarations());
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
@@ -16478,6 +16480,7 @@ export class AgentFramework {
     this.storeViews.set(contextManager, view);
 
     const agent = new Agent(config, contextManager, this.membrane);
+    agent.setCompileHoldsChanges(config.toolDeclarations === 'entries');
     this.attachHeads(agent);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
@@ -18388,6 +18391,7 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
+      agent.setCompileHoldsChanges(config.toolDeclarations === 'entries');
       this.attachHeads(agent);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
