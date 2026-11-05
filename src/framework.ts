@@ -2922,13 +2922,22 @@ const DUMP_MAX_BYTES = 4 * 1024 * 1024;
 const SUPPRESSED_PROBE: Record<string, unknown> = Object.freeze({ suppressed: Object.freeze({ rule: '', eventType: '' }) });
 
 /**
- * What a reader of the residents' shared message slot does not see: held
- * messages, suppressed rows and legacy reasoning-loss notices. Used by every
- * resident, and by a context derived from one when it is reopened.
+ * A resident's context/compression view of the shared slot. Hosts opening the
+ * same store should use this predicate instead of copying the framework's rule.
  */
-const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
+export const residentViewFilter = (message: Pick<StoredMessage, 'metadata'>, agentName: string): boolean =>
   !heldFromResidents(message.metadata as Record<string, unknown> | undefined)
   && !suppressedRow(message.metadata as Record<string, unknown> | undefined)
+  && !isAnotherAgentsInjection(message.metadata, agentName)
+  && !isReasoningLoss(message.metadata);
+
+/**
+ * The subconscious's context/compression view, including held traffic. Hosts
+ * should use this predicate instead of copying the framework's rule.
+ */
+export const subconsciousViewFilter = (message: Pick<StoredMessage, 'metadata'>, agentName: string): boolean =>
+  !suppressedRow(message.metadata as Record<string, unknown> | undefined)
+  && !isAnotherAgentsInjection(message.metadata, agentName)
   && !isReasoningLoss(message.metadata);
 
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
@@ -11416,7 +11425,7 @@ export class AgentFramework {
     // context, not conversation (Weft's ninth-round probe: an ended reader
     // reopened for inspection showed a co-resident's injection it never saw live).
     const residentSees = (name: string) => (metadata: unknown): boolean =>
-      RESIDENT_VIEW_FILTER({ metadata } as StoredMessage) && !isAnotherAgentsInjection(metadata, name);
+      residentViewFilter({ metadata: metadata as StoredMessage['metadata'] }, name);
     // A context derived from a reader of the shared slot sees, as it did live
     // (deriveSharedContext, #291), what its source saw and its own stored
     // injections; its source's view is composed the same way, up the shared
@@ -16161,15 +16170,13 @@ export class AgentFramework {
   }
 
   private async createAgent(config: AgentConfig): Promise<Agent> {
-    // The residents' view (RESIDENT_VIEW_FILTER: held rows out, read by
-    // heldFromResidents) composed with this agent's own: another agent's
-    // stored context injections out. Main's boundary and arrival checks read
+    // The resident's composed view: held rows and another agent's stored
+    // context injections out, along with suppressed rows and legacy notices.
+    // Main's boundary and arrival checks read
     // the same predicate (storeSees, agentSees), so they and the compiled
     // view agree.
     const sees = (metadata: unknown): boolean =>
-      !heldFromResidents(metadata as Record<string, unknown> | undefined)
-      && !suppressedRow(metadata as Record<string, unknown> | undefined)
-      && !isAnotherAgentsInjection(metadata, config.name) && !isReasoningLoss(metadata);
+      residentViewFilter({ metadata: metadata as StoredMessage['metadata'] }, config.name);
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -16271,8 +16278,7 @@ export class AgentFramework {
     // Suppressed rows and legacy reasoning-loss notices are never rendered
     // for anyone, the reader of held traffic included.
     const sees = (metadata: unknown): boolean =>
-      !suppressedRow(metadata as Record<string, unknown> | undefined)
-      && !isAnotherAgentsInjection(metadata, name) && !isReasoningLoss(metadata);
+      subconsciousViewFilter({ metadata: metadata as StoredMessage['metadata'] }, name);
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,

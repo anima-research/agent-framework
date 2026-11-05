@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NativeFormatter, type ContentBlock, type NormalizedRequest } from '@animalabs/membrane';
+import * as packageEntry from '../src/index.js';
 import { Agent, AgentFramework, type AgentConfig, type Module, type ProcessEvent } from '../src/index.js';
 import { ContextManager, PassthroughStrategy, AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -378,4 +379,80 @@ it('omits persisted notices from a reopened resident after a framework restart',
   assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('after')])));
   assert.ok(!JSON.stringify(contents).includes(notice));
   assert.deepEqual(reopened.getAllMessages().slice(0, stored.length), stored, 'inference leaves existing stored rows untouched');
+});
+
+it('exports the composed resident and subconscious views actually applied by the framework', async () => {
+  // Reflect keeps this regression runnable against an entry missing the exports.
+  const residentView = Reflect.get(packageEntry, 'residentViewFilter');
+  const subconsciousView = Reflect.get(packageEntry, 'subconsciousViewFilter');
+  const isReasoningLoss = Reflect.get(packageEntry, 'isReasoningLoss');
+  assert.equal(typeof residentView, 'function');
+  assert.equal(typeof subconsciousView, 'function');
+  assert.equal(typeof isReasoningLoss, 'function');
+  const x = await fixture(false, {}, new MockMembrane(), [], true);
+  const metadata = [
+    flags, { system: true }, undefined, { kind: 'reasoning-loss' },
+    { tuneOut: { epochId: 'held' } },
+    { suppressed: { rule: 'test', eventType: 'test' } },
+    { system: true, kind: 'context-injection', contextInjection: {
+      agent: 'assistant', namespace: 'test', contentHash: 'resident', part: 0, parts: 1,
+    } },
+    { system: true, kind: 'context-injection', contextInjection: {
+      agent: 'Subconscious', namespace: 'test', contentHash: 'subconscious', part: 0, parts: 1,
+    } },
+  ];
+  for (const [i, mark] of metadata.entries()) await x.add('user', [text(`row-${i}`)], mark);
+  const rows = x.cm.getAllMessages();
+  assert.deepEqual(metadata.map(isReasoningLoss), [true, false, false, false, false, false, false, false]);
+  const expected = (view: (message: typeof rows[number], name: string) => boolean, name: string) =>
+    rows.filter(row => view(row, name)).map(row => row.content);
+  assert.deepEqual((await x.request()).messages.map(m => m.content), expected(residentView, 'assistant'));
+  const subconscious = x.framework.getAgent('Subconscious')!;
+  assert.deepEqual((await subconscious.buildActivationRequest([])).messages.map(m => m.content),
+    expected(subconsciousView, 'Subconscious'));
+  assert.deepEqual(expected(residentView, 'assistant'), [[text('row-1')], [text('row-2')], [text('row-3')], [text('row-6')]]);
+  assert.deepEqual(expected(subconsciousView, 'Subconscious'),
+    [[text('row-1')], [text('row-2')], [text('row-3')], [text('row-4')], [text('row-7')]]);
+});
+
+it('migration: context-manager #369 must keep a summary with a hidden first source before newer messages', {
+  todo: 'context-manager #369 or equivalent: hidden summary endpoints are unresolved on 0.24.2',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-reasoning-loss-migration-'));
+  const storePath = join(dir, 'store');
+  cleanups.push(async () => { rmSync(dir, { recursive: true, force: true }); });
+  const membrane = new CompressionRecorder();
+  // Non-adaptive selection makes the existing summary's timeline placement
+  // visible, rather than expanding it back into raw messages at a large budget.
+  const strategy = () => new AutobiographicalStrategy({
+    compressionModel: 'test-compression-model', adaptiveResolution: false,
+    targetChunkTokens: 100, headWindowTokens: 0, recentWindowTokens: 0,
+    autoTickOnNewMessage: false, minChunkCharsForLLM: 0, l1HoldbackChunks: 0,
+  });
+  const legacy = await ContextManager.open({ path: storePath, namespace: 'agents/assistant',
+    strategy: strategy(), membrane: membrane.asMembrane() });
+  cleanups.push(async () => { legacy.close(); });
+  const noticeId = legacy.addMessage('user', [text(notice)], flags);
+  for (let i = 0; i < 3; i++) legacy.addMessage(i % 2 ? 'assistant' : 'user', [text('old conversation '.repeat(30))]);
+  for (let i = 0; i < 100 && (!legacy.getSummariesInRange({}).length || !legacy.isReady()); i++) await legacy.tick();
+  const summaries = legacy.getSummariesInRange({});
+  assert.equal(summaries.length, 1, 'real unfiltered compression persisted a summary');
+  assert.equal(summaries[0]!.firstMessageId, noticeId, 'the notice really is the first source');
+  legacy.addMessage('user', [text('newer raw message')]);
+  const stored = structuredClone(legacy.getAllMessages());
+  legacy.close();
+  const framework = await AgentFramework.create({
+    storePath, membrane: membrane.asMembrane(), syncIntervalMs: 0, maintenanceIntervalMs: 0, modules: [],
+    agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', strategy: strategy() }],
+  });
+  cleanups.push(async () => framework.stop());
+  const agent = framework.getAgent('assistant')!;
+  assert.deepEqual(agent.getContextManager().getAllMessages(), stored, 'migration leaves stored rows unchanged');
+  const compiled = await agent.compileContext();
+  const contents = compiled.messages.flatMap(m => m.content).filter(b => b.type === 'text').map(b => b.text);
+  assert.ok(contents.includes(summaries[0]!.content), 'the old summary is still selected');
+  assert.ok(contents.indexOf(summaries[0]!.content) < contents.indexOf('newer raw message'),
+    'context-manager #369: an old summary must precede newer raw messages even when its first source is hidden');
+  assert.equal(agent.getContextManager().getSummariesInRange({}).length, 1,
+    'context-manager #369: the existing summary must remain in the history overview');
 });
