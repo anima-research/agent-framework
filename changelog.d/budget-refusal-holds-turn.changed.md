@@ -19,7 +19,9 @@
     wait makes it hasn't been measured. The refused attempt emits
     `inference:failed`, as an attempt a provider hold keeps does, and then the
     new trace `inference:held`; `inference:hold_ended` follows when the hold
-    ends, and the turn's next start emits `inference:started` again.
+    ends, and the turn's next start emits `inference:started` again. A
+    listener of the hold's `context-hold` alert that ends the turn at once
+    puts its `inference:aborted` before `inference:held`.
     `healthSnapshot()` gives each agent's `budgetHold` (or null): since when
     it holds, when the hold last saw compression's own work change
     (`compressionChangedAt`: the summaries it has made and whether a call is

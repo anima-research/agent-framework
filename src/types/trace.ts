@@ -159,8 +159,10 @@ export type TraceEvent =
        * A turn whose compile was refused for budget is held while compression
        * makes its context fit, instead of failing (#304). It follows the
        * refused attempt's `inference:failed`, as a provider hold does. Its
-       * logical turn stays open; `inference:hold_ended` follows, and then,
-       * unless the turn was stopped while held, its fresh compile. After a
+       * logical turn stays open, unless a listener of the hold's
+       * `context-hold` alert ended it, whose `inference:aborted` then comes
+       * first; `inference:hold_ended` follows, and then, unless the turn was
+       * stopped while held, its fresh compile. After a
        * hold that ended without a fit, a refusal of that compile takes the
        * error policy's path.
        */
@@ -176,7 +178,8 @@ export type TraceEvent =
       /** When the hold started (epoch ms): this refusal, or for a released
        *  turn refused again, the refusal that first held it. */
       since: number;
-      /** Requests the hold has taken so far, the refused one included. */
+      /** Requests the hold holds as it starts: the refused start's own. Later
+       *  joins are counted in `inference:hold_ended`. */
       heldRequests: number;
     })
   | (TraceEventBase & {

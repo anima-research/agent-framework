@@ -45,7 +45,8 @@
     only once something that could make the context fit has changed:
     compression's progress or whether it still has compression pending, a
     message added, edited or removed (other than the arrival of a stored
-    context injection, the hold's own note among them, or of a clock row), the
+    context injection, the hold's own note among them, or of a clock row, and
+    the arrival or edit of a row a suppress rule kept out of the context), the
     agent's runtime settings, the budget its next compile plans at, or its
     context manager's pins and document marks, since removing one can let
     messages it kept raw fold to summaries they already have. Those are the
