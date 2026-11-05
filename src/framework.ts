@@ -11001,10 +11001,10 @@ export class AgentFramework {
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
         });
+        this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
       }
       // Either manager is the run's to release (main's manager release), the derived one included.
       this.trackManager(contextManager);
-      if (!this.storeSees.has(contextManager)) this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
       release.manager = contextManager;
 
       const agent = new Agent(config, contextManager, this.membrane);
@@ -11156,8 +11156,8 @@ export class AgentFramework {
       if (!shared) {
         // The historical copy: the parent's compiled view, its turns renamed
         // so the child reads its inheritance as its own history.
-        const compiled = await parent.getContextManager().compile();
-        for (const message of compiled.messages) {
+        const { messages } = await parent.getContextManager().compile();
+        for (const message of messages) {
           created.contextManager.addMessage(
             parent.isOwnParticipant(message.participant) ? options.name : message.participant,
             message.content,
@@ -18068,11 +18068,8 @@ export class AgentFramework {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
-        const compiledResult = await template.toolResultGuard.afterAnnotations(
+        const { messages: compiledWhole, provenance } = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
-        // Legacy reasoning-loss rows are already outside the compiled view,
-        // not seed-time omissions counted by logSeedOmissions.
-        const { messages: compiledWhole, provenance } = compiledResult;
         const templateRows = template.getContextManager().getAllMessages();
         // The template's stored context injections (stored-injections.ts) are
         // its context, not the conversation, so the seed leaves them out, as
@@ -38167,8 +38164,9 @@ export class AgentFramework {
   /**
    * Whether `agent`'s view leaves suppressed rows out, asked of the view
    * itself (storeSees): every resident's, the subconscious's and a view
-   * derived from one does; an isolated agent's own store has no view filter,
-   * so a row stamped there would render.
+   * derived from one does. An isolated agent's own view excludes legacy
+   * reasoning-loss notices, not suppressed rows, so a suppressed row stamped
+   * there would render.
    */
   private viewHidesSuppressed(agent: Agent | undefined): boolean {
     if (!agent) return false;
