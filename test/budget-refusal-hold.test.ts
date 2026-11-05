@@ -440,6 +440,27 @@ interface Internal {
   overBudgetDrains: Set<Promise<void>>;
 }
 type HeldRequest = { agentName: string; reason: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; coalescingSubject?: string };
+/** Runs `run` with the ops webhook set to a stub that records the kind of each post for prime, in order. */
+async function withWebhook<T>(run: (posts: string[]) => Promise<T>): Promise<T> {
+  const env = process.env.CONNECTOME_OPS_WEBHOOK;
+  const fetchWas = globalThis.fetch;
+  const posts: string[] = [];
+  process.env.CONNECTOME_OPS_WEBHOOK = 'http://zz-webhook.invalid/hook';
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+    const content = String((JSON.parse(String(init?.body ?? '{}')) as { content?: unknown }).content ?? '');
+    const kind = /\*\*prime\*\* ([a-z-]+):/.exec(content)?.[1];
+    if (kind) posts.push(kind);
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  try {
+    return await run(posts);
+  } finally {
+    globalThis.fetch = fetchWas;
+    if (env === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK;
+    else process.env.CONNECTOME_OPS_WEBHOOK = env;
+  }
+}
+
 const holdOf = (t: { internal: Internal }) =>
   (t.internal.budgetHolds as unknown as Map<string, { state: string; heldRequests: HeldRequest[] }>).get('prime');
 
@@ -1139,6 +1160,40 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.equal(backlog.previews, looks, 'a row no compile renders brings no new look');
         add('zz an arrival that shows', false);
         assert.ok(await pollUntil(() => backlog.previews > looks, 2_000), 'a row that shows does');
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('takes no new look for an edit of a suppressed row while a turn is held, and does for an edit of a row that shows', async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const cm = t.framework.getAgent('prime')!.getContextManager();
+      const add = (text: string, suppressed: boolean) => (t.framework as unknown as {
+        addMessage(participant: string, content: unknown[], metadata?: unknown, opts?: unknown): unknown;
+      }).addMessage('user', [{ type: 'text', text }], {}, suppressed ? { suppressedBy: { rule: 'zz-rule', eventType: 'zz-event' } } : {});
+      const ids: Array<{ id: string; suppressed: boolean }> = [];
+      cm.onMessage((event) => {
+        if (event.type === 'add') ids.push({ id: event.message.id, suppressed: (event.message.metadata as Record<string, unknown> | undefined)?.suppressed !== undefined });
+      });
+      try {
+        add('zz a suppressed row', true);
+        add('zz a row that shows', false);
+        const suppressed = ids.find((row) => row.suppressed)?.id;
+        const shown = ids.find((row) => !row.suppressed)?.id;
+        assert.ok(suppressed && shown, 'premise: both rows are stored, one suppressed');
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const looks = backlog.previews;
+        cm.editMessage(suppressed!, [{ type: 'text', text: 'zz the suppressed row, edited' }]);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.equal(backlog.previews, looks, 'an edit of a row no compile renders brings no new look');
+        cm.editMessage(shown!, [{ type: 'text', text: 'zz the shown row, edited' }]);
+        assert.ok(await pollUntil(() => backlog.previews > looks, 2_000), 'an edit of a row that shows does');
         backlog.fit = true;
         assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
       } finally {
@@ -2475,6 +2530,58 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('posts every context-hold and its clear to the ops webhook, so its last post for a turn held again is the start', async () => {
+    await withWebhook(async (posts) => {
+      await withBacklog({ stalled: true }, async (backlog) => {
+        const t = await residentTurn({ maintenanceIntervalMs: 50 });
+        let ended = 0;
+        t.framework.onTrace((event) => {
+          if (event.type === 'inference:hold_ended' && ++ended === 1) backlog.fit = false;
+        });
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+          backlog.fit = true;
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'premise: released, then held again within the cooldown');
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          assert.equal(holdOf(t)?.state, 'holding', 'premise: the turn is held');
+          assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
+            ['context-hold', 'context-hold-clear', 'context-hold'], 'premise: the trace has both starts');
+          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold', 'context-hold-clear', 'context-hold']);
+        } finally {
+          await t.close();
+        }
+      });
+    });
+  });
+
+  it("reports a hold that a listener of its context-hold alert ends at once in order, on the trace and on the webhook", async () => {
+    await withWebhook(async (posts) => {
+      await withBacklog({ stalled: true }, async () => {
+        const t = await residentTurn({ maintenanceIntervalMs: 50 });
+        const order: string[] = [];
+        t.framework.onTrace((event) => {
+          if (event.type === 'ops:alert' && String(event.kind).startsWith('context-hold')) order.push(String(event.kind));
+          else if (event.type === 'inference:held' || event.type === 'inference:hold_ended') order.push(event.type);
+        });
+        let ended = false;
+        t.framework.onTrace((event) => {
+          if (event.type === 'ops:alert' && event.kind === 'context-hold' && !ended) { ended = true; t.framework.abortInference('prime'); }
+        });
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000));
+          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped'], 'premise: the listener ended the hold');
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          assert.deepEqual(order, ['context-hold', 'inference:held', 'inference:hold_ended', 'context-hold-clear']);
+          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold', 'context-hold-clear']);
+        } finally {
+          await t.close();
+        }
+      });
+    });
+  });
+
   it('clears context-hold when the held turn is ended', async () => {
     await withBacklog({ stalled: true }, async () => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
@@ -3608,6 +3715,49 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     };
     return { t, cm, pinId, pinned: lowest(), free: lowest([pinId]) };
   }
+
+  it("keeps compressionChangedAt where compression left it while traffic adds chunks, and moves it when compression makes a summary", async () => {
+    class SeededStrategy extends AutobiographicalStrategy {
+      seedL1(content: string, sourceIds: string[]): void {
+        this.pushSummary({
+          id: `L1-${this.nextSummaryIdCounter()}`, level: 1, content, tokens: Math.ceil(content.length / 4), sourceLevel: 0,
+          sourceIds, sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! }, created: Date.now(),
+        } as never);
+      }
+    }
+    const strategy = new SeededStrategy({ adaptiveResolution: true, targetChunkTokens: 300, recentWindowTokens: 400, autoTickOnNewMessage: false });
+    const t = await realResident(true, undefined, [], strategy);
+    const cm = t.framework.getAgent('prime')!.getContextManager();
+    const hold = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { since: number; compressionChangedAt: number } | null }> })
+      .agents.find((a) => a.name === 'prime')!.budgetHold;
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 16; i++) {
+        ids.push(cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]));
+      }
+      t.setBudget(3_000);
+      t.framework.start();
+      t.wake();
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'held, with compression pending');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const before = strategy.getProgressSnapshot();
+      const looks = t.previews();
+      for (let round = 0; round < 3; round++) {
+        for (let i = 0; i < 6; i++) t.addMessage(`zz traffic ${round}.${i} ` + 'lorem ipsum dolor sit amet '.repeat(60));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+      const after = strategy.getProgressSnapshot();
+      assert.ok(after.totalChunks > before.totalChunks, `premise: traffic added chunks (${before.totalChunks} to ${after.totalChunks})`);
+      assert.equal(after.chunksCompressed, before.chunksCompressed, 'premise: and nothing compressed them');
+      assert.ok(t.previews() > looks, 'premise: the hold looked again for the traffic');
+      assert.equal(hold()!.compressionChangedAt, hold()!.since, 'traffic moves nothing compression did');
+      const changed = Date.now();
+      strategy.seedL1('zz a summary compression made', ids.slice(0, 2));
+      assert.ok(await pollUntil(() => (hold()?.compressionChangedAt ?? 0) >= changed, 2_000), 'a summary compression makes does');
+    } finally {
+      await t.close();
+    }
+  });
 
   for (const kind of ['pin', 'document mark'] as const) {
     it(`releases a held turn once the ${kind} its compile was refused for is removed, with nothing else changing`, async () => {

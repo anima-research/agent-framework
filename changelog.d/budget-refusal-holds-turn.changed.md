@@ -21,12 +21,14 @@
     new trace `inference:held`; `inference:hold_ended` follows when the hold
     ends, and the turn's next start emits `inference:started` again.
     `healthSnapshot()` gives each agent's `budgetHold` (or null): since when
-    it holds, when compression's own state last changed
-    (`compressionChangedAt`: its progress snapshot, whether work is pending,
-    or its description of that work; the hold's start until then; messages,
-    settings and pins arriving don't move it), context-manager's description
-    of its pending work now (`pending`, bounded to 2,000 characters, or null),
-    the held count, and the refusal's type and figures.
+    it holds, when the hold last saw compression's own work change
+    (`compressionChangedAt`: the summaries it has made and whether a call is
+    in flight, as the strategy's progress snapshot gives them, or the whole
+    snapshot from a strategy whose snapshot doesn't give those; the hold's
+    start until then; messages arriving, and changes to settings or pins,
+    don't move it for the autobiographical strategy), context-manager's
+    description of its pending work now (`pending`, bounded to 2,000
+    characters, or null), the held count, and the refusal's type and figures.
   - A held turn raises `context-hold` (under Added) rather than
     `context-refusal`, since it goes on. Before, the refused compile's
     exhaustion raised `context-refusal`; a hold that ends without a fit and
