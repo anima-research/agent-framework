@@ -472,11 +472,18 @@ describe('toolDeclarations', () => {
     heads.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
     const events: HeadEvent[] = [];
     const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
-    const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let request: Awaited<ReturnType<Agent['buildActivationRequest']>>;
+    try { request = await agent.buildActivationRequest([tool('a'), tool('b')]); } finally { console.error = error; }
     assert.deepEqual(request.tools, [tool('a')], 'it goes on its recorded head');
     assert.deepEqual(changeRows(context.rows), [], 'with nothing written');
     assert.deepEqual(heads.read('agent'), { tools: [tool('a')], system: ['You are an agent.'] }, 'and its record as it was');
     assert.deepEqual(events, [], 'and nothing declared');
+    assert.equal(errors.length, 1, 'and the refusal logged once');
+    assert.match(errors[0]!, /^\[head-declarations\] agent: a system change could not be stored, so the request goes on the recorded head/);
+    assert.match(errors[0]!, /Message refused: a system change can't go between a tool call and its result/, 'with the store\'s error');
   });
 
   it("lets a refusal over budget go on, keeping its own change rows, on the head while its record can't be cleared", async () => {
