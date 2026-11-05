@@ -212,7 +212,9 @@ function unlabelled(text: string): string {
 
 function safeJson(value: unknown): string {
   try {
-    return (JSON.stringify(value) ?? '').replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+    const json = JSON.stringify(value);
+    if (json === undefined) return unlabelled(String(value));
+    return json.replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
   } catch {
     return unlabelled(String(value));
   }
