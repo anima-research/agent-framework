@@ -21701,8 +21701,8 @@ export class AgentFramework {
         notes.push(`draft ${d.id} delivered ${how}`);
       } else {
         shown.push(`${this.destinationText(attempt.destination)} (draft ${d.id}, ${how})`);
-        logged.push(logValue(`${attempt.destination.channelId} (draft ${d.id}, ${how})`));
       }
+      logged.push(logValue(`${attempt.destination.channelId} (draft ${d.id}, ${how})`));
     }
     if (notHeld) {
       notes.push(

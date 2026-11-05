@@ -2838,6 +2838,28 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
+  it("hybrid: a draft a bare {{unsent}} delivers in its own turn is named in the log when its receipt can't be recorded", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      fixIds(h, ['d-unsent1']);
+      const cm = h.framework.getAgent('scout')!.getContextManager();
+      const add = cm.addMessage.bind(cm);
+      t.mock.method(cm, 'addMessage', (...args: Parameters<typeof cm.addMessage>) => {
+        if ((args[2] as { kind?: string } | undefined)?.kind === 'delivery-receipt') throw new Error('zz-receipt refused');
+        return add(...args);
+      });
+      await h.turn(rounds([text('>>>#nowhere lost words'), call('l1', 'channel_list', {})], [text(`>>>${ROOM} {{unsent}}`), call('l2', 'channel_list', {})]));
+      assert.deepEqual(h.publishes().map((p) => p.text), ['lost words'], 'premise: the {{unsent}} delivered the draft');
+      const line = errors.find((e) => e.startsWith("[delivered] scout: its receipt couldn't be recorded; it named "));
+      assert.ok(line, `premise: the receipt couldn't be recorded: ${errors.join('\n')}`);
+      assert.ok(line.includes('d-unsent1'), line);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('the turn-end receipt reports each draft as it stands: resent, dismissed, unconfirmed or still held', async () => {
     const h = await harness();
     try {
