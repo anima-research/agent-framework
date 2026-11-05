@@ -11,8 +11,10 @@
   the head on every request. A move stores the new head first, and takes the
   agent's change rows out of its context only once that's stored. A head that
   can't be stored moves nothing: the request goes on the recorded head with
-  its changes (with none recorded, on what's current), and a later request
-  moves it again. A request carrying a change that ends with a 400 membrane
+  its changes (with none recorded, on what's current, without the agent's
+  change rows, which stay stored), and a later request moves it again. A
+  change row the store refuses to write is declared later, as one that would
+  part a call from its result is. A request carrying a change that ends with a 400 membrane
   doesn't file as `context_length` or `auth`, or with a refusal membrane
   recognises, goes again on the agent's current head, which it keeps to until
   it's built again. Until then it compiles as it's configured, so a host's

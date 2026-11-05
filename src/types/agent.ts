@@ -181,7 +181,9 @@ export interface AgentConfig {
    * share of the input only if its host reports each response's input
    * (`noteResponseInput`). The direct API
    * (runInference) declares nothing: it sends the tools its caller passes
-   * and the current system text, and leaves the context's changes out.
+   * and the current system text, and leaves the context's changes out of its
+   * request, though under `'entries'` its compile holds them, as a compile
+   * kept to its head does.
    *
    * Turning it on is a choice from those records, not a runtime toggle, so
    * it isn't one of the agent's runtime settings.
