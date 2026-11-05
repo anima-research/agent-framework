@@ -14,7 +14,7 @@ const SENT_TO = 'the console that sent this turn';
 const HEDGE = 'This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.';
 const UNDELIVERABLE = '[send-undeliverable]';
 
-type Answer = 'sent' | 'per-text' | 'none' | 'throw' | 'hang' | 'held' | 'late' | 'late-throw' | { sentTo?: unknown };
+type Answer = 'sent' | 'per-text' | 'none' | 'hang' | 'held' | 'late' | 'late-throw' | { sentTo?: unknown };
 type Asked = { agent: string; text: string; context: SpeechRoutedContext };
 
 class Surface {
@@ -50,7 +50,6 @@ class Surface {
     this.asked.push({ agent, text, context });
     this.onAsked();
     const answer = this.answer;
-    if (answer === 'throw') throw new Error(`${this.name} broke`);
     if (answer === 'hang') return new Promise(() => {});
     if (answer === 'held') {
       return new Promise((resolve) => {
@@ -268,15 +267,25 @@ describe('plain speech a module says it showed', () => {
   let dir: string | undefined;
   let framework: AgentFramework | undefined;
   let surfaces: Surface[] = [];
+  let gates: Array<() => void> = [];
 
   afterEach(async () => {
     for (const surface of surfaces) for (const release of surface.held) release();
     surfaces = [];
+    for (const release of gates) release();
+    gates = [];
     await framework?.stop();
     framework = undefined;
     if (dir) rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
+
+  function gate(): [Promise<void>, () => void] {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    gates.push(release);
+    return [released, release];
+  }
 
   async function host(modules: Surface[], membrane: MockMembrane, agent: Record<string, unknown> = {}, channels = true, config: Record<string, unknown> = {}) {
     dir = mkdtempSync(join(tmpdir(), 'speech-routed-'));
@@ -691,8 +700,7 @@ describe('plain speech a module says it showed', () => {
       taken.push(String((event as { content?: unknown }).content));
       return process(event);
     };
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
+    const [released, release] = gate();
     const ask = surface.onSpeechRouted.bind(surface);
     surface.onSpeechRouted = async (agent, text, context) => {
       const answer = ask(agent, text, context);
@@ -725,8 +733,7 @@ describe('plain speech a module says it showed', () => {
     membrane.pushResponse(lookRound('Looking around.'));
     membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'sr', name: 'skip_reply', input: { reason: 'done' } } as ContentBlock], 'tool_use'));
     const f = await host([surface], membrane);
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
+    const [released, release] = gate();
     const ask = surface.onSpeechRouted.bind(surface);
     surface.onSpeechRouted = async (agent, text, context) => {
       void ask(agent, text, context);
@@ -975,8 +982,8 @@ describe('plain speech a module says it showed', () => {
     const surface = new Surface();
     const membrane = new AtEachStream();
     const f = await host([surface], membrane);
-    let post!: () => void;
-    const published = runSpeaksIn(f, membrane, 'run-1', new Promise<void>((resolve) => { post = resolve; }));
+    const [posted, post] = gate();
+    const published = runSpeaksIn(f, membrane, 'run-1', posted);
     const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting: 'locus' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
@@ -1376,8 +1383,7 @@ describe('plain speech a module says it showed', () => {
   it("a hybrid reply's >>> post that follows a piece with no channel waits for that piece's answer, then posts", async () => {
     const surface = new Surface();
     const order: string[] = [];
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
+    const [released, release] = gate();
     const ask = surface.onSpeechRouted.bind(surface);
     surface.onSpeechRouted = async (agent, text, context) => {
       const answer = ask(agent, text, context);
@@ -1409,8 +1415,7 @@ describe('plain speech a module says it showed', () => {
 
   it("a module removed while it's being asked names nothing", async () => {
     const surface = new Surface();
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
+    const [released, release] = gate();
     const ask = surface.onSpeechRouted.bind(surface);
     surface.onSpeechRouted = async (agent, text, context) => {
       void ask(agent, text, context);
@@ -1432,8 +1437,7 @@ describe('plain speech a module says it showed', () => {
     const surface = new Surface();
     const other = new Surface('other');
     other.answer = 'none';
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
+    const [released, release] = gate();
     const ask = other.onSpeechRouted.bind(other);
     other.onSpeechRouted = async (agent, text, context) => {
       const answer = ask(agent, text, context);
@@ -1847,8 +1851,7 @@ describe('plain speech a module says it showed', () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi room.' }]));
     const f = await host([surface], membrane);
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
+    const [released, release] = gate();
     const asked = surface.onSpeechRouted.bind(surface);
     const published = await channelTurn(f, true);
     surface.onSpeechRouted = async (agent, text, context) => {
@@ -1891,8 +1894,7 @@ describe('plain speech a module says it showed', () => {
     membrane.pushResponse(lookRound('Looking around.'));
     membrane.pushResponse(afterLook('Looking around.', 'Nothing here.'));
     const f = await host([surface], membrane);
-    let releaseRound!: () => void;
-    const roundReleased = new Promise<void>((resolve) => { releaseRound = resolve; });
+    const [roundReleased, releaseRound] = gate();
     const ask = surface.onSpeechRouted.bind(surface);
     surface.onSpeechRouted = async (agent, text, context) => {
       void ask(agent, text, context);
