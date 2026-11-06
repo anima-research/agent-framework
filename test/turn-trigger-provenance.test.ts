@@ -2712,7 +2712,7 @@ describe('private wins, one way', () => {
           .addMessage('user', [{ type: 'text', text }], { inboundSource: { kind: 'surface', surface: 'tui', acceptedAt: Date.now() } });
         const note = () => ((rig.framework as unknown as { store: { getStateJson(id: string): unknown } }).store
           .getStateJson('framework/state') as { privateInputWaiting?: Record<string, unknown> } | null)?.privateInputWaiting?.aide;
-        return { rig, during, gathering, compiles: () => compiles, aideStarts, aideTurn, store, note };
+        return { rig, during, gathering, compiles: () => compiles, aideStarts, aideIdle, aideTurn, store, note };
       };
 
       it('makes that start compile again, private, before it sends anything, and leaves the next channel turn in its channel', async () => {
@@ -2753,6 +2753,53 @@ describe('private wins, one way', () => {
           assert.deepEqual(await aideTurn(), [], 'the next start speaks in no channel');
           assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('and this one too'), "control: the next start's request held the second message");
           assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await rig.close();
+        }
+      });
+
+      it('compiles once a silent heartbeat start, and leaves the message for the next start, private with the notice', async () => {
+        const { rig, during, compiles, aideStarts, aideIdle, aideTurn, store, note } = await compileRig();
+        try {
+          assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+          const ran = compiles();
+          const starts = aideStarts();
+          during.push(() => { store('for your eyes only'); });
+          rig.i.pendingRequests.push({
+            agentName: 'aide', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+            suppressProse: true, silentHeartbeat: { eventId: 'tick-1', serverId: 'heartbeat' },
+          });
+          await rig.until(() => aideStarts() > starts && aideIdle(), 'the silent tick');
+          await rig.framework.runUntilIdle();
+          assert.equal(compiles() - ran, 1, 'the silent start compiled once');
+          assert.equal(note(), true, 'the stored note says input waits');
+          assert.deepEqual(await aideTurn(), [], 'the next start speaks in no channel');
+          const request = JSON.stringify(rig.membrane.calls.at(-1));
+          assert.ok(request.includes('for your eyes only'), "control: the next start's request held the message");
+          assert.ok(request.includes(PRIVATE_FROM_HERE), 'and told it the turn is private');
+          assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await rig.close();
+        }
+      });
+
+      it('compiles once a start whose framework begins to stop during its compile, and stores no notice for it', async () => {
+        const { rig, during, compiles, aideTurn, store } = await compileRig();
+        let stopping: Promise<void> | undefined;
+        try {
+          assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+          const notices: unknown[] = [];
+          rig.framework.onTrace((event) => {
+            if (event.type === 'message:added' && (event as { source?: string }).source === 'routing-notice') notices.push(event);
+          });
+          const ran = compiles();
+          during.push(() => { store('for your eyes only'); stopping = rig.framework.stop(); });
+          rig.i.pendingRequests.push({ ...roomWake(), agentName: 'aide' });
+          const { running } = await rig.whileRunning(() => stopping !== undefined, 'the stop during the compile');
+          await stopping;
+          await running.catch(() => {});
+          assert.equal(compiles() - ran, 1, 'it compiled once');
+          assert.deepEqual(notices, [], 'and stored no notice that the turn is private');
         } finally {
           await rig.close();
         }

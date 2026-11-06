@@ -25352,7 +25352,10 @@ export class AgentFramework {
       };
       let notedBeforeCompile = this.privateInputNoted.get(agent.name);
       let started = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, compileOptions);
-      if (!routing.nonChannelOrigin && this.privateInputNoted.get(agent.name) !== notedBeforeCompile) {
+      if (
+        !routing.nonChannelOrigin && !trigger?.suppressProse && this.privateInputNoted.get(agent.name) !== notedBeforeCompile
+        && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed
+      ) {
         this.cancelUnsentStream(agent, started.stream, 'compiled while private input was stored');
         agent.reset();
         this.makeTurnPrivate(agent, routing, trigger?.suppressProse === true);
