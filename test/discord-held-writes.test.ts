@@ -611,6 +611,33 @@ test("a kept create whose release can't say it landed, and whose read then throw
   }
 });
 
+// AF #844 bot review 4, finding 35: a lost create whose outcome is unknown
+// and whose lookup throws at the release is kept, flagged; the next event's
+// sweep that reads the store and finds no row ends it, as endLostCreate
+// does when it finds none, so a history sync then reaches the message.
+test("a kept create whose release can't say it landed, and whose read then throws, is ended by the next event's sweep that finds no row", async () => {
+  const s = await withLostRelease('x1', async () => {}, {
+    store: () => { throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed: 1 }, new Error('zz-store-unknown (test)')); },
+    readThrows: true,
+  });
+  try {
+    assert.deepEqual(lostTraces(s.traces).map((t) => [t.external, t.mayBeStored]), [[{ source: 'discord', id: 'x1' }, true]],
+      'premise: the release traced the write as maybe stored');
+    assert.deepEqual(s.texts('x1'), [], 'premise: no row landed');
+    assert.equal(s.module.creating.has('x1'), true, 'premise: kept, its read having thrown');
+    const next = s.processed('discord:message', 'x2');
+    await s.discord.onMessageHandler!(live('x2', 'next message'));
+    await next;
+    assert.equal(s.module.creating.has('x1'), false, 'the sweep reads no row for it, and ends its record');
+    s.discord.history = [history('x1', 'from the sync')];
+    const synced = await s.module.syncChannelHistory('c1');
+    assert.equal(synced.newMessages, 1);
+    assert.deepEqual(s.texts('x1'), ['from the sync']);
+  } finally {
+    await s.cleanup();
+  }
+});
+
 // AF #844 bot review 4, finding 36: each answered create's lookup is its
 // own. One that throws at an event's sweep is logged and that entry kept
 // for the next event; the other entries are still applied and ended, and

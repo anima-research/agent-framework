@@ -360,6 +360,10 @@ interface LiveCreate {
   text?: string;
   attachments?: DiscordAttachment[];
   unapplied?: 'delete' | Array<{ text: string; attachments?: DiscordAttachment[] }>;
+  /** A release lost its write without saying whether it landed, and the
+   *  lookup made then threw (endLostCreate): the next sweep that reads the
+   *  store and finds no row ends the entry, as that lookup would have. */
+  lostUnread?: true;
 }
 
 /**
@@ -1531,7 +1535,9 @@ export class DiscordModule implements Module {
    * unknown (`mayBeStored`) is looked for: where its row landed, no
    * `message:added` came for it, so what was kept for it is applied now,
    * and the entry waits, as any answered create, for the next Discord event
-   * to find the row.
+   * to find the row. Where that lookup throws, the entry is flagged
+   * (`lostUnread`), and the next event's sweep that reads the store ends it
+   * where it finds no row.
    */
   private endLostCreate(discordMessageId: string, mayBeStored: boolean): void {
     if (this.creating.get(discordMessageId)?.phase !== 'writing') return;
@@ -1541,6 +1547,8 @@ export class DiscordModule implements Module {
         landed = this.storedRow(discordMessageId) !== undefined;
       } catch (error) {
         console.error(`Discord: whether message ${discordMessageId}'s lost create left a row couldn't be read, so its record waits for the next event to find its row:`, error);
+        const live = this.creating.get(discordMessageId);
+        if (live) live.lostUnread = true;
         return;
       }
       if (landed) {
@@ -1569,12 +1577,16 @@ export class DiscordModule implements Module {
    * Ends each answered create (`writing`) whose row a query shows now
    * (sweptRow), but one still holding what was kept for it, which
    * applyUnapplied couldn't apply (its lookup threw): it waits for the
-   * next event, so what was kept isn't dropped with it.
+   * next event, so what was kept isn't dropped with it. A lost create
+   * whose release's lookup threw (`lostUnread`) ends where the lookup now
+   * reads no row: no row comes for it.
    */
   private endShownCreates(): void {
     for (const [id, live] of this.creating) {
-      if (live.phase !== 'writing' || live.unapplied !== undefined) continue;
-      if (this.sweptRow(id)?.row) this.creating.delete(id);
+      if (live.phase !== 'writing') continue;
+      const swept = this.sweptRow(id);
+      if (swept === undefined) continue;
+      if (swept.row ? live.unapplied === undefined : live.lostUnread) this.creating.delete(id);
     }
   }
 
