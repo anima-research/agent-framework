@@ -3035,6 +3035,49 @@ test("a render's delivery that may have stored it is redelivered at its recovery
   }
 });
 
+// AF #844 bot review 5, finding 43: a render whose delivery throws arms
+// its batch's recovery, saves the batch at once and awaits the save's
+// commit, all while the render is still the subject's. A recovery timer
+// that fires while a render is under way does nothing and isn't re-armed,
+// so a commit slower than the backoff would leave the batch waiting for
+// unrelated traffic. The recovery is armed once the render has settled.
+test("a render whose delivery throws is re-woken by its recovery though the save's commit outlasts the backoff", async () => {
+  const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];
+  const wakes: string[] = [];
+  let commits = 0;
+  let releaseCommit!: () => void;
+  const held = new Promise<void>((resolve) => { releaseCommit = resolve; });
+  const host: CoalescerHost<null> = {
+    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    deliver: async () => { throw new Error('the store refused it'); },
+    wakeForBatch: async (occ) => { wakes.push(occ.eventId); }, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent'],
+    render: async () => ({ content: [{ type: 'text', text: 'rendered' }] }),
+    audit: (record) => { audits.push(record); },
+    save: () => {},
+    saveNow: () => {},
+    // The render-start boundary's commit returns at once; the failed
+    // delivery's is held past the backoff.
+    commit: async () => { if (++commits === 2) await held; },
+  };
+  const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 20 });
+  await coalescer.accept({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId: 'e1', timestamp: TS,
+    retract: false, deferred: true, initial: false, content: [{ type: 'text', text: 'fallback e1' }], event: null,
+  });
+  wakes.length = 0;
+  commits = 0;
+  const assembled = coalescer.assemble('agent');
+  await eventually(() => commits === 2, "the failed delivery's commit");
+  assert.ok(audits.some((a) => a.kind === 'deliver-failed'), 'setup: the delivery threw, and its commit is held');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  releaseCommit();
+  await assembled;
+  await eventually(() => audits.some((a) => a.kind === 'recovery-wake'), 'the recovery wake');
+  assert.deepEqual(wakes, ['e1'], 'the batch is woken again by its recovery');
+  coalescer.suspend();
+});
+
 test("a render cancelled while it runs leaves the recovery wake of a batch opened after it", async () => {
   let failPersist = false;
   const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];

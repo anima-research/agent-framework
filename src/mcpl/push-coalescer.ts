@@ -1230,6 +1230,7 @@ export class PushCoalescer<E = unknown> {
     // update no admission can withdraw or replace what is being published.
     let failed = false;
     let current = false;
+    let recover = false;
     await this.locked(async () => {
       try {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
@@ -1299,7 +1300,11 @@ export class PushCoalescer<E = unknown> {
             this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(saveError) });
           }
           if (!written) this.persist();
-          this.scheduleRecovery(subject, state);
+          // Its recovery is armed once the render has settled (the finally
+          // below): a recovery that fires while a render is under way does
+          // nothing and isn't armed again, and the commit may outlast the
+          // backoff.
+          recover = true;
           if (written) {
             try {
               await this.host.commit?.();
@@ -1352,6 +1357,7 @@ export class PushCoalescer<E = unknown> {
       } finally {
         if (state.rendering === rendering) state.rendering = undefined;
         if (current && !failed) this.clearRecovery(subject);
+        if (recover) this.scheduleRecovery(subject, state);
       }
     });
   }
