@@ -18713,6 +18713,21 @@ export class AgentFramework {
           if (presentsWindow) {
             heard.push(...this.presentation!.presentAtBoundary(agent, [replyId, resultsId, clock?.id], { injects }).heard);
           }
+          // The clock's store and the boundary's presentations run their
+          // listeners synchronously too, and one may have stopped the turn,
+          // as at the round's store above: the clock and what was presented
+          // stay, in the window, and the stream isn't resumed with them.
+          const stoppedAtBoundary = this.roundStoppedDuringBuild(agent, currentState, currentState.stream);
+          if (stoppedAtBoundary !== null) {
+            console.warn(
+              `[framework] Not resuming the tool round of agent '${agent.name}' (callId=${event.callId}): its turn was ` +
+              `stopped as its boundary presented what arrived (status '${agent.state.status}'` +
+              `${stoppedAtBoundary !== 'state-changed' ? `, stream cancelled: ${stoppedAtBoundary}` : ''}), so the round ` +
+              `is stored, its call with its results, and its stream isn't resumed.`,
+            );
+            agent.toolResultGuard.settleTurnEnded();
+            return;
+          }
           if (injects) {
             // Rendered in one call: a render prepares as a compile does, so
             // the batch shares one preparation. The image limits count from
