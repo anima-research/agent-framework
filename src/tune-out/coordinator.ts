@@ -1647,6 +1647,19 @@ export class TuneOutCoordinator {
     return { ok: true, params };
   }
 
+  /**
+   * Whether a write the coordinator just made was kept in memory, by what
+   * it answered: an empty id, the framework's answer for a write it keeps
+   * (a surgery's hold, a context manager refusing its work), with writes
+   * held now, as they are while it keeps one. A write that answered an id
+   * landed, whether or not writes are held since (a hold begun as it
+   * returned); one that answered no id with nothing held (a host that
+   * answers none) isn't kept. Never judged by writesHeld alone (Weft, #844).
+   */
+  private writeKept(id: string | void): boolean {
+    return id === '' && this.writesHeldNow();
+  }
+
   /** Whether the framework keeps writes in memory now (writesHeld), with `forAgent`'s among them; a hook that throws counts as not. */
   private writesHeldNow(forAgent?: string): boolean {
     try {
@@ -3308,12 +3321,12 @@ export class TuneOutCoordinator {
     const subName = this.hooks.subconsciousName();
     if (subName) {
       const id = this.hooks.addMessage(subName, [{ type: 'text', text: note }], { ...metadata });
-      return id === '' ? 'kept' : 'stored';
+      return this.writeKept(id) ? 'kept' : 'stored';
     }
     if (author && this.hooks.deliverFromReader) {
       const { serverId: _server, ...mail } = metadata;
       const id = this.hooks.deliverFromReader(author, [{ type: 'text', text: note }], mail);
-      return id === '' ? 'kept' : 'stored';
+      return this.writeKept(id) ? 'kept' : 'stored';
     }
     return false;
   }
@@ -3680,18 +3693,18 @@ export class TuneOutCoordinator {
     let releaseKept = false;
     if (earlier.length === 0 || backlog.length > 0) {
       const record: ReleaseRecord = { ...keysOf(backlog), total: backlog.length, truncated, report: { ids: [], writeIds: [] } };
-      releaseKept = this.hooks.addMessage(
+      releaseKept = this.writeKept(this.hooks.addMessage(
         'user',
         [{ type: 'text', text: render(lines, truncated) }],
         { system: true, kind: 'tune-out-cancel', channelId, epochId, released: record, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, ...(lost ? { lostNote: true } : {}) },
-      ) === '';
+      ));
       records.push(record);
     } else if (lost) {
       // Every held message is in an earlier release: this one carries the
       // loss alone, and covers none (no `released`). `lostNote` marks a
       // release that tells a queued note's loss, as a boot reads it
       // (noteUnstampedStop).
-      releaseKept = this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }) === '';
+      releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
     }
     // Told, in the release written: not delivered or told again, even if
     // the release isn't made durable below and the queued cancel runs later,
@@ -4225,14 +4238,14 @@ export class TuneOutCoordinator {
     let releaseKept = false;
     if (earlier.length === 0 || fresh.length > 0) {
       const record: ReleaseRecord = { ...keysOf(fresh), total: fresh.length, truncated: truncatedInAll, report: { ids: [], writeIds: [] } };
-      releaseKept = this.hooks.addMessage(
+      releaseKept = this.writeKept(this.hooks.addMessage(
         'user',
         [{ type: 'text', text: `${header}\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
         { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, released: record, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, ...(lost ? { lostNote: true } : {}) },
-      ) === '';
+      ));
     } else if (lost) {
-      releaseKept = this.hooks.addMessage('user', [{ type: 'text', text: header }],
-        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }) === '';
+      releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: header }],
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
     }
     if (first?.lost) {
       first.entry.noteSettled = true;
