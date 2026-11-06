@@ -5,11 +5,14 @@
  * Every such question used to compare a row's own store sequence with the
  * chronicle head taken at the moment (`{ branch, sequence }`). While the
  * window an agent reads is the record itself (context-manager's legacy
- * mode) that is exact: a compile reads every row stored so far. Once the
+ * mode) that is exact: a compile reads every row stored so far that its
+ * view keeps (a row its view leaves out it never read, and each reader of a
+ * row is weighed by its own view, agentSees). Once the
  * agent's window follows its presentation index (`presentRows`), a row is
  * stored first and presented later, so a row stored before the head was
  * taken can still be out of the window then, and the head says nothing of
- * what the agent read. The window's own coordinate is the index ordinal: a
+ * what the agent was shown; a mark is taken at a request, which carries the
+ * window as it then stands. The window's own coordinate is the index ordinal: a
  * row is in the window as of a mark when its ordinal is below the index
  * length taken with the mark (`indexLength()` is exclusive: the ordinal the
  * next row will take).
@@ -97,8 +100,9 @@ function mark(branch: string, head: number, length: number | null): ReadMark {
 /**
  * A mark of where `cm` stands now: its branch, the store's head (the
  * chronicle head, not the slot's last row: in legacy mode a compile reads
- * everything stored on the branch, rows merged in from another slot
- * included; a double without a store gives its last row's sequence), and
+ * everything stored on the branch that its view keeps, rows merged in from
+ * another slot included; a double without a store gives its last row's
+ * sequence), and
  * its index length when it is in presented mode, where a compile reads the
  * window and the mark covers by that length, not by the head. Null for a
  * double that can't say, or when reading throws.

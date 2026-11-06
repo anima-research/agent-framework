@@ -3,9 +3,10 @@
  * holds, and when a row enters it.
  *
  * The store's record keeps every write in the order it arrived. An agent's
- * window is another order over the same rows: the rows it was shown, in the
- * order its requests carried them (context-manager's window index,
- * `presentRows`). While one agent writes one slot the two orders are the
+ * window is another order over the same rows: the rows presented to it, in
+ * the order its requests carry them (context-manager's window index,
+ * `presentRows`; a row presented at rest is in the window before a request
+ * has carried it). While one agent writes one slot the two orders are the
  * same. Once agents share a slot, or one reads another's, they differ: a row
  * another agent stored during my turn sits inside my turn in the record, but
  * my requests carried it only at my next tool boundary or turn start, so a
