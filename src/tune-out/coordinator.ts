@@ -1120,6 +1120,8 @@ export class TuneOutCoordinator {
    * so none is written until a try reads those rows (checkLossNoticesWritten).
    */
   private readonly lossNoticesUnchecked = new Set<string>();
+  /** The authors whose loss notice is being written now (writeLossNotices): a loss told for one meanwhile waits behind it. */
+  private readonly lossNoticesWriting = new Set<string>();
   /**
    * The one retry of the deferred cancels whose run threw (a release that
    * couldn't be made durable, a store operation that threw), and of the
@@ -2218,7 +2220,9 @@ export class TuneOutCoordinator {
    * read from the store's record while whether it was written before the
    * stop can't be read (checkLossNoticesWritten). Then the store's
    * record of the persistent subconscious's kept notices is brought in
-   * line (writeLossRecord). Each leaves its author's list just before it
+   * line (writeLossRecord). A loss told for an author while its notice is
+   * being written (a listener of that write) waits behind it, written next
+   * in this pass. Each leaves its author's list just before it
    * is written, as a deferred cancel leaves its queue, so a stop meanwhile
    * (a listener of the write) keeps those not written yet in the store
    * (stop), and none is written after it; one whose write that stop met and
@@ -2228,21 +2232,31 @@ export class TuneOutCoordinator {
   private writeLossNotices(author?: string): void {
     this.checkLossNoticesWritten();
     for (const name of author !== undefined ? [author] : [...this.lossNotices.keys()]) {
-      // One that fails goes back ahead of the rest, which wait behind it
-      // for the next try, so the author is told in the order the losses
-      // came; a loss told meanwhile is kept after them.
-      for (const notice of [...(this.lossNotices.get(name) ?? [])]) {
+      // A loss told for this author from a listener of its notice's write
+      // (that write's trace, or its failure's) only joins the queue, behind
+      // the one in flight: written now, it went ahead of it (AF #844
+      // review 5, #24). This pass writes it next.
+      if (this.lossNoticesWriting.has(name)) continue;
+      // Each from the head: one that fails goes back there, the rest
+      // waiting behind it for the next try, so the author is told in the
+      // order the losses came; a loss told meanwhile is kept after them.
+      for (;;) {
+        const kept = this.lossNotices.get(name);
+        const notice = kept?.[0];
         // One the boot read from the record, which may be written already,
         // waits until that can be read (checkLossNoticesWritten), and those
         // after it with it.
-        if (this.stopped || this.writesHeldNow(name) || this.lossNoticesUnchecked.has(notice.id)) break;
-        const kept = this.lossNotices.get(name);
-        const at = kept?.indexOf(notice) ?? -1;
-        // Written meanwhile, by a write a listener made.
-        if (!kept || at < 0) continue;
-        kept.splice(at, 1);
+        if (!kept || !notice || this.stopped || this.writesHeldNow(name) || this.lossNoticesUnchecked.has(notice.id)) break;
+        kept.shift();
         if (kept.length === 0) this.lossNotices.delete(name);
-        if (this.writeLossNotice(name, notice) !== 'failed') continue;
+        this.lossNoticesWriting.add(name);
+        let written: ReturnType<TuneOutCoordinator['writeLossNotice']>;
+        try {
+          written = this.writeLossNotice(name, notice);
+        } finally {
+          this.lossNoticesWriting.delete(name);
+        }
+        if (written !== 'failed') continue;
         this.lossNotices.set(name, [notice, ...(this.lossNotices.get(name) ?? [])]);
         break;
       }

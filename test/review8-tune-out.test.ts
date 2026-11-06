@@ -2954,3 +2954,44 @@ test("review 5 #38 (regression of 21eb8f86): the notice of a note dropped beside
     errors.mock.restore();
   }
 });
+
+test("review 5 #24: a loss for an author told from a listener of that author's notice write is written after it, whether that write fails or lands", () => {
+  for (const write of ['fails', 'lands'] as const) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ forks: true });
+    try {
+      const a = h.enter();
+      const s = h.enterScope();
+      h.state.held = true;
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-1', 'For A.', 'reader-1');
+      h.coordinator.cancelAllExcept('subconscious', 'by reader-1', 'For the hold.', 'reader-1');
+      // A's hold ends without its cancel: the drop tells reader-1 its note was lost with it.
+      h.endOtherwise();
+      h.state.held = false;
+      if (write === 'fails') h.state.noticeFails = true;
+      let nested = false;
+      const loseAnother = (): void => {
+        if (nested) return;
+        nested = true;
+        h.state.noticeFails = false;
+        // From the listener, a cancel ends the all-except hold, and reader-1's note waiting with that hold's cancel can't be delivered.
+        h.state.noteFails = true;
+        h.coordinator.cancelAllExcept('agent-tool', 'agent request');
+        h.state.noteFails = false;
+      };
+      if (write === 'fails') h.listen((event) => { if (event.type === 'tune-out:note-loss-untold' && event.reason === 'write-failed') loseAnother(); });
+      else h.listenWrites((metadata) => { if (metadata?.kind === 'tune-out-note-undelivered') loseAnother(); });
+      h.coordinator.runDeferredCancels();
+      h.listen(() => {});
+      h.listenWrites(() => {});
+      assert.ok(nested, `premise (${write}): the second loss was told from the listener`);
+      assert.equal(h.scopeInForce(), null, `premise (${write}): the all-except hold ended`);
+      if (write === 'fails') h.coordinator.runDeferredCancels();
+      assert.deepEqual(h.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId]), [['reader-1', a], ['reader-1', s]],
+        `${write}: reader-1 is told in the order the losses came, A's first`);
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
