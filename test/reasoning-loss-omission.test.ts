@@ -457,9 +457,7 @@ it('exports the composed resident and subconscious views actually applied by the
     [[text('row-1')], [text('row-2')], [text('row-3')], [text('row-4')], [text('row-7')]]);
 });
 
-it('migration: context-manager #369 must keep a summary with a hidden first source before newer messages', {
-  todo: 'context-manager #369 or equivalent: hidden summary endpoints are unresolved on 0.24.2',
-}, async () => {
+it('migration: reopening legacy summaries preserves setup and stored history', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'af-reasoning-loss-migration-'));
   const storePath = join(dir, 'store');
   cleanups.push(async () => { rmSync(dir, { recursive: true, force: true }); });
@@ -493,8 +491,18 @@ it('migration: context-manager #369 must keep a summary with a hidden first sour
   const compiled = await agent.compileContext();
   const contents = compiled.messages.flatMap(m => m.content).filter(b => b.type === 'text').map(b => b.text);
   assert.ok(contents.includes(summaries[0]!.content), 'the old summary is still selected');
-  assert.ok(contents.indexOf(summaries[0]!.content) < contents.indexOf('newer raw message'),
-    'context-manager #369: an old summary must precede newer raw messages even when its first source is hidden');
-  assert.equal(agent.getContextManager().getSummariesInRange({}).length, 1,
-    'context-manager #369: the existing summary must remain in the history overview');
+  const summaryPrecedesNewer = contents.indexOf(summaries[0]!.content) < contents.indexOf('newer raw message');
+  const overviewCount = agent.getContextManager().getSummariesInRange({}).length;
+  await t.test('canary: the installed context-manager still has the hidden-endpoint defect', () => {
+    assert.ok(!summaryPrecedesNewer && overviewCount === 0,
+      'The hidden-endpoint defect changed: once the dependency floor includes anima-research/context-manager#369, remove the migration limit and the todo below.');
+  });
+  await t.test('a summary with a hidden first source precedes newer messages and remains in overview', {
+    todo: 'anima-research/context-manager#369 or equivalent: hidden summary endpoints are unresolved on 0.24.2',
+  }, () => {
+    assert.ok(summaryPrecedesNewer,
+      'anima-research/context-manager#369: an old summary must precede newer raw messages even when its first source is hidden');
+    assert.equal(overviewCount, 1,
+      'anima-research/context-manager#369: the existing summary must remain in the history overview');
+  });
 });
