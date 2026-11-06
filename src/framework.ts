@@ -1,4 +1,4 @@
-import { replyConsumer, replyWork, replyOwner, workOf, carryWork, sameWork, sameDestination, shareReplyTurn, turnReply, privateReplyNotice, replyBindingCurrent, workKey, type ReplyBinding, type ReplyWork } from './mcpl/reply-routing.js';
+import { replyConsumer, replyWork, replyOwner, workOf, carryWork, sameWork, sameDestination, shareReplyTurn, turnReply, privateReplyBinding, privateReplyNotice, replyBindingCurrent, workKey, type ReplyBinding, type ReplyWork } from './mcpl/reply-routing.js';
 import { MAX_PENDING_ADMISSIONS, admissionOf, admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type ConnectionKey, type RequiredIngress } from './mcpl/inbound-admission.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
@@ -17857,7 +17857,7 @@ export class AgentFramework {
     }
     if (decision.locus) this.noteDeliveredOrPark(event);
     if (!decision.held && !decision.suppressed) {
-      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId });
+      this.considerWakeOnboarding({ ...carryWork(event), serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId });
     }
 
     if (decision.wake) {
@@ -19919,7 +19919,7 @@ export class AgentFramework {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
     if (!silentHeartbeat && !decision.held && !decision.suppressed) {
-      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId });
+      this.considerWakeOnboarding({ ...carryWork(event), serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId });
     }
 
     if (decision.wake) {
@@ -24148,6 +24148,7 @@ export class AgentFramework {
         agentName: name,
         reason: 'prose-bounce',
         source: 'framework',
+        ...replyForNextTurn(round.routing),
         timestamp: Date.now(),
         ...this.heartbeatTurnMark(round.routing),
       });
@@ -37593,7 +37594,17 @@ export class AgentFramework {
           this.addMessage(participant, content, metadata as MessageMetadata,
             forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source) => {
-          this.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+          // Tune-out wakes summarize stored backlog, not one admitted cause.
+          // Do not guess authority from persisted rows or become an unbound
+          // successor that can pick up a legacy destination on another peer.
+          const privateWorks = this.mcplServerRegistry?.getAllServers().flatMap(server => {
+            const ingress = server.replyAuthority ? server.requiredAdmission?.capture(() => undefined) : undefined;
+            return ingress ? [privateReplyBinding(ingress.key)] : [];
+          }) ?? [];
+          const reply = turnReply(privateWorks);
+          this.pendingRequests.push({ agentName, reason, source, timestamp: Date.now(),
+            ...(reply ? { [replyWork]: [reply] } : {}),
+          });
         },
         subconsciousName: () => this.subconsciousAgentName,
         ...(this.readerForks
@@ -38749,7 +38760,7 @@ export class AgentFramework {
     recipients: readonly string[];
     /** Where the event came from, so a turn it wakes speaks there (as the lane's own wake would). */
     channelId?: string;
-  }): void {
+  } & ReplyWork): void {
     try {
       const d = event.gateDecision;
       if (!this.wakeDecisions || !this.eventGate || !d || d.trigger) return;
@@ -38789,6 +38800,7 @@ export class AgentFramework {
           agentName,
           reason: 'wake-onboarding',
           source: event.serverId,
+          ...carryWork(event),
           timestamp: Date.now(),
           ...(event.channelId ? { channelId: event.channelId, channelServerId: event.serverId } : {}),
           addressed: isAddressedMessage(event.tags as string[] | undefined),

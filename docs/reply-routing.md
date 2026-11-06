@@ -70,11 +70,15 @@ Pushes need neither a channel origin nor a publishable route.
 
 ## Shared turns and send-time checks
 
-Every admitted cause retains private work identity through queues, holds,
-retries and continuations. Equality and parked-request keys distinguish
+Every admitted cause retains private work identity through request queues, holds,
+retries and continuations. Tune-out is a stored-backlog boundary, not an in-memory
+request hold: its aggregate release and reader wakes are explicitly private when
+any connected server opts in. They do not reconstruct authority from persisted
+rows; replying to that backlog requires a separately authorized explicit send. Equality and parked-request keys distinguish
 connection incarnation, channel and work identity; opaque separators cannot
 collapse them. Causes for the same frozen destination can share a turn, retaining
-**all** their work. Different destinations get separate turns; incompatible or
+**all** their work. Destination-less causes with the same owner also share one
+private turn, without gaining publication authority. Different destinations get separate turns; incompatible or
 missing authority can only keep prose private, never select a new destination.
 A debounce batch mixing bound and unbound causes stays **private as a whole**:
 its wake and full context remain, but only separately authorized send tools may
@@ -95,8 +99,9 @@ Destination-less admitted work remains private in locked mode too.
 The logical turn owns in-turn continuations (setup retries, tool waits, budget
 restarts and provider holds). Exhausted-turn re-arms, post-turn continuations and rewind retries carry
 the same work into a fresh logical turn without retaining the ended turn id.
-Destination-less work can resume its own turn only with the same private binding
-and matching owner; it cannot join a destination-bearing turn or gain permission
+Prose-bounce successors do too; wake-onboarding requests carry the event's work.
+Destination-less work can resume its own turn only with a member of that turn's
+original private work set and matching owner; it cannot join a destination-bearing turn or gain permission
 to publish.
 Stale in-turn continuations are dropped and their logical turn/guard/waiter
 cleaned up. Token release stays frame-owned, as on the existing drop path.

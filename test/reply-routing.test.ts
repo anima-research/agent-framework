@@ -995,3 +995,55 @@ test('R1-2 opted-in mismatching lock explains refusal before inference', async (
   } finally { x.f.mcplServerRegistry = null; await x.close(); }
 });
 
+test('R1-3 prose-bounce successor retains all work without the ended owner', async () => {
+  const x = await frameworkFor([
+    createMockResponse([{ type: 'text', text: '>>>#nowhere lost words' }]),
+    createMockResponse([{ type: 'text', text: 'the corrected answer' }]),
+  ], [], undefined, { proseRouting: 'hybrid' });
+  try {
+    const request = await x.request(reply());
+    x.f.pendingRequests.push(request);
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 2);
+    assert.deepEqual(x.f.turnRouting.get('assistant').replyWorks, workOf(request));
+    assert.equal(x.publishes.length, 1);
+    assert.equal(x.publishes[0].channelId, 'room/one');
+  } finally { await x.close(); }
+});
+
+test('R1-3 onboarding request carries the event work into a real turn', async () => {
+  const x = await frameworkFor();
+  try {
+    const request = await x.request(reply());
+    x.f.wakeDecisions = { mayOfferSoon: () => true, mayOffer: () => true, get: () => undefined, set() {} };
+    x.f.eventGate = { policyInForce: () => undefined, onInferenceStarted() {}, onInferenceEnded() {}, stop() {} };
+    x.f.mcplServerRegistry = { getServer: (id: string) => x.peers.get(id), getAllServers: () => [...x.peers.values()] };
+    x.f.wakeOffer = () => ({ server: 'endpoint-a', digest: 'test', rules: [], tagDescriptions: {}, untranslated: [] });
+    x.f.considerWakeOnboarding({ ...request, serverId: 'endpoint-a', tags: ['chat:addressed'],
+      gateDecision: { trigger: false, behavior: 'defer', policyName: null }, recipients: ['assistant'] });
+    assert.equal(x.f.pendingRequests.length, 1);
+    assert.deepEqual(workOf(x.f.pendingRequests[0]), workOf(request));
+    x.f.eventGate = null;
+    await x.framework.runUntilIdle();
+    assert.equal(x.publishes[0]?.channelId, 'room/one');
+  } finally { x.f.eventGate = null; x.f.mcplServerRegistry = null; await x.close(); }
+});
+
+test('R1-3 tune-out aggregate release is explicitly private on opted-in hosts', async () => {
+  const x = await frameworkFor();
+  try {
+    x.f.mcplServerRegistry = { getAllServers: () => [...x.peers].map(([id, peer]) => ({ ...peer, id, replyAuthority: {} })) };
+    const coordinator = x.f.makeTuneOutCoordinator({ announce: false });
+    // Invoke the real release-to-framework adapter; coordinator release policy is tested separately.
+    coordinator.hooks.requestInference('assistant', 'tune-out cancelled (test)', 'tune-out');
+    const work = workOf(x.f.pendingRequests[0]);
+    assert.equal(work.length, 1);
+    assert.equal(work[0].destination, undefined);
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1);
+    assert.deepEqual(x.publishes, []);
+    assert.match(JSON.stringify(x.membrane.calls[0]), /Your prose stays private/);
+  } finally { x.f.mcplServerRegistry = null; await x.close(); }
+});
+
+
