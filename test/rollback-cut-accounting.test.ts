@@ -14,8 +14,8 @@
  * one write presented together with the target stay after it and are
  * reported too (`keptInWindowAfterTarget`), and a rollback that would
  * change nothing because of them names them and the removals that can take
- * them out; and the preview counts the removed rows no window holds
- * (`neverPresented`). A host's message-granular undo counts back over the
+ * them out; and the preview counts the removed rows no window holds or
+ * every view that holds them hides (`neverPresented`). A host's message-granular undo counts back over the
  * rows of the agent's own slot in its window, which can merge a slot the
  * agent observes (a persistent subconscious's).
  */
