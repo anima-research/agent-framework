@@ -205,6 +205,12 @@ describe('the audience stamp (#291)', () => {
 
     // Each resident's rounds and results, the clock and the puppeted pair: their own rows.
     const ownOf = (row: Row) => row.metadata?.ownRowOf;
+    // AF #844 bot review 5, finding 78: the replies are among the rows the
+    // loops below read, stored under their resident's name, not only found
+    // by their text.
+    for (const [who, said] of [['mira', 'mira done'], ['oren', 'oren here'], ['oren', 'oren again']] as const) {
+      assert.ok(slot.some((r) => r.participant === who && textOf(r) === said), `${said} is ${who}'s row`);
+    }
     for (const row of slot.filter((r) => r.participant === 'mira')) {
       assert.equal(ownOf(row), 'mira', `mira's round is her own: ${textOf(row)}`);
       assert.deepEqual(row.metadata?.audience, ['mira']);
