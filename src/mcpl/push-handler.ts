@@ -127,7 +127,7 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: TraceEventInput) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
-    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']) => Promise<PushEventResult>,
+    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check'], afterResponse?: RequiredIngress['afterResponse']) => Promise<PushEventResult>,
     /** An ordinary (uncoalesced) push was just admitted, before it is queued
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
@@ -239,9 +239,9 @@ export class PushHandler {
         refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
         return;
       }
-      const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, afterResponse: admission.afterResponse, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+      const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
       // No await between the final check and the admitted continuation's first effect.
-      return await this.handlePushEvent(serverId, params, responder, envelope, check);
+      return await this.handlePushEvent(serverId, params, responder, envelope, check, admission.afterResponse);
     } finally {
       ticket?.retire();
     }
@@ -253,6 +253,7 @@ export class PushHandler {
     responder?: Responder,
     envelope?: AdmittedEnvelope,
     check?: RequiredIngress['check'],
+    afterResponse?: RequiredIngress['afterResponse'],
   ): Promise<void> {
     // §16.3: expand the normative chat:* core closure once, at entry, so
     // every downstream consumer (wake matching, metadata, the queued event)
@@ -369,7 +370,7 @@ export class PushHandler {
       // unread one, appends, or withdraws; it delivers through the same event
       // the ordinary path would have queued.
       try {
-        const result = await this.handleCoalesced!(serverId, params, pushEvent, check);
+        const result = await this.handleCoalesced!(serverId, params, pushEvent, check, afterResponse);
         if (envelope && !result.accepted) {
           this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', result.reason as import('./inbound-admission.js').AdmissionDiagnosticCode, params);
           responder?.respond(result.reason === 'admission_module_capacity' ? { ...result, reason: 'admission_denied' } : result);

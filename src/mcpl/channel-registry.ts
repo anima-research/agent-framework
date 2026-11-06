@@ -994,6 +994,7 @@ interface ChannelRegistryOptions {
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
     check?: RequiredIngress['check'],
+    afterResponse?: RequiredIngress['afterResponse'],
   ) => Promise<ChannelIncomingMessageResult & { firstView?: true }>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
@@ -2031,7 +2032,7 @@ export class ChannelRegistry {
             refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
             continue;
           }
-          envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, afterResponse: admission.afterResponse, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+          envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
         }
 
         // ACCEPTED from here down: semantic processing only for admitted
@@ -2170,7 +2171,7 @@ export class ChannelRegistry {
           // the coalescer, which replaces, appends or withdraws. Malformed
           // `coalesce` is a per-message failure; siblings are unaffected.
           try {
-            const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event, checkAdmission);
+            const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event, checkAdmission, admission?.afterResponse);
             if (admission && !result.accepted) {
               this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', result.reason as import('./inbound-admission.js').AdmissionDiagnosticCode, message);
             }

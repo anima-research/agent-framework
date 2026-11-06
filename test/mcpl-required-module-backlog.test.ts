@@ -2,6 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually, settles } from './helpers/coalescing-fixture.js';
+import { admissionOf } from '../src/mcpl/inbound-admission.js';
 import { MAX_PENDING_REQUIRED_MODULE_WORK } from '../src/index.js';
 
 const allow = { store: true, mayWake: false } as const;
@@ -290,4 +291,22 @@ for (const moduleCount of [0, 1]) {
     if (moduleCount) assert.deepEqual(seen, ['b0', 'concurrent', ...Array.from({ length: 63 }, (_, i) => `b${i + 1}`)]);
     for (let i = 0; i < 64; i++) assert(f.context().includes(`batch_body_${i}_end`));
   });
+}
+
+for (const lane of ['push/event', 'channels/incoming'] as const) {
+  test(`R4-3 required ${lane}: modules receive a data-only admission receipt`, async t => {
+    const envelopes: any[] = [];
+    const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: any) {
+      if (['mcpl:push-event', 'mcpl:channel-incoming'].includes(e.type)) envelopes.push(admissionOf(e));
+      return {};
+    } };
+    const f = await fixture({ server: { inboundAdmission: admission }, framework: { modules: [spy] } as never });
+    t.after(() => f.close()); await f.register();
+    const item = lane === 'push/event' ? f.params('receipt', 'body', { initial: true }) : f.channel('receipt', 'body', { initial: true });
+    await f.send(lane, lane === 'push/event' ? item : { messages: [item] });
+    await eventually(() => envelopes.length === 1);
+    assert(Object.isFrozen(envelopes[0]));
+    assert.deepEqual(Object.keys(envelopes[0]).sort(), ['connection', 'mayWake']);
+  });
+
 }

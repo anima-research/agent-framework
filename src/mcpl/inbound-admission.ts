@@ -72,7 +72,7 @@ class InvalidData extends Error {}
 
 /** A receipt is private runtime state, never metadata, persistence or a peer result. */
 export const admittedEnvelope = Symbol('admitted inbound');
-export type AdmittedEnvelope = Readonly<{ connection: ConnectionKey; mayWake: boolean; replyIntent?: unknown; afterResponse?: RequiredIngress['afterResponse'] }>;
+export type AdmittedEnvelope = Readonly<{ connection: ConnectionKey; mayWake: boolean; replyIntent?: unknown }>;
 export function attachAdmission(event: object, envelope: AdmittedEnvelope): void {
   Object.defineProperty(event, admittedEnvelope, { value: envelope, enumerable: true });
 }

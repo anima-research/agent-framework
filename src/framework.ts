@@ -19018,6 +19018,7 @@ export class AgentFramework {
     message: ChannelIncomingMessage,
     event: CoalescedChannelEvent,
     check?: RequiredIngress['check'],
+    afterResponse?: RequiredIngress['afterResponse'],
   ): Promise<ChannelIncomingMessageResult> {
     return this.admitCoalesced(async () => {
       const replay = check && this.replayCoalescedIncoming(serverId, message, check);
@@ -19060,7 +19061,7 @@ export class AgentFramework {
         content: message.content,
         identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
         event: { lane: 'channel', event: { ...event, eventId: message.eventId, inboundSource } },
-      }, check);
+      }, check, afterResponse);
       if (!result.accepted) return { messageId: message.messageId, ...result };
       return this.finishCoalescedIncoming(serverId, message, result);
     });
@@ -19104,7 +19105,7 @@ export class AgentFramework {
     }, check);
   }
 
-  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']): Promise<PushEventResult> {
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check'], afterResponse?: RequiredIngress['afterResponse']): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
       // A required replay must pass current channel authorization too,
       // including when it waited behind another coalesced effect.
@@ -19171,7 +19172,7 @@ export class AgentFramework {
           },
         } : {}),
         event: { lane: 'push', event: { ...event, inboundSource } },
-      }, check);
+      }, check, afterResponse);
     });
   }
 
@@ -19337,7 +19338,7 @@ export class AgentFramework {
 
   /** Reserve under the coalescer's final check, before subject mutation,
    * replacement/removal or built-in storage. Receipt replay creates no work. */
-  private acceptCoalescedWithModuleCapacity(occ: CoalescedOccurrence<CoalescedDelivery>, check?: RequiredIngress['check']): Promise<PushEventResult> {
+  private acceptCoalescedWithModuleCapacity(occ: CoalescedOccurrence<CoalescedDelivery>, check?: RequiredIngress['check'], afterResponse?: RequiredIngress['afterResponse']): Promise<PushEventResult> {
     if (!check) return this.pushCoalescer!.accept(occ);
     return (async () => {
       let slot: RequiredModuleSlot | undefined;
@@ -19375,7 +19376,7 @@ export class AgentFramework {
             // batch may still be awaiting later siblings. Keep this FIFO
             // position ineligible until that response boundary has passed.
             const acceptedSlot = slot;
-            admissionOf(occ.event.event)!.afterResponse!(() => {
+            afterResponse!(() => {
               if (acceptedSlot.dropped) return;
               acceptedSlot.ready = true;
               this.pumpRequiredModuleQueue(acceptedSlot.queue);
@@ -33079,7 +33080,7 @@ export class AgentFramework {
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event),
       triggerFilter,
-      (serverId, params, event, check) => this.handleCoalescedPush(serverId, params, event, check),
+      (serverId, params, event, check, afterResponse) => this.handleCoalescedPush(serverId, params, event, check, afterResponse),
       // An ordinary push: freeze its envelope and observe the acceptance at
       // admission, before it is queued.
       (event) => {
@@ -33113,8 +33114,8 @@ export class AgentFramework {
       {
         store: this.store,
         replayCoalescedIncoming: (serverId, message, check) => this.replayCoalescedIncoming(serverId, message, check),
-        handleCoalescedIncoming: (serverId, message, event, check) =>
-          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, check),
+        handleCoalescedIncoming: (serverId, message, event, check, afterResponse) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, check, afterResponse),
         // An ordinary channels/incoming message: freeze its envelope and
         // observe the acceptance at admission, before it is queued.
         acceptInbound: (event) => {
