@@ -2002,6 +2002,8 @@ interface SurgeryHeldWrite {
    *  the write's (heldWriteTargetGone). */
   heldFor?: Agent;
   heldAt: number;
+  /** Its place among every write kept in memory, in arrival order (AgentFramework.heldWritesKept). */
+  heldOrder: number;
 }
 
 /** Where rows entered a window that its open turn weighs as arrivals (noteArrival): a tool boundary weighs what it hears itself. */
@@ -4738,6 +4740,8 @@ export class AgentFramework {
   private replayingHeld = false;
   /** A release of the tune-outs on record with no reader (releaseTuneOutsWithoutReader) that met held writes, to run once they are stored. */
   private releaseWithoutReaderWaits = false;
+  /** How many writes this process has kept in memory (SurgeryHeldWrite.heldOrder): their arrival order across agents. */
+  private heldWritesKept = 0;
   /**
    * Writes for an agent whose context manager refuses its work, by the
    * agent's name, each agent's in arrival order: its re-initialization after
@@ -16142,6 +16146,10 @@ export class AgentFramework {
       recovered.push(...writes);
     }
     if (recovered.length === 0) return;
+    // In arrival order across the agents, as each agent's are: writes for
+    // two agents whose slot one record holds (residents) land there in the
+    // order they came.
+    recovered.sort((x, y) => x.heldOrder - y.heldOrder);
     this.surgeryHeldWrites.unshift(...recovered);
     if (!this.surgeryHold) this.releaseSurgeryHeldWrites();
   }
@@ -16186,9 +16194,21 @@ export class AgentFramework {
    * a surgery's hold still keeps (surgeryHeldWrites, a hold whose operation
    * outlived stop()'s wait for it) are stored only if it releases before the
    * process exits. Mail among them stays held in the registry, and the next
-   * boot delivers it. Says nothing when none is kept.
+   * boot delivers it. Says nothing when none is kept. An alert's listeners
+   * run as it is raised, and a write one makes is kept so too, after this
+   * read of what is kept: each round tells the writes the rounds before it
+   * didn't, until one finds none new (a few rounds at most, for a listener
+   * that writes at every alert).
    */
   private reportHeldWritesAtStop(): void {
+    const told = new Set<SurgeryHeldWrite>();
+    for (let round = 0; round < 4; round++) {
+      if (!this.reportHeldWritesOnce(told)) return;
+    }
+  }
+
+  /** One round of reportHeldWritesAtStop: tells the writes kept in memory that aren't in `told`, adding them; whether any was. */
+  private reportHeldWritesOnce(told: Set<SurgeryHeldWrite>): boolean {
     // Read defensively, as releaseSurgeryHeldWrites is.
     const kept = new Map<string, { recovery: SurgeryHeldWrite[]; hold: SurgeryHeldWrite[] }>();
     const entry = (agentName: string) => {
@@ -16196,10 +16216,15 @@ export class AgentFramework {
       if (!found) kept.set(agentName, found = { recovery: [], hold: [] });
       return found;
     };
-    for (const [agentName, writes] of this.heldForRecovery ?? []) entry(agentName).recovery.push(...writes);
+    for (const [agentName, writes] of this.heldForRecovery ?? []) {
+      entry(agentName).recovery.push(...writes.filter((write) => !told.has(write)));
+    }
     for (const write of this.surgeryHeldWrites ?? []) {
+      if (told.has(write)) continue;
       entry(write.direct?.agentName ?? write.opts?.forAgent ?? this.primaryAgentName ?? 'the primary').hold.push(write);
     }
+    for (const { recovery, hold } of kept.values()) for (const write of [...recovery, ...hold]) told.add(write);
+    let any = false;
     const verb = this.surgeryHold ? MOVE_NOUNS[this.surgeryHold.verb] ?? this.surgeryHold.verb : 'surgery';
     for (const [agentName, { recovery, hold }] of kept) {
       const writes = [...recovery, ...hold];
@@ -16215,11 +16240,13 @@ export class AgentFramework {
       ];
       const message = `${writes.length === 1 ? '1 write' : `${writes.length} writes`} for ${agentName} kept in memory ` +
         `${writes.length === 1 ? 'is' : 'are'} not stored by this stop (${parts.join('; ')}). ${told}`;
+      any = true;
       console.error(`[stop] agent=${agentName}: ${message}`);
       this.opsAlert('store-held-lost', agentName, message, {
         data: { count: writes.length, keptForRecovery: recovery.length, heldBySurgery: hold.length, kinds, mail },
       });
     }
+    return any;
   }
 
   /**
@@ -24015,7 +24042,7 @@ export class AgentFramework {
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
-      heldFor: target, heldAt: Date.now(),
+      heldFor: target, heldAt: Date.now(), heldOrder: ++this.heldWritesKept,
     });
     if (this.surgeryHold || (this.replayingHeld && !replayed)) {
       this.surgeryHeldWrites.push(kept());
@@ -32669,6 +32696,7 @@ export class AgentFramework {
         ...(opts ? { opts: rest } : {}),
         heldFor: agent,
         heldAt: Date.now(),
+        heldOrder: ++this.heldWritesKept,
       };
     };
     // While the release replays what the hold kept, a write made meanwhile,
