@@ -327,6 +327,7 @@ async function firstCloseFails(f: Fixture): Promise<void> {
   try {
     const first = await close(f, { channelId: 'work' }, 'c0');
     assert.equal(first.success, false, 'premise: the first close failed');
+    assert.match(String((first as { error?: unknown }).error ?? ''), /The focus on it is still in force/, 'premise: the failure is the focus-still-in-force one (AF #844 review 2, #107)');
   } finally { hooks.commitDeliveries = commit; }
   assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus outlived the first close');
 }

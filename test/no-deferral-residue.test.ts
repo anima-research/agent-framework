@@ -62,6 +62,7 @@ const TEST_ALLOWED: Record<string, { names?: readonly string[]; handles?: true; 
   'no-deferral-residue.test.ts': { names: GONE, handles: true, why: 'the scan itself' },
   'presentation-mandatory.test.ts': { names: ['presentationIndex'], why: "a host's configuration that still names the removed flag passes" },
   'module-held-writes.test.ts': { handles: true, why: 'for one release, a `held:` handle an earlier release answered reaches its row' },
+  'mcpl-coalescer-render-run.test.ts': { names: ['deferredId'], why: 'for one release, a snapshot an earlier release saved can place an occupant under a deferredId, which restore reads' },
 };
 
 /** The released window, read for one agent: the queue's held writes, its second argument once, are gone. */
