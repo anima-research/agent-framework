@@ -33,7 +33,9 @@
   stored, and the agent's store is read back first for the occurrence's rows, by the subject and event id they carry.
   Rows found are placed as the delivery, and no fallback is stored; with none found, the fallback is stored; and
   where the store still can't be read, the fallback is stored and a line logged names the occurrence the agent may
-  then see twice. Any other throw means none of the write landed.
+  then see twice. Any other throw means none of the write landed. A write whose store refuses it as it is made, on
+  the ordinary write path, is lost, logged, where the queue used to keep it, so a refused failure notice for a fork
+  is no longer passed to the primary at the fork's release.
   A tune-out's cancel asked for meanwhile (its end time passing, a wake past its budget, a tool's or a host's
   cancel), or while the primary's or the subconscious's context manager refuses its work before anything is kept for
   it, waits, the tune-out in force, until the release has stored the writes, or told of those it couldn't, then runs,
