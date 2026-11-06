@@ -1118,7 +1118,7 @@ test('the breaker reads the status a real failure carries: a 404 never sheds; a 
     } else {
       assert.equal(shed.length, 0, `${label} sheds nothing`);
       assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2'], `${label}: the history still holds every exchange`);
-      // Only the shed is gated: each failure is still logged, and, since each turn did nothing, none is marked.
+      // Only the shed is gated: each failure is still logged.
       assert.deepEqual(markers, [], `${label}: no [inference-failed] marker`);
       const records = failuresLog.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
         .filter((record) => record.kind === 'inference-exhausted');

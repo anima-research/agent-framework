@@ -159,6 +159,7 @@ test('a framework reopened on the store after turns that did nothing holds none 
   const membrane = new ScriptedMembrane(() => 'fails');
   const r = await resident(t, membrane);
   for (const n of [1, 2, 3]) await r.say(`zz-hello ${n}`);
+  assert.equal(r.traces.filter((e) => e.type === 'inference:exhausted').length, 3, 'premise: three turns exhausted');
   await r.reopen();
   assert.deepEqual(r.notes(), []);
   assert.deepEqual(r.stored().flatMap((m) => m.content).map((b) => (b as { text?: string }).text), ['zz-hello 1', 'zz-hello 2', 'zz-hello 3']);
@@ -169,6 +170,7 @@ test('seventeen failures leave each next request as it would be without them: wh
   const r = await resident(t, membrane);
   for (let n = 1; n <= 18; n++) await r.say(`zz-hello ${n}`);
   assert.equal(membrane.sends.length, 18, 'premise: seventeen failed sends, then one that answered');
+  assert.equal(r.traces.filter((e) => e.type === 'inference:exhausted').length, 17, 'premise: seventeen turns exhausted');
   assert.ok(r.stored().some((m) => m.content.some((b) => (b as { text?: string }).text === 'zz-answer-18')), 'premise: the eighteenth answered');
   for (let n = 1; n < 18; n++) {
     assert.deepEqual(texts(membrane.sends[n]!), [...texts(membrane.sends[n - 1]!), `zz-hello ${n + 1}`], `send ${n + 1}`);
@@ -207,6 +209,7 @@ test('SUPPRESS_INFERENCE_FAILED_MARKER=1 leaves out the note for a turn that got
   const r = await resident(t, membrane);
   await r.say('zz-hello');
   assert.equal(r.traces.filter((e) => e.type === 'inference:exhausted').length, 1, 'premise: the turn exhausted');
+  assert.ok(r.stored().some((m) => JSON.stringify(m.content).includes('zz-looked')), 'premise: the turn got partway, its round in the context with its result');
   assert.deepEqual(r.notes(), []);
   assert.equal(r.failures().filter((f) => f.kind === 'inference-exhausted').length, 1);
 });

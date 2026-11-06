@@ -1,11 +1,12 @@
 - **Residents:** a turn whose inference is exhausted before it got partway
   writes no `[inference-failed]` note into the agent's context. Partway means
   one of its rounds reached the context with its results, or had its tool
-  calls started and cut off. Its failure goes to operators alone:
-  stderr's `[inference-failed] agent=…` line, `failures.log`'s
+  calls started and cut off. Everything else its failure does is as
+  before: stderr's `[inference-failed] agent=…` line, `failures.log`'s
   `inference-exhausted` record, the consecutive-failure streak, the
-  `inference:exhausted` trace, the hard-down alert and the poison-history
-  breaker, each as before. So a failure that comes back at every turn's first
+  `inference:exhausted` trace, the hard-down alert, and the poison-history
+  breaker, whose `[refusal-rewind]` note carries the failure's reason when
+  it sheds history. So a failure that comes back at every turn's first
   call, such as a provider that's down or a context that's too long, no longer
   adds a note per turn to the context it's sent with (#979).
   - A turn that got partway still gets one note, which says how far it got
@@ -15,6 +16,8 @@
     identically (e.g. drop an oversized attachment or an unsupported
     setting)." A timed-out turn's note keeps "If a reply is still owed from
     that turn, you can give it now."
+  - The reply judge reads the agent's context, so it no longer sees that a
+    turn which did nothing failed.
   - `SUPPRESS_INFERENCE_FAILED_MARKER=1` now leaves out only that note, since
     no other is written.
   - Notes already in a store stay as they are.
@@ -31,6 +34,9 @@
       of it ran or had its tool calls cut off; any other failure of it writes
       one." Now a failure of a re-armed turn writes a note only when a round
       of it ran or had its tool calls cut off, as any turn's failure does.
+    - 0.22.1: "a non-retryable failure that states a wait keeps its terminal
+      disposition (its marker and failure count)". Now such a failure keeps
+      its failure count, and its marker only when its turn got partway.
     - 0.29.0: "A re-armed turn's transient failure writes no
       `[inference-failed]` marker unless it got partway, so the agent's
       context keeps the one the first exhaustion wrote; a failure of another
@@ -41,6 +47,11 @@
       did … Other failures keep their wording and advice." Now only a turn
       that got partway has the note, which says its last call timed out, and
       no failure's note carries the advice.
+    - The `[assistant-persist]` stderr line for a thinking-only reply the
+      store refuses ended "See the refusal/inference-failed record for why.",
+      though a refusal never wrote an `[inference-failed]` note. It now
+      ends "If it was refused, see its [inference-refusal] line and
+      failures.log record."
     - Earlier entries' wording of the note for a turn that did nothing ("the
       model call failed … and produced no response, so nothing was sent")
       describes only notes already in stores.

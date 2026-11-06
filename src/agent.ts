@@ -2371,16 +2371,15 @@ export class Agent {
     // in the latest assistant message cannot be modified", unrecoverable by
     // retry (labclaude, 2026-07-27: hard down ~4h on exactly this pair).
     //
-    // Refused turns are surfaced by the refusal path (stderr's
-    // [inference-refusal] line and failures.log's refusal record); the store
-    // does not also need a content-free artifact of them. Loud, never silent.
+    // Refused turns are surfaced by the refusal path; the store does not
+    // also need a content-free artifact of them. Loud, never silent.
     if (content.length > 0 && content.every(
       (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
     )) {
       console.error(
         `[assistant-persist] agent=${this.name}: refusing to store a thinking-only assistant ` +
         `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
-        `output. If it was refused, its [inference-refusal] line and failures.log record say why.`,
+        `output. If it was refused, see its [inference-refusal] line and failures.log record.`,
       );
       return undefined;
     }

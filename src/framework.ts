@@ -7767,7 +7767,7 @@ export class AgentFramework {
       error: 'Stream cancelled',
     }, closes, stream);
     // Distinct trace type: emitTrace funnels every inference:exhausted into
-    // noteInferenceExhausted (streak, failures.log, a partway turn's note); inference:aborted
+    // noteInferenceExhausted (streak, failures.log); inference:aborted
     // carries the honest cause without any of that.
     this.emitTrace({
       type: 'inference:aborted',
@@ -21544,6 +21544,8 @@ export class AgentFramework {
         roundsRan: routing.roundsRan === true, callsCutOff, liveSpeech: routing.liveSpeech === true,
         speechRouting: (routing.speechRouting ?? 0) > 0,
       });
+    } else {
+      this.exhaustedTurns?.delete(agent.name);
     }
   }
 
@@ -32153,13 +32155,10 @@ export class AgentFramework {
    *
    *   1. stderr  — always, with the underlying API reason. The place an
    *      operator greps; previously empty in headless mode.
-   *   2. chronicle marker — for a turn that got partway (noteFailedTurnEnd
-   *      recorded it: a round ran, or a round's tool calls were cut off), one
-   *      `[inference-failed]` message, so the agent learns how far the turn
-   *      got, which of its calls ran or may have taken effect, and why it
-   *      failed. A turn that did nothing gets none: the failure is
-   *      telemetry (#979). addMessage does NOT request inference, so this
-   *      never causes a retry/wake loop.
+   *   2. chronicle marker — for a turn that got partway, a `[inference-failed]`
+   *      message so the agent itself learns its turn failed and why.
+   *      addMessage does NOT request inference, so this never causes a
+   *      retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
    *   4. breaker — when a failure at or past the hard-down threshold suggests
@@ -32572,7 +32571,7 @@ export class AgentFramework {
     // classification fields are additive.
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
-    // (2) Agent-facing chronicle marker, for a turn that got partway only (no inference triggered → no loop).
+    // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
     if (agent && ended && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
