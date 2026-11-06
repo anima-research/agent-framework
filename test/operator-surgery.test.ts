@@ -324,6 +324,51 @@ describe('live operator surgery', () => {
     assert.equal(internals.surgeryHeldWrites.length, 0);
   });
 
+  // AF #844 bot review 4, finding 17: an audience-fault listener that starts
+  // a surgery runs before the write's clock row is due. The clock is then
+  // not written under the switch's reservation, which takes every agent's
+  // turn token, so the write reads a turn alive and takes no clock; it waits
+  // for the release, and the release's replay takes the clock due, ahead of
+  // it.
+  it("a write whose audience check's trace starts a surgery writes no clock row under it; the release stores the clock, then the write", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-surgery-audience-clock-'));
+    const clocked = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', clock: { intervalMinutes: 10 } }],
+      modules: [],
+      operatorLogPath: false,
+    });
+    const internals = clocked as unknown as {
+      surgeryHeldWrites: unknown[];
+      addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { audience?: readonly string[] }): string;
+    };
+    const scoutCm = clocked.getAgent('scout')!.getContextManager();
+    const kinds = () => scoutCm.getAllMessages()
+      .map((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'clock' ? 'clock' : (m.content[0] as { text?: string }).text);
+    let switching: Promise<void> | undefined;
+    let clocksAtTheSwitch: number | undefined;
+    clocked.onTrace((event) => {
+      if (event.type === 'presentation:unreadable-audience' && !switching) {
+        clocksAtTheSwitch = kinds().filter((k) => k === 'clock').length;
+        switching = clocked.switchBranch(clocked.getStore().currentBranch().name);
+      }
+    });
+    try {
+      const id = internals.addMessage('someone', [{ type: 'text', text: 'for a worker' }], undefined, { audience: ['worker-9'] });
+      assert.ok(switching, "setup: the stamp's fault was traced, and its listener started a switch");
+      assert.equal(id, '', 'held behind the surgery its trace started');
+      assert.equal(kinds().filter((k) => k === 'clock').length, clocksAtTheSwitch, 'no clock row written under the reservation');
+      await switching;
+      const after = kinds();
+      assert.deepEqual(after.slice(-2), ['clock', 'for a worker'], "the release stores the clock due, then the write");
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      await clocked.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // AF #844 bot review 3, findings 24 and 63: the write a release replays is
   // taken off the queue only once it is stored, so a listener of its clock
   // row's trace still finds it listed, and a hold that listener begins keeps
