@@ -974,13 +974,20 @@ describe('Conversation routing', () => {
       addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
     };
     const streamYielding = membrane.streamYielding.bind(membrane);
+    let during: { id: string; stored: boolean; status: string } | undefined;
     membrane.streamYielding = (request, options) => {
-      internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
+      const id = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
         { forAgent: forkName('slack:D4', 1) });
+      const cm = g1.getContextManager();
+      during = { id, stored: cm.getAllMessages().some((m) => m.id === id), status: id ? cm.windowStatusOf(id as never) : 'none' };
       return streamYielding(request, options);
     };
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
+
+    assert.ok(during, 'the closure turn streamed');
+    assert.notEqual(during!.id, '', 'the write has an id: stored at once');
+    assert.deepEqual([during!.stored, during!.status], [true, 'out'], "in the fork's store, and out of the closure turn's window");
 
     assert.equal(framework.getAgent(forkName('slack:D4', 1)), null, 'disposed once its closure turn finished');
     const window = g1.getContextManager().getPresentedMessages().map((m) => JSON.stringify(m.content));
@@ -1145,6 +1152,7 @@ describe('Conversation routing', () => {
     // The closure turn's tool boundary hears what arrived (#291), so the
     // restarted stream carries it and its reply follows.
     assert.ok(window[window.length - 2]!.includes('one more thing'), window.join('\n'));
+    assert.ok(JSON.stringify(membrane.calls.at(-1)!.messages).includes('one more thing'), "the restart's request carries it");
     assert.ok(window[window.length - 1]!.includes('Final report posted.'), 'the restarted closure turn finished in the fork');
 
     await framework.stop();

@@ -1007,6 +1007,42 @@ describe('a wake for a write heard mid-turn', () => {
     await framework.stop();
   });
 
+  // The cases above read marks built from a sequence. On a presented window a
+  // mark covers the rows its window held then, by ordinal: a row stored
+  // before the script started and presented only after it isn't credited.
+  it("on a presented window, a script's channel_publish is credited with the rows the window held when its run call started the script, not a row stored before then and presented after", async () => {
+    const framework = await createFramework();
+    const publishes: Array<[string, 'delivered' | 'refused']> = [];
+    stubChannelRegistry(framework, ROOM, { publishes });
+    const fw = internals(framework) as unknown as {
+      turnRouting: Map<string, unknown>;
+      scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string; held?: true }>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    assert.equal(cm.windowMode(), 'presented', 'premise: the window is presented');
+    const room = destinationKey({ serverId: 'chat', channelId: ROOM });
+    const rowOf = (id: string): MarkedRow => cm.getMessage(id as never)!;
+    const before = cm.addMessage('someone', [{ type: 'text', text: 'read before the script' }] as ContentBlock[]);
+    cm.presentRows([before]);
+    const after = cm.addMessage('someone', [{ type: 'text', text: 'presented after the script started' }] as ContentBlock[]);
+    agent.markContextConsumed();
+    const atStart = agent.getConsumedWatermark()!;
+    cm.presentRows([after]);
+    fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set() });
+
+    const answer = fw.scriptToolCall('assistant', 'channel_publish', JSON.stringify({ channelId: ROOM, content: 'a script posts' }),
+      { watch: { turnId: 1, endTurn: false }, startTurnId: 1, startReadThrough: atStart });
+    const answered = await bridgeAnswer(framework, answer);
+
+    assert.equal(JSON.parse(answered.json).isError, false, `the call succeeded: ${answered.json}`);
+    assert.deepEqual(publishes, [[ROOM, 'delivered']], "the premise: the script's publish was delivered");
+    assert.equal(agent.publishedAfterReading(room, rowOf(before), cm), true, 'credited with a row the window held when the script started');
+    assert.equal(agent.publishedAfterReading(room, rowOf(after), cm), false,
+      'not with a row stored before then and presented after, though its sequence is below the mark\'s head');
+    await framework.stop();
+  });
+
   const event = (e: Record<string, unknown>) => (framework: AgentFramework) => framework.pushEvent(e as unknown as ProcessEvent);
   const kept: Array<[string, (framework: AgentFramework) => unknown]> = [
     ['console input, which nothing records an answer to', event({ type: 'external-message', source: 'console', content: 'are you there?' })],
