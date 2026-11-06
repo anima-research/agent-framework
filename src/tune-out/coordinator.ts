@@ -2596,7 +2596,9 @@ export class TuneOutCoordinator {
    * surgery's restore, say), so that a crash from here on reads only what
    * this run stored on it. The destination's kept loss notices aren't in memory: the next write
    * of the record reads them in first (lossRecordUnread), and writes this
-   * run's kept ones there too. Never throws.
+   * run's kept ones there too; where this run keeps any, that write is
+   * made here, before the marker, and the last stop's bound is judged by
+   * the destination's record (carriedNeeded). Never throws.
    */
   branchMoved(): void {
     if (this.stopped) return;
@@ -2613,6 +2615,16 @@ export class TuneOutCoordinator {
         if (branch !== undefined) this.runStarts.set(branch, this.runStartedAt);
       }
       this.runBranch = branch;
+      // The destination's record isn't read yet, so a notice only the
+      // record left held is kept in none here (stampNoticesUnkept). It is
+      // written there first, where writes aren't held, so the marker below
+      // lands after it.
+      this.lossRecordUnread = true;
+      this.lossRecordIds = new Set();
+      if (this.persistedLossNotices().length > 0) {
+        this.lossRecordStale = true;
+        this.writeLossRecord();
+      }
       // Kept while still needed (carriedNeeded), as the boot keeps it: a
       // failed surgery's restore to the stamp's own branch reads those rows
       // again, and on another branch the bound reads as elsewhere.
@@ -2620,9 +2632,6 @@ export class TuneOutCoordinator {
       this.markerPending = this.runMarker();
       this.writePendingMarker();
       if (this.markerPending) this.armDeferredRetry();
-      this.lossRecordUnread = true;
-      this.lossRecordIds = new Set();
-      if (this.persistedLossNotices().length > 0) this.lossRecordStale = true;
     } catch (err) {
       console.error(`[tune-out] the stop stamp and loss record could not be moved to the store's new branch: ${thrownReason(err)}`);
     }

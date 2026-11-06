@@ -1626,3 +1626,59 @@ test("review 3 #80: a stop whose record can't be made durable leaves its hold ou
     assert.ok(!(h.states.get(STAMP) as { epochs: string[] }).epochs.includes(e), 'the stamp leaves it out, so a crash before the record lands is told');
   } finally { h.stopAll(); }
 }));
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 4 (at 0f7e2711).
+// ---------------------------------------------------------------------------
+
+test("review 4 #13: a branch move to a branch whose loss record lacks the boot's kept notice writes the record there before the marker, so a crash after gives the next boot that notice", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    // A branch made before the next boot keeps its notice: no loss record there.
+    h.fork('other');
+    // The host dies with the cancel waiting. The next boot can't write its notice to the subconscious, and keeps it in the store.
+    h.state.subRefuses = true;
+    const c = h.boot();
+    assert.deepEqual(h.told(), [], 'premise: the notice could not be written');
+    assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, "premise: kept in this branch's record");
+    h.switchTo('other');
+    h.log.length = 0;
+    c.branchMoved();
+    const record = h.log.indexOf(`write:${LOSS_RECORD}`);
+    assert.ok(record >= 0 && record < h.log.indexOf(`write:${STAMP}`), `the record is written there before the marker: ${h.log.join(', ')}`);
+    // The host dies before anything else is written there.
+    h.state.subRefuses = false;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')], 'the next boot writes the kept notice, once');
+  } finally { h.stopAll(); }
+}));
+
+test("review 4 #13: a bound still carried where the record left holds the notice is judged by the destination's record: refused there, the marker keeps it", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    const start = h.state.seq;
+    h.boot();
+    h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.fork('other');
+    h.state.subRefuses = true;
+    h.refuse.add(LOSS_RECORD);
+    const c = h.boot();
+    assert.deepEqual(h.told(), [], 'premise: the notice could not be written, nor kept in the store');
+    h.refuse.delete(LOSS_RECORD);
+    // The record is written on this branch by a write that leaves the bound for the next check (a loss told meanwhile, say).
+    assert.equal((c as unknown as { writeLossRecord(): boolean }).writeLossRecord(), true);
+    assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, "premise: kept in this branch's record now");
+    const carried = () => (c as unknown as { carriedBound?: unknown }).carriedBound;
+    assert.ok(carried(), 'premise: the bound is still carried');
+    // The move: the destination refuses the record.
+    h.switchTo('other');
+    h.refuse.add(LOSS_RECORD);
+    c.branchMoved();
+    assert.ok(carried(), 'the notice is in no record there, so the bound stays');
+    assert.equal((h.states.get(STAMP) as { runStartedAt?: number }).runStartedAt, start, 'and the marker there reads the last run, from where it began');
+  } finally { h.stopAll(); }
+}));
