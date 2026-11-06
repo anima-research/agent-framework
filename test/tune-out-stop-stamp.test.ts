@@ -56,6 +56,8 @@ function stampSetup() {
     noteRefuses: false,
     /** The stamp can't be read. */
     stampUnreadable: false,
+    /** A release isn't made durable (commitDeliveries answers false). */
+    commitFails: false,
     /** The holds' channels are registered, as a boot after #900 may find them, with this wake count. */
     registered: false, wakeCount: 0,
   };
@@ -101,7 +103,7 @@ function stampSetup() {
     subconsciousWindow: () => window,
     emitTrace: (event: Trace) => { traces.push(event); },
     writesHeld: () => state.held,
-    commitDeliveries: () => true,
+    commitDeliveries: () => !state.commitFails,
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
@@ -1089,11 +1091,11 @@ test("pin: a release carrying a queued note's loss alone, a channel's or the all
       if (scope) c.cancelAllExcept('subconscious', 'by Subconscious', 'Back.', SUB);
       else c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
       h.state.held = false;
-      // Its own run stores its release, and its end can't be recorded.
-      if (scope) h.refuse.add(SCOPE); else h.state.endFails = true;
+      // Its own run stores its release, which isn't made durable: its note
+      // waits, as it goes out only once the release is.
+      h.state.commitFails = true;
       c.runDeferredCancels();
-      h.refuse.delete(SCOPE);
-      h.state.endFails = false;
+      h.state.commitFails = false;
       h.state.noteRefuses = true;
       if (scope) c.cancelAllExcept('channel-close', 'the excepted channel was closed');
       else c.cancel('editor', 'noisy', 'agent-tool', 'agent request');
@@ -1134,7 +1136,7 @@ test("pin: a waiting cancel's release records every caller it answered as waitin
 // Weft's reading of 0401939e.
 // ---------------------------------------------------------------------------
 
-test("1 (Weft, 0401939e): the subconscious's own ask that joined a reader fork's waiting cancel, which ran, is credited to it, in either order", () => quiet(() => {
+test("1 (Weft, 0401939e): the subconscious's own ask that joined a reader fork's waiting cancel, which ran, is credited to it, in either order, its note out before the end (review 2 #25)", () => quiet(() => {
   for (const forkFirst of [true, false]) {
     const h = stampSetup();
     try {
@@ -1152,12 +1154,12 @@ test("1 (Weft, 0401939e): the subconscious's own ask that joined a reader fork's
       assert.equal(h.holds.length, 1, 'premise: its end was not recorded');
       h.boot();
       assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}The cancel of it you asked for ran (with reader-fork-7's): its release `
-        + `reached scout, but the note you left with it, "SUB NOTE", did not. ${STILL}]`, forkFirst ? 'fork first' : 'subconscious first');
+        + `reached scout, with the note you left with it. ${STILL}]`, forkFirst ? 'fork first' : 'subconscious first');
     } finally { h.stopAll(); }
   }
 }));
 
-test("1 (Weft, 0401939e), control: its ask alone, its cancel run, its end unrecorded", () => quiet(() => {
+test("1 (Weft, 0401939e), control: its ask alone, its cancel run, its note out before the end, its end unrecorded", () => quiet(() => {
   const h = stampSetup();
   try {
     h.hold();
@@ -1171,8 +1173,8 @@ test("1 (Weft, 0401939e), control: its ask alone, its cancel run, its end unreco
     c.runDeferredCancels();
     h.state.endFails = false;
     h.boot();
-    assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}The cancel of it you asked for ran: its release reached scout, but the note `
-      + `you left with it, "SUB NOTE", did not. ${STILL}]`);
+    assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}The cancel of it you asked for ran: its release reached scout, with the note `
+      + `you left with it. ${STILL}]`);
   } finally { h.stopAll(); }
 }));
 
@@ -1191,3 +1193,4 @@ test("pin: a kept notice silences by when its boot decided it: one kept before a
     assert.equal(h.unrecorded().length, 2);
   } finally { h.stopAll(); }
 }));
+

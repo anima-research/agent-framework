@@ -152,15 +152,21 @@ test('65: a deferred cancel whose hold ended meanwhile ends nothing and is not t
 
 type Trace = Record<string, unknown> & { type: string };
 
-/** `forks`: reader forks read, with no persistent subconscious; a fork's note goes out as its mail (`mail`). */
-function epochSetup(options: { forks?: boolean } = {}) {
+/**
+ * `forks`: reader forks read, with no persistent subconscious; a fork's note goes out as its mail (`mail`).
+ * `stored`: the residents' store (`rows`) shows the coordinator's own writes there too, as a real store does.
+ */
+function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   const state = {
     held: false, durable: true, noteFails: false, noticeFails: false, wakeFails: false, subNameFailsAfterEnd: false,
     /** The store refuses a release's row (tune-out-cancel). */
     releaseFails: false,
     /** Agents that have ended: the framework drops a write for one, answering an empty id. */
     gone: [] as string[],
+    /** The process dies just after a hold's end is recorded: the end lands, and the step throws. */
+    crashAfterEnd: false,
   };
+  let onTrace: ((event: Trace) => void) | undefined;
   let channel: { params: { epochId: string }; wakeCount: number } | null = null;
   const states = new Map<string, unknown>();
   const rows: Array<{ participant: string; content: ContentBlock[]; metadata: Record<string, unknown>; sequence: number }> = [];
@@ -171,10 +177,16 @@ function epochSetup(options: { forks?: boolean } = {}) {
   const registry = {
     getTuneOutState: (_s: string, channelId: string) => (channelId === 'disc:guild:a' ? channel : null),
     enterTuneOut: (_s: string, _c: string, params: { epochId: string }) => { channel = { params, wakeCount: 0 }; },
-    cancelTuneOut: () => { const ended = channel; channel = null; return ended; },
+    cancelTuneOut: () => {
+      const ended = channel;
+      channel = null;
+      if (state.crashAfterEnd) throw new Error('the process died just after the end was recorded (test)');
+      return ended;
+    },
     readCoordinatorState: (id: string) => states.get(id) ?? null,
     writeCoordinatorState: (id: string, value: unknown) => {
       if (value === null) states.delete(id); else states.set(id, structuredClone(value));
+      if (value === null && state.crashAfterEnd && id.endsWith('/all-except')) throw new Error('the process died just after the end was recorded (test)');
     },
     nameShown: (c: { channelId: string }) => c.channelId,
     quotedShown: (c: { channelId: string }) => JSON.stringify(c.channelId),
@@ -187,6 +199,7 @@ function epochSetup(options: { forks?: boolean } = {}) {
       if (state.noticeFails && metadata?.kind === 'tune-out-note-undelivered') throw new Error('the store refused the notice too (test)');
       if (state.releaseFails && metadata?.kind === 'tune-out-cancel') throw new Error('the store refused the release (test)');
       added.push({ participant, content, metadata, forAgent });
+      if (options.stored && forAgent === undefined) rows.push({ participant, content, metadata: metadata ?? {}, sequence: rows.length + 1 });
       return `m${added.length}`;
     },
     requestInference: (agentName: string, reason: string) => {
@@ -210,7 +223,7 @@ function epochSetup(options: { forks?: boolean } = {}) {
     getStoredMessages: () => rows,
     getSurgeryHeldMessages: () => [],
     unseenBySubconscious: () => 0,
-    emitTrace: (event: Trace) => { traces.push(event); },
+    emitTrace: (event: Trace) => { traces.push(event); onTrace?.(event); },
     writesHeld: () => state.held,
     commitDeliveries: () => state.durable,
     isForkBound: () => false,
@@ -255,7 +268,9 @@ function epochSetup(options: { forks?: boolean } = {}) {
   const reboot = (): TuneOutCoordinator => new TuneOutCoordinator(registry as never, {} as never, hooks as never);
   /** The persistent subconscious's kept loss notices, as the store keeps them. */
   const lossRecord = () => (states.get(LOSS_RECORD_UNIT) as { v: number; pendingLossNotices: Array<Record<string, unknown>> } | undefined);
-  return { coordinator, state, states, added, mail, wakes, traces, enter, enterScope, inForce, scopeInForce, releasesOf, notes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord };
+  /** A trace listener, as a host's: called with each trace as it is emitted. */
+  const listen = (fn: (event: Trace) => void): void => { onTrace = fn; };
+  return { coordinator, state, states, rows, added, mail, wakes, traces, enter, enterScope, inForce, scopeInForce, releasesOf, notes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen };
 }
 
 const LOSS_RECORD_UNIT = 'tune-out/scout/loss-notices';
@@ -978,7 +993,27 @@ test("65 follow-up (Isaac-3593): the all-except hold's queued cancel whose own r
   }
 });
 
-test("65 follow-up (Isaac-3593): a queued cancel's run that ends its tune-out and fails before its note is written tells the note's author, with the error", () => {
+test("65 follow-up (Isaac-3593; review 2 #25): a queued cancel's run that ends its tune-out and fails after the end has written its note already", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+    h.state.held = false;
+    h.state.subNameFailsAfterEnd = true;
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null, 'premise: its run ended A');
+    assert.ok(errors.mock.calls.some((c) => String(c.arguments[0]).includes('a step after the end failed')), 'premise: and then failed');
+    assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], 'its note went out before the end');
+    assert.deepEqual([h.lossNotices(), h.dropped()], [[], []], 'so nothing is told lost');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("65 follow-up (Isaac-3593): a queued cancel's run whose note can't be delivered, and that fails after it ends its tune-out, tells the note's author, with the note's error", () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup();
   try {
@@ -986,6 +1021,7 @@ test("65 follow-up (Isaac-3593): a queued cancel's run that ends its tune-out an
     h.state.held = true;
     h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
     h.state.held = false;
+    h.state.noteFails = true;
     h.state.subNameFailsAfterEnd = true;
     h.coordinator.runDeferredCancels();
     assert.equal(h.inForce(), null, 'premise: its run ended A');
@@ -996,9 +1032,9 @@ test("65 follow-up (Isaac-3593): a queued cancel's run that ends its tune-out an
     assert.equal(told[0]!.forAgent, 'Subconscious');
     assert.equal(textOf(told[0]!.content),
       '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. Your cancel ended '
-      + 'that tune-out when it ran, and delivering the note then failed: the subconscious could not be named (test).]');
+      + 'that tune-out when it ran, and delivering the note then failed: the store refused the row (test).]');
     assert.deepEqual(h.dropped().map((t) => [t.epochId, t.reason, t.noteAuthor, t.error]),
-      [[a, 'note-undelivered', 'Subconscious', 'the subconscious could not be named (test)']]);
+      [[a, 'note-undelivered', 'Subconscious', 'the store refused the row (test)']]);
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -1545,3 +1581,139 @@ test('69: a window-starts record that cannot be read is never written over, and 
     assert.deepEqual(h.kept(), { v: 1, starts: { X: 3, Y: 8 }, inForce: 3 });
   } finally { errors.mock.restore(); }
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 2 (at caf5a48f): the deferred cancel's queue.
+// ---------------------------------------------------------------------------
+
+test("review 2 #25: a queued cancel's own run makes its note durable before it records the hold's end, so a death just after the end finds the note stored", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup();
+    try {
+      if (scope) h.enterScope(); else h.enter();
+      h.state.held = true;
+      const asked = scope
+        ? h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious')
+        : h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      assert.deepEqual(asked, { ok: true, deferred: true }, 'premise: accepted as waiting, with its note');
+      h.state.crashAfterEnd = true;
+      h.state.held = false;
+      h.coordinator.runDeferredCancels();
+      assert.ok(scope ? !h.states.has('tune-out/scout/all-except') : h.inForce() === null, "premise: the hold's end is recorded");
+      assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'],
+        `${scope ? 'all-except' : 'channel'}: the note was written before the end, so the store has it whatever comes after`);
+      assert.deepEqual(h.lossNotices(), [], 'and nothing says it was lost');
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("review 2 #25, control: a queued cancel's own run whose release isn't made durable writes no note yet, and the next run delivers it once", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+    failFirstRelease(h);
+    assert.deepEqual(h.notes(), [], 'its release failed: the note waits with it');
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null);
+    assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], 'delivered once, at the run that ends the hold');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("review 2 #55: a stop from a trace listener while the deferred cancels run leaves those not run yet to the stop: none runs after it, and the stop tells each", () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    h.enter();
+    const scope = h.enterScope();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request');
+    h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Look at #b.', 'Subconscious');
+    h.listen((event) => { if (event.type === 'tune-out:cancelled' && event.scope === undefined) h.coordinator.stop(); });
+    h.state.held = false;
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null, "premise: the channel's cancel ran, and its trace stopped the host");
+    assert.equal(h.scopeInForce(), scope, 'the all-except cancel did not run after the stop: the hold stays in force');
+    assert.deepEqual(h.dropped().map((t) => [t.epochId, t.reason, t.noteLost]), [[scope, 'stopped', true]], 'the stop told it, its note lost');
+    assert.equal(h.lossRecord()?.pendingLossNotices.length, 1, "and kept its note's loss in the store for the next boot");
+    mock.timers.tick(120_000);
+    assert.equal(h.scopeInForce(), scope, 'no retry runs it after the stop');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+    mock.timers.reset();
+  }
+});
+
+test("review 2 #68: a stop logs and traces every waiting cancel it drops, one with no note and one whose note went out already, telling no note lost", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'duration', 'duration elapsed');
+    h.coordinator.stop();
+    const lines = errors.mock.calls.map((c) => String(c.arguments[0])).filter((l) => l.includes('stopping:'));
+    assert.ok(lines.some((l) => l.includes('the cancel of disc:guild:a (duration elapsed)') && l.includes('ends nothing') && !l.includes('note')),
+      `the stop names the cancel it drops, and no note: ${lines.join('\n')}`);
+    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], 'and traces it');
+
+    // A note another cancel delivered ahead of its release, which then failed.
+    const g = epochSetup();
+    try {
+      g.enter();
+      g.state.held = true;
+      g.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      failFirstRelease(g);
+      g.state.durable = false;
+      assert.throws(() => g.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), /could not be made durable/);
+      assert.deepEqual(g.notes().map((n) => n.text), ['Someone asked for you.'], 'premise: its note went out ahead of that release');
+      g.coordinator.stop();
+      assert.deepEqual(g.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], 'the drop is traced, its note not lost');
+      assert.deepEqual(g.lossRecord()?.pendingLossNotices ?? [], [], 'and no notice tells it lost');
+    } finally { g.coordinator.stop(); }
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("review 2 #56: a note whose loss a release told, that release not made durable then, is traced as lost and its turn asked for once the hold ends", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+    failFirstRelease(h);
+    h.state.noteFails = true;
+    h.state.durable = false;
+    assert.throws(() => h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), /could not be made durable/);
+    assert.equal(h.added.filter((m) => m.metadata?.lostNote === true).length, 1, "premise: that cancel's release told the note's loss, and wasn't made durable");
+    assert.deepEqual(h.dropped(), [], 'premise: nothing traced yet, the hold in force');
+    h.state.noteFails = false;
+    h.state.durable = true;
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null, 'the waiting cancel ends the hold');
+    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost, t.noteAuthor]), [['note-undelivered', true, 'Subconscious']],
+      'the loss is traced as the release told it');
+    assert.deepEqual(h.wakes.filter(([, why]) => why.startsWith('tune-out note not delivered')),
+      [['Subconscious', 'tune-out note not delivered: disc:guild:a']], 'with a turn to read it');
+    assert.deepEqual(h.lossNotices(), [], 'no notice of its own: the release tells it');
+    assert.deepEqual(h.notes(), [], 'and the note is not delivered after its loss was told');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+

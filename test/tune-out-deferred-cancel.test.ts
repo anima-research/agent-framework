@@ -670,7 +670,7 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
     }
   });
 
-  it("the cancel the subconscious asked for ran, its release stored, and its end's record failed, then a crash: the row says it ran and that its note did not go out (Weft, finding 2)", async () => {
+  it("the cancel the subconscious asked for ran, its release stored, and its end's record failed, then a crash: the row says it ran, its note with it, which goes out before the end (Weft, finding 2; review 2 #25)", async () => {
     const errors = mock.method(console, 'error', () => {});
     const { f, sub, epochId } = await heldWithPrimer();
     try {
@@ -697,7 +697,7 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
       await f.create();
       assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [
         `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${epochId}). The cancel of it you `
-        + 'asked for ran: its release reached agent, but the note you left with it, "Antra asked for you in #noisy.", did not. Its end '
+        + 'asked for ran: its release reached agent, with the note you left with it. Its end '
         + 'was not recorded, so that tune-out is still in force.]',
       ]);
     } finally {
