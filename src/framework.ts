@@ -5136,6 +5136,16 @@ export class AgentFramework {
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
     assertObservedAgentsConfigured(config.agents);
+    // The presentation index (#291) needs a context-manager that keeps a
+    // window index per agent (presentRows): 0.25.0 on, since 0.23.x and
+    // 0.24.0 were published without one. It needs no store, so it is
+    // checked before one is opened.
+    if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
+      throw new Error(
+        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
+          'Install @animalabs/context-manager ^0.25.0, which this package declares (0.23.x and 0.24.0 have no window index)',
+      );
+    }
 
     // Create or use existing store
     let store: JsStore;
@@ -5218,6 +5228,14 @@ export class AgentFramework {
     config: FrameworkConfig,
     building: { framework?: AgentFramework },
   ): Promise<AgentFramework> {
+    // A store handle with chronicle's batched identity append (0.6.0 on):
+    // context-manager writes a window of several rows with it alone, so on
+    // a handle without it (chronicle 0.5.0 or earlier, or a host's handle
+    // from one) the first agent's write-down would throw. Refused before
+    // anything is written to the store, the state registrations below
+    // included.
+    const unbatched = unbatchedStoreRefusal(store);
+    if (unbatched !== undefined) throw new Error(unbatched);
     // Register framework states. The deferred-write slot is an earlier
     // release's, which the importer reads and clears (one release).
     ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
@@ -5334,21 +5352,8 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
-    // The presentation index (#291), before any agent exists. It needs a
-    // context-manager that keeps a window index per agent (presentRows):
-    // 0.25.0 on, since 0.23.x and 0.24.0 were published without one.
-    if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
-      throw new Error(
-        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
-          'Install @animalabs/context-manager ^0.25.0, which this package declares (0.23.x and 0.24.0 have no window index)',
-      );
-    }
-    // And a store handle with chronicle's batched identity append (0.6.0
-    // on): context-manager writes a window of several rows with it alone,
-    // so on a handle without it (chronicle 0.5.0 or earlier, or a host's
-    // handle from one) the first agent's write-down would throw.
-    const unbatched = unbatchedStoreRefusal(store);
-    if (unbatched !== undefined) throw new Error(unbatched);
+    // The presentation index (#291), before any agent exists: its
+    // context-manager and store handle are checked at the start of create().
     framework.bootFreeze = true;
     framework.presentation = new AgentPresentation({
       liveAgents: () => framework.agents.values(),

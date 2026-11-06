@@ -16,7 +16,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -182,6 +182,10 @@ describe('presentation is mandatory (#291)', () => {
     };
     const version = manifestOf('../../node_modules/@animalabs/chronicle/package.json').version;
     const declared = manifestOf('../../package.json').dependencies['@animalabs/chronicle']!;
+    // AF #844 bot review 4, finding 72: refused before create() writes
+    // anything, the framework's state registrations included.
+    const states = () => store.listStates().map((s) => s.id).sort();
+    const before = states();
     try {
       await assert.rejects(AgentFramework.create({
         store,
@@ -202,6 +206,7 @@ describe('presentation is mandatory (#291)', () => {
       for (const name of ['mira', 'oren']) {
         assert.equal(store.getStateLen(`agents/${name}/window`) ?? 0, 0, `nothing written to ${name}'s window`);
       }
+      assert.deepEqual(states(), before, 'no state registered: the refusal comes before any write');
     } finally {
       store.close();
     }
@@ -258,6 +263,9 @@ describe('presentation is mandatory (#291)', () => {
         assert.ok(error.message.includes(`Install @animalabs/context-manager ${declared}, which this package declares`), error.message);
         return true;
       });
+      // AF #844 bot review 4, finding 72: it needs no store, so it comes
+      // before create() opens one.
+      assert.ok(!existsSync(join(dir, 'store.chronicle')), 'no store was made');
     } finally {
       proto.presentRows = presentRows;
     }

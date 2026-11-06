@@ -9,9 +9,9 @@
   floor can be lower. The published chronicle 0.5.1 (and 0.5.0, 0.30.0's branch views) has none of the batched calls, and the
   published context-manager 0.23.x and 0.24.0 have no window index. Context-manager has no one-record-per-row path:
   on a store handle without the batched append, the first window write-down of a record that holds a row throws, and
-  every agent's window is written down at its registration (#291). So `AgentFramework.create()` refuses, before any
-  agent is registered, a store handle without `appendManyToStateJsonWithIdentity` and a context-manager without
-  `ContextManager.presentRows`, each with an error that names the range this package declares. chronicle 0.6.0 and
+  every agent's window is written down at its registration (#291). So `AgentFramework.create()` refuses, before it
+  writes anything to the store, a store handle without `appendManyToStateJsonWithIdentity`, and before it opens one, a
+  context-manager without `ContextManager.presentRows`, each with an error that names the range this package declares. chronicle 0.6.0 and
   context-manager 0.25.0 carry 0.5.0's and 0.24.0's changes, so what 0.30.0's entry says of derived agents and
   branch views holds under them too. The framework reads those two errors from context-manager's exports as it loads,
   not by a named import, so on 0.24.0, which has neither, the package loads and `create()` gives that error, where
