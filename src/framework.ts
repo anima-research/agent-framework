@@ -35409,8 +35409,16 @@ export class AgentFramework {
           };
           const endedText = 'The focus on it ended, and what the other channels held was delivered, up to its backlog cap.';
           // A failure before the end leaves the hold in force, which the reason
-          // needn't say: the answer does.
-          const stillText = (why: string): string => `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it is still in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.`;
+          // needn't say: the answer does. The coordinator's two failures to
+          // make the release durable (endAllExcept: the release, or the note
+          // left with it) come after the release notice, with the other
+          // channels' backlog, was stored: the residents hold that backlog,
+          // and the next release doesn't give it again, so only what arrives
+          // from now on stays held. They are told by their words, which no
+          // other failure here has.
+          const stillText = (why: string, releaseStored = false): string => `${/[.!?]$/.test(why) ? why : `${why}.`} ${releaseStored
+            ? "The focus on it is still in force, but its release notice, with what the other channels held up to its backlog cap, was stored before that failure: what they hold from now on stays held until it ends."
+            : 'The focus on it is still in force: what the other channels hold stays held until it ends.'} A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.`;
           let released: ReturnType<typeof coordinator.cancelAllExcept>;
           try {
             released = coordinator.cancelAllExcept('channel-close', unregistered
@@ -35425,7 +35433,8 @@ export class AgentFramework {
               throw new Error(`${unregistered ? "A step of the focus's release failed" : "The close wasn't recorded"}: `
                 + `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it ended before that failure, and what the other channels held was delivered, up to its backlog cap.`);
             }
-            throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(why)}` : `The close wasn't recorded: ${stillText(why)}`);
+            const stored = /^the (all-except release|note left with the all-except release) could not be made durable\b/.test(why);
+            throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(why, stored)}` : `The close wasn't recorded: ${stillText(why, stored)}`);
           }
           if (!released.ok) throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(released.error)}` : `The close wasn't recorded: ${stillText(released.error)}`);
           // What holds the channel set when the answer is built: this close's

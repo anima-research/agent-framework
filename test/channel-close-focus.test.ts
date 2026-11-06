@@ -156,7 +156,11 @@ describe('a close that fails after the focus ended says the focus ended', () => 
       const result = await close(f, { channelId: 'work' });
       assert.equal(result.success, false);
       assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus is in force');
-      assert.equal(result.error, "The close wasn't recorded: the all-except release could not be made durable, so the hold stays in force. The focus on it is still in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.");
+      // AF #844 bot review 5, finding 44: the release notice, with the
+      // other channels' backlog, was stored before the commit failed, so
+      // only what arrives from now on stays held.
+      assert.equal(result.error, "The close wasn't recorded: the all-except release could not be made durable, so the hold stays in force. The focus on it is still in force, but its release notice, with what the other channels held up to its backlog cap, was stored before that failure: what they hold from now on stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.");
+      assert.match(textOf(find(f, 'all channels except')), /antra: held/, 'premise: the release notice, with its backlog, was stored');
     } finally { await f.close(); }
   });
 });
@@ -208,7 +212,7 @@ describe('a close naming the excepted channel after its server no longer registe
       assert.equal(result.success, false);
       assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus is in force');
       assert.equal(result.error, 'Server "editor" no longer registers channel "work", so no close was recorded or sent. '
-        + "The focus on it wasn't ended: the all-except release could not be made durable, so the hold stays in force. The focus on it is still in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.");
+        + "The focus on it wasn't ended: the all-except release could not be made durable, so the hold stays in force. The focus on it is still in force, but its release notice, with what the other channels held up to its backlog cap, was stored before that failure: what they hold from now on stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.");
     } finally { await f.close(); }
   });
 
