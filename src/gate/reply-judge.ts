@@ -71,6 +71,7 @@ const CHUNK_TOKENS = 6_000;
 const FIXED_TOKENS_RESERVE = 3_000;
 /** Longest text block (characters) a message renders whole; a longer one keeps its head and tail. */
 const MAX_TEXT_CHARS = 6_000;
+/** Longest message (characters) rendered, its participant's name and all its blocks together. */
 const MAX_MESSAGE_CHARS = 12_000;
 /** Longest tool call input / tool result (characters) rendered. */
 const MAX_TOOL_CHARS = 600;
@@ -480,6 +481,7 @@ export class ReplyJudge {
     );
     const fixedChars = system.length + question.length;
 
+    // The budget the document may fill, in characters at the ratio it's built at.
     const docTokens = Math.max(1_000, this.maxInputTokens - FIXED_TOKENS_RESERVE - Math.ceil(fixedChars / ratio));
     const docChars = Math.floor(docTokens * ratio);
 
