@@ -1015,6 +1015,12 @@ export class TuneOutCoordinator {
    */
   private restoredTold: LossNotice[] = [];
   /**
+   * The ids of the notices the boot read from the store's record whose
+   * rows it couldn't read (restoreLossNotices): each may be written already,
+   * so none is written until a try reads those rows (checkLossNoticesWritten).
+   */
+  private readonly lossNoticesUnchecked = new Set<string>();
+  /**
    * The one retry of the deferred cancels whose run threw (a release that
    * couldn't be made durable, a store operation that threw), and of the
    * loss notices not written (lossNotices), armed by runDeferredCancels and
@@ -1950,7 +1956,9 @@ export class TuneOutCoordinator {
    * for the next try (writeLossNotice). None is written while writes are
    * held (writesHeld): the framework would keep it in memory and answer an
    * empty id, which then couldn't tell a kept write from an ended author's
-   * dropped one. The release or the retry writes them. Then the store's
+   * dropped one. The release or the retry writes them. Nor is one the boot
+   * read from the store's record while whether it was written before the
+   * stop can't be read (checkLossNoticesWritten). Then the store's
    * record of the persistent subconscious's kept notices is brought in
    * line (writeLossRecord). Each leaves its author's list just before it
    * is written, as a deferred cancel leaves its queue, so a stop meanwhile
@@ -1960,12 +1968,16 @@ export class TuneOutCoordinator {
    * throws.
    */
   private writeLossNotices(author?: string): void {
+    this.checkLossNoticesWritten();
     for (const name of author !== undefined ? [author] : [...this.lossNotices.keys()]) {
       // Those that fail go back ahead of the rest, in their order; a loss
       // told meanwhile is kept after them.
       let failed = 0;
       for (const notice of [...(this.lossNotices.get(name) ?? [])]) {
-        if (this.stopped || this.writesHeldNow()) break;
+        // One the boot read from the record, which may be written already,
+        // waits until that can be read (checkLossNoticesWritten), and those
+        // after it with it.
+        if (this.stopped || this.writesHeldNow() || this.lossNoticesUnchecked.has(notice.id)) break;
         const kept = this.lossNotices.get(name);
         const at = kept?.indexOf(notice) ?? -1;
         // Written meanwhile, by a write a listener made.
@@ -2153,18 +2165,49 @@ export class TuneOutCoordinator {
    * The persistent subconscious's rows as a boot reads them for what it was
    * told already: its window, and its own stored rows
    * (subconsciousStoredMessages), which hold a notice its window doesn't yet.
-   * Either read that throws is logged and read as none.
+   * Either read that throws is logged, with what follows (`then`), and read
+   * as none; `unread` says one did.
    */
-  private subconsciousRows(): readonly WindowRow[] {
+  private subconsciousRows(then: string): { rows: readonly WindowRow[]; unread: boolean } {
+    let unread = false;
     const read = (what: string, rows: (() => readonly WindowRow[]) | undefined): readonly WindowRow[] => {
       try {
         return rows?.() ?? [];
       } catch (err) {
-        console.error(`[tune-out] the subconscious's ${what} could not be read at boot, so what it was told is read without it: ${thrownReason(err)}`);
+        unread = true;
+        console.error(`[tune-out] the subconscious's ${what} could not be read, ${then}: ${thrownReason(err)}`);
         return [];
       }
     };
-    return [...read('window', this.hooks.subconsciousWindow), ...read('stored rows', this.hooks.subconsciousStoredMessages)];
+    const rows = [...read('window', this.hooks.subconsciousWindow), ...read('stored rows', this.hooks.subconsciousStoredMessages)];
+    return { rows, unread };
+  }
+
+  /**
+   * Of the notices read from the store's record at boot (restoreLossNotices),
+   * those the subconscious's rows hold already (`lossNoticeId`: written,
+   * the record not brought in line before the stop) leave the record, not
+   * written again. Where its rows can't be read, they stay unchecked
+   * (lossNoticesUnchecked), and none of them is written (writeLossNotices)
+   * until a later try reads them.
+   */
+  private checkLossNoticesWritten(): void {
+    if (this.lossNoticesUnchecked.size === 0) return;
+    const { rows, unread } = this.subconsciousRows(
+      `so the loss notices kept in the store, which may have been written before the stop, aren't written until it can be`);
+    if (unread) return;
+    const written = new Set<string>();
+    for (const m of rows) {
+      const id = (m.metadata as { lossNoticeId?: unknown } | undefined)?.lossNoticeId;
+      if (typeof id === 'string' && this.lossNoticesUnchecked.has(id)) written.add(id);
+    }
+    this.lossNoticesUnchecked.clear();
+    for (const [author, kept] of this.lossNotices) {
+      const left = kept.filter((n) => !written.has(n.id));
+      if (left.length === kept.length) continue;
+      console.error(`[tune-out] ${kept.length - left.length} loss notice(s) kept in the store for ${author} ${kept.length - left.length === 1 ? 'was' : 'were'} written before the last stop already, so ${kept.length - left.length === 1 ? 'it leaves' : 'they leave'} the record`);
+      if (left.length > 0) this.lossNotices.set(author, left); else this.lossNotices.delete(author);
+    }
   }
 
   /** The epoch holding where a kept notice's cancel was (DeferredFor's `current`): the channel's tune-out, or the all-except hold. */
@@ -2405,7 +2448,7 @@ export class TuneOutCoordinator {
     const asks = elsewhere ? [] : cancelAsksIn(window, author, archived);
     // Its rows, its window's and its stored ones (a notice written but not
     // presented yet among them), for what it was told already.
-    const told = this.subconsciousRows();
+    const told = this.subconsciousRows('at boot, so what it was told is read without it').rows;
     // A hold whose waiting cancel's loss the stop that wrote this stamp kept,
     // the boot that wrote it then dying before its marker: its row names
     // that stamp's bound (`lostAtStop`), and accounts for the hold, as the
@@ -2762,8 +2805,10 @@ export class TuneOutCoordinator {
    * to now reaches no one, which is traced (`author-gone`), and leaves the
    * record. One whose row the subconscious's rows hold already
    * (`lossNoticeId`: written, its record not brought in line before the
-   * stop) leaves the record, not written again. The notices of an
-   * unrecorded stop written here count as told (restoredTold). Never throws.
+   * stop) leaves the record, not written again; where those rows can't be
+   * read, none is written, kept in the record, until a retry reads them
+   * (checkLossNoticesWritten). The notices of an unrecorded stop written
+   * here count as told (restoredTold). Never throws.
    */
   private restoreLossNotices(): Set<string> {
     // The holds whose waiting cancel's loss the last stop kept (`stopped`),
@@ -2776,18 +2821,10 @@ export class TuneOutCoordinator {
       }
       // One written already, its record not brought in line after (a stop,
       // or a record the store refused, between the two), is in the
-      // subconscious's rows: it leaves the record, not written again.
-      const written = new Set<string>();
-      for (const m of this.subconsciousRows()) {
-        const id = (m.metadata as { lossNoticeId?: unknown } | undefined)?.lossNoticeId;
-        if (typeof id === 'string') written.add(id);
-      }
-      for (const [author, kept] of this.lossNotices) {
-        const left = kept.filter((n) => !written.has(n.id));
-        if (left.length === kept.length) continue;
-        console.error(`[tune-out] ${kept.length - left.length} loss notice(s) kept in the store for ${author} ${kept.length - left.length === 1 ? 'was' : 'were'} written before the last stop already, so ${kept.length - left.length === 1 ? 'it leaves' : 'they leave'} the record`);
-        if (left.length > 0) this.lossNotices.set(author, left); else this.lossNotices.delete(author);
-      }
+      // subconscious's rows: it leaves the record, not written again; none
+      // is written while those rows can't be read (checkLossNoticesWritten).
+      for (const kept of this.lossNotices.values()) for (const notice of kept) this.lossNoticesUnchecked.add(notice.id);
+      this.checkLossNoticesWritten();
       const unstamped = [...this.lossNotices.values()].flat().filter((n) => n.drop.reason === 'unstamped-stop');
       const count = [...this.lossNotices.values()].reduce((n, kept) => n + kept.length, 0);
       if (count > 0) console.error(`[tune-out] ${count} loss notice(s) kept in the store for the subconscious before the last stop ${count === 1 ? 'is' : 'are'} tried again now`);

@@ -72,6 +72,8 @@ function stampSetup() {
     frozen: false,
     /** The residents' rows can't be read from this read on (getStoredMessages throws); the reads so far are `rowReads`. */
     rowsFailFrom: Infinity, rowReads: 0,
+    /** The subconscious's rows can't be read: its window and its stored rows (subconsciousWindow, subconsciousStoredMessages) throw. */
+    subRowsUnreadable: false,
   };
   /** Every write for the subconscious, stored, whether or not its window holds it (`frozen`). */
   const subRows: Row[] = [];
@@ -130,8 +132,14 @@ function stampSetup() {
     },
     getSurgeryHeldMessages: () => [],
     unseenBySubconscious: () => 0,
-    subconsciousWindow: () => window,
-    subconsciousStoredMessages: () => subRows,
+    subconsciousWindow: () => {
+      if (state.subRowsUnreadable) throw new Error("the subconscious's window could not be read (test)");
+      return window;
+    },
+    subconsciousStoredMessages: () => {
+      if (state.subRowsUnreadable) throw new Error("the subconscious's rows could not be read (test)");
+      return subRows;
+    },
     emitTrace: (event: Trace) => { traces.push(event); },
     writesHeld: () => state.held,
     commitDeliveries: () => { log.push('sync'); return !state.commitFails; },
@@ -1681,4 +1689,38 @@ test("review 4 #13: a bound still carried where the record left holds the notice
     assert.ok(carried(), 'the notice is in no record there, so the bound stays');
     assert.equal((h.states.get(STAMP) as { runStartedAt?: number }).runStartedAt, start, 'and the marker there reads the last run, from where it began');
   } finally { h.stopAll(); }
+}));
+
+test("review 4 #18: a boot that can't read the subconscious's rows writes no kept notice until they read, so one written before the stop isn't written again", () => quiet(() => {
+  for (const writtenBefore of [true, false]) {
+    const h = stampSetup();
+    try {
+      const first = h.boot();
+      h.hold();
+      h.state.held = true;
+      first.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
+      first.stop();
+      h.state.held = false;
+      const record = () => (h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices;
+      const rows = () => h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length;
+      if (writtenBefore) {
+        // The next boot writes the notice, and the store refuses the record that would drop it: it dies so.
+        h.refuse.add(LOSS_RECORD);
+        h.boot();
+        h.refuse.delete(LOSS_RECORD);
+        assert.equal(rows(), 1, 'premise: written once, still in the record');
+      }
+      assert.equal(record().length, 1, 'premise: the record keeps it');
+      h.state.subRowsUnreadable = true;
+      const c = h.boot();
+      assert.equal(rows(), writtenBefore ? 1 : 0, `${writtenBefore ? 'written before' : 'not written'}: not written while its rows can't be read`);
+      assert.equal(record().length, 1, 'and kept in the record');
+      c.runDeferredCancels();
+      assert.equal(rows(), writtenBefore ? 1 : 0, 'nor at a retry while they still can\'t');
+      h.state.subRowsUnreadable = false;
+      c.runDeferredCancels();
+      assert.equal(rows(), 1, writtenBefore ? 'once they read, its row is found: it is not written again' : 'once they read, it is written');
+      assert.deepEqual(record(), [], 'and it leaves the record');
+    } finally { h.stopAll(); }
+  }
 }));
