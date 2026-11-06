@@ -379,6 +379,33 @@ describe("a bare channel_close id the focus's channel answers to means that chan
     } finally { await f.close(); await other.stop(); }
   });
 
+  // AF #844 bot review 4, finding 55: where the other channel the bare name
+  // reaches has a tune-out of its own, a close of it is refused until that
+  // tune-out is cancelled, so the not-closed sentence says so and names the
+  // cancel first, then the close.
+  it("the focus's channel beside another server's `work` with its own tune-out: the not-closed sentence names that tune-out's cancel, then the close", async () => {
+    const f = await focused();
+    const other = await otherServer(f);
+    try {
+      await other.registerOpen('work');
+      const tuned = coordinatorOf(f).enter('other', 'work', {}, 'agent-tool');
+      assert.ok(tuned.ok, (tuned as { error?: string }).error);
+      assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'tuned-out', 'premise: other\'s work is tuned out');
+      const result = await close(f, { channelId: 'work' });
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(result.data, {
+        channelId: 'work', serverId: 'editor', status: 'closed',
+        note: `${ENDED} Channel "work" on server "other" was not closed: it is tuned out, and a close doesn't change that. ` +
+          'Call tune_out with channelId "other:work" and mode "cancel" for it to resume normal attention; cancelling delivers ' +
+          'the diverted backlog, and channel_close with channelId "work" and serverId "other" closes it after that.',
+      });
+      // As it says: the close given now is refused while the tune-out stands.
+      const early = await close(f, { channelId: 'work', serverId: 'other' }, 'c2');
+      assert.equal(early.success, false, 'premise: refused while tuned out');
+      assert.match(String(early.error), /is tuned out/);
+    } finally { await f.close(); await other.stop(); }
+  });
+
   it("the focus's channel still registered beside another server's `work`: the close goes to the focus's channel, and says other's `work` was not closed", async () => {
     const f = await focused();
     const other = await otherServer(f);
