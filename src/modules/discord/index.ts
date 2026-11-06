@@ -791,8 +791,12 @@ export class DiscordModule implements Module {
     // A stopped module answers nothing (stop()).
     if (!this.ctx) return {};
 
-    // Each Discord event ends the entries whose row a query shows now.
+    // Each Discord event ends the entries whose row a query shows now,
+    // having applied what was kept for them first (applyUnapplied): an
+    // entry kept where its lost create's read threw (endLostCreate) still
+    // holds the edits or the delete made while its create was held.
     if (event.type.startsWith('discord:')) {
+      this.applyUnapplied();
       for (const [id, live] of this.creating) if (live.phase === 'writing' && this.storedRow(id)) this.creating.delete(id);
     }
 
