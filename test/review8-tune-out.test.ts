@@ -1719,9 +1719,10 @@ test("review 3 #2: a queued cancel's own run whose note can't be made durable le
 
 test("review 2 #25, control: a queued cancel's own run whose release isn't made durable writes no note yet, and the next run delivers it once", () => {
   const errors = mock.method(console, 'error', () => {});
-  const h = epochSetup();
+  // The residents' store shows the release the failed attempt wrote, as a real store does (review 4 #43).
+  const h = epochSetup({ stored: true });
   try {
-    h.enter();
+    const a = h.enter();
     h.state.held = true;
     h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
     failFirstRelease(h);
@@ -1729,6 +1730,7 @@ test("review 2 #25, control: a queued cancel's own run whose release isn't made 
     h.coordinator.runDeferredCancels();
     assert.equal(h.inForce(), null);
     assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], 'delivered once, at the run that ends the hold');
+    assert.equal(h.releasesOf(a), 1, 'the first attempt\'s release covers the backlog: the run that ends the hold writes no second one (review 4 #43)');
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
