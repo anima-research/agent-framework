@@ -16736,9 +16736,9 @@ export class AgentFramework {
      * say, presented at its turn's end). The cut is at that write, so they
      * stay in the window after the target: a branch cut can't separate
      * them from it. Not removed, so not counted in `messagesRemoved` and
-     * not marked; suppressMessages, or the host's hide by Discord message
-     * id, takes them out: a suppression through the agent whose own slot
-     * holds each, this one, or for a row of a slot it observes (a
+     * not marked; suppressMessages, or, for those with a Discord message
+     * id, the host's hide by it, takes them out: a suppression through the
+     * agent whose own slot holds each, this one, or for a row of a slot it observes (a
      * persistent subconscious's residents' rows), that slot's owner. Set
      * only on a presented window.
      */
@@ -17193,10 +17193,12 @@ export class AgentFramework {
         const discordId = discordIdOf(first);
         const named = `${String(first.id)}${discordId !== undefined ? `, Discord message ${discordId}` : ''}`;
         // The host's hide matches a Discord id, so it is named only where
-        // one of them has one (an API or a module's row has none).
-        const hide = kept.some((m) => discordIdOf(m) !== undefined)
-          ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`
-          : '';
+        // one of them has one (an API or a module's row has none), and for
+        // those alone where only some have one.
+        const withId = kept.filter((m) => discordIdOf(m) !== undefined).length;
+        const hide = withId === 0 ? ''
+          : withId === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`
+          : ", or hide those with a Discord message id by it (the host's hide command)";
         throw new OperatorActionError('invalid',
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +

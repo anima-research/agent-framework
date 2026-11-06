@@ -210,6 +210,22 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     });
   });
 
+  // AF #844 bot review 3, finding 23: a batch where only some rows have a
+  // Discord id is told to hide those, not all of them, by it.
+  it("the refusal of a rollback whose kept rows only partly have a Discord id offers the hide for those alone", async () => {
+    const h = await boot();
+    const x = h.store('x');
+    const api = h.cm().addMessage('someone', [{ type: 'text', text: 'from the api' } as ContentBlock], { source: 'api' });
+    const y = h.store('y');
+    h.cm().presentRows([x, api, y]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.match(e.message, /the 2 messages after it/, e.message);
+      assert.ok(e.message.endsWith(", or hide those with a Discord message id by it (the host's hide command)"), e.message);
+      return true;
+    });
+  });
+
   it('a rollback to a row presented together with every row after it changes nothing, and is refused saying so', async () => {
     const h = await boot();
     const x = h.store('x');
