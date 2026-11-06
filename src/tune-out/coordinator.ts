@@ -2008,7 +2008,9 @@ export class TuneOutCoordinator {
    * the author is told so in its own context where it still exists, a
    * reader fork whose run has ended being written nothing (tellNoteLost),
    * unless the release of the cancel that ended the hold tells it already
-   * (`told` release, queuedNoteFirst): no second notice is written then.
+   * (`told` release, queuedNoteFirst): no second notice is written then. A
+   * note that may be stored after all (lostAtRelease, `mayBeStored`) is
+   * traced so (`noteMayBeStored`, with the `error`), as its notice says it.
    */
   private dropDeferred(entry: DeferredCancel, asked: DeferredDrop, told: 'notice' | 'release' = 'notice'): void {
     const { epochId, serverId, channelId, scope } = entry.for;
@@ -2018,7 +2020,8 @@ export class TuneOutCoordinator {
     // `mayBeStored`) may be stored: a stop's drop, or one for a hold that
     // ended without it, says so (`noteUnknown`), never that it was lost.
     const drop = noteLost ? withUnknownNote(asked, entry.lostAtRelease) : asked;
-    const unknown = (drop.reason === 'hold-ended' || drop.reason === 'stopped') && drop.noteUnknown !== undefined;
+    const noteUnknown = drop.reason === 'hold-ended' || drop.reason === 'stopped' ? drop.noteUnknown : undefined;
+    const unknown = noteUnknown !== undefined;
     if (drop.reason === 'hold-ended') {
       const current = drop.current;
       console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, is dropped: `
@@ -2054,7 +2057,11 @@ export class TuneOutCoordinator {
       ...(drop.reason === 'hold-ended' && drop.current !== undefined ? { currentEpochId: drop.current } : {}),
       noteLost,
       ...(author !== undefined ? { noteAuthor: author } : {}),
-      ...(drop.reason === 'note-undelivered' ? { error: drop.error } : {}),
+      // A note that may be stored after all (`mayBeStored`, `noteUnknown`)
+      // is marked so, with what the store couldn't tell, as its author's
+      // notice says it: not delivered, read alone, would be a known loss.
+      ...(drop.reason === 'note-undelivered' ? { error: drop.error } : noteUnknown !== undefined ? { error: noteUnknown } : {}),
+      ...((drop.reason === 'note-undelivered' && drop.mayBeStored) || unknown ? { noteMayBeStored: true as const } : {}),
     });
   }
 

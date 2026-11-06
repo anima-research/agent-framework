@@ -2786,3 +2786,48 @@ test("review 4 #106: a loss notice for a reader fork whose context manager refus
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 5 (at 1f96d1f7).
+// ---------------------------------------------------------------------------
+
+test("review 5 #10: the trace of a dropped cancel whose note may be stored after all says so, with the error; a definite loss's doesn't", () => {
+  const cases = [
+    { how: 'a stop', unknown: true }, { how: 'a stop', unknown: false },
+    { how: 'its hold ended without it', unknown: true },
+    { how: 'its own run', unknown: true }, { how: 'its own run', unknown: false },
+  ] as const;
+  for (const { how, unknown } of cases) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    try {
+      const { epochId } = ownNoteKeptInMemory(h, false);
+      const error = unknown ? UNKNOWN_STORE : 'EIO: the store refused the note (test)';
+      noteLostAtRelease(h, epochId, false, new Error(error), unknown);
+      if (how === 'a stop') {
+        h.coordinator.stop();
+      } else {
+        if (how === 'its hold ended without it') h.endOtherwise();
+        // The release replayed the other writes; the note's replay is the one that threw.
+        h.heldWrites.splice(0);
+        h.state.held = false;
+        h.coordinator.runDeferredCancels();
+      }
+      const reason = how === 'a stop' ? 'stopped' : how === 'its own run' ? 'note-undelivered' : 'hold-ended';
+      const [trace, ...more] = h.dropped();
+      assert.deepEqual(more, [], `${how}: one drop traced`);
+      assert.equal(trace?.reason, reason, `premise (${how}): dropped as ${reason}`);
+      assert.equal(trace?.noteLost, true, `${how}: with its note`);
+      if (unknown) {
+        assert.equal(trace?.noteMayBeStored, true, `${how}: the trace says the note may be stored after all`);
+        assert.equal(trace?.error, error, `${how}: with what the store couldn't tell`);
+      } else {
+        assert.equal(trace?.noteMayBeStored, undefined, `${how}, control: a definite loss isn't marked as one that may be stored`);
+        assert.equal(trace?.error, reason === 'note-undelivered' ? error : undefined, `${how}, control: the error where it is the loss's`);
+      }
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
