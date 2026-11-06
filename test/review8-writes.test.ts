@@ -120,6 +120,34 @@ describe('an own row whose add throws with rows of it stored (AF #844 findings 2
     assert.deepEqual(h.window().slice(-2), ['own-unknown', 'own-later']);
   });
 
+  for (const named of [[], ['no-such-row']] as const) {
+    it(`storeOwnRow presents every row an unknown-outcome write names where the read of them throws${named.length ? ', one the store doesn\'t hold among them' : ''}, so a later own row enters after it (bot review 2, #75)`, async () => {
+      const h = await bootOne();
+      // The row lands, its write names none landed and it among the unknown,
+      // and the store read that would tell whether they are stored throws.
+      const original = h.cm.addMessage;
+      const getMessage = h.cm.getMessage;
+      h.cm.addMessage = function (this: ContextManager, ...args: Parameters<ContextManager['addMessage']>) {
+        const id = original.apply(h.cm, args);
+        if (!JSON.stringify(args[1]).includes('own-unknown')) return id;
+        h.cm.addMessage = original;
+        h.cm.getMessage = function () {
+          h.cm.getMessage = getMessage;
+          throw new Error('zz-read-failed (test)');
+        } as ContextManager['getMessage'];
+        throw new WriteOutcomeUnknownError({ landed: [], unknown: [id, ...(named as readonly string[] as MessageId[])], unnamed: 0 }, new Error('the store read failed'));
+      } as ContextManager['addMessage'];
+      const { value: thrown } = await quietly(() => {
+        try { storeOwnRow(h.agent, 'mira', [text('own-unknown')]); } catch (error) { return error; }
+        return undefined;
+      });
+      assert.ok(thrown instanceof WriteOutcomeUnknownError, 'the add\'s error is passed on');
+      assert.equal(h.cm.getMessage, getMessage, 'premise: the read threw');
+      await quietly(() => storeOwnRow(h.agent, 'mira', [text('own-later')]));
+      assert.deepEqual(h.window().slice(-2), ['own-unknown', 'own-later'], 'the window keeps store order');
+    });
+  }
+
   it('a row held back (present: false) stays out of the window though its add threw after it landed', async () => {
     const h = await bootOne();
     landThenThrowOnce(h.cm, 'held-back');

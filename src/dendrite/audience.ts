@@ -259,8 +259,12 @@ export function storeOwnRow(
  * - WriteOutcomeUnknownError: its `landed` rows, then those its `unknown`
  *   names (the store holds all of these or none) that `holds` reads as
  *   stored, as addMessage presents such a write's rows (presentedThoughUnknown
- *   in framework.ts, whose afterStore reads the rows too). Without `holds`,
- *   or where its read throws, its `landed` rows only.
+ *   in framework.ts, whose afterStore reads the rows too). Where that read
+ *   throws, every row `unknown` names, as presentedThoughUnknown gives them:
+ *   the sink keeps a row it can't present and presents it ahead of the next
+ *   own row, dropping one the store doesn't hold (presentOwn), so a landed
+ *   row isn't put behind an own row written after it. Without `holds`, its
+ *   `landed` rows only.
  * - Any other error: none of the write is stored, so nothing is told.
  *
  * Without `told` (a writer that holds its row back, storeOwnRow's
@@ -297,7 +301,7 @@ function storedOfThrownWrite(error: unknown, holds: ((id: MessageId) => boolean)
     try {
       unknown = error.unknown.filter((id) => holds(id));
     } catch {
-      unknown = [];
+      unknown = [...error.unknown];
     }
   }
   return [...error.landed, ...unknown];
