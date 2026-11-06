@@ -57,13 +57,23 @@ them the same way.
   latest bounced text, held as a draft (see below), enabling verbatim resend
   without retyping.
 
+## Host reply authority
+
+With `replyAuthority`, `>>` envelopes remain subject to the turn's automatic-reply
+binding. They cannot publish without an approved binding to that destination or
+retarget it. For unbound work or another destination, use a separately authorized
+send tool such as `drafts(action: "resend", ...)`, not `>>#channel {{unsent}}`.
+The prefix alone does not grant publication authority. Unconfigured connections
+keep the behavior described below.
+
 ## The bounce (unprefixed prose)
 
 Unprefixed prose with no sticky target is **never delivered**. It is held as a
 draft (src/prose-drafts.ts) — never published except by the agent's own
 resend — and a system notice naming the draft tells
 the agent how to resend: `>>#channel {{unsent}}`, or the `drafts` tool by id.
-The notice requests inference so the resend can happen immediately — capped at
+For admitted reply work the notice recommends the separately authorized `drafts`
+resend instead of a prefix that may be refused. The notice requests inference so the resend can happen immediately — capped at
 2 consecutive bounce-wakes per agent (then notices append without waking,
 breaking any loop).
 

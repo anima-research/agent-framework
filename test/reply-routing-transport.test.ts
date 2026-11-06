@@ -197,9 +197,11 @@ for (const outcome of ['throw', 'timeout', 'close', 'stop'] as const) test(`real
 
 test('real stdio: queued reply cannot publish to a replacement registration', async t => {
   const x = await wire(); t.after(x.close);
-  await x.send('channels/incoming', { messages: [incoming('old-registration')] });
+  const accepted = await x.send('channels/incoming', { messages: [incoming('old-registration')] });
+  assert.equal(accepted.result.results[0].accepted, true);
   await x.send('channels/register', { channels: [{ id: 'room/one', type: 'synthetic', label: 'Replacement' }] });
   await x.framework.runUntilIdle();
+  assert.equal(x.membrane.calls.length, 1, 'the stale-registration reply turn really ran');
   assert.equal((await x.seen()).filter(e => e.method === 'channels/publish').length, 0);
 });
 
@@ -373,12 +375,12 @@ test('real stdio: push still invokes its resolver and publishes the bound channe
 });
 
 test('real stdio: held routing stays sequential while direct inference releases at provider dispatch', async t => {
-  const resolved: string[] = [], dispatched: string[] = [];
+  const resolved: string[] = [], dispatched: string[] = [], resolvedLanes: string[] = [];
   let releaseResolver!: () => void, releaseProvider!: () => void;
   const resolverWait = new Promise<void>(r => { releaseResolver = r; });
   const providerWait = new Promise<void>(r => { releaseProvider = r; });
   const x = await wire({ inboundAdmission: { ...admission(), timeoutMs: 5000 }, replyAuthority: { timeoutMs: 1000, authorize: () => true, resolve: async (input: any) => {
-    assert.notEqual(input.lane, 'inference/request');
+    resolvedLanes.push(input.lane);
     const id = input.item.messageId ?? input.item.eventId;
     resolved.push(id);
     if (id === 'first') await resolverWait;
@@ -417,6 +419,7 @@ test('real stdio: held routing stays sequential while direct inference releases 
   await eventually(() => dispatched.length === 5);
   assert.deepEqual(dispatched, ['first', 'second', 'inference', 'push', 'live']);
   assert.deepEqual(resolved, ['first', 'second', 'push', 'live']);
+  assert.deepEqual(resolvedLanes, ['channels/incoming', 'channels/incoming', 'push/event', 'channels/incoming']);
   assert.equal(answered, false, 'a direct provider call cannot hold later routed storage');
   assert.equal(bindings.length, 4);
   assert.deepEqual(bindings.map(b => b.destination?.channelId), ['room/one', 'topic:second', 'room/one', 'topic:live']);
@@ -597,4 +600,99 @@ test('real stdio: a throwing post-admission consumer keeps the wake accepted and
   const context = JSON.stringify(x.framework.getAgent('assistant')!.getContextManager().getAllMessages());
   assert(context.includes('prose stays private')); assert(!context.includes('private consumer detail'));
   assert.equal((await x.seen()).filter(e => e.method === 'channels/publish').length, 0);
+});
+
+for (const change of ['registration', 'queue']) test(`#10 framework ${change} invalidation before verdict skips resolution`, async t => {
+  let release!: (verdict: any) => void; let entered = false, resolved = 0;
+  const base = admission();
+  const x = await wire({ inboundAdmission: { ...base, bind: (connection: any) => ({ connection, admit: () => {
+    entered = true; return new Promise(done => { release = done; });
+  } }) }, replyAuthority: { timeoutMs: 1000, resolve: () => { resolved++; return { channelId: 'room/one' }; }, authorize: () => true } });
+  t.after(x.close);
+  const pending = x.send('channels/incoming', { messages: [incoming('stale-before-resolve')] });
+  await eventually(() => entered);
+  if (change === 'registration') await x.send('channels/register', { channels: [{ id: 'room/one', label: 'replacement', type: 'synthetic' }] });
+  else x.f.queue.close();
+  release({ store: true, mayWake: true });
+  const response = await pending;
+  assert.equal(response.result.results[0].accepted, false);
+  assert.equal(resolved, 0, 'framework lane and registration guards precede resolution');
+});
+
+for (const mode of ['locus', 'locked']) test(`#2 private ${mode} work has no inferred tool destination`, async t => {
+  const x = await wire({ replyAuthority: { timeoutMs: 1000, resolve: () => null, authorize: () => true } }, {
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test', proseRouting: mode,
+      ...(mode === 'locked' ? { proseLock: 'endpoint-a:room/other' } : {}) }],
+  }); t.after(x.close);
+  x.f.channelRegistry.noteDelivered(at('room/other'), 'recent', 'recent');
+  let result: any, routing: any;
+  const cm = x.framework.getAgent('assistant')!.getContextManager(); const compile = cm.compile.bind(cm);
+  cm.compile = async (...args: Parameters<typeof cm.compile>) => {
+    routing = x.f.openLogical.get('assistant');
+    result = await x.framework.executeToolCall({ id: 'missing-channel', name: 'channel_publish', input: { content: 'must stay private' },
+      callerAgentName: 'assistant', callerTurnId: routing.turnId } as never);
+    return compile(...args);
+  };
+  assert.equal((await x.send('channels/incoming', { messages: [incoming('private-default')] })).result.results[0].accepted, true);
+  await x.framework.runUntilIdle();
+  assert.equal(x.membrane.calls.length, 1); assert.equal(result.success, false);
+  assert.equal(routing.triggerChannel, undefined); assert.equal(routing.locus ?? null, null);
+  assert.equal((await x.seen()).filter(e => e.method === 'channels/publish').length, 0);
+});
+
+for (const mode of ['explicit', 'hybrid']) for (const bound of [true, false]) test(`#5 ${mode} envelopes cannot bypass reply binding (bound=${bound}); bounce recommends send tools`, async t => {
+  const prefix = mode === 'explicit' ? '>>' : '>>>';
+  const x = await wire(bound ? {} : { replyAuthority: { timeoutMs: 1000, resolve: () => null, authorize: () => true } }, { agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test', proseRouting: mode }] }); t.after(x.close);
+  x.membrane.streamYielding = request => {
+    x.membrane.calls.push(request);
+    return new MockYieldingStream([createMockResponse([{ type: 'text', text: `${prefix}endpoint-a:room/other answer` }])]);
+  };
+  await x.send('channels/incoming', { messages: [incoming('wrong-target')] });
+  await x.framework.runUntilIdle();
+  assert(x.membrane.calls.length > 0);
+  assert.equal((await x.seen()).filter(e => e.method === 'channels/publish').length, 0);
+  const context = JSON.stringify(x.framework.getAgent('assistant')!.getContextManager().getAllMessages());
+  assert(context.includes(bound ? 'automatic_reply_target_mismatch' : 'automatic_reply_destination_missing'));
+  assert(context.includes('drafts(action:'));
+  assert(!context.includes('To deliver it unchanged, reply with a destination'));
+});
+
+for (const mode of ['mixed', 'all-bound', 'all-unbound']) test(`#4 real debounce ${mode} batch retains wake and full context`, async t => {
+  const x = await wire(mode === 'all-unbound' ? { replyAuthority: undefined } : {}, {
+    gate: { judge: { enabled: false }, config: { policies: [{ name: 'mixed', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } },
+  }); t.after(x.close);
+  // Model an unbound source while keeping the real transport and gate adapters.
+  if (mode === 'mixed') x.connection('endpoint-b').postAdmissionConsumer = undefined;
+  await x.send('channels/incoming', { messages: [incoming('batch-bound')] });
+  await x.send('channels/incoming', { messages: [incoming('batch-sibling')] }, mode === 'mixed' ? 'endpoint-b' : 'endpoint-a');
+  x.framework.start(); await eventually(() => x.membrane.calls.length === 1);
+  await eventually(() => !x.f.openLogical.has('assistant'));
+  const compiled = JSON.stringify(x.membrane.calls[0]);
+  assert(compiled.includes('batch-bound')); assert(compiled.includes('batch-sibling'));
+  if (mode !== 'mixed') await x.published(1);
+  else {
+    const reply = x.f.turnRouting.get('assistant').reply;
+    assert(reply); assert.equal(reply.destination, undefined);
+  }
+  const sends = [...await x.seen(), ...await x.seen('endpoint-b')].filter(e => e.method === 'channels/publish');
+  assert.equal(sends.length, mode === 'mixed' ? 0 : 1);
+});
+
+test('#9 real read-only admission suppresses immediate wake but records held cadence work', async t => {
+  const x = await wire({ inboundAdmission: admission(true) }, { subconscious: SUB }); t.after(x.close);
+  const coordinator = x.f.tuneOutCoordinator;
+  assert.equal(coordinator.enter('endpoint-a', 'room/one', { cadenceSeconds: 30 }, 'agent-tool').ok, true);
+  let gatePass: unknown; const held = coordinator.recordHeld.bind(coordinator);
+  coordinator.recordHeld = (...args: any[]) => { gatePass = args[5]; return held(...args); };
+  assert.equal((await x.send('channels/incoming', { messages: [incoming('stored-only-held')] })).result.results[0].accepted, true);
+  await x.framework.runUntilIdle();
+  assert.equal(gatePass, false);
+  assert.equal(x.membrane.calls.length, 0);
+  assert.equal(coordinator.divertedSinceInvocation.get('endpoint-a\0room/one'), 1);
+});
+
+test('#8 framework setup error names the failing server among configured peers', async () => {
+  const base = admission();
+  await assert.rejects(wire({ inboundAdmission: { ...base, bind: (key: any) => key.connectionId === 'endpoint-b' ? undefined : base.bind(key) } }),
+    error => /admission_missing/.test(String(error)) && /endpoint-b/.test(String(error)));
 });

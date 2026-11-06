@@ -1,5 +1,5 @@
 import { admissionRoutingFields } from './reply-admission.js';
-import { isReplyBinding, replyBindingCurrent, privateReplyNotice, type ReplyBinding } from './reply-routing.js';
+import { isReplyBinding, replyBindingCurrent, type ReplyBinding } from './reply-routing.js';
 /**
  * ChannelRegistry — manages MCPL channel lifecycle, incoming messages, and
  * synthesized channel tools.
@@ -570,7 +570,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's or private admitted work with no host-approved reply destination, has no default, so it names one. Automatic reply bindings override legacy routing defaults; this tool still authorizes explicit sends separately. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2021,7 +2021,7 @@ export class ChannelRegistry {
           }
           const before = admission.check();
           if (before) { await ticket?.ready; refuse(before); continue; }
-          const verdict = await admission.admit('channels/incoming', message);
+          const verdict = await admission.admit.call({ ...admission, check: checkAdmission }, 'channels/incoming', message);
           await ticket?.ready;
           const concurrentReceipt = replay();
           if (concurrentReceipt) {
@@ -2651,15 +2651,9 @@ export class ChannelRegistry {
    * `candidates` lists only its open channels. Undefined when none applies.
    */
   buildChannelContext(agentName: string | undefined, serverId: string): ChannelContext | undefined {
-    // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
-    // told the channel its speech will actually land in (none, when its server
-    // declared it inbound-only, since speech isn't posted there): a conversation
-    // fork's home channel, else this turn's channel (single trunk agent — item-3
-    // redux: its locus, else its triggering channel), else the global default
-    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none).
-    // Without this, a fork
-    // was advertised the global locus but published somewhere else; and a trunk
-    // agent was told the wrong channel under concurrency.
+    // Legacy server context prefers a fork's home, then the active turn,
+    // then the registry fallback. It is advisory context, not publication
+    // authority: admitted automatic speech separately uses its frozen binding.
     // Each lookup is keyed on whether a name was given, not its truthiness:
     // '' is a name an ephemeral run can have, and resolveLocus reads it too.
     const home = agentName !== undefined ? this.homeChannelResolver?.(agentName) : undefined;
@@ -6279,7 +6273,7 @@ export class ChannelRegistry {
           reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}),
         });
       }
-      return outcome.reason?.startsWith('automatic_reply_') ? { ...outcome, reason } : outcome;
+      return outcome;
     };
 
     // These two reasons are the only ones whose log line and trace keep the
@@ -6292,7 +6286,7 @@ export class ChannelRegistry {
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
     if (opts?.binding && !opts.binding.destination) {
-      return fail(null, privateReplyNotice, { status: 'failed', reason: 'automatic_reply_destination_missing', at: Date.now() }, 'automatic_reply_destination_missing');
+      return fail(null, 'automatic_reply_destination_missing: no host-approved destination was chosen for this turn', { status: 'failed', reason: 'automatic_reply_destination_missing', at: Date.now() });
     }
     if (locus === undefined) {
       const reason = 'the host lost track of which channel this reply was for; if this keeps happening, ask whoever runs this host';
@@ -6319,7 +6313,9 @@ export class ChannelRegistry {
     const outcome = await this.publish(conversationId, text, { serverId: locus.serverId, channelId: locus.channelId, routed: true, binding: opts?.binding });
     const channelId = outcome.destination?.channelId ?? locus.channelId;
     if (outcome.status !== 'delivered') {
-      return fail(outcome.destination ?? locus, outcome.reason?.startsWith('automatic_reply_') ? privateReplyNotice : outcome.reason ?? 'delivery not confirmed', outcome, outcome.reason);
+      return fail(outcome.destination ?? locus, outcome.reason?.startsWith('automatic_reply_')
+        ? `${outcome.reason}; your prose stays private; explicit send tools are authorized separately`
+        : outcome.reason ?? 'delivery not confirmed', outcome, outcome.reason);
     }
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${logValue(channelId)} (server=${outcome.destination!.serverId}, delivered=true)`);

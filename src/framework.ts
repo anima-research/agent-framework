@@ -6747,6 +6747,9 @@ export class AgentFramework {
     const request: MarkedRequest = { ...trigger, [REARMED]: true };
     delete request[TURN_RETRY];
     delete request[MERGED_BATCH];
+    // Re-arm is a fresh logical turn, not a continuation of the exhausted one.
+    // Keep every admitted cause, but never the ended turn's owner.
+    delete (request as MarkedRequest & ReplyWork)[replyOwner];
     if (continuation) {
       request.reason = REARM_REASON;
       delete request.counterparty;
@@ -17990,8 +17993,8 @@ export class AgentFramework {
         reason: 'mcpl:channel-incoming',
         source: event.serverId,
         timestamp: Date.now(),
-        // A fork's home channel wins in routeSpeech regardless, but carry the
-        // triggering channel too so the trunk/active path stays consistent.
+        // Carry the triggering channel for legacy routing; admitted reply work
+        // independently freezes its host-approved destination (or none).
         channelId: event.channelId, channelServerId: event.serverId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags),
@@ -20205,37 +20208,43 @@ export class AgentFramework {
         continue;
       }
 
-      if (this.openLogical.get(agentName)?.reply || requests.some(r => workOf(r).length)) {
-        const runnable: InferenceRequest[] = [];
-        for (const request of requests) {
-          const disposition = this.replyStartDisposition(agentName, request);
-          if (disposition === 'defer') this.pendingRequests.push(request);
-          else if (disposition === 'stale') {
-            if (continuesTurn(request)) {
-              this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its admitted reply owner ended' });
-            }
-            this.emitTrace({ type: 'inference:request_dropped', agentName, reason: 'reply_owner_ended', requestCount: 1, oldestRequestAge: Math.max(0, Date.now() - request.timestamp) });
-          } else runnable.push(request);
+      // Check before parking, and again after expanding late holds/batches.
+      // A stale owner must still be dropped promptly while a provider is held.
+      const selectReplyRequests = (): boolean => {
+        if (this.openLogical.get(agentName)?.reply || requests.some(r => workOf(r).length)) {
+          const runnable: InferenceRequest[] = [];
+          for (const request of requests) {
+            const disposition = this.replyStartDisposition(agentName, request);
+            if (disposition === 'defer') this.pendingRequests.push(request);
+            else if (disposition === 'stale') {
+              if (continuesTurn(request)) {
+                this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its admitted reply owner ended' });
+              }
+              this.emitTrace({ type: 'inference:request_dropped', agentName, reason: 'reply_owner_ended', requestCount: 1, oldestRequestAge: Math.max(0, Date.now() - request.timestamp) });
+            } else runnable.push(request);
+          }
+          if (this.pendingRequests.some(r => r.agentName === agentName)) {
+            const status = this.surgeryHold && agent.state.status === 'idle'
+              ? `idle+surgery(${this.surgeryHold.verb})`
+              : this.hasTurn(agentName) && agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
+            // Show the whole still-pending snapshot, including a runnable
+            // continuation, so the shared throttle cannot conceal older siblings.
+            warnStaleRequests(agentName, [...this.pendingRequests.filter(r => r.agentName === agentName), ...runnable],
+              `${status}+reply-deferred`);
+          }
+          const first = runnable[0];
+          if (!first) {
+            if (!this.pendingRequests.some(r => r.agentName === agentName)) this.endPendingPrimary(agentName);
+            return false;
+          }
+          // Compatible causes share a turn; publication rechecks every original authority.
+          const selected = runnable.filter(r => workOf(first).length ? shareReplyTurn(first, r) : !workOf(r).length);
+          this.pendingRequests.push(...runnable.filter(r => !selected.includes(r)));
+          requests = selected;
         }
-        if (this.pendingRequests.some(r => r.agentName === agentName)) {
-          const status = this.surgeryHold && agent.state.status === 'idle'
-            ? `idle+surgery(${this.surgeryHold.verb})`
-            : this.hasTurn(agentName) && agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
-          // Show the whole still-pending snapshot, including a runnable
-          // continuation, so the shared throttle cannot conceal older siblings.
-          warnStaleRequests(agentName, [...this.pendingRequests.filter(r => r.agentName === agentName), ...runnable],
-            `${status}+reply-deferred`);
-        }
-        const first = runnable[0];
-        if (!first) {
-          if (!this.pendingRequests.some(r => r.agentName === agentName)) this.endPendingPrimary(agentName);
-          continue;
-        }
-        // Compatible causes share a turn; publication rechecks every original authority.
-        const selected = runnable.filter(r => workOf(first).length ? shareReplyTurn(first, r) : !workOf(r).length);
-        this.pendingRequests.push(...runnable.filter(r => !selected.includes(r)));
-        requests = selected;
-      }
+        return true;
+      };
+      if (!selectReplyRequests()) continue;
 
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
       if (providerCooldown) {
@@ -20272,6 +20281,9 @@ export class AgentFramework {
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
         requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
       }
+
+      // Every released/taken-back cause must pass the same checks anew.
+      if (!selectReplyRequests()) continue;
 
       // A provider's stated wait on this agent's primary model, including one
       // recorded before a restart, holds the turn until it passes. An
@@ -20666,6 +20678,7 @@ export class AgentFramework {
   private publishInputWithTurnLocus(input: unknown, agentName: string, callingTurn: TurnRouting | undefined): unknown {
     const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
     if (typeof given === 'string') return input;
+    if (callingTurn?.reply && !callingTurn.reply.destination) return input;
     // A locked turn's default is its lock, or none: never what the registry
     // resolves now, which reads the agent's latest routing (a silent start's).
     const locus = callingTurn
@@ -24073,7 +24086,8 @@ export class AgentFramework {
     // a draft that may already have been posted. Then only the drafts tool
     // reaches this one.
     const ownRisk = !!draft && !inherited && draftState(draft) === 'unconfirmed';
-    const byToken = !!draft && !inherited && !ownRisk && this.proseDrafts.latestBounce(name)?.id === draft.id;
+    const byToken = !!draft && !inherited && !ownRisk && !round.routing.reply && !reason.includes('automatic_reply_')
+      && this.proseDrafts.latestBounce(name)?.id === draft.id;
     const kept = !draft
       ? 'It could not be held as a draft; the words remain in your history.'
       : byToken
@@ -25045,7 +25059,7 @@ export class AgentFramework {
       // pair exactly, registered or not (channelNamed), as every selector
       // with a server does; while it isn't registered, the turn's speech to
       // it is refused, with no fallback either.
-      routing.triggerChannel = routing.reply?.destination ?? (trigger?.channelId
+      routing.triggerChannel = routing.reply ? routing.reply.destination : (trigger?.channelId
         ? this.channelNamed(trigger.channelId, trigger.channelServerId)
         : undefined);
       noteTurnChannel(routing, routing.triggerChannel);
@@ -25076,7 +25090,7 @@ export class AgentFramework {
         // tells servers and gives a send with no channel is its lock or
         // nothing, never the channel that woke it or a fallback.
         routing.locked = true;
-        const locus = this.proseLockLocus(agent);
+        const locus = routing.reply && !routing.reply.destination ? null : this.proseLockLocus(agent);
         if (locus !== null) routing.locus = locus;
       } else if (turnProseRouting === 'locked') {
         // Locked mode: the agent's lock, whatever woke the turn, a heartbeat
@@ -25086,7 +25100,7 @@ export class AgentFramework {
         // confirms it, even where a rewind dropped that exchange), and after
         // a recipe proseLock's channel registers. The primer counts as told.
         routing.locked = true;
-        const locus = this.proseLockLocus(agent);
+        const locus = routing.reply && !routing.reply.destination ? null : this.proseLockLocus(agent);
         if (locus !== null) {
           routing.locus = locus;
           noteTurnChannel(routing, locus);
@@ -25094,7 +25108,7 @@ export class AgentFramework {
         if (attempt === 0) this.announceLocusIfChanged(agent.name, locus, true);
       } else if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
         // None for a turn with no channel (noChannel), unless it's a fork's.
-        const locus = routing.reply?.destination ?? this.channelRegistry?.resolveLocus(agent.name) ?? null;
+        const locus = routing.reply ? routing.reply.destination ?? null : this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) {
           routing.locus = locus;
           noteTurnChannel(routing, locus);
@@ -33310,6 +33324,7 @@ export class AgentFramework {
           // A locked turn's channel is its lock, or none: the channel that
           // woke it isn't where its speech goes.
           if (routing?.locked) return this.turnSpeaksAt(routing);
+          if (routing?.reply) return routing.reply.destination ?? null;
           return routing?.locus ?? routing?.triggerChannel ?? (routing?.noChannel || routing?.heartbeat ? null : undefined);
         },
         // An ephemeral run (a subagent) never takes the process-global

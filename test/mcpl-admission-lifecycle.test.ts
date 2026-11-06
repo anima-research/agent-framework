@@ -123,7 +123,7 @@ for (const outcome of ['match', 'absent', 'mismatch', 'throw', 'timeout', 'malfo
       env: { TRANSCRIPT: transcript, ...(outcome === 'protocol' ? { PROTOCOL: 'wrong' } : {}) }, inboundAdmission: admission }, { version: '0.5' }, undefined, FRAMEWORK_INBOUND_ADMISSION);
     if (outcome === 'match') { const c = await connecting; t.after(() => c.close()); await c.sendToolsCall('seen', {}); assert.equal(binds, 1); }
     else {
-      await assert.rejects(connecting, e => outcome === 'protocol' ? /protocolVersion/.test(String(e)) : /^(AdmissionConnectError: (initialize_attestation_refused|admission_missing))$/.test(String(e)));
+      await assert.rejects(connecting, e => outcome === 'protocol' ? /protocolVersion/.test(String(e)) : /^AdmissionConnectError: (initialize_attestation_refused|admission_missing) \(server endpoint-a\)$/.test(String(e)));
       const lines = existsSync(transcript) ? readFileSync(transcript, 'utf8') : '';
       assert(!lines.includes('notifications/initialized'));
     }

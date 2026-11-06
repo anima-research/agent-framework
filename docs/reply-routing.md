@@ -38,16 +38,22 @@ deadline
 resolutions per connection. No turn can wake or publish with an unresolved
 binding: resolution finishes, or becomes definitively private, before delivery
 to the existing wake path. Admission/storage rules remain unchanged; reply
-authority only decides the private publish binding. Routing can delay delivery by its bounded wait,
+authority only decides the private publish binding. Sequential channel batches
+and held backlogs also wait for each channel/push item's reply resolution: their
+per-item latency includes both admission and reply deadlines (roughly
+`inboundAdmission.timeoutMs + replyAuthority.timeoutMs` in the worst case).
+Direct inference does not add a reply-resolution wait. Routing can delay delivery by its bounded wait,
 but cannot turn route failure into an admission refusal.
 
 Null, malformed output, a throw, timeout, overload, denied approval or an
 unavailable destination means **admitted and wakeable as before, but private**.
 Automatic prose remains in context/archive and a readable agent notice explains
 that no unique currently approved destination exists and explicit send tools
-remain available. Callback exceptions produce a fixed, bounded diagnostic at
+remain available. Private work has no inferred locus or default for `channel_publish`;
+name an explicit destination when using a separately authorized send tool.
+Callback exceptions, timeout and overload produce a fixed, bounded diagnostic at
 most once per 60 seconds per connection while the fault persists. Consumer and
-authority faults share this window, including across reconnects. Exception
+authority faults, timeout and overload share this monotonic-clock window, including across reconnects. Exception
 content is never included in agent context.
 Cancellation aborts resolution; late results are discarded. The admission layer's
 existing final current/epoch/registration checks still govern stale ingress. Callbacks must
@@ -66,6 +72,9 @@ connection incarnation, channel and work identity; opaque separators cannot
 collapse them. Causes for the same frozen destination can share a turn, retaining
 **all** their work. Different destinations get separate turns; incompatible or
 missing authority can only keep prose private, never select a new destination.
+A debounce batch mixing bound and unbound causes stays **private as a whole**:
+its wake and full context remain, but only separately authorized send tools may
+publish from it. All-bound and all-unbound batches retain their existing behavior.
 
 Each original cause must still authorize that same destination at send time.
 `authorize` runs at binding and immediately before automatic open/send effects;
@@ -75,7 +84,7 @@ turn's prose stays private with a notice. The resolver is not called again and
 there is no fallback to a home, locus, latest inbound or another connection.
 
 The logical turn owns in-turn continuations (setup retries, tool waits, budget
-restarts and provider holds). Post-turn continuations and rewind retries carry
+restarts and provider holds). Exhausted-turn re-arms, post-turn continuations and rewind retries carry
 the same work into a fresh logical turn without retaining the ended turn id.
 Destination-less work can resume its own turn only with the same private binding
 and matching owner; it cannot join a destination-bearing turn or gain permission
@@ -88,13 +97,20 @@ retain the existing stale-diagnostic threshold, throttle and quiesce suppression
 Coordinator and agent-tool locus changes cannot redirect an admitted turn.
 Automatic sleep announcements use its frozen binding or fail closed. Explicit
 send tools keep their chosen targets and their existing, separate authorization;
-they neither require nor inherit automatic-reply authority.
+they neither require nor inherit automatic-reply authority. Prose envelopes
+(`>>` in explicit mode, `>>>` in hybrid mode) are still automatic speech, not
+send tools: they cannot override a binding, and unbound envelopes aimed at an
+opted-in connection fail closed. For a different destination or an unbound turn,
+use a separately authorized send tool, for example `drafts(action: "resend", ...)`;
+`>>#channel {{unsent}}` cannot bypass these checks.
 
 Opting in also refuses unbound automatic prose aimed at that connection (for
 example timer, home, or heartbeat prose or an unrelated module wake). Such prose gets
 a private failure notice, not a guessed destination. Module wakes caused by an
 admitted channel/push event carry only that event's existing private work;
-`mayWake: false` still forbids waking. Check existing unbound-post dependencies
+`mayWake: false` still forbids direct event/module wakes. Stored held work may
+still contribute to a later tune-out reader cadence wake (the admission guide
+describes that existing limit). Check existing unbound-post dependencies
 before opting in. Wakes carrying private admitted work are also exempt from the
 redundant-wake drop based on deferred/stored-message read and publication
 watermarks: those watermarks cannot discard an admitted cause or its authority,

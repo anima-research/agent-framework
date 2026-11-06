@@ -656,3 +656,13 @@ it('a thrown value that is not an Error is reported as a string, even one with n
   assert.doesNotThrow(() => t.mock.timers.tick(60_000));
   assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full', '(a value that could not be read)']);
 });
+
+it('#9 a held message vetoed for immediate wake still contributes to reader cadence', t => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { cadenceSeconds: 30 }, 'agent-tool').ok, true);
+  h.coordinator.recordHeld('disc', '#a', 'stored-only', ['chat:addressed'], 'person', false);
+  t.mock.timers.tick(29_999);
+  assert.deepEqual(h.wakeTurns(), []); assert.deepEqual(h.cadenceTurns(), []);
+  t.mock.timers.tick(1);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #a']);
+});

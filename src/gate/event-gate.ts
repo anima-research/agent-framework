@@ -1,4 +1,4 @@
-import { carryWork, workOf, replyWork, type ReplyWork } from '../mcpl/reply-routing.js';
+import { carryWork, workOf, replyWork, turnReply, privateReplyBinding, type ReplyWork } from '../mcpl/reply-routing.js';
 /**
  * EventGate — file-driven inference gating with per-policy debounce.
  *
@@ -313,7 +313,12 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
   const pick = newestAddressed ?? newest;
-  const work = events.flatMap(workOf);
+  let work = events.flatMap(workOf);
+  // A debounce wake sees the whole batch's context. An unbound cause cannot
+  // borrow a sibling's authority: keep the wake, but make this batch private.
+  if (work.length && events.some(event => !workOf(event).length)) {
+    work = [turnReply([...work, privateReplyBinding(work[0].connection)])!];
+  }
   if (!pick) return work.length ? { [replyWork]: work } : undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one

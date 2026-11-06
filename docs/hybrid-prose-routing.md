@@ -1,7 +1,11 @@
 # Hybrid prose routing (`>>>destination`)
 
 Hybrid routing preserves ordinary frozen-locus speech while allowing a resident
-to explicitly publish one or more prose envelopes elsewhere.
+to explicitly publish one or more prose envelopes elsewhere, subject to host
+publication authority. On `replyAuthority` connections, `>>>` remains automatic
+speech: it cannot override the approved reply destination or publish unbound
+work. Use a separately authorized send tool (such as `drafts` resend) instead;
+see [reply routing](reply-routing.md).
 
 ```text
 ordinary prose                         # current frozen locus

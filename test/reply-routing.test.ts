@@ -8,8 +8,9 @@ import { AgentFramework } from '../src/index.js';
 import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
+import { MembraneError, type NormalizedRequest, type NormalizedResponse } from '@animalabs/membrane';
 
+import { wakeProvenance } from '../src/gate/event-gate.js';
 import { RequiredAdmission } from '../src/mcpl/inbound-admission.js';
 import { withReplyConsumer, admissionRoutingFields } from '../src/mcpl/reply-admission.js';
 import { replyConsumer, replyWork, replyOwner, workOf, shareReplyTurn, type ReplyBinding } from '../src/mcpl/reply-routing.js';
@@ -103,7 +104,7 @@ test('recipient connections refuse automatic speech without an admitted envelope
   } finally { x.registry.stopAll(); }
 });
 
-test('separate addressed roots queued together each get their own turn', async () => {
+test('addressed roots for different destinations queued together get separate turns', async () => {
   const x = await frameworkFor();
   try {
     await x.enqueue(reply());
@@ -461,9 +462,10 @@ test('opaque separators, colliding channels and stale epochs cannot redirect pub
     assert.equal((await x.registry.routeSpeech('a', 'one', a.destination!, a))?.delivered, true);
     assert.equal((await x.registry.routeSpeech('b', 'two', b.destination!, b))?.delivered, true);
     assert.deepEqual(x.publishes.map(p => p.serverId), ['endpoint-a', 'endpoint-b']);
+    assert.equal(await x.registry.routeSpeech('a', 'forged', a.destination!, { ...a } as ReplyBinding), null, 'forged work on the live epoch is refused');
+    assert.equal(x.publishes.length, 2);
     x.admissions.get('endpoint-a')!.bind(2);
-    assert.equal(await x.registry.routeSpeech('a', 'stale', at(), a), null);
-    assert.equal(await x.registry.routeSpeech('a', 'forged', at(), { ...a } as ReplyBinding), null);
+    assert.equal(await x.registry.routeSpeech('a', 'stale', a.destination!, a), null);
     assert.equal(x.publishes.length, 2);
     const registeredChannel = await x.binding({ channelId: 'room/one' });
     await x.registry.routeSpeech('a', 'registered channel', at(), registeredChannel);
@@ -478,7 +480,9 @@ for (const mutation of ['epoch', 'grant', 'registration']) test(`automatic publi
     const r = x.registry as any;
     const entry = r.channels.get(destinationKey(at()));
     r.hasPendingLifecycle = () => true;
+    let waits = 0;
     r.waitForOpenChannel = async () => {
+      waits++;
       if (mutation === 'epoch') x.admissions.get('endpoint-a')!.bind(2);
       if (mutation === 'grant') x.peers.get('endpoint-a').grant = new CapabilityGrant(new Set(), []);
       if (mutation === 'registration') r.channels.set(destinationKey(at()), { ...entry });
@@ -486,6 +490,7 @@ for (const mutation of ['epoch', 'grant', 'registration']) test(`automatic publi
     };
     let opens = 0; r.openChannelNow = () => { opens++; throw Error('must not open'); };
     assert.equal(await x.registry.routeSpeech('a', 'answer', at(), binding), null);
+    assert.equal(waits, 1, 'the lifecycle wait was reached');
     assert.equal(opens, 0); assert.equal(x.publishes.length, 0);
   } finally { x.registry.stopAll(); }
 });
@@ -795,5 +800,141 @@ for (const kind of ['deferred', 'stored'] as const) test(`an admitted reply wake
     x.f.pendingRequests.push(unbound);
     await x.framework.runUntilIdle();
     assert.equal(x.membrane.calls.length, 1, 'the existing redundant-wake drop still applies without admitted work');
+  } finally { await x.close(); }
+});
+
+for (const privateOpening of [false, true]) test(`#1 exhausted reply rearm opens a fresh turn and retains all work (private=${privateOpening})`, async () => {
+  const x = await frameworkFor();
+  try {
+    const trigger: any = await x.request(reply(privateOpening ? '' : 'room/one'));
+    // Use the production re-arm/release/scheduler path with an ended owner.
+    const routing = x.f.routingOf('assistant');
+    routing.replyWorks = workOf(trigger); routing.reply = workOf(trigger)[0];
+    routing.locus = privateOpening ? undefined : at();
+    trigger[replyOwner] = routing.turnId;
+    x.f.openLogical.set('assistant', routing);
+    x.f.turnRearmMs = [60_000];
+    x.f.rearmExhaustedTurn(x.framework.getAgent('assistant'), Error('transient'), trigger, true, routing, true);
+    const hold = x.f.providerAccelerationCooldowns.get('assistant');
+    assert(hold); assert.equal(hold.heldRequests.length, 1);
+    const rearmed = hold.heldRequests[0];
+    assert.equal(rearmed[replyOwner], undefined, 'a post-turn wake must not retain the ended owner');
+    assert.deepEqual(workOf(rearmed), workOf(trigger), 'no fresh authority and no lost private work');
+    x.f.openLogical.delete('assistant');
+    hold.until = Date.now() - 1;
+    x.f.releaseProviderAccelerationCooldown('assistant');
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1, 'the rearmed work really reached inference');
+    assert.notEqual(x.f.turnRouting.get('assistant').turnId, routing.turnId);
+    assert.equal(x.publishes.length, privateOpening ? 0 : 1);
+    if (!privateOpening) assert.equal(x.publishes[0].channelId, 'room/one');
+  } finally { await x.close(); }
+});
+
+for (const later of ['different', 'unbound']) test(`#3 expired auxiliary hold rechecks reply compatibility (${later})`, async () => {
+  const x = await frameworkFor();
+  try {
+    const held = await x.request(reply());
+    const timer = setTimeout(() => {}, 60_000); timer.unref();
+    x.f.providerAccelerationCooldowns.set('assistant', { until: Date.now() - 1, startedAt: 0, timer,
+      heldRequests: [held], failures: 0, reason: 'test', auxiliaryOrigin: true });
+    x.f.pendingRequests.push(later === 'different' ? await x.request(reply('topic:second')) : {
+      agentName: 'assistant', reason: 'module', source: 'test', timestamp: Date.now(),
+    });
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 2, 'incompatible causes never share a turn after release');
+    assert.equal(x.publishes[0]?.channelId, 'room/one');
+    if (later === 'different') assert.equal(x.publishes[1]?.channelId, 'topic:second');
+  } finally { await x.close(); }
+});
+
+test('#7 target mismatch keeps its real refusal reason', async () => {
+  const x = registryFor();
+  try {
+    const result = await x.registry.deliverSpeech('assistant', 'answer', at('room/other'), { binding: await x.binding(reply()), heldOnFailure: true });
+    assert.equal(result.status, 'failed');
+    assert.match(result.reason!, /automatic_reply_target_mismatch/);
+    assert(!result.reason!.includes('no unique'));
+    assert.deepEqual(x.publishes, []);
+  } finally { x.registry.stopAll(); }
+});
+
+test('#22 independently admitted same-destination roots share one turn', async () => {
+  const x = await frameworkFor();
+  try {
+    await x.enqueue(reply()); await x.enqueue(reply());
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1); assert.equal(x.publishes.length, 1);
+    assert.equal(x.f.turnRouting.get('assistant').replyWorks.length, 2);
+  } finally { await x.close(); }
+});
+
+for (const mode of ['mixed', 'all-bound', 'all-unbound']) test(`#4 gate ${mode} batch preserves context/wake without borrowing authority`, async () => {
+  const x = await frameworkFor();
+  try {
+    const a = await x.request(reply());
+    const b = mode === 'all-bound' ? await x.request(reply()) : {};
+    const events: any[] = [mode === 'all-unbound' ? {} : a, b].map((cause, i) => ({
+      ...cause, content: `batch context ${i}`, eventType: 'test', timestamp: i + 1, inContext: true,
+      channelId: 'room/one', serverId: 'endpoint-a', authorId: 'person', addressed: true,
+    }));
+    const provenance = wakeProvenance(events);
+    const works = workOf(provenance);
+    if (mode === 'mixed') {
+      assert.equal(works.length, 1); assert.equal(works[0].destination, undefined);
+    } else assert.equal(works.length, mode === 'all-bound' ? 2 : 0);
+    // Exercise the scheduler with the same expansion used by the gate adapter.
+    for (const event of events) x.f.addMessage('user', [{ type: 'text', text: event.content }]);
+    for (const cause of works.length ? works : [undefined]) x.f.pendingRequests.push({ agentName: 'assistant',
+      reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), channelId: 'room/one', channelServerId: 'endpoint-a',
+      ...(cause ? { [replyWork]: [cause] } : {}),
+    });
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1);
+    assert(JSON.stringify(x.membrane.calls).includes('batch context 0'));
+    assert(JSON.stringify(x.membrane.calls).includes('batch context 1'));
+    assert.equal(x.publishes.length, mode === 'all-bound' ? 1 : 0);
+  } finally { await x.close(); }
+});
+
+for (const revoke of [false, true]) test(`#1 real exhausted stream rearm reaches inference with original authority (revoke=${revoke})`, async () => {
+  const x = await frameworkFor();
+  try {
+    x.f.turnRearmMs = [60_000];
+    x.f.errorPolicy = { maxRetries: 0, onInferenceError: () => ({ retry: false, delayMs: 0 }) };
+    const stream = x.membrane.streamYielding.bind(x.membrane); let first = true;
+    x.membrane.streamYielding = request => {
+      if (first) { first = false; throw new MembraneError({ type: 'server', message: 'transient', retryable: true, httpStatus: 502, rawError: undefined }); }
+      return stream(request);
+    };
+    const request = await x.request(reply()); x.f.pendingRequests.push(request);
+    await x.framework.runUntilIdle();
+    assert.equal(x.f.openLogical.has('assistant'), false, 'the exhausted logical turn ended');
+    const hold = x.f.providerAccelerationCooldowns.get('assistant'); assert(hold?.rearm);
+    assert.deepEqual(workOf(hold.heldRequests[0]), workOf(request));
+    if (revoke) x.admissions.get('endpoint-a')!.invalidate();
+    hold.until = Date.now() - 1; x.f.releaseProviderAccelerationCooldown('assistant');
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1, 'the fresh inference was not dropped as a stale owner');
+    assert.equal(x.publishes.length, revoke ? 0 : 1);
+  } finally { await x.close(); }
+});
+
+test('#3 taken-back merged batches are partitioned after expansion', async () => {
+  const x = await frameworkFor();
+  try {
+    const a = await x.request(reply()); const b = await x.request(reply());
+    let merged: any;
+    const start = x.f.startAgentStream;
+    x.f.startAgentStream = async (_agent: any, request: any) => { merged = request; };
+    x.f.pendingRequests.push(a, b); await x.f.processInferenceRequests();
+    x.f.startAgentStream = start;
+    const batchKey = Object.getOwnPropertySymbols(merged).find(symbol => symbol.description === 'merged-batch');
+    assert(batchKey); assert.equal(merged[batchKey].length, 2);
+    // A retained batch's causes must be judged, not only its wrapper's work.
+    merged[batchKey].push(await x.request(reply('topic:second')));
+    x.f.pendingRequests.push(merged); await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 2);
+    assert.deepEqual(x.publishes.map(p => p.channelId), ['room/one', 'topic:second']);
   } finally { await x.close(); }
 });

@@ -21,8 +21,10 @@ key and cancellation signal. It returns either `{ store: false, mayWake: false,
 reason }` or `{ store: true, mayWake: boolean, replyIntent? }`. Reasons are the
 closed `RefusalCode` union. Unknown members, accessors and inconsistent branches
 are refused; neither metadata nor tags supply host authority. Optional intent
-must pass the host validator. It remains private and non-authorizing: no reply
-resolution, publication or persistence is added. Host modules can read the
+must pass the host validator. It remains private and non-authorizing by itself: admission alone adds no reply
+resolution, publication or persistence. With optional `replyAuthority`, its
+validated value is passed to the separate resolver, which can approve automatic
+publication; see [reply routing](reply-routing.md). Host modules can read the
 `AdmittedEnvelope` via the exported read-only `admissionOf(event)` accessor
 (`undefined` for unconfigured events); private means host-only, not hidden from host code.
 
@@ -36,7 +38,9 @@ and `MAX_PENDING_ADMISSIONS = 64`. Timeout must be an integer in 1..60000;
 invalid configuration cannot start the connection. Each connection has its own
 budget (including attestation/validation); overload returns `admission_denied`
 without queueing. Channel-batch items run sequentially with independent deadlines,
-so a whole batch can take roughly its item count times `timeoutMs`.
+so a whole batch can take roughly its item count times `timeoutMs` without
+reply authority. With `replyAuthority`, add its independent resolution deadline
+for each wakeable channel/push item.
 Timeout aborts the signal and discards late results. Callbacks must cooperate with
 cancellation, avoid framework mutation/reentrancy and protect their own external
 effects. JavaScript timers cannot preempt a synchronous infinite loop or undo an
@@ -57,7 +61,7 @@ overload. New data arriving during the drain joins the same bounded hold buffer;
 control traffic and RPC responses remain live. Time waiting in the hold buffer is
 outside the admission timeout. While a backlog drains, required data (held and
 newly arriving) is admitted one at a time, so sustained ingress above roughly one
-item per callback latency accumulates and is dropped/refused at the existing hold
+item per combined admission-and-optional-reply-resolution latency accumulates and is dropped/refused at the existing hold
 bounds. A bounded-concurrency ordered drain is a possible follow-up, at the
 maintainer's discretion; it is not implemented here.
 

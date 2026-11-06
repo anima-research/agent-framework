@@ -93,13 +93,15 @@ export function workKey(value: object): unknown[] {
 /** Keep persistent fail-closed faults visible without exposing callback details.
  * The live connection object shares the window across epochs and failure paths. */
 const failureLines = new WeakMap<object, number>();
-export function reportReplyFailure(connection: object, kind: 'authority' | 'consumer'): void {
-  const now = Date.now();
+export function reportReplyFailure(connection: object, kind: 'authority' | 'consumer' | 'timeout' | 'overload'): void {
+  const now = performance.now();
   const last = failureLines.get(connection);
   if (last !== undefined && now - last < 60_000) return;
   failureLines.set(connection, now);
   console.error(kind === 'consumer'
     ? '[automatic-reply] post-admission consumer threw; automatic prose stays private'
+    : kind === 'timeout' ? '[automatic-reply] reply resolution timeout; automatic prose stays private'
+    : kind === 'overload' ? '[automatic-reply] reply resolution overload; automatic prose stays private'
     : '[automatic-reply] host reply authority threw; automatic prose stays private');
 }
 
@@ -109,11 +111,12 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
   return async (input, verdict) => {
     if (!verdict.mayWake) return {};
     const privateWork = () => ({ routing: privateReplyBinding(input.connection) });
-    if (pending >= 64) return privateWork();
+    if (pending >= 64) { reportReplyFailure(diagnosticConnection ?? input.connection, 'overload'); return privateWork(); }
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abort: (() => void) | undefined;
     try {
       pending++;
+      const deadline = performance.now() + timeoutMs;
       const controller = new AbortController();
       abort = () => controller.abort();
       input.signal.addEventListener('abort', abort, { once: true });
@@ -121,11 +124,17 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
       const approvedInput = Object.freeze({ ...input, signal: controller.signal, replyIntent: verdict.replyIntent });
       const cancelled = new Promise<null>(done => {
         controller.signal.addEventListener('abort', () => done(null), { once: true });
-        timer = setTimeout(() => { done(null); controller.abort(); }, timeoutMs);
+        timer = setTimeout(() => { reportReplyFailure(diagnosticConnection ?? input.connection, 'timeout'); done(null); controller.abort(); }, timeoutMs);
         if (controller.signal.aborted) done(null);
       });
       const operation = Promise.resolve().then(() => controller.signal.aborted ? null : resolve(approvedInput)).catch(() => { reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return null; });
       const raw = await Promise.race([operation, cancelled]);
+      // Timers cannot preempt synchronous host callbacks. Check elapsed time
+      // before accepting a microtask result that overtook the timeout timer.
+      if (performance.now() >= deadline) {
+        reportReplyFailure(diagnosticConnection ?? input.connection, 'timeout');
+        controller.abort(); return privateWork();
+      }
       if (controller.signal.aborted || !raw || typeof raw !== 'object' ||
         ![Object.prototype, null].includes(Object.getPrototypeOf(raw))) return privateWork();
       const fields = Reflect.ownKeys(raw);

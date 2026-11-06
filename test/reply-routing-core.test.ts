@@ -94,8 +94,10 @@ test('core: refusal and read-only verdict never call the reply consumer', async 
   const result = await x.run(); assert.equal(result.verdict.store, true); assert.equal(result.binding, undefined);
   const admission = new RequiredAdmission({ timeoutMs: 100, bind: connection => ({ connection, admit: () => ({ store: false, mayWake: false, reason: 'admission_denied' }) }), isReplyIntent: () => true }, 'endpoint');
   admission.bind(1);
-  const ingress = withReplyConsumer(admission.capture(() => undefined), async () => { assert.fail('refusal cannot resolve'); }, x.transport.signal);
+  let consumed = 0;
+  const ingress = withReplyConsumer(admission.capture(() => undefined), async () => { consumed++; return {}; }, x.transport.signal);
   assert.equal((await ingress.admit('push/event', {})).store, false);
+  assert.equal(consumed, 0);
 });
 
 test('core: reply authority is optional but when present requires bounded resolve and synchronous authorize', () => {
@@ -132,6 +134,7 @@ test('core: a route resolved under an invalidated epoch is discarded without rer
 
 test('core: persistent authority throws log once per minute without exception details', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
+  let monotonic = 100_000; t.mock.method(performance, 'now', () => monotonic);
   const original = console.error, logs: unknown[][] = [];
   console.error = (...args: unknown[]) => { logs.push(args); };
   try {
@@ -142,9 +145,9 @@ test('core: persistent authority throws log once per minute without exception de
     };
     await run(); await run();
     assert.equal(logs.length, 1);
-    t.mock.timers.tick(59_999); await run();
+    monotonic += 59_999; t.mock.timers.tick(59_999); await run();
     assert.equal(logs.length, 1);
-    t.mock.timers.tick(1); await run();
+    monotonic += 1; t.mock.timers.tick(1); await run();
     assert.equal(logs.length, 2);
     assert(logs.every(line => JSON.stringify(line).length < 200));
     assert(!JSON.stringify(logs).includes('sensitive detail'));
@@ -207,6 +210,7 @@ test('core: setup throws release the reply consumer pending slot', async () => {
 
 test('core: failure diagnostics share a connection window across paths and reconnects, not connections', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
+  let monotonic = 100_000; t.mock.method(performance, 'now', () => monotonic);
   const a = fixture(), b = fixture(), scope = {}, original = console.error, logs: unknown[][] = [];
   const throwing = async () => { throw Error('private failure'); };
   const authority = replyConsumer({ timeoutMs: 100, resolve: throwing, authorize: () => true }, () => true, scope);
@@ -221,9 +225,70 @@ test('core: failure diagnostics share a connection window across paths and recon
     assert.equal(logs.length, 1, 'a reconnect does not reset the connection diagnostic window');
     await withReplyConsumer(b.ingress, throwing, b.transport.signal, {}).admit('channels/incoming', {});
     assert.equal(logs.length, 2, 'another connection has an independent window');
-    t.mock.timers.tick(60_000);
+    monotonic += 60_000; t.mock.timers.tick(60_000);
     await withReplyConsumer(a.admission.capture(() => undefined), throwing, a.transport.signal, scope).admit('channels/incoming', {});
     await runAuthority();
     assert.equal(logs.length, 3, 'one new line for the still-failing connection');
   } finally { console.error = original; }
+});
+
+test('#6 synchronous resolver results after the elapsed deadline are private', async () => {
+  let signal!: AbortSignal;
+  const x = fixture({ timeoutMs: 1, resolve: input => {
+    signal = input.signal;
+    const until = performance.now() + 10; while (performance.now() < until) {}
+    return { channelId: 'room' };
+  } });
+  const result = await x.run();
+  assert.equal(result.verdict.store, true);
+  assert.equal(result.binding.destination, undefined);
+  assert.equal(signal.aborted, true);
+});
+
+test('#8 setup failures identify the server without callback details', async () => {
+  for (const stage of ['bind', 'attest']) {
+    const admission = new RequiredAdmission({ timeoutMs: 100,
+      bind: () => { throw Error('secret bind detail'); }, isReplyIntent: () => true,
+      initializeAttestation: { read: () => { throw Error('secret attest detail'); }, matches: () => true },
+    }, 'second-server');
+    let failure: any;
+    try { if (stage === 'bind') admission.bind(1); else await admission.attest({}); } catch (error) { failure = error; }
+    assert(failure); assert.match(failure.message, /second-server/);
+    assert(!failure.message.includes('secret'));
+  }
+});
+
+test('#11 validated intent reaches only the optional reply resolver', async () => {
+  let intent: unknown;
+  const result = await fixture({ resolve: input => { intent = input.replyIntent; return { channelId: 'room' }; } }).run();
+  assert.equal(intent, 'private'); assert.equal(result.verdict.store, true);
+  assert.equal(result.binding.destination?.channelId, 'room');
+});
+
+test('#12 timeout and overload have fixed bounded diagnostics', async t => {
+  const logs: string[] = []; t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args.join(' ')));
+  const timed = fixture({ timeoutMs: 1, resolve: () => new Promise(() => {}) });
+  assert.equal((await timed.run()).binding.destination, undefined);
+  assert(logs.some(line => line.includes('timeout')));
+  logs.length = 0;
+  let entered = 0;
+  const x = fixture({ timeoutMs: 5000, resolve: () => { entered++; return new Promise(() => {}); } });
+  const pending = Array.from({ length: 64 }, () => x.run());
+  try {
+    while (entered < 64) await new Promise(done => setImmediate(done));
+    assert.equal((await x.run()).binding.destination, undefined);
+    await x.run();
+    assert.equal(logs.length, 1); assert(logs[0].includes('overload'));
+    assert(logs.every(line => line.length < 200));
+  } finally { x.transport.abort(); await Promise.all(pending); }
+});
+
+test('#13 diagnostic throttling ignores backward wall-clock steps', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
+  let monotonic = 100_000; t.mock.method(performance, 'now', () => monotonic);
+  const logs: unknown[][] = []; t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args));
+  const x = fixture({ resolve: () => { throw Error('secret'); } });
+  await x.run(); assert.equal(logs.length, 1);
+  t.mock.timers.setTime(1); monotonic += 60_000;
+  await x.run(); assert.equal(logs.length, 2);
 });

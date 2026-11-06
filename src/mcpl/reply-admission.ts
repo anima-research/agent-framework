@@ -30,7 +30,8 @@ export function withReplyConsumer(admission: RequiredIngress, consume: PostAdmis
   return Object.freeze({ key: admission.key, check: admission.check, afterResponse: admission.afterResponse,
     async admit(lane: AdmissionLane, item: unknown, signal?: AbortSignal) {
       const verdict = await admission.admit(lane, item, signal);
-      if (verdict.store && verdict.mayWake && !admission.check()) {
+      // Lane adapters may strengthen check with framework/registration guards.
+      if (verdict.store && verdict.mayWake && !this.check()) {
         try {
           const input = Object.freeze({ connection: admission.key, lane, item: detach(item),
             signal: signal ? AbortSignal.any([signal, transportSignal]) : transportSignal }) as AdmissionInput;

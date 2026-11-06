@@ -31,7 +31,9 @@ export interface InboundAdmissionConfig {
 const reasons = new Set<RefusalCode>(['admission_denied', 'admission_threw', 'admission_timeout', 'admission_invalid', 'admission_missing', 'admission_stale', 'admission_not_ready', 'admission_unsupported', 'admission_mode_ungranted']);
 export const refusal = (reason: RefusalCode): AdmissionVerdict & { store: false } => ({ store: false, mayWake: false, reason });
 export class AdmissionConnectError extends Error {
-  constructor(code: 'initialize_attestation_refused' | 'admission_missing') { super(code); this.name = 'AdmissionConnectError'; }
+  constructor(readonly code: 'initialize_attestation_refused' | 'admission_missing', readonly connectionId?: string) {
+    super(connectionId === undefined ? code : `${code} (server ${logValue(connectionId)})`); this.name = 'AdmissionConnectError';
+  }
 }
 /** Startup wrappers preserve causes even when cleaning up a failed launch fails. */
 export function admissionConnectErrorOf(error: unknown): AdmissionConnectError | undefined {
@@ -116,10 +118,10 @@ export class RequiredAdmission {
     const key = Object.freeze({ connectionId: this.connectionId, instance: this.instance, transportEpoch: epoch });
     try {
       const bound = this.config.bind(key);
-      if (!bound || bound.connection !== key || typeof bound.admit !== 'function') throw new AdmissionConnectError('admission_missing');
+      if (!bound || bound.connection !== key || typeof bound.admit !== 'function') throw new AdmissionConnectError('admission_missing', this.connectionId);
       this.key = key;
       this.binding = Object.freeze({ connection: key, admit: bound.admit });
-    } catch { throw new AdmissionConnectError('admission_missing'); }
+    } catch { throw new AdmissionConnectError('admission_missing', this.connectionId); }
   }
   capture(check: () => RefusalCode | undefined): RequiredIngress {
     const key = this.key ?? Object.freeze({ connectionId: this.connectionId, instance: this.instance, transportEpoch: -1 });
@@ -157,7 +159,7 @@ export class RequiredAdmission {
       if (value === undefined || attestation.matches(snapshot(value)) !== true) throw new InvalidData();
       return { store: true, mayWake: false };
     });
-    if (!verdict.store) throw new AdmissionConnectError('initialize_attestation_refused');
+    if (!verdict.store) throw new AdmissionConnectError('initialize_attestation_refused', this.connectionId);
   }
   /** Only a held-data drainer waits. Live ingress still refuses overload
    * immediately, and a queued item owns no slot or timeout until dispatched. */
