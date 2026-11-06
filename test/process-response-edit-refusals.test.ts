@@ -87,11 +87,16 @@ test("a response that throws at a removal the store refuses stops there, and the
 
 test("a response whose edit throws stops there, as before: its later edits and removals and its state update aren't applied", async (t) => {
   const refused = new Responder('refused');
-  const x = await harness([refused]); t.after(x.close);
+  // AF #844 bot review 3, finding 90: a message the response adds before
+  // the edit stays added, and a module after it still applies.
+  const after = new Responder('after');
+  const x = await harness([refused, after]); t.after(x.close);
   const cm = x.framework.getAgent('assistant')!.getContextManager();
   const kept = cm.addMessage('Antra', text('before'));
   const gone = cm.addMessage('Antra', text('to remove'));
+  after.onPing = { addMessages: [{ participant: 'After', content: text('from after') }] };
   refused.onPing = {
+    addMessages: [{ participant: 'Refused', content: text('added before the edit') }],
     editMessages: [
       { messageId: 'no-such-message', content: text('nowhere') },
       { messageId: kept, content: text('after') },
@@ -103,17 +108,19 @@ test("a response whose edit throws stops there, as before: its later edits and r
   await x.framework.runUntilIdle();
   const window = x.window();
   assert.ok(window.includes('Antra: before') && window.includes('Antra: to remove'), `nothing after the throw applied:\n${window.join('\n')}`);
+  assert.ok(window.includes('Refused: added before the edit'), `what came before the throw stays applied:\n${window.join('\n')}`);
+  assert.ok(window.includes('After: from after'), `the module after it still applies:\n${window.join('\n')}`);
   assert.ok(x.errors.some((e) => e.startsWith("[process] refused's response to ping threw at the edit of no-such-message")), x.errors.join('\n'));
   assert.equal(refused.ctx.getState(), null, 'its state update was not applied');
   // Where it threw is recorded with the event, as the console line says it.
   const completed = x.traces.filter((e) => e.type === 'process:completed' && (e.processEvent as { type: string }).type === 'ping');
   assert.equal(completed.length, 1, 'the event completed, traced');
   const listed = completed[0]!.responses as Array<{ moduleName: string; threw?: { at: string; error: string } }>;
-  assert.deepEqual(listed.map((r) => [r.moduleName, r.threw?.at]), [['refused', 'the edit of no-such-message']], 'the trace names where the response threw');
+  assert.deepEqual(listed.map((r) => [r.moduleName, r.threw?.at]), [['refused', 'the edit of no-such-message'], ['after', undefined]], 'the trace names where the response threw, and the one after it threw nowhere');
   assert.ok(listed[0]!.threw?.error.length, `and with what: ${JSON.stringify(listed[0]!.threw)}`);
   const logged = x.framework.queryProcessLogs({ eventType: 'ping' }).entries
     .map(({ entry }) => (entry.responses as Array<{ moduleName: string; threw?: { at: string } }>).map((r) => [r.moduleName, r.threw?.at]));
-  assert.deepEqual(logged, [[['refused', 'the edit of no-such-message']]], 'and so does the process log');
+  assert.deepEqual(logged, [[['refused', 'the edit of no-such-message'], ['after', undefined]]], 'and so does the process log');
 });
 
 test("a response whose removals are applied in order keeps those before a throw, and not those after it", async (t) => {

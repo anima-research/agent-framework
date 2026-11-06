@@ -573,7 +573,10 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         // image where it was given one.
         const rendered = next[0]!.content as ContentBlock[];
         const renderedText = rendered.map((b) => (b.type === 'text' ? (b as { text: string }).text : '')).join('');
-        if (!renderedText.includes('Sentence 59 ')) differ.push(`${name}: the next compile renders the body without its last sentence`);
+        // Every sentence, not only the last: a shard dropped from the middle
+        // is a body not stored whole (AF #844 bot review 3, finding 104).
+        const missing = Array.from({ length: 60 }, (_, k) => k).filter((k) => !renderedText.includes(`Sentence ${k} of`));
+        if (missing.length > 0) differ.push(`${name}: the next compile renders the body without sentence(s) ${missing.join(', ')}`);
         if (content.some((b) => b.type === 'image') && !rendered.some((b) => b.type === 'image')) {
           differ.push(`${name}: the next compile renders the body without its image`);
         }

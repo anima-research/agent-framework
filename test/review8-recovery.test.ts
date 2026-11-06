@@ -272,21 +272,26 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
   });
 
   it('85: a cut that only returns rows to the arrivals reports them as returnedToArrivals, a dry run too', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'af-review8-recovery-'));
-    dirs.push(dir);
-    const storePath = join(dir, 'agent.chronicle');
-    const store = JsStore.openOrCreate({ path: storePath });
-    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
-    cm.presentRows([]);
-    const meta = (t: string) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId: `d-${t}` });
-    const a = cm.addMessage('user', [{ type: 'text', text: 'A' } as ContentBlock], meta('A'));
-    const b = cm.addMessage('user', [{ type: 'text', text: 'B' } as ContentBlock], meta('B'));
-    const c = cm.addMessage('user', [{ type: 'text', text: 'C' } as ContentBlock], meta('C'));
-    cm.presentRows([a]);
-    cm.presentRows([b]);
-    cm.presentRows([c]);
-    cm.close();
-    store.close();
+    /** A, B and C stored, each presented in a write of its own. */
+    const built = async (): Promise<string> => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-review8-recovery-'));
+      dirs.push(dir);
+      const at = join(dir, 'agent.chronicle');
+      const store = JsStore.openOrCreate({ path: at });
+      const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+      cm.presentRows([]);
+      const meta = (t: string) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId: `d-${t}` });
+      const a = cm.addMessage('user', [{ type: 'text', text: 'A' } as ContentBlock], meta('A'));
+      const b = cm.addMessage('user', [{ type: 'text', text: 'B' } as ContentBlock], meta('B'));
+      const c = cm.addMessage('user', [{ type: 'text', text: 'C' } as ContentBlock], meta('C'));
+      cm.presentRows([a]);
+      cm.presentRows([b]);
+      cm.presentRows([c]);
+      cm.close();
+      store.close();
+      return at;
+    };
+    const storePath = await built();
 
     const dry = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'd-A', dryRun: true });
     assert.equal(dry.messagesRemoved, 0);
@@ -301,6 +306,16 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
     const after = await recordOn(storePath);
     assert.deepEqual(after.texts, ['A', 'B', 'C']);
     assert.deepEqual(after.window, ['A']);
+    // AF #844 bot review 3, finding 60: the same suppression run live, on a
+    // store of its own: C is removed, and B alone returns.
+    const livePath = await built();
+    const live = await createOfflineRecoveryBranch({
+      storePath: livePath, agentName: 'cairn', messageId: 'd-A', suppressMessageIds: ['d-C'], branchName: 'recovery/cairn/suppressed',
+    });
+    assert.deepEqual([live.messagesSuppressed, live.returnedToArrivals], [1, 1]);
+    const suppressed = await recordOn(livePath);
+    assert.deepEqual(suppressed.texts, ['A', 'B'], 'C is out of the record');
+    assert.deepEqual(suppressed.window, ['A'], 'and B waits outside the window, an arrival again');
   });
 
   it('85: a window that is still the record reports no returnedToArrivals', async () => {

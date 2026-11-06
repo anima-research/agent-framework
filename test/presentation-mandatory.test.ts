@@ -75,6 +75,9 @@ async function run(extra: Record<string, unknown> = {}) {
   return { framework, membrane, traces, internals, store: framework.getStore() };
 }
 
+/** An import or re-export of named items from context-manager, with either quote: the items are group 2, `type` group 1. */
+const CONTEXT_MANAGER_IMPORT = /(?:import|export)\s+(type\s+)?\{([^}]*)\}\s*from\s*(['"])@animalabs\/context-manager\3/g;
+
 describe('presentation is mandatory (#291)', () => {
   // A host may still pass the option an earlier release took: it is read as
   // any unknown key is, and turns nothing off.
@@ -303,7 +306,9 @@ describe('presentation is mandatory (#291)', () => {
     const named: string[] = [];
     for (const file of readdirSync(src, { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.ts'))) {
       const text = readFileSync(join(src, file), 'utf8');
-      for (const m of text.matchAll(/(?:import|export)\s+(type\s+)?\{([^}]*)\}\s*from\s*'@animalabs\/context-manager'/g)) {
+      // Either quote: no lint rule fixes the quotes an import is written with
+      // (AF #844 bot review 3, finding 22).
+      for (const m of text.matchAll(CONTEXT_MANAGER_IMPORT)) {
         if (m[1]) continue;
         for (const item of m[2]!.split(',').map((s) => s.trim())) {
           const name = item.split(/\s+as\s+/)[0]!;
@@ -312,5 +317,13 @@ describe('presentation is mandatory (#291)', () => {
       }
     }
     assert.deepEqual(named, []);
+  });
+
+  it('the scan reads an import from context-manager written with either quote', () => {
+    const names = (text: string) => [...text.matchAll(CONTEXT_MANAGER_IMPORT)].map((m) => m[2]!.trim());
+    assert.deepEqual(names(`import { WriteLandedError } from '@animalabs/context-manager';`), ['WriteLandedError']);
+    assert.deepEqual(names(`import { WriteLandedError } from "@animalabs/context-manager";`), ['WriteLandedError']);
+    assert.deepEqual(names(`export { WriteLandedError } from"@animalabs/context-manager"`), ['WriteLandedError']);
+    assert.deepEqual(names(`import { X } from '@animalabs/context-manager-other';`), [], 'another package is not read');
   });
 });

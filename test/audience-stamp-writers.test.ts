@@ -157,8 +157,13 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
     }
     if (node.type === 'ObjectPattern') {
       for (const property of node.properties as Node[]) {
-        if (property.type === 'ObjectProperty' && keyName(child(property, 'key'), property.computed) === 'addMessage') {
-          sites.push(at(declared ? slice(declared) : '(destructured)'));
+        if (property.type !== 'ObjectProperty') continue;
+        const key = child(property, 'key');
+        if (keyName(key, property.computed) === 'addMessage') sites.push(at(declared ? slice(declared) : '(destructured)'));
+        // A computed key that is a name, read as a computed member's is,
+        // once the file's bindings are known.
+        else if (property.computed && key?.type === 'Identifier') {
+          byName.push({ file, name: key.name as string, site: at(declared ? slice(declared) : '(destructured)') });
         }
       }
     }
@@ -306,6 +311,9 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     // later one: read scope-blind, it is the member either way.
     "export function shadowed(cm: Record<string, () => void>) { const method = 'addMessage'; cm[method](); }",
     "export function other(cm: Record<string, () => void>) { const method = 'other'; cm[method](); }",
+    // AF #844 bot review 3, finding 33: a destructuring whose computed key
+    // is a name bound to the string.
+    "export function picked(cm: Record<string, () => void>) { const pick = 'addMessage'; const { [pick]: add } = cm; add(); }",
   ].join('\n');
   const sites = scanAddMessageSites([{ name: 'writer.ts', text }]);
   assert.deepEqual(sites.map((s) => [s.line, s.receiver, s.scope.join('.')]), [
@@ -324,6 +332,7 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     // A later binding of the name to another string doesn't hide the first.
     [21, 'cm', 'shadowed'],
     [22, 'cm', 'other'],
+    [23, 'cm', 'picked'],
   ]);
   assert.ok(sites[0]!.scopeText.startsWith('store(') && sites[0]!.scopeText.includes('asOwnRow('), "a site's scope text is its method's");
   assert.deepEqual(sites.slice(0, 4).map((s) => s.metadata), ["asOwnRow(undefined, 'a')", '', '', undefined],
