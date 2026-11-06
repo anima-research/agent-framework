@@ -25,6 +25,7 @@ import {
   SUBCONSCIOUS_TOOL_NAMES,
   defaultReaderFraming,
   persistentReaderName,
+  tuneOutNoReaderAnswer,
   tuneOutReachWords,
   tunedOutTrafficWords,
   type SubconsciousConfig,
@@ -40312,8 +40313,9 @@ export class AgentFramework {
     if (!coordinator || !channelRegistry) {
       return { success: false, error: 'tune-out is not available (no MCPL channels)', isError: true };
     }
-    // An open that throws is answered too, never left unhandled.
-    const openThrew = (err: unknown): string =>
+    // An open that throws is answered too, never left unhandled; where no
+    // reader runs, by that alone (tuneOutNoReaderAnswer).
+    const openThrew = (err: unknown): string => tuneOutNoReaderAnswer(this.tuneOutReader()) ??
       `The tune-out is recorded, but its messages ${tuneOutReachWords(this.tuneOutReader(), 'may not reach')}, since ` +
       `opening its channel failed: ${thrownText(err)}`;
     const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
@@ -40427,7 +40429,8 @@ export class AgentFramework {
         const error = now?.params.epochId === tuneOut.params.epochId
           // A name in a sentence is quoted as tune_out takes it back (main's #852).
           ? alreadyTunedOutText(channelRegistry.quotedShown(resolved), now.params,
-            openError ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
+            openError ?? tuneOutNoReaderAnswer(this.tuneOutReader())
+              ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
           : TUNE_OUT_REPLACED;
         return { success: false, error, isError: true };
       }
