@@ -979,7 +979,7 @@ interface ChannelRegistryOptions {
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
   /** Required-only receipt replay, without a new admission decision. */
-  replayCoalescedIncoming?: (serverId: string, message: ChannelIncomingMessage, check?: RequiredIngress['check']) => Promise<ChannelIncomingMessageResult> | undefined;
+  replayCoalescedIncoming?: (serverId: string, message: ChannelIncomingMessage, check?: RequiredIngress['check'], ready?: Promise<void>) => Promise<ChannelIncomingMessageResult> | undefined;
   /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
@@ -1998,7 +1998,7 @@ export class ChannelRegistry {
           const target = entry.descriptor;
           checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
           const replay = () => {
-            const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message, checkAdmission) : undefined;
+            const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message, checkAdmission, ticket?.ready) : undefined;
             return receipt?.then(result => {
               const { firstView: _firstView, ...wire } = result as ChannelIncomingMessageResult & { firstView?: true };
               if (!wire.accepted) this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', wire.reason as import('./inbound-admission.js').RefusalCode, message);

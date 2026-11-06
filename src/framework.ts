@@ -19067,12 +19067,12 @@ export class AgentFramework {
     });
   }
 
-  private replayCoalescedIncoming(serverId: string, message: ChannelIncomingMessage, check?: RequiredIngress['check']): Promise<ChannelIncomingMessageResult> | undefined {
+  private replayCoalescedIncoming(serverId: string, message: ChannelIncomingMessage, check?: RequiredIngress['check'], ready?: Promise<void>): Promise<ChannelIncomingMessageResult> | undefined {
     if (typeof message.eventId !== 'string') return undefined;
     return this.pushCoalescer?.replayReceipt({
       serverId, binding: this.coalescingBinding(serverId), eventId: message.eventId,
       scope: { kind: 'channel', id: message.channelId }, key: message.coalesce?.key ?? '',
-    }, check)?.then(result => result.accepted ? this.finishCoalescedIncoming(serverId, message, result) : { messageId: message.messageId, ...result });
+    }, check, ready)?.then(result => result.accepted ? this.finishCoalescedIncoming(serverId, message, result) : { messageId: message.messageId, ...result });
   }
 
   private finishCoalescedIncoming(serverId: string, message: ChannelIncomingMessage, result: PushEventResult): ChannelIncomingMessageResult & { firstView?: true } {
@@ -19095,14 +19095,14 @@ export class AgentFramework {
     return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
   }
 
-  private replayCoalescedPush(serverId: string, params: PushEventParams, check?: RequiredIngress['check']): Promise<PushEventResult> | undefined {
+  private replayCoalescedPush(serverId: string, params: PushEventParams, check?: RequiredIngress['check'], ready?: Promise<void>): Promise<PushEventResult> | undefined {
     if (typeof params.eventId !== 'string') return undefined;
     const c = params.coalesce;
     return this.pushCoalescer?.replayReceipt({
       serverId, binding: this.coalescingBinding(serverId), eventId: params.eventId,
       scope: c?.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet },
       key: c?.key ?? '',
-    }, check);
+    }, check, ready);
   }
 
   private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check'], afterResponse?: RequiredIngress['afterResponse']): Promise<PushEventResult> {
@@ -33088,7 +33088,7 @@ export class AgentFramework {
         this.noteInboundAccepted(source);
         return source;
       },
-      (serverId, params, check) => this.replayCoalescedPush(serverId, params, check),
+      (serverId, params, check, ready) => this.replayCoalescedPush(serverId, params, check, ready),
       (serverId, channelId) => this.assertChannelScopedPush(serverId, channelId),
     );
 
@@ -33113,7 +33113,7 @@ export class AgentFramework {
       (event) => this.emitTrace(event),
       {
         store: this.store,
-        replayCoalescedIncoming: (serverId, message, check) => this.replayCoalescedIncoming(serverId, message, check),
+        replayCoalescedIncoming: (serverId, message, check, ready) => this.replayCoalescedIncoming(serverId, message, check, ready),
         handleCoalescedIncoming: (serverId, message, event, check, afterResponse) =>
           this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, check, afterResponse),
         // An ordinary channels/incoming message: freeze its envelope and

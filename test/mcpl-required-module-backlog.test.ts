@@ -310,3 +310,36 @@ for (const lane of ['push/event', 'channels/incoming'] as const) {
   });
 
 }
+
+for (const lane of ['push/event', 'channels/incoming'] as const) {
+  test(`R4-4 required ${lane}: closed transport abandons response and releases stored module work`, async t => {
+    const order: string[] = [];
+    const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: any) {
+      if (['mcpl:push-event', 'mcpl:channel-incoming'].includes(e.type)) order.push('module');
+      return {};
+    } };
+    const f = await fixture({ server: { inboundAdmission: admission }, framework: { modules: [spy] } as never });
+    t.after(() => f.close()); await f.register();
+    const inner = f.framework as any;
+    const connection = inner.mcplServerRegistry.getServer('editor');
+    const sendResponse = connection.sendResponse.bind(connection);
+    const commit = inner.pushCoalescer.host.commit;
+    inner.pushCoalescer.host.commit = async () => {
+      await commit();
+      f.disconnect();
+      await eventually(() => connection.closed);
+      order.push('closed');
+    };
+    connection.sendResponse = (...args: any[]) => {
+      assert(connection.closed);
+      const sent = sendResponse(...args);
+      order.push('abandoned');
+      return sent;
+    };
+    const item = lane === 'push/event' ? f.params('closed', 'stored_before_close', { initial: true }) : f.channel('closed', 'stored_before_close', { initial: true });
+    f.sendUnanswered(lane, lane === 'push/event' ? item : { messages: [item] });
+    await eventually(() => order.includes('module'));
+    assert(f.context().includes('stored_before_close'));
+    assert.deepEqual(order, ['closed', 'abandoned', 'module']);
+  });
+}

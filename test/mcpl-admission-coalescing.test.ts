@@ -315,3 +315,38 @@ for (const lane of lanes) for (const saturation of ['callbacks', 'busy-chain'] a
     await eventually(() => inner.coalescingTicketCounts.size === 0);
   });
 }
+
+for (const lane of lanes) for (const change of ['grant', 'receipt-expiry'] as const) {
+  test(`R4-4 required ${lane}: pinned receipt waits for subject ticket before ${change} recheck`, async t => {
+    let release!: (v: AdmissionVerdict) => void;
+    let waiting = false; let calls = 0;
+    const held = new Promise<AdmissionVerdict>(r => { release = r; });
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      calls++;
+      return input.item.eventId === 'slow-edit' ? held : allow;
+    }) } });
+    const pending: Promise<any>[] = [];
+    t.after(async () => { release(deny); await Promise.all(pending); await f.close(); });
+    await f.register();
+    const first = await send(f, lane, 'receipt', 'stored_once');
+    const inner = f.framework as any;
+    const slowItem = item(f, lane, 'slow-edit', 'never_store_slow');
+    const slow = f.send(lane, lane === 'channels/incoming' ? { messages: [slowItem] } : slowItem); pending.push(slow);
+    await eventually(() => calls === 2);
+    const replay = inner.pushCoalescer.replayReceipt.bind(inner.pushCoalescer);
+    inner.pushCoalescer.replayReceipt = (...args: any[]) => { waiting = true; return replay(...args); };
+    const retry = send(f, lane, 'receipt', 'never_store_retry'); pending.push(retry);
+    await eventually(() => waiting);
+    // Let the old implementation finish its too-early mutex check.
+    await inner.pushCoalescer.locked(async () => {});
+    const connection = inner.mcplServerRegistry.getServer('editor');
+    if (change === 'grant') connection.grant = CapabilityGrant.empty();
+    else inner.pushCoalescer.host.now = () => Date.now() + 1_000_000_000;
+    release(deny); await slow;
+    const result = await retry;
+    if (change === 'grant') assert.equal(result.reason, 'admission_stale');
+    else assert.deepEqual(result, first, 'receipt pinned before ticket wait cannot expire into fresh admission');
+    assert.equal(calls, 2);
+    assert(f.context().includes('stored_once')); assert(!f.context().includes('never_store'));
+  });
+}

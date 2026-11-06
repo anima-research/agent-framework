@@ -2,7 +2,7 @@
   with `McplServerConfig.inboundAdmission` through AgentFramework only (direct
   connection factories reject it). Required coalesced content acknowledgement
   does not await module processing; per-channel module dispatch starts after
-  acceptance and after the acknowledgement is sent, in acceptance order
+  acceptance and after the lane's response is written or abandoned, in acceptance order
   (callback-completion order across subjects). Channel messages, pushes and inference
   requests are authorized before an asynchronous, fail-closed host callback.
   Unconfigured connections retain their existing behaviour without a preflight.
@@ -37,7 +37,8 @@
   `mayWake: true` does not override gate declines or prevent a module-driven wake.
   Admission refusals are traced with fixed codes and rate-limited diagnostics.
   The package exports read-only `admissionOf(event)`, `AdmittedEnvelope`,
-  `AdmissionConnectError`, `MAX_ADMISSION_TIMEOUT_MS` and `MAX_PENDING_ADMISSIONS`.
+  `AdmissionConnectError`, `MAX_ADMISSION_TIMEOUT_MS`, `MAX_PENDING_ADMISSIONS`
+  and `MAX_PENDING_REQUIRED_MODULE_WORK`.
   Missing bindings and attestation refusals abort startup even if cleanup also
   fails; ordinary transport failures keep the existing non-fatal startup and
   configured reconnect policy. Pending inference admission is cancelled by stop

@@ -139,7 +139,7 @@ stream drains deferred work immediately for the next compile.
 
 For required coalesced traffic, built-in storage and the durable acknowledgement
 do not await module `onProcess`. Module dispatch starts after acceptance and after
-the acknowledgement is sent, and runs per channel (feature-set scope for plain pushes) in acceptance order (callback-completion order across subjects).
+the lane's response is written or abandoned, and runs per channel (feature-set scope for plain pushes) in acceptance order (callback-completion order across subjects).
 The exported ceiling `MAX_PENDING_REQUIRED_MODULE_WORK = 64` (equal to
 `MAX_PENDING_ADMISSIONS`) bounds released queued **plus running** work at
 reservation. Not-yet-released reservations are bounded separately at 64 per
@@ -156,9 +156,10 @@ The lane diagnostic/trace reasons `admission_ticket_capacity` and
 `admission_module_capacity` distinguish the two bounds from policy denials;
 both capacity refusals retain wire reason `admission_denied` (no wire schema change).
 Receipt retries create no work and still replay at capacity, after current
-authority (not the callback verdict or capacity) is checked under the mutex.
+authority (not the callback verdict or capacity) is checked under the mutex,
+after its subject ticket is ready. The receipt stays pinned during that wait.
 There is no wait for module space under the coalescer lock. A channel batch
-releases its module work only after its batch response; later accepted work in
+releases its module work only after its batch response is written or abandoned; later accepted work in
 the same scope cannot overtake that waiting FIFO position. Notifications release
 module work at lane completion, without a response.
 

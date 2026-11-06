@@ -99,6 +99,8 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   return {
     get framework() { return framework; }, membrane, notifications, renders, hostCaps, published, create, send, dir,
     port: (wss.address() as AddressInfo).port,
+    /** Send a request whose transport is intentionally closed before its reply. */
+    sendUnanswered: (method: string, params: unknown) => socket.send(JSON.stringify({ jsonrpc: '2.0', id: next++, method, params })),
     notify: (method: string, params: unknown) => socket.send(JSON.stringify({ jsonrpc: '2.0', method, params })),
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },

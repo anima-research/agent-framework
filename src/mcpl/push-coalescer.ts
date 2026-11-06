@@ -605,19 +605,21 @@ export class PushCoalescer<E = unknown> {
     return entry && structuredClone(entry.result);
   }
 
-  /** Replay only work already admitted. Pin a live receipt before queueing,
-   * then retain the ordinary durability barrier without repeating effects. */
-  replayReceipt(occurrence: Pick<CoalescedOccurrence<E>, 'serverId' | 'binding' | 'eventId' | 'scope' | 'key'>, authority?: () => string | undefined): Promise<PushEventResult> | undefined {
+  /** Replay only work already admitted. Pin a live receipt before waiting
+   * for subject order, then queue the authority check and ordinary durability
+   * barrier under the mutex without repeating effects. */
+  replayReceipt(occurrence: Pick<CoalescedOccurrence<E>, 'serverId' | 'binding' | 'eventId' | 'scope' | 'key'>, authority?: () => string | undefined, ready?: Promise<void>): Promise<PushEventResult> | undefined {
     const key = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
     const entry = this.receiptEntry(key);
     if (!entry) return undefined;
     const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
-    return this.locked(() => {
+    const replay = () => this.locked(() => {
       if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000, { admitted: true });
       const reason = authority?.();
       if (reason) return Promise.resolve({ accepted: false, reason });
       return this.acknowledge(key, entry, subject, occurrence.eventId);
     });
+    return ready ? ready.then(replay) : replay();
   }
 
   /** Whether the admission this receipt records delivered its occurrence as

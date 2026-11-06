@@ -230,10 +230,11 @@ export interface McplChannelCapabilities {
 export interface McplServerConfig {
   /** AgentFramework-only opt-in, fail-closed admission for inbound data lanes.
    * Direct McplServerConnection factories reject this option. Required coalesced
-   * module dispatch starts after acceptance and after the acknowledgement is sent,
+   * module dispatch starts after acceptance and after the lane's response is written or abandoned,
    * per channel in acceptance order (callback-completion order across subjects).
-   * The 64-slot queued+running module backlog refuses new deliveries before
-   * content acceptance, but withdrawals stand at that cap (only notice module work may
+   * Released queued+running work and unreleased reservations have separate
+   * 64-slot admission limits (batch release can temporarily exceed 64 released).
+   * New deliveries refuse before acceptance at either limit; withdrawals stand (only notice module work may
    * be dropped at capacity). Stop/disconnect drop queued work with diagnostics;
    * close/reconnect preserve it. Required and unconfigured coalescing servers
    * share one host-wide chain/mutex: an unconfigured server's hung coalesced

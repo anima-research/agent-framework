@@ -85,7 +85,7 @@ export function wakeForbidden(event: object): boolean {
 }
 export interface RequiredIngress {
   readonly key: ConnectionKey;
-  /** Host-only continuation after the lane's response (or notification completion). */
+  /** Host-only continuation after the lane's response is written or abandoned (or notification completion). */
   afterResponse?(work: () => void): void;
   /** Reserve at arrival, before callbacks; both lanes share the subject queue. */
   orderCoalesced?(scope: CoalescingScope, key: string, retract?: boolean): { ready: Promise<void>; retire(): void; overloaded?: boolean };

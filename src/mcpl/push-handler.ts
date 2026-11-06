@@ -132,7 +132,7 @@ export class PushHandler {
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
-    private readonly replayCoalesced?: (serverId: string, params: PushEventParams, check?: RequiredIngress['check']) => Promise<PushEventResult> | undefined,
+    private readonly replayCoalesced?: (serverId: string, params: PushEventParams, check?: RequiredIngress['check'], ready?: Promise<void>) => Promise<PushEventResult> | undefined,
     private readonly assertChannelScopedPush?: (serverId: string, channelId: string) => void,
   ) {
     this.featureSetManager = featureSetManager;
@@ -195,7 +195,7 @@ export class PushHandler {
             return Promise.resolve();
           }
         }
-        const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params, check) : undefined;
+        const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params, check, ticket?.ready) : undefined;
         return receipt?.then(async result => {
           await ticket?.ready;
           if (!result.accepted) { refuse(result.reason as import('./inbound-admission.js').RefusalCode); return; }
