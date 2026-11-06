@@ -1134,6 +1134,40 @@ describe("a kept note whose store couldn't tell whether it landed, its cancel st
   });
 });
 
+// AF #844 bot review 5, #31: the same kept note, the host stopped by a
+// listener of that write's `message:lost`, which the framework traces
+// before it tells the coordinator (heldWriteLost). The stop proper runs only
+// after the stop's wait (hold 2's order), so the coordinator has heard of
+// the lost write by then.
+describe("a kept note whose store couldn't tell whether it landed, the host stopped from a listener of that loss (AF #844 review 5, #31)", () => {
+  it('is told after the start as a note that may be lost, never as one that was not delivered', async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun('unknown');
+    let stopping: Promise<void> | undefined;
+    try {
+      endNotRecorded(h.f);
+      const off = h.f.framework.onTrace((t) => {
+        if (t.type === 'message:lost' && !stopping) stopping = h.f.framework.stop();
+      });
+      h.release();
+      off();
+      assert.ok(stopping, 'premise: a listener of the lost write stopped the host');
+      await stopping;
+      assert.equal(h.attempts(), 1, 'premise: storing the kept note was tried once, and threw');
+      await h.f.create();
+      const told = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.equal(told.length, 1, `told once: ${JSON.stringify(told)}`);
+      assert.match(told[0]!, /^\[Tune-out: the note you left with your cancel of noisy may be lost\./, 'as a note that may be lost');
+      assert.doesNotMatch(told[0]!, /was not delivered/, 'never as one known lost');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // AF #844 (Weft's hold 2, her q4-stop-held probe): the waiting note is
 // written into a second hold (B), and the host stops during B. stop()
