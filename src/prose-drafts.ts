@@ -15,9 +15,10 @@
  * published except by its resident's explicit resend (or `{{unsent}}`), and
  * only that resident can list or act on it. Its notices go into the
  * resident's own history: residents that share one message slot store
- * them in that slot, but each is stamped as its resident's own row and
- * enters no other resident's window but an observer's
- * (AgentConfig.observes), as the assistant turn the words came from does.
+ * them in that slot, but each is stamped as its resident's: the drafts
+ * notice as its own row, which enters no other resident's window but an
+ * observer's (AgentConfig.observes), as the assistant turn the words came
+ * from does, and a bounce notice as for that resident alone.
  *
  * Durability is outside the conversation. Drafts live in a RecordJournal of
  * typed Chronicle records, which do not follow branch switches: undo,

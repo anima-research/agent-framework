@@ -302,6 +302,91 @@ describe('live operator surgery', () => {
     }
   });
 
+  // AF #844 bot review 3, finding 20: a write that takes no clock, whose
+  // audience check's trace starts a surgery, waits for its release too.
+  it("a write whose audience check's trace starts a surgery is held behind it and stored at its release", async () => {
+    const internals = framework as unknown as {
+      surgeryHeldWrites: unknown[];
+      addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { audience?: readonly string[] }): string;
+    };
+    let switching: Promise<void> | undefined;
+    framework.onTrace((event) => {
+      if (event.type === 'presentation:unreadable-audience' && !switching) {
+        switching = framework.switchBranch(framework.getStore().currentBranch().name);
+      }
+    });
+    const id = internals.addMessage('someone', [{ type: 'text', text: 'for a worker' }], undefined, { audience: ['worker-9'] });
+    assert.ok(switching, "setup: the stamp's fault was traced, and its listener started a switch");
+    assert.equal(id, '', 'held behind the surgery its trace started');
+    assert.equal(internals.surgeryHeldWrites.length, 1, 'kept in memory');
+    await switching;
+    assert.equal(remainingTexts().filter((t) => t === 'for a worker').length, 1, 'stored once, at the release');
+    assert.equal(internals.surgeryHeldWrites.length, 0);
+  });
+
+  // AF #844 bot review 3, findings 24 and 63: the write a release replays is
+  // taken off the queue only once it is stored, so a listener of its clock
+  // row's trace still finds it listed, and a hold that listener begins keeps
+  // it at the head, ahead of the writes that came after it.
+  it("a replayed write whose clock row's listener begins a hold stays listed, and ahead of the writes behind it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-surgery-replay-'));
+    const clocked = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', clock: { intervalMinutes: 10 } }],
+      modules: [],
+      operatorLogPath: false,
+    });
+    const internals = clocked as unknown as {
+      surgeryHeldWrites: Array<{ content: Array<{ text?: string }> }>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    const scoutCm = clocked.getAgent('scout')!.getContextManager();
+    // The first switch's re-initialization waits on a gate, so its hold is
+    // up while the writes arrive.
+    const c = scoutCm as unknown as { setStrategy: (strategy: unknown) => Promise<void> };
+    const originalSetStrategy = c.setStrategy;
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let armed = true;
+    c.setStrategy = async function (this: unknown, strategy: unknown) {
+      if (armed) { armed = false; await gate; }
+      return originalSetStrategy.call(this, strategy);
+    };
+    const branch = clocked.getStore().currentBranch().name;
+    let second: Promise<void> | undefined;
+    let listedAtTheClock: Array<string | undefined> | undefined;
+    clocked.onTrace((event) => {
+      if (event.type === 'message:added' && event.source === 'clock:event' && !second) {
+        listedAtTheClock = internals.surgeryHeldWrites.map((w) => w.content[0]?.text);
+        second = clocked.switchBranch(branch);
+      }
+    });
+    const texts = () => scoutCm.getAllMessages()
+      .map((m) => (m.content[0] as { text?: string }).text)
+      .filter((t) => t === 'M' || t === 'N' || t === 'O');
+    try {
+      const first = clocked.switchBranch(branch);
+      await new Promise((resolve) => setImmediate(resolve));
+      for (const text of ['M', 'N', 'O']) {
+        assert.equal(internals.addMessage('user', [{ type: 'text', text }]), '', `${text} held`);
+      }
+      releaseFirst();
+      await first;
+      assert.ok(second, "setup: M's clock row was traced at its replay, and its listener began a hold");
+      assert.deepEqual(listedAtTheClock, ['M', 'N', 'O'], 'the write being replayed is still listed as its clock row is traced');
+      assert.deepEqual(texts(), [], 'none stored under the new hold');
+      assert.deepEqual(internals.surgeryHeldWrites.map((w) => w.content[0]?.text), ['M', 'N', 'O'], 'M stays at the head, for the new hold');
+      await second;
+      assert.deepEqual(texts(), ['M', 'N', 'O'], 'stored in the order they arrived');
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      c.setStrategy = originalSetStrategy;
+      await clocked.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // Ported for #291: what the hold keeps is in memory, so there is no
   // recovery queue to acknowledge, which this test once checked.
   it("the hold's release stores what waited behind it while another agent's tool cycle is pending", { timeout: 60_000 }, async () => {

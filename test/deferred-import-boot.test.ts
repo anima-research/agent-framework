@@ -490,6 +490,46 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     }
   });
 
+  // AF #844 bot review 3, finding 89: the cut is per agent whatever the
+  // write's kind, so a queued tool_use whose store throws keeps its
+  // tool_result from being stored alone (main's deferred-window-only case).
+  it("keeps a queued tool_result behind its tool_use whose store throws, and the next boot stores the pair once, in order", async () => {
+    const h = await host([{ name: 'mira' }, { name: 'oren' }]);
+    const proto = StoreWindow.prototype as unknown as { addMessage(participant: string, content: ContentBlock[], ...rest: unknown[]): unknown };
+    const original = proto.addMessage;
+    const quiet = console.error;
+    const pairOf = (framework: AgentFramework) => rowsOf(framework, 'oren')
+      .filter((m) => ['p1', 'p2'].includes(String(writeIdOf(m)))).map((m) => m.content[0]!.type);
+    try {
+      h.writeQueue([
+        { id: 'p1', seq: 1, participant: 'oren', forAgent: 'oren', content: [{ type: 'tool_use', id: 'tu-9', name: 'files--read', input: {} }], heldAt: 1_700_000_000_000 },
+        { id: 'p2', seq: 2, participant: 'user', forAgent: 'oren', content: [{ type: 'tool_result', toolUseId: 'tu-9', content: 'ok' }], heldAt: 1_700_000_000_000 },
+      ]);
+      let refused = 0;
+      proto.addMessage = function (this: unknown, participant, content, ...rest) {
+        if (content.some((b) => b.type === 'tool_use') && refused === 0) { refused++; throw new Error('zz-store-write-failed'); }
+        return original.call(this, participant, content, ...rest);
+      };
+      console.error = () => {};
+      let framework: AgentFramework;
+      try { framework = await h.boot(); } finally { proto.addMessage = original; console.error = quiet; }
+      try {
+        assert.equal(refused, 1, "premise: the tool_use's store write threw");
+        assert.deepEqual(pairOf(framework), [], 'its tool_result is not stored alone');
+        assert.deepEqual(h.readQueue().pending.map((m) => m.id), ['p1', 'p2'], 'both left for the next boot, in order');
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.deepEqual(pairOf(framework), ['tool_use', 'tool_result'], 'the pair once, in order');
+        assert.deepEqual(h.readQueue().pending, []);
+      } finally { await framework.stop(); }
+    } finally {
+      proto.addMessage = original;
+      console.error = quiet;
+      h.close();
+    }
+  });
+
   it("passes a gone agent's failed reply to the primary as its notice, under the write's id, and drops its other writes, logged", async () => {
     const h = await host();
     const errors: string[] = [];

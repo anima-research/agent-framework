@@ -277,6 +277,8 @@ interface Boundary {
   /** Let the round's spill write finish, and wait until the boundary has
    *  dropped, resumed or restarted the round. */
   release: () => Promise<void>;
+  /** Let the round's spill write finish, waiting for nothing after it. */
+  releaseWrite: () => Promise<void>;
   /** Whether the turn has ended: no turn alive, the agent idle. */
   turnEnded: () => boolean;
   /** The round's rows in the agent's window: its tool_use or tool_result. */
@@ -390,6 +392,10 @@ async function holdAtToolBoundary(options: HoldOptions = {}): Promise<Boundary> 
       spills.open();
       await within('the spill write to finish', spills.written);
       await within('the boundary to drop, resume or restart the round', decided.promise);
+    },
+    releaseWrite: async () => {
+      spills.open();
+      await within('the spill write to finish', spills.written);
     },
     turnEnded: () => framework.getHostModeStatus().activeTurns === 0 && agent.state.status === 'idle',
     roundRows: () => blocks().filter((b) => b.endsWith(':call_fetch')).map((b) => b.split(':')[0]),
@@ -602,6 +608,35 @@ describe('a stop at a tool boundary', () => {
       await waitFor('the turn to end', b.turnEnded);
       assert.equal(b.requests(), 1, 'no other request was made');
       assert.deepEqual(b.blocks().filter((x) => TWO_CALL_BLOCKS.has(x)), [], 'nothing of the round is in the window');
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
+  // AF #844 bot review 3, finding 67: storing the round's reply presents it,
+  // and that runs the presentation's listeners synchronously. One that stops
+  // the turn there ends it as the stop before the store does, but for what
+  // is stored already: the reply's call keeps its results, so the record
+  // holds no call without one, and the stream isn't resumed.
+  it("a stop made by a listener of the reply's presentation ends the turn: the round's call keeps its results, and the stream isn't resumed", async () => {
+    const b = await holdAtToolBoundary();
+    try {
+      const agent = b.framework.getAgent('prime')!;
+      let stopped = false;
+      b.framework.onTrace((event) => {
+        if (stopped || event.type !== 'presentation:presented' || event.agentName !== 'prime' || event.occasion !== 'write') return;
+        stopped = true;
+        agent.cancelStream();
+      });
+      await b.releaseWrite();
+      await waitFor('the turn to end', b.turnEnded);
+      assert.ok(stopped, "setup: the reply's presentation was traced, and its listener stopped the turn");
+      assert.ok(b.streams[0].cancelled, 'the stop cancelled the stream');
+      assert.equal(b.streams[0].resumeAttempts, 0, 'the round was not resumed');
+      await waitFor('the turn to end', b.turnEnded);
+      assert.equal(b.requests(), 1, 'no other request was made');
+      assert.deepEqual(b.roundRows(), ['tool_use', 'tool_result'], 'the call is stored with its result');
       await b.stop();
     } finally {
       await b.cleanup();

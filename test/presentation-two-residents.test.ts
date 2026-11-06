@@ -7,8 +7,8 @@
  * window at its tool boundary, where its stream is given it, or at its
  * turn's end, never inside the turn. So each request a resident makes
  * starts with the one before it (the prompt cache's prefix; an operator's
- * removal aside), and its rounds' signed thinking is sent again
- * under the prefix it was minted under. Without the index, the record's
+ * removal or the strategy's folding aside), and its rounds' signed
+ * thinking is sent again under the prefix it was minted under. Without the index, the record's
  * order is every resident's window, and the other resident's rounds land
  * inside each turn.
  *
@@ -74,21 +74,30 @@ function pushEvent(t: string) {
   };
 }
 
+/** A result's outcome as text: a string as it is, else its text blocks joined, its other blocks by kind. */
+function resultText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return JSON.stringify(content ?? null);
+  return content.map((b) => ((b as { type?: string }).type === 'text' ? (b as { text: string }).text : `[${(b as { type?: string }).type}]`)).join('');
+}
+
 /**
  * A message's blocks as a request and a window both say them: text,
- * thinking by its signature, a call and a result by their call's id. A
- * result handed to a stream (membrane's ToolResult, with no `type`) reads
- * as a stored one. Empty text, which no request carries, is left out.
+ * thinking by its signature, a call by its id and its input, a result by
+ * its call's id and its outcome (AF #844 bot review 3, finding 31: a stored
+ * result with the right id and other content is no match). A result handed
+ * to a stream (membrane's ToolResult, with no `type`) reads as a stored
+ * one. Empty text, which no request carries, is left out.
  */
 function tokensOf(content: readonly unknown[]): string[] {
   return content.flatMap((block) => {
-    const b = block as { type?: string; text?: string; signature?: string; id?: string; toolUseId?: string };
-    if (b.type === undefined && typeof b.toolUseId === 'string') return [`result:${b.toolUseId}`];
+    const b = block as { type?: string; text?: string; signature?: string; id?: string; toolUseId?: string; input?: unknown; content?: unknown };
+    if (b.type === undefined && typeof b.toolUseId === 'string') return [`result:${b.toolUseId}:${resultText(b.content)}`];
     switch (b.type) {
       case 'text': return b.text!.trim() === '' ? [] : [`text:${b.text}`];
       case 'thinking': return [`thinking:${b.signature}`];
-      case 'tool_use': return [`call:${b.id}`];
-      case 'tool_result': return [`result:${b.toolUseId}`];
+      case 'tool_use': return [`call:${b.id}:${JSON.stringify(b.input ?? {})}`];
+      case 'tool_result': return [`result:${b.toolUseId}:${resultText(b.content)}`];
       default: return [String(b.type)];
     }
   });
@@ -337,7 +346,7 @@ function assertResidents(r: Run): void {
   assert.ok(at('hello both') < orenRound && orenRound < orenResults && orenResults < at('oren done') && at('oren done') < miraRound,
     "in the record, oren's whole turn lies inside mira's");
   const miraFirst = said(streamsOf('mira')[0]!.request.messages);
-  assert.ok(!miraFirst.includes('call:call-o') && !miraFirst.includes('text:oren done'), "mira's first request carried none of oren's turn");
+  assert.ok(!miraFirst.some((t) => t.startsWith('call:call-o:')) && !miraFirst.includes('text:oren done'), "mira's first request carried none of oren's turn");
 
   for (const name of names) {
     const cm = cmOf(name);
@@ -363,8 +372,8 @@ function assertResidents(r: Run): void {
     const atSecondStart = name === 'mira' ? ['text:round two'] : ['text:oren, idle', 'text:round two'];
     const after = said(second.request.messages.slice(firstMessages.length));
     assert.deepEqual(after, [
-      `@${name}`, `thinking:sig-${name}-1`, `text:${name} looks`, `call:call-${name[0]}`,
-      '@user', `result:call-${name[0]}`, ...heard,
+      `@${name}`, `thinking:sig-${name}-1`, `text:${name} looks`, `call:call-${name[0]}:{"gate":"${name[0]}"}`,
+      '@user', `result:call-${name[0]}:{"released":"${name[0]}"}`, ...heard,
       `@${name}`, `thinking:sig-${name}-2`, `text:${name} done`,
       '@user', ...(r.receipts ? [receipt(2)] : []), ...atSecondStart,
     ], `${name}'s second request goes on from its first in the order its window took the rows`);

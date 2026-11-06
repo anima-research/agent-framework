@@ -225,7 +225,7 @@ describe('read marks', () => {
     } finally { r.cleanup(); }
   });
 
-  it('markAtOrAfter compares by head on one branch, and says when the marks are on two', () => {
+  it('markAtOrAfter compares window lengths where both marks keep one and they differ, else heads, on one branch, and says when the marks are on two', () => {
     const early = readMarkForTest('main', 4, null);
     const late = readMarkForTest('main', 9, 3);
     assert.equal(markAtOrAfter(late, early), true);

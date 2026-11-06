@@ -183,8 +183,9 @@ The specified Discord message is the last message the agent will still see;
 everything after it is left on the old branch (on a window presented since
 #291, but for the rows stored before the write that presented it, which the
 new branch keeps and the window takes again after that message). The command
-scans in bounded windows (a presented window's `--messages` count and the check
-of a cut that would remove nothing read the window whole), never compiles
+scans in bounded windows (on a presented window, a `--messages` count and the
+walk of the rows after the anchor, which the cut returns or keeps, read the
+window whole), never compiles
 message content, and activates the new Chronicle branch. By default the
 recovery is local to the resident: nothing is posted to Discord. To let the
 people involved see that the agent no longer has their
@@ -886,8 +887,8 @@ at its pass over every agent at rest. Rows that one write presented together wit
 the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot
-the agent observes, which the refusal names), or the host's `hide` by Discord message
-id, takes them out. The preview's `neverPresented` counts the messages it
+the agent observes, which the refusal names), or, for those with a Discord message id,
+the host's `hide` by it, takes them out. The preview's `neverPresented` counts the messages it
 removes that no live agent is shown: no window holds them, or only windows
 whose view leaves them out (a row a tune-out holds); a message that may be in
 a window that couldn't be read isn't counted, and is logged. The host command's
@@ -1049,7 +1050,11 @@ framework.onTrace((event) => {
 Trace events are observability-only. They are intended for logs, metrics, UI
 updates, and debugging, not framework-internal control flow. Internal lifecycle
 code should use state-machine signals or process events instead of consuming
-traces, so trace emit order does not become an API contract.
+traces, so trace emit order does not become an API contract. One exception: the
+Discord module applies the edits and deletes it kept for a held create on
+`message:added` (source `surgery-release`), and ends a lost create's record on
+`message:lost`, so those two traces, emitted as a surgery's release stores a
+held write or loses it, are a contract.
 
 Query raw inference logs:
 

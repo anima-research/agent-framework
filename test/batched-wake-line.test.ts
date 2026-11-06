@@ -181,6 +181,36 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.match(gateLines()[0], /2 messages in /);
   });
 
+  // AF #844 bot review 3, finding 61: a line stored with its batch is
+  // placed, as the self-wake's notice is, so the delivery agent's wake reads
+  // its row (readsRow), and a live turn that carried and answered the line
+  // drops the wake rather than start a turn that reads nothing new.
+  it('two DMs in one batch: the line is stored, and the wake reads its row', async () => {
+    const gate = (framework as unknown as {
+      eventGate: { requestInferenceFn: (agent: string, reason: string, source: string, provenance?: unknown, after?: { agent?: string; messageId?: string }) => void };
+    }).eventGate;
+    const asked: Array<{ agent: string; reason: string; after?: { agent?: string; messageId?: string } }> = [];
+    const request = gate.requestInferenceFn;
+    gate.requestInferenceFn = (agent, reason, source, provenance, after) => {
+      asked.push({ agent, reason, ...(after ? { after: { ...after } } : {}) });
+      request(agent, reason, source, provenance, after);
+    };
+    const batches = holdBatches();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello back' }]));
+    dm('first');
+    await waitFor(() => batches.held() >= 1, "the first DM's batch, held");
+    dm('second');
+    await waitFor(() => window().some((t) => t.includes('second')), 'the second DM stored');
+    batches.release();
+    await waitFor(() => membrane.calls.length >= 1, 'the wake');
+    const line = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.includes('[Gate:')));
+    assert.ok(line, 'premise: the line is stored');
+    const wake = asked.find((a) => a.reason === 'gate:debounce');
+    assert.ok(wake, 'premise: the batch woke scout');
+    assert.deepEqual(wake.after, { agent: 'scout', messageId: line.id }, "the wake is placed at the line's row");
+  });
+
   /** The text of the first request's messages, in order. */
   const requestTexts = (): string[] => {
     const request = membrane.calls[0] as unknown as { messages: Array<{ content: unknown }> };

@@ -195,7 +195,8 @@ export interface SurgeryMarksPreview {
    * agent's window that the write presenting the target presented too (a
    * batch). The cut is at that write, so they stay in the window after the
    * target. Not removed, so not counted in `messagesRemoved`, and not
-   * marked: a suppression, or a hide by Discord message id, takes them out.
+   * marked: a suppression, or, for those with a Discord message id, a hide
+   * by it, takes them out.
    * Set only then.
    */
   keptInWindowAfterTarget?: number;

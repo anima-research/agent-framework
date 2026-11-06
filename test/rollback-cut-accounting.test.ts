@@ -10,7 +10,8 @@
  * (`returnedToArrivals`): the agent's own rows among them enter it again at
  * its next presentation point (the surgery's release), and the rest, arrived
  * and not presented, wait outside the window until the agent's next turn
- * start, so for them the cut holds until it speaks again; the rows
+ * start, so for them the cut holds until it speaks again (the hold is in
+ * memory: a restart presents them at its pass at rest); the rows
  * one write presented together with the target stay after it and are
  * reported too (`keptInWindowAfterTarget`), and a rollback that would
  * change nothing because of them names them and the removals that can take
@@ -209,6 +210,22 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     });
   });
 
+  // AF #844 bot review 3, finding 23: a batch where only some rows have a
+  // Discord id is told to hide those, not all of them, by it.
+  it("the refusal of a rollback whose kept rows only partly have a Discord id offers the hide for those alone", async () => {
+    const h = await boot();
+    const x = h.store('x');
+    const api = h.cm().addMessage('someone', [{ type: 'text', text: 'from the api' } as ContentBlock], { source: 'api' });
+    const y = h.store('y');
+    h.cm().presentRows([x, api, y]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.match(e.message, /the 2 messages after it/, e.message);
+      assert.ok(e.message.endsWith(", or hide those with a Discord message id by it (the host's hide command)"), e.message);
+      return true;
+    });
+  });
+
   it('a rollback to a row presented together with every row after it changes nothing, and is refused saying so', async () => {
     const h = await boot();
     const x = h.store('x');
@@ -261,6 +278,16 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     assert.deepEqual([withHeld.messagesRemoved, withHeld.neverPresented], [3, 1]);
     const suppress = h.framework.previewSurgeryMarks('scout', { suppress: [t] });
     assert.deepEqual([suppress.messagesRemoved, suppress.neverPresented, suppress.returnedToArrivals], [1, 0, undefined]);
+    // AF #844 bot review 3, finding 39: another agent's stored context
+    // injection in scout's window (a write-down from the record keeps an
+    // unstamped one), which its view leaves out too.
+    const injection = h.cm().addMessage('user', [{ type: 'text', text: 'injected' } as ContentBlock], {
+      system: true, contextInjection: { agent: 'oren', namespace: 'notes', contentHash: 'h1', part: 0, parts: 1 },
+    } as never);
+    h.cm().presentRows([injection]);
+    assert.equal(h.cm().windowStatusOf(injection), 'in');
+    const withInjection = h.framework.previewSurgeryMarks('scout', { rollbackTo: t });
+    assert.deepEqual([withInjection.messagesRemoved, withInjection.neverPresented], [4, 2], "another agent's injection is never presented to scout");
   });
 
   it("a host's message-granular undo counts back in the window, whose order isn't the record's", async () => {

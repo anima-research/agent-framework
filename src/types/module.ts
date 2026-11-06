@@ -563,7 +563,8 @@ export interface ModuleContext {
 
   /**
    * Whether an agent's view keeps a stored row (#291): whether its requests
-   * carry the row while its window holds it. windowStatusOf answers before
+   * carry the row, as its strategy renders it (a row it has folded, as that
+   * summary), while its window holds it. windowStatusOf answers before
    * the view's filter, and a window written down from the record the
    * residents share can hold rows the view never sends: another agent's
    * stored context injection, and, for an agent whose view leaves held

@@ -19,7 +19,8 @@ interface Options {
  *  removed, read, or gone, whichever agent assembled it. CoalescerHost leaves
  *  placement to the host, so this is one it allows; the framework presents
  *  the assembling agent's own render before its turn's compile, which
- *  mcpl-coalescing's tests run. Its removal refuses nothing; the
+ *  mcpl-coalescing's tests run. Its removal refuses only a row it doesn't
+ *  hold or one a test names unremovable (`options.unremovable`); the
  *  framework's refuses a row a request has read, which the coalescer,
  *  asking isUnread first, never asks it to remove. Each render says which notices it
  *  covers, as a notice-only server's does. (Before #291 such a delivery

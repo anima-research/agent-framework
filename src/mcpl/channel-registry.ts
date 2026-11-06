@@ -5510,7 +5510,8 @@ export class ChannelRegistry {
    * what reaches it alone. The hold's channel is reached by its
    * server-qualified name, registered or not (focusNamedBare), unless a
    * channel of the turn's answers to that too; the turn's channel as a
-   * refusal of the turn's names shows it (ownCandidates). A serverId goes
+   * refusal of the turn's names shows it (ownCandidates), unless another
+   * channel of the turn's has its qualified name for its id. A serverId goes
    * with the channel's own id, so it's offered only where the name is the id
    * of both, for the hold's server (registered or not, the close reaches its
    * channel: unregisteredFocusNamed) and for the turn's channel's where that
@@ -5522,9 +5523,12 @@ export class ChannelRegistry {
     const qualified = qualifiedChannelName(focus);
     const focusReaches = this.ownChannelNamed(qualified, own) === undefined;
     const [theirs] = this.ownCandidates([mine]);
+    // The turn's channel's name, as the focus's: a bare id answers to the
+    // turn's own channels first, so one of them with that id catches it.
+    const theirsReaches = theirs!.reaches && this.ownChannelNamed(theirs!.text, own) === undefined;
     const parts = [
       { text: focusReaches ? quotedValue(qualified) : channelOnServer(focus), reaches: focusReaches },
-      { text: theirs!.reaches ? quotedValue(theirs!.text) : theirs!.text, reaches: theirs!.reaches },
+      { text: theirsReaches ? quotedValue(theirs!.text) : theirs!.reaches ? channelOnServer(mine) : theirs!.text, reaches: theirsReaches },
     ];
     const named = parts.filter((p) => p.reaches).map((p) => p.text);
     const byName = named.length === 2 ? 'channelId set to one of them' : named.length === 1 ? `channelId ${named[0]}` : '';

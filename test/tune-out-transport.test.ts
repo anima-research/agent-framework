@@ -1549,6 +1549,41 @@ test("a tune-out on record when a start with no reader connects a server during 
   assert.ok(!store.logged.some((l) => l.includes('nothing will deliver')), store.logged.join('\n'));
 });
 
+// AF #844 bot review 3, finding 12: the release write itself meets the
+// refusal, so the coordinator made for the release defers its cancel; the
+// release waits for the move that re-initializes the manager, as one met
+// before it does, rather than being dropped with the cancel.
+test("a tune-out on record whose release write, with no reader, is kept for a manager that refuses its work is released once a move re-initializes it", async (t) => {
+  const store = await tunedOutStore(t, 2);
+  const second = await store.start(false, false);
+  const i = second as unknown as RestartInternals;
+  const cm = second.getAgent('scout')!.getContextManager() as unknown as { addMessage: (...args: unknown[]) => string };
+  const addMessage = cm.addMessage;
+  let refused = 0;
+  cm.addMessage = function (this: unknown, ...args: unknown[]) {
+    const metadata = args[2] as { kind?: string } | undefined;
+    if (metadata?.kind === 'tune-out-cancel' && refused === 0) {
+      refused++;
+      throw new Error('ContextManager.addMessage requires successful strategy initialization (injected)');
+    }
+    return addMessage.apply(this, args);
+  };
+  try {
+    await store.capture(() => second.connectMcplServer(store.server));
+  } finally {
+    cm.addMessage = addMessage;
+  }
+  assert.equal(refused, 1, 'setup: the release write met the refusal');
+  const registry = i.channelRegistry;
+  assert.notEqual(registry.getTuneOutState('disc', CHANNEL), null, 'the hold stays on record while its release is kept in memory');
+  await store.capture(() => second.switchBranch(second.getStore().currentBranch().name));
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null, 'ended once the move re-initialized the manager');
+  const released = second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(released.length, 1, 'one release');
+  assert.match(JSON.stringify(released[0]!.content), /messages=2/, 'both diverted messages in its backlog');
+});
+
 // AF #844 bot review 2, finding 21.
 test("a tune-out on record when a start with no reader connects a server while the primary's context manager refuses its work is released once a move re-initializes it", async (t) => {
   const store = await tunedOutStore(t, 2);

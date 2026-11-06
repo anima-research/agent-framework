@@ -11,3 +11,6 @@
 - A definite loss (`message:lost` without `mayBeStored`) ends the module's record of the create with no store read:
   a read that threw kept the entry waiting for a row that never comes, and history syncs and creates of the
   message passed it over until the module stopped.
+- Where the read that looks for such a create's row throws, the entry waits with what was kept for it, and the next
+  Discord event's sweep now applies the edits or delete to the row it finds before it ends the entry. The sweep
+  ended it with them unapplied.

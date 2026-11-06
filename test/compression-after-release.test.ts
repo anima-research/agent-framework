@@ -548,7 +548,7 @@ describe('a context manager the framework is done with makes no further provider
     }
   });
 
-  it('a fork disposed on a quiesced host makes no call after the disposal, and its held writes land at the resume', { timeout: 60_000 }, async () => {
+  it('a fork disposed on a quiesced host makes no call after the disposal, and a write made while quiesced is stored at once', { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(100);
     const { dir, framework } = await setup('af-done-quiesced-', membrane, { agents: true });
     const internals = framework as unknown as ForkInternals;
@@ -563,13 +563,15 @@ describe('a context manager the framework is done with makes no further provider
       // Read onto #291: a write while quiesced is stored at once (a quiesce
       // freezes windows, not the record) and presented at the resume.
       assert.notEqual(internals.addMessage('user', [{ type: 'text', text: 'HELD WHILE QUIESCED' }], undefined, { forAgent: 'trunk-chan-g1' }), '');
+      // AF #844 bot review 3, finding 88: in the record at once, while
+      // quiesced; the fork is disposed below, so no resume presents it.
+      assert.ok(fork.getAllMessages().some((message) => JSON.stringify(message.content).includes('HELD WHILE QUIESCED')),
+        'its write is stored at once, while quiesced');
       internals.disposeConversationAgent('trunk-chan-g1');
       const sent = membrane.compressions.length;
       await sleep(800);
       assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the disposal');
       await framework.resume();
-      assert.ok(fork.getAllMessages().some((message) => JSON.stringify(message.content).includes('HELD WHILE QUIESCED')),
-        'its held write landed in its window at the resume');
       await sleep(300);
       assert.equal(membrane.compressions.length, sent, 'nor after the resume');
       assert.deepEqual(drainLines(errors.lines), []);

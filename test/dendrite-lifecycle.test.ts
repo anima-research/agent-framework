@@ -989,6 +989,26 @@ describe('Dendrite restart', () => {
     await miraReads(second, 'a word mid-turn');
   });
 
+  // AF #844 bot review 3, finding 37: mail its sender asked to wake no one
+  // (`wake: false`) asks for no wake at the boot either, as main's queued
+  // mail asked none; the row records the ask.
+  it("asks no wake at boot for a message sent with wake: false that reached her mid-turn", async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'tool-result' } }));
+    await miraMidTurn(first, gates1);
+    const sent = first.sendAgentMessage('job', 'mira', [{ type: 'text', text: 'no need to wake' }], { wake: false });
+    assert.equal(sent.delivered, true);
+    const cm1 = first.getAgent('mira')!.getContextManager();
+    const [row] = cm1.getAllMessages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-message');
+    assert.equal(cm1.ordinalOf(row!.id), undefined, 'premise: out of her window while her turn runs');
+
+    const second = await process(new GateModule());
+    assert.equal(textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-message').length, 1, 'stored once');
+    assert.deepEqual(wakesOf(second), [], 'no wake asked for it');
+  });
+
   // A result delivered while mira had no turn alive was presented to her
   // window at once, and its wake ran then: a crash after that leaves the
   // boot nothing to wake her for.

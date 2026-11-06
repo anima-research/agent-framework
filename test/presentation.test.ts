@@ -437,7 +437,11 @@ describe('the presentation module', () => {
     fresh.adopt(reopened);
     assert.equal(reopened.has(kept), true, 'repaired at adopt');
     assert.equal(reopened.has(undone), false, 'an undone row is not repaired');
-    assert.equal(r.oren.has(kept), false, "and it is not oren's");
+    // Oren is weighed at a point of his own under the reopened module, not
+    // only by the sink, which a row held back at its write never told.
+    fresh.adopt(r.oren);
+    fresh.presentAtStart(r.oren, 'turn-start');
+    assert.equal(r.oren.has(kept), false, "and it is not oren's, at his own start");
     assert.deepEqual(ofType(traces, 'presentation:repaired').map((t) => [t.agentName, t.count]), [['mira', 1]]);
     fresh.adopt(reopened);
     assert.equal(ofType(traces, 'presentation:repaired').length, 1, 'adopt is once per manager');
@@ -1148,5 +1152,68 @@ describe('the presentation module at the point after one that failed', () => {
     for (const agent of r.live.values()) r.presentation.rebase(agent);
     assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], 'back on its branch, still held');
     assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [returned], 'until the next start');
+  });
+
+
+  // AF #844 bot review 3, finding 48.
+  it("rows a presentation wrote count as entered though a read of the window throws right after, so its listeners hear them", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('oren');
+    const heard: Array<[string, string[]]> = [];
+    r.presentation.onPresented('oren', (event) => heard.push([event.occasion, event.rows.map(textOf)]));
+    const cm = r.oren.cm;
+    const realPresent = cm.presentRows.bind(cm);
+    const realOrdinal = cm.ordinalOf.bind(cm);
+    let armed = false;
+    cm.presentRows = (ids) => { const ordinals = realPresent(ids); armed = true; return ordinals; };
+    cm.ordinalOf = (id) => {
+      if (armed) { armed = false; throw new Error('a transient read failure'); }
+      return realOrdinal(id);
+    };
+    const reply = quietly(() => storeOwnRow(r.oren, 'oren', text("oren's reply")));
+    cm.ordinalOf = realOrdinal;
+    assert.equal(r.oren.has(reply), true, 'setup: the write presented it');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed'), [], 'a write the store accepted is no failure');
+    assert.deepEqual(ofType(r.traces, 'presentation:presented').filter((t) => t.agentName === 'oren').map((t) => [t.occasion, t.count]), [['write', 1]]);
+    assert.deepEqual(heard, [['write', ["oren's reply"]]], 'and its listeners hear it');
+  });
+
+  // AF #844 bot review 3, finding 46.
+  it("an own row kept after a failed write still enters ahead of the next own row when a fresh start throws at its retraction", async () => {
+    const r = await rig();
+    r.presentation.adopt(r.mira);
+    r.write(r.mira, 'alice', text('a DM for mira alone'), ['mira']);
+    const retract = r.oren.cm.retractRows.bind(r.oren.cm);
+    let failures = 2;
+    r.oren.cm.retractRows = (ids, options) => {
+      if (failures > 0) { failures--; throw new Error('a transient write failure'); }
+      return retract(ids, options);
+    };
+    quietly(() => r.presentation.adopt(r.oren));
+    r.alive.add('oren');
+    failNextPresent(r.oren.cm);
+    const first = quietly(() => storeOwnRow(r.oren, 'oren', text('A')));
+    assert.equal(r.oren.has(first), false, 'setup: A missed its write');
+    quietly(() => assert.throws(() => r.presentation.presentAtStart(r.oren, 'turn-start'),
+      (error: Error) => error.message.includes("oren's turn start could not take the rows that aren't its out of its window")));
+    const second = storeOwnRow(r.oren, 'oren', text('B'));
+    assert.deepEqual([r.oren.has(first), r.oren.has(second)], [true, true], 'A enters with B');
+    assert.deepEqual(r.oren.window().slice(-2), ['A', 'B'], 'A ahead of B, as the record has them');
+  });
+
+  // AF #844 bot review 3, finding 47.
+  it("a fresh start while frozen presents no arrival, and keeps a rollback's hold for the next start that can", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const returned = r.write(r.oren, 'someone', text('returned'), ['mira']);
+    r.alive.delete('mira');
+    r.presentation.holdUntilStart(r.mira, [returned]);
+    r.setFrozen(true);
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start'), [], 'frozen: no arrival enters');
+    r.setFrozen(false);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], 'the hold still keeps it out at rest');
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [returned], 'the next start presents it');
   });
 });
