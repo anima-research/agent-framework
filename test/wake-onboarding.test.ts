@@ -392,6 +392,80 @@ describe('wake onboarding: the host', () => {
     } finally { await h.f.close(); }
   });
 
+  /**
+   * A host with a resident ('agent', the conversations' template) and a
+   * conversation fork of it, spawned by a message in #chat, which reads its
+   * own slot, not the delivery slot; `residents` adds a second resident.
+   * `target` pushes one undecided, attention-carrying event to the agents
+   * named, as a module's or a router's targeted push is queued.
+   */
+  async function withFork(residents: string[] = []) {
+    const h = await games({
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, ...residents.map((name) => ({ name, model: 'test', systemPrompt: 'test' }))],
+      framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as Partial<FrameworkConfig>,
+    });
+    await registerOpen(h.f, 'chat');
+    await incoming(h.f, 'chat', 'm1', 'verso, hello', MENTION);
+    void h.f.framework.runUntilIdle();
+    const agents = (h.f.framework as unknown as { agents: Map<string, unknown> }).agents;
+    await eventually(() => [...agents.keys()].some((n) => n.startsWith('conversation-')), 'the conversation fork');
+    const fork = [...agents.keys()].find((n) => n.startsWith('conversation-'))!;
+    assert.equal(h.traces.filter((t) => t.type === 'gate:onboarding-offered').length, 0, 'premise: nothing offered yet');
+    const target = async (targetAgents: string[]) => {
+      h.f.framework.pushEvent({
+        type: 'mcpl:push-event', serverId: 'editor', featureSet: 'games', eventId: 'targeted', timestamp: TS, inferenceId: 'inf-targeted',
+        content: [{ type: 'text', text: 'your move.' }], tags: ['surface:turn'], ...(targetAgents.length > 0 ? { targetAgents } : {}),
+      } as never);
+      void h.f.framework.runUntilIdle();
+      await eventually(() => h.traces.some((t) => t.type === 'gate:onboarding-offered'), 'the offer');
+    };
+    type Row = { content: Array<{ text?: string }>; metadata?: Record<string, unknown> };
+    /** The offer's rows in an agent's own store. */
+    const offerIn = (name: string) => (h.f.framework.getAgent(name)!.getContextManager().getAllMessages() as unknown as Row[])
+      .filter((m) => m.content.some((b) => b.text?.startsWith('[wake onboarding]')));
+    const woken = () => [...new Set(h.traces.filter((t) => t.type === 'inference:started' && (t.reason === 'wake-onboarding' || true)).map((t) => t.agentName as string))];
+    return { ...h, fork, target, offerIn, woken };
+  }
+
+  it("an event whose one recipient is a conversation fork, which doesn't read the delivery slot: the offer is in the fork's context, for it, and for no resident (#291)", { timeout: 60_000 }, async () => {
+    const h = await withFork();
+    try {
+      await h.target([h.fork]);
+      assert.equal(h.offerIn(h.fork).length, 1, "the offer is in the fork's context");
+      assert.deepEqual(h.offerIn(h.fork)[0]!.metadata?.audience, [h.fork], 'stamped for the fork');
+      assert.equal(h.notices('agent').length, 0, "not shown to a resident the event wasn't for");
+      assert.ok(!h.offerIn('agent').some((m) => (m.metadata?.audience as string[] | undefined)?.includes('agent')), 'nor stamped for one');
+    } finally { await h.f.close(); }
+  });
+
+  it('control: an event for a resident reading the delivery slot, and one for no one, keep their offer where it was', { timeout: 60_000 }, async () => {
+    for (const targets of [['oren'], []]) {
+      const h = await withFork(['oren']);
+      try {
+        await h.target(targets);
+        assert.equal(h.offerIn(h.fork).length, 0, "nothing in the fork's context");
+        const row = h.offerIn('agent');
+        assert.equal(row.length, 1, 'one offer, where a write that names no agent is');
+        assert.deepEqual(row[0]!.metadata?.audience, targets.length > 0 ? ['oren'] : ['agent', 'oren'],
+          targets.length > 0 ? 'for its recipient' : 'for the residents that take untargeted messages');
+      } finally { await h.f.close(); }
+    }
+  });
+
+  it('mixed recipients, a resident reading the delivery slot and a conversation fork: the offer is in both places, once each, each stamped for its own readers', { timeout: 60_000 }, async () => {
+    const h = await withFork(['oren']);
+    try {
+      await h.target(['oren', h.fork]);
+      const shared = h.offerIn('agent');
+      assert.equal(shared.length, 1, 'once where a write that names no agent is');
+      assert.deepEqual(shared[0]!.metadata?.audience, ['oren'], 'for the resident that reads it');
+      assert.equal(h.offerIn(h.fork).length, 1, "once in the fork's context");
+      assert.deepEqual(h.offerIn(h.fork)[0]!.metadata?.audience, [h.fork]);
+      assert.equal(h.notices('oren').length, 1, "in oren's window");
+      assert.equal(h.notices('agent').length, 0, "not in agent's, whom the event wasn't for");
+    } finally { await h.f.close(); }
+  });
+
   it('a held (tuned-out) channel message brings no offer', { timeout: 60_000 }, async () => {
     const h = await games({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {

@@ -40254,13 +40254,17 @@ export class AgentFramework {
    * stamp): the event's recipients, as its row's stamp names them
    * (inboundAudience), so it reads as following "the one above" only where
    * that one is, and a co-resident the event wasn't for is neither shown it
-   * nor woken by it. It is stored where a write that names no agent is, so
-   * it is for those of them that read that slot; where none does (an event
-   * for a conversation fork alone), it is stamped as a write that names no
-   * agent (readersNamed), and its wake still goes to the recipients. It
-   * goes through addMessage, which stores it at once and presents it to
-   * each of them at rest or at their next point, as it does the event; a
-   * wake for it reads its row (readsRowFor), as the event's own wake does.
+   * nor woken by it. It is stored where a write that names no agent is for
+   * those of them that read that slot (readersNamed), stamped for them; a
+   * recipient that doesn't read it (a conversation fork, on its own slot)
+   * gets its own copy where it reads (`forAgent`), stamped for it, so a
+   * recipient is woken to a notice it is shown and no one else is shown it.
+   * Mixed recipients get it in both places, once each. An event with no
+   * recipients is for the residents that take untargeted messages, as
+   * before. It goes through addMessage, which stores it at once and
+   * presents it to each of them at rest or at their next point, as it does
+   * the event; a wake for it reads the row its agent is shown
+   * (readsRowFor), as the event's own wake does.
    */
   private considerWakeOnboarding(event: {
     serverId: string;
@@ -40283,18 +40287,24 @@ export class AgentFramework {
       const wake = carriesAttention(event.tags);
       const text = this.wakeOnboardingText(offer, { policyName: d.policyName, behavior: String(d.behavior), tags: event.tags ?? [], wake });
       // An event with no recipients wakes those that take untargeted inbound, as on main.
-      const readers = event.recipients.length > 0 ? [...event.recipients] : this.registry.untargetedRecipients();
-      // The notice is stored where a write that names no agent is: for those
-      // of them that read that slot, or as such a write when none does
-      // (readersNamed), as a process response's messages are.
+      const targeted = event.recipients.length > 0;
+      const readers = targeted ? [...event.recipients] : this.registry.untargetedRecipients();
+      // The notice is stored where a write that names no agent is for those
+      // of them that read that slot, and, for a recipient that doesn't (a
+      // conversation fork on its own slot), where it reads (`forAgent`).
       const audience = readers.length > 0 ? this.readersNamed(readers) : readers;
+      const elsewhere = targeted ? readers.filter((name) => !(audience ?? []).includes(name) && this.agents.has(name)) : [];
+      const metadata = { system: true, kind: 'wake-onboarding', serverId: event.serverId } as MessageMetadata;
       const placement: WritePlacement = {};
-      this.addMessage(
-        'user',
-        [{ type: 'text', text }],
-        { system: true, kind: 'wake-onboarding', serverId: event.serverId } as MessageMetadata,
-        { placement, ...(audience ? { audience } : {}) },
-      );
+      const placements = new Map<string, WritePlacement>();
+      if (!targeted || (audience && audience.length > 0)) {
+        this.addMessage('user', [{ type: 'text', text }], { ...metadata }, { placement, ...(audience ? { audience } : {}) });
+      }
+      for (const name of elsewhere) {
+        const own: WritePlacement = {};
+        this.addMessage('user', [{ type: 'text', text }], { ...metadata }, { placement: own, forAgent: name });
+        placements.set(name, own);
+      }
       // Recorded once the notice is stored: a notice that failed to be written is offered again.
       // An earlier acceptance's rule names stay on record while the new question is open.
       const prior = this.wakeDecisions.get(event.serverId);
@@ -40317,7 +40327,7 @@ export class AgentFramework {
           timestamp: Date.now(),
           ...(event.channelId ? { channelId: event.channelId, channelServerId: event.serverId } : {}),
           addressed: isAddressedMessage(event.tags as string[] | undefined),
-          ...this.readsRowFor(placement, agentName),
+          ...this.readsRowFor(placements.get(agentName) ?? placement, agentName),
         });
       }
     } catch (error) {
