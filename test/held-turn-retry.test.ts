@@ -489,7 +489,7 @@ test("a conversation agent's turn a wait recorded during its compile holds is al
   });
 });
 
-test("a conversation agent's start assembling under a provider wait on its model, which the wait holds after its compile, is listed as a maybe, and the failed-turn line rendered from its reading says only that the wake may not start a turn, as the wake list gives the wait as its reason", async () => {
+for (const batchOnly of [false, true] as const) test(`a conversation agent's start assembling${batchOnly ? ' deferred pushes that are its only causes' : ''} under a provider wait on its model, which the wait holds after its compile, is listed as a maybe${batchOnly ? ' with both reasons' : ''}, and the failed-turn line rendered from its reading says only that the wake may not start a turn, as the wake list gives the wait as its reason`, async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
@@ -505,14 +505,14 @@ test("a conversation agent's start assembling under a provider wait on its model
       let assembled!: () => void;
       const assembly = new Promise<undefined>((resolve) => { assembled = () => resolve(undefined); });
       view.pushCoalescer = { pendingBatches: () => 1, assemble: () => assembly, isRendering: () => false, identity: () => undefined, suspend: () => {} };
-      const started = internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      const started = internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now(), ...(batchOnly ? { coalescingBatchSubjects: ['zz-subject'] } : {}) });
       await waitFor(fw, () => view.assembling.has('resident'), 'the start to assemble');
       internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz wait while it assembles');
       const now = Date.now();
       view.lastStartFailed.set(agent, now - 30_000);
       const lines = ifYouWait(view.upcomingWakesFor('resident'), 'resident', now, view.failedLastTurnFor('resident')).split('\n');
       assert.equal(lines[1], "resident's last turn, 30s ago, failed and may not have answered all of what woke it. A wake for resident is already queued, which may not start a turn.");
-      assert.ok(lines.includes('- as soon as it is free, maybe: a start assembling its deferred pushes, which a provider wait on its model holds after its compile if the wait still stands then'), lines.join('\n'));
+      assert.ok(lines.includes(`- as soon as it is free, maybe: a start assembling its deferred pushes, which ${batchOnly ? 'starts no turn if they give it nothing to read, and which ' : ''}a provider wait on its model holds after its compile if the wait still stands then`), lines.join('\n'));
       assembled();
       await started;
       assert.ok(log.lines.some((line) => line.includes('binds after the compile')), 'premise: the wait holds it after its compile');

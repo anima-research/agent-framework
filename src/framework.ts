@@ -6266,7 +6266,9 @@ export class AgentFramework {
     const passedMaybe: string[] = [];
     if (this.assembling.has(agentName)) {
       const heldAfterCompile = this.registry.homeChannel(agentName) !== undefined && wait !== undefined;
-      if (this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length) passedMaybe.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
+      const batchOnly = Boolean(this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length);
+      if (batchOnly && heldAfterCompile) passedMaybe.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read, and which a provider wait on its model holds after its compile if the wait still stands then');
+      else if (batchOnly) passedMaybe.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
       else if (heldAfterCompile) passedMaybe.push('a start assembling its deferred pushes, which a provider wait on its model holds after its compile if the wait still stands then');
       else passed.push('a start assembling its deferred pushes');
     }

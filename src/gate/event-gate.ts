@@ -4032,9 +4032,10 @@ export class EventGate {
     const events = state.events;
     this.debounceTimers.delete(policyName);
 
-    // A judge rule's batch goes to the reply judge, which delivers it, or
-    // doesn't, once it has decided (judgeBatch). Without a judge wired it's
-    // delivered below, as a debounce's batch is.
+    // A judge rule's batch goes to judgeBatch, which asks the reply judge, or,
+    // while the judge's calls are refused, holds the batch or delivers it
+    // without one. Without a judge wired it's delivered below, as a debounce's
+    // batch is.
     if (state.judge && this.judgeFn) {
       this.judgeBatch(policyName, events, state.judge);
       return;

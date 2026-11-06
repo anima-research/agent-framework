@@ -207,7 +207,7 @@ function renderBlock(block: ContentBlock): string {
 const LINE_OPENING_BRACKET = new RegExp(`(^|\\n)((?:(?!\\n)${SKIPPED})*)\\[`, 'gu');
 
 function labelName(name: unknown): string {
-  return oneLine(String(name)).replace(/[[\]]/g, '\\$&');
+  return oneLine(String(name)).replace(/[\\[\]]/g, '\\$&');
 }
 
 function unlabelled(text: string): string {
@@ -329,7 +329,7 @@ export function judgeSystemPrompt(agentName: string): string {
     '',
     "You're given the agent's context as a document: its conversation, oldest first, cut from the oldest end to",
     "fit, then its system prompt (abridged). The agent's own messages are those from the participant named",
-    `${agentName}. Then you're given the new events and, when it has written them, the agent's own instructions to you.`,
+    `${field(agentName)}. Then you're given the new events and, when it has written them, the agent's own instructions to you.`,
     "Its instructions are its preferences about its own attention and come first. Where they don't decide, wake it",
     'when it is addressed or asked something, when a reply from it is expected or would clearly help, or when',
     'something it is following needs it; let events go by when the talk is between others and does not need it,',
