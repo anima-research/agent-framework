@@ -773,13 +773,14 @@ export interface TuneOutFrameworkHooks {
   /**
    * Whether a write the coordinator made now would be kept in memory rather
    * than stored: a live surgery's hold, or a context manager of the primary
-   * or the subconscious refusing its work until a branch move re-initializes it.
-   * A cancel then waits (deferCancel), the tune-out still in force, until
-   * the framework says the writes are stored again, or told of where storing
-   * one fails (runDeferredCancels), so the release is in the store before
-   * the epoch's end is recorded. Left out, never.
+   * or the subconscious refusing its work until a branch move re-initializes it,
+   * and with `forAgent`, that agent's too (a reader fork a loss notice is
+   * written for). A cancel then waits (deferCancel), the tune-out still in
+   * force, until the framework says the writes are stored again, or told of
+   * where storing one fails (runDeferredCancels), so the release is in the
+   * store before the epoch's end is recorded. Left out, never.
    */
-  writesHeld?: () => boolean;
+  writesHeld?: (forAgent?: string) => boolean;
   /**
    * The history-reading tool the resident actually has (e.g. a server's
    * `fetch_history`), or null. A truncation note names it only when it exists
@@ -1571,10 +1572,10 @@ export class TuneOutCoordinator {
     return { ok: true, params };
   }
 
-  /** Whether the framework keeps writes in memory now (writesHeld); a hook that throws counts as not. */
-  private writesHeldNow(): boolean {
+  /** Whether the framework keeps writes in memory now (writesHeld), with `forAgent`'s among them; a hook that throws counts as not. */
+  private writesHeldNow(forAgent?: string): boolean {
     try {
-      return this.hooks.writesHeld?.() === true;
+      return this.hooks.writesHeld?.(forAgent) === true;
     } catch (err) {
       console.error('[tune-out] could not ask whether writes are held in memory, so a cancel goes on:', err);
       return false;
@@ -1978,7 +1979,7 @@ export class TuneOutCoordinator {
         // One the boot read from the record, which may be written already,
         // waits until that can be read (checkLossNoticesWritten), and those
         // after it with it.
-        if (this.stopped || this.writesHeldNow() || this.lossNoticesUnchecked.has(notice.id)) break;
+        if (this.stopped || this.writesHeldNow(name) || this.lossNoticesUnchecked.has(notice.id)) break;
         const kept = this.lossNotices.get(name);
         const at = kept?.indexOf(notice) ?? -1;
         // Written meanwhile, by a write a listener made.
@@ -2857,10 +2858,12 @@ export class TuneOutCoordinator {
    * refuses its work from it on), which writesHeld then says: memory alone
    * holds it then, which a crash or a stop loses, so it answers `failed`,
    * kept in the store's record and written again once writes are stored
-   * (twice, where the kept write is stored too). A reader fork's own context manager
-   * refusing its work isn't told apart from its end here: the framework
-   * answers an empty id for both. A turn that can't be asked for is
-   * logged. Never throws.
+   * (twice, where the kept write is stored too). writesHeld is asked about
+   * the author too, so a reader fork still registered whose own context
+   * manager refuses its work is told apart from one whose run has ended:
+   * the notice stays kept for it, and isn't written while that lasts
+   * (writeLossNotices). A turn that can't be asked for is logged. Never
+   * throws.
    */
   private writeLossNotice(author: string, notice: LossNotice): 'written' | 'failed' | 'gone' {
     const { serverId, channelId, epochId, scope } = notice.for;
@@ -3006,7 +3009,7 @@ export class TuneOutCoordinator {
       }
       return 'failed';
     }
-    if (id === '' && this.writesHeldNow()) {
+    if (id === '' && this.writesHeldNow(author)) {
       console.error(`[tune-out] ${author} could not be told ${lossSubject(notice)} yet: the notice was kept in memory as it was written `
         + '(writes are held from it on), so it stays kept, in the store too, and is written again once writes are stored');
       return 'failed';

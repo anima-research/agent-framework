@@ -174,7 +174,14 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     keepWhenHeld: false,
     /** The sync after a note's row (the last one written a subconscious-note) fails, the release's before it landing. */
     noteSyncFails: false,
+    /**
+     * Agents whose context manager refuses its work: a write for one is kept in memory for its recovery,
+     * answering an empty id (`keptFor`), and writesHeld(agent) says so, as the framework's tuneOutWritesHeld.
+     */
+    refusing: [] as string[],
   };
+  /** The writes kept in memory for an agent whose manager refuses its work (`refusing`), by agent. */
+  const keptFor = new Map<string, Added[]>();
   /** How many of `added` the last sync that answered true made durable. */
   let durableCount = 0;
   let onTrace: ((event: Trace) => void) | undefined;
@@ -209,6 +216,10 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
       onWrite?.(metadata);
       if (state.keepWhenHeld && state.held) return '';
       if (forAgent !== undefined && state.gone.includes(forAgent)) return '';
+      if (forAgent !== undefined && state.refusing.includes(forAgent)) {
+        keptFor.set(forAgent, [...(keptFor.get(forAgent) ?? []), { participant, content, metadata, forAgent }]);
+        return '';
+      }
       if (state.noteFails && metadata?.kind === 'subconscious-note') throw new Error('the store refused the row (test)');
       if (state.noticeFails && metadata?.kind === 'tune-out-note-undelivered') throw new Error('the store refused the notice too (test)');
       if (state.releaseFails && metadata?.kind === 'tune-out-cancel') throw new Error('the store refused the release (test)');
@@ -242,7 +253,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     getSurgeryHeldMessages: () => [],
     unseenBySubconscious: () => 0,
     emitTrace: (event: Trace) => { traces.push(event); onTrace?.(event); },
-    writesHeld: () => state.held,
+    writesHeld: (forAgent?: string) => state.held || (forAgent !== undefined && state.refusing.includes(forAgent)),
     commitDeliveries: () => {
       if (!state.durable || (state.noteSyncFails && added.at(-1)?.metadata?.kind === 'subconscious-note')) return false;
       durableCount = added.length;
@@ -296,7 +307,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   const listen = (fn: (event: Trace) => void): void => { onTrace = fn; };
   /** A listener inside each write, as a host's synchronous trace listener of the store write runs: before the write lands. */
   const listenWrites = (fn: (metadata: Record<string, unknown> | undefined) => void): void => { onWrite = fn; };
-  return { coordinator, state, states, rows, added, mail, wakes, traces, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
+  return { coordinator, state, states, rows, added, mail, wakes, traces, keptFor, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
 }
 
 const LOSS_RECORD_UNIT = 'tune-out/scout/loss-notices';
@@ -2109,5 +2120,44 @@ test("review 4 #29: a loss notice whose write fails keeps the author's later not
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
+  }
+});
+
+test("review 4 #106: a loss notice for a reader fork whose context manager refuses its work is kept for it, not traced as reaching no one", () => {
+  for (const when of ['before the write', 'from the write on'] as const) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ forks: true });
+    try {
+      const a = h.enter();
+      h.state.held = true;
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-1', 'For A.', 'reader-1');
+      failFirstRelease(h);
+      h.endOtherwise();
+      h.enter();
+      h.state.held = true;
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-2', 'For B.', 'reader-2');
+      assert.deepEqual(h.dropped().map((t) => [t.epochId, t.reason, t.noteAuthor]), [[a, 'hold-ended', 'reader-1']],
+        "premise: B's cancel, waiting, dropped A's, whose note was reader-1's");
+      // reader-1, still registered, has a context manager that refuses its work: before the notice's write, or from it on.
+      if (when === 'before the write') h.state.refusing.push('reader-1');
+      else h.listenWrites((metadata) => { if (metadata?.kind === 'tune-out-note-undelivered') h.state.refusing.push('reader-1'); });
+      h.state.held = false;
+      h.coordinator.runDeferredCancels();
+      assert.deepEqual(h.untold().filter((t) => t.reason === 'author-gone'), [], `${when}: not traced as an author gone`);
+      const kept = (h.coordinator as unknown as { lossNotices: Map<string, unknown[]> }).lossNotices.get('reader-1') ?? [];
+      assert.equal(kept.length, 1, `${when}: the notice stays kept, to be written again`);
+      assert.equal((h.keptFor.get('reader-1') ?? []).length, when === 'before the write' ? 0 : 1,
+        `${when}: ${when === 'before the write' ? 'nothing is written into its recovery wait' : 'the one write kept for its recovery'}`);
+      h.coordinator.runDeferredCancels();
+      assert.equal((h.keptFor.get('reader-1') ?? []).length, when === 'before the write' ? 0 : 1, 'a retry while it refuses writes no copy');
+      // Its manager recovers: the next retry writes the notice to it.
+      h.listenWrites(() => {});
+      h.state.refusing.length = 0;
+      h.coordinator.runDeferredCancels();
+      assert.deepEqual(h.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId]), [['reader-1', a]], `${when}: written once it recovers`);
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
   }
 });

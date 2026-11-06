@@ -39453,7 +39453,7 @@ export class AgentFramework {
             .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
         },
         commitDeliveries: () => this.commitDeliveries(),
-        writesHeld: () => this.tuneOutWritesHeld(),
+        writesHeld: (forAgent) => this.tuneOutWritesHeld(forAgent),
         historyTool: () => this.residentHistoryTool(),
         // Every reader of the shared slot compiles the dump with its own
         // strategy, so the dump fits the smallest of their bounds.
@@ -39505,11 +39505,12 @@ export class AgentFramework {
    * epoch's end is on disk at once. The coordinator's cancel waits for them
    * then (its writesHeld; releaseSurgeryHeldWrites runs it), and so does a
    * release of the holds on record with no reader
-   * (releaseTuneOutsWithoutReader).
+   * (releaseTuneOutsWithoutReader). With `forAgent`, a write for that agent
+   * too (a loss notice for a reader fork whose manager refuses its work).
    */
-  private tuneOutWritesHeld(): boolean {
+  private tuneOutWritesHeld(forAgent?: string): boolean {
     return this.surgeryHold !== null || this.replayingHeld
-      || [this.primaryAgentName, this.subconsciousAgentName]
+      || [this.primaryAgentName, this.subconsciousAgentName, forAgent]
         .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name)));
   }
 
