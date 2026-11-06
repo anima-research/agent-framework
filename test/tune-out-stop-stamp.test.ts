@@ -66,6 +66,8 @@ function stampSetup() {
     branch: 'main',
   };
   const key = (s: string, c: string) => `${s}\0${c}`;
+  /** A listener inside each write, as a host's synchronous trace listener of the store write runs. */
+  let onWrite: ((row: Row) => void) | undefined;
   const registry = {
     tuneOutsOnRecord: () => holds.map((h) => ({ serverId: h.serverId, channelId: h.channelId, params: { epochId: h.epochId, startedAtSequence: h.startedAt }, source: 'agent-tool' })),
     getTuneOutState: (s: string, c: string) => {
@@ -95,6 +97,7 @@ function stampSetup() {
       if (forAgent === SUB && state.subRefuses) throw new Error("the subconscious's context refused the write (test)");
       if (metadata?.kind === 'subconscious-note' && state.noteRefuses) throw new Error('the store refused the note (test)');
       const row: Row = { participant, content, ...(metadata ? { metadata } : {}), sequence: ++state.seq, ...(forAgent ? { forAgent } : {}) };
+      onWrite?.(row);
       added.push(row);
       if (forAgent === SUB) window.push(row); else rows.push(row);
       return `m${state.seq}`;
@@ -172,7 +175,8 @@ function stampSetup() {
   const unrecorded = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered' && textOf(m.content).includes('without recording'));
   const told = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered');
   const stopAll = (): void => { for (const c of made) c.stop(); };
-  return { states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll, fork, switchTo, stampTries };
+  const listenWrites = (fn: (row: Row) => void): void => { onWrite = fn; };
+  return { listenWrites, states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll, fork, switchTo, stampTries };
 }
 
 const conditional = (hold: string, epochId: string, it = 'tune-out') => `[Tune-out: the host stopped without recording the state of ${hold} `
@@ -416,7 +420,7 @@ test('pin: a stop whose loss record alone the store refuses leaves the hold out 
   } finally { h.stopAll(); }
 }));
 
-test("pin: a stop that can't keep a waiting note's loss (its drop throws) leaves the hold out of its stamp", () => quiet(() => {
+test("pin: a stop whose drop of a waiting cancel throws at its trace has kept the note's loss first (review 3 #43): the store holds it, and the stamp covers the hold", () => quiet(() => {
   const h = stampSetup();
   try {
     const first = h.boot();
@@ -427,7 +431,8 @@ test("pin: a stop that can't keep a waiting note's loss (its drop throws) leaves
     const push = traces.push.bind(traces);
     traces.push = (...t: Trace[]) => { if (t[0]?.type === 'tune-out:deferred-cancel-dropped') throw new Error('the trace failed (test)'); return push(...t); };
     first.stop();
-    assert.ok(!(h.states.get(STAMP) as { epochs: string[] }).epochs.includes(e));
+    assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, "the note's loss was kept before the trace threw");
+    assert.ok((h.states.get(STAMP) as { epochs: string[] }).epochs.includes(e), 'so the stamp covers the hold: the next boot tells the kept notice, and no second row');
   } finally { h.stopAll(); }
 }));
 
@@ -1390,5 +1395,35 @@ test("review 2 #42, control: a move back to the branch this run began on keeps t
     assert.deepEqual(h.unrecorded().map((m) => (m.metadata?.stopUnrecorded as { found: string }).found), ['unknown', 'asked'],
       "the ask made on `main` before the moves is this run's: the specific row");
     assert.equal(h.unrecorded().at(-1)!.metadata?.epochId, e);
+  } finally { h.stopAll(); }
+}));
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 3 (at 22dc7d48).
+// ---------------------------------------------------------------------------
+
+test("review 3 R2: a stop from a listener of a loss notice's write keeps its stamp: the run's marker isn't written over it", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    // The host dies with the cancel waiting. The next boot can neither
+    // write the notice nor keep it in the store: it carries the last stop's
+    // bound (review 2, #26).
+    h.state.subRefuses = true;
+    h.refuse.add(LOSS_RECORD);
+    const c = h.boot();
+    h.state.subRefuses = false;
+    h.refuse.delete(LOSS_RECORD);
+    let stopped = false;
+    h.listenWrites((row) => {
+      if (row.metadata?.kind !== 'tune-out-note-undelivered' || stopped) return;
+      stopped = true;
+      c.stop();
+    });
+    c.runDeferredCancels();
+    assert.ok(stopped, "premise: the notice's write stopped the host");
+    assert.deepEqual((h.states.get(STAMP) as { epochs: string[] }).epochs, [e], "the stop's stamp stands, covering the hold it accounted for");
   } finally { h.stopAll(); }
 }));

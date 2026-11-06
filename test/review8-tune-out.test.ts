@@ -170,8 +170,11 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     crashAfterEnd: false,
     /** A loss notice's write meets a hold that begins at it: kept in memory, an empty id, writes held from then on. */
     noticeKept: false,
+    /** A write made while writes are held (`held`) is kept in memory, answering an empty id, as the framework keeps one. */
+    keepWhenHeld: false,
   };
   let onTrace: ((event: Trace) => void) | undefined;
+  let onWrite: ((metadata: Record<string, unknown> | undefined) => void) | undefined;
   let channel: { params: { epochId: string }; wakeCount: number } | null = null;
   const states = new Map<string, unknown>();
   const rows: Array<{ id: string; participant: string; content: ContentBlock[]; metadata: Record<string, unknown>; sequence: number }> = [];
@@ -199,6 +202,8 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
+      onWrite?.(metadata);
+      if (state.keepWhenHeld && state.held) return '';
       if (forAgent !== undefined && state.gone.includes(forAgent)) return '';
       if (state.noteFails && metadata?.kind === 'subconscious-note') throw new Error('the store refused the row (test)');
       if (state.noticeFails && metadata?.kind === 'tune-out-note-undelivered') throw new Error('the store refused the notice too (test)');
@@ -279,7 +284,9 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   const lossRecord = () => (states.get(LOSS_RECORD_UNIT) as { v: number; pendingLossNotices: Array<Record<string, unknown>> } | undefined);
   /** A trace listener, as a host's: called with each trace as it is emitted. */
   const listen = (fn: (event: Trace) => void): void => { onTrace = fn; };
-  return { coordinator, state, states, rows, added, mail, wakes, traces, enter, enterScope, inForce, scopeInForce, releasesOf, notes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen };
+  /** A listener inside each write, as a host's synchronous trace listener of the store write runs: before the write lands. */
+  const listenWrites = (fn: (metadata: Record<string, unknown> | undefined) => void): void => { onWrite = fn; };
+  return { coordinator, state, states, rows, added, mail, wakes, traces, enter, enterScope, inForce, scopeInForce, releasesOf, notes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
 }
 
 const LOSS_RECORD_UNIT = 'tune-out/scout/loss-notices';
@@ -1772,4 +1779,123 @@ test("review 2 #35: a restart whose read of the strategy's persisted anchor thro
   h.control.persistedThrows = false;
   h.internals.anchorSubconscious('resume');
   assert.deepEqual(h.calls, ['setAnchorOrdinal(2)'], 'the next restart that can read it keeps the earlier one');
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 3 (at 22dc7d48): a stop, or a hold, that a trace
+// listener begins while the deferred cancels run.
+// ---------------------------------------------------------------------------
+
+/** What the coordinator still has queued (deferCancel), as stop and runDeferredCancels read it. */
+const queuedOf = (h: ReturnType<typeof epochSetup>): number =>
+  (h.coordinator as unknown as { deferredCancels: Map<string, unknown> }).deferredCancels.size;
+
+test("review 3 #27: a queued cancel whose release meets a hold begun with a listener's stop is told as the stop tells one, not put back on the stopped queue", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup();
+    try {
+      const held = scope ? h.enterScope() : h.enter();
+      h.state.held = true;
+      if (scope) h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      h.state.held = false;
+      h.state.keepWhenHeld = true;
+      h.listenWrites((metadata) => {
+        if (metadata?.kind !== 'tune-out-cancel') return;
+        h.coordinator.stop();
+        h.state.held = true;
+      });
+      h.coordinator.runDeferredCancels();
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), held, 'premise: its release was kept in memory, the hold in force');
+      assert.equal(queuedOf(h), 0, `${scope ? 'all-except' : 'channel'}: nothing is left queued on the stopped coordinator`);
+      assert.deepEqual(h.dropped().map((t) => [t.epochId, t.reason, t.noteLost]), [[held, 'stopped', true]], 'it is told as the stop tells a waiting cancel, its note lost');
+      assert.equal(h.lossRecord()?.pendingLossNotices.length, 1, "and its note's loss is kept in the store, for the next boot to tell");
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("review 3 #28: a hold that a listener of the run's own lost-note drop begins keeps the timers it armed", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup();
+    try {
+      if (scope) h.enterScope(); else h.enter();
+      h.state.held = true;
+      if (scope) h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      let next: string | undefined;
+      h.listen((event) => {
+        if (event.type !== 'tune-out:deferred-cancel-dropped' || event.reason !== 'note-undelivered' || next !== undefined) return;
+        next = scope ? h.enterScope() : h.enter();
+      });
+      ownRunLosesNote(h);
+      assert.ok(next, "premise: the drop's listener began a new hold");
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), next, 'premise: it is in force');
+      const timers = h.coordinator as unknown as { cadenceTimers: Map<string, unknown>; expiryTimers: Map<string, unknown> };
+      const key = scope ? '\0all-except' : 'disc\0disc:guild:a';
+      assert.ok(timers.cadenceTimers.has(key), `${scope ? 'all-except' : 'channel'}: its cadence is not cleared by the release of the hold before it`);
+      if (scope) assert.ok(timers.expiryTimers.has(key), 'nor its end time');
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("review 3 #43: a stop from the trace of a stale cancel's drop keeps that note's loss, and the cancel asked for then isn't queued on the stopped coordinator", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'For A.', 'Subconscious');
+    h.endOtherwise();
+    const b = h.enter();
+    h.listen((event) => { if (event.type === 'tune-out:deferred-cancel-dropped' && event.reason === 'hold-ended') h.coordinator.stop(); });
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'For B.', 'Subconscious');
+    assert.equal(h.inForce(), b, 'premise: B stays in force');
+    assert.equal(queuedOf(h), 0, "B's cancel isn't queued on the stopped coordinator");
+    const kept = (h.lossRecord()?.pendingLossNotices ?? []).map((n) => (n.drop as { reason: string }).reason);
+    assert.deepEqual(kept, ['hold-ended', 'stopped'], "both notes' losses are kept in the store for the next boot: A's dropped, B's lost at the stop");
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("review 3 #68: a stop from a loss notice's write keeps the notices not written yet in the store, and none is written after it", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    // Two notes lost while writes are held, their notices kept: A's, then B's.
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'For A.', 'Subconscious');
+    h.endOtherwise();
+    const b = h.enter();
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'For B.', 'Subconscious');
+    h.endOtherwise();
+    h.enter();
+    h.coordinator.cancel('disc', 'disc:guild:a', 'duration', 'duration elapsed');
+    assert.equal(h.lossNotices().length, 0, 'premise: both notices wait for the writes');
+    let stopped = false;
+    h.listenWrites((metadata) => {
+      if (metadata?.kind !== 'tune-out-note-undelivered' || stopped) return;
+      stopped = true;
+      h.coordinator.stop();
+    });
+    h.state.held = false;
+    h.coordinator.runDeferredCancels();
+    assert.ok(stopped, 'premise: the first notice\'s write stopped the host');
+    assert.equal(h.lossNotices().length, 1, "only the notice being written then is written: none after the stop");
+    const kept = (h.lossRecord()?.pendingLossNotices ?? []) as Array<{ for: { epochId: string } }>;
+    assert.ok(kept.some((n) => n.for.epochId === b), `B's notice, not written yet, is kept in the store by the stop: ${JSON.stringify(kept)}`);
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
 });
