@@ -983,6 +983,21 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         assert.equal(child.status, 0, `the child exited where it was told (stderr: ${child.stderr.slice(-800)})`);
         const want = Array.from({ length: crash.count }, (_, i) => `CRASH-${i}`);
         const crashed = (f: AgentFramework) => rowsOf(f).map(textOf).filter((x) => x.startsWith('CRASH-'));
+        if (crash.mode !== 'mid-import') {
+          // AF #844 bot review 4, finding 44: the child exited past the
+          // importer's sync (it exits 4 where the record's write comes with
+          // no sync since the last imported write), so every row is on disk
+          // before the next boot opens the store: read it there, past any
+          // framework, so the next boot is shown to store none of them twice
+          // rather than to store them once.
+          const store = JsStore.openOrCreate({ path: h.storePath });
+          try {
+            const cm = await StoreWindow.open({ store, ...residentContextOptions('agent'), strategy: new PassthroughStrategy() });
+            try {
+              assert.deepEqual(cm.getAllMessages().map(textOf).filter((x) => x.startsWith('CRASH-')), want, 'every row is on disk before the next boot');
+            } finally { cm.close(); }
+          } finally { store.close(); }
+        }
         let framework = await h.boot();
         try {
           assert.equal(framework.getHostModeStatus().quiesced, true);

@@ -10,11 +10,15 @@
  *                       write, before its sync: what it stored may be lost.
  *   before-rewrite      exit after the importer's sync, before it clears the
  *                       record: every write is on disk and still queued.
+ *                       Exit code 4 instead where the record's write is
+ *                       reached with no store sync since the last imported
+ *                       write (AF #844 bot review 4, finding 44).
  *   big-before-rewrite  the same, for a queue the test made large (more than
  *                       any fixed scan tail).
  *
  * argv[2] = store path.
  */
+import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../../src/index.js';
 import { MockMembrane } from './mock-membrane.js';
 
@@ -40,7 +44,22 @@ if (mode === 'mid-import') {
     return id;
   };
 } else {
-  proto.writeImportedRecord = function () { process.exit(0); };
+  // Whether the store synced after the last write the importer stored.
+  let syncedSinceImported = true;
+  const addMessage = proto.addMessage;
+  proto.addMessage = function (participant, content, metadata, opts) {
+    const id = addMessage.call(this, participant, content, metadata, opts);
+    if (opts?.imported) syncedSinceImported = false;
+    return id;
+  };
+  const storeProto = JsStore.prototype as unknown as { sync(this: JsStore): unknown };
+  const sync = storeProto.sync;
+  storeProto.sync = function (this: JsStore) {
+    const synced = sync.call(this);
+    syncedSinceImported = true;
+    return synced;
+  };
+  proto.writeImportedRecord = function () { process.exit(syncedSinceImported ? 0 : 4); };
 }
 
 await AgentFramework.create({
