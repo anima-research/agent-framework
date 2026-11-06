@@ -15498,8 +15498,9 @@ export class AgentFramework {
         sourceBranch = this.store.currentBranch().name;
         this.store.switchBranch(name);
         moved = true;
-        // No manager made this move, so every live agent's context follows it.
-        reinitializing = this.followBranchMove();
+        // No manager made this move, so every live agent's context follows
+        // it, the branch it was on too (a recovery of a refusing manager).
+        reinitializing = this.followBranchMove(undefined, sourceBranch === name);
         const ws = this.moduleRegistry.getModule('workspace');
         if (ws && 'materializeMount' in ws) {
           await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
@@ -15544,7 +15545,11 @@ export class AgentFramework {
    * wait for the reservation's release, which presents what each agent is
    * owed. Redo entries are
    * dropped, every agent's: each was an undo on a window of the branch the
-   * store left. Returns the managers whose re-initialization failed, for
+   * store left. A switch to the branch the store was on (`sameBranch`, a
+   * refusing manager's recovery) moves no branch, so each agent whose
+   * window is presented after the rebase keeps its redo entries: an undo is
+   * a retraction on that window, and the rebase presents no undone row
+   * (main kept redo across a switch too). Returns the managers whose re-initialization failed, for
    * the caller to report (reportReinitFailures) before it releases the
    * store.
    *
@@ -15556,12 +15561,12 @@ export class AgentFramework {
    * wait in memory (heldForRecovery), and the move whose re-initialization
    * of it succeeds stores them at its release (recoverHeldWrites).
    */
-  private async followBranchMove(except?: string): Promise<ManagerReinitFailure[]> {
+  private async followBranchMove(except?: string, sameBranch = false): Promise<ManagerReinitFailure[]> {
     let failures: ManagerReinitFailure[] = [];
     try {
       this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
       this.tuneOutCoordinator?.branchMoved();
-      this.redoStacks.clear();
+      if (!sameBranch) this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
       // The agent the move was made through initialized its own manager,
       // or failed to: a failed surgery's restore that left it refusing its
@@ -15580,6 +15585,7 @@ export class AgentFramework {
         // The rebase can present a window a write-down left in legacy mode,
         // or leave one in it.
         this.applyForeignRounds(agent);
+        if (sameBranch && !this.presents(agent)) this.redoStacks.delete(agent.name);
       }
       return failures;
     } catch (error) {

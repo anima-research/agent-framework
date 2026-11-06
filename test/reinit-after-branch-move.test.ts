@@ -3399,6 +3399,26 @@ describe('the window follows a branch move (#291)', () => {
     }
   });
 
+  // AF #844 bot review 5, finding 64: a switch to the branch the store is
+  // on (how a manager left refusing its work is recovered) moves no branch.
+  // An undo is a retraction on that branch's window, so the redo entry is
+  // still good after it, as main kept redo across a switch.
+  it("a switch to the branch the store is on keeps every redo entry, and the redo restores the turn", async () => {
+    const h = await boot();
+    await h.bothServe('a round');
+    const before = h.framework.getAgent('mira')!.getContextManager().getPresentedMessages().length;
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.undoLastTurn(name).undone, true);
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `setup: ${name} can redo`);
+    }
+    await h.framework.switchBranch(h.store.currentBranch().name);
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `${name}'s entry is kept`);
+      assert.equal(h.framework.redo(name).redone, true, `${name}'s redo goes ahead`);
+    }
+    assert.equal(h.framework.getAgent('mira')!.getContextManager().getPresentedMessages().length, before, "mira's window holds the turn again");
+  });
+
   /** An autobiographical strategy that folds small chunks into L1s and merges four of them into an L2, compressing only when ticked. */
   const folding = () => new AutobiographicalStrategy({
     compressionModel: 'test-model', targetChunkTokens: 200, recentWindowTokens: 300, headWindowTokens: 0, mergeThreshold: 4,
