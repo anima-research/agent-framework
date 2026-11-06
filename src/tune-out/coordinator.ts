@@ -403,7 +403,9 @@ interface DeferredCancel {
   /**
    * Its note, delivered while writes were held (heldInMemory), was lost
    * when they were stored: the framework's replay of the write threw
-   * (heldWriteLost), so the note isn't settled any more. It is told lost,
+   * (heldWriteLost), so the note isn't settled any more; or the release
+   * kept so that told its loss (lostInRelease) was, which told nothing,
+   * and this is that loss (by another cancel). It is told lost,
    * with that error, by whichever run ends the hold or drops the cancel
    * (noteNow, dropQueued), never written again; `mayBeStored`: the store
    * couldn't tell whether it landed, so it is told as one that may be lost.
@@ -1837,11 +1839,31 @@ export class TuneOutCoordinator {
    * the hold tells it lost then, with this error, as it tells a note it
    * can't write (noteNow, dropDeferred), and a stop before then tells it
    * lost with the cancel (dropQueued). The note is never written again,
-   * since it may be stored after all. Any other write is left to the
-   * operator. Never throws.
+   * since it may be stored after all. A release kept so that told a queued
+   * note's loss (`tune-out-cancel` with `lostNote`, queuedNoteFirst), lost
+   * here, told nothing: the entry it settled (lostInRelease, heldInMemory)
+   * is unsettled, that loss moved to lostAtRelease, so the run that ends
+   * the hold tells it by a notice, and the note isn't written again (AF
+   * #844 review 5, #18). The note's loss is known whether or not that
+   * release may have landed: told twice, where it did, rather than never.
+   * Any other write is left to the operator. Never throws.
    */
   heldWriteLost(metadata: Readonly<Record<string, unknown>> | undefined, error: unknown, mayBeStored = false): void {
     try {
+      if (metadata?.kind === 'tune-out-cancel' && metadata.lostNote === true && typeof metadata.epochId === 'string') {
+        for (const entry of this.deferredCancels.values()) {
+          const told = entry.lostInRelease;
+          if (entry.for.epochId !== metadata.epochId || entry.note === undefined || !entry.noteSettled || !entry.heldInMemory || !told) continue;
+          delete entry.noteSettled;
+          delete entry.heldInMemory;
+          delete entry.lostInRelease;
+          entry.lostAtRelease = told;
+          console.error(`[tune-out] the release that told the loss of the note left with the cancel of ${entry.what}, kept in memory as it was written, `
+            + `${mayBeStored ? 'may be lost' : 'is lost'}: storing it when the writes were stored threw (${thrownReason(error)}), so the note's author is told by a notice once the hold ends`);
+          return;
+        }
+        return;
+      }
       if (metadata?.kind !== 'subconscious-note' || typeof metadata.epochId !== 'string') return;
       for (const entry of this.deferredCancels.values()) {
         if (entry.for.epochId !== metadata.epochId || entry.note === undefined || !entry.noteSettled || !entry.heldInMemory || entry.lostInRelease) continue;

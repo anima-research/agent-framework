@@ -2831,3 +2831,40 @@ test("review 5 #10: the trace of a dropped cancel whose note may be stored after
     }
   }
 });
+
+test("review 5 #18: a release that told a queued note's loss, kept in memory and lost when the writes are stored, leaves the loss untold: its author is told by a notice once the hold ends", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup();
+    try {
+      const epochId = scope ? h.enterScope() : h.enter();
+      h.state.held = true;
+      if (scope) h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      failFirstRelease(h);
+      // Another cancel ends the hold first: the note can't be written, and its release, telling so, meets a hold as it is written.
+      h.state.noteFails = true;
+      h.state.keepWhenHeld = true;
+      h.listenWrites((metadata) => { if (metadata?.kind === 'tune-out-cancel') h.state.held = true; });
+      const ending = scope ? h.coordinator.cancelAllExcept('agent-tool', 'agent request') : h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request');
+      assert.deepEqual(ending, { ok: true, deferred: true }, 'premise: that release was kept in memory, so the cancel waits');
+      h.listenWrites(() => {});
+      // The release replays what the hold kept, and the replay of that release throws: the framework says so.
+      const kept = h.heldWrites.splice(0);
+      const release = kept.find((w) => w.metadata?.kind === 'tune-out-cancel' && w.metadata?.lostNote === true);
+      assert.ok(release, 'premise: the release kept in memory tells the loss');
+      h.coordinator.heldWriteLost(release.metadata, new Error('EIO: the store refused the release (test)'));
+      h.state.held = false;
+      h.state.noteFails = false;
+      h.coordinator.runDeferredCancels();
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), null, `${scope ? 'all-except' : 'channel'}: the hold ends`);
+      assert.deepEqual(h.notes(), [], 'the note is not written again');
+      assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [lostAtRelease(scope, 'the store refused the row (test).')],
+        'its author is told, by a notice, that the note was not delivered, and why, once');
+      assert.deepEqual(h.dropped().map((t) => [t.epochId, t.reason, t.noteLost]), [[epochId, 'note-undelivered', true]], 'and the loss is traced once');
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
