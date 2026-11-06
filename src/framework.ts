@@ -24164,9 +24164,14 @@ export class AgentFramework {
    * Record, at an agent's registration, the mode its requests send other
    * agents' rounds in (foreignRoundsConfigured). An agent that takes its
    * context from another (`from`: a derived agent's parent, a conversation
-   * fork's template) is sent them as that agent is, its inheritance holding
-   * what that agent's window held of them, a shared derivation's as a
-   * window and a copy's or a fork's seed as its own rows. Otherwise, an
+   * fork's template) is sent them in the mode configured for that agent,
+   * the one its window uses when presented (a source left in legacy mode by
+   * a failed write-down is sent them as stored meanwhile; a child it
+   * derives, presented, isn't), its inheritance holding what that agent's
+   * window held of them, a shared derivation's as a window and a copy's or
+   * a fork's seed as its own rows. The source is live here: the registry
+   * admits a derived agent only while its context source is, but for a
+   * resumption, which takes its configuration's mode as below. Otherwise, an
    * agent that observes another is sent them as its configuration's
    * foreignRounds says, a transcript by default, as the persistent
    * subconscious is (foreign-rounds.ts). Any other agent reads no other
