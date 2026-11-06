@@ -50,14 +50,14 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(options: { subconscious?: boolean } = {}) {
+async function boot(options: { subconscious?: boolean; miraObservesOren?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-presented-watermarks-'));
   dirs.push(dir);
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'),
     membrane: new MockMembrane().asMembrane(),
     agents: [
-      { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' },
+      { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', ...(options.miraObservesOren ? { observes: ['oren'] } : {}) },
       { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
     ],
     modules: [],
@@ -267,6 +267,20 @@ describe('read marks once windows are presented (#291)', () => {
       h.store('the event', ['mira', 'oren'], event);
       h.oren.getContextManager().addMessage('oren', text("oren's reply"), asOwnRow(undefined, 'oren'));
       assert.equal(h.internals.isNewestIn(h.mira, entry), true, "oren's row isn't in mira's window");
+    });
+
+    // AF #844 bot review 4, finding 83: an observed co-resident's own round
+    // is an arrival for the observer (bearingOf), so her next request holds
+    // it after the entry, though its stamp names only its owner.
+    it("an observed co-resident's own round stored after the entry, not yet presented, makes it not newest", async () => {
+      const h = await boot({ miraObservesOren: true });
+      h.writeDown(h.mira, h.oren);
+      const arrived = h.store('the event', ['mira', 'oren'], event);
+      h.mira.getContextManager().presentRows([arrived]);
+      assert.equal(h.internals.isNewestIn(h.mira, entry), true, 'premise: the entry is newest in her window');
+      const round = h.oren.getContextManager().addMessage('oren', text("oren's reply"), asOwnRow(undefined, 'oren'));
+      assert.equal(h.mira.getContextManager().windowStatusOf(round), 'out', 'premise: not presented to her yet');
+      assert.equal(h.internals.isNewestIn(h.mira, entry), false, "oren's round, which she observes, follows it in her next request");
     });
 
     it("a co-resident's clock row isn't this agent's last clock, nor a row not yet presented its newest", async () => {

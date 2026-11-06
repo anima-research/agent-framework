@@ -33312,9 +33312,11 @@ export class AgentFramework {
    *  is in legacy mode, its window is the slot's record, read from its
    *  newest row. Once it presents rows (#291), the window's own order
    *  decides, as the agent's next request will hold it (windowTail): the
-   *  rows presented to it, then the rows stored for it and not presented
-   *  yet, which its next start presents; a row stored in a shared slot for
-   *  another agent, such as a co-resident's own round, isn't in it. */
+   *  rows presented to it, then its own rows and its arrivals not presented
+   *  yet (bearingOf), an observed co-resident's rounds among them, which its
+   *  next start presents; a row stored in a shared slot for another agent,
+   *  such as the own round of a co-resident it doesn't observe, isn't in
+   *  it. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
     // A clock row the framework wrote after it (a turn start's, an event's),
     // or a stored context injection (any agent's, a start's), isn't a
@@ -33339,18 +33341,15 @@ export class AgentFramework {
 
   /**
    * The newest `limit` rows of a presented window as the agent's next
-   * request will hold them, newest first: the rows stored for it and not
-   * presented yet (its arrivals and own rows, whose audience names it, or
-   * unstamped ones), after the rows its window holds. A row presented later
-   * than a newer one comes after it here, as in the window.
+   * request will hold them, newest first: the rows it is owed and not
+   * presented yet (its own rows and its arrivals, one per body, as the
+   * presentation index reads them: owedOf, so an observed co-resident's
+   * round is among them), after the rows its window holds. A row presented
+   * later than a newer one comes after it here, as in the window.
    */
   private windowTail(agent: Agent, limit: number): StoredMessage[] {
     const cm = agent.getContextManager();
-    const meantFor = (m: StoredMessage): boolean => {
-      const stamp = audienceOf(m.metadata);
-      return stamp === undefined || stamp.audience.includes(agent.name);
-    };
-    const pending = cm.getUnpresentedMessages().filter(meantFor);
+    const pending = this.presentation?.owedOf(agent) ?? [];
     const tail: StoredMessage[] = [];
     for (let i = pending.length - 1; i >= 0 && tail.length < limit; i--) tail.push(pending[i]!);
     const presented = cm.getPresentedMessages();
