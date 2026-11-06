@@ -2148,23 +2148,28 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual([...(surface.asked.at(-1)?.context.openedBy?.messages ?? [])].sort(), ['m-first', 'm-second']);
   });
 
-  it("three parked pushes with one key, a plain one, a silent heartbeat's and another plain one, name both plain pushes' messages at resume, the first's carried on by the silent push the park kept between them", async () => {
+  it("three pushes parked with one key for an agent their messages aren't written to, a plain one, a silent heartbeat's and another plain one, name both plain pushes' messages at resume, the first's carried on by the silent push the park kept between them", async () => {
     const surface = new Surface();
     const membrane = new MockMembrane();
-    const f = await host([surface], membrane);
+    const f = await host([surface], membrane, {}, true, {
+      agents: [
+        { name: 'resident', model: 'test-model', systemPrompt: 'Resident.', proseRouting: 'locus' },
+        { name: 'second', model: 'test-model', systemPrompt: 'Second.', proseRouting: 'locus' },
+      ],
+    });
     await f.quiesce({ reason: 'test window' });
     const t0 = Date.now();
     const pending = internals(f).pendingRequests;
-    pending.push({ agentName: 'resident', reason: 'mcpl:push-event', source: 'discord', timestamp: t0, addressed: false, openingMessages: ['m-first'] });
-    pending.push({ agentName: 'resident', reason: 'mcpl:push-event', source: 'discord', timestamp: t0 + 10, suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } });
-    pending.push({ agentName: 'resident', reason: 'mcpl:push-event', source: 'discord', timestamp: t0 + 20, addressed: false, openingMessages: ['m-second'] });
+    pending.push({ agentName: 'second', reason: 'mcpl:push-event', source: 'discord', timestamp: t0, addressed: false, openingMessages: ['m-first'] });
+    pending.push({ agentName: 'second', reason: 'mcpl:push-event', source: 'discord', timestamp: t0 + 10, suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } });
+    pending.push({ agentName: 'second', reason: 'mcpl:push-event', source: 'discord', timestamp: t0 + 20, addressed: false, openingMessages: ['m-second'] });
     await (f as unknown as { processInferenceRequests(): Promise<void> }).processInferenceRequests();
     assert.equal(membrane.calls.length, 0, 'premise: parked while quiesced');
     assert.equal(internals(f).pendingRequests.length, 1, 'premise: coalesced into one');
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi.' }]));
     await f.resume();
     await f.runUntilIdle();
-    assert.deepEqual(surface.asked.at(-1)?.context.openedBy?.messages, ['m-first', 'm-second']);
+    assert.deepEqual(surface.asked.filter((a) => a.agent === 'second').at(-1)?.context.openedBy?.messages, ['m-first', 'm-second']);
   });
 
   it('two equal wakes a provider hold keeps as one name both their messages at its release', async () => {
