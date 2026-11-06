@@ -15028,10 +15028,12 @@ export class AgentFramework {
     // n messages are counted back from the newest of the agent's window on a
     // presented one (#291), where branchAt cuts at the write that presented
     // the target: rows the cut keeps return to arrivals (returnedToArrivals),
-    // which wait for the agent's next turn start (an own row among them
-    // re-enters at the surgery's release; the hold is in memory, so a
-    // restart presents them at its pass at rest), and rows presented with
-    // the target stay (keptInWindowAfterTarget).
+    // which wait for the agent's next turn start on the rollback's branch
+    // (an own row among them re-enters at the surgery's release; a later
+    // move of the store's branch ends the hold; it is in memory, so a
+    // restart presents them at its pass at rest, or at the resume where it
+    // boots quiesced), and rows presented with the target stay
+    // (keptInWindowAfterTarget).
     if (typeof params.messages === 'number' && params.messages > 0) {
       const agent = this.agents.get(agentName)!;
       if (agent.state.status !== 'idle') {
@@ -16814,10 +16816,13 @@ export class AgentFramework {
      * start, which presents them after what its window holds then: the
      * surgery's release, a resume, the agent's turn ending or a row
      * stored for it while it is idle don't bring them back, so the cut
-     * holds until the agent speaks again. An own row of the agent's among
+     * holds until the agent speaks again, on the rollback's branch: a later
+     * move of the store's branch, a suppression or rollback through another
+     * agent included, ends it. An own row of the agent's among
      * them is the exception: it re-enters at the surgery's release, as own
      * rows enter at every point. The hold is in memory: a restart before
-     * then presents them at its pass over every agent at rest. Not counted
+     * then presents them at its pass over every agent at rest, or, where it
+     * boots quiesced, at the resume. Not counted
      * in `messagesRemoved`, and not marked. Set only on a presented window.
      */
     returnedToArrivals?: number;
@@ -17219,8 +17224,11 @@ export class AgentFramework {
    * the target: they leave the window (`returnedToArrivals`, named by
    * `returnedIds`); the agent's own rows among them enter it again at its
    * next presentation point (the surgery's release), and the rest, as
-   * arrived and not presented, at the agent's next turn start (the hold is
-   * in memory: a restart presents them at its pass at rest). The rows of
+   * arrived and not presented, at the agent's next turn start on the
+   * rollback's branch (a later move of the store's branch, a suppression or
+   * rollback through another agent included, ends the hold; it is in
+   * memory: a restart presents them at its pass at rest, or, where it boots
+   * quiesced, at the resume). The rows of
    * the agent's window after the
    * target that the write presenting it presented too (`keptInWindow`, a
    * batch: one write, one presentation point) stay in the window, since no

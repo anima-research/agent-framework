@@ -882,8 +882,10 @@ target leave the window (`returnedToArrivals`, on the result and the
 preview). The agent's own rows among them enter it again at its next
 presentation point, the surgery's release; the rest wait outside it until
 the agent's next turn start, so for them the cut holds until the agent
-speaks again. That hold is in memory: a restart before then presents them
-at its pass over every agent at rest. Rows that one write presented together with
+speaks again, on the rollback's branch: a later move of the store's branch,
+a suppression or rollback through another agent included, ends it. That hold
+is in memory: a restart before then presents them at its pass over every
+agent at rest, or, where it boots quiesced, at the resume. Rows that one write presented together with
 the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot

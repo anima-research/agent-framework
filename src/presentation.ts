@@ -980,9 +980,12 @@ export class AgentPresentation {
    * A tool boundary isn't held back (a turn alive started since). An own
    * row among them isn't held: own rows enter at every point, as ever. The
    * hold is the branch's the store is on (the rollback's): on another
-   * branch the same stored rows are arrivals as any, and back on this one
-   * they are held again until the agent's next turn start. In memory: a
-   * restart presents them at its pass at rest, and an agent let go (forget)
+   * branch the same stored rows are arrivals as any, so a later move of the
+   * store's branch, a suppression or rollback through another agent
+   * included, ends it there, and back on this one they are held again until
+   * the agent's next turn start. In memory: a restart presents them at its
+   * pass at rest, or, where it boots quiesced, at the resume (a frozen pass
+   * presents no arrival), and an agent let go (forget)
    * drops them. Rows given again on the same branch add to those held, and
    * on another replace them. Never throws.
    */
