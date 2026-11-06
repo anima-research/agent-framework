@@ -354,7 +354,7 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("a provider hold that keeps one of two equal gate wakes keeps both batches' channels", async () => {
+  it("a provider hold that keeps a silent push carrying channels and folds an equal plain push into it keeps both pushes' channels", async () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'held.chronicle'),
       membrane: membrane.asMembrane(),
@@ -369,11 +369,18 @@ describe('Turn trigger provenance', () => {
     const timer = setTimeout(() => {}, 60_000);
     try {
       i.providerAccelerationCooldowns.set('scout', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'test hold', failures: 1 });
-      const wake = (channelId: string) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now, wakeChannels: [{ serverId: 'discord', channelId }] });
-      i.pendingRequests.push(wake('discord:g:a'), wake('discord:g:b'));
+      // The silent push's channels stand for those a quiesce's park writes
+      // onto a silent push that absorbed a plain one.
+      const push = (channelId: string, silent: boolean) => ({
+        agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: now, addressed: false,
+        ...(silent ? { suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } } : {}),
+        wakeChannels: [{ serverId: 'discord', channelId }],
+      });
+      i.pendingRequests.push(push('discord:g:a', true), push('discord:g:b', false));
       await framework.runUntilIdle();
-      const held = i.providerAccelerationCooldowns.get('scout')!.heldRequests;
-      assert.equal(held.length, 1, 'premise: the hold keeps one of the two equal wakes');
+      const held = i.providerAccelerationCooldowns.get('scout')!.heldRequests as Array<{ wakeChannels?: unknown; suppressProse?: unknown }>;
+      assert.equal(held.length, 1, 'premise: the hold keeps one of the two equal pushes');
+      assert.equal(held[0]!.suppressProse, true, 'premise: the hold keeps the silent push it held first');
       assert.deepEqual(held[0]!.wakeChannels, [{ serverId: 'discord', channelId: 'discord:g:a' }, { serverId: 'discord', channelId: 'discord:g:b' }]);
     } finally {
       clearTimeout(timer);
