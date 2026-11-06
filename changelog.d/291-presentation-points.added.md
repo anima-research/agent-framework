@@ -44,9 +44,12 @@
   redone, or finished by another undo. A redo is refused on another branch than its undo's, where
   `getUndoRedoState().canRedo` is false, and every branch move the framework makes drops the redo entries. A stored
   injection whose copy an undo took out of the window is stored again at the next start.
-- `WorkspaceModule.useWindow(lookup)`: how the framework tells the workspace whether an agent's window still holds
-  the turn that wrote a mount direct, so the head-move notice follows an undo that moves no branch. A turn an earlier
-  release stored, with no audience stamp, is the agent's by the rule the undo takes it out by (its voice).
+- `WorkspaceModule.useWindow(lookup, turnAlive?)`: how the framework tells the workspace whether an agent's window
+  still holds the turn that wrote a mount direct, so the head-move notice follows an undo that moves no branch. A turn
+  an earlier release stored, with no audience stamp, is the agent's by the rule the undo takes it out by (its voice).
+  A write made while no turn of the agent's is alive (a host's `executeToolCall` naming the agent) is judged by the
+  branch's position alone, as `turnAlive` tells the workspace: an undo of a later turn, which holds nothing of the
+  write, gives no notice. The saved positions carry that mark (`outsideTurn`).
 - A gate batch whose delivery throws once it has woken some of its agents (a debounced batch, one held for a turn or
   the quiesce, a judged one) logs whom it woke, and that it is dropped for the others, who aren't woken, a batch
   naming no agent as well as one naming its agents; it was logged as dropped whole.

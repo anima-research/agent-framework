@@ -8080,9 +8080,16 @@ export class AgentFramework {
       });
     }
     // With the presentation index an undo moves no branch: the workspace asks
-    // the window whether the turn that wrote is still in it.
+    // the window whether the turn that wrote is still in it, for a write made
+    // while a turn of the agent's was alive.
     if (this.presentation && workspace === module && typeof workspace.useWindow === 'function') {
-      workspace.useWindow((agentName, afterSequence) => this.windowHoldsOwnRowsAfter(agentName, afterSequence));
+      workspace.useWindow(
+        (agentName, afterSequence) => this.windowHoldsOwnRowsAfter(agentName, afterSequence),
+        (agentName) => {
+          const agent = this.agents.get(agentName);
+          return !!agent && this.logicalTurnAlive(agent);
+        },
+      );
     }
     this.emitTrace({ type: 'module:added', moduleName: module.name });
   }
@@ -24046,8 +24053,9 @@ export class AgentFramework {
   /**
    * For the workspace's head-move notice (useWindow): whether `agentName`'s
    * window still holds the first of its own rows stored after
-   * `afterSequence`, the store's head when it wrote a mount direct, which is
-   * the round that made the write. An undo on the window leaves the record
+   * `afterSequence`, the store's head when it wrote a mount direct during a
+   * turn of its, which is the round that made the write (one made outside
+   * any turn isn't asked here). An undo on the window leaves the record
    * and the branch as they were and takes the turn's own rows out of the
    * window as undone, so this is where the agent's history no longer holds
    * the write. True for an agent the index doesn't present for, and where
