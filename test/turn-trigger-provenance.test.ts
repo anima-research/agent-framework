@@ -2675,7 +2675,19 @@ describe('private wins, one way', () => {
 
     describe("a private surface's message stored for one resident while another resident's channel start compiles, after the compile read the store", () => {
       const compileRig = async () => {
-        const rig = await surfaceRig({ otherAgents: ['aide'] });
+        const gathering: Array<() => void> = [];
+        const gatherer = {
+          name: 'gatherer',
+          async start() {}, async stop() {},
+          getTools: () => [],
+          async handleToolCall() { return { success: true }; },
+          async onProcess() { return {}; },
+          async gatherContext(agentName: string) {
+            if (agentName === 'aide') gathering.shift()?.();
+            return [];
+          },
+        } as unknown as Module;
+        const rig = await surfaceRig({ otherAgents: ['aide'], modules: [gatherer] });
         const aide = rig.framework.getAgent('aide')! as unknown as { startStreamWithInjections: (...args: unknown[]) => Promise<unknown> };
         const compile = aide.startStreamWithInjections.bind(aide);
         const during: Array<() => void> = [];
@@ -2700,7 +2712,7 @@ describe('private wins, one way', () => {
           .addMessage('user', [{ type: 'text', text }], { inboundSource: { kind: 'surface', surface: 'tui', acceptedAt: Date.now() } });
         const note = () => ((rig.framework as unknown as { store: { getStateJson(id: string): unknown } }).store
           .getStateJson('framework/state') as { privateInputWaiting?: Record<string, unknown> } | null)?.privateInputWaiting?.aide;
-        return { rig, during, compiles: () => compiles, aideStarts, aideTurn, store, note };
+        return { rig, during, gathering, compiles: () => compiles, aideStarts, aideTurn, store, note };
       };
 
       it('makes that start compile again, private, before it sends anything, and leaves the next channel turn in its channel', async () => {
@@ -2737,6 +2749,27 @@ describe('private wins, one way', () => {
           assert.equal(compiles() - ran, 2, 'it compiled twice');
           assert.equal(aideStarts() - starts, 1, 'as one start');
           assert.ok(!JSON.stringify(rig.membrane.calls.at(-1)).includes('and this one too'), "control: its request didn't hold the second message");
+          assert.equal(note(), true, 'the stored note says input waits');
+          assert.deepEqual(await aideTurn(), [], 'the next start speaks in no channel');
+          assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('and this one too'), "control: the next start's request held the second message");
+          assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await rig.close();
+        }
+      });
+
+      it('compiles once a start already private before its compile, and keeps the next start out of every channel', async () => {
+        const { rig, during, gathering, compiles, aideTurn, store, note } = await compileRig();
+        try {
+          assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+          const ran = compiles();
+          gathering.push(() => { store('for your eyes only'); });
+          during.push(() => { store('and this one too'); });
+          assert.deepEqual(await aideTurn(), [], 'the start speaks in no channel');
+          assert.equal(compiles() - ran, 1, 'it compiled once');
+          const request = JSON.stringify(rig.membrane.calls.at(-1));
+          assert.ok(request.includes('for your eyes only'), 'control: its request held the message stored while it gathered its context');
+          assert.equal(request.split(PRIVATE_FROM_HERE).length - 1, 1, 'and told it once that the turn is private');
           assert.equal(note(), true, 'the stored note says input waits');
           assert.deepEqual(await aideTurn(), [], 'the next start speaks in no channel');
           assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('and this one too'), "control: the next start's request held the second message");
