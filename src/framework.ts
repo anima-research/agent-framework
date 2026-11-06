@@ -2655,8 +2655,10 @@ interface FrameworkWriteOptions {
    * the recipients admission delivered an inbound message to, or none
    * for one a tune-out holds. Stamped on the row as `metadata.audience`
    * (dendrite/audience.ts). Absent, the row is for nobody when its
-   * metadata carries a tune-out's hold; else for `forAgent` when the
-   * write names one; else, a write that names no agent, for the
+   * metadata carries a tune-out's hold, unless `forAgent` names an agent
+   * whose own view keeps held traffic, which it is for (defaultAudience);
+   * else for `forAgent` when the write names one; else, a write that names
+   * no agent, for the
    * agents that take untargeted inbound in the slot it lands in
    * (untargetedAudience): every resident on a residents' host.
    */
@@ -10061,7 +10063,10 @@ export class AgentFramework {
   /**
    * Store, once, the context writes a release before #291 left queued
    * (src/deferred-import.ts reads its record), and clear the record. One
-   * release only: the release after this one deletes it.
+   * release only: the release after this one deletes it. A host boots this
+   * release until its record is empty (the `deferred-import` alert says
+   * when writes stay queued, such as those for an agent a move cut), and
+   * doesn't upgrade past it from a release that kept a queue.
    *
    * Such a release held a write while its agent's turn was alive or the host
    * was quiesced, and mirrored the queue to its recovery file (or the
@@ -10309,7 +10314,8 @@ export class AgentFramework {
       this.importLeftQueued = kept;
       console.error(`[host-mode] the store did not sync after the deferred-write import, so ${file ?? DEFERRED_WRITES_ID} is left as it was; the next boot skips the writes that landed:`, error);
       this.opsAlert('deferred-import', 'framework',
-        `the store did not sync after importing an earlier version's deferred writes, so their record is left as it was: ${reason}`,
+        `the store did not sync after importing an earlier version's deferred writes, so their record is left as it was; the writes ` +
+          `imported may not be on disk, and the next boot imports again any that didn't land, skipping those that did, once the store syncs: ${reason}`,
         { data: { record: file ?? DEFERRED_WRITES_ID } });
       return outcome;
     }
@@ -24268,10 +24274,12 @@ export class AgentFramework {
    * into rows the write-down presented), so a branch move doesn't end it.
    * One whose window couldn't be written down (another version's index
    * format, or a failed write), or whose context couldn't follow a branch
-   * move, stays in legacy mode until the next move, its window the whole
-   * record, traced as presentation:failed; the paths that ask this pass it
-   * by: nothing is presented for it, its tool boundaries hear nothing, and
-   * undo refuses it.
+   * move, stays unpresented until the next move (legacy mode: its window
+   * the whole record where the branch has none, or as the new branch holds
+   * it, writes for it then waiting in memory), traced as
+   * presentation:failed; the paths that ask this pass it by: nothing is
+   * presented for it, its tool boundaries hear nothing, and undo refuses
+   * it.
    */
   private presents(agent: Agent | undefined): boolean {
     return !!agent && !!this.presentation?.presenting(agent);
@@ -27264,9 +27272,10 @@ export class AgentFramework {
     if (assembled && !this.quiesced && this.presents(agent)) this.presentation!.presentAtStart(agent, 'assembly');
 
     // The batched-wake lines the gate left to this start (WakeLine), decided
-    // now that the turn's inputs are in and before its checkpoint: on the
-    // delivery agent's own start (a co-resident's places none,
-    // placeWakeLines), from here to the compile an arrival into its window is
+    // now that the turn's inputs are in and before its checkpoint: on each
+    // start of an agent the wake is for whose window presents, and for an
+    // agent whose window is the record, on the delivery agent's alone
+    // (placeWakeLines), from here to the compile an arrival into its window is
     // deferred past this request. Not on a start that resumes a logical turn,
     // as the flushes above: it takes in no new input. Each line is written at
     // most once (placeWakeLines); one left out is decided again by a later
@@ -34482,9 +34491,9 @@ export class AgentFramework {
    * window holds it. The view is the one its context was opened with, as
    * recorded for it (agentSees, main's #853: liveViewFilterOf's choice,
    * through the agent a shared derivation's view came from): a resident's
-   * leaves out held traffic and the other agents' stored context
-   * injections, the subconscious's those injections only, and an agent
-   * opened with no view keeps every row. An agent the registry has no
+   * leaves out held traffic, the other agents' stored context injections
+   * and what a suppress rule hid, the subconscious's those injections and
+   * suppressed rows, and an agent opened with no view keeps every row. An agent the registry has no
    * record of is read through a resident's view, the one that keeps least.
    */
   private viewKeepsFor(row: StoredMessage, opts?: { forAgent?: string }): boolean {
@@ -40947,8 +40956,11 @@ export class AgentFramework {
    * recipients is for the residents that take untargeted messages, as
    * before. It goes through addMessage, which stores it at once and
    * presents it to each of them at rest or at their next point, as it does
-   * the event; a wake for it reads the row its agent is shown
-   * (readsRowFor), as the event's own wake does.
+   * the event. The wake of the agent its write's placement names reads the
+   * row (readsRowFor): the delivery agent, or, where the stamp doesn't name
+   * it, a recipient whose own slot that is (placementReaders); and so does
+   * a fork's for its own copy. A co-resident's wake beside the delivery
+   * agent stays plain, as the event's own does.
    */
   private considerWakeOnboarding(event: {
     serverId: string;
@@ -41719,9 +41731,10 @@ export class AgentFramework {
         const WINDOW = 25;
         const cm = agent.getContextManager();
         // On a presented window (#291) only the rows the agent's window
-        // holds are its context: another agent's round, a row not presented
-        // to it yet, or one undone or shed, isn't, so its images aren't
-        // either. They are walked in the window's order, and messagesBack
+        // holds are its context: a row not presented to it yet, one undone
+        // or shed, or another agent's round it doesn't observe, isn't, so
+        // its images aren't either (an observed agent's round is, below).
+        // They are walked in the window's order, and messagesBack
         // and the scan count the rows it holds.
         const presented = this.presents(agent) ? cm.getPresentedMessages() : undefined;
         const total = presented ? presented.length : cm.getMessageCount();
