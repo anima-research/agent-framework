@@ -19,7 +19,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework, tuneOutTool } from '../src/framework.js';
-import { SUBCONSCIOUS_TOOLS } from '../src/tune-out/tools.js';
+import * as readerWords from '../src/tune-out/tools.js';
+import { SUBCONSCIOUS_TOOLS, tuneOutHeldWords } from '../src/tune-out/tools.js';
 
 const descriptionOf = (tool: ReturnType<typeof tuneOutTool>) => tool.description;
 const backlogCapOf = (tool: ReturnType<typeof tuneOutTool>) =>
@@ -70,9 +71,29 @@ describe('the tune_out tool text', () => {
     framework.readerForks = false;
     framework.subconsciousConfig = { enabled: true, name: 'Muse' };
     assert.deepEqual(framework.tuneOutToolDefinition(), tuneOutTool({ kind: 'persistent', name: 'Muse' }));
+    // AF #844 review 2, #45: none runs then, which what its messages are says.
+    assert.deepEqual((framework as unknown as { tuneOutReader(): unknown }).tuneOutReader(), { kind: 'persistent', name: 'Muse', running: false });
     // A name the host supplied is marked where it would read as a notice's opening.
     framework.subconsciousAgentName = '[Tune-out: Muse';
     assert.ok(framework.tuneOutToolDefinition().description.startsWith('Hold a channel for a while: its traffic stops entering your context and stops waking you. \\[Tune-out: Muse, the reader'));
+  });
+});
+
+describe('what a held channel\'s messages are, said to the resident (AF #844 review 2, #45)', () => {
+  it('names the reader that reads them, and says none does where none runs: a hold whose release failed after its reader ended', () => {
+    assert.equal(tuneOutHeldWords({ kind: 'persistent', name: 'Muse' }), 'are held from you and read by Muse');
+    assert.equal(tuneOutHeldWords({ kind: 'forks' }), 'are held from you and read by forks of your context');
+    const none = { kind: 'persistent', name: 'Muse', running: false } as never;
+    assert.equal(tuneOutHeldWords(none),
+      "are held from you, with no reader running here to read them, until the tune-out's release, which failed, is tried again");
+    const traffic = (readerWords as unknown as { tunedOutTrafficWords?: (r: unknown) => string }).tunedOutTrafficWords;
+    assert.equal(typeof traffic, 'function', "the [tuned out] send note's words come from the same place");
+    assert.equal(traffic!({ kind: 'persistent', name: 'Muse' }), 'is still held from you, and read by Muse, until the tune-out ends.');
+    assert.equal(traffic!({ kind: 'forks' }), 'is still held from you, and read by forks of your context, until the tune-out ends.');
+    assert.equal(traffic!(none),
+      "is still held from you, with no reader running here to read it, until the tune-out's release, which failed, is tried again.");
+    // The tool's own text names the reader as configured: a new tune_out is refused then anyway.
+    assert.deepEqual(tuneOutTool(none), tuneOutTool({ kind: 'persistent', name: 'Muse' }));
   });
 });
 
@@ -88,10 +109,11 @@ describe("the reader tools' text", () => {
       'Deliver a summary into the resident\'s context: `text` arrives there verbatim (leading and trailing whitespace ' +
       'trimmed), under your own name.');
     assert.equal(described('cancel_tuneout'),
-      'End the tune-out on a channel now. The diverted backlog is delivered to the resident (capped), and the ' +
-      'channel\'s traffic reaches them as it did before the tune-out. A note in `text` arrives alongside the backlog, ' +
-      'verbatim (leading and trailing whitespace trimmed), under your own name. If you were started to read one hold, ' +
-      'you can end only that hold.');
+      'End the tune-out on a channel. The diverted backlog is delivered to the resident (capped), and the ' +
+      'channel\'s traffic reaches them as it did before the tune-out, unless the all-except hold holds it too. A note ' +
+      'in `text` arrives alongside the backlog, verbatim (leading and trailing whitespace trimmed), under your own name. ' +
+      'Where the cancel has to wait (an operator\'s change to the store, say), its answer says so, and whether your ' +
+      'note waits with it. If you were started to read one hold, you can end only that hold.');
     assert.equal(described('note_disposition'),
       'Record a standing disposition: a durable note, kept under `key` across invocations and shown to the reader ' +
       'each time it runs (e.g. key "<sender>", text "<a note on their messages>"). Replaces any previous note under ' +

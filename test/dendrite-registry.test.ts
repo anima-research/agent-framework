@@ -543,8 +543,29 @@ describe('AgentRegistry slots: where own rows go, apart from what is observed (#
     registry.register({ name: 'of-worker', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, readsSharedSlot: true, observes: [{ agent: 'worker-1' }], namespace: 'watch/o' });
     assert.deepEqual(registry.ownSlotOf('owner'), { namespace: null }, 'no observe edge explains the flag: it owns the slot, as a resident');
     assert.deepEqual(registry.ownSlotOf('watcher'), { namespace: 'watch/w' }, 'an edge on the slot: it observes it from a slot of its own');
-    assert.deepEqual(registry.ownSlotOf('of-worker'), { namespace: null }, 'an edge on another agent\'s slot doesn\'t explain the flag either');
+    // An edge with no slot read the shared slot when the flag was all there
+    // was (bot review 2, #9): it explains the flag, as the record's restore
+    // reads it (withOwnSlot), whatever agent it names.
+    assert.deepEqual(registry.ownSlotOf('of-worker'), { namespace: 'watch/o' }, 'an edge naming an agent explains the flag too');
     assert.deepEqual(registry.observersOf(RESIDENTS_SLOT), ['watcher']);
+  });
+
+  it('a spec with the deprecated readsSharedSlot and an agent-named edge gets the own slot its restored record gets (bot review 2, #9)', () => {
+    const { state, make } = persisted();
+    const roles = { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false };
+    const first = make();
+    first.register(residentSpec('resident', { primary: true }));
+    first.register({ name: 'observer', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, readsSharedSlot: true, observes: [{ agent: 'resident' }], namespace: 'watch/observer' });
+    assert.deepEqual(first.ownSlotOf('observer'), { namespace: 'watch/observer' }, 'isolated, not an owner of the shared slot');
+    assert.deepEqual(first.readersOf(RESIDENTS_SLOT), ['resident', 'observer'], 'it reads the shared slot through its edge');
+    assert.deepEqual(first.observersOf(RESIDENTS_SLOT), ['observer']);
+
+    const legacy = JSON.parse(JSON.stringify(state.snapshot)) as RegistrySnapshot;
+    for (const record of legacy.records) delete (record as Partial<AgentRecord>).ownSlot;
+    const second = make();
+    second.restore(legacy, []);
+    second.reconcile(); // no longer declared: ended, still inspectable
+    assert.deepEqual(second.inspect('observer')!.ownSlot, first.ownSlotOf('observer'), 'the spec reads as its record restores');
   });
 
   it('restores records written before own slots from what they say: a resident owns the shared slot, the subconscious observes it through its edge', () => {

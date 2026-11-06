@@ -13,6 +13,11 @@
   results; a boundary or hand-off whose read of the store throws is traced as `presentation:failed`, hears
   nothing or vouches for nothing, and the turn goes on; and a window write-down that throws once its record is
   written (a snapshot after the write failing) leaves the window presented rather than the agent in legacy mode.
+  A fresh turn start where the rows a write-down took in that aren't the agent's can't be taken out of its window
+  (their retraction failed at its registration and fails again there) fails, as a start whose presentation fails
+  does, rather than compile with them.
+  An agent whose window couldn't be written down at its registration, left in legacy mode, still has each idle
+  reader of its slot presented its own rows as it writes them.
   Two residents of one slot whose turns overlap each keep a window that is what their requests carried, so each
   request starts with the one before it and their rounds' signed thinking is sent again. A wake for a row stored where it would have been queued reads
   that row (`WritePlacement.presented` false); a write stored during a turn, the gap before a budget restart's
@@ -32,10 +37,15 @@
   is presented. A redo first takes out the rows presented since its undo, which the agent's next point presents
   after the redone turn, so undos redone in turn give back the window they took, in its order. The agent's read
   marks that covered the undone rows (consumed, shown, answered, and each destination's) cover them again once a
-  redo puts them back, so a row the redone reply answered isn't taken back as unread. An undo cut short after rows
+  redo puts them back, so a row the redone reply answered isn't taken back as unread; so does the mark each of its
+  running scripts started with, which its sends are credited with. An undo cut short after rows
   left the window (its second retraction refused) is refused with `OperatorActionError` `'failed'` and can be
   redone, or finished by another undo. A redo is refused on another branch than its undo's, where
   `getUndoRedoState().canRedo` is false, and every branch move the framework makes drops the redo entries. A stored
   injection whose copy an undo took out of the window is stored again at the next start.
 - `WorkspaceModule.useWindow(lookup)`: how the framework tells the workspace whether an agent's window still holds
-  the turn that wrote a mount direct, so the head-move notice follows an undo that moves no branch.
+  the turn that wrote a mount direct, so the head-move notice follows an undo that moves no branch. A turn an earlier
+  release stored, with no audience stamp, is the agent's by the rule the undo takes it out by (its voice).
+- A gate batch whose delivery throws once it has woken some of its agents (a debounced batch, one held for a turn or
+  the quiesce, a judged one) logs whom it woke, and that it is dropped for the others, who aren't woken, a batch
+  naming no agent as well as one naming its agents; it was logged as dropped whole.

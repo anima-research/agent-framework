@@ -589,7 +589,9 @@ export class Agent {
    * subconscious and for a resident that observes another
    * (AgentConfig.observes), as their configurations' `foreignRounds` say
    * (`'transcript'` by default); every other agent reads no other agent's
-   * rounds.
+   * rounds, but for a co-resident's rows stored before audience stamps,
+   * which a window written down from the record keeps and which go out as
+   * stored ('raw'), as earlier releases sent them.
    */
   private foreignRounds: 'raw' | 'transcript' = 'raw';
 

@@ -45,7 +45,8 @@ import type { ContentBlock } from '@animalabs/membrane';
 //   too, as does every write for it until a branch move re-initializes it, which
 //   stores them (main kept them in its queue); an agent that ends first passes
 //   on the ones the primary takes in its place.
-// - stop() has no queued write to name, persisted or not.
+// - stop() names no queue (there is none); it names the writes kept in
+//   memory, under [stop] (below).
 // - A row written past the framework enters an agent's window at its next
 //   point, so a test that reads a context such a row should be in presents it
 //   first.
@@ -587,7 +588,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.deepEqual(reinitAlerts(), []);
   });
 
-  it("the alert's remedy says a switch to the current branch re-initializes the agent and stores the writes kept in memory for it meanwhile; stop() names no queued write", async () => {
+  it("the alert's remedy says a switch to the current branch re-initializes the agent and stores the writes kept in memory for it meanwhile; stop() logs no deferral-queue line", async () => {
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
     strategy.initialize = async () => { throw new Error('injected initialization failure'); };
     const logged: string[] = [];
@@ -611,7 +612,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     } finally {
       console.error = quiet;
     }
-    assert.ok(!logged.some((line) => line.startsWith('[deferral] stop: ')), `no queued write to name: ${logged.join('\n')}`);
+    assert.ok(!logged.some((line) => line.startsWith('[deferral] stop: ')), `no deferral-queue line: ${logged.join('\n')}`);
   });
 
   // main's two tests of what stop() says of a persisted queue's record
@@ -654,6 +655,72 @@ describe('after a branch move, every agent on the store compiles without a resta
       ['b', { count: 3, keptForRecovery: 3, heldBySurgery: 0, kinds: { message: 2, 'agent-message': 1 }, mail: 1 }],
     ]);
     assert.ok(framework.listHeldMail().some((held) => held.id === mail.mailId), 'the mail stays held for the next boot');
+  });
+
+  // AF #844 bot review 2, finding 91.
+  it('the writes kept for two agents whose managers refuse their work are stored in the order they arrived, across the agents', async () => {
+    let failing = 2;
+    for (const name of ['a', 'b']) {
+      const strategy = cmOf(name).getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+      const initialize = strategy.initialize.bind(strategy);
+      strategy.initialize = async (...args: unknown[]) => {
+        if (failing > 0) { failing--; throw new Error('injected initialization failure'); }
+        return initialize(...args);
+      };
+    }
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+      assert.deepEqual(reinitAlerts().map((alert) => alert.agentName).sort(), ['a', 'b'], 'setup: both refuse their work');
+      const order: Array<[string, string]> = [['a', 'A1'], ['b', 'B1'], ['a', 'A2']];
+      for (const [name, words] of order) {
+        assert.equal(courier.addMessage('courier', text(words), undefined, { forAgent: name }), '', `setup: ${words} kept in memory`);
+      }
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+      const sequenceOf = (name: string, words: string) => cmOf(name).getAllMessages()
+        .find((m) => m.content.some((block) => block.type === 'text' && block.text === words))?.sequence;
+      const sequences = order.map(([name, words]) => sequenceOf(name, words));
+      assert.ok(sequences.every((s) => s !== undefined), `all stored: ${JSON.stringify(sequences)}`);
+      assert.ok(sequences.every((s, i) => i === 0 || s! > sequences[i - 1]!), `stored A1, B1, A2: ${JSON.stringify(sequences)}`);
+    } finally {
+      console.error = quiet;
+    }
+  });
+
+  // AF #844 bot review 2, finding 53.
+  it("stop() names a write an alert's listener makes for an agent whose manager refuses its work, after the writes it named", async () => {
+    const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    strategy.initialize = async () => { throw new Error('injected initialization failure'); };
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', 'for b, during the hold');
+      pass.open();
+      await pass.switched;
+      let wrote = false;
+      let probe: unknown;
+      framework.onTrace((event) => {
+        if (wrote || event.type !== 'ops:alert' || event.kind !== 'store-held-lost') return;
+        wrote = true;
+        // The framework's own write path (a host's listener), modules being stopped by then.
+        probe = (framework as unknown as { addMessage(p: string, c: unknown[], m: undefined, o: { forAgent: string }): string })
+          .addMessage('courier', text("for b, from the alert's listener"), undefined, { forAgent: 'b' });
+      });
+      await framework.stop();
+      assert.ok(wrote, "setup: the listener wrote at stop's alert");
+      assert.equal(probe, '', 'setup: the write is kept in memory for b');
+    } finally {
+      console.error = quiet;
+    }
+    const lines = logged.filter((line) => line.startsWith('[stop] '));
+    assert.equal(lines.length, 2, `the listener's write is named too: ${lines.join('\n')}`);
+    says(lines[1]!, '[stop] agent=b: 1 write for b kept in memory is not stored by this stop');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.deepEqual(lost.map((alert) => (alert.data as { count: number }).count), [1, 1]);
   });
 
   it("stop() names the writes a surgery's hold still keeps when the surgery outlives its wait", async () => {
@@ -1090,13 +1157,33 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it('a hold let go before its threshold says nothing after it', async () => {
-    shortenHoldAlert(1_000);
+    // The hold's watchdog is a wall-clock timer. Find the one the hold arms,
+    // by a threshold no switch reaches, and whether its release clears it,
+    // rather than trust the switch to end within a second's threshold.
+    const threshold = 987_654;
+    shortenHoldAlert(threshold);
+    const armed: Array<ReturnType<typeof setTimeout>> = [];
+    const cleared = new Set<unknown>();
+    const { setTimeout: realSet, clearTimeout: realClear } = globalThis;
+    globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      const handle = realSet(fn, ms, ...args);
+      if (ms === threshold) armed.push(handle);
+      return handle;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((handle?: Parameters<typeof clearTimeout>[0]) => {
+      cleared.add(handle);
+      realClear(handle);
+    }) as typeof clearTimeout;
     const before = longHoldAlerts().length;
-    await framework.switchBranch(framework.getStore().currentBranch().name);
-    const atRelease = longHoldAlerts().length;
-    assert.equal(atRelease, before, 'nothing while it was held: it was let go before its threshold');
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-    assert.equal(longHoldAlerts().length, atRelease, 'its timer went with the hold');
+    try {
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+    } finally {
+      globalThis.setTimeout = realSet;
+      globalThis.clearTimeout = realClear;
+    }
+    assert.equal(armed.length, 1, 'the hold armed its watchdog');
+    assert.equal(cleared.has(armed[0]), true, 'its timer went with the hold: the release cleared it');
+    assert.equal(longHoldAlerts().length, before, 'nothing while it was held: it was let go before its threshold');
   });
 
   it('a suppression whose fork switches the store and then fails restores the source, and the other agent is current', async () => {
@@ -2343,7 +2430,7 @@ describe('conversation forks and a branch move', () => {
       assert.equal(count(storedTexts(early), prompt), 0, 'the closure prompt is not written into the fork during the hold');
       pass.open();
       await moving;
-      internals.lastConversationSweep = 0;
+      assert.equal(internals.lastConversationSweep, 0, 'the held sweep did not count');
       internals.sweepExpiredConversations();
       const texts = storedTexts(early);
       assert.ok(texts.indexOf(prompt) > texts.indexOf('early own'), `its own history, then the closure prompt: ${JSON.stringify(texts)}`);
@@ -3385,6 +3472,7 @@ describe('the window follows a branch move (#291)', () => {
     } finally {
       mira.initializeStrategy = initializeStrategy;
     }
+    assert.equal(failNext, false, "the switch's re-initialization of mira was the step that failed");
     assert.equal(h.store.currentBranch().name, main);
     for (const name of ['mira', 'oren']) {
       assert.equal(h.internals.presents(h.framework.getAgent(name)!), true, `${name} presents`);
@@ -3402,8 +3490,9 @@ describe('the window follows a branch move (#291)', () => {
     const mira = h.cm('mira') as unknown as { removeMessage: (...args: unknown[]) => void; removeMessages: (...args: unknown[]) => void };
     const removeMessage = mira.removeMessage;
     const removeMessages = mira.removeMessages;
-    mira.removeMessage = () => { throw new Error('zz-removal-failed'); };
-    mira.removeMessages = () => { throw new Error('zz-removal-failed'); };
+    let removals = 0;
+    mira.removeMessage = () => { removals++; throw new Error('zz-removal-failed'); };
+    mira.removeMessages = () => { removals++; throw new Error('zz-removal-failed'); };
     try {
       await assert.rejects(
         h.framework.suppressMessages('mira', { messageIds: [target], branchName: 'zz-partly-suppressed' }),
@@ -3413,6 +3502,7 @@ describe('the window follows a branch move (#291)', () => {
       mira.removeMessage = removeMessage;
       mira.removeMessages = removeMessages;
     }
+    assert.ok(removals > 0, 'the removals were the step that failed');
     assert.equal(h.store.currentBranch().name, main);
     for (const name of ['mira', 'oren']) {
       assert.equal(h.cm(name).windowStatusOf(target), 'in', `the row stays in ${name}'s window on the source`);

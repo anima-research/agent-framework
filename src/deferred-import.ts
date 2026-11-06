@@ -93,7 +93,8 @@ export function deferredWritesRefusal(record: DeferredWritesRecord, problem: str
   const { file, slotId } = record;
   return new Error(
     `the deferred context writes (${file ?? slotId}) ${problem}. The framework doesn't start without them: an earlier ` +
-      `version left them queued, and they are stored at boot, ahead of anything newer. ` +
+      `version left them queued, and they are stored at boot, ahead of anything written once the modules have ` +
+      `started. ` +
       (file
         ? `The file is unchanged, and the framework starts once ${cause === undefined
           ? 'it holds a queue of writes, such as {"version":1,"pending":[]} for none. Removing it reads the queue ' +

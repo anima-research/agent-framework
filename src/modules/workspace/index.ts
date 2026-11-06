@@ -5161,9 +5161,10 @@ export class WorkspaceModule implements Module {
    * Whether the store's current branch holds what came before a direct
    * write: it's the write's branch, or continues it with every fork point on
    * the way after `after`, the store's head when the write landed. A fork at
-   * exactly `after` doesn't: an undo forks at its turn's sequenceBefore,
-   * which is the head at the write when nothing was recorded in the turn
-   * before it. A missing branch or one without fork metadata holds nothing,
+   * exactly `after` doesn't: a rollback cut there (to the row the write
+   * followed) leaves the write out, as an undo's fork at its turn's
+   * sequenceBefore did before #291 (an undo moves no branch since). A
+   * missing branch or one without fork metadata holds nothing,
    * as for the materialize guard (isLinearContinuation).
    */
   private holdsPosition({ branchId, after }: DirectHead): boolean {

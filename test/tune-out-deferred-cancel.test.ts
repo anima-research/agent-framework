@@ -20,7 +20,7 @@ function saysWhatItWaitsFor(note: string): void {
   assert.match(note, /an operator's change to the store/, `names a surgery's hold: ${note}`);
   assert.match(note, /refuses writes until the host re-initializes it/, `names a refusing context: ${note}`);
   assert.doesNotMatch(note, /writes (are |kept |held )?(in memory|stored)/, `doesn't say it waits for writes: ${note}`);
-  assert.match(note, /Cancelling again doesn't end the wait sooner, and how long it lasts isn't known here/, `says asking again won't end it: ${note}`);
+  assert.match(note, /Cancelling again doesn't end the wait sooner while that lasts, and how long it lasts isn't known here/, `says asking again won't end it: ${note}`);
   assert.doesNotMatch(note, /Nothing you can do/, `claims nothing of the host's other tools: ${note}`);
   assert.match(note, /If the host stops before then, the cancel is lost/, `says a stop loses it: ${note}`);
 }
@@ -337,9 +337,11 @@ async function noteWaitingAfterFailedRelease() {
   assert.equal(answer.success, true, answer.error);
   assert.equal(waiting(answer).waiting, true, 'premise: accepted as waiting');
   const commit = fw.commitDeliveries.bind(fw);
-  fw.commitDeliveries = () => false;
+  let commits = 0;
+  fw.commitDeliveries = () => { commits++; return false; };
   release();
   fw.commitDeliveries = commit;
+  assert.ok(commits > 0, "premise: the waiting cancel ran at the release, and its release's durability check was asked (review 2, #106)");
   assert.equal(registry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'premise: the first release failed its durability check, the tune-out stays in force');
   assert.ok(!has(f, 'Someone asked for you.'), 'premise: the note is not delivered');
   return { f, fw, sub, epochId, coordinator, release };
@@ -670,7 +672,7 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
     }
   });
 
-  it("the cancel the subconscious asked for ran, its release stored, and its end's record failed, then a crash: the row says it ran and that its note did not go out (Weft, finding 2)", async () => {
+  it("the cancel the subconscious asked for ran, its release stored, and its end's record failed, then a crash: the row says it ran, its note with it, which goes out before the end (Weft, finding 2; review 2 #25)", async () => {
     const errors = mock.method(console, 'error', () => {});
     const { f, sub, epochId } = await heldWithPrimer();
     try {
@@ -697,7 +699,7 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
       await f.create();
       assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [
         `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${epochId}). The cancel of it you `
-        + 'asked for ran: its release reached agent, but the note you left with it, "Antra asked for you in #noisy.", did not. Its end '
+        + 'asked for ran: its release reached agent, with the note you left with it. Its end '
         + 'was not recorded, so that tune-out is still in force.]',
       ]);
     } finally {
@@ -816,6 +818,31 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
       guardOf('agent').append(staged('y', { waiting: true }));
       const read = (f.framework as unknown as { subconsciousGuardedResults(): Map<string, unknown> }).subconsciousGuardedResults();
       assert.deepEqual([...read.entries()], [['x', JSON.stringify({ waiting: true, serverId: 'editor' })]]);
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
+  // AF #844 bot review 2, finding 90.
+  it("a staged audit record whose blob is missing, unreadable or isn't JSON is logged, naming the agent and the blob, and read as absent", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub } = await heldWithPrimer();
+    try {
+      type Appending = { append(record: Record<string, unknown>): void };
+      const guard = (f.framework.getAgent(sub) as unknown as { toolResultGuard: Appending }).toolResultGuard;
+      const garbled = f.framework.getStore().storeBlob(Buffer.from('not json {'), 'application/json');
+      const gone = '0'.repeat(64);
+      guard.append({ type: 'staged', batchId: 'b-gone', content: { blobId: gone } });
+      guard.append({ type: 'staged', batchId: 'b-bad-id', content: { blobId: 'not-a-hash' } });
+      guard.append({ type: 'staged', batchId: 'b-garbled', content: { blobId: garbled } });
+      errors.mock.resetCalls();
+      const read = (f.framework as unknown as { subconsciousGuardedResults(): Map<string, unknown> }).subconsciousGuardedResults();
+      assert.deepEqual([...read.entries()], [], 'neither is read');
+      const lines = errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
+      for (const blob of [gone, 'not-a-hash', garbled]) {
+        assert.ok(lines.some((l) => l.includes(sub) && l.includes(blob)), `logged, naming ${blob}: ${lines.join('\n')}`);
+      }
     } finally {
       errors.mock.restore();
       await f.close();

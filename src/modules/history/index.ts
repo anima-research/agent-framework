@@ -1567,14 +1567,28 @@ export class HistoryModule implements Module {
     }
     const candidatePoolSize = windowMessages.length;
     const byAuthor = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
-    // A row left out for the caller (viewFor) is no candidate.
-    const candidates = view ? byAuthor.filter((m) => !view.leaves(m)) : byAuthor;
-    const leftOut = byAuthor.length - candidates.length;
-    const poolInfo = {
-      candidatePoolSize,
-      ...(authorFilter ? { afterAuthorFilter: byAuthor.length } : {}),
-      ...(leftOut > 0 ? { leftOut } : {}),
-      order,
+    // A row left out for the caller (viewFor) is no candidate. Beside each
+    // candidate, how many were left out before it.
+    const candidates: StoredMessage[] = [];
+    const leftOutBefore: number[] = [];
+    let leftOutOfPool = 0;
+    for (const m of byAuthor) {
+      if (view?.leaves(m)) { leftOutOfPool++; continue; }
+      candidates.push(m);
+      leftOutBefore.push(leftOutOfPool);
+    }
+    // A scan stopped at `limit` resumes after its last scanned candidate, so
+    // the rows left out past it are the next call's to count, as extract's
+    // page-full stop counts them (leftOutAtPage): counts add up across a
+    // chain of resumes.
+    const poolInfo = (scanned: number) => {
+      const leftOut = scanned > 0 && scanned < candidates.length ? leftOutBefore[scanned - 1]! : leftOutOfPool;
+      return {
+        candidatePoolSize,
+        ...(authorFilter ? { afterAuthorFilter: byAuthor.length } : {}),
+        ...(leftOut > 0 ? { leftOut } : {}),
+        order,
+      };
     };
     // Where the scan stopped, when it stopped before the end of the window
     // the caller asked about: either `limit` matches came first (the rest of
@@ -1643,7 +1657,7 @@ export class HistoryModule implements Module {
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
       const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit, view);
-      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches } };
+      return { success: true, data: { scanned, ...poolInfo(scanned), truncated, ...resumeInfo(scanned, matches.length), matches } };
     }
 
     // Plain substring search (String.prototype.indexOf) is inherently
@@ -1676,7 +1690,7 @@ export class HistoryModule implements Module {
 
     return {
       success: true,
-      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches },
+      data: { scanned, ...poolInfo(scanned), truncated, ...resumeInfo(scanned, matches.length), matches },
     };
   }
 
@@ -2664,13 +2678,15 @@ function mergeForeignIntoGap(
 /** The sentence extract's and search's descriptions gain with the window lookup (getTools). */
 const WINDOW_NOTE =
   ' A message that isn\'t in your context carries `window`: "undone" for one an undo or a refusal rewind took ' +
-  'out of it, "not-shown" for one you were never shown; another agent\'s own turns and notes that aren\'t in your ' +
-  'context are left out unless you observe that agent, and how many were is `leftOut`.';
+  'out of it, "not-shown" for one not in your context now, never shown to you or returned by an undo or rollback ' +
+  'to be shown again; another agent\'s own turns and notes that aren\'t in your context are left out unless you ' +
+  'observe that agent, and how many were is `leftOut`.';
 
 /** semantic_search's form of it. */
 const WINDOW_NOTE_SEMANTIC =
   ' A message hit that isn\'t in your context carries `window` ("undone" for one an undo or a refusal rewind took ' +
-  'out of it, "not-shown" for one you were never shown); another agent\'s own turns and notes that aren\'t in your ' +
+  'out of it, "not-shown" for one not in your context now, never shown to you or returned by an undo or rollback ' +
+  'to be shown again); another agent\'s own turns and notes that aren\'t in your ' +
   'context are left out unless you observe that agent, and so are summary hits when the summaries fold another ' +
   'agent\'s context (the one this history is bound to) and you don\'t observe that agent, all counted in ' +
   'index.leftOut.';

@@ -32,7 +32,7 @@
   or "reach the subconscious"; and tune_out with no reader said "this host has no subconscious resident to watch a
   channel". Now the messages "are held from you and read by <name>" (a persistent reader, by the name it runs
   under) or "… read by forks of your context" (reader forks); they "reach <name>" or "the reader"; and the refusals
-  say "No reader is configured here". A reader's `cancel_tuneout` gave its cancel the reason "subconscious judgment", which the
+  say "No reader is running here". A reader's `cancel_tuneout` gave its cancel the reason "subconscious judgment", which the
   resident read in "[Tune-out: … cancelled — subconscious judgment, N wakes]", the reader in its cancel notice, the
   excepted channel in an all-except hold's release line, and a host in the `tune-out:cancelled` trace; the reason is
   now "by <name>", the reader's name or a reader fork's own (or "by the reader" where the call names none), except
@@ -43,3 +43,12 @@
 - **Hosts: `create()`'s refusal of reader forks with no `model` says what a reader fork is.** It said to give the
   resident's model "for a copy of the resident"; it now says a reader fork of the resident holds its whole prefix,
   and `model` is the model the resident runs or another by name.
+- **Residents and readers: where no reader runs, the text says so, and a cancel that can wait says it can.** A
+  held channel's messages, in a channel tool's refusal and the `[tuned out]` send note, were "read by <name>" after
+  the persistent reader ended, or at a start with none configured, for a hold whose release failed; they are now
+  held "with no reader running here to read them, until the tune-out's release, which failed, is tried again"
+  (`TuneOutReader`'s `running: false`). `tune_out`'s refusal with no reader says none "is running here", a reader
+  that ended included. `cancel_tuneout`'s description no longer says it ends the tune-out "now": its answer says
+  when the cancel has to wait, and whether the note waits with it, and the channel's traffic reaches the resident
+  again unless the all-except hold holds it too; `speak_in_channel`'s refusal where speech is off, and `tune_out`'s
+  refusal of a channel already tuned out, say a cancel's answer tells if it waits, where they said it delivers now.

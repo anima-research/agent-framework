@@ -79,12 +79,12 @@ test('tune_out and cancel_tuneout say why nothing changed, and name the connecte
   // No reader, and no hold without one: tune_out says so, with no word of a
   // subconscious.
   const unavailable = refusalOf(coordinator({ subconscious: false }).enter('disc', 'disc:guild:noisy', {}, 'agent-tool'));
-  assert.equal(unavailable, "Nothing was tuned out: no reader is configured here to read a held channel, and this host "
+  assert.equal(unavailable, "Nothing was tuned out: no reader is running here to read a held channel, and this host "
     + "doesn't hold one without a reader, so tune_out isn't available here, and calling it again won't change that. If "
     + 'you need channels diverted, ask whoever runs this host.');
   // And a deliver_summary with no reader to deliver it from says that.
   assert.deepEqual(await coordinator({ subconscious: false }).handleSubconsciousTool('deliver_summary', { text: 'All quiet.', channelId: 'disc:guild:noisy' }),
-    { success: false, error: 'Nothing was delivered: no reader is configured here.', isError: true });
+    { success: false, error: 'Nothing was delivered: no reader is running here.', isError: true });
   const bound = refusalOf(coordinator({ forkBound: true }).enter('disc', 'disc:guild:noisy', {}, 'agent-tool'));
   assert.match(bound, /^Nothing changed: a conversation is bound to "disc:guild:noisy"/);
   assert.match(bound, /tune_out won't divert a channel while one is/);

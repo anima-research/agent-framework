@@ -27,7 +27,7 @@ type Framework = {
   channelRegistry: { handleChannelToolCall(name: string, input: unknown, origin?: unknown): Promise<Answer> };
 };
 
-const ENDED = 'The focus on it ended, and what the other channels held was delivered.';
+const ENDED = 'The focus on it ended, and what the other channels held was delivered, up to its backlog cap.';
 const WAITS = /^The close cancels the all-except hold that excepts it\. Not cancelled yet: /;
 
 const framework = (f: Fixture) => f.framework as unknown as Framework;
@@ -143,7 +143,7 @@ describe('a close that fails after the focus ended says the focus ended', () => 
       assert.equal(coordinatorOf(f).getAllExcept(), null, 'premise: the focus ended before the failure');
       assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'work'), 'open', 'premise: the close was not recorded');
       assert.equal(result.error,
-        "The close wasn't recorded: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered.");
+        "The close wasn't recorded: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered, up to its backlog cap.");
       assert.match(textOf(find(f, 'all channels except')), /antra: held/, 'its backlog was released');
     } finally { await f.close(); }
   });
@@ -226,7 +226,7 @@ describe('a close naming the excepted channel after its server no longer registe
       assert.equal(result.success, false);
       assert.equal(coordinatorOf(f).getAllExcept(), null, 'premise: the focus ended');
       assert.equal(result.error, 'Server "editor" no longer registers channel "work", so no close was recorded or sent. '
-        + "A step of the focus's release failed: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered.");
+        + "A step of the focus's release failed: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered, up to its backlog cap.");
     } finally { await f.close(); }
   });
 
@@ -331,7 +331,7 @@ async function firstCloseFails(f: Fixture): Promise<void> {
   assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus outlived the first close');
 }
 
-const OTHER_NOT_CLOSED = 'Channel "work" on server "other" was not closed: name its server to close it.';
+const OTHER_NOT_CLOSED = 'Channel "work" on server "other" was not closed: to close it, call again with channelId "work" and serverId "other".';
 
 describe("a bare channel_close id the focus's channel answers to means that channel, not another server's with the id", () => {
   it("the focus's channel gone and another server's `work` registered: the repeat ends the focus, and leaves other's `work` open", async () => {
@@ -353,6 +353,28 @@ describe("a bare channel_close id the focus's channel answers to means that chan
       f.alwaysRespond();
       await f.framework.runUntilIdle();
       assert.deepEqual(other.closes, [], "other's server was sent no close");
+    } finally { await f.close(); await other.stop(); }
+  });
+
+  it("a focus on `other:work` beside server other's `work`: the not-closed sentence gives the channelId and serverId that close other's `work` (bot review 2, #161)", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    const other = await otherServer(f);
+    try {
+      await registerOpen(f, 'other:work', 'noisy');
+      const r = coordinatorOf(f).enterAllExcept({ serverId: 'editor', channelId: 'other:work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool');
+      assert.ok(r.ok, (r as { error?: string }).error);
+      await other.registerOpen('work');
+      const result = await close(f, { channelId: 'other:work' });
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(result.data, { channelId: 'other:work', serverId: 'editor', status: 'closed', note: `${ENDED} ${OTHER_NOT_CLOSED}` });
+      assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'open', 'premise: not closed');
+      // The advice, followed as given, closes other's `work`; keeping the id
+      // the call used and adding the server, as "name its server" read, doesn't.
+      const kept = await close(f, { channelId: 'other:work', serverId: 'other' }, 'c2');
+      assert.equal(kept.success, false, 'premise: the bare id with the server named is no channel there');
+      const followed = await close(f, { channelId: 'work', serverId: 'other' }, 'c3');
+      assert.equal(followed.success, true, followed.error);
+      assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'closed');
     } finally { await f.close(); await other.stop(); }
   });
 

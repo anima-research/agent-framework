@@ -2,23 +2,30 @@
  * Presentation is mandatory (#291, AF-6): FrameworkConfig.presentationIndex
  * is gone, and every agent is taken on as it is registered, its window
  * written down and presented, whatever a host's configuration still says. A
- * turn's requests are its window, which is the record when no other
- * agent's turn overlaps it and every row in the slot is meant for it, and a
- * write stamped only for agents that can't read its slot is traced once. A
+ * turn's requests are its window, and a request-only `[Continue]` where the
+ * window ends on its own reply. The window is the record when nothing
+ * arrives for the agent during a turn and every row in the slot is meant
+ * for it, and a write stamped only for agents that can't read its slot is
+ * traced once. A
  * context-manager that keeps no window index is refused, and so is a store
  * handle without chronicle's batched identity append, with which
- * context-manager writes a window.
+ * context-manager writes a window. The package loads on context-manager
+ * 0.24.0 for create() to say so: no module names an export 0.25.0 added in
+ * an import from it.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, type MessageId, type MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, audienceOf, type EventResponse, type Module, type ProcessEvent, type ToolCall, type TraceEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { ADDED_IN_0_25 } from './helpers/context-manager-0.24.js';
 
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
@@ -251,5 +258,59 @@ describe('presentation is mandatory (#291)', () => {
     } finally {
       proto.presentRows = presentRows;
     }
+  });
+
+  it('loads on context-manager 0.24.0, which has no write-outcome errors, and create() names the release to install', () => {
+    // A child process whose context-manager is 0.24.0's exports
+    // (helpers/context-manager-0.24.ts). The package is ESM: a named import
+    // of an export 0.25.0 added fails its load there, before create() runs.
+    const dir = mkdtempSync(join(tmpdir(), 'af-presentation-mandatory-'));
+    dirs.push(dir);
+    const url = (path: string) => JSON.stringify(pathToFileURL(join(import.meta.dirname, path)).href);
+    const script = `
+      let outcome;
+      try {
+        const { AgentFramework } = await import(${url('../src/index.js')});
+        const { MockMembrane } = await import(${url('helpers/mock-membrane.js')});
+        try {
+          await AgentFramework.create({
+            storePath: ${JSON.stringify(join(dir, 'store.chronicle'))},
+            membrane: new MockMembrane().asMembrane(),
+            agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+            modules: [],
+          });
+          outcome = { created: true };
+        } catch (error) { outcome = { refused: error.message }; }
+      } catch (error) { outcome = { load: String(error) }; }
+      console.log(JSON.stringify(outcome));
+      process.exit(0);
+    `;
+    const register = pathToFileURL(join(import.meta.dirname, 'helpers/context-manager-0.24-register.js')).href;
+    const out = execFileSync(process.execPath, ['--import', register, '--input-type=module', '--eval', script], { encoding: 'utf8' });
+    const outcome = JSON.parse(out.trim().split('\n').at(-1)!) as { load?: string; refused?: string; created?: true };
+    assert.equal(outcome.load, undefined, `the package loads on 0.24.0: ${outcome.load}`);
+    const declared = (JSON.parse(readFileSync(join(import.meta.dirname, '../../package.json'), 'utf8')) as {
+      dependencies: Record<string, string>;
+    }).dependencies['@animalabs/context-manager']!;
+    assert.ok(outcome.refused?.includes(`Install @animalabs/context-manager ${declared}, which this package declares`), JSON.stringify(outcome));
+  });
+
+  it('names no export context-manager 0.25.0 added in an import from it, in any module of src', () => {
+    // Those come through src/context-manager-errors.ts, which reads them
+    // from a namespace: the load test above runs what the package's index
+    // loads, and this reads every module, an entry point's among them.
+    const src = join(import.meta.dirname, '../../src');
+    const named: string[] = [];
+    for (const file of readdirSync(src, { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.ts'))) {
+      const text = readFileSync(join(src, file), 'utf8');
+      for (const m of text.matchAll(/(?:import|export)\s+(type\s+)?\{([^}]*)\}\s*from\s*'@animalabs\/context-manager'/g)) {
+        if (m[1]) continue;
+        for (const item of m[2]!.split(',').map((s) => s.trim())) {
+          const name = item.split(/\s+as\s+/)[0]!;
+          if (!item.startsWith('type ') && ADDED_IN_0_25.includes(name)) named.push(`${file}: ${name}`);
+        }
+      }
+    }
+    assert.deepEqual(named, []);
   });
 });

@@ -292,14 +292,19 @@ test('for one release, the held: handle an earlier release answered reaches the 
   }
 });
 
+/** `ahead`: rows stored before the queue is imported, so the write lands
+ *  past them; `content`: the queued write's. */
 async function withImportedW1(run: (probe: Probe, cm: {
   queryMessages(...args: unknown[]): unknown;
   getMessageWindow(offset: number, limit: number, opts?: { resolveBlobs?: boolean }): { messages: unknown[] };
-}) => void): Promise<void> {
+}) => void, options: { ahead?: number; content?: ContentBlock[] } = {}): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
   const storePath = join(dir, 'store');
-  await (await open(storePath)).framework.stop();
-  writeEarlierQueue(storePath, [{ id: 'w1', seq: 1, participant: 'user', content: text('queued before the upgrade') }]);
+  const first = await open(storePath);
+  const before = first.framework.getAgent('assistant')!.getContextManager();
+  for (let i = 0; i < (options.ahead ?? 0); i++) before.addMessage('user', text(`ahead ${i}`));
+  await first.framework.stop();
+  writeEarlierQueue(storePath, [{ id: 'w1', seq: 1, participant: 'user', content: options.content ?? text('queued before the upgrade') }]);
   const probe = await open(storePath);
   const cm = probe.framework.getAgent('assistant')!.getContextManager() as unknown as Parameters<typeof run>[1];
   const query = cm.queryMessages;
@@ -321,6 +326,22 @@ test("a held: handle reaches the row its write landed as by a blob-free scan whe
     assert.ok(row && !row.id.startsWith('held:'), 'the stored row');
     assert.equal(textOf(row), 'queued before the upgrade');
   });
+});
+
+// The scan reads the store in windows of 500 rows (landedPositions): a row
+// past the first window is found where it stands, and read with its blobs.
+test("a held: handle reaches its row past the scan's first window, its image read whole, when context-manager's query throws", async () => {
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+  const image = { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } } as ContentBlock;
+  await withImportedW1(({ framework, ctx }) => {
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    assert.ok(cm.getMessageCount() > 600, 'premise: the write landed past the first window of the scan');
+    const row = ctx.getMessage('held:w1');
+    assert.ok(row && !row.id.startsWith('held:'), 'the stored row');
+    assert.equal(textOf(row), 'queued past 600 rows');
+    const stored = row.content.find((b) => b.type === 'image') as { source?: { data?: string } } | undefined;
+    assert.equal(stored?.source?.data, PNG, 'its image read whole, its blob resolved');
+  }, { ahead: 600, content: [...text('queued past 600 rows'), image] });
 });
 
 test("a held: handle whose blob-free scan comes back short throws that the store can't be searched, rather than naming nothing", async () => {

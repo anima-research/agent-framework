@@ -28,4 +28,5 @@
   a stored row keeps its wake. A resumed turn (a
   context-budget restart, or a tool-result guard's retry a provider held)
   presents nothing that arrived meanwhile, so such a row's wake still starts
-  its turn.
+  its turn. A conversation fork's channel message, routed to it or delivered
+  to it by name (`deliverTo`), marks the fork's wake the same way.

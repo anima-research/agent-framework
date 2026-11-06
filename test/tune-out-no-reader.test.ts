@@ -46,12 +46,12 @@ test('once the reader is gone, a hold is refused for one channel and for all-exc
   // Refused before its options are read, as all-except is below.
   const one = coordinator.enter('editor', 'chat', { durationSeconds: 'soon' }, 'agent-tool');
   assert.equal(one.ok, false);
-  assert.match((one as { error: string }).error, /no reader is configured here to read a held channel/);
+  assert.match((one as { error: string }).error, /no reader is running here to read a held channel/);
   assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'chat'), null);
   // Refused before its options are read: a bad duration isn't sent back for correction.
   const all = coordinator.enterAllExcept({ serverId: 'editor', channelId: 'other' }, { durationSeconds: 'soon' }, 'agent-tool');
   assert.equal(all.ok, false);
-  assert.match((all as { error: string }).error, /no reader is configured here to read a held channel/);
+  assert.match((all as { error: string }).error, /no reader is running here to read a held channel/);
   assert.equal(coordinator.getAllExcept(), null);
 });
 
@@ -126,7 +126,7 @@ test('when the persistent reader is stopped, its holds end with it and each back
   assert.ok(names.length > 0 && !names.includes('tune_out') && !names.includes('focus'), names.join(', '));
   const again = coordinator.enter('editor', 'chat', {}, 'agent-tool');
   assert.equal(again.ok, false);
-  assert.match((again as { error: string }).error, /no reader is configured here to read a held channel/);
+  assert.match((again as { error: string }).error, /no reader is running here to read a held channel/);
   const focus = coordinator.enterAllExcept({ serverId: 'editor', channelId: 'chat' }, { durationSeconds: 600 }, 'agent-tool');
   assert.equal(focus.ok, false);
 });

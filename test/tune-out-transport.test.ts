@@ -1305,7 +1305,7 @@ test('tune_out repeated for a channel already tuned out whose transport is open 
   assert.equal(again.text,
     `Nothing changed: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, backlogCap ` +
     `${backlogCap} and maxWakes ${maxWakes}. To change those, cancel it first with tune_out mode "cancel", which ` +
-    'delivers its backlog to you now, then call tune_out again with the new settings.');
+    'delivers its backlog to you when it ends (its answer says if it waits), then call tune_out again with the new settings.');
   assert.equal(calls, 0, 'its transport is open, with nothing to wait for');
 });
 
@@ -1358,7 +1358,7 @@ for (const outcome of [
     assert.deepEqual(await answering, {
       text: `Nothing changed in the tune-out: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, ` +
         `backlogCap ${backlogCap} and maxWakes ${maxWakes}. ${transport} To change those, cancel it first with tune_out ` +
-        'mode "cancel", which delivers its backlog to you now, then call tune_out again with the new settings.',
+        'mode "cancel", which delivers its backlog to you when it ends (its answer says if it waits), then call tune_out again with the new settings.',
       isError: true,
       // Its open may have run, so it's a failure, not a refusal saying
       // nothing was done.
@@ -1547,6 +1547,24 @@ test("a tune-out on record when a start with no reader connects a server during 
   assert.match(JSON.stringify(releasedRows()[0]!.content), /messages=2/, 'both diverted messages in its backlog');
   assert.match(JSON.stringify(releasedRows()[0]!.content), /no reader is configured/);
   assert.ok(!store.logged.some((l) => l.includes('nothing will deliver')), store.logged.join('\n'));
+});
+
+// AF #844 bot review 2, finding 21.
+test("a tune-out on record when a start with no reader connects a server while the primary's context manager refuses its work is released once a move re-initializes it", async (t) => {
+  const store = await tunedOutStore(t, 2);
+  const second = await store.start(false, false);
+  const i = second as unknown as RestartInternals & { managersRefusingWork: WeakMap<object, string> };
+  i.managersRefusingWork.set(second.getAgent('scout')!.getContextManager(), 'injected: a failed re-initialization');
+  await store.capture(() => second.connectMcplServer(store.server));
+  const registry = i.channelRegistry;
+  assert.notEqual(registry.getTuneOutState('disc', CHANNEL), null, 'the hold stays on record while the manager refuses its work');
+  assert.ok(store.logged.some((l) => l.includes('[tune-out] the tune-outs on record are released once the store takes writes again')), store.logged.join('\n'));
+  await store.capture(() => second.switchBranch(second.getStore().currentBranch().name));
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null, 'ended once the move re-initialized the manager');
+  const released = second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(released.length, 1, 'one release');
+  assert.match(JSON.stringify(released[0]!.content), /messages=2/, 'both diverted messages in its backlog');
 });
 
 test('a tune-out whose release fails at a start with no subconscious stays recorded for the next start, and the log says so', async (t) => {

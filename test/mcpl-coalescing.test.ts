@@ -2031,7 +2031,7 @@ test("a wake to read a render that carries a channel starts its turn until the a
   agent.notePublished(room, at(branch, placed));
   assert.equal(await pass(), 0, 'spoken there again on this branch having read it, the wake starts no turn');
   // A publish on another branch replaces the record whatever its sequence,
-  // since a branch an undo made can carry lower sequences than the one it
+  // since a branch a rollback made can carry lower sequences than the one it
   // left.
   agent.notePublished(room, at(`${branch}-other`, placed - 3));
   assert.equal(await pass(), 1, 'spoken there last on another branch at a lower sequence, the wake starts the turn');
@@ -2256,7 +2256,7 @@ test("a provider hold keeps a wake to read a render or a stored message, a batch
     'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 
-test("a render that settles after its turn's assembly threw, while the turn is alive, is stored out of its window like any write during the turn", async (t) => {
+test("a render that settles after its turn's assembly threw, while the turn is alive, is stored out of its window like any arrival during the turn", async (t) => {
   const f = await fixture(); t.after(f.close);
   let release!: (value: unknown) => void;
   let began!: () => void;
@@ -3160,9 +3160,10 @@ test("a render whose store write is refused leaves a batch opened while it rende
 
 test("a render whose store write is refused while a newer batch is open saves that batch's fallback mark at once, so a restart before the assembly's other renders settle delivers it as its fallback", async () => {
   // The host saves as the framework's does: save() is throttled, written
-  // only once its timer fires (flush), and saveNow() writes at once, so
-  // `onDisk` is what a restart finds.
+  // only once its timer fires (flush), and saveNow() writes at once but
+  // unsynced, which commit() syncs, so `onDisk` is what a restart finds.
   let onDisk: CoalescingSnapshot | undefined;
+  let unsynced: CoalescingSnapshot | undefined;
   let dirty: (() => CoalescingSnapshot) | undefined;
   const flush = () => { if (dirty) { onDisk = structuredClone(dirty()); dirty = undefined; } };
   const latch = () => { let open!: () => void; const opened = new Promise<void>((resolve) => { open = resolve; }); return { open, opened }; };
@@ -3189,7 +3190,8 @@ test("a render whose store write is refused while a newer batch is open saves th
     },
     audit: (record) => { kinds.push(String(record.kind)); },
     save: (snapshot) => { dirty = snapshot; },
-    saveNow: (snapshot) => { dirty = undefined; onDisk = structuredClone(snapshot); },
+    saveNow: (snapshot) => { dirty = undefined; unsynced = structuredClone(snapshot); },
+    commit: async () => { if (unsynced) { onDisk = unsynced; unsynced = undefined; } },
   };
   const occurrence = (key: string, eventId: string, initial = false): CoalescedOccurrence<null> => ({
     serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key, eventId, timestamp: TS,

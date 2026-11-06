@@ -364,7 +364,7 @@ describe("the persistent subconscious's window start of a tune-out entered while
 });
 
 describe("the persistent subconscious's window start whose keeping failed, across a branch move", () => {
-  it("(l) isn't kept on the branch moved to at the ordinal it was fixed at on the branch left", { timeout: 120_000 }, async () => {
+  it("(l) is fixed again on the branch moved to, from its window there, not kept at the ordinal it was fixed at on the branch left", { timeout: 120_000 }, async () => {
     const h = await boot(place());
     h.residentRow('PRE-1 before the tune-out');
     await h.framework.runUntilIdle();
@@ -392,11 +392,14 @@ describe("the persistent subconscious's window start whose keeping failed, acros
     h.residentRow('SIDE-1 after the move');
     await h.framework.runUntilIdle();
     const state = h.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number } | null;
-    assert.equal(state?.starts?.[t1.params.epochId], undefined, "T1's start isn't kept on the branch moved to at the ordinal fixed before the move");
-    assert.equal(state?.inForce, undefined, 'nor its ordinal kept as the start in force');
+    const cm = h.subCm();
+    const pastBefore = Math.max(0, ...cm.getPresentedMessages().filter((m) => m.sequence < t1.params.startedAtSequence).map((m) => cm.ordinalOf(m.id)! + 1));
+    assert.equal(state?.starts?.[t1.params.epochId], pastBefore,
+      "T1's start is fixed on the branch moved to, just past the last row of its window there stored before it (AF #844 review 2, #28)");
+    assert.equal(state?.inForce, pastBefore, 'and kept as the start in force');
   });
 
-  it("(m) isn't kept at that ordinal by the move's own presentation of the subconscious's rows", { timeout: 120_000 }, async () => {
+  it("(m) is fixed, after the move's own presentation of the subconscious's rows, from the window of the branch moved to", { timeout: 120_000 }, async () => {
     const h = await boot(place());
     h.residentRow('PRE-1 before the tune-out');
     await h.framework.runUntilIdle();
@@ -431,14 +434,18 @@ describe("the persistent subconscious's window start whose keeping failed, acros
     refusing = false;
     await h.framework.switchBranch('side');
     assert.ok(atRebase > 0, "premise: the move's rebase presented the subconscious's own rows");
+    await h.framework.runUntilIdle();
     const state = h.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number } | null;
-    assert.equal(state?.starts?.[t1.params.epochId], undefined, "T1's start isn't kept on the branch moved to at the ordinal fixed before the move");
-    assert.equal(state?.inForce, undefined, 'nor its ordinal kept as the start in force');
+    const cm = h.subCm();
+    const pastBefore = Math.max(0, ...cm.getPresentedMessages().filter((m) => m.sequence < t1.params.startedAtSequence).map((m) => cm.ordinalOf(m.id)! + 1));
+    assert.equal(state?.starts?.[t1.params.epochId], pastBefore,
+      "T1's start is kept at the ordinal the branch moved to gives it, not the one fixed before the move (AF #844 review 2, #28)");
+    assert.equal(state?.inForce, pastBefore, 'and in force');
   });
 });
 
 describe("the persistent subconscious's window start set while its window is the record", () => {
-  it('(n) is fixed at the next enter once a branch move recovers the window, a restart before it setting the start kept in force', { timeout: 120_000 }, async () => {
+  it('(n) is fixed at the restart once a branch move recovers the window, the restart setting the start kept in force', { timeout: 120_000 }, async () => {
     const dir = place();
     const h = await boot(dir);
     h.residentRow('PRE-1 before the tune-outs');
@@ -478,16 +485,16 @@ describe("the persistent subconscious's window start set while its window is the
     const after = await boot(dir);
     await after.framework.runUntilIdle();
     assert.equal(after.strategy().getAnchorOrdinal(), t1Start, 'a restart sets the start kept in force');
-    assert.equal(after.windowStarts()?.[t2.params.epochId], undefined, "and T2's start, the oldest active and not kept, waits");
-    after.bump();
-    const t3 = after.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
-    assert.ok(t3.ok, (t3 as { error?: string }).error);
-    await after.framework.runUntilIdle();
     const cm = after.subCm();
     const t2Start = t2.params.startedAtSequence;
     const pastBefore = Math.max(0, ...cm.getPresentedMessages().filter((m) => m.sequence < t2Start).map((m) => cm.ordinalOf(m.id)! + 1));
     assert.equal(after.windowStarts()?.[t2.params.epochId], pastBefore,
-      "the next enter fixes T2's start, just past the last row in the window stored before it");
+      "and fixes T2's start, the oldest active and not kept, just past the last row in the window stored before it, without moving the window to it (AF #844 review 2, #28)");
+    after.bump();
+    const t3 = after.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t3.ok, (t3 as { error?: string }).error);
+    await after.framework.runUntilIdle();
+    assert.equal(after.windowStarts()?.[t2.params.epochId], pastBefore, 'the next enter keeps it there');
   });
 });
 
@@ -573,7 +580,7 @@ describe('SubconsciousWindowAnchor', () => {
     assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchor(50)']);
   });
 
-  it("a start whose keeping failed isn't kept at that ordinal after a branch move; one still waiting is fixed on the branch it presents on", () => {
+  it("a start whose keeping failed is fixed again after a branch move, on the window it presents on, not kept at the ordinal fixed before it; one still waiting is fixed there too", () => {
     const options = { rows: [{ sequence: 10, ordinal: 0 }] };
     const h = host(options);
     h.state.keepFails = 1;
@@ -584,8 +591,9 @@ describe('SubconsciousWindowAnchor', () => {
     h.state.owed = [];
     h.state.rows.push({ sequence: 20, ordinal: 1 }, { sequence: 60, ordinal: 2 });
     h.anchor.presented();
-    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t2'], ordinal: 3 }],
-      "t1 isn't kept at the ordinal fixed before the move, and t2 is fixed on the window it presents on");
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t1'], ordinal: 2 }, { epochIds: ['t2'], ordinal: 3 }],
+      "t1 is fixed again on the branch moved to, past its rows stored before it (AF #844 review 2, #28), and t2 on the window it presents on");
+    assert.deepEqual(h.calls.filter((c) => c.startsWith('setAnchorOrdinal')), ['setAnchorOrdinal(1)', 'setAnchorOrdinal(2)'], 't1, in force, is set at the new ordinal');
   });
 
   it('a start whose setting or keeping fails is set and kept at the next presentation, at the ordinal it was fixed at', () => {

@@ -578,7 +578,11 @@ describe('presentation points (#291)', () => {
     assert.ok(clock, 'written for mira: her own row, in no window but hers');
     assert.notEqual(h.cm('mira').ordinalOf(clock.id), undefined, 'in her window');
     assert.equal(h.cm('oren').ordinalOf(clock.id), undefined, "never in oren's");
+    // oren's live turn would keep an arrival out until its next point, so
+    // end it and run that point: the row isn't oren's arrival either.
     h.internals.activeTurnTokens.delete('oren');
+    h.internals.presentAtEndOf(h.agent('oren'));
+    assert.equal(h.cm('oren').ordinalOf(clock.id), undefined, "nor once oren's turn has ended and its point has run");
   });
 
   it("each resident a batched wake was for writes its own line into its own window, once", async () => {
@@ -591,7 +595,7 @@ describe('presentation points (#291)', () => {
       [[true, false], [false, true]], 'each in its own window');
   });
 
-  it('a closure prompt written while the fork\'s turn is alive waits for that turn\'s end', async () => {
+  it('a closure prompt written while the fork\'s turn is alive waits for that turn\'s next point (here its end)', async () => {
     const h = await boot({ forks: true });
     const fork = await h.fork('fork-room');
     const real = h.internals.conversationRouter;

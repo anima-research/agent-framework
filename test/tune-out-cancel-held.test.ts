@@ -2,15 +2,16 @@
  * What a tune-out's cancel makes of the messages it held. The dump and the
  * subconscious's report notice take the ended epoch's messages only, and the
  * notice counts what the dump left out. Every held message is stored as it
- * arrives (#291), so the subconscious's view holds each of them, its media
- * included, and none follows the notice as a row of its own (before #291 the
- * ones still queued at the cancel did). A cancel the subconscious makes
+ * arrives (#291), unless a surgery's hold or a refusing manager keeps it in
+ * memory, so none follows the notice as a row of its own (before #291 the
+ * ones still queued at the cancel did). The fake here builds no view: that
+ * the subconscious's window takes the held rows is presentation.test.ts's. A cancel the subconscious makes
  * itself gets that notice and a report turn when some of the epoch's messages
  * came in after it last looked (unseenBySubconscious), or when it wrote no
  * note and the dump left anything out. Here the cap does it;
  * test/tune-out-dump-fit has the residents' per-message room do it too.
  */
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
 import { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
@@ -87,7 +88,7 @@ test("a cancel's dump shows only its own epoch's messages, and its notice tells 
   assert.ok(inferences.includes('Subconscious'), 'and a report turn is requested');
 });
 
-test("the notice counts what the cap leaves out, which the subconscious's view holds stored, media and all", () => {
+test("the notice counts what the cap leaves out, media and all, and hands on no row of its own", () => {
   const { dump, notice } = cancelWith({
     backlogCap: 0,
     source: 'agent-tool',
@@ -249,5 +250,78 @@ test("a reader's cancel_tuneout gives the cancel who made it as its reason, neve
     assert.ok(textOf(notice.content).startsWith(`[Tune-out cancelled: disc:guild:a — ${by}. `), textOf(notice.content));
     assert.deepEqual(traces.filter((e) => e.type === 'tune-out:cancelled').map((e) => e.reason), [by]);
     for (const m of added) assert.ok(!/subconscious|judg/i.test(textOf(m.content)), textOf(m.content));
+  }
+});
+
+// AF #844 bot review 2, #24: a release that meets a hold as it is written (a
+// context manager that refuses its work from that write on) is kept in
+// memory, and addMessage answers an empty id. Syncing the store doesn't
+// make it durable, so recording the end then would leave a crash with no
+// release and the held rows out of the residents' view. The cancel waits
+// again, the tune-out in force, and its run once the writes are stored
+// finds the release stored, covering the backlog, and records the end.
+test("review 2 #24: a release kept in memory by a hold that begins at its write leaves the tune-out in force, and the waiting cancel ends it once the writes are stored, with one release", () => {
+  for (const scope of [false, true]) {
+    const stored: Array<Row & { id?: string }> = [{ ...row('Ann', [text('A1 stored')], 'eA'), id: 'm1' }];
+    const kept: Array<Row & { id?: string }> = [];
+    let held = false;
+    let fence = true;
+    let channelInForce = !scope;
+    let scopeState: unknown = scope ? {
+      params: { epochId: 'eA', except: { serverId: 'disc', channelId: 'disc:guild:x' }, cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0, startedAtMs: 0, expiresAtMs: Date.now() + 3_600_000, source: 'agent-tool' },
+      wakeCount: 0,
+    } : null;
+    const params = { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 };
+    const registry = {
+      getTuneOutState: (_s: string, channelId: string) => (channelInForce && channelId === 'disc:guild:a' ? { params, wakeCount: 0 } : null),
+      readCoordinatorState: (id: string) => (id.endsWith('/all-except') ? scopeState : null),
+      writeCoordinatorState: (id: string, value: unknown) => { if (id.endsWith('/all-except')) scopeState = value; },
+      nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
+      cancelTuneOut: () => { if (!channelInForce) return null; channelInForce = false; return { params, wakeCount: 0 }; },
+      listChannelsRaw: () => [],
+    };
+    const hooks = {
+      addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => {
+        const m = { participant, content, ...(metadata ? { metadata } : {}), id: `m${stored.length + kept.length + 1}` };
+        if (held || (fence && metadata?.kind === 'tune-out-cancel')) {
+          // The write meets the fence: kept in memory, writes held from now on.
+          held = true;
+          kept.push(m);
+          return '';
+        }
+        stored.push(m);
+        return `m${stored.length}`;
+      },
+      requestInference: () => {},
+      subconsciousName: () => 'Subconscious',
+      primaryName: () => 'scout',
+      getStoredMessages: () => stored,
+      getSurgeryHeldMessages: () => [],
+      unseenBySubconscious: () => 0,
+      emitTrace: () => {},
+      writesHeld: () => held,
+      commitDeliveries: () => true,
+    };
+    const coordinator = new TuneOutCoordinator(registry as never, {} as never, hooks as never);
+    const inForce = () => (scope ? (scopeState as { params?: { epochId?: string } } | null)?.params?.epochId === 'eA' : channelInForce);
+    const errors = mock.method(console, 'error', () => {});
+    try {
+      const answer = scope ? coordinator.cancelAllExcept('duration', 'test') : coordinator.cancel('disc', 'disc:guild:a', 'duration', 'test');
+      assert.deepEqual(answer, { ok: true, deferred: true }, `${scope ? 'all-except' : 'channel'}: its release was kept in memory, so the cancel waits`);
+      assert.ok(inForce(), 'the tune-out stays in force: its end is not recorded over a release only memory holds');
+      // The recovery stores what it kept, then runs the cancels that waited.
+      fence = false;
+      held = false;
+      stored.push(...kept.splice(0));
+      coordinator.runDeferredCancels();
+      assert.ok(!inForce(), 'the waiting cancel ends it');
+      const releases = stored.filter((m) => m.metadata?.kind === 'tune-out-cancel');
+      assert.equal(releases.length, 1, 'with the one release, stored at the recovery: the run finds it covers the backlog');
+      assert.match(textOf(releases[0]!.content), /A1 stored/);
+    } finally {
+      errors.mock.restore();
+      coordinator.stop();
+    }
   }
 });

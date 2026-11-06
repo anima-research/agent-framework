@@ -1,11 +1,12 @@
-- **Hosts: every agent's context follows its own presentation index** (#291). `FrameworkConfig.presentationIndex`
-  is removed: what it turned on is how every framework runs (see the presentation index's entries), and a host's
-  configuration that still passes it is read as any unknown key is. `create()` refuses a context-manager without
+- **Hosts: every agent's context follows its own presentation index** (#291), in every framework, with no setting
+  to turn it on or off (see the presentation index's entries). `create()` refuses a context-manager without
   `ContextManager.presentRows` (one before 0.25.0), and a store handle without chronicle's
   `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.0 or earlier), each naming the range this package
   declares (the 291-chronicle-0.6 entry). An agent whose window
   can't be written down at its registration (another version's index format, a failed write) stays in legacy mode,
-  its window the whole record, as before, until a branch move writes its window down on the new branch.
+  its window the whole record, as before, until a branch move writes its window down on the new branch. A
+  conversation fork is seeded with its template's window, so a row a host writes into the template's context
+  manager directly, past the framework, reaches a fork only once the template's next point has presented it.
   - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
     agent's window, its own as undone and others' back to arrived, and `redo` puts them back. In a turn an earlier
     release recorded, whose rows carry no audience stamp, a row stored under the agent's name, one holding only
@@ -40,8 +41,8 @@
     291-window-batches entry). Going back to an earlier release after that needs a copy of the store taken before
     the upgrade.
 
-  **Migration:** drop `presentationIndex` from the configuration. A host that listened for `undo:completed`,
-  `redo:completed`, or `branch:switched` with reason `undo`/`redo`, to refresh a view listens for `window:undone`.
+  **Migration:** a host that listened for `undo:completed`, `redo:completed`, or `branch:switched` with reason
+  `undo`/`redo`, to refresh a view listens for `window:undone`.
   A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`. A host whose
   residents read each other's rounds sets `observes` on each resident, naming the others: an edge is one way, so
   two residents that share their rounds each name the other. Mail and messages meant for a co-resident stay out of

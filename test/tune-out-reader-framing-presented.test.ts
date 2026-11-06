@@ -144,6 +144,7 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", (
     assert.equal(rest.at(-1)!.split('\n')[0], `[Tune-out reader — ${CHANNEL}, epoch ${epochId.slice(0, 8)}, wake]`, 'and last the framing');
     const body = JSON.stringify(forkRequest.messages);
     assert.equal(body.split('AMB-1 chatter').length - 1, 1, 'the held message is in the framing alone, not raw beside it');
+    assert.equal(body.split('ADDR-2 hey scout').length - 1, 1, 'and so is the other one handed (AF #844 review 2, #198)');
 
     // Once the fork ends it holds nothing.
     await waitFor('the fork ended', () => !framework.getAgent(during!.fork));
@@ -184,6 +185,13 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", (
     const id = internals.addMessage('antra', [text('HELD-1 chatter')], { tuneOut: { epochId }, channelId: CHANNEL, serverId: 'disc' });
     const row = framework.getAgent('scout')!.getContextManager().getAllMessages().find((m) => m.id === id)!;
     await framework.quiesce({ reason: 'test' });
+    // What the framing held at the fork's trace, before its run refused it
+    // (AF #844 review 2, #111): the trace alone doesn't show the framing was noted.
+    let atFraming: { framed: boolean; toAny: boolean } | undefined;
+    framework.onTrace((e) => {
+      if (e.type !== 'tune-out:reader-fork' || atFraming) return;
+      atFraming = { framed: internals.presentation.framed.has((e as { agentName: string }).agentName), toAny: internals.presentation.framedToAny(id) };
+    });
     // The invocation a cadence period or a cancel hands the framework.
     internals.invokeReaderFork({ serverId: 'disc', channelId: CHANNEL, epochId, trigger: 'cadence', notice: '[Tune-out cadence: test]', backlog: [row], dispositions: null });
     await waitFor("the fork's refusal", () => traces.some((t) => t.type === 'tune-out:reader-fork-failed'));
@@ -192,6 +200,7 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", (
     assert.equal(framework.getAgent(failed.agentName) ?? undefined, undefined, 'premise: never registered');
     assert.ok(traces.some((t) => t.type === 'tune-out:reader-fork' && (t as { agentName?: string }).agentName === failed.agentName),
       'premise: framed at its derivation');
+    assert.deepEqual(atFraming, { framed: true, toAny: true }, 'premise: the framing was noted then, for the fork and its row');
     assert.equal(failed.returned, 1, 'its row goes back to the next reader');
     await framework.resume();
     await framework.runUntilIdle();

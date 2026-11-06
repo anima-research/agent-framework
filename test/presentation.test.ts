@@ -190,6 +190,11 @@ describe('the presentation module', () => {
     const reply = storeOwnRow(r.mira, 'mira', [...text('calling'), toolUse('c1')]);
     assert.equal(r.mira.has(reply), true, 'presented at its write, while its turn is alive');
     assert.equal(r.oren.has(reply), false, "another agent's round is not oren's (decision 1)");
+    // oren's live turn would keep an arrival out until its next point, so
+    // end it and run that point: the round isn't oren's arrival either.
+    r.alive.delete('oren');
+    r.presentation.presentAtEnd(r.oren);
+    assert.equal(r.oren.has(reply), false, "nor once oren's turn has ended and its point has run");
     assert.deepEqual(r.mira.sinkCalls, [[reply]], 'the sink heard it once, by its id');
     const held = storeOwnRow(r.mira, 'user', text('held back'), undefined, undefined, false);
     assert.equal(r.mira.has(held), false, "a row written with present: false isn't");
@@ -555,7 +560,7 @@ describe('the presentation module', () => {
     } finally { console.warn = warn; }
     assert.equal(r.oren.cm.windowMode(), 'legacy');
     assert.equal(r.presentation.presenting(r.oren), false);
-    assert.equal(r.oren.sink, undefined, 'no sink for an agent the module does not present for');
+    assert.ok(r.oren.sink, 'its sink is installed, which presents nothing for it and tells the readers of its slot (review 2 #73)');
     assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['oren', 'adopt']]);
     const row = r.write(r.mira, 'someone', text('for both'), ['mira', 'oren']);
     assert.deepEqual(r.presentation.presentAtEnd(r.oren), []);
@@ -963,6 +968,18 @@ describe('the presentation module at the point after one that failed', () => {
     assert.equal(r.sub.has(reply), true, 'the idle subconscious takes it at once');
   });
 
+  // AF #844 bot review 2, finding 73.
+  it("a writer whose write-down failed at adopt, left in legacy mode, still tells the idle readers of its slot of its own rows", async () => {
+    const r = await rig();
+    r.presentation.adopt(r.sub);
+    r.presentation.adopt(r.oren);
+    r.mira.cm.presentRows = () => { throw new Error('a write-down failure'); };
+    quietly(() => r.presentation.adopt(r.mira));
+    assert.equal(r.presentation.presenting(r.mira), false, 'setup: mira is left in legacy mode');
+    const reply = storeOwnRow(r.mira, 'mira', text('a reply in legacy mode'));
+    assert.equal(r.sub.has(reply), true, 'the idle subconscious takes it at once');
+  });
+
   // AF #844 bot review finding 34.
   it('a failed presentation names the rows that stay out of the window, in its trace and its log', async () => {
     const r = await rig();
@@ -1021,6 +1038,42 @@ describe('the presentation module at the point after one that failed', () => {
     assert.equal(ofType(r.traces, 'presentation:retracted').length, 1, 'and not again');
   });
 
+  // AF #844 bot review 2, finding 4.
+  it("a fresh start whose retraction of rows that aren't the agent's fails again throws, and a later start takes them out", async () => {
+    const r = await rig();
+    r.presentation.adopt(r.mira);
+    const dm = r.write(r.mira, 'alice', text('a DM for mira alone'), ['mira']);
+    const retract = r.oren.cm.retractRows.bind(r.oren.cm);
+    let failures = 2;
+    r.oren.cm.retractRows = (ids, options) => {
+      if (failures > 0) { failures--; throw new Error('a transient write failure'); }
+      return retract(ids, options);
+    };
+    quietly(() => r.presentation.adopt(r.oren));
+    assert.equal(r.oren.has(dm), true, "setup: mira's DM is in oren's window");
+    quietly(() => assert.throws(() => r.presentation.presentAtStart(r.oren, 'turn-start'),
+      (error: Error) => error.message.includes("oren's turn start could not take the rows that aren't its out of its window")));
+    assert.equal(r.oren.has(dm), true, 'it stays, and the start compiles nothing');
+    assert.deepEqual(r.presentation.presentAtStart(r.oren, 'compile'), [], "the compile's backstop doesn't throw");
+    r.presentation.presentAtStart(r.oren, 'turn-start');
+    assert.equal(r.oren.has(dm), false, 'the next start takes it out');
+  });
+
+  // AF #844 bot review 2, finding 99.
+  it("a fresh start whose presentation fails keeps a rollback's hold: its teardown at rest leaves the held arrivals out", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const returned = r.write(r.oren, 'someone', text('returned'), ['mira']);
+    r.alive.delete('mira');
+    r.presentation.holdUntilStart(r.mira, [returned]);
+    failNextPresent(r.mira.cm);
+    quietly(() => assert.throws(() => r.presentation.presentAtStart(r.mira, 'turn-start')));
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], "the failed start's teardown presents no held arrival");
+    assert.equal(r.mira.has(returned), false, 'held until a start that succeeds');
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [returned]);
+  });
+
   // AF #844 bot review finding 53.
   it("framing whose presentation into a fork's window failed enters at the fork's next turn start", async () => {
     const r = await rig();
@@ -1055,6 +1108,26 @@ describe('the presentation module at the point after one that failed', () => {
     r.alive.add('mira');
     const arrival = r.write(r.oren, 'someone', text('for mira'), ['mira']);
     assert.deepEqual(r.presentation.owedOf(r.mira).map((m) => m.id), [arrival], 'a row stored after them is found');
+  });
+
+  // AF #844 bot review 2, finding 77.
+  it("a scan at rest passes over an arrival a rollback holds: the next starts after the rows it weighed, and the hold's arrival is still owed", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const returned = r.write(r.oren, 'someone', text('returned'), ['mira']);
+    r.alive.delete('mira');
+    r.presentation.holdUntilStart(r.mira, [returned]);
+    const foreign = ['one', 'two', 'three'].map((t) => r.write(r.oren, 'someone', text(t), ['oren']));
+    const asked: Array<number | undefined> = [];
+    const list = r.mira.cm.getUnpresentedMessages.bind(r.mira.cm);
+    r.mira.cm.getUnpresentedMessages = (options) => { asked.push(options?.afterSequence); return list(options); };
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), []);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), []);
+    assert.deepEqual(asked, [undefined, r.oren.cm.getMessage(foreign.at(-1)!)!.sequence],
+      'the second scan at rest lists only the rows after those the first weighed');
+    assert.deepEqual(r.presentation.owedOf(r.mira).map((m) => m.id), [returned], 'still owed');
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [returned], 'and the next start presents it');
   });
 
   // AF #844 bot review finding 62.

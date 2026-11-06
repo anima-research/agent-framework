@@ -458,7 +458,7 @@ export class DiscordModule implements Module {
         return;
       }
       if (event.type === 'message:lost' && event.external?.source === 'discord') {
-        this.endLostCreate(event.external.id);
+        this.endLostCreate(event.external.id, event.mayBeStored === true);
         return;
       }
       if (!this.config.autoTyping) return;
@@ -1511,17 +1511,27 @@ export class DiscordModule implements Module {
    * an answered create of the message (`writing`) with no row then ends,
    * with the edits or delete kept for it (LiveCreate.unapplied), since no
    * row comes for them to reach. Its delete, a history sync and a live
-   * create of the message are no longer passed over. One whose row the
-   * store shows (a write whose outcome is unknown that landed) waits, as
-   * any answered create, for the next Discord event to find it.
+   * create of the message are no longer passed over. A definite loss
+   * stored none of it, so it ends with no read. One whose outcome is
+   * unknown (`mayBeStored`) is looked for: where its row landed, no
+   * `message:added` came for it, so what was kept for it is applied now,
+   * and the entry waits, as any answered create, for the next Discord event
+   * to find the row.
    */
-  private endLostCreate(discordMessageId: string): void {
+  private endLostCreate(discordMessageId: string, mayBeStored: boolean): void {
     if (this.creating.get(discordMessageId)?.phase !== 'writing') return;
-    try {
-      if (this.storedRow(discordMessageId)) return;
-    } catch (error) {
-      console.error(`Discord: whether message ${discordMessageId}'s lost create left a row couldn't be read, so its record waits for the next event to find its row:`, error);
-      return;
+    if (mayBeStored) {
+      let landed: boolean;
+      try {
+        landed = this.storedRow(discordMessageId) !== undefined;
+      } catch (error) {
+        console.error(`Discord: whether message ${discordMessageId}'s lost create left a row couldn't be read, so its record waits for the next event to find its row:`, error);
+        return;
+      }
+      if (landed) {
+        this.applyUnapplied();
+        return;
+      }
     }
     this.creating.delete(discordMessageId);
   }

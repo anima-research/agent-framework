@@ -1007,6 +1007,42 @@ describe('a wake for a write heard mid-turn', () => {
     await framework.stop();
   });
 
+  // The cases above read marks built from a sequence. On a presented window a
+  // mark covers the rows its window held then, by ordinal: a row stored
+  // before the script started and presented only after it isn't credited.
+  it("on a presented window, a script's channel_publish is credited with the rows the window held when its run call started the script, not a row stored before then and presented after", async () => {
+    const framework = await createFramework();
+    const publishes: Array<[string, 'delivered' | 'refused']> = [];
+    stubChannelRegistry(framework, ROOM, { publishes });
+    const fw = internals(framework) as unknown as {
+      turnRouting: Map<string, unknown>;
+      scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string; held?: true }>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    assert.equal(cm.windowMode(), 'presented', 'premise: the window is presented');
+    const room = destinationKey({ serverId: 'chat', channelId: ROOM });
+    const rowOf = (id: string): MarkedRow => cm.getMessage(id as never)!;
+    const before = cm.addMessage('someone', [{ type: 'text', text: 'read before the script' }] as ContentBlock[]);
+    cm.presentRows([before]);
+    const after = cm.addMessage('someone', [{ type: 'text', text: 'presented after the script started' }] as ContentBlock[]);
+    agent.markContextConsumed();
+    const atStart = agent.getConsumedWatermark()!;
+    cm.presentRows([after]);
+    fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set() });
+
+    const answer = fw.scriptToolCall('assistant', 'channel_publish', JSON.stringify({ channelId: ROOM, content: 'a script posts' }),
+      { watch: { turnId: 1, endTurn: false }, startTurnId: 1, startReadThrough: atStart });
+    const answered = await bridgeAnswer(framework, answer);
+
+    assert.equal(JSON.parse(answered.json).isError, false, `the call succeeded: ${answered.json}`);
+    assert.deepEqual(publishes, [[ROOM, 'delivered']], "the premise: the script's publish was delivered");
+    assert.equal(agent.publishedAfterReading(room, rowOf(before), cm), true, 'credited with a row the window held when the script started');
+    assert.equal(agent.publishedAfterReading(room, rowOf(after), cm), false,
+      'not with a row stored before then and presented after, though its sequence is below the mark\'s head');
+    await framework.stop();
+  });
+
   const event = (e: Record<string, unknown>) => (framework: AgentFramework) => framework.pushEvent(e as unknown as ProcessEvent);
   const kept: Array<[string, (framework: AgentFramework) => unknown]> = [
     ['console input, which nothing records an answer to', event({ type: 'external-message', source: 'console', content: 'are you there?' })],
@@ -1077,4 +1113,48 @@ describe('a wake for a write heard mid-turn', () => {
       await framework.stop();
     });
   }
+});
+
+// AF #844 bot review 2, finding 14: a fork's channel message marks its wake
+// with the row it was stored as, as a resident's does, so a live turn that
+// reads and answers it can drop the wake (rowDone) rather than start a turn.
+describe("a fork's channel wake", () => {
+  let tempDir: string;
+  beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'heard-wake-fork-')); });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  it('carries the id its message was stored as, routed to the fork or delivered to it by name', async () => {
+    const membrane = new MockMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+      modules: [],
+      conversations: { templateAgent: 'trunk' },
+    });
+    try {
+      const dm = (body: string, extra: Record<string, unknown> = {}) => ({
+        type: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'srv:dm:alice', messageId: `m-${body}`,
+        author: { id: 'U1', name: 'alice' }, content: [text(body)], timestamp: new Date().toISOString(),
+        metadata: { channel_type: 'im' }, triggerInference: true, ...extra,
+      }) as unknown as ProcessEvent;
+      membrane.pushResponse(createMockResponse([text('Hello.')]));
+      framework.pushEvent(dm('hello there'));
+      await framework.runUntilIdle();
+      const fork = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'srv:dm:alice' })!.agentName;
+      const fw = internals(framework) as Internals & { handleMcplChannelIncoming(event: unknown): Promise<unknown> };
+      const rowOf = (body: string) => framework.getAgent(fork)!.getContextManager().getAllMessages()
+        .find((m) => JSON.stringify(m.content).includes(body))?.id;
+      for (const [body, extra] of [['routed again', {}], ['a correction', { deliverTo: fork }]] as const) {
+        fw.pendingRequests.length = 0;
+        await fw.handleMcplChannelIncoming(dm(body, extra));
+        const wake = fw.pendingRequests.find((r) => r.agentName === fork);
+        assert.ok(wake, `${body}: setup: the fork's wake is queued`);
+        assert.ok(rowOf(body), `${body}: setup: stored in the fork`);
+        assert.equal(wake.readsRow, rowOf(body), `${body}: the wake reads its row`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
 });

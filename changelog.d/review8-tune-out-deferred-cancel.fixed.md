@@ -20,12 +20,13 @@
   reader fork whose run has ended, which nothing can be written to. After the waiting cancel's first release failed,
   a resident's cancel, an end time or a close of the excepted channel could end the tune-out before the retry, and
   it delivered only its own caller's note: the queued one was never delivered. That cancel now takes the waiting one
-  off the queue and delivers its note once, after the release, under the subconscious's name (a reader fork's as its
-  mail, even after its run has ended), before the caller's own. If that write fails, the loss is logged and traced
-  as `tune-out:deferred-cancel-dropped` (`note-undelivered`, with the reason and the author), and the note's author
-  is told so in its own context, with the hold, the resident and the error's text, where it still exists: a reader
-  fork whose run has ended is written nothing, and the loss, reaching no one, is traced as
-  `tune-out:note-loss-untold` (`author-gone`). The cancel still ends the tune-out. Each notice of a lost note gives
+  off the queue and delivers its note once, before the caller's own: a reader fork's after the release, as its mail,
+  even after its run has ended, and the persistent subconscious's before the release, under its name (the
+  844-queued-note-loss-in-release entry). If that write fails, the loss is logged and traced as
+  `tune-out:deferred-cancel-dropped` (`note-undelivered`, with the reason and the author), and the note's author is
+  told so: the persistent subconscious in the release itself, a reader fork in its own context, with the hold, the
+  resident and the error's text, where it still exists. A reader fork whose run has ended is written nothing, and the
+  loss, reaching no one, is traced as `tune-out:note-loss-untold` (`author-gone`). The cancel still ends the tune-out. Each notice of a lost note gives
   the persistent subconscious a turn to read it. No notice is written while writes are held: it waits for their
   release. A notice of a lost note that can't be written was only logged; it is now kept, traced as
   `tune-out:note-loss-untold` (`write-failed`, with the author and the error) at its first failure, and tried again

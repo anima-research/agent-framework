@@ -51,11 +51,14 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'cancel_tuneout',
     description:
-      'End the tune-out on a channel now. The diverted backlog is delivered ' +
+      'End the tune-out on a channel. The diverted backlog is delivered ' +
       'to the resident (capped), and the channel\'s traffic reaches them as ' +
-      'it did before the tune-out. A note in `text` arrives alongside the ' +
+      'it did before the tune-out, unless the all-except hold holds it too. ' +
+      'A note in `text` arrives alongside the ' +
       'backlog, verbatim (leading and trailing whitespace trimmed), under ' +
-      'your own name. If you were started to read ' +
+      'your own name. Where the cancel has to wait (an operator\'s change to ' +
+      'the store, say), its answer says so, and whether your note waits with ' +
+      'it. If you were started to read ' +
       'one hold, you can end only that hold.',
     inputSchema: {
       type: 'object',
@@ -114,11 +117,16 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
 /**
  * Who reads a tuned-out channel's traffic, as the text a resident reads
  * says it: the persistent subconscious by the name it runs under, or reader
- * forks. There is no hold without a reader (0.33.0). A persistent reader's
- * name is a value the host supplied, marked as such (suppliedValue).
+ * forks. There is no hold without a reader (0.33.0) but one whose release
+ * failed after the persistent reader ended, or at a start with none
+ * configured: none runs then (`running: false`), the reader named as
+ * configured, or by its default name, for tune_out's own text, and what a
+ * held channel's messages are says that none reads them (tuneOutHeldWords,
+ * tunedOutTrafficWords). A persistent reader's name is a value the host
+ * supplied, marked as such (suppliedValue).
  */
 export type TuneOutReader =
-  | { readonly kind: 'persistent'; readonly name: string }
+  | { readonly kind: 'persistent'; readonly name: string; readonly running?: false }
   | {
       readonly kind: 'forks';
       /** `subconscious.persist`, when it persists the reader; left out for a fork per look. */
@@ -133,8 +141,26 @@ export type TuneOutReader =
  * as forks of the resident's context.
  */
 export function tuneOutHeldWords(reader: TuneOutReader): string {
+  if (reader.kind === 'persistent' && reader.running === false) {
+    return "are held from you, with no reader running here to read them, until the tune-out's release, which failed, is tried again";
+  }
   return reader.kind === 'persistent' ? `are held from you and read by ${reader.name}`
     : 'are held from you and read by forks of your context';
+}
+
+/**
+ * What a tuned-out channel's traffic is, as the words after "its traffic"
+ * in the [tuned out] note to a send there: held from the resident and read
+ * by `reader` until the tune-out ends, or, where none runs, held until its
+ * release is tried again (TuneOutReader).
+ */
+export function tunedOutTrafficWords(reader: TuneOutReader): string {
+  if (reader.kind === 'persistent' && reader.running === false) {
+    return "is still held from you, with no reader running here to read it, until the tune-out's release, which failed, is tried again.";
+  }
+  return reader.kind === 'persistent'
+    ? `is still held from you, and read by ${reader.name}, until the tune-out ends.`
+    : 'is still held from you, and read by forks of your context, until the tune-out ends.';
 }
 
 /**
@@ -389,7 +415,9 @@ export interface ReaderFramingContext {
   /**
    * The traffic held since the last look, oldest first, as stored; empty
    * when nothing arrived. A held message is stored as it arrives, the
-   * resident's turn alive or not (#291), so the stored rows are all of it.
+   * resident's turn alive or not (#291), so the stored rows are all of it,
+   * but for one a surgery's hold or a manager awaiting recovery keeps in
+   * memory: it isn't stored yet, and is in the first backlog after it is.
    */
   backlog: StoredMessage[];
   /**

@@ -11,8 +11,10 @@
  * confabulated an apology for a choice it never made) and a KV bust (every
  * later compile diverged from the live prefix at the inserted message).
  *
- * Since #291 a write is stored at once, and the presentation index keeps it
- * out of the agent's window until the agent's next presentation point; the
+ * Since #291 a write is stored at once (unless a surgery's hold or a context
+ * manager refusing its work keeps it in memory until that is over), and the
+ * presentation index keeps it out of the agent's window until the agent's
+ * next presentation point; the
  * deferral queue these invariants were first written against is gone, and
  * the tests read the window instead.
  *
@@ -24,10 +26,10 @@
  *     between dequeue and stream registration is closed to cross-turn
  *     writers. What they write is stored, and enters the window at the
  *     turn's next point.
- *  3. endTurn edge: a message stored at an endTurn tool boundary (collected
- *     for injection but never delivered — the stream is cancelled) is seen by
- *     the follow-up turn its own wake starts, positioned AFTER the turn that
- *     never saw it, never before.
+ *  3. endTurn edge: a message written while an endTurn tool runs (stored at
+ *     once, and never delivered at that tool's boundary — the stream is
+ *     cancelled) is seen by the follow-up turn its own wake starts,
+ *     positioned AFTER the turn that never saw it, never before.
  *  4. Turn tokens never leak: after runUntilIdle, no turn-alive markers
  *     remain (a leaked token would permanently requeue every wake — the
  *     'idle+turn-alive' wedge).
@@ -275,7 +277,7 @@ describe('deferred-message wake integrity', () => {
     await framework.stop();
   });
 
-  it('endTurn edge: a message stored at an endTurn boundary is answered by its own wake, positioned after the turn that never saw it', async () => {
+  it('endTurn edge: a message stored while an endTurn tool runs is answered by its own wake, positioned after the turn that never saw it', async () => {
     scheduleTurns(membrane, [
       // Turn A: the agent is mid-scene and halts (skip_reply-shaped: an
       // endTurn tool result cancels the stream — collected injections are

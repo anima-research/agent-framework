@@ -9,7 +9,9 @@
  * is stored at once, whatever the residents' turns (#291, AF-5), so its
  * readers have it while a resident is busy. Since #291 a module's reads also
  * mark `held` a row that isn't in the window of the agent the read is for
- * (AF-6), which a message a tune-out holds from the residents never is. The
+ * (AF-6), which a message a tune-out holds from the residents never is, but
+ * for one stored before audience stamps: a window written down from the
+ * record keeps it, and the view still leaves it out. The
  * channel and its traffic come from test/tune-out-e2e.test.ts's MCPL fixture.
  */
 import { describe, it } from 'node:test';

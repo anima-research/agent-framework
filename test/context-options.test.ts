@@ -61,6 +61,16 @@ async function boot() {
     [STORED_INJECTION_KEY]: { agent: 'oren', namespace: 'notes', contentHash: 'h1', part: 0, parts: 1 },
   } as never);
   write('antra', [text('another word')]);
+  // The held row and oren's injection are 'elsewhere' for mira (and the
+  // injection for the subconscious), so no presentation point takes them
+  // in; a window written down from the record (an earlier release's) holds
+  // them, though. Put every stored row in each window, as that one does, so
+  // only the view keeps them out of a compile.
+  for (const name of ['mira', 'oren', 'Subconscious']) {
+    const cm = framework.getAgent(name)!.getContextManager();
+    cm.presentRows(cm.getUnpresentedMessages().map((m) => m.id));
+    assert.deepEqual(cm.getUnpresentedMessages(), [], `premise: ${name}'s window holds every stored row`);
+  }
   const store = (framework as unknown as { store: JsStore }).store;
   const record = (name: string) => (framework as unknown as { registry: { inspect(n: string): AgentRecord | undefined } }).registry.inspect(name)!;
   const reopen = async (name: string) => {

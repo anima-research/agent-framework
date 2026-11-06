@@ -47,6 +47,26 @@ describe('foreign rounds as a transcript', () => {
     assert.equal(sent[4], messages[4], 'and so is the result of its own call');
   });
 
+  // AF #844 bot review 2, finding 13: calls numbered per response.
+  it("tells a result by the nearest call before it: another agent's result whose id a call of the watcher's shares is transcribed", () => {
+    const own = (p: string) => p === 'Subconscious';
+    for (const order of ['own first', 'own last'] as const) {
+      const mine: NormalizedMessage[] = [
+        { participant: 'Subconscious', content: [call('c1', 'note_disposition', { key: 'k' })] },
+        { participant: 'user', content: [result('c1', '{"noted":"k"}')] },
+      ];
+      const scouts: NormalizedMessage[] = [
+        { participant: 'scout', content: [call('c1', 'search', { q: 'build status' })] },
+        { participant: 'user', content: [result('c1', 'green')] },
+      ];
+      const messages = order === 'own first' ? [...mine, ...scouts] : [...scouts, ...mine];
+      const sent = transcribeForeignRounds(messages, own);
+      const at = (m: NormalizedMessage) => messages.indexOf(m);
+      assert.equal(sent[at(mine[1]!)], mine[1], `${order}: the result of the watcher's own c1 is sent as stored`);
+      assert.deepEqual(sent[at(scouts[1]!)]!.content, [text('[search returned: green]')], `${order}: scout's c1 result is transcribed`);
+    }
+  });
+
   it('leaves a request with no other agent\'s blocks as it is, and keeps a row with nothing left as a line', () => {
     const messages: NormalizedMessage[] = [{ participant: 'antra', content: [text('hello')] }];
     assert.equal(transcribeForeignRounds(messages, () => false), messages, 'the same array');

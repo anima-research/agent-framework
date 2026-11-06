@@ -77,6 +77,17 @@ export interface OfflineRecoveryBranchResult {
   targetBranch: string;
   messagesRemoved: number;
   messagesSuppressed: number;
+  /**
+   * On a presented window (#291): the rows after the anchor in the agent's
+   * window that the cut keeps in the record (stored before the write that
+   * presented the anchor, presented after it), as the live rollback counts
+   * them. They leave the window as arrived and not presented, and enter it
+   * again at the agent's next presentation point, after the anchor. Not
+   * removed, so not counted in `messagesRemoved`, and not marked; a row the
+   * same recovery suppresses is counted there instead. 0 for a run with no
+   * anchor; absent on a window that is still the record.
+   */
+  returnedToArrivals?: number;
   /** Removed messages that carry a Discord address. */
   discordAddressable: number;
   /** The publication scope recorded for this recovery. */
@@ -103,9 +114,12 @@ export interface OfflineRecoveryBranchResult {
 /**
  * Create a safe Chronicle branch while the normal agent host is stopped.
  *
- * History is scanned in bounded windows and blobs are not re-inlined. The
- * affected messages are never compiled and their content is never written to
- * the recovery outbox; only Discord addressing metadata leaves Chronicle.
+ * History is scanned in bounded windows and blobs are not re-inlined, but a
+ * presented window (#291) is read whole where its order counts: for a
+ * `messages` count, and for the rows after the anchor that the cut returns
+ * to the arrivals or keeps (windowAfterCut). The affected messages are never
+ * compiled and their content is never written to the recovery outbox; only
+ * Discord addressing metadata leaves Chronicle.
  */
 export async function createOfflineRecoveryBranch(
   options: OfflineRecoveryBranchOptions,
@@ -182,7 +196,7 @@ export async function createOfflineRecoveryBranch(
       const firstRemoved = firstRemovedAfter(targetIndex, target);
       removedCount = total - firstRemoved;
       carriers = collectDiscordCarriers(contextManager, firstRemoved, total);
-    } else if (presented) {
+    } else if (presented && count !== undefined) {
       // Counted back in the agent's window, whose order isn't the record's:
       // the anchor is the window's row `count` before its newest. Only the
       // rows of the context's own slot count, as the live undo counts them:
@@ -210,7 +224,9 @@ export async function createOfflineRecoveryBranch(
     } else {
       // Count mode remains for compatibility. Read only the target plus suffix,
       // avoiding full-history materialization and attachment blob inflation.
-      // With no anchor (removeSuppressed alone), the target is the newest row.
+      // With no anchor (removeSuppressed alone), the target is the newest row,
+      // on a presented window too: nothing is cut, the branch starting at the
+      // head.
       const dropping = count ?? 0;
       const window = contextManager.getMessageWindow(total - dropping - 1, dropping + 1, {
         resolveBlobs: false,
@@ -239,8 +255,13 @@ export async function createOfflineRecoveryBranch(
       options.suppressRanges ?? [],
       options.removeSuppressed === true,
     );
-    if (presented && removedCount === 0 && suppression.intervals.length === 0) {
-      refuseIneffectiveCut(contextManager, target, options.agentName);
+    // A run with no anchor cuts nothing, so there is no anchor to name and
+    // nothing returns: one with nothing to suppress makes a branch at the
+    // head, as on a legacy window.
+    const afterCut = presented && anchorCount > 0 ? windowAfterCut(contextManager, target) : undefined;
+    const returnedToArrivals = afterCut?.returned.filter((id) => !suppression.ids.has(String(id))).length;
+    if (afterCut && removedCount === 0 && suppression.intervals.length === 0 && afterCut.returned.length === 0) {
+      refuseIneffectiveCut(target, afterCut.kept, options.agentName);
     }
     validateRemovalIntegrity(
       contextManager,
@@ -280,6 +301,7 @@ export async function createOfflineRecoveryBranch(
       targetBranch,
       messagesRemoved: removedCount,
       messagesSuppressed: suppression.messageCount,
+      ...(presented ? { returnedToArrivals: returnedToArrivals ?? 0 } : {}),
       discordAddressable: addressable,
       marksScope: marks === 'none' ? 'none' : marks.scope,
       discordMarkersQueued: refs.length,
@@ -529,22 +551,21 @@ function firstIndexAfterCut(
 }
 
 /**
- * Refuses a recovery on a presented window that would change nothing, as
- * the live rollback refuses one: the cut at the write that presented the
- * anchor removes no row, and no row the window took after that write
- * (stored at or before the cut) becomes an arrival again. Read from the
- * window's newest row back to the anchor or the first row presented before
- * the cut, as the live rollback reads it (every row's cut grows in window
- * order). The rows that write presented after the anchor name the way to
- * take them out: a suppression in the same recovery.
+ * The rows after `target` in a presented window, as the live rollback reads
+ * them (windowAfterCut): those the write that presented the target
+ * presented too (`kept`, which no branch cut separates from it), and those
+ * presented after that write but stored at or before it (`returned`, which
+ * the cut keeps in the record and makes arrivals again). Read from the
+ * window's newest row back to the target or the first row presented before
+ * the cut (every row's cut grows in window order).
  */
-function refuseIneffectiveCut(
+function windowAfterCut(
   contextManager: ContextManager,
   target: StoredWindowMessage,
-  agentName: string,
-): void {
+): { returned: StoredWindowMessage['id'][]; kept: StoredWindowMessage[] } {
   const cut = contextManager.branchSequenceOf(target.id);
   const window = contextManager.getPresentedMessages();
+  const returned: StoredWindowMessage['id'][] = [];
   const kept: StoredWindowMessage[] = [];
   for (let i = window.length - 1; i >= 0; i--) {
     const row = window[i]!;
@@ -552,8 +573,26 @@ function refuseIneffectiveCut(
     const at = contextManager.branchSequenceOf(row.id);
     if (at < cut) break;
     if (at === cut) kept.unshift(row as StoredWindowMessage);
-    else if (row.sequence <= cut) return;
+    else if (row.sequence <= cut) returned.unshift(row.id);
   }
+  return { returned, kept };
+}
+
+/**
+ * Refuses a recovery on a presented window that would change nothing, as
+ * the live rollback refuses one: the cut at the write that presented the
+ * anchor removes no row, and no row the window took after that write
+ * becomes an arrival again (windowAfterCut). The rows that write presented
+ * after the anchor (`kept`) name the way to take them out: a suppression in
+ * the same recovery, which names a row by its Discord message id, and for a
+ * row with none (an agent's round, a tool row) the live `suppressMessages`
+ * by its row id.
+ */
+function refuseIneffectiveCut(
+  target: StoredWindowMessage,
+  kept: readonly StoredWindowMessage[],
+  agentName: string,
+): never {
   const anchorDiscordId = discordIdOf(target);
   const anchor = `${String(target.id)}${anchorDiscordId ? ` (Discord message ${anchorDiscordId})` : ''}`;
   if (kept.length > 0) {
@@ -561,11 +600,20 @@ function refuseIneffectiveCut(
     const first = kept[0]!;
     const firstDiscordId = discordIdOf(first);
     const named = `${String(first.id)}${firstDiscordId ? `, Discord message ${firstDiscordId}` : ''}`;
+    const unaddressed = kept.filter((row) => discordIdOf(row) === undefined).map((row) => String(row.id));
+    const rowIds = `${unaddressed.slice(0, 5).join(', ')}${unaddressed.length > 5 ? ` (+${unaddressed.length - 5})` : ''}`;
+    const offline = 'in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)';
+    const live = `by row id with the live suppressMessages (${rowIds}) once the host runs, since the offline recovery ` +
+      'suppresses only by Discord message id';
+    const how = unaddressed.length === 0 ? `suppress ${n === 1 ? 'it' : 'them'} ${offline}`
+      : unaddressed.length === n ? `suppress ${n === 1 ? 'it' : 'them'} ${live} and ${n === 1 ? 'it has none' : 'none of them has one'}`
+      : `suppress the ${n - unaddressed.length} with a Discord message id ${offline}, and the ${unaddressed.length} ` +
+        `without one ${live}`;
     throw new Error(
       `Recovery anchor ${anchor} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
       `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
       `so a recovery anchored there would remove nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-      `suppress ${n === 1 ? 'it' : 'them'} in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)`,
+      how,
     );
   }
   throw new Error(
@@ -669,7 +717,7 @@ function buildSuppressionPlan(
   rawMessageIds: string[],
   rawRanges: Array<{ fromMessageId: string; toMessageId: string }>,
   removeSuppressed = false,
-): { intervals: SuppressionInterval[]; carriers: DiscordMessageMetadataCarrier[]; messageCount: number } {
+): { intervals: SuppressionInterval[]; carriers: DiscordMessageMetadataCarrier[]; messageCount: number; ids: Set<string> } {
   const messageIds = rawMessageIds.map(normalizeDiscordMessageId);
   const ranges = rawRanges.map((range) => ({
     fromMessageId: normalizeDiscordMessageId(range.fromMessageId),
@@ -679,7 +727,7 @@ function buildSuppressionPlan(
     ...messageIds,
     ...ranges.flatMap((range) => [range.fromMessageId, range.toMessageId]),
   ]);
-  if (wanted.size === 0 && !removeSuppressed) return { intervals: [], carriers: [], messageCount: 0 };
+  if (wanted.size === 0 && !removeSuppressed) return { intervals: [], carriers: [], messageCount: 0, ids: new Set() };
   const stamped: SuppressionInterval[] = [];
 
   const locations = new Map<string, MessageLocation>();
@@ -774,13 +822,15 @@ function buildSuppressionPlan(
   }
 
   const carriers: DiscordMessageMetadataCarrier[] = [];
+  const ids = new Set<string>();
   for (const interval of merged) {
-    carriers.push(...collectDiscordCarriers(contextManager, interval.start, interval.end + 1));
+    carriers.push(...collectDiscordCarriers(contextManager, interval.start, interval.end + 1, ids));
   }
   return {
     intervals: merged,
     carriers,
     messageCount: merged.reduce((sum, interval) => sum + interval.end - interval.start + 1, 0),
+    ids,
   };
 }
 
@@ -788,12 +838,14 @@ function buildSuppressionPlan(
  * The addressing metadata of removed messages, read in bounded windows: only
  * the Discord address and the MCPL tags (for `addressed` selection) are kept,
  * never content. A sharded message may repeat its metadata across adjacent
- * records; selection dedupes by address.
+ * records; selection dedupes by address. Each row's id is added to `ids`
+ * where given.
  */
 function collectDiscordCarriers(
   contextManager: ContextManager,
   start: number,
   end: number,
+  ids?: Set<string>,
 ): DiscordMessageMetadataCarrier[] {
   const carriers: DiscordMessageMetadataCarrier[] = [];
   for (let offset = start; offset < end; offset += RECOVERY_SCAN_WINDOW) {
@@ -803,6 +855,7 @@ function collectDiscordCarriers(
       { resolveBlobs: false },
     ).messages;
     carriers.push(...messages.map(addressingOnly));
+    if (ids) for (const message of messages) ids.add(String(message.id));
   }
   return carriers;
 }

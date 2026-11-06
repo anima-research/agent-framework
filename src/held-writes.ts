@@ -36,7 +36,9 @@ export type ModuleRowWindow = Pick<ContextManager, 'windowMode' | 'ordinalOf'>;
  *   resident, so a marked row is one the store keeps and no resident is
  *   shown (ModuleMessage.heldFromResidents says where its text can still
  *   reach one). So is a row a suppress rule hid (`metadata.suppressed`),
- *   which no view shows either, nor any window presents.
+ *   which no view shows either, nor any window presents (one stored before
+ *   audience stamps stays in a window written down from the record; the
+ *   view still leaves it out).
  * - `held` when that agent's window (`window`) presents rows and doesn't
  *   hold it (#291): stored and not yet presented to the agent, which its
  *   next presentation point does, or taken out of it as an undone turn's,

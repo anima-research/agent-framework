@@ -193,6 +193,22 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     assert.deepEqual(h.windowTexts(), ['A']);
   });
 
+  // AF #844 bot review 2, finding 180.
+  it("the refusal of a rollback the rows presented with its target make empty names no hide by Discord id where none of them has one", async () => {
+    const h = await boot();
+    const api = (t: string): MessageId => h.cm().addMessage('someone', [{ type: 'text', text: t } as ContentBlock], { source: 'api' });
+    const x = api('x');
+    const y = api('y');
+    h.cm().presentRows([x, y]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.ok(e.message.includes(`(the first: ${y})`), e.message);
+      assert.match(e.message, /suppress it \(suppressMessages\)$/, 'suppression is the removal named');
+      assert.doesNotMatch(e.message, /Discord message id|hide command/);
+      return true;
+    });
+  });
+
   it('a rollback to a row presented together with every row after it changes nothing, and is refused saying so', async () => {
     const h = await boot();
     const x = h.store('x');

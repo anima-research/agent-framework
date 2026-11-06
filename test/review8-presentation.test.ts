@@ -212,7 +212,7 @@ describe('an agent left in legacy mode (AF #844 bot review finding 6)', () => {
 });
 
 describe("the boot's pass over an agent whose owed rows couldn't be read for their wakes (AF #844 bot review finding 36)", () => {
-  it('leaves them out of its window, so the next boot asks the wake they owe', async () => {
+  it('leaves them out of its window, and a later write at rest leaves them out too, so the next boot asks the wake they owe', async () => {
     const storePath = join(dir(), 'store');
     const boot = () => AgentFramework.create({
       storePath,
@@ -247,6 +247,12 @@ describe("the boot's pass over an agent whose owed rows couldn't be read for the
       assert.ok(release, 'setup: the release is stored');
       assert.ok(first.lines.some((line) => line.includes("could not read what agent's window is owed at boot")), first.lines.join('\n'));
       assert.equal(cm.windowStatusOf(release.id), 'out', "the boot's pass leaves it out of the agent's window");
+      // Review 2 #51: a row stored for the idle agent later presents no
+      // arrival at rest, the release among them, until its next turn start.
+      const later = (first.result as unknown as Internals).addMessage('alice', text('a later message'));
+      assert.notEqual(later, '', 'setup: the later row is stored');
+      assert.equal(cm.windowStatusOf(release.id), 'out', 'a later write at rest leaves the release out');
+      assert.equal(cm.windowStatusOf(later), 'out', 'and that write too');
     } finally {
       await first.result.stop();
     }
@@ -256,6 +262,38 @@ describe("the boot's pass over an agent whose owed rows couldn't be read for the
       assert.ok(pending.some((r) => r.agentName === 'agent' && r.reason === 'tune-out released (restored)'), JSON.stringify(pending));
     } finally {
       await second.stop();
+    }
+  });
+});
+
+// AF #844 bot review 2, finding 95.
+describe("a persistent subconscious whose window is the record", () => {
+  it("reads the residents' slot it observes at boot, where a release's loss line is stored, as well as its own", async () => {
+    // Its window's index in another version's format: its write-down leaves it in legacy mode.
+    const store = JsStore.openOrCreate({ path: join(dir(), 'store.chronicle') });
+    store.registerState({ id: 'subconscious/mira/window', strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 100 });
+    store.appendToStateJson('subconscious/mira/window', { v: 99 });
+    const framework = await logged(() => AgentFramework.create({
+      store,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+      modules: [],
+      subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for mira.' },
+      syncIntervalMs: 0,
+      operatorLogPath: false,
+    } as Parameters<typeof AgentFramework.create>[0]));
+    try {
+      const f = framework.result;
+      const sub = f.getAgent('Subconscious')!.getContextManager();
+      assert.equal(sub.windowMode(), 'legacy', "setup: the subconscious's window is the record");
+      const loss = f.getAgent('mira')!.getContextManager().addMessage('user', text('[Tune-out: #room cancelled; a note was lost]'), {
+        system: true, kind: 'tune-out-cancel', lostNote: true, audience: ['Subconscious'],
+      } as MessageMetadata);
+      const window = (f as unknown as { subconsciousWindow(): Array<{ id: string }> }).subconsciousWindow();
+      assert.ok(window.some((m) => m.id === loss), "the release in the residents' slot is in what its boot reads");
+    } finally {
+      await framework.result.stop();
+      store.close();
     }
   });
 });
