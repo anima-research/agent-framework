@@ -725,7 +725,8 @@ for (const lane of ['push/event', 'channels/incoming'] as const) test(`replay in
   const connection = f.mcplServerRegistry.getServer('editor');
   assert.equal(connection.config, f.mcplServerConfigs.get('editor'));
   assert(Object.isFrozen(connection.replyAuthority));
-  assert.equal(connection.replyAuthority.authorize, approve);
+  assert.notEqual(connection.replyAuthority.authorize, profile.authorize);
+  assert.equal(connection.replyAuthority.authorize({}, {}), approve(), 'the pinned receiver-bound callback still uses the pre-dial function');
   assert.equal(connection.replyAuthority.timeoutMs, 1000);
   const traces: any[] = []; x.framework.onTrace(e => traces.push(e));
   connection.emit('orphaned-response', { id: 123, method: 'tools/call', hadState: false, hadCheckpoint: false,
