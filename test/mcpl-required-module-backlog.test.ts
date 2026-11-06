@@ -263,3 +263,31 @@ for (const lane of ['push/event', 'channels/incoming'] as const) {
     assert.deepEqual(order, ['wire-error', 'module:first', 'wire-ack', 'module:next']);
   });
 }
+
+for (const moduleCount of [0, 1]) {
+  test(`R4-2 channel batch: 64 siblings plus concurrent arrival with ${moduleCount} idle modules`, async t => {
+    const held = deferred(); const entered = deferred(); const seen: string[] = [];
+    const spy = { name: 'spy', async start() {}, async stop() {}, async onProcess(e: any) {
+      if (e.type === 'mcpl:channel-incoming') seen.push(e.eventId);
+      return {};
+    } };
+    const f = await fixture({ server: { inboundAdmission: { ...admission, bind: (connection: any) => ({ connection, admit: async ({ item }: any) => {
+      if (item.eventId === 'b1') { entered.release(); await held.promise; }
+      return allow;
+    } }) } }, framework: { modules: moduleCount ? [spy] : [] } as never });
+    t.after(async () => { held.release(); await f.close(); }); await f.register();
+    const batch = f.send('channels/incoming', { messages: Array.from({ length: 64 }, (_, i) =>
+      f.channel(`b${i}`, `batch_body_${i}_end`, { key: `b${i}`, initial: true }, 'chat', `b${i}`)) });
+    await settles(entered.promise, 'second batch callback');
+    const concurrent = await f.send('channels/incoming', { messages: [f.channel('concurrent', 'concurrent_body', { key: 'concurrent', initial: true })] });
+    assert.equal(concurrent.result.results[0].accepted, true);
+    const beforeAck = [...seen];
+    held.release();
+    const response = await batch;
+    assert.deepEqual(response.result.results.map((r: any) => r.accepted), Array(64).fill(true));
+    assert.deepEqual(beforeAck, [], 'module FIFO still waits for the batch response');
+    await eventually(() => (f.framework as any).requiredModuleQueues.size === 0);
+    if (moduleCount) assert.deepEqual(seen, ['b0', 'concurrent', ...Array.from({ length: 63 }, (_, i) => `b${i + 1}`)]);
+    for (let i = 0; i < 64; i++) assert(f.context().includes(`batch_body_${i}_end`));
+  });
+}

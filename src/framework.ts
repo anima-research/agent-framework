@@ -1078,8 +1078,8 @@ interface CoalescedChannelEvent {
 type CoalescedDelivery =
   | { lane: 'channel'; event: CoalescedChannelEvent }
   | { lane: 'push'; event: McplPushEvent };
-/** Required coalesced module work per channel/feature-set scope, including
- * the running call and reservations before built-in acceptance. */
+/** Required coalesced released module work per channel/feature-set scope,
+ * including the running call. Unreleased reservations have a separate equal bound. */
 export const MAX_PENDING_REQUIRED_MODULE_WORK = MAX_PENDING_ADMISSIONS;
 type RequiredModuleSlot = {
   connection: ConnectionKey;
@@ -19348,9 +19348,14 @@ export class AgentFramework {
           if (!slot) {
             const key = JSON.stringify([occ.serverId, occ.binding, occ.scope]);
             let queue = this.requiredModuleQueues.get(key);
-            if (queue && queue.pending.length + (queue.running ? 1 : 0) >= MAX_PENDING_REQUIRED_MODULE_WORK) {
-              // Removal must stand; only a delivered notice's module work may
-              // be dropped. Never reserve beyond the bound.
+            const released = queue?.pending.filter(slot => slot.ready).length ?? 0;
+            const unreleased = (queue?.pending.length ?? 0) - released;
+            if (released + (queue?.running ? 1 : 0) >= MAX_PENDING_REQUIRED_MODULE_WORK
+              || unreleased >= MAX_PENDING_REQUIRED_MODULE_WORK) {
+              // A batch's own not-yet-released work is not module backlog.
+              // Bound those reservations separately so stalled responses
+              // cannot accumulate payloads without limit. Removal must stand;
+              // only a delivered notice's module work may be dropped.
               return occ.retract ? undefined : 'admission_module_capacity';
             }
             if (!queue) {

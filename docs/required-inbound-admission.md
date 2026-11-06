@@ -141,13 +141,17 @@ For required coalesced traffic, built-in storage and the durable acknowledgement
 do not await module `onProcess`. Module dispatch starts after acceptance and after
 the acknowledgement is sent, and runs per channel (feature-set scope for plain pushes) in acceptance order (callback-completion order across subjects).
 The exported ceiling `MAX_PENDING_REQUIRED_MODULE_WORK = 64` (equal to
-`MAX_PENDING_ADMISSIONS`) bounds queued **plus running** work, including
-capacity reserved before storage. At capacity, new deliveries refuse with
+`MAX_PENDING_ADMISSIONS`) bounds released queued **plus running** work at
+reservation. Not-yet-released reservations are bounded separately at 64 per
+scope, so a batch's own reservations do not count as module backlog for its
+later siblings. Each batch is also bounded by its arrival tickets. Releasing a
+batch can temporarily take released work over 64; total retained slots stay
+bounded by the two allowances (at most 128). At either capacity, new deliveries refuse with
 `admission_denied` before replacement, storage or acceptance receipt.
 Withdrawals are never refused at the module cap: removal stands, and if the
 withdrawal delivers a notice, only that notice's module work is dropped with
 `mcpl:module-work-dropped`, count 1, reason `admission_module_capacity`.
-No module work is queued over the cap. Pure withdrawals deliver no module work.
+No reservation exceeds either allowance at admission. Pure withdrawals deliver no module work.
 The lane diagnostic/trace reasons `admission_ticket_capacity` and
 `admission_module_capacity` distinguish the two bounds from policy denials;
 both capacity refusals retain wire reason `admission_denied` (no wire schema change).

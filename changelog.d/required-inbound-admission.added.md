@@ -22,6 +22,9 @@
   through admission with per-subject arrival ordering shared across both lanes.
   At the ticket cap, one withdrawal per live/pending subject still takes its
   ordered ticket through the ordinary admission budget; unknown subjects refuse.
+  Module backlog counts released/running work separately from the bounded
+  reservations awaiting a lane response, so a batch does not refuse its own
+  later siblings as module backlog.
   Superseded-epoch items are refused. During initialize, data requests
   receive the existing capability error (-32002). Required connections do not
   advertise `toolHints` or carry RFC-014 toolset presence; an explicit
