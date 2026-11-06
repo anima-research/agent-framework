@@ -64,6 +64,8 @@ function stampSetup() {
     registered: false, wakeCount: 0,
     /** The store's branch now (switchTo). */
     branch: 'main',
+    /** A channel can't be named (nameShown throws). */
+    shownFails: false,
   };
   const key = (s: string, c: string) => `${s}\0${c}`;
   /** A listener inside each write, as a host's synchronous trace listener of the store write runs. */
@@ -88,7 +90,10 @@ function stampSetup() {
       if (refuse.has(id)) throw new Error(`the store refused ${id} (test)`);
       if (value === null) states.delete(id); else states.set(id, structuredClone(value));
     },
-    nameShown: (c: { serverId: string; channelId: string }) => shown.get(key(c.serverId, c.channelId)) ?? c.channelId,
+    nameShown: (c: { serverId: string; channelId: string }) => {
+      if (state.shownFails) throw new Error('the channel could not be named (test)');
+      return shown.get(key(c.serverId, c.channelId)) ?? c.channelId;
+    },
     quotedShown: (c: { channelId: string }) => JSON.stringify(c.channelId),
     listChannelsRaw: () => (state.registered ? holds.map((x) => ({ serverId: x.serverId, descriptor: { id: x.channelId } })) : []),
   };
@@ -1425,5 +1430,40 @@ test("review 3 R2: a stop from a listener of a loss notice's write keeps its sta
     c.runDeferredCancels();
     assert.ok(stopped, "premise: the notice's write stopped the host");
     assert.deepEqual((h.states.get(STAMP) as { epochs: string[] }).epochs, [e], "the stop's stamp stands, covering the hold it accounted for");
+  } finally { h.stopAll(); }
+}));
+
+test("review 3 #13: a branch move back to the stamp's own branch, while the boot's notice is neither written nor kept, leaves the marker reading the last run", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.state.subRefuses = true;
+    h.refuse.add(LOSS_RECORD);
+    const c = h.boot();
+    assert.deepEqual(h.told(), [], 'premise: the notice could not be written, nor kept in the store');
+    // A failed surgery's restore: the store moves back to the branch it was on.
+    c.branchMoved();
+    // The host dies before either lands.
+    h.state.subRefuses = false;
+    h.refuse.delete(LOSS_RECORD);
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')], "the next boot still reads the first run's ask");
+  } finally { h.stopAll(); }
+}));
+
+test("review 3 #66: a boot whose telling of the last stop's stamp throws partway leaves the marker reading the last run, so the next boot tells the holds it didn't reach", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.state.shownFails = true;
+    h.boot();
+    assert.deepEqual(h.told(), [], "premise: the telling threw before it told the hold");
+    h.state.shownFails = false;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')], "the next boot reads the first run's ask, not this run's rows alone");
   } finally { h.stopAll(); }
 }));
