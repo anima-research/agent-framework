@@ -3048,7 +3048,7 @@ describe("a re-initialization alert's opening", () => {
       assert.ok(opening.includes(` wait in memory (${says} now). `), opening);
     }
     says(longHoldAlert({ move: 'branch switch', agentName: 'a', heldSeconds: 61, queued: 1, waitingForMaintenance: false }).opening,
-      'the writes the hold keeps are lost, as are those kept for a manager refusing its work.');
+      'the writes the hold keeps are lost, as are those kept for a manager refusing its work, except mail.');
     // A disposed agent's held writes: those the primary takes in its place
     // went on to it, and the rest were dropped.
     for (const [heldWrites, passedOn, clause] of [

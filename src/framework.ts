@@ -3507,14 +3507,16 @@ export function longHoldAlert(hold: {
   // #291: the hold keeps its writes in memory (surgeryHeldWrites), and its
   // release stores them; no queue persists them, nor the writes kept for an
   // agent whose manager refuses its work (heldForRecovery).
-  const opening = `The ${move} has held the store for ${heldSeconds} s, so no turn starts and the writes it holds wait in ` +
+  // The opening is what the ops webhook keeps whole (opsWebhookText), so
+  // where the mail goes is said after it.
+  const opening = `The ${move} has held the store for ${heldSeconds} s, so no turn starts and its writes wait in ` +
     `memory (${queued === 1 ? '1 write' : `${queued} writes`} now). A restart ends the ${move}, the ` +
     'conversation agents and the runs, and re-initializes the configured agents; the writes the hold keeps are lost, ' +
-    'as are those kept for a manager refusing its work.';
+    'as are those kept for a manager refusing its work, except mail.';
   const on = reinitializing !== undefined
     ? `, and is re-initializing ${reinitializing}'s context manager now`
     : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
-  return { opening, message: `${opening} The ${move} is for ${agentName}${on}.` };
+  return { opening, message: `${opening} That mail stays held in the registry, for the next boot. The ${move} is for ${agentName}${on}.` };
 }
 
 const HOLD_ALERT_MS = 60_000;
