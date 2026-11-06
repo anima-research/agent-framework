@@ -188,6 +188,34 @@ class EndsSilentlyAfterFirstRound extends MockMembrane {
   }
 }
 
+class CancelThrowsAfterFirstRound extends MockMembrane {
+  failNow: (() => void) | undefined;
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    const inner = super.streamYielding(request);
+    let resultsGiven = false;
+    let wake: (() => void) | undefined;
+    const membrane = this;
+    return {
+      provideToolResults: () => { resultsGiven = true; wake?.(); },
+      cancel: () => { throw new Error('zz the cancel threw'); },
+      get isWaitingForTools() { return !resultsGiven && inner.isWaitingForTools; },
+      get pendingToolCallIds() { return resultsGiven ? [] : inner.pendingToolCallIds; },
+      get toolDepth() { return inner.toolDepth; },
+      get isCancelled() { return false; },
+      async *[Symbol.asyncIterator]() {
+        for await (const event of inner) {
+          yield event;
+          if (event.type !== 'tool-calls') continue;
+          while (!resultsGiven) await new Promise<void>((resolve) => { wake = resolve; });
+          await new Promise<void>((resolve) => { membrane.failNow = resolve; });
+          yield { type: 'error', error: new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, message: "zz this organization's acceleration limit was reached", rawError: { status: 429 } }) } as unknown as StreamEvent;
+          return;
+        }
+      },
+    } as unknown as YieldingStream;
+  }
+}
+
 class HeldSecond extends MockMembrane {
   primary = 0;
   override streamYielding(request: NormalizedRequest): YieldingStream {
@@ -882,6 +910,30 @@ describe('plain speech a module says it showed', () => {
     framework = undefined;
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the place logged once the stop ends the turn');
     assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+  });
+
+  it("a turn whose stream's cancel throws at stop(), and that fails after it, logs the place a module named for its speech", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    surface.heldAnswer = { sentTo: SENT_TO };
+    const membrane = new CancelThrowsAfterFirstRound();
+    membrane.pushResponse(lookRound('Looking around.'));
+    const f = await host([surface], membrane);
+    push(f, 'hello');
+    void f.runUntilIdle();
+    await until(() => membrane.failNow !== undefined, 'premise: the stream took its tool results and waits to fail');
+    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
+    surface.release();
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(f.stop(), 'premise: the stream\'s cancel threw, so stop() rejects');
+    framework = undefined;
+    assert.deepEqual(errors.filter((e) => e.startsWith('[speechRouted]')), [], "premise: the stop left the still-running stream's turn its asks");
+    membrane.failNow!();
+    await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the place logged once the stream fails');
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+    await f.stop();
   });
 
   it("a turn whose continuation is dropped while a module's answer is due logs the place it names when it answers", async (t) => {
