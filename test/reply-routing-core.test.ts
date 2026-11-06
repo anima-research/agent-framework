@@ -325,3 +325,14 @@ test('R1-5 private fault trace is bounded with fixed codes and no callback detai
   assert(!JSON.stringify(traces).includes('secret'));
 });
 
+test('R1-6 blocking authorize cannot mint after the monotonic deadline', async () => {
+  let signal!: AbortSignal;
+  const x = fixture({ timeoutMs: 5, resolve: input => { signal = input.signal; return { channelId: 'room' }; }, authorize: () => {
+    const until = performance.now() + 15; while (performance.now() < until) {}
+    return true;
+  } });
+  const result = await x.run();
+  assert.equal(result.verdict.store, true);
+  assert.equal(result.binding.destination, undefined);
+  assert.equal(signal.aborted, true);
+});

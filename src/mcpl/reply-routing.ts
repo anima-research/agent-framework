@@ -153,7 +153,14 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
         try { return valid(input.connection, destination) && authorize.call(config, approvedInput, destination) === true; }
         catch { reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return false; }
       };
-      return current() ? { routing: mint(input.connection, destination, current) } : privateWork();
+      const authorized = current();
+      // authorize/valid are synchronous too: their elapsed time counts toward
+      // the same deadline, even when they blocked the timeout timer.
+      if (performance.now() >= deadline) {
+        reportReplyFailure(diagnosticConnection ?? input.connection, 'timeout');
+        controller.abort(); return privateWork();
+      }
+      return authorized ? { routing: mint(input.connection, destination, current) } : privateWork();
     } catch {
       reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return privateWork();
     } finally {
