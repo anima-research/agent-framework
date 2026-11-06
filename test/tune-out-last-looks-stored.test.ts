@@ -3,7 +3,8 @@
  * store, or over the store reopened from disk, reads back the looks another
  * coordinator marked, for each epoch and each channel, and a start keeps the
  * looks of every tune-out on record, whether its channel is registered yet or
- * not.
+ * not. Ending the all-except hold leaves a channel's own tune-out the wake and
+ * the count kept under that channel's key.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,6 +21,9 @@ type Looks = Record<string, Record<string, number>>;
 interface Inner {
   markLook(epochId: string, serverId: string, channelId: string): void;
   lastLooks(): Looks | undefined;
+  key(serverId: string, channelId: string): string;
+  pendingWakes: Map<string, unknown>;
+  divertedSinceInvocation: Map<string, number>;
 }
 
 const CHANNEL = 'disc:guild:a';
@@ -29,7 +33,7 @@ function registryOn(store: JsStore): ChannelRegistry {
   return new ChannelRegistry(servers, {} as FeatureSetManager, () => {}, () => {}, { store });
 }
 
-function coordinatorOn(registry: ChannelRegistry, sequence: () => number = () => 0): TuneOutCoordinator {
+function coordinatorOn(registry: ChannelRegistry, sequence: () => number = () => 0, privileged = false): TuneOutCoordinator {
   const hooks = {
     addMessage: () => {},
     commitDeliveries: () => true,
@@ -42,7 +46,7 @@ function coordinatorOn(registry: ChannelRegistry, sequence: () => number = () =>
     currentSequence: sequence,
     setSubconsciousAnchor: () => {},
     isForkBound: () => false,
-    isPrivilegedAuthor: () => false,
+    isPrivilegedAuthor: () => privileged,
     allowChannelSpeech: () => false,
   };
   return new TuneOutCoordinator(registry, { getServer: () => undefined } as never, hooks as never);
@@ -127,3 +131,24 @@ for (const order of ['before', 'after'] as const) {
     }
   });
 }
+
+test("ending the all-except hold leaves a channel's own tune-out its pending wake and its tally", (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const dir = mkdtempSync(join(tmpdir(), 'last-looks-hold-end-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  try {
+    const coordinator = coordinatorOn(registryOn(store), () => 0, true);
+    assert.equal(coordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:work' }, { durationSeconds: 120 }, 'agent-tool').ok, true);
+    assert.equal(coordinator.enter('disc', CHANNEL, {}, 'agent-tool').ok, true);
+    coordinator.recordHeld('disc', CHANNEL, 'm1', undefined, 'author');
+    const key = inner(coordinator).key('disc', CHANNEL);
+    const own = () => ({ wake: inner(coordinator).pendingWakes.has(key), tally: inner(coordinator).divertedSinceInvocation.get(key) });
+    assert.deepEqual(own(), { wake: true, tally: 1 }, 'a held message from a privileged author wakes the reader, and is counted');
+    assert.equal(coordinator.cancelAllExcept('agent-tool', 'the hold ends').ok, true);
+    assert.deepEqual(own(), { wake: true, tally: 1 });
+    coordinator.stop();
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
