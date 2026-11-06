@@ -5348,8 +5348,8 @@ export class TuneOutCoordinator {
             isError: true,
             error: "Nothing was posted: speak_in_channel is turned off for you in the resident's configuration, and "
               + "calling it again won't change that. The resident can speak there. deliver_summary puts your text in "
-              + "the resident's context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident (its "
-              + 'answer says if the cancel has to wait).',
+              + "the resident's context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident, up "
+              + 'to its backlog cap (its answer says if the cancel has to wait).',
           };
         }
         const channelId = String(input.channelId ?? '');
