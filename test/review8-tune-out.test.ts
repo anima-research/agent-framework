@@ -354,8 +354,8 @@ function failFirstRelease(h: ReturnType<typeof epochSetup>): void {
 }
 
 /**
- * The deferred cancel's own run, once writes resume, ends its hold, and the
- * note it carries can't be written: the loss is told by a notice of its own.
+ * The deferred cancel's own run, once writes resume, has its note's write
+ * refused, ends its hold, and tells the loss by a notice of its own.
  * A cancel that ends the hold first tells the persistent subconscious of
  * its note's loss in its release instead (Ivy-3594, round 8).
  */
@@ -519,7 +519,9 @@ test("65 follow-up: a subconscious's note, queued with a cancel whose first rele
     assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), { ok: true });
     assert.deepEqual(h.notes(), [{ from: 'Subconscious', text: 'Someone asked for you.', epochId: a }], "under the subconscious's name, for A");
     const kinds = h.added.map((m) => m.metadata?.kind);
-    assert.ok(kinds.indexOf('tune-out-cancel') < kinds.indexOf('subconscious-note'), 'after the release, as the deferred release delivers it');
+    assert.ok(kinds.indexOf('tune-out-cancel') < kinds.indexOf('subconscious-note'),
+      "after the first attempt's release, the only one: the cancel that ends the hold writes none (a subconscious note goes "
+      + 'out ahead of a release that cancel writes, queuedNoteFirst)');
     assert.equal(h.releasesOf(a), 1, 'the first release covers the backlog: the cancel that ends the hold writes no second one (review 3, #81)');
     mock.timers.tick(120_000);
     assert.equal(h.notes().length, 1, 'once: the retry has nothing left to run');
@@ -1014,7 +1016,7 @@ test("65 follow-up (Isaac-3593): a queued cancel of an ended tune-out, found by 
   }
 });
 
-test("65 follow-up (Isaac-3593): a queued cancel whose own run ends its tune-out and then can't write its note tells its author, and the cancel goes on", () => {
+test("65 follow-up (Isaac-3593): a queued cancel whose own run can't write its note ends its tune-out and tells its author, and the cancel goes on", () => {
   mock.timers.enable({ apis: ['setTimeout'] });
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup();
@@ -1411,8 +1413,8 @@ type RestartFramework = {
 /**
  * Ivy-3594's sequence up to the stop: with writes held, the subconscious's
  * cancel_tuneout with a note is accepted as waiting; its run at the release
- * ends the hold, the note's write is refused, and so is the first write of
- * the notice of its loss, unless `noticeWritten`. (Round 6 had the
+ * has the note's write refused, ends the hold, and so is the first write of
+ * the notice of its loss refused, unless `noticeWritten`. (Round 6 had the
  * resident's cancel end the hold first, after the first release failed its
  * durability check: since round 8 that cancel's release tells the loss,
  * and no notice is written, test/tune-out-deferred-cancel.test.ts.) A

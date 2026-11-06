@@ -319,7 +319,10 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    * framework stores whatever this returns as a user message with
    * `metadata.kind = 'tune-out-reader-framing'`; the notice, voice,
    * dispositions and held traffic are in the context, and nothing else
-   * about the fork's prompt is fixed by the path.
+   * about the fork's prompt is fixed by the path. note_disposition tells a
+   * reader that a disposition it records is shown to the reader each time
+   * it runs, and a fork is shown them only as its framing puts them
+   * (`dispositions`), so a framing that leaves them out makes that untrue.
    */
   framing?: (context: ReaderFramingContext) => ContentBlock[];
 }

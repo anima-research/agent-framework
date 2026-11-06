@@ -545,7 +545,9 @@ describe('a cadence look for held messages no reader has looked at, though nothi
   // The house's two cases for a held message still queued behind the
   // resident's turn (across a restart; under the scope when the channel's own
   // tune-out ends) have no counterpart here: every held message is stored as
-  // it arrives (#291), and the stored cases above are those.
+  // it arrives (#291), unless a surgery's hold or a refusing manager keeps it
+  // in memory until that ends, and the stored cases above, and the kept ones,
+  // are those.
 
   it("a look while the stored last looks can't be read leaves the other channels' stored looks as they were", (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
