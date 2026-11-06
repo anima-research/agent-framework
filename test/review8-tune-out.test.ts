@@ -168,7 +168,10 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     gone: [] as string[],
     /** The process dies just after a hold's end is recorded: the end lands, and the step throws. */
     crashAfterEnd: false,
-    /** A loss notice's write meets a hold that begins at it: kept in memory, an empty id, writes held from then on. */
+    /**
+     * A loss notice's write meets a hold that begins at it: kept in memory (`heldWrites`), an empty id, writes held
+     * from then on, and stored at their release (storeHeld), as the framework keeps one.
+     */
     noticeKept: false,
     /**
      * A write made while writes are held (`held`) is kept in memory, answering an empty id, as the framework keeps
@@ -241,6 +244,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
       if (state.releaseFails && metadata?.kind === 'tune-out-cancel') throw new Error('the store refused the release (test)');
       if (state.noticeKept && metadata?.kind === 'tune-out-note-undelivered') {
         state.held = true;
+        heldWrites.push({ participant, content, metadata, forAgent });
         return '';
       }
       added.push({ participant, content, metadata, forAgent });
@@ -341,7 +345,18 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
       coordinator.heldWriteStored(write.metadata);
     }
   };
-  return { coordinator, state, states, rows, added, mail, wakes, traces, keptFor, heldWrites, storeHeld, syncs, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
+  /**
+   * `agent`'s context manager recovers (a branch move re-initializes it): what was kept for it (`keptFor`) is stored,
+   * in order, the coordinator told of each one (heldWriteStored), as the framework's recoverHeldWrites replays them.
+   */
+  const recover = (agent: string): void => {
+    state.refusing = state.refusing.filter((name) => name !== agent);
+    for (const write of keptFor.get(agent)?.splice(0) ?? []) {
+      added.push(write);
+      coordinator.heldWriteStored(write.metadata);
+    }
+  };
+  return { coordinator, state, states, rows, added, mail, wakes, traces, keptFor, heldWrites, storeHeld, recover, syncs, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
 }
 
 const LOSS_RECORD_UNIT = 'tune-out/scout/loss-notices';
@@ -2071,6 +2086,9 @@ test("review 3 #11: a cancel asked for with a note while an earlier one runs joi
     h.state.held = true;
     h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'First.', 'Subconscious');
     h.state.held = false;
+    // The release's write begins a hold, so the framework keeps it in memory, as it keeps any write made while writes
+    // are held (review 5, #6).
+    h.state.keepWhenHeld = true;
     let asked = false;
     h.listenWrites((metadata) => {
       if (metadata?.kind !== 'tune-out-cancel' || asked) return;
@@ -2082,8 +2100,9 @@ test("review 3 #11: a cancel asked for with a note while an earlier one runs joi
     h.coordinator.runDeferredCancels();
     assert.ok(asked, 'premise: the second cancel was asked for during the run');
     assert.equal(queuedOf(h), 1, 'one cancel waits');
+    assert.equal(h.heldWrites.filter((w) => w.metadata?.kind === 'tune-out-cancel').length, 1, 'premise: the release is kept in memory');
     h.listenWrites(() => {});
-    h.state.held = false;
+    h.storeHeld();
     h.coordinator.runDeferredCancels();
     assert.equal(h.inForce(), null, 'the hold ends');
     assert.deepEqual(h.notes().map((n) => n.text), ['First.'], 'with the note asked for first');
@@ -2782,11 +2801,13 @@ test("review 4 #106: a loss notice for a reader fork whose context manager refus
         `${when}: ${when === 'before the write' ? 'nothing is written into its recovery wait' : 'the one write kept for its recovery'}`);
       h.coordinator.runDeferredCancels();
       assert.equal((h.keptFor.get('reader-1') ?? []).length, when === 'before the write' ? 0 : 1, 'a retry while it refuses writes no copy');
-      // Its manager recovers: the next retry writes the notice to it.
+      // Its manager recovers: what was kept for it is stored, and the next retry writes the notice only where it wasn't.
       h.listenWrites(() => {});
-      h.state.refusing.length = 0;
+      h.recover('reader-1');
       h.coordinator.runDeferredCancels();
-      assert.deepEqual(h.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId]), [['reader-1', a]], `${when}: written once it recovers`);
+      assert.deepEqual(h.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId]), [['reader-1', a]], `${when}: written once it recovers, once`);
+      h.coordinator.runDeferredCancels();
+      assert.equal(h.lossNotices().length, 1, `${when}: and not at a later try`);
     } finally {
       h.coordinator.stop();
       errors.mock.restore();
