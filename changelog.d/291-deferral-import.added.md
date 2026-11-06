@@ -26,7 +26,9 @@
   boot, mail stored for an agent and still out of its window (it arrived during a turn the process ended before
   finishing) wakes that agent again, once per sender and kind (`agent-result:<sender>`, `agent-message:<sender>`,
   source `dendrite`), before the boot's pass presents it. Earlier releases kept such mail held while its write
-  waited, and the boot's redelivery woke the recipient. An interrupted job whose result is stored this way still
+  waited, and the boot's redelivery woke the recipient. Mail sent with `wake: false` asks for no wake at the boot
+  either, as such queued mail asked none: its row records it (`dendrite.wake: false`). An interrupted job whose
+  result is stored this way still
   tells its recipient nothing about ending without a result.
   Where the boot can't read what an agent is owed to ask those wakes, the agent's arrivals stay out of its window
   until its next turn start, at the boot's pass and at every point at rest after it, so a later boot asks them.

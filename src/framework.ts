@@ -10321,9 +10321,11 @@ export class AgentFramework {
    * and releases. The row is the recipient's when it
    * names that agent as the one it is for (`dendrite.to`); one stored before
    * mail named its recipient counts for an agent its audience names, so a
-   * slot's observer isn't woken for a resident's mail. Like reconcile's
-   * redelivery of held mail, it doesn't ask whether the sender asked for no
-   * wake (sendAgentMessage's `wake: false`), which the row doesn't record.
+   * slot's observer isn't woken for a resident's mail. Mail whose sender
+   * asked for no wake (sendAgentMessage's `wake: false`, recorded on the row
+   * as `dendrite.wake: false`) asks for none, as main's queued mail asked
+   * none; reconcile's redelivery of held mail doesn't ask, as the registry
+   * doesn't record it.
    * Mail in the window already was presented at rest, or sent in a request
    * of the turn's (at its tool boundary), its wake run or lost as before
    * #291, and asks for none; nor does a wake with the same reason already
@@ -10346,8 +10348,8 @@ export class AgentFramework {
         continue;
       }
       for (const row of rows) {
-        const stamp = (row.metadata as { dendrite?: { mailId?: unknown; kind?: unknown; to?: unknown; from?: { agent?: unknown } } } | undefined)?.dendrite;
-        if (typeof stamp?.mailId !== 'string') continue;
+        const stamp = (row.metadata as { dendrite?: { mailId?: unknown; kind?: unknown; to?: unknown; from?: { agent?: unknown }; wake?: unknown } } | undefined)?.dendrite;
+        if (typeof stamp?.mailId !== 'string' || stamp.wake === false) continue;
         if (stamp.to === undefined ? audienceOf(row.metadata)?.audience.includes(agent.name) === false : stamp.to !== agent.name) continue;
         const reason = `agent-${String(stamp.kind ?? 'message')}:${String(stamp.from?.agent ?? '')}`;
         if (this.pendingRequests.some((r) => r.agentName === agent.name && r.reason === reason)) continue;
@@ -12328,6 +12330,9 @@ export class AgentFramework {
           // and the reader should be able to tell.
           producedAt: mail.createdAt,
           ...(mail.causedBy?.length ? { causedBy: mail.causedBy } : {}),
+          // Its sender asked for no wake (sendAgentMessage's `wake: false`):
+          // the boot asks none for it either (wakeForUnpresentedMail).
+          ...(wake ? {} : { wake: false }),
         },
       } as MessageMetadata,
       { forAgent: mail.to, placement },
