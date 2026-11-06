@@ -50,6 +50,14 @@ async function lastMillisecond(end: number, before: () => void): Promise<void> {
   await advance(1);
 }
 
+async function byThisMillisecond(done: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 10 && !done(); i++) {
+    mock.timers.tick(0);
+    await settle();
+  }
+  assert.ok(done(), `${what}, without the clock moving on`);
+}
+
 function answersTaken(gate: EventGate): () => number {
   const internal = gate as unknown as { finishJudging: (...args: unknown[]) => void };
   const finish = internal.finishJudging.bind(gate);
@@ -1273,7 +1281,7 @@ describe('judge rules: timing', () => {
     gate.evaluate(elsewhere('hi'));
     await until(() => judge.waiting() === 1, "second's call");
     assert.deepStrictEqual(judge.requests.at(-1)!.upcomingWakes, [{
-      certain: false, when: 'once a later judge call gets a REPLY or WAIT, or the hold on its calls is released, and no turn or quiesce holds it', what: 'rule "first"\'s batch of 1 event, held for the judge',
+      certain: false, when: "with its rule's next batch, or once a later judge call gets a REPLY or WAIT, or the hold on its calls is released, and no turn or quiesce holds it", what: 'rule "first"\'s batch of 1 event, held for the judge',
     }]);
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
@@ -1453,6 +1461,23 @@ describe('judge rules: timing', () => {
     await lastMillisecond(refusalEnd(gate), () => assert.strictEqual(judge.requests.length, 1, 'not asked a millisecond before the stated wait ends'));
     assert.strictEqual(judge.waiting(), 1, "judged at the refusal's end");
     assert.ok(judge.askedAt[1]! - refusedAt >= 1_200, `the turn's end sent nothing to a judge still refused (asked ${judge.askedAt[1]! - refusedAt} ms on)`);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under 'skip', a batch held for a refusal whose stated wait ends while the host is quiesced goes back to the judge once the quiesce clears", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-quiesced.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 1_200));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    gate.setQuiesced(true);
+    await advance(refusalEnd(gate) - Date.now() + 100);
+    assert.strictEqual(judge.requests.length, 1, 'not asked while the host is quiesced, though the stated wait has ended');
+    assert.strictEqual(judgeState(gate).heldCount, 1, 'still held');
+    gate.setQuiesced(false);
+    await until(() => judge.waiting() === 1, 'judged once the quiesce clears');
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
@@ -2435,6 +2460,7 @@ describe('the framework wires the reply judge', () => {
         assert.strictEqual(eventGate.getStatus().policies[0]!.judgeState!.heldCount, 1, 'still held, not taken into a judge call, a millisecond before the hold ends');
         assert.strictEqual(calledAt, undefined);
       });
+      await byThisMillisecond(() => calledAt !== undefined, "the judge called at the hold's end");
       await until(() => eventGate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the batch judged once the hold ends');
       assert.ok(calledAt !== undefined && calledAt - heldAt >= 3_000, `the judge's call was made ${calledAt === undefined ? 'never' : `${calledAt - heldAt} ms after the hold began`}`);
       assert.deepStrictEqual(membrane.calls.map((c) => c.assistantParticipant), ['reply-judge']);
@@ -2507,6 +2533,7 @@ describe('the framework wires the reply judge', () => {
       assert.strictEqual(judgeState().heldCount, 1, "still held, not taken into a judge call, before the hold's timer lets it go");
       assert.strictEqual(calledAt(), undefined, "not called a millisecond before the hold's timer lets it go");
     });
+    await byThisMillisecond(() => calledAt() !== undefined, "the judge called as the hold's timer lets it go");
     await until(() => judgeState().verdicts.wait === 1, "the batch judged once the hold's timer lets it go");
     assert.ok(calledAt() !== undefined && calledAt()! - heldAt >= 3_000, `the judge's call was made ${calledAt() === undefined ? 'never' : `${calledAt()! - heldAt} ms after the hold began`}`);
     assert.deepStrictEqual(judgeState().verdicts, { reply: 0, wait: 1, error: 0, refused: 1 });
@@ -2525,6 +2552,7 @@ describe('the framework wires the reply judge', () => {
       assert.strictEqual(judgeState().heldCount, 1, 'still held, not taken into a judge call, a millisecond before the extended hold lets go');
       assert.strictEqual(calledAt(), undefined);
     });
+    await byThisMillisecond(() => calledAt() !== undefined, 'the judge called as the extended hold lets go');
     await until(() => judgeState().verdicts.wait === 1, 'the batch judged once the extended hold lets go');
     assert.strictEqual(consulted(), 3, 'premise: the host extended the hold once, then let it go');
     assert.ok(calledAt()! - heldAt >= 5_000, `the judge's call was made ${calledAt()! - heldAt} ms after the hold began`);
@@ -3243,7 +3271,7 @@ describe('the framework wires the reply judge', () => {
     const hold = internal.providerAccelerationCooldowns.get('scout');
     assert.deepStrictEqual([hold?.auxiliaryOrigin, hold?.heldRequests.length], [true, 0], "premise: an auxiliary call's hold, holding nothing");
     assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
-      [false, 'a start held by a provider hold, which starts no turn if its deferred pushes give it nothing to read'],
+      [false, 'a start held by a provider hold, which starts no turn if it has nothing to read then'],
     ]);
     internal.lastStartFailed.set(framework.getAgent('scout')!, Date.now());
     assert.deepStrictEqual(internal.failedLastTurnFor('scout')?.again, { kind: 'held', maybe: true }, "the failed turn's line says the held start may start no turn");
@@ -3254,7 +3282,7 @@ describe('the framework wires the reply judge', () => {
     internal.providerAccelerationCooldowns.delete('scout');
     assert.ok(internal.recordProviderWait('scout', 'test-model', new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 3_600_000, message: 'slow down', rawError: { status: 429 } })), "premise: a wait on scout's model");
     assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
-      [false, 'a start held by a provider hold, which starts no turn if its deferred pushes give it nothing to read'],
+      [false, 'a start held by a provider hold, which starts no turn if it has nothing to read then'],
     ], 'under a recorded wait alone, too');
     finish();
     await auxiliary;
@@ -3326,6 +3354,40 @@ describe('the framework wires the reply judge', () => {
     failed.lastStartFailed.set(failed.agents.get('scout')!, Date.now());
     assert.deepStrictEqual(failed.failedLastTurnFor('scout')?.again, { kind: 'queued', maybe: true }, "the failed turn's line says the parked start may start no turn");
     await done();
+  });
+
+  it("lists a start parked behind an auxiliary call whose stored message is deleted while it waits as a maybe, since a hold, a quiesce or a turn would send it back to the scheduler, which drops it", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane } = await judgeFramework(t, {}, { providerHold: () => ({ holdMs: 60_000, reason: 'weekly quota spent' }) });
+    const internal = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      providerGates: Map<string, { primaryDepth: number; auxiliaryInFlight: number }>;
+      holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean;
+      removeMessage(id: string): void;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    const stored = framework.getAgent('scout')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-stored' }]);
+    let finish!: () => void;
+    const auxiliary = internal.withAuxiliaryAdmission('scout', () => new Promise<void>((resolve) => { finish = resolve; }));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a wake for a stored message', source: 'test', timestamp: Date.now(), readsStoredMessage: stored });
+    await internal.processInferenceRequests();
+    const gate = internal.providerGates.get('scout')!;
+    assert.deepStrictEqual([gate.auxiliaryInFlight, gate.primaryDepth, internal.pendingRequests.length], [1, 1, 0], 'premise: the start waits behind the auxiliary call');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [[true, 'a wake already queued (a start waiting for an auxiliary call to finish)']], 'premise: certain while its message is there');
+    internal.removeMessage(stored);
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
+      [false, 'a start waiting for an auxiliary call to finish, which starts no turn if a hold, a quiesce or a turn stops it then, since it has nothing left to read'],
+    ]);
+    internal.holdProviderAcceleration(framework.getAgent('scout'), new MembraneError({ type: 'rate_limit', retryable: true, message: 'quota spent', rawError: { status: 429 } }), undefined, true);
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
+      [false, 'a start held by a provider hold, which starts no turn if it has nothing to read then'],
+    ], "under an auxiliary call's hold, a maybe too");
+    finish();
+    await auxiliary;
   });
 
   it('lists a start that waits for its deferred pushes to be assembled as a wake on its way', async (t) => {
