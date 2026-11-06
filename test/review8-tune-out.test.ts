@@ -879,10 +879,10 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
       + `when it starts again that any cancel of ${hold} then waiting was lost, with any note left with it.`;
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc', text: 'Look here.' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}${kept('the tune-out')}` } });
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}${kept('the tune-out')}` } });
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}` } },
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}` } },
       'control: with no note of its own, nothing is said of one');
     h.state.held = false;
     h.coordinator.runDeferredCancels();
@@ -890,7 +890,7 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
     h.state.held = true;
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'all-except', scope: 'all-except', text: 'Look at #b.' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, scope: 'all-except', note: `${waits}The all-except hold stays in force until then, and what it held is delivered when it ends. ${stop}${kept('the all-except hold')}` } });
+      { success: true, data: { waiting: true, scope: 'all-except', note: `${waits}The all-except hold stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}${kept('the all-except hold')}` } });
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -1179,7 +1179,7 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
       'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
       + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
       + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. The tune-out stays in force until '
-      + 'then, and what it held is delivered when it ends. If the host stops before then, the cancel is lost and it is '
+      + 'then, and what it held is delivered when it ends, up to its backlog cap. If the host stops before then, the cancel is lost and it is '
       + 'still in force after the restart, unless its end time has passed by then. Your note waits with the cancel and '
       + 'goes to the resident as your mail when the tune-out ends, even if your run has ended by then. If it can\'t be '
       + 'delivered then, you are told so in your context, and why, but only while your run lasts: once it has ended, '

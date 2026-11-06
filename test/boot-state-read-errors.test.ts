@@ -235,7 +235,7 @@ test("a deferred-write queue that can't be read fails create(), and the next boo
   const before = readFileSync(file, 'utf8');
   const restore = failRecoveryRead('deferred-writes.json');
   try {
-    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything newer\. The file is unchanged, and the framework starts once it can be read\.$/);
+    await rejectsBuild(() => AgentFramework.create(config(storePath)), /^the deferred context writes \(.*deferred-writes\.json\) could not be read: injected EIO reading deferred-writes\.json\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything written once the modules have started\. The file is unchanged, and the framework starts once it can be read\.$/);
   } finally { restore(); }
   assert.equal(readFileSync(file, 'utf8'), before, 'the queue is as it was');
   const f = await AgentFramework.create(config(storePath));
@@ -260,7 +260,7 @@ test("a deferred-write queue that isn't a queue, or isn't JSON, fails create(), 
     writeFileSync(file, content);
     await rejectsBuild(() => AgentFramework.create(config(storePath)), new RegExp(
       `^the deferred context writes \\(.*deferred-writes\\.json\\) ${holds}\\. The framework doesn't start without them: an earlier ` +
-      `version left them queued, and they are stored at boot, ahead of anything newer\\. The file is unchanged, and the framework starts once it holds a queue of writes, ` +
+      `version left them queued, and they are stored at boot, ahead of anything written once the modules have started\\. The file is unchanged, and the framework starts once it holds a queue of writes, ` +
       `such as \\{"version":1,"pending":\\[\\]\\} for none\\. Removing it reads the queue from framework/deferred-writes instead, ` +
       `which the file's writes don't keep, so it imports whatever older queue is there, or none\\.$`,
     ), content);
@@ -282,13 +282,13 @@ test("with no recovery file, a deferred-write queue that can't be read, or isn't
     const queue = store.getStateJson('framework/deferred-writes');
     const restore = failStoreRead('framework/deferred-writes', 'importPersistedDeferredWrites');
     try {
-      await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) could not be read: injected EIO reading framework\/deferred-writes\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything newer\. They're unchanged, and the framework starts once they can be read\.$/);
+      await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) could not be read: injected EIO reading framework\/deferred-writes\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything written once the modules have started\. They're unchanged, and the framework starts once they can be read\.$/);
     } finally { restore(); }
     assert.deepEqual(store.getStateJson('framework/deferred-writes'), queue, 'the queue is as it was');
     const f = await AgentFramework.create(slotConfig());
     try { assert.equal(texts(f).filter((t) => t === 'said during surgery').length, 1, 'imported'); } finally { await f.stop(); }
     store.setStateJson('framework/deferred-writes', 'pending');
-    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) hold a string, not a queue of writes\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything newer\. They're unchanged, and starting again won't help until they're repaired\.$/);
+    await rejectsBuild(() => AgentFramework.create(slotConfig()), /^the deferred context writes \(framework\/deferred-writes\) hold a string, not a queue of writes\. The framework doesn't start without them: an earlier version left them queued, and they are stored at boot, ahead of anything written once the modules have started\. They're unchanged, and starting again won't help until they're repaired\.$/);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

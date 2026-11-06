@@ -22735,7 +22735,7 @@ export class AgentFramework {
     const more = rest.length > 0 ? ` · and ${rest.length} more: ${rest.join(', ')}` : '';
     const text =
       `[${NOTICE_TAG.drafts}] ${agent.name}: ${pending.length === 1 ? 'an open draft' : `${pending.length} open drafts`} of yours ` +
-      `that no recent notice on this branch names: ${shown.join(' · ')}${more}. ` +
+      `that no recent notice in your context names: ${shown.join(' · ')}${more}. ` +
       'drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
     let mid: string;
     try {
@@ -34919,7 +34919,7 @@ export class AgentFramework {
               return false;
             }
           };
-          const endedText = 'The focus on it ended, and what the other channels held was delivered.';
+          const endedText = 'The focus on it ended, and what the other channels held was delivered, up to its backlog cap.';
           // A failure before the end leaves the hold in force, which the reason
           // needn't say: the answer does.
           const stillText = (why: string): string => `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it is still in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.`;
@@ -34935,7 +34935,7 @@ export class AgentFramework {
             // failure there comes after the end, which the answer says.
             if (over()) {
               throw new Error(`${unregistered ? "A step of the focus's release failed" : "The close wasn't recorded"}: `
-                + `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it ended before that failure, and what the other channels held was delivered.`);
+                + `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it ended before that failure, and what the other channels held was delivered, up to its backlog cap.`);
             }
             throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(why)}` : `The close wasn't recorded: ${stillText(why)}`);
           }

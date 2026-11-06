@@ -2,12 +2,12 @@
   arrives. A close whose hold's release waited for held writes, and ran while the close's transport
   round-trip was awaited, answered `status: 'closed'` with "The close cancels the all-except hold that
   excepts it. Not cancelled yet: …" though the focus had ended. The answer's sentence is now read as the
-  answer is built: "The focus on it ended, and what the other channels held was delivered." where the hold
+  answer is built: "The focus on it ended, and what the other channels held was delivered, up to its backlog cap." where the hold
   has ended by then, and the wait's note where it is still in force.
 - A `channel_close` of the excepted channel whose hold's release failed after it had ended the focus (a step
   after the end, such as the resident's wake, threw) answered "The close wasn't recorded: <reason>" and said
   nothing of the focus. It now answers "The close wasn't recorded: <reason>. The focus on it ended before
-  that failure, and what the other channels held was delivered." A release that fails before the end
+  that failure, and what the other channels held was delivered, up to its backlog cap." A release that fails before the end
   answers "The close wasn't recorded: <reason>. The focus on it is still in force: what the other channels
   hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' },
   or asks this close again." — the answer says the hold stays, not only the reason. The release's
@@ -19,13 +19,13 @@
   channel's id, its server-qualified name, its id with its `serverId`, or, inside the turn whose channel it
   was, its id, now ends the focus as a close of the registered channel ends it, its backlog released, and
   answers, as a failure since no close ran: "Server "editor" no longer registers channel "work", so no close
-  was recorded or sent. The focus on it ended, and what the other channels held was delivered." The release
+  was recorded or sent. The focus on it ended, and what the other channels held was delivered, up to its backlog cap." The release
   notice gives its reason as "a close of the excepted channel, which its server no longer registers". While
   the store's writes are held the answer says "This call cancels the all-except hold that excepts it." and
   the wait's note; a release that fails before the end adds "The focus on it wasn't ended: <reason>. The focus on it is
   still in force: …" (the same sentence as above), and
   one that fails after it "A step of the focus's release failed: <reason>. The focus on it ended before
-  that failure, and what the other channels held was delivered." A module's close of such a name is
+  that failure, and what the other channels held was delivered, up to its backlog cap." A module's close of such a name is
   refused as before, the focus left in force.
 - A `channel_close` answer built after its focus ended names a replacement all-except focus in force by
   then: "… A new all-except focus is in force now, excepting <server>/<channel>: not this close's, and what

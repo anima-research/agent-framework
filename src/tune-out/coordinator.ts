@@ -161,7 +161,7 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
   return 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
     + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
     + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. '
-    + `${what} stays in force until then, and what it held is delivered when it ends. If the host stops before then, `
+    + `${what} stays in force until then, and what it held is delivered when it ends, up to its backlog cap. If the host stops before then, `
     + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.'
     + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '')
     + (noteKept === 'persistent' && !noteDropped

@@ -1053,7 +1053,7 @@ describe('explicit prose routing', () => {
       trigger(framework);
       await until(() => turns() > after && naming().length > 0, 'a later turn to name it');
       assert.equal(naming().length, 1);
-      assert.match(naming()[0]!, /no recent notice on this branch names/);
+      assert.match(naming()[0]!, /no recent notice in your context names/);
     });
   });
 
@@ -1414,7 +1414,7 @@ describe('explicit prose routing', () => {
       const later = draftsOf(framework).open('assistant').find((d) => d.text === 'carrying on');
       assert.ok(later, "the later compile's unprefixed text is held under the turn's hold");
       assert.ok(receipts[0]!.includes(later.id), `and the receipt names that draft as well: ${receipts[0]}`);
-      assert.ok(!texts.some((t) => t.includes('that no recent notice on this branch names')), 'the catch-up left the draft to the receipt');
+      assert.ok(!texts.some((t) => t.includes('that no recent notice in your context names')), 'the catch-up left the draft to the receipt');
       assert.equal(internals.openLogical.has('assistant'), false, 'the logical turn settled');
     } finally {
       await framework.stop();
@@ -1440,7 +1440,7 @@ describe('explicit prose routing', () => {
       assert.ok(late, 'the late envelope bounced into a draft');
       const texts = context(framework).texts;
       assert.ok(texts.some((t) => t.startsWith('[prose-routing]') && t.includes(late.id)), 'its bounce notice names it');
-      assert.ok(!texts.some((t) => t.includes('that no recent notice on this branch names')), "the catch-up doesn't name it again");
+      assert.ok(!texts.some((t) => t.includes('that no recent notice in your context names')), "the catch-up doesn't name it again");
       assert.ok((store.get('assistant', late.id)?.noticedIn ?? []).length > 0, 'it is recorded as noticed');
     });
   });

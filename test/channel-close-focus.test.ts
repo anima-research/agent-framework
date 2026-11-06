@@ -27,7 +27,7 @@ type Framework = {
   channelRegistry: { handleChannelToolCall(name: string, input: unknown, origin?: unknown): Promise<Answer> };
 };
 
-const ENDED = 'The focus on it ended, and what the other channels held was delivered.';
+const ENDED = 'The focus on it ended, and what the other channels held was delivered, up to its backlog cap.';
 const WAITS = /^The close cancels the all-except hold that excepts it\. Not cancelled yet: /;
 
 const framework = (f: Fixture) => f.framework as unknown as Framework;
@@ -143,7 +143,7 @@ describe('a close that fails after the focus ended says the focus ended', () => 
       assert.equal(coordinatorOf(f).getAllExcept(), null, 'premise: the focus ended before the failure');
       assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'work'), 'open', 'premise: the close was not recorded');
       assert.equal(result.error,
-        "The close wasn't recorded: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered.");
+        "The close wasn't recorded: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered, up to its backlog cap.");
       assert.match(textOf(find(f, 'all channels except')), /antra: held/, 'its backlog was released');
     } finally { await f.close(); }
   });
@@ -226,7 +226,7 @@ describe('a close naming the excepted channel after its server no longer registe
       assert.equal(result.success, false);
       assert.equal(coordinatorOf(f).getAllExcept(), null, 'premise: the focus ended');
       assert.equal(result.error, 'Server "editor" no longer registers channel "work", so no close was recorded or sent. '
-        + "A step of the focus's release failed: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered.");
+        + "A step of the focus's release failed: post-end inference refused (probe). The focus on it ended before that failure, and what the other channels held was delivered, up to its backlog cap.");
     } finally { await f.close(); }
   });
 

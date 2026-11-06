@@ -1188,7 +1188,7 @@ describe('held prose drafts, end to end', () => {
       h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice on this branch names: /);
+      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice in your context names: /);
       assert.match(notice, /d-[a-z2-9]{7} \(held \(not sent\); explicit send in its turn\)/);
       assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in its turn\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
@@ -1206,7 +1206,7 @@ describe('held prose drafts, end to end', () => {
       const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}` }], 'explicit-send').held[0]!);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice on this branch names: /);
+      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice in your context names: /);
       // Newest first: the eight newest with their state, then the two oldest
       // by id alone. No draft's words appear.
       const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(held \(not sent\); explicit send in its turn\)/g)].map((m) => m[1]);
@@ -1231,7 +1231,7 @@ describe('held prose drafts, end to end', () => {
       ]);
       const [draft] = h.drafts();
       assert.ok(h.texts().some((t) => t.includes(`held as draft ${draft!.id}`)), 'the turn-end receipt names it');
-      const catchUps = () => h.texts().filter((t) => t.includes('that no recent notice on this branch names'));
+      const catchUps = () => h.texts().filter((t) => t.includes('that no recent notice in your context names'));
       assert.deepEqual(catchUps(), []);
       // The rollback takes the turn, and its notices, off the branch; the
       // draft stays, as drafts do.
@@ -1239,7 +1239,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice on this branch names: ${draft!.id} \\(held \\(not sent\\); explicit send in its turn\\)`));
+      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice in your context names: ${draft!.id} \\(held \\(not sent\\); explicit send in its turn\\)`));
       assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');
@@ -1436,7 +1436,7 @@ describe('held prose drafts, end to end', () => {
           const naming = () => h.texts().filter((t) => t.includes(held!.id));
           if (naming().length === 0) await h.turn([createMockResponse([])]);
           assert.equal(naming().length, 1, `one notice names it: ${JSON.stringify(naming())}`);
-          assert.ok(naming()[0]!.includes('that no recent notice on this branch names'), `a catch-up, not a mid-turn offer: ${naming()[0]}`);
+          assert.ok(naming()[0]!.includes('that no recent notice in your context names'), `a catch-up, not a mid-turn offer: ${naming()[0]}`);
         } else {
           assert.deepEqual(h.drafts(), [], 'nothing is left held');
           assert.ok(receipt?.includes('1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)'), receipt);
@@ -2003,7 +2003,7 @@ describe('draft notices and turn-end settlement', () => {
     const cm = agent.getContextManager();
     const catchUps = () => cm.getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
-      .filter((t) => t.includes('that no recent notice on this branch names'));
+      .filter((t) => t.includes('that no recent notice in your context names'));
     return { framework, internals, agent, cm, catchUps, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
   };
 
@@ -2139,7 +2139,7 @@ describe('a draft whose notice an undo takes out of the window', () => {
   const windowNames = (h: Harness, id: string): boolean =>
     JSON.stringify(h.framework.getAgent('scout')!.getContextManager().getPresentedMessages()).includes(id);
   const catchUpsNaming = (h: Harness, id: string): string[] =>
-    h.texts().filter((t) => t.includes('that no recent notice on this branch names') && t.includes(id));
+    h.texts().filter((t) => t.includes('that no recent notice in your context names') && t.includes(id));
 
   it("is named again at the next start when the undone turn's receipt was its only notice, and only once", async () => {
     const h = await harness({ xml: true });

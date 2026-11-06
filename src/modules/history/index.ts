@@ -2678,13 +2678,15 @@ function mergeForeignIntoGap(
 /** The sentence extract's and search's descriptions gain with the window lookup (getTools). */
 const WINDOW_NOTE =
   ' A message that isn\'t in your context carries `window`: "undone" for one an undo or a refusal rewind took ' +
-  'out of it, "not-shown" for one you were never shown; another agent\'s own turns and notes that aren\'t in your ' +
-  'context are left out unless you observe that agent, and how many were is `leftOut`.';
+  'out of it, "not-shown" for one not in your context now, never shown to you or returned by an undo or rollback ' +
+  'to be shown again; another agent\'s own turns and notes that aren\'t in your context are left out unless you ' +
+  'observe that agent, and how many were is `leftOut`.';
 
 /** semantic_search's form of it. */
 const WINDOW_NOTE_SEMANTIC =
   ' A message hit that isn\'t in your context carries `window` ("undone" for one an undo or a refusal rewind took ' +
-  'out of it, "not-shown" for one you were never shown); another agent\'s own turns and notes that aren\'t in your ' +
+  'out of it, "not-shown" for one not in your context now, never shown to you or returned by an undo or rollback ' +
+  'to be shown again); another agent\'s own turns and notes that aren\'t in your ' +
   'context are left out unless you observe that agent, and so are summary hits when the summaries fold another ' +
   'agent\'s context (the one this history is bound to) and you don\'t observe that agent, all counted in ' +
   'index.leftOut.';
