@@ -83,7 +83,10 @@ export interface OfflineRecoveryBranchResult {
    * On a presented window (#291): the rows after the anchor in the agent's
    * window that the cut keeps in the record (stored before the write that
    * presented the anchor, presented after it), as the live rollback counts
-   * them. They leave the window as arrived and not presented, and enter it
+   * them, of the agent's own slot: the recovery reads that slot alone, so a
+   * row of a slot the agent observes (the residents' rows in a persistent
+   * subconscious's window), which the live rollback counts, isn't counted
+   * here, and the check of a cut that would change nothing doesn't see it. They leave the window as arrived and not presented, and enter it
    * again at the agent's next presentation point, after the anchor. Not
    * removed, so not counted in `messagesRemoved`, and not marked; a row the
    * same recovery suppresses is counted there instead. 0 for a run with no
@@ -588,7 +591,9 @@ function windowAfterCut(
  * after the anchor (`kept`) name the way to take them out: a suppression in
  * the same recovery, which names a row by its Discord message id, and for a
  * row with none (an agent's round, a tool row) the live `suppressMessages`
- * by its row id.
+ * by its row id. Each refusal says the recovery reads the agent's own slot
+ * alone: a row of a slot it observes, which the live rollback weighs, isn't
+ * weighed here.
  */
 function refuseIneffectiveCut(
   target: StoredWindowMessage,
@@ -597,13 +602,15 @@ function refuseIneffectiveCut(
 ): never {
   const anchorDiscordId = discordIdOf(target);
   const anchor = `${String(target.id)}${anchorDiscordId ? ` (Discord message ${anchorDiscordId})` : ''}`;
+  const ownSlotOnly = `. Offline, only ${agentName}'s own slot is read: a row of a slot it observes, which the live rollback weighs, isn't weighed here.`;
   if (kept.length > 0) {
     const n = kept.length;
     const first = kept[0]!;
     const firstDiscordId = discordIdOf(first);
     const named = `${String(first.id)}${firstDiscordId ? `, Discord message ${firstDiscordId}` : ''}`;
     const unaddressed = kept.filter((row) => discordIdOf(row) === undefined).map((row) => String(row.id));
-    const rowIds = `${unaddressed.slice(0, 5).join(', ')}${unaddressed.length > 5 ? ` (+${unaddressed.length - 5})` : ''}`;
+    // Every one, so following the advice leaves none of them in place.
+    const rowIds = unaddressed.join(', ');
     const offline = 'in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)';
     const live = `by row id with the live suppressMessages (${rowIds}) once the host runs, since the offline recovery ` +
       'suppresses only by Discord message id';
@@ -615,13 +622,13 @@ function refuseIneffectiveCut(
       `Recovery anchor ${anchor} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
       `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
       `so a recovery anchored there would remove nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-      how,
+      how + ownSlotOnly,
     );
   }
   throw new Error(
     `Recovery anchor ${anchor} is already the tail of ${agentName}'s window: every message stored after it was ` +
     'stored before the write that presented it, where the branch is cut, and none entered the window after it, so ' +
-    'a recovery anchored there would change nothing',
+    'a recovery anchored there would change nothing' + ownSlotOnly,
   );
 }
 
