@@ -1095,3 +1095,41 @@ describe("a note kept in memory by its cancel's own run and stored when the writ
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 (nissa's house, the third finding): the kept note's store throws
+// a WriteOutcomeUnknownError at the release, and its cancel still waits
+// (its run can't record the end). An orderly stop and a start in the same
+// process: the subconscious is told the note may be lost, never that it
+// was not delivered.
+// ---------------------------------------------------------------------------
+
+describe("a kept note whose store couldn't tell whether it landed, its cancel still waiting at an orderly stop (AF #844, nissa's house)", () => {
+  it("is told after the start as a note that may be lost, with the reason, never as one that was not delivered", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun('unknown');
+    try {
+      endNotRecorded(h.f);
+      h.release();
+      assert.equal(h.attempts(), 1, 'premise: storing the kept note was tried once, and threw');
+      assert.equal(h.traces.filter((t) => t.type === 'message:lost' && t.mayBeStored === true).length, 1, 'premise: as a write that may be stored');
+      assert.equal(h.registry.getTuneOutState('editor', 'noisy')?.params.epochId, h.epochId, "premise: the cancel's run couldn't record the end, so it waits on");
+      assert.deepEqual(presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost')), [], 'premise: nothing is told before the stop');
+      await h.f.framework.stop();
+      await h.f.create();
+      const told = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.deepEqual(told, [
+        '[Tune-out: the note you left with your cancel of noisy may be lost. The host stopped while your cancel waited, so your cancel was lost. '
+        + "Whether the note was delivered to agent isn't known here, as what the store holds of it can't be read here: addMessage failed, and the "
+        + "manager can't tell whether the store holds a row of the append that threw: the store read failed (test). That tune-out is still in force.]",
+      ], 'the subconscious is told once that the note may be lost, and why it is not known');
+      assert.ok(!told.some((t) => t.includes('was not delivered')), 'never as a note known lost');
+      assert.ok(internals(h.f).pendingRequests.some((r) => r.agentName === h.sub && r.reason === 'tune-out note not delivered: noisy'), 'with a turn to read it');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+});

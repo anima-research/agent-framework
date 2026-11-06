@@ -146,8 +146,10 @@ interface WindowStartsState {
  * force; where storing it when they are stored fails, the framework says
  * so (heldWriteLost), and the note is told lost by a notice, as above, once
  * the hold ends, or as one that may be lost where the store can't tell
- * whether it landed; it isn't written again. Stored then, it counts as
- * delivered (heldWriteStored), even while the cancel still waits. The waiting
+ * whether it landed, as is the stop's notice, or a hold's that ends
+ * without the cancel, before then (`noteUnknown`); it isn't written
+ * again. Stored then, it counts as delivered (heldWriteStored), even while
+ * the cancel still waits. The waiting
  * cancel, and the note with it, is kept in memory only: a stop before the
  * hold ends loses both, and the subconscious is told of the note's loss
  * as of any other, by a notice kept in the store for the next boot (stop),
@@ -423,12 +425,31 @@ interface DeferredCancel {
  * force (stop); `superseded`, it was asked for while an earlier cancel of
  * the same hold was running, and joined that one when it was queued again,
  * the earlier one's note standing (requeue): its note is dropped.
+ * `noteUnknown`, on a `hold-ended` or `stopped` drop: the note was written
+ * while writes were held, and storing it when they were stored threw where
+ * the store couldn't tell whether it landed (lostAtRelease, `mayBeStored`),
+ * so it may be stored after all: the error, which the notice gives, the
+ * note told as one that may be lost, never as one known lost (dropDeferred).
+ * A `superseded` drop never carries it: the note it drops is the later
+ * caller's, never written.
  */
 type DeferredDrop =
-  | { reason: 'hold-ended'; current?: string }
+  | { reason: 'hold-ended'; current?: string; noteUnknown?: string }
   | { reason: 'note-undelivered'; by: 'another' | 'itself'; error: string; mayBeStored?: true }
-  | { reason: 'stopped' }
+  | { reason: 'stopped'; noteUnknown?: string }
   | { reason: 'superseded' };
+
+/**
+ * A drop of a queued cancel whose note may be stored after all
+ * (lostAtRelease with `mayBeStored`), carrying that (`noteUnknown`) where
+ * it is a `hold-ended` or `stopped` drop, which would otherwise tell the
+ * note as known lost; any other drop as it is.
+ */
+function withUnknownNote(drop: DeferredDrop, lost: DeferredCancel['lostAtRelease']): DeferredDrop {
+  if (!lost?.mayBeStored) return drop;
+  if (drop.reason === 'hold-ended' || drop.reason === 'stopped') return { ...drop, noteUnknown: lost.error };
+  return drop;
+}
 
 /**
  * Why a loss notice (LossNotice) is written: a deferred cancel's drop
@@ -561,7 +582,10 @@ interface PersistedLossNotice {
 /** What a loss notice tells its author, as the log lines name it. */
 function lossSubject(notice: Pick<LossNotice, 'what' | 'drop'>): string {
   if (notice.drop.reason !== 'unstamped-stop') {
-    return `that the note it left with the cancel of ${notice.what} ${notice.drop.reason === 'note-undelivered' && notice.drop.mayBeStored ? 'may not have been' : 'was not'} delivered`;
+    const drop = notice.drop;
+    const unknown = drop.reason === 'note-undelivered' ? drop.mayBeStored === true
+      : (drop.reason === 'stopped' || drop.reason === 'hold-ended') && drop.noteUnknown !== undefined;
+    return `that the note it left with the cancel of ${notice.what} ${unknown ? 'may not have been' : 'was not'} delivered`;
   }
   return `that the host stopped without recording the state of ${notice.what}`
     + (notice.drop.found === 'delivered' ? ', after the note it left with a cancel of it was delivered'
@@ -580,12 +604,13 @@ function readPersistedLossNotice(value: unknown): PersistedLossNotice | undefine
   if (!at || typeof at !== 'object' || typeof at.epochId !== 'string' || typeof at.serverId !== 'string'
     || typeof at.channelId !== 'string' || (at.scope !== undefined && at.scope !== 'all-except')) return undefined;
   let why: LossReason;
+  const noteUnknown = typeof drop?.noteUnknown === 'string' ? { noteUnknown: drop.noteUnknown } : {};
   if (drop?.reason === 'hold-ended' && (drop.current === undefined || typeof drop.current === 'string')) {
-    why = { reason: 'hold-ended', ...(typeof drop.current === 'string' ? { current: drop.current } : {}) };
+    why = { reason: 'hold-ended', ...(typeof drop.current === 'string' ? { current: drop.current } : {}), ...noteUnknown };
   } else if (drop?.reason === 'note-undelivered' && (drop.by === 'another' || drop.by === 'itself') && typeof drop.error === 'string') {
     why = { reason: 'note-undelivered', by: drop.by, error: drop.error, ...(drop.mayBeStored === true ? { mayBeStored: true as const } : {}) };
   } else if (drop?.reason === 'stopped') {
-    why = { reason: 'stopped' };
+    why = { reason: 'stopped', ...noteUnknown };
   } else if (drop?.reason === 'superseded') {
     why = { reason: 'superseded' };
   } else if (drop?.reason === 'unstamped-stop') {
@@ -1932,19 +1957,24 @@ export class TuneOutCoordinator {
    * unless the release of the cancel that ended the hold tells it already
    * (`told` release, queuedNoteFirst): no second notice is written then.
    */
-  private dropDeferred(entry: DeferredCancel, drop: DeferredDrop, told: 'notice' | 'release' = 'notice'): void {
+  private dropDeferred(entry: DeferredCancel, asked: DeferredDrop, told: 'notice' | 'release' = 'notice'): void {
     const { epochId, serverId, channelId, scope } = entry.for;
     const noteLost = entry.note !== undefined;
     const author = noteLost ? this.noteAuthorOf(entry) : undefined;
+    // A note whose store couldn't tell whether it landed (lostAtRelease,
+    // `mayBeStored`) may be stored: a stop's drop, or one for a hold that
+    // ended without it, says so (`noteUnknown`), never that it was lost.
+    const drop = noteLost ? withUnknownNote(asked, entry.lostAtRelease) : asked;
+    const unknown = (drop.reason === 'hold-ended' || drop.reason === 'stopped') && drop.noteUnknown !== undefined;
     if (drop.reason === 'hold-ended') {
       const current = drop.current;
       console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, is dropped: `
         + `that epoch's hold ended without it${current !== undefined ? `, and epoch ${current} holds there now, which it was not asked for` : ''}, `
-        + `so it ends nothing${noteLost ? ', and the note it carried is not delivered' : ''}`);
+        + `so it ends nothing${noteLost ? `, and the note it carried ${unknown ? 'may not have been' : 'is not'} delivered` : ''}`);
     } else if (drop.reason === 'stopped') {
       console.error(`[tune-out] stopping: the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, `
         + `ends nothing, the tune-out staying in force on disk`
-        + (noteLost ? `, and the note${author !== undefined ? ` ${author} left` : ''} with it is not delivered` : ''));
+        + (noteLost ? `, and the note${author !== undefined ? ` ${author} left` : ''} with it ${unknown ? 'may not have been' : 'is not'} delivered` : ''));
     } else if (drop.reason === 'superseded') {
       console.error(`[tune-out] the cancel of ${entry.what}, asked for while an earlier cancel of epoch ${epochId} was running, joins that one, `
         + `whose note stands${noteLost ? `, so the note${author !== undefined ? ` ${author} left` : ''} with it is not delivered` : ''}`);
@@ -2120,12 +2150,14 @@ export class TuneOutCoordinator {
           id: notice.id, author, what: notice.what,
           for: { epochId, serverId, channelId, ...(scope ? { scope } : {}) },
           drop: drop.reason === 'hold-ended'
-            ? { reason: 'hold-ended', ...(drop.current !== undefined ? { current: drop.current } : {}) }
-            : drop.reason === 'stopped' || drop.reason === 'superseded'
-              ? { reason: drop.reason }
-              : drop.reason === 'unstamped-stop'
-                ? { ...drop }
-                : { reason: 'note-undelivered', by: drop.by, error: drop.error, ...(drop.mayBeStored ? { mayBeStored: true as const } : {}) },
+            ? { reason: 'hold-ended', ...(drop.current !== undefined ? { current: drop.current } : {}), ...(drop.noteUnknown !== undefined ? { noteUnknown: drop.noteUnknown } : {}) }
+            : drop.reason === 'stopped'
+              ? { reason: 'stopped', ...(drop.noteUnknown !== undefined ? { noteUnknown: drop.noteUnknown } : {}) }
+              : drop.reason === 'superseded'
+                ? { reason: drop.reason }
+                : drop.reason === 'unstamped-stop'
+                  ? { ...drop }
+                  : { reason: 'note-undelivered', by: drop.by, error: drop.error, ...(drop.mayBeStored ? { mayBeStored: true as const } : {}) },
           keptAtMs: notice.keptAtMs,
           ...(notice.keptAtSequence !== undefined ? { keptAtSequence: notice.keptAtSequence } : {}),
           ...(notice.traced ? { traced: true as const } : {}),
@@ -2993,8 +3025,19 @@ export class TuneOutCoordinator {
       };
       const to = resident ? suppliedValue(resident) : 'the resident';
       let why = '';
+      // The note's store couldn't tell whether it landed (`noteUnknown`):
+      // the cancel's loss is told as it is, the note's as not known, with
+      // the error, as a note-undelivered drop's `mayBeStored` says it.
+      const noteUnknown = drop.reason === 'hold-ended' || drop.reason === 'stopped' ? drop.noteUnknown : undefined;
+      const withNote = noteUnknown === undefined ? ', and the note with it.' : '.';
+      const notKnown = (error: string): string => {
+        const reason = suppliedValue(error);
+        return ` Whether the note was delivered to ${to} isn't known here, as what the store holds of it can't be read here: `
+          + `${reason}${/[.!?]$/.test(reason) ? '' : '.'}`;
+      };
       if (drop.reason === 'hold-ended') {
-        why = `That ${it} ended without your cancel while it waited, so your cancel was dropped, and the note with it.`;
+        why = `That ${it} ended without your cancel while it waited, so your cancel was dropped${withNote}`
+          + (noteUnknown !== undefined ? notKnown(noteUnknown) : '');
         if (drop.current !== undefined) {
           // The later hold as it is when the notice is written, which a
           // kept notice is after the drop: whether it still holds, unknown
@@ -3012,7 +3055,8 @@ export class TuneOutCoordinator {
               + `${still === false ? ', and has ended since' : ''}.`;
         }
       } else if (drop.reason === 'stopped') {
-        why = `The host stopped while your cancel waited, so your cancel was lost, and the note with it.${nowInForce()}`;
+        why = `The host stopped while your cancel waited, so your cancel was lost${withNote}`
+          + `${noteUnknown !== undefined ? notKnown(noteUnknown) : ''}${nowInForce()}`;
       } else if (drop.reason === 'superseded') {
         why = `An earlier cancel of that ${it} was running when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note is to go out when it ends the ${it}; where it can't be delivered, its author is told.`;
       } else if (drop.reason === 'unstamped-stop') {
@@ -3078,7 +3122,7 @@ export class TuneOutCoordinator {
           text = `${unrecorded}If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and any `
             + `note you left with it.${nowInForce()}]`;
         }
-      } else if (drop.reason === 'note-undelivered' && drop.mayBeStored) {
+      } else if ((drop.reason === 'note-undelivered' && drop.mayBeStored) || noteUnknown !== undefined) {
         text = `[${NOTICE_TAG.tuneOut}: the note you left with your cancel of ${hold} may be lost. ${why}]`;
       } else {
         text = `[${NOTICE_TAG.tuneOut}: the note you left with your cancel of ${hold} was not delivered to ${to}. ${why}]`;

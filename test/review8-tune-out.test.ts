@@ -2289,6 +2289,69 @@ test("nissa's house's fault arm on #844, control: a lost write of another kind, 
 });
 
 // ---------------------------------------------------------------------------
+// AF #844 (nissa's house, the third finding): a kept note whose store
+// couldn't tell whether it landed (lostAtRelease, mayBeStored), its cancel
+// dropped before its run tells it (a stop, or its hold ending without it):
+// the drop says the note may be lost, with the error, never that it was
+// not delivered.
+// ---------------------------------------------------------------------------
+
+const UNKNOWN_STORE = "addMessage failed, and the manager can't tell whether the store holds message m9: the store read failed (test)";
+
+test("nissa's house on #844: a stop while the cancel of a kept note whose store couldn't tell whether it landed still waits tells the note as one that may be lost, kept so for the next boot; a definite loss stays told as lost", () => {
+  for (const unknown of [true, false]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    try {
+      const { epochId } = ownNoteKeptInMemory(h, false);
+      noteLostAtRelease(h, epochId, false, new Error(unknown ? UNKNOWN_STORE : 'EIO: the store refused the note (test)'), unknown);
+      h.coordinator.stop();
+      const what = unknown ? 'unknown' : 'definite';
+      assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', true]], `${what}: the stop drops the cancel with its note`);
+      const kept = h.lossRecord()?.pendingLossNotices ?? [];
+      assert.deepEqual(kept.map((n) => n.drop), [unknown ? { reason: 'stopped', noteUnknown: UNKNOWN_STORE } : { reason: 'stopped' }],
+        `${what}: one notice, kept in the store${unknown ? ' with what the store couldn\'t tell' : ''}`);
+      h.state.held = false;
+      const next = h.reboot();
+      try {
+        next.resumeActiveEpochs();
+        assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [unknown
+          ? '[Tune-out: the note you left with your cancel of disc:guild:a may be lost. The host stopped while your cancel waited, so your cancel was lost. '
+            + `Whether the note was delivered to scout isn't known here, as what the store holds of it can't be read here: ${UNKNOWN_STORE}. That tune-out is still in force.]`
+          : '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. The host stopped while your cancel waited, so your cancel '
+            + 'was lost, and the note with it. That tune-out is still in force.]'],
+        `${what}: the next boot writes it ${unknown ? 'as a note that may be lost, never as one known lost' : 'as a lost note'}`);
+      } finally {
+        next.stop();
+      }
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("nissa's house on #844: a kept note whose store couldn't tell whether it landed, its hold ending without its cancel, is told as one that may be lost", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  try {
+    const { epochId } = ownNoteKeptInMemory(h, false);
+    noteLostAtRelease(h, epochId, false, new Error(UNKNOWN_STORE), true);
+    h.endOtherwise();
+    h.state.held = false;
+    h.coordinator.runDeferredCancels();
+    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['hold-ended', true]], 'the cancel is dropped with its note');
+    assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [
+      '[Tune-out: the note you left with your cancel of disc:guild:a may be lost. That tune-out ended without your cancel while it waited, so your cancel '
+      + `was dropped. Whether the note was delivered to scout isn't known here, as what the store holds of it can't be read here: ${UNKNOWN_STORE}.]`,
+    ], 'its author is told it may be lost, with the error');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // AF #844 (nissa's house, the follow-up): a kept write stored when the
 // writes are stored (heldWriteStored) is no longer kept in memory: a stop
 // while its cancel still waits doesn't tell the note lost.
