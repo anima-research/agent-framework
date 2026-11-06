@@ -1145,7 +1145,9 @@ export type TraceEvent =
    * was). `note-undelivered`: its hold ended, by another cancel or by its
    * own run, and delivering the note it carried failed (`error`).
    * `stopped`: the host stopped while it waited, its hold still in force,
-   * which the next boot resumes without running it.
+   * which the next boot resumes without running it. `superseded`: it was
+   * asked for while an earlier cancel of the same hold ran, and joined that
+   * one when it was queued again, whose note stands.
    * `noteLost`: it carried a reader's note, which is not delivered; its
    * author is told so in its own context where the author still exists,
    * and a reader fork that has ended is not, the loss reaching no one
@@ -1163,7 +1165,7 @@ export type TraceEvent =
       channelId: string;
       epochId: string;
       scope?: 'all-except';
-      reason: 'hold-ended' | 'note-undelivered' | 'stopped';
+      reason: 'hold-ended' | 'note-undelivered' | 'stopped' | 'superseded';
       currentEpochId?: string;
       noteLost: boolean;
       noteAuthor?: string;

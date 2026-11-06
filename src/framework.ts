@@ -15483,7 +15483,7 @@ export class AgentFramework {
   private async followBranchMove(except?: string): Promise<ManagerReinitFailure[]> {
     let failures: ManagerReinitFailure[] = [];
     try {
-      this.subconsciousAnchor?.branchMoved();
+      this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
       this.tuneOutCoordinator?.branchMoved();
       this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
@@ -39286,6 +39286,7 @@ export class AgentFramework {
           this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined),
         unseenBySubconscious: (keep) => this.unseenBySubconscious(keep),
         subconsciousWindow: () => this.subconsciousWindow(),
+        subconsciousStoredMessages: () => (this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName)?.getContextManager().getAllMessages() : undefined) ?? [],
         subconsciousGuardedResults: () => this.subconsciousGuardedResults(),
         isForkBound: (channel) =>
           this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
