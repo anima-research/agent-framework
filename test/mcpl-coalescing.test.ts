@@ -2031,7 +2031,7 @@ test("a wake to read a render that carries a channel starts its turn until the a
   agent.notePublished(room, at(branch, placed));
   assert.equal(await pass(), 0, 'spoken there again on this branch having read it, the wake starts no turn');
   // A publish on another branch replaces the record whatever its sequence,
-  // since a branch an undo made can carry lower sequences than the one it
+  // since a branch a rollback made can carry lower sequences than the one it
   // left.
   agent.notePublished(room, at(`${branch}-other`, placed - 3));
   assert.equal(await pass(), 1, 'spoken there last on another branch at a lower sequence, the wake starts the turn');
@@ -2256,7 +2256,7 @@ test("a provider hold keeps a wake to read a render or a stored message, a batch
     'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 
-test("a render that settles after its turn's assembly threw, while the turn is alive, is stored out of its window like any write during the turn", async (t) => {
+test("a render that settles after its turn's assembly threw, while the turn is alive, is stored out of its window like any arrival during the turn", async (t) => {
   const f = await fixture(); t.after(f.close);
   let release!: (value: unknown) => void;
   let began!: () => void;

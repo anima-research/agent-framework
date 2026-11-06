@@ -16,8 +16,8 @@
  * (AF-8). In test it also fails on the released window's held part (a
  * released window read with a second argument, the set of writes the queue
  * held) and on a `held:` handle, the id a release before #291 answered for
- * a write it queued, outside the one-release test of that handle. Comments
- * aren't read.
+ * a write it queued, outside module-held-writes.test.ts, the file of the
+ * one-release test of that handle. Comments aren't read.
  */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';

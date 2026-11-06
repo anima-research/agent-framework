@@ -1,11 +1,13 @@
 /**
  * Reader forks and the messages a tune-out holds (#291).
  *
- * A held message is stored as it arrives, whatever the resident's turn, so
- * a reader fork is handed what arrived while the resident was busy, when a
- * reader is most useful: on a wake, on a cadence look and on a cancel. Each
- * held message goes to exactly one reader, by the coordinator's cursor over
- * the stored rows. A fork that never read what it was handed gives it back
+ * A held message is stored as it arrives, whatever the resident's turn
+ * (unless a surgery's hold or a context manager refusing its work keeps it
+ * in memory until that is over), so a reader fork is handed what arrived
+ * while the resident was busy, when a reader is most useful: on a wake, on
+ * a cadence look and on a cancel. Each held message goes to exactly one
+ * reader, by the coordinator's cursor over the stored rows. A fork that
+ * never read what it was handed gives it back
  * (`readerFailed`). A reader's own cancel is followed by one more fork only
  * for what arrived after the reader was handed its own, and a cadence period
  * with nothing new derives no fork. (Before #291 a message that arrived
