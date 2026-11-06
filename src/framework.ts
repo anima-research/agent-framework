@@ -3975,7 +3975,10 @@ interface ChannelNotice {
   text: string;
   untold?: string;
   metadata: MessageMetadata;
-  target?: { forAgent: string };
+  /** Who it's for: the agent it's addressed to (`forAgent`), or, for one
+   *  told to the primary by name, the primary as its audience, as
+   *  passNoticeToPrimary stamps it (#291). */
+  target?: { forAgent: string } | { audience: readonly string[] };
   told: string;
   shown: string;
 }
@@ -25156,6 +25159,8 @@ export class AgentFramework {
         text: `[${NOTICE_TAG.channels}] Now open: ${shown}: a message from ${sender.first} into the closed channel opened it; ${sender.again} has ended.` +
           optOut(this.holdsChannelTraffic(primary, refs), this.canCloseChannels(primary, refs)),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
+        // The primary's, judged for it: stamped for it alone (#291).
+        target: { audience: [primary] },
         told: `the primary, by name (${agentName} has ended)`,
         shown,
       }];
@@ -25199,6 +25204,7 @@ export class AgentFramework {
         text: `[${NOTICE_TAG.channels}] Now open: ${shown}: a message from ${sender.first} into the closed channel opened it, and ${sender.again} can't close ${plural ? 'them' : 'it'}.` +
           optOut(this.holdsChannelTraffic(primary, refs), true),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
+        target: { audience: [primary] },
         told: `the primary, by name (${agentName} can't close ${plural ? 'them' : 'it'})`,
         shown,
       });
@@ -25326,8 +25332,9 @@ export class AgentFramework {
    * to can call it: a conversation fork's channel_open is refused outright
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
    * Where several residents share one slot it is stored in the slot they
-   * share, but stamped for the agent it's addressed to (#291); a fork's
-   * seed leaves it out (primaryNoticeTexts).
+   * share, but stamped for the agent it's addressed to (#291), the primary
+   * alone where it's told by name; a fork's seed leaves it out
+   * (primaryNoticeTexts).
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
    * record putting the channel's decision back, a later delivery or
@@ -25414,7 +25421,9 @@ export class AgentFramework {
             ? { passOn: { notice: 'reply-open-failed', serverId, channel, selectedForOpening } satisfies ChannelNoticePassOn }
             : {}),
         }) as MessageMetadata,
-      ...(agentName && !ended ? { target: { forAgent: agentName } } : {}),
+      // An ended agent's is the primary's, told by name: stamped for it
+      // alone (#291), as the primary's copy below is.
+      ...(agentName && !ended ? { target: { forAgent: agentName } } : ended ? { target: { audience: [primary!] } } : {}),
       told: ended ? `the primary, by name (${agentName} has ended)` : who ?? 'no agent',
       shown,
     };
@@ -25427,6 +25436,7 @@ export class AgentFramework {
           selected + ', and channel_close withdraws that.' +
           (primaryCanOpen && !hostRetries ? ' channel_open tries again.' : ''),
         metadata: { system: true, kind: 'channel-notice', speaker: who } as MessageMetadata,
+        target: { audience: [primary!] },
         told: `the primary, by name (${who} can't close it)`,
         shown,
       });
