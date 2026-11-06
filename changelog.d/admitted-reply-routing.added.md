@@ -11,3 +11,6 @@
 - Stale reply continuations clean up their logical turn, guard and waiter;
   token release stays frame-owned. Reply-deferred waits retain existing stale
   diagnostics. No thread transport, typing, replay or recovery contract is added.
+- Destination-less reply work resumes its own in-turn continuations by binding
+  identity and turn ownership, without gaining automatic publication authority
+  or joining work for an approved destination.

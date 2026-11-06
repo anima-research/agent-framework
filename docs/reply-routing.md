@@ -77,6 +77,9 @@ there is no fallback to a home, locus, latest inbound or another connection.
 The logical turn owns in-turn continuations (setup retries, tool waits, budget
 restarts and provider holds). Post-turn continuations and rewind retries carry
 the same work into a fresh logical turn without retaining the ended turn id.
+Destination-less work can resume its own turn only with the same private binding
+and matching owner; it cannot join a destination-bearing turn or gain permission
+to publish.
 Stale in-turn continuations are dropped and their logical turn/guard/waiter
 cleaned up. Token release stays frame-owned, as on the existing drop path.
 An unrelated wake cannot borrow an open turn's binding. Reply-deferred waits

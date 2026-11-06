@@ -20110,7 +20110,9 @@ export class AgentFramework {
     const owner = (request as ReplyWork | undefined)?.[replyOwner];
     if (work && owner !== undefined && open?.turnId !== owner) return 'stale';
     if (!open || (!open.reply && !work)) return 'run';
-    return owner === open.turnId && sameDestination(open.reply, work) ? 'run' : 'defer';
+    // Private continuations own the same work, not a publishable destination.
+    const samePrivateWork = !!open.reply && !open.reply.destination && open.reply === work;
+    return owner === open.turnId && (samePrivateWork || sameDestination(open.reply, work)) ? 'run' : 'defer';
   }
 
   private async processInferenceRequests(): Promise<void> {

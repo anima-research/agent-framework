@@ -12,7 +12,7 @@ import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane'
 
 import { RequiredAdmission } from '../src/mcpl/inbound-admission.js';
 import { withReplyConsumer, admissionRoutingFields } from '../src/mcpl/reply-admission.js';
-import { replyConsumer, replyWork, replyOwner, workOf, type ReplyBinding } from '../src/mcpl/reply-routing.js';
+import { replyConsumer, replyWork, replyOwner, workOf, shareReplyTurn, type ReplyBinding } from '../src/mcpl/reply-routing.js';
 const reply = (channelId = 'room/one', override = channelId) => ({ channelId: override });
 const at = (channelId = 'room/one', serverId = 'endpoint-a') => ({ serverId, channelId });
 /** Private scaffolding: real admission mints bindings; a recording double replaces transport. */
@@ -243,7 +243,7 @@ test('opening another channel is not an implicit redirect of the frozen reply', 
 });
 
 
-for (const missingStreamOwner of [false, true]) test(`a tool-driven budget restart keeps the frozen envelope despite later context and another root (missing stream owner: ${missingStreamOwner})`, async () => {
+for (const privateOpening of [false, true]) for (const missingStreamOwner of [false, true]) test(`a tool-driven budget restart keeps the frozen envelope despite later context and another root (private opening: ${privateOpening}, missing stream owner: ${missingStreamOwner})`, async () => {
   let x: Awaited<ReturnType<typeof frameworkFor>>;
   const module: Module = {
     name: 'work', async start() {}, async stop() {}, async onProcess() { return {}; },
@@ -275,17 +275,62 @@ for (const missingStreamOwner of [false, true]) test(`a tool-driven budget resta
       (round as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
       return new MockYieldingStream([round], true);
     };
-    await x.enqueue(reply());
+    await x.enqueue(privateOpening ? reply('') : reply());
     x.framework.start();
-    for (let i = 0; i < 300 && (x.membrane.calls.length < 3 || x.publishes.length < 2); i++) await new Promise(r => setTimeout(r, 10));
+    const expectedPublications = privateOpening ? ['topic:second'] : ['room/one', 'topic:second'];
+    for (let i = 0; i < 300 && (x.membrane.calls.length < 3 || x.publishes.length < expectedPublications.length); i++) await new Promise(r => setTimeout(r, 10));
     assert.ok(traces.includes('inference:stream_restarted'), 'the real context-budget restart path ran');
-    assert.deepEqual(x.publishes.map(p => p.channelId), [
-      'room/one', 'topic:second',
-    ]);
+    assert.deepEqual(x.publishes.map(p => p.channelId), expectedPublications);
     assert.equal(x.membrane.calls.length, 3, 'one tool stream, one continuation, one later root');
     assert.ok(JSON.stringify(x.membrane.calls[1]).includes('later context during the budget restart'));
   } finally { await x.close(); }
 });
+
+for (const mode of ['same private work', 'same approved destination', 'private to approved', 'approved to private', 'different destinations', 'different private work'] as const) {
+  test(`in-turn reply continuation: ${mode}`, async () => {
+    const x = await frameworkFor();
+    try {
+      const privateWork = await x.binding(reply(''));
+      const approved = await x.binding(reply());
+      assert.equal(privateWork.destination, undefined);
+      const opening = mode === 'same private work' || mode === 'private to approved' || mode === 'different private work' ? privateWork : approved;
+      const carried = mode === 'same private work' ? privateWork
+        : mode === 'same approved destination' ? await x.binding(reply())
+        : mode === 'private to approved' ? approved
+        : mode === 'different destinations' ? await x.binding(reply('room/other'))
+        : mode === 'different private work' ? await x.binding(reply('')) : privateWork;
+      // Install the open-turn precondition; selection, stream start and publication
+      // still use the actual scheduler and automatic speech path.
+      const open = x.f.routingOf('assistant');
+      open.reply = opening; open.replyWorks = [opening]; open.locus = at();
+      x.f.openLogical.set('assistant', open);
+      x.f.turnRouting.set('assistant', open);
+      const continuation = { agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(),
+        [replyWork]: [carried], [replyOwner]: open.turnId };
+      const shouldRun = mode === 'same private work' || mode === 'same approved destination';
+      if (!shouldRun) {
+        assert.equal(shareReplyTurn({ [replyWork]: [opening] }, { [replyWork]: [carried] }), false);
+        assert.equal(shareReplyTurn({ [replyWork]: [carried] }, { [replyWork]: [opening] }), false);
+      }
+      x.f.pendingRequests.push(continuation);
+      await x.f.processInferenceRequests();
+      if (shouldRun) {
+        assert.equal(x.f.pendingRequests.length, 0, 'the owned continuation must not be requeued');
+        await x.framework.runUntilIdle();
+        assert.equal(x.membrane.calls.length, 1);
+        assert.equal(x.f.openLogical.has('assistant'), false);
+        assert.deepEqual(x.publishes.map(p => p.channelId), opening.destination ? ['room/one'] : []);
+      } else {
+        assert.equal(x.membrane.calls.length, 0);
+        assert.deepEqual(x.publishes, []);
+        assert.equal(x.f.pendingRequests.length, 1);
+        assert.equal(x.f.pendingRequests[0], continuation);
+        assert.equal(x.f.openLogical.get('assistant'), open);
+        assert.equal(open.reply, opening, 'a deferred cause must not replace the opening binding');
+      }
+    } finally { await x.close(); }
+  });
+}
 
 for (const direct of [false, true]) test(`a recipient wake waits rather than joining an unowned open logical turn (${direct ? 'direct start' : 'scheduler'})`, async () => {
   const x = await frameworkFor();

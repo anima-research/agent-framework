@@ -9,7 +9,7 @@ import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { type AdmissionInput } from '../src/mcpl/inbound-admission.js';
 import { workOf, replyWork } from '../src/mcpl/reply-routing.js';
 import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { eventually } from './helpers/coalescing-fixture.js';
+import { eventually, fixture as coalescingFixture } from './helpers/coalescing-fixture.js';
 const peer = fileURLToPath(new URL('./fixtures/reply-routing-server.mjs', import.meta.url));
 const at = (channelId = 'room/one', serverId = 'endpoint-a') => ({ serverId, channelId });
 const incoming = (id: string, target = 'room/one', channelId = target) => ({
@@ -448,18 +448,66 @@ for (const lane of ['channels/incoming', 'push/event'] as const) for (const mayW
   });
 }
 
-for (const lane of ['channels/incoming', 'push/event'] as const) test(`real stdio: required routed ${lane} coalescing refuses before the resolver`, async t => {
+test('routed coalescing keeps cross-lane arrival order while reply resolution waits', async t => {
+  let release!: () => void;
+  let firstResolving = false, secondResolved = false;
+  const waiting = new Promise<void>(done => { release = done; });
+  const f = await coalescingFixture({ server: {
+    inboundAdmission: { timeoutMs: 5000, isReplyIntent: () => true, bind: (connection: unknown) => ({ connection,
+      admit: () => ({ store: true, mayWake: true, replyIntent: { channelId: 'chat' } }) }) },
+    replyAuthority: { timeoutMs: 5000, authorize: () => true, resolve: async (input: any) => {
+      if (input.item.eventId === 'first') { firstResolving = true; await waiting; }
+      else secondResolved = true;
+      return input.replyIntent;
+    } },
+  } });
+  t.after(async () => { release(); await f.close(); });
+  await f.register();
+  const first = f.send('channels/incoming', { messages: [f.channel('first', 'original_body', { key: 'shared', initial: true })] });
+  await eventually(() => firstResolving);
+  let secondAnswered = false;
+  const second = f.send('push/event', f.params('second', 'edited_body', { key: 'shared', channelId: 'chat' }))
+    .then(result => { secondAnswered = true; return result; });
+  await eventually(() => secondResolved);
+  assert.equal(secondAnswered, false, 'reply resolution must not bypass the reserved subject order');
+  release();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.result.results[0].coalesce.outcome, 'first');
+  assert.deepEqual(b.result.coalesce, { outcome: 'replaced', priorEventId: 'first' });
+  assert(!f.context().includes('original_body'));
+  assert(f.context().includes('edited_body'));
+  await f.framework.runUntilIdle();
+  assert.equal(f.published.length, 1);
+  assert.equal(f.published[0].channelId, 'chat');
+});
+
+test('routed channel-scoped push is authorized before admission and reply callbacks', async t => {
+  let admissions = 0, resolutions = 0;
+  const f = await coalescingFixture({ server: {
+    inboundAdmission: { timeoutMs: 5000, isReplyIntent: () => true, bind: (connection: unknown) => ({ connection,
+      admit: () => { admissions++; return { store: true, mayWake: true }; } }) },
+    replyAuthority: { timeoutMs: 5000, authorize: () => true, resolve: () => { resolutions++; return { channelId: 'chat' }; } },
+  } }); t.after(f.close);
+  const response = await f.send('push/event', f.params('unauthorized', 'must_not_store', { key: 'shared', channelId: 'chat', initial: true }));
+  assert.equal(response.error?.code, -32023);
+  assert.equal(admissions, 0); assert.equal(resolutions, 0);
+  assert(!f.context().includes('must_not_store'));
+});
+
+for (const lane of ['channels/incoming', 'push/event'] as const) test(`real stdio: required routed ${lane} rejects deferred coalescing`, async t => {
   let resolves = 0;
   const x = await wire({ replyAuthority: { timeoutMs: 1000, authorize: () => true, resolve: () => { resolves++; return { channelId: 'room/one' }; } } }); t.after(x.close);
   const item: any = lane === 'channels/incoming' ? incoming('coalesced') : {
     featureSet: 'feed', eventId: 'coalesced', timestamp: '2026-01-01T00:00:00Z',
     origin: { mcplChannelId: 'room/one' }, payload: { content: [{ type: 'text', text: 'coalesced' }] },
   };
-  item.coalesce = { key: 'subject', initial: true };
+  item.coalesce = { key: 'subject', initial: true, deferred: true };
   const result = await x.send(lane, lane === 'channels/incoming' ? { messages: [item] } : item);
   const receipt = lane === 'channels/incoming' ? result.result.results[0] : result.result;
-  assert.equal(receipt.accepted, false); assert.equal(receipt.reason, 'admission_unsupported');
-  assert.equal(resolves, 0);
+  assert.equal(receipt.accepted, false);
+  assert.equal(receipt.reason, lane === 'channels/incoming' ? 'coalesce_invalid' : 'admission_unsupported');
+  // Channel shape validation follows admission; deferred pushes are refused first.
+  assert.equal(resolves, lane === 'channels/incoming' ? 1 : 0);
   await x.framework.runUntilIdle(); assert.equal(x.membrane.calls.length, 0);
 });
 
