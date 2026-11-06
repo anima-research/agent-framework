@@ -1707,8 +1707,7 @@ function* rowsNewestFirst(cm: ContextManager, sees: (metadata: unknown) => boole
 function holdsUnansweredPrivateInput(cm: ContextManager, agentName: string, sees: (metadata: unknown) => boolean): boolean {
   for (const message of rowsNewestFirst(cm, sees)) {
     if (isMarkedPrivateInput(message.metadata)) return true;
-    if (typeof (message.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number') return true;
-    if (message.participant === agentName && !silentHeartbeatOf(message.metadata)) return false;
+    if (message.participant === agentName && !silentHeartbeatOf(message.metadata) && message.content.some((b) => b.type === 'text')) return false;
   }
   return false;
 }
@@ -3979,6 +3978,7 @@ export class AgentFramework {
   private midTurnInputSignals: Set<string> = new Set();
   private privateInputStored: Set<string> = new Set();
   private privateInputResidents = new Set<string>();
+  private privateInputNoted = new Map<string, number>();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). Kept in the store as well
@@ -12251,6 +12251,7 @@ export class AgentFramework {
     this.proseSpeechChains.delete(name);
     this.openLogical.delete(name);
     this.privateInputStored.delete(name);
+    this.privateInputNoted.delete(name);
     // What it was last told of where its speech goes goes with it, kept
     // only for an agent declared by configuration, which comes back under
     // its name at the next boot: so the stored baselines are those of
@@ -13033,6 +13034,7 @@ export class AgentFramework {
         this.proseSpeechChains.delete(agent.name);
         this.openLogical.delete(agent.name);
         this.privateInputStored.delete(agent.name);
+        this.privateInputNoted.delete(agent.name);
         this.forgetAnnouncedLocus(agent.name);
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
@@ -16364,8 +16366,7 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    const recorded = this.readPrivateInputRecord(config.name);
-    const waiting = recorded ?? holdsUnansweredPrivateInput(contextManager, config.name, sees);
+    const waiting = this.readPrivateInputRecord(config.name) === true || holdsUnansweredPrivateInput(contextManager, config.name, sees);
     if (waiting) this.privateInputStored.add(config.name);
     this.privateInputResidents.add(config.name);
     this.recordPrivateInput(config.name, waiting);
@@ -18469,6 +18470,7 @@ export class AgentFramework {
       this.proseSpeechChains.delete(agentName);
       this.openLogical.delete(agentName);
       this.privateInputStored.delete(agentName);
+      this.privateInputNoted.delete(agentName);
       this.forgetAnnouncedLocus(agentName);
       this.codeExecution?.scripts.agentGone(agentName);
     }
@@ -25340,6 +25342,8 @@ export class AgentFramework {
 
       if (carry && this.heardSince(agent, routing, carry.read)) carry = undefined;
       const streamCarry: TurnCarry = { silence: carry?.silence ?? null, sends: carry?.sends ?? null, read: lastHeardAt };
+      if (this.privateInputStored.has(agent.name) && !routing.nonChannelOrigin) this.makeTurnPrivate(agent, routing, trigger?.suppressProse === true);
+      const notedBeforeCompile = this.privateInputNoted.get(agent.name);
       const {
         stream,
         request: compiledRequest,
@@ -25455,7 +25459,10 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-      if (!trigger?.suppressProse) this.privateInputStored.delete(agent.name);
+      if (!trigger?.suppressProse) {
+        if (this.privateInputNoted.get(agent.name) === notedBeforeCompile) this.privateInputStored.delete(agent.name);
+        else if (!routing.nonChannelOrigin) this.makeTurnPrivate(agent, routing);
+      }
       const handle = this.driveStream(
         agent,
         stream,
@@ -31084,7 +31091,9 @@ export class AgentFramework {
   }
 
   private notePrivateInput(agentName: string, metadata: MessageMetadata | undefined): void {
-    if (this.isPrivateInput(metadata)) this.privateInputStored.add(agentName);
+    if (!this.isPrivateInput(metadata)) return;
+    this.privateInputStored.add(agentName);
+    this.privateInputNoted.set(agentName, (this.privateInputNoted.get(agentName) ?? 0) + 1);
   }
 
   private recordPrivateInputAhead(agent: Agent, metadata: MessageMetadata | undefined): void {

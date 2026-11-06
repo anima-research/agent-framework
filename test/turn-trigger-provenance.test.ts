@@ -2426,6 +2426,76 @@ describe('private wins, one way', () => {
       }
     });
 
+    it("a private surface's message a release that keeps no note stored after this release's note said nothing waits keeps the next run's first start out of every channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'stale-note-private-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir });
+        try {
+          await firstTurn(first, false);
+          first.framework.getAgent('scout')!.getContextManager().addMessage(
+            'user', [{ type: 'text', text: 'for your eyes only' }], { inboundSource: { kind: 'surface', surface: 'tui', acceptedAt: Date.now() } } as never);
+          assert.ok(stored(first).includes('for your eyes only'), 'control: the message is stored');
+        } finally {
+          await first.close();
+        }
+        const raw = JsStore.openOrCreate({ path: join(storeDir, 'store') });
+        try {
+          const state = raw.getStateJson('framework/state') as { privateInputWaiting?: Record<string, unknown> };
+          assert.equal(state.privateInputWaiting?.scout, false, 'control: the note says nothing waits');
+        } finally {
+          raw.close();
+        }
+        const next = await surfaceRig({ storeDir });
+        try {
+          const { channelTurn } = restarted(next);
+          assert.deepEqual(await channelTurn(), [], 'the start that reads it speaks in no channel');
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
+    it("a store from before this release, holding a private surface's message no start read with a /puppet pair stored after it, keeps its first opening's first start out of every channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'older-store-puppet-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir, quietSources: ['console'], modules: [robot()] });
+        try {
+          await firstTurn(first, false);
+          first.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+          await first.until(() => stored(first).includes('for your eyes only'), 'the private message stored');
+          await first.framework.runUntilIdle();
+          await first.framework.puppetToolCall('scout', 'robot--move', {});
+          const rows = first.framework.getAgent('scout')!.getContextManager().getAllMessages();
+          const at = rows.findIndex((m) => JSON.stringify(m.content).includes('for your eyes only'));
+          assert.ok(rows.slice(at + 1).some((m) => m.participant === 'scout'), "control: the /puppet pair stored a row of the resident's own after the message");
+        } finally {
+          await first.close();
+        }
+        const raw = JsStore.openOrCreate({ path: join(storeDir, 'store') });
+        try {
+          const state = raw.getStateJson('framework/state') as Record<string, unknown>;
+          assert.ok(state.privateInputWaiting, 'control: this release kept a record');
+          delete state.privateInputWaiting;
+          raw.setStateJson('framework/state', state);
+        } finally {
+          raw.close();
+        }
+        const next = await surfaceRig({ storeDir, quietSources: ['console'], modules: [robot()] });
+        try {
+          const { channelTurn } = restarted(next);
+          assert.deepEqual(await channelTurn(), [], 'the start that reads it speaks in no channel');
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
     it("wherever a crash cuts the store's log, from before a private surface's message is stored to after the start that read it answered, the next run's first start speaks in no channel while the message is stored unanswered, and in its channel once the answer and its record are", async () => {
       const root = mkdtempSync(join(tmpdir(), 'private-input-crash-'));
       const live = join(root, 'live');
@@ -2547,6 +2617,90 @@ describe('private wins, one way', () => {
         await rig.until(() => stored(rig).includes('for your eyes only'), 'the private message stored');
         assert.deepEqual(await aideTurn(), [], 'the turn that reads it speaks in no channel');
         assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('for your eyes only'), "control: the aide's request held the message");
+        assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a private surface's message stored for one resident while another resident's channel start gathers its context keeps that start out of every channel, and tells it its turn is private", async () => {
+      let hold: Promise<void> | undefined;
+      let gathering = false;
+      const slow = {
+        name: 'slow',
+        async start() {}, async stop() {},
+        getTools: () => [],
+        async handleToolCall() { return { success: true }; },
+        async onProcess() { return {}; },
+        async gatherContext(agentName: string) {
+          if (agentName === 'aide' && hold) { gathering = true; await hold; }
+          return [];
+        },
+      } as unknown as Module;
+      const rig = await surfaceRig({ otherAgents: ['aide'], modules: [slow] });
+      try {
+        const aideStarts = () => rig.starts.filter((s) => s.agentName === 'aide').length;
+        const aideIdle = () => rig.framework.getAgent('aide')!.state.status === 'idle' && idle(rig);
+        const aideTurn = async () => {
+          const before = rig.routed.length;
+          const starts = aideStarts();
+          rig.i.pendingRequests.push({ ...roomWake(), agentName: 'aide' });
+          await rig.until(() => aideStarts() > starts && aideIdle(), "the aide's channel turn");
+          await rig.framework.runUntilIdle();
+          return rig.routed.slice(before).map((r) => r.locus);
+        };
+        assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+        let release!: () => void;
+        hold = new Promise((resolve) => { release = resolve; });
+        const before = rig.routed.length;
+        const starts = aideStarts();
+        rig.i.pendingRequests.push({ ...roomWake(), agentName: 'aide' });
+        const { running } = await rig.whileRunning(() => gathering, "the aide's start gathering its context");
+        storeOperatorMessage(rig.framework);
+        assert.ok(stored(rig).includes('for your eyes only'), 'control: the message is stored while the start gathers its context');
+        hold = undefined;
+        release();
+        await running;
+        await rig.until(() => aideStarts() > starts && aideIdle(), "the aide's held channel turn");
+        await rig.framework.runUntilIdle();
+        assert.deepEqual(rig.routed.slice(before).map((r) => r.locus), [], 'the start that reads it speaks in no channel');
+        const request = JSON.stringify(rig.membrane.calls.at(-1));
+        assert.ok(request.includes('for your eyes only'), "control: the aide's request held the message");
+        assert.ok(request.includes(PRIVATE_FROM_HERE), 'its request tells it the turn is private');
+        assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a private surface's message stored for one resident while another resident's channel start compiles, after the compile read the store, keeps that start and the next one out of every channel", async () => {
+      const rig = await surfaceRig({ otherAgents: ['aide'] });
+      try {
+        const aide = rig.framework.getAgent('aide')! as unknown as { startStreamWithInjections: (...args: unknown[]) => Promise<unknown> };
+        const compile = aide.startStreamWithInjections.bind(aide);
+        let during: (() => void) | undefined;
+        aide.startStreamWithInjections = async (...args: unknown[]) => {
+          const started = await compile(...args);
+          during?.();
+          during = undefined;
+          return started;
+        };
+        const aideStarts = () => rig.starts.filter((s) => s.agentName === 'aide').length;
+        const aideIdle = () => rig.framework.getAgent('aide')!.state.status === 'idle' && idle(rig);
+        const aideTurn = async () => {
+          const before = rig.routed.length;
+          const starts = aideStarts();
+          rig.i.pendingRequests.push({ ...roomWake(), agentName: 'aide' });
+          await rig.until(() => aideStarts() > starts && aideIdle(), "the aide's channel turn");
+          await rig.framework.runUntilIdle();
+          return rig.routed.slice(before).map((r) => r.locus);
+        };
+        assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+        during = () => { storeOperatorMessage(rig.framework); };
+        assert.deepEqual(await aideTurn(), [], 'the start whose compile was running speaks in no channel');
+        assert.ok(!JSON.stringify(rig.membrane.calls.at(-1)).includes('for your eyes only'), "control: that start's request didn't hold the message");
+        assert.deepEqual(await aideTurn(), [], 'the next start, which reads it, speaks in no channel');
+        assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('for your eyes only'), "control: the next start's request held the message");
         assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
       } finally {
         await rig.close();

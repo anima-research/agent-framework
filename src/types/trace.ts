@@ -187,8 +187,8 @@ export type TraceEvent =
        *  turn in any mode: none, though the turn may show typing, since its
        *  text is never sent to a channel. A turn that holds private input,
        *  from its start or from the boundary that made it private: none, in
-       *  every mode; a turn made private part-way stops its indicator at that
-       *  boundary. */
+       *  every mode; a turn made private part-way stops the framework's
+       *  indicator at that boundary. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -217,8 +217,8 @@ export type TraceEvent =
        *  turn in any mode: none, though the turn may show typing, since its
        *  text is never sent to a channel. A turn that holds private input,
        *  from its start or from the boundary that made it private: none, in
-       *  every mode; a turn made private part-way stops its indicator at that
-       *  boundary. */
+       *  every mode; a turn made private part-way stops the framework's
+       *  indicator at that boundary. */
       channelId?: string;
     })
   | (TraceEventBase & {

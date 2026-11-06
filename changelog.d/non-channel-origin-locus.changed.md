@@ -14,10 +14,14 @@
   a merged start and the other isn't, each request of the start's batch takes
   the other's marks, a private wake's included. So is a start that is the
   first
-  to read a private surface's message stored before it, though the message's
+  to read a private surface's message stored before it or while it gathers
+  its context, though the message's
   own wake may still wait in a gate window, or the message woke nothing, and
   for an ordinary resident whose view keeps the message, whichever resident
-  of its shared slot it was stored for. So is a resident's first start in a
+  of its shared slot it was stored for. A message stored while a start's
+  request compiles, which that request may or may not hold, makes the turn
+  private as its stream begins, and the resident's next start too. So is a
+  resident's first start in a
   framework made on its store, as after a restart, when the earlier run left
   private input stored for it that no start has answered. The framework keeps
   that note in the store, beside the messages: it's written before the
@@ -25,13 +29,13 @@
   resident's own after taking the input in (a silent heartbeat tick's row
   doesn't count, and neither do the rows `puppetToolCall` stores). So
   whatever part of the store a crash keeps, a stored input whose answer it
-  lost still counts as unanswered. A store from a release before this one
-  holds no such note, so there the first run reads it from the store, as the
-  release before did, and keeps it from then on: the start is private when, in
-  what the resident's view keeps, no row of its own, other than a silent
-  heartbeat tick's, follows a private surface's message, a result or mail
-  from a private turn's work, or a report from a script a turn started,
-  whichever turn it was. So is
+  lost still counts as unanswered. Where the note says nothing waits, or
+  there's none, as in a store from a release before this one or one such a
+  release has written to since, the framework also reads the store as it
+  opens the resident, and keeps what it finds in the note: the start is
+  private when, in what the resident's view keeps, no row of its own with
+  text in it, other than a silent heartbeat tick's, follows a private
+  surface's message or a result or mail from a private turn's work. So is
   the turn of its own that a wake starts after waiting beside a private
   turn's own continuation: a budget restart or a held retry that started
   alone, or one that passed a quiesce in the same pass that parked the wake.
@@ -41,7 +45,9 @@
   private input stays private for the rest of it: a start that continues it
   with a private wake or stored private input, or a tool boundary that injects
   a private surface's message, removes its locus, its trigger channel and its
-  sticky `>>` or `>>>` destination, stops the typing indicator it showed, and
+  sticky `>>` or `>>>` destination, stops the framework's typing indicator
+  it showed (the built-in Discord module's `autoTyping` loop runs to the
+  turn's end, as before), and
   from there its `inference:tokens` and `inference:content_block` traces name
   no channel, in every mode; a `[routing]` notice says why,
   whatever destination the turn had, unless the turn is a silent heartbeat
