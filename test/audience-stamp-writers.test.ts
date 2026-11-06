@@ -121,9 +121,10 @@ function walkSources(
  */
 function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Site[] {
   const sites: Site[] = [];
-  // Each file's names bound to a string, and the computed members keyed by
-  // a name, read once the file's bindings are all known.
-  const bound = new Map<string, Map<string, string>>();
+  // Each file's names bound to a string, every string each is bound to
+  // anywhere in the file, and the computed members keyed by a name, read
+  // once the file's bindings are all known.
+  const bound = new Map<string, Map<string, Set<string>>>();
   const byName: Array<{ file: string; name: string; site: Site }> = [];
   // Each call, by its callee, so a member can find the call it is called by.
   const callOf = new WeakMap<Node, Node>();
@@ -133,7 +134,10 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
       const text = literalText(child(node, 'init'));
       if (text !== undefined) {
         if (!bound.has(file)) bound.set(file, new Map());
-        bound.get(file)!.set(child(node, 'id')!.name as string, text);
+        const names = bound.get(file)!;
+        const name = child(node, 'id')!.name as string;
+        if (!names.has(name)) names.set(name, new Set());
+        names.get(name)!.add(text);
       }
     }
     const at = (receiver: string): Site => {
@@ -159,7 +163,7 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
       }
     }
   });
-  for (const { file, name, site } of byName) if (bound.get(file)?.get(name) === 'addMessage') sites.push(site);
+  for (const { file, name, site } of byName) if (bound.get(file)?.get(name)?.has('addMessage')) sites.push(site);
   const order = new Map(sources.map((s, i) => [s.name, i]));
   return sites.sort((a, b) => order.get(a.file)! - order.get(b.file)! || a.line - b.line);
 }
@@ -298,6 +302,10 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     'export function free(cm: { addMessage(): void }) { cm?.addMessage(); }',
     "export function named(cm: Record<string, (...args: unknown[]) => void>) { const method = 'addMessage'; cm[method]('user', []); cm[`addMessage`]('user', []); }",
     'export function given(cm: Record<string, () => void>, key: string) { cm[key](); }',
+    // A name bound to the string in one scope and to another string in a
+    // later one: read scope-blind, it is the member either way.
+    "export function shadowed(cm: Record<string, () => void>) { const method = 'addMessage'; cm[method](); }",
+    "export function other(cm: Record<string, () => void>) { const method = 'other'; cm[method](); }",
   ].join('\n');
   const sites = scanAddMessageSites([{ name: 'writer.ts', text }]);
   assert.deepEqual(sites.map((s) => [s.line, s.receiver, s.scope.join('.')]), [
@@ -313,6 +321,9 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     // string; a name it doesn't bind isn't read.
     [19, 'cm', 'named'],
     [19, 'cm', 'named'],
+    // A later binding of the name to another string doesn't hide the first.
+    [21, 'cm', 'shadowed'],
+    [22, 'cm', 'other'],
   ]);
   assert.ok(sites[0]!.scopeText.startsWith('store(') && sites[0]!.scopeText.includes('asOwnRow('), "a site's scope text is its method's");
   assert.deepEqual(sites.slice(0, 4).map((s) => s.metadata), ["asOwnRow(undefined, 'a')", '', '', undefined],
@@ -365,6 +376,32 @@ function scanCalls(sources: Array<{ name: string; text: string }>, name: string)
   });
   return sites;
 }
+
+/**
+ * Whether storeOwnRow's `present`, as a call passes it (its sixth argument's
+ * source), is true whatever the scope decides: a literal true, or undefined
+ * (`undefined`, `void …`), which takes the parameter's default, true.
+ */
+function presentsAtItsWrite(sixth: Node | undefined): boolean {
+  if (!sixth) return true;
+  if (sixth.type === 'BooleanLiteral') return sixth.value === true;
+  if (sixth.type === 'Identifier') return sixth.name === 'undefined';
+  return sixth.type === 'UnaryExpression' && sixth.operator === 'void';
+}
+
+it("the held-back check reads a `present` that defaults to true as true", () => {
+  const calls = scanCalls([{ name: 'writer.ts', text: [
+    'export function w(a: A, present: boolean, alive: boolean) {',
+    "  storeOwnRow(a, 'u', [], undefined, undefined, true);",
+    "  storeOwnRow(a, 'u', [], undefined, undefined, undefined);",
+    "  storeOwnRow(a, 'u', [], undefined, undefined, void 0);",
+    "  storeOwnRow(a, 'u', [], undefined, undefined, false);",
+    "  storeOwnRow(a, 'u', [], undefined, undefined, present);",
+    "  storeOwnRow(a, 'u', [], undefined, undefined, !alive);",
+    '}',
+  ].join('\n') }], 'storeOwnRow');
+  assert.deepEqual(calls.map((c) => presentsAtItsWrite(c.sixth)), [true, true, true, false, false, false]);
+});
 
 /**
  * When each writer of an agent's own rows writes them, and so whether
@@ -442,8 +479,8 @@ it("every writer of an agent's own rows is classified by when it writes, and one
   for (const call of calls.filter((c) => OWN_ROW_WRITERS[keyOf(c)]!.when === 'held-back')) {
     const { what } = OWN_ROW_WRITERS[keyOf(call)]!;
     assert.equal(call.args, 6, `${where(call)} (${what}) holds its row back with storeOwnRow's \`present\`, its sixth argument`);
-    assert.ok(!(call.sixth?.type === 'BooleanLiteral' && call.sixth.value === true),
-      `${where(call)} (${what}) passes \`present\` as true, which presents the row into a turn it isn't part of`);
+    assert.ok(!presentsAtItsWrite(call.sixth),
+      `${where(call)} (${what}) passes \`present\` as true (or as undefined, which defaults to true), which presents the row into a turn it isn't part of`);
   }
   // A row whose write threw after it landed is told to the own-row sink by
   // hand (ownRowsStored), only by a writer that presents at its write.

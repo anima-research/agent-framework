@@ -937,11 +937,12 @@ describe('a debounced batch of targeted messages', () => {
     handleMcplChannelIncoming(event: Record<string, unknown>): Promise<unknown>;
     pendingRequests: Array<{ agentName: string; reason: string; wakeLines?: unknown[] }>;
   };
-  const boot = async (): Promise<{ framework: AgentFramework; internals: Internals; dir: string }> => {
+  const boot = async (): Promise<{ framework: AgentFramework; internals: Internals; dir: string; membrane: MockMembrane }> => {
     const dir = mkdtempSync(join(tmpdir(), 'wake-line-targeted-'));
+    const membrane = new MockMembrane();
     const framework = await AgentFramework.create({
       storePath: join(dir, 'test.chronicle'),
-      membrane: new MockMembrane().asMembrane(),
+      membrane: membrane.asMembrane(),
       agents: [
         { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
         { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' },
@@ -958,7 +959,7 @@ describe('a debounced batch of targeted messages', () => {
       },
       modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     });
-    return { framework, internals: framework as unknown as Internals, dir };
+    return { framework, internals: framework as unknown as Internals, dir, membrane };
   };
   const forMira = (messageId: string, text: string, targetAgents = ['mira']) => ({
     type: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM, messageId,
@@ -972,13 +973,23 @@ describe('a debounced batch of targeted messages', () => {
     .getPresentedMessages().map((m) => JSON.stringify(m.content));
 
   it('one message for a co-resident wakes her alone, and its line goes to her wake, newest in her window: no line is stored', async () => {
-    const { framework, internals, dir } = await boot();
+    const { framework, internals, dir, membrane } = await boot();
     try {
       await internals.handleMcplChannelIncoming(forMira('m-t1', 'mira, a word'));
       await waitFor(() => batchWakes(internals).length > 0, 'the batch to fire');
       assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['mira'], 'mira alone is woken');
       assert.equal(batchWakes(internals)[0]!.wakeLines?.length, 1, 'the line goes to her wake');
       assert.deepEqual(gateRows(framework), [], 'no line is stored in the slot');
+      // Her start places the line (placeWakeLines): run it, where "no line"
+      // is decided, her message being the newest row of her window.
+      const omitted: Array<{ reason: string }> = [];
+      framework.onTrace((event) => { if (event.type === 'gate:wake-line-omitted') omitted.push(event as unknown as { reason: string }); });
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+      await framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 1, 'her turn ran');
+      assert.ok(JSON.stringify(membrane.calls[0]!.messages).includes('mira, a word'), 'her request carries the message');
+      assert.deepEqual(omitted.map((t) => t.reason), ['newest'], 'her start left the line out: the message is the newest row of her window');
+      assert.deepEqual(gateRows(framework), [], 'and stored none');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -986,13 +997,23 @@ describe('a debounced batch of targeted messages', () => {
   });
 
   it('one message for a co-resident and a name that is no agent\'s wakes her alone, and its line goes to her wake: no line is stored', async () => {
-    const { framework, internals, dir } = await boot();
+    const { framework, internals, dir, membrane } = await boot();
     try {
       await internals.handleMcplChannelIncoming(forMira('m-t1', 'mira, a word', ['mira', 'ghost']));
       await waitFor(() => batchWakes(internals).length > 0, 'the batch to fire');
       assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['mira'], 'mira alone is woken');
       assert.equal(batchWakes(internals)[0]!.wakeLines?.length, 1, 'the line goes to her wake');
       assert.deepEqual(gateRows(framework), [], 'no line is stored in the slot');
+      // Her start places the line (placeWakeLines): run it, where "no line"
+      // is decided, her message being the newest row of her window.
+      const omitted: Array<{ reason: string }> = [];
+      framework.onTrace((event) => { if (event.type === 'gate:wake-line-omitted') omitted.push(event as unknown as { reason: string }); });
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+      await framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 1, 'her turn ran');
+      assert.ok(JSON.stringify(membrane.calls[0]!.messages).includes('mira, a word'), 'her request carries the message');
+      assert.deepEqual(omitted.map((t) => t.reason), ['newest'], 'her start left the line out: the message is the newest row of her window');
+      assert.deepEqual(gateRows(framework), [], 'and stored none');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
