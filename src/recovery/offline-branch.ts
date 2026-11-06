@@ -26,7 +26,9 @@ export interface OfflineRecoveryBranchOptions {
    * write that presented the anchor, so rows stored after the anchor and
    * before that write stay on the branch: those the window took after the
    * anchor enter it again at the agent's next presentation point, after the
-   * anchor. Only rows stored after the cut are removed and counted. A
+   * anchor, and the rows that one write presented together with the anchor
+   * stay after it in the window. Only rows stored after the cut are removed
+   * and counted. A
    * suppression may name any row the branch keeps that has a Discord
    * message id, one the cut keeps after the anchor too; one without (an
    * agent's round, a tool row) takes the live suppressMessages, by its row
@@ -50,9 +52,11 @@ export interface OfflineRecoveryBranchOptions {
    * For rolling back to a release that doesn't read the stamp, where a row
    * hidden between messages a summary covers makes that summary non-contiguous,
    * and the store is refused at open. The source branch keeps them. Once this
-   * release has written its window down (MANIFEST version 2), no earlier
-   * release opens the store at all, and only a copy taken before the upgrade
-   * goes back.
+   * release has made a window write of two or more rows (the first
+   * write-down of a window that holds a row, as at the first boot on a store
+   * with history, or a presentation of more than one row: MANIFEST version
+   * 2), no earlier release opens the store at all, and only a copy taken
+   * before the upgrade goes back.
    */
   removeSuppressed?: boolean;
   /** Exact Discord messages to suppress on the new branch. */
