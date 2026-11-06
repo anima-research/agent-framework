@@ -739,12 +739,17 @@ function noLongerRegistered(ref: ChannelRef): string {
 
 /** What a channel_close's bare name reached besides the channel it closed
  *  (ChannelRegistry.focusNamedBare): each by its id and server, which the
- *  bare name leaves out, and that naming its server closes it. */
+ *  bare name leaves out, and the channelId and serverId a call closes it
+ *  with: its own id, which needn't be the name the call gave (a focus on
+ *  `b:room` beside server b's `room`), so naming the server alone, the
+ *  name kept, is no channel there. */
 function notClosedText(refs: readonly ChannelRef[]): string {
   const names = refs.map(channelOnServer);
-  return names.length === 1
-    ? `Channel ${names[0]} was not closed: name its server to close it.`
-    : `Channels ${names.slice(0, -1).join(', ')} and ${names.at(-1)} were not closed: name the server of the one to close.`;
+  const call = (ref: ChannelRef) => `channelId ${quotedValue(ref.channelId)} and serverId ${quotedValue(ref.serverId)}`;
+  return refs.length === 1
+    ? `Channel ${names[0]} was not closed: to close it, call again with ${call(refs[0]!)}.`
+    : `Channels ${names.slice(0, -1).join(', ')} and ${names.at(-1)} were not closed: to close one, call again with ` +
+      `${refs.slice(0, -1).map(call).join(', with ')}, or with ${call(refs.at(-1)!)}.`;
 }
 
 /** A tool result with a sentence added: a success's after its note (or as
