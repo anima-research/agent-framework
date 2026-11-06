@@ -2092,6 +2092,38 @@ test("review 3 #11: a cancel asked for with a note while an earlier one runs joi
   }
 });
 
+test("pin (H3, Weft at 1f96d1f7): a cancel another caller asks for while an earlier one runs joins it when it is queued again: the release its next run writes credits both", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'First.', 'Subconscious');
+    h.state.held = false;
+    let asked = false;
+    h.listenWrites((metadata) => {
+      if (metadata?.kind !== 'tune-out-cancel' || asked) return;
+      asked = true;
+      // The release's write begins a hold, and a reader fork's cancel of the same hold waits.
+      h.state.held = true;
+      assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-fork-7', undefined, 'reader-fork-7'), { ok: true, deferred: true });
+    });
+    h.coordinator.runDeferredCancels();
+    assert.ok(asked, 'premise: the second cancel was asked for during the run');
+    assert.equal(queuedOf(h), 1, 'one cancel waits');
+    h.listenWrites(() => {});
+    h.state.held = false;
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null, 'the hold ends');
+    const release = h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel').at(-1)!;
+    assert.deepEqual(release.metadata?.cancel, { source: 'subconscious', reason: 'by Subconscious', by: 'Subconscious', askers: ['Subconscious', 'reader-fork-7'] },
+      "the run's release credits the caller that joined it");
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
 test("review 3 #14: a stop while the release that told a queued note's loss is kept in memory tells that loss, kept in the store", () => {
   for (const scope of [false, true]) {
     const errors = mock.method(console, 'error', () => {});
