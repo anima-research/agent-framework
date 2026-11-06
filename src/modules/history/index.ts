@@ -45,7 +45,10 @@
  * its requests never carry. For an agent's call, another agent's own rows
  * (its rounds, its notes, its stored injections) that it isn't shown are
  * left out unless it observes that agent (decision 1), counted as
- * `leftOut`. The summaries `overview` and `semantic_search` read fold the
+ * `leftOut`; extract's `offset` counts them, so a caller pages on by
+ * `returned + leftOut`. A row stored before the audience stamp, whose owner
+ * isn't recorded, is nobody's own and isn't left out: it carries `window`
+ * where the caller isn't shown it. The summaries `overview` and `semantic_search` read fold the
  * bound context's agent's window (ModuleContext.agentNameOf says whose), so
  * for another agent's call that doesn't observe that agent they are left
  * out too: `overview` keeps each summarized span's time, level and counts
@@ -706,6 +709,9 @@ export class HistoryModule implements Module {
     // text is left out the same way. Without it, the tools are as they were.
     const windowed = !!this.ctx?.windowStatusOf;
     const windowNote = windowed ? WINDOW_NOTE : '';
+    // extract's offset counts the rows left out for the caller, as the page's
+    // place in the window does.
+    const extractWindowNote = windowed ? WINDOW_NOTE + EXTRACT_OFFSET_NOTE : '';
     return [
       {
         name: 'stats',
@@ -739,7 +745,7 @@ export class HistoryModule implements Module {
           'may report truncated:true with a `resume` object ({windowOffset, offset, afterId}) — repeat the call with ' +
           'those fields added to continue exactly where it stopped. If messages were added or removed in the window ' +
           'meanwhile, the resume re-anchors on afterId and says so (windowChanged), or fails loudly when it can\'t.' +
-          windowNote,
+          extractWindowNote,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -978,7 +984,7 @@ export class HistoryModule implements Module {
     const forCaller = caller === undefined ? undefined : { forAgent: caller };
     const statuses = new Map<string, WindowStatus | null>();
     // Set once a lookup throws: an agent the framework no longer knows. Its
-    // rows carry no mark, and its window is taken as holding nothing.
+    // window is taken as holding nothing, so each row is marked not shown.
     let unknown = false;
     const statusOf = (msg: StoredMessage): WindowStatus | null => {
       if (unknown) return null;
@@ -1040,6 +1046,7 @@ export class HistoryModule implements Module {
     return {
       mark: (msg) => {
         const status = statusOf(msg);
+        if (unknown) return 'not-shown';
         if (status === 'undone') return 'undone';
         if (status === 'out' || status === 'absent') return 'not-shown';
         return status === 'in' && !keeps(msg) ? 'not-shown' : undefined;
@@ -2681,6 +2688,9 @@ const WINDOW_NOTE =
   'out of it, "not-shown" for one not in your context now, never shown to you or returned by an undo or rollback ' +
   'to be shown again; another agent\'s own turns and notes that aren\'t in your context are left out unless you ' +
   'observe that agent, and how many were is `leftOut`.';
+
+/** extract's addition to it: its offset counts the rows left out, as its page's place in the window does. */
+const EXTRACT_OFFSET_NOTE = ' `offset` counts the messages left out too: to page on, advance it by returned + leftOut.';
 
 /** semantic_search's form of it. */
 const WINDOW_NOTE_SEMANTIC =

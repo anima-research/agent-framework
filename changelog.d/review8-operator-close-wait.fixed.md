@@ -21,4 +21,5 @@
     survives a stop: the next boot writes it into the subconscious's
     context, with the reason. A reader fork's is dropped at a stop.
   - A stop before the retry succeeds loses the queued cancel, and the hold
-    is still in force after the restart unless its end time has passed.
+    is still in force after the restart unless its end time has passed, or
+    the host starts again with no reader, which ends every hold on record.

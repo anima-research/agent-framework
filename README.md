@@ -182,7 +182,9 @@ agent-framework-recover \
 The specified Discord message is the last message the agent will still see;
 everything after it is left on the old branch (on a window presented since
 #291, but for the rows stored before the write that presented it, which the
-new branch keeps and the window takes again after that message). The command
+new branch keeps and the window takes again after that message, and the rows
+that one write presented together with it, which stay after it in the window).
+The command
 scans in bounded windows (on a presented window, a `--messages` count and the
 walk of the rows after the anchor, which the cut returns or keeps, read the
 window whole), never compiles
@@ -454,7 +456,8 @@ first.
 
 Plain content stays in context and is delivered on arrival through the ordinary
 channel/push path; the host only remembers where it landed. "Unread" means:
-above the agent's consumed watermark (set when the agent is created, and
+above the agent's consumed watermark (a position in the agent's window, #291:
+a row not in the window yet is unread wherever it is in the store; set when the agent is created, and
 advanced at every compile of a request it sends, which a preview isn't, and at
 a tool boundary that injects messages into a stream declaring it carries them,
 as membrane's native path does from 0.6.0), on the current branch, not a
@@ -561,7 +564,9 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   with the host stopped, run this release's `agent-framework-recover --store
   <path> --agent <name> --remove-suppressed`: it makes and activates a branch
   without the hidden rows, which such a release opens, and the source branch
-  keeps them. That holds unless this release has written its window down: the
+  keeps them. That holds unless this release has made a window write of two or
+  more rows (the first write-down of a window that holds a row, as at the first
+  boot on a store with history, or a presentation of more than one row): the
   store's MANIFEST is then at version 2, which no earlier release opens, and
   only a copy taken before the upgrade goes back (the 291-presentation-mandatory
   changelog entry). Skipped where no summary spans one, the rows render again where
@@ -838,7 +843,8 @@ persists across restarts; `resume` gates on a fresh per-agent feasibility
 preview of the current runtime settings (`force` overrides). While quiesced, a
 context write (a module event, an API `message.send`) is stored at once, unless
 a surgery's hold or a context manager refusing its work keeps it in memory, and
-enters the agents' windows at `resume` (#291).
+enters the agents' windows at `resume`, or, for an agent whose turn is still
+draining then, at that turn's next point (#291).
 
 ```typescript
 await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
@@ -882,8 +888,10 @@ target leave the window (`returnedToArrivals`, on the result and the
 preview). The agent's own rows among them enter it again at its next
 presentation point, the surgery's release; the rest wait outside it until
 the agent's next turn start, so for them the cut holds until the agent
-speaks again. That hold is in memory: a restart before then presents them
-at its pass over every agent at rest. Rows that one write presented together with
+speaks again, on the rollback's branch: a later move of the store's branch,
+a suppression or rollback through another agent included, ends it. That hold
+is in memory: a restart before then presents them at its pass over every
+agent at rest, or, where it boots quiesced, at the resume. Rows that one write presented together with
 the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot

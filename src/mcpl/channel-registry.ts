@@ -4180,7 +4180,7 @@ export class ChannelRegistry {
     return entry ? this.tuneOutEndText(entry) : undefined;
   }
 
-  private tuneOutEndText(entry: ChannelEntry, tool?: string): string {
+  private tuneOutEndText(entry: ChannelEntry, tool?: string, closeWith?: string): string {
     const close = tool === 'channel_close';
     // A name is written as a literal tune_out's channelId takes back
     // (quotedValue, main's #852); one no name picks alone, by its id and
@@ -4190,7 +4190,7 @@ export class ChannelRegistry {
       ? `channelId ${quotedValue(name)}`
       : `channelId ${quotedValue(entry.descriptor.id)}, serverId ${JSON.stringify(entry.serverId)}`;
     return `Call tune_out with ${names} and mode "cancel" for it to resume normal ` +
-      `attention; cancelling delivers the diverted backlog${close ? ', and channel_close closes it after that.' : '.'}`;
+      `attention; cancelling delivers the diverted backlog${close ? `, and channel_close${closeWith ? ` with ${closeWith}` : ''} closes it after that.` : '.'}`;
   }
 
   /**
@@ -5482,6 +5482,11 @@ export class ChannelRegistry {
    * Undefined where no hold is in force, where the name isn't the hold
    * channel's, and where the hold's record can't be read, which leaves the
    * name to resolve as any other (resolveToolChannelEntry).
+   *
+   * Another channel the name reaches that has a tune-out of its own is
+   * refused by a close until that tune-out is cancelled (tunedOutRefusal),
+   * so its sentence says it is tuned out, and names the cancel first, then
+   * the close by its id and server.
    */
   private focusNamedBare(
     name: string,
@@ -5500,8 +5505,18 @@ export class ChannelRegistry {
     if (!focus || (name !== focus.channelId && name !== qualifiedChannelName(focus))) return undefined;
     if (mine) return sameChannel(mine.channel, focus) ? undefined : { refusal: this.focusOrOwnRefusal(name, focus, mine.channel, own) };
     const held = focus;
-    const others = this.entriesNamed(name).map(refOf).filter((ref) => !sameChannel(ref, held));
-    return { focus: held, ...(others.length > 0 ? { notClosed: notClosedText(others) } : {}) };
+    const others = this.entriesNamed(name).filter((entry) => !sameChannel(refOf(entry), held));
+    const tunedOut = others.filter((entry) => this.getDesiredState(entry.serverId, entry.descriptor.id) === 'tuned-out');
+    const closable = others.filter((entry) => !tunedOut.includes(entry)).map(refOf);
+    const sentences = [
+      ...(closable.length > 0 ? [notClosedText(closable)] : []),
+      ...tunedOut.map((entry) => {
+        const ref = refOf(entry);
+        return `Channel ${channelOnServer(ref)} was not closed: it is tuned out, and a close doesn't change that. ` +
+          this.tuneOutEndText(entry, 'channel_close', `channelId ${quotedValue(ref.channelId)} and serverId ${quotedValue(ref.serverId)}`);
+      }),
+    ];
+    return { focus: held, ...(sentences.length > 0 ? { notClosed: sentences.join(' ') } : {}) };
   }
 
   /**

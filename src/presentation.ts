@@ -3,9 +3,10 @@
  * holds, and when a row enters it.
  *
  * The store's record keeps every write in the order it arrived. An agent's
- * window is another order over the same rows: the rows it was shown, in the
- * order its requests carried them (context-manager's window index,
- * `presentRows`). While one agent writes one slot the two orders are the
+ * window is another order over the same rows: the rows presented to it, in
+ * the order its requests carry them (context-manager's window index,
+ * `presentRows`; a row presented at rest is in the window before a request
+ * has carried it). While one agent writes one slot the two orders are the
  * same. Once agents share a slot, or one reads another's, they differ: a row
  * another agent stored during my turn sits inside my turn in the record, but
  * my requests carried it only at my next tool boundary or turn start, so a
@@ -979,9 +980,12 @@ export class AgentPresentation {
    * A tool boundary isn't held back (a turn alive started since). An own
    * row among them isn't held: own rows enter at every point, as ever. The
    * hold is the branch's the store is on (the rollback's): on another
-   * branch the same stored rows are arrivals as any, and back on this one
-   * they are held again until the agent's next turn start. In memory: a
-   * restart presents them at its pass at rest, and an agent let go (forget)
+   * branch the same stored rows are arrivals as any, so a later move of the
+   * store's branch, a suppression or rollback through another agent
+   * included, ends it there, and back on this one they are held again until
+   * the agent's next turn start. In memory: a restart presents them at its
+   * pass at rest, or, where it boots quiesced, at the resume (a frozen pass
+   * presents no arrival), and an agent let go (forget)
    * drops them. Rows given again on the same branch add to those held, and
    * on another replace them. Never throws.
    */
@@ -1285,17 +1289,26 @@ export class AgentPresentation {
     return owed.sort((a, b) => a.sequence - b.sequence).map((row) => row.id);
   }
 
-  /** Keep, of the own rows presentOwn tried, those still out of the window, for its next call; forget the rest. */
+  /**
+   * Keep, of the own rows presentOwn tried, those still out of the window,
+   * for its next call; forget the rest. Rows kept meanwhile that this call
+   * didn't try stay kept: a listener of its presentation, which runs
+   * inside it, may have stored an own row whose presentation failed, kept
+   * by that nested call.
+   */
   private keepFailedOwn(agent: PresentedAgent, tried: readonly MessageId[]): void {
     const cm = agent.getContextManager();
+    const triedHere = new Set(tried);
+    const keptMeanwhile = [...(this.failedOwn.get(cm) ?? [])].filter((id) => !triedHere.has(id));
+    let keep: MessageId[];
     try {
-      const left = tried.filter((id) => cm.ordinalOf(id) === undefined);
-      if (left.length > 0) this.failedOwn.set(cm, new Set(left));
-      else this.failedOwn.delete(cm);
+      keep = [...tried, ...keptMeanwhile].filter((id) => cm.ordinalOf(id) === undefined);
     } catch {
       // A window that can't be read now: keep every row tried.
-      if (tried.length > 0) this.failedOwn.set(cm, new Set(tried));
+      keep = [...tried, ...keptMeanwhile];
     }
+    if (keep.length > 0) this.failedOwn.set(cm, new Set(keep));
+    else this.failedOwn.delete(cm);
   }
 
   /** presentAtEnd under a named occasion; a rollback's held arrivals wait (holdUntilStart), and so do all of an agent's the boot left out (restWithheld). */
@@ -1527,7 +1540,14 @@ export class AgentPresentation {
     return { entered, ...(error !== undefined ? { error } : {}) };
   }
 
-  /** Tell the agent's listeners of the rows that entered its window, in order. */
+  /**
+   * Tell the agent's listeners of the rows that entered its window, in
+   * order, each body as the window holds it. Where the window can't be
+   * read for that, they are told of each entered row by its first shard
+   * (a body's later shards left out), and that is logged: the rows are in
+   * the window whatever the read, so the listeners (noteArrival, the
+   * subconscious's anchor) still hear them.
+   */
   private tell(
     agent: PresentedAgent,
     occasion: PresentationOccasion,
@@ -1540,17 +1560,33 @@ export class AgentPresentation {
     const cm = agent.getContextManager();
     const byHead = new Map((bodies ?? []).map((body) => [body.shards[0]!.id, body.shards] as const));
     let window: StoredMessage[] | undefined;
-    const rows = ids.filter((id) => entered.has(id)).flatMap((id) => {
-      const shards = byHead.get(id);
-      if (shards) return shards.filter((shard) => cm.ordinalOf(shard.id) !== undefined);
-      // A row named alone (an own row at its write): its body as the window now holds it.
-      window ??= cm.getPresentedMessages();
-      const at = window.findIndex((m) => m.id === id);
-      if (at === -1) return [];
-      let end = at + 1;
-      while (end < window.length && continuesBody(window[end - 1], window[end])) end++;
-      return window.slice(at, end);
-    });
+    const named = ids.filter((id) => entered.has(id));
+    let rows: StoredMessage[];
+    try {
+      rows = named.flatMap((id) => {
+        const shards = byHead.get(id);
+        if (shards) return shards.filter((shard) => cm.ordinalOf(shard.id) !== undefined);
+        // A row named alone (an own row at its write): its body as the window now holds it.
+        window ??= cm.getPresentedMessages();
+        const at = window.findIndex((m) => m.id === id);
+        if (at === -1) return [];
+        let end = at + 1;
+        while (end < window.length && continuesBody(window[end - 1], window[end])) end++;
+        return window.slice(at, end);
+      });
+    } catch (error) {
+      console.error(`[presentation] ${agent.name}'s window couldn't be read to tell its listeners which rows entered it, so they are told of each by its first shard:`, error);
+      rows = named.flatMap((id) => {
+        const head = byHead.get(id)?.[0];
+        if (head) return [head];
+        try {
+          const row = cm.getMessage(id);
+          return row ? [row] : [];
+        } catch {
+          return [];
+        }
+      });
+    }
     for (const listener of [...listeners]) {
       try {
         listener({ agentName: agent.name, occasion, rows });

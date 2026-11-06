@@ -7,7 +7,8 @@
  * window at its tool boundary, where its stream is given it, or at its
  * turn's end, never inside the turn. So each request a resident makes
  * starts with the one before it (the prompt cache's prefix; an operator's
- * removal or the strategy's folding aside), and its rounds' signed
+ * removal, the strategy's folding, or a module injection placed at each
+ * compile aside), and its rounds' signed
  * thinking is sent again under the prefix it was minted under. Without the index, the record's
  * order is every resident's window, and the other resident's rounds land
  * inside each turn.
@@ -36,6 +37,7 @@ import { join } from 'node:path';
 import type { CompileResult, ContextManager, MessageId, MessageMetadata, StoredMessage, WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework, audienceOf } from '../src/index.js';
+import { transcribeForeignRounds } from '../src/foreign-rounds.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { GateModule, until } from './helpers/dendrite.js';
@@ -83,21 +85,28 @@ function resultText(content: unknown): string {
 
 /**
  * A message's blocks as a request and a window both say them: text,
- * thinking by its signature, a call by its id and its input, a result by
- * its call's id and its outcome (AF #844 bot review 3, finding 31: a stored
- * result with the right id and other content is no match). A result handed
- * to a stream (membrane's ToolResult, with no `type`) reads as a stored
- * one. Empty text, which no request carries, is left out.
+ * thinking by its signature and its text, a call by its id, its tool's name
+ * and its input, a result by its call's id, whether it is an error and its
+ * outcome (AF #844 bot review 3, finding 31: a stored result with the right
+ * id and other content is no match; review 4, finding 15: nor is a call
+ * with another name, a thinking block with other text, or a result that
+ * differs in being an error). A result handed to a stream (membrane's
+ * ToolResult, with no `type`) reads as a stored one. Empty text, which no
+ * request carries, is left out.
  */
 function tokensOf(content: readonly unknown[]): string[] {
   return content.flatMap((block) => {
-    const b = block as { type?: string; text?: string; signature?: string; id?: string; toolUseId?: string; input?: unknown; content?: unknown };
-    if (b.type === undefined && typeof b.toolUseId === 'string') return [`result:${b.toolUseId}:${resultText(b.content)}`];
+    const b = block as {
+      type?: string; text?: string; thinking?: string; signature?: string; id?: string; name?: string;
+      toolUseId?: string; input?: unknown; content?: unknown; isError?: boolean;
+    };
+    const result = () => `result:${b.toolUseId}:${b.isError === true}:${resultText(b.content)}`;
+    if (b.type === undefined && typeof b.toolUseId === 'string') return [result()];
     switch (b.type) {
       case 'text': return b.text!.trim() === '' ? [] : [`text:${b.text}`];
-      case 'thinking': return [`thinking:${b.signature}`];
-      case 'tool_use': return [`call:${b.id}:${JSON.stringify(b.input ?? {})}`];
-      case 'tool_result': return [`result:${b.toolUseId}:${resultText(b.content)}`];
+      case 'thinking': return [`thinking:${b.signature}:${b.thinking ?? ''}`];
+      case 'tool_use': return [`call:${b.id}:${b.name}:${JSON.stringify(b.input ?? {})}`];
+      case 'tool_result': return [result()];
       default: return [String(b.type)];
     }
   });
@@ -372,9 +381,9 @@ function assertResidents(r: Run): void {
     const atSecondStart = name === 'mira' ? ['text:round two'] : ['text:oren, idle', 'text:round two'];
     const after = said(second.request.messages.slice(firstMessages.length));
     assert.deepEqual(after, [
-      `@${name}`, `thinking:sig-${name}-1`, `text:${name} looks`, `call:call-${name[0]}:{"gate":"${name[0]}"}`,
-      '@user', `result:call-${name[0]}:{"released":"${name[0]}"}`, ...heard,
-      `@${name}`, `thinking:sig-${name}-2`, `text:${name} done`,
+      `@${name}`, `thinking:sig-${name}-1:`, `text:${name} looks`, `call:call-${name[0]}:test--wait:{"gate":"${name[0]}"}`,
+      '@user', `result:call-${name[0]}:false:{"released":"${name[0]}"}`, ...heard,
+      `@${name}`, `thinking:sig-${name}-2:`, `text:${name} done`,
       '@user', ...(r.receipts ? [receipt(2)] : []), ...atSecondStart,
     ], `${name}'s second request goes on from its first in the order its window took the rows`);
     const injected = first.stream.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []);
@@ -384,7 +393,7 @@ function assertResidents(r: Run): void {
     // first stream's signatures and none of the other resident's, and no
     // committing compile took thinking out.
     const signatures = tokensOf(second.request.messages.flatMap((m) => m.content)).filter((t) => t.startsWith('thinking:'));
-    assert.deepEqual(signatures, [`thinking:sig-${name}-1`, `thinking:sig-${name}-2`], `${name}'s rounds' thinking is sent again`);
+    assert.deepEqual(signatures, [`thinking:sig-${name}-1:`, `thinking:sig-${name}-2:`], `${name}'s rounds' thinking is sent again`);
     assert.ok(membrane.callsFor(name).every((c) => !JSON.stringify(c.messages).includes(`sig-${other}-`)), `no request of ${name}'s carries ${other}'s thinking`);
 
     // E. Decision 1: another resident's own rows, and rows for it, never
@@ -476,6 +485,16 @@ describe("two residents' overlapping turns, each in a window of its own (#291)",
     // Its window is over the residents' slot: its second request carries
     // their turns, the rows for each of them and the held row, the
     // residents' rounds as a transcript and none of their thinking.
+    // AF #844 bot review 4, finding 16: past what its first request carried,
+    // its second carries its window's rows in the window's order, each as
+    // it is sent them (the residents' rounds as a transcript), as part B
+    // checks for the residents.
+    assert.equal(sub.windows.length, 2, 'premise: its window as each of its two requests read it');
+    const sentWindow = transcribeForeignRounds(
+      window.slice(0, sub.windows[1]!.length).map(({ participant, content }) => ({ participant, content })), (p) => p === SUB);
+    assert.deepEqual(window.slice(0, sub.windows[1]!.length).map((m) => m.id), sub.windows[1], 'premise: its window keeps what its second request read');
+    assert.deepEqual(said(second.request.messages.slice(first.request.messages.length)), said(sentWindow.slice(firstWindow.length)),
+      'its second request goes on from its first in the order its window took the rows');
     const body = second.request.messages.map((m) => rowText(m as never)).join('\n');
     for (const t of ['hello both', 'mira looks', 'oren looks', 'for mira', 'for oren', 'HELD chatter', 'oren, idle', 'mira done', 'oren done', 'round two', 'mira again', 'oren again']) {
       assert.ok(body.includes(t), `its second request carries '${t}'`);
@@ -494,7 +513,7 @@ describe("two residents' overlapping turns, each in a window of its own (#291)",
     const plain = (req: NormalizedRequest) => req.messages.map(({ participant, content }) => ({ participant, content }));
     assert.deepStrictEqual(plain(second.request).slice(0, first.request.messages.length), plain(first.request), 'its second request starts with its first');
     const signatures = tokensOf(second.request.messages.flatMap((m) => m.content)).filter((t) => t.startsWith('thinking:'));
-    assert.deepEqual(signatures, ['thinking:sig-sub-1', 'thinking:sig-sub-2'], "its turn's thinking is sent again");
+    assert.deepEqual(signatures, ['thinking:sig-sub-1:', 'thinking:sig-sub-2:'], "its turn's thinking is sent again");
     const subStrips = r.strips.filter((s) => s.agent === SUB);
     assert.ok(subStrips.length >= 2, 'its starts compiled');
     assert.deepEqual(subStrips.filter((s) => s.strip !== undefined), [], 'no committing compile of its took thinking out');

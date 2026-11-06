@@ -1,14 +1,16 @@
 /**
  * The Discord module over writes the framework holds (F198, with #516's
- * record of the creates on their way). The framework holds a module's writes
- * while the agent's turn is alive or the host is quiesced, and a module's
- * reads now see them, marked held, and its edits and removals reach them. So
- * a message deleted while its create is held is removed, and none of it is
- * stored after the resume, one edited then is stored as edited, a sync's held add keeps a live create from
- * adding a second copy, and a create whose write hasn't landed ends its
+ * record of the creates on their way). The framework stores a module's write
+ * at once and holds it from the agent's window while the agent's turn is
+ * alive or the host is quiesced (#291), and a module's reads see it, marked
+ * held, and its edits and removals reach it. So a message deleted while its
+ * create is held is removed, and none of it is stored after the resume, one
+ * edited then is stored as edited, a sync's held add keeps a live create
+ * from adding a second copy, and a create stored while quiesced ends its
  * record once its row shows, so a sync no longer passes over the message.
  * The module runs in a real framework, which holds its writes by quiescing
- * the host, the same branch of addMessage a live turn takes.
+ * the host, the same branch of addMessage a live turn takes. A create that
+ * a surgery's or a recovery's hold keeps unstored is withKeptCreate's.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -147,7 +149,7 @@ test("a live create that comes after a sync's held add of its message adds no se
   });
 });
 
-test("a create whose write hasn't landed ends its record once its held row shows, so a sync then reaches the message", async () => {
+test("a create stored while quiesced, its row held from the agent's window, ends its record once the row shows, so a sync then reaches the message", async () => {
   await withDiscord(async ({ discord, module, rows }) => {
     await discord.onMessageHandler!(live('m4', 'as sent'));
     await waitFor('the create to be held', () => rows('m4').length === 1);
@@ -607,6 +609,81 @@ test("a kept create whose release can't say it landed, and whose read then throw
     assert.equal(s.module.creating.has('w1'), false, 'the sweep ends the entry');
     assert.deepEqual(s.texts('w1'), ['after edit'], 'having applied the edit kept for it');
   } finally {
+    await s.cleanup();
+  }
+});
+
+// AF #844 bot review 4, finding 35: a lost create whose outcome is unknown
+// and whose lookup throws at the release is kept, flagged; the next event's
+// sweep that reads the store and finds no row ends it, as endLostCreate
+// does when it finds none, so a history sync then reaches the message.
+test("a kept create whose release can't say it landed, and whose read then throws, is ended by the next event's sweep that finds no row", async () => {
+  const s = await withLostRelease('x1', async () => {}, {
+    store: () => { throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed: 1 }, new Error('zz-store-unknown (test)')); },
+    readThrows: true,
+  });
+  try {
+    assert.deepEqual(lostTraces(s.traces).map((t) => [t.external, t.mayBeStored]), [[{ source: 'discord', id: 'x1' }, true]],
+      'premise: the release traced the write as maybe stored');
+    assert.deepEqual(s.texts('x1'), [], 'premise: no row landed');
+    assert.equal(s.module.creating.has('x1'), true, 'premise: kept, its read having thrown');
+    const next = s.processed('discord:message', 'x2');
+    await s.discord.onMessageHandler!(live('x2', 'next message'));
+    await next;
+    assert.equal(s.module.creating.has('x1'), false, 'the sweep reads no row for it, and ends its record');
+    s.discord.history = [history('x1', 'from the sync')];
+    const synced = await s.module.syncChannelHistory('c1');
+    assert.equal(synced.newMessages, 1);
+    assert.deepEqual(s.texts('x1'), ['from the sync']);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+// AF #844 bot review 4, finding 36: each answered create's lookup is its
+// own. One that throws at an event's sweep is logged and that entry kept
+// for the next event; the other entries are still applied and ended, and
+// the event goes on.
+test("a lookup that throws for one kept create at an event's sweep leaves the others to be applied and ended, and that one to the next event", async () => {
+  const s = await withLostRelease('w1', async ({ discord, processed }) => {
+    const edited = processed('discord:edit', 'w1');
+    discord.onEditHandler!('w1', 'after edit');
+    await edited;
+  }, {
+    store: (add) => {
+      const landed = add();
+      throw new WriteOutcomeUnknownError({ landed: [], unknown: [landed], unnamed: 0 }, new Error('zz-read-failed (test)'));
+    },
+    readThrows: true,
+  });
+  const quiet = console.error;
+  try {
+    assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
+    // A second answered create whose row is stored, with an edit kept for it.
+    s.framework.getAgent('Sol')!.getContextManager().addMessage('User', [{ type: 'text', text: 'k9 as created' }],
+      { external: { source: 'discord', id: 'k9' } } as never);
+    (s.module.creating as Map<string, unknown>).set('k9', { phase: 'writing', deleted: false, unapplied: [{ text: 'k9 edited' }] });
+    const storedRow = s.module.storedRow.bind(s.module);
+    let refuseOnce = true;
+    s.module.storedRow = (id: string) => {
+      if (id === 'w1' && refuseOnce) { refuseOnce = false; throw new Error('zz-read-refused (test)'); }
+      return storedRow(id);
+    };
+    console.error = () => {};
+    const next = s.processed('discord:message', 'w2');
+    await s.discord.onMessageHandler!(live('w2', 'next message'));
+    await next;
+    assert.deepEqual(s.texts('k9'), ['k9 edited'], "the other entry's edit is applied");
+    assert.equal(s.module.creating.has('k9'), false, 'and its entry ended');
+    assert.ok(s.module.creating.get('w1')?.unapplied, 'the entry whose lookup threw is kept, its edit unapplied');
+    assert.deepEqual(s.texts('w2'), ['next message'], 'the event went on');
+    const after = s.processed('discord:message', 'w3');
+    await s.discord.onMessageHandler!(live('w3', 'another message'));
+    await after;
+    assert.deepEqual(s.texts('w1'), ['after edit'], "the next event's sweep applies it");
+    assert.equal(s.module.creating.has('w1'), false);
+  } finally {
+    console.error = quiet;
     await s.cleanup();
   }
 });

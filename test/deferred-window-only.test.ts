@@ -577,6 +577,18 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         // is a body not stored whole (AF #844 bot review 3, finding 104).
         const missing = Array.from({ length: 60 }, (_, k) => k).filter((k) => !renderedText.includes(`Sentence ${k} of`));
         if (missing.length > 0) differ.push(`${name}: the next compile renders the body without sentence(s) ${missing.join(', ')}`);
+        // Each text block given, whole and in the order given: an intro
+        // dropped, a suffix lost or a change of order is a body not stored
+        // whole either (AF #844 bot review 4, finding 21).
+        let from = 0;
+        for (const given of content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)) {
+          const at = renderedText.indexOf(given, from);
+          if (at < 0) {
+            differ.push(`${name}: the next compile renders the body without ${JSON.stringify(given.slice(0, 40))}… whole, in the order given`);
+            break;
+          }
+          from = at + given.length;
+        }
         if (content.some((b) => b.type === 'image') && !rendered.some((b) => b.type === 'image')) {
           differ.push(`${name}: the next compile renders the body without its image`);
         }

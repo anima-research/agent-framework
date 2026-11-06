@@ -110,7 +110,7 @@ A host's `stop()` does not end bounded work it cuts off: a fork or job still run
 - Every other agent that was live is recorded as ended with reason `host-restart`. If its result route is a message, the recipient is told once that it ended without a result, unless its result is already in the recipient's store.
 - A persistent agent that the configuration no longer declares is ended with reason `not-configured`.
 - Results held from before the restart are delivered, once.
-- Mail already stored for a recipient but not yet in its window (it arrived during a turn the restart cut off) wakes that recipient again, once per sender and kind (`agent-result:<sender>`, `agent-message:<sender>`), before the boot presents it. Mail already in the window asks for no wake.
+- Mail already stored for a recipient but not yet in its window (it arrived during a turn the restart cut off) wakes that recipient again, once per sender and kind (`agent-result:<sender>`, `agent-message:<sender>`), before the boot presents it, except mail sent with `wake: false`, whose row records it (`dendrite.wake: false`) and asks for none. Mail already in the window asks for no wake.
 
 ## Messages and results
 

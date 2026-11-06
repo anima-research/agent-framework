@@ -48,7 +48,9 @@
   compression formed a summary around a hidden row, it refuses the store at
   open (`StoreTopologyError`). The command makes and activates a branch without
   the hidden rows; the source branch keeps them. That holds unless this release
-  has written its window down: the store's MANIFEST is then at version 2, which
+  has made a window write of two or more rows (the first write-down of a window
+  that holds a row, as at the first boot on a store with history, or a
+  presentation of more than one row): the store's MANIFEST is then at version 2, which
   no earlier release opens, and only a copy of the store taken before the
   upgrade goes back (the 291-presentation-mandatory entry). It cleans the agent's own
   branch, not a derived context's (`dendrite/…`), so finish any such context

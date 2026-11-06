@@ -154,6 +154,65 @@ describe('AgentConfig.observes', () => {
     }
   });
 
+  // AF #844 bot review 4, finding 73: the mode is the source's, read when
+  // the child's run starts. The persistent subconscious's mode isn't its own
+  // configuration's (it observes the residents' slot through an edge its
+  // AgentConfig doesn't name), so a child of it is sent the residents'
+  // rounds as a transcript only through that lookup. A source that ends
+  // before the run starts can't leave the child on its configuration's
+  // 'raw': the registry refuses a derived agent whose context source isn't
+  // live (only a resumption is admitted without one), so the run never
+  // starts and nothing is sent.
+  it("a child derived from the persistent subconscious is sent the residents' rounds as a transcript; one whose subconscious ends before its run starts never runs", { timeout: 120_000 }, async () => {
+    for (const ends of [false, true]) {
+      const dir = mkdtempSync(join(tmpdir(), 'resident-observes-sub-'));
+      const membrane = new WireMembrane();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 0,
+        subconscious: { enabled: true, systemPrompt: 'You notice.' },
+      } as never);
+      try {
+        await framework.start();
+        const sub = framework.getAgent('Subconscious')!;
+        const row = storeOwnRow(framework.getAgent('mira')!, 'mira', [
+          { type: 'thinking', thinking: 'mulling', signature: 'sig-mira' } as ContentBlock,
+          text('Looking it up.'),
+          { type: 'tool_use', id: 'c1', name: 'search', input: { q: 'build status' } } as ContentBlock,
+        ]);
+        assert.notEqual(sub.getContextManager().ordinalOf(row), undefined, "premise: mira's round is in the subconscious's window");
+        membrane.identify = (request) =>
+          (JSON.stringify(request.messages).includes('CHILD-FRAMING') ? 'sub-task' : request.assistantParticipant ?? '');
+        const child = await framework.deriveAgent({
+          name: 'sub-task', from: 'Subconscious', mode: 'copy',
+          framing: [{ participant: 'user', content: [text('CHILD-FRAMING: look')] }],
+        });
+        if (ends) {
+          framework.stopAgent('Subconscious', { reason: 'test' });
+          assert.equal(framework.getAgent('Subconscious'), null, 'premise: the subconscious has ended');
+          await assert.rejects(framework.runEphemeralToCompletion(child.agent, child.contextManager),
+            /context source "Subconscious" is not a registered agent/);
+          assert.equal(membrane.callsFor('sub-task').length, 0, 'the child never ran, so nothing went out raw');
+          continue;
+        }
+        await framework.runEphemeralToCompletion(child.agent, child.contextManager);
+        const request = membrane.callsFor('sub-task').at(-1);
+        assert.ok(request, "premise: the child's request");
+        const round = request.messages.find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'Looking it up.'));
+        assert.ok(round, `mira's round is in the child's request: ${JSON.stringify(request.messages)}`);
+        assert.deepEqual(round.content, [text('Looking it up.'), text('[search called: {"q":"build status"}]')], 'a transcript');
+        assert.ok(!JSON.stringify(request.messages).includes('sig-mira'), "none of mira's thinking");
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('create refuses an agent that observes itself, or a name no configured agent has', async () => {
     const refused = (agents: Array<Partial<AgentConfig> & { name: string }>) => AgentFramework.create({
       agents: agents.map((a) => ({ model: 'test-model', systemPrompt: 'x', ...a })),

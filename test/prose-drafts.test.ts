@@ -4760,6 +4760,7 @@ describe('the held-draft notice written mid-turn', () => {
       const internals = framework as unknown as {
         activeTurnTokens: Map<string, number>;
         holdProseDrafts(agent: unknown, texts: string[], reason: string, opts: { routing: unknown; notice: 'now' }): unknown[];
+        presentAtEndOf(agent: unknown): void;
       };
       const scout = framework.getAgent('scout')!;
       internals.activeTurnTokens.set('scout', 9999);
@@ -4772,6 +4773,10 @@ describe('the held-draft notice written mid-turn', () => {
       assert.notEqual(framework.getAgent('nova')!.getContextManager().ordinalOf(notice.id), undefined,
         "in nova's window at once: she observes scout, and is idle");
       internals.activeTurnTokens.delete('scout');
+      // AF #844 bot review 4, finding 102: the turn's end point presents it
+      // to scout, as the title says.
+      internals.presentAtEndOf(scout);
+      assert.notEqual(scout.getContextManager().ordinalOf(notice.id), undefined, "in scout's window at its turn's end");
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
