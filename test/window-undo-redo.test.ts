@@ -16,6 +16,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, OperatorActionError, asOwnRow } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { covers, type ReadMark } from '../src/read-marks.js';
+import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { AgentScripts } from '../src/code-execution/isolate/scripts.js';
 import { GateModule, until } from './helpers/dendrite.js';
 import { WireMembrane, final, round } from './helpers/wire-membrane.js';
@@ -381,6 +382,53 @@ describe('undo and redo on the window (#291)', () => {
     assert.ok(credited && credited !== callMark, "the publish's mark is given again");
     assert.equal(covers(credited, h.cm, h.cm.getMessage(render)!), 'covered', 'and covers the render put back');
     assert.equal(covers(credited, h.cm, h.cm.getMessage(reply)!), 'not-covered', 'but not the reply it read before');
+  });
+
+  // AF #844 bot review 4, finding 19: the same, through the real path: a
+  // channel_publish dispatched in mira's turn, its delivery held open while
+  // the turn's rows are undone and redone, is credited on its delivery
+  // (notePublished) with the mark the redo gave its call.
+  it("a channel_publish dispatched in a turn and delivered after an undo and a redo is credited with the mark the redo gave", async () => {
+    const h = await boot();
+    h.internals.recordTurnCheckpoint('mira');
+    const render = h.internals.addMessage('editor', [text('render v1')], undefined, { forAgent: 'mira' });
+    await h.mira.compileContext();
+    const callMark = { ...h.mira.getConsumedWatermark()! } as ReadMark;
+    const room = { serverId: 'chat', channelId: 'chat:room' };
+    type Published = { outcome?: unknown };
+    const internals = h.framework as unknown as {
+      channelRegistry: unknown;
+      turnRouting: Map<string, unknown>;
+      dispatchChannelToolCall(agentName: string, call: ToolCall): void;
+    };
+    let deliver!: () => void;
+    const delivering = new Promise<void>((resolve) => { deliver = resolve; });
+    let settled = false;
+    internals.channelRegistry = {
+      handleChannelToolCall: async (_name: string, _input: unknown, _origin: unknown, published: Published) => {
+        await delivering;
+        published.outcome = { status: 'delivered', destination: room, at: Date.now() };
+        return { success: true, data: { status: 'delivered' } };
+      },
+    };
+    internals.turnRouting.set('mira', { turnId: 9_001, wasIn: [], locus: room, locked: false });
+    h.framework.onTrace((event) => { if (event.type === 'tool:completed' && (event as { callId?: string }).callId === 'pub-1') settled = true; });
+    internals.dispatchChannelToolCall('mira', {
+      id: 'pub-1', name: 'channel_publish', input: { ...room, content: 'I saw it' }, callerAgentName: 'mira', callerTurnId: 9_001,
+    } as ToolCall);
+    internals.turnRouting.delete('mira');
+    const reply = h.cm.addMessage('mira', [text('I saw render v1')], asOwnRow(undefined, 'mira'));
+    h.cm.presentRows([reply]);
+    assert.equal(covers(callMark, h.cm, h.cm.getMessage(render)!), 'covered', "setup: the call's mark covers the render");
+
+    assert.equal(h.framework.undoLastTurn('mira').undone, true);
+    assert.deepEqual(h.framework.redo('mira').window, { retracted: 0, represented: 2 });
+    assert.equal(covers(callMark, h.cm, h.cm.getMessage(render)!), 'not-covered', "setup: the call's own mark no longer covers the render put back");
+    deliver();
+    await until(() => settled, 'the publish to settle');
+    const key = destinationKey(room);
+    assert.equal(h.mira.publishedAfterReading(key, h.cm.getMessage(render)!, h.cm), true, 'credited as having read the render put back');
+    assert.equal(h.mira.publishedAfterReading(key, h.cm.getMessage(reply)!, h.cm), false, 'but not the reply it read before');
   });
 
   it("a stored injection that changed in the undone turn is stored again at the next start", async () => {
