@@ -1953,7 +1953,8 @@ export class TuneOutCoordinator {
    * Write the loss notices kept (lossNotices), `author`'s or every
    * author's, each author's in the order its losses came: one written, or
    * whose author has ended, leaves the queue; one whose write fails stays
-   * for the next try (writeLossNotice). None is written while writes are
+   * for the next try (writeLossNotice), and that author's later ones with
+   * it, behind it. None is written while writes are
    * held (writesHeld): the framework would keep it in memory and answer an
    * empty id, which then couldn't tell a kept write from an ended author's
    * dropped one. The release or the retry writes them. Nor is one the boot
@@ -1970,9 +1971,9 @@ export class TuneOutCoordinator {
   private writeLossNotices(author?: string): void {
     this.checkLossNoticesWritten();
     for (const name of author !== undefined ? [author] : [...this.lossNotices.keys()]) {
-      // Those that fail go back ahead of the rest, in their order; a loss
-      // told meanwhile is kept after them.
-      let failed = 0;
+      // One that fails goes back ahead of the rest, which wait behind it
+      // for the next try, so the author is told in the order the losses
+      // came; a loss told meanwhile is kept after them.
       for (const notice of [...(this.lossNotices.get(name) ?? [])]) {
         // One the boot read from the record, which may be written already,
         // waits until that can be read (checkLossNoticesWritten), and those
@@ -1985,9 +1986,8 @@ export class TuneOutCoordinator {
         kept.splice(at, 1);
         if (kept.length === 0) this.lossNotices.delete(name);
         if (this.writeLossNotice(name, notice) !== 'failed') continue;
-        const now = this.lossNotices.get(name) ?? [];
-        now.splice(Math.min(failed++, now.length), 0, notice);
-        this.lossNotices.set(name, now);
+        this.lossNotices.set(name, [notice, ...(this.lossNotices.get(name) ?? [])]);
+        break;
       }
     }
     if (this.stopped) {

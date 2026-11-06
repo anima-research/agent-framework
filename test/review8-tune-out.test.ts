@@ -2071,3 +2071,42 @@ test("review 3 #45: a window-starts record whose start or start in force is ill-
   } finally { errors.mock.restore(); }
   assert.deepEqual(h.calls, ['setAnchorOrdinal(3)'], "X's well-formed start is read and set, as before");
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 4 (at 0f7e2711).
+// ---------------------------------------------------------------------------
+
+test("review 4 #29: a loss notice whose write fails keeps the author's later notices behind it, so they are written in the order the losses came", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    // Two notes lost while writes are held, their notices kept: A's, then B's.
+    const a = h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'For A.', 'Subconscious');
+    h.endOtherwise();
+    const b = h.enter();
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'For B.', 'Subconscious');
+    h.endOtherwise();
+    h.enter();
+    h.coordinator.cancel('disc', 'disc:guild:a', 'duration', 'duration elapsed');
+    assert.equal(h.lossNotices().length, 0, 'premise: both notices wait for the writes');
+    // The first notice's write fails once; the store takes the rest.
+    let failed = 0;
+    h.listenWrites((metadata) => {
+      if (metadata?.kind === 'tune-out-note-undelivered' && failed === 0) {
+        failed++;
+        throw new Error('the store refused the notice once (test)');
+      }
+    });
+    h.state.held = false;
+    h.coordinator.runDeferredCancels();
+    assert.equal(failed, 1, "premise: A's notice's write failed");
+    assert.deepEqual(h.lossNotices(), [], "B's notice isn't written ahead of A's");
+    h.coordinator.runDeferredCancels();
+    assert.deepEqual(h.lossNotices().map((m) => m.metadata?.epochId), [a, b], 'the retry writes both, A first');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
