@@ -20,7 +20,7 @@ function saysWhatItWaitsFor(note: string): void {
   assert.match(note, /an operator's change to the store/, `names a surgery's hold: ${note}`);
   assert.match(note, /refuses writes until the host re-initializes it/, `names a refusing context: ${note}`);
   assert.doesNotMatch(note, /writes (are |kept |held )?(in memory|stored)/, `doesn't say it waits for writes: ${note}`);
-  assert.match(note, /Cancelling again doesn't end the wait sooner, and how long it lasts isn't known here/, `says asking again won't end it: ${note}`);
+  assert.match(note, /Cancelling again doesn't end the wait sooner while that lasts, and how long it lasts isn't known here/, `says asking again won't end it: ${note}`);
   assert.doesNotMatch(note, /Nothing you can do/, `claims nothing of the host's other tools: ${note}`);
   assert.match(note, /If the host stops before then, the cancel is lost/, `says a stop loses it: ${note}`);
 }

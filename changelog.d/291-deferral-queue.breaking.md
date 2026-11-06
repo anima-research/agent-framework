@@ -43,7 +43,8 @@
   `'all-except'`) and the subconscious's `cancel_tuneout` `waiting: true` (with `scope: 'all-except'` for that
   hold), each with a `note`: not cancelled yet, since an operator's change to the store is in progress or a context
   the cancel writes to refuses writes until the host re-initializes it; cancelling again doesn't end the wait
-  sooner; the tune-out stays in force until then, and what it held is delivered when it ends; and a host that stops
+  sooner while that lasts (once writes are stored, a cancel whose run failed is retried, and another can end the
+  hold first: review8-operator-close-wait); the tune-out stays in force until then, and what it held is delivered when it ends; and a host that stops
   first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed.
   `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A `channel_close` of the
   channel an all-except hold excepts carries what became of the focus, whatever became of the close (`note` on a

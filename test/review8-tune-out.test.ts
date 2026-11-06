@@ -859,7 +859,7 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
     h.state.held = true;
     const waits = 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
       + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-      + 'doesn\'t end the wait sooner, and how long it lasts isn\'t known here. ';
+      + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. ';
     const stop = 'If the host stops before then, the cancel is lost and it is still in force after the restart, unless its '
       + 'end time has passed by then.';
     const kept = (hold: string) => ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be `
@@ -1172,7 +1172,7 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
     assert.deepEqual(answer, { success: true, data: { waiting: true, serverId: 'disc', note:
       'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
       + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-      + 'doesn\'t end the wait sooner, and how long it lasts isn\'t known here. The tune-out stays in force until '
+      + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. The tune-out stays in force until '
       + 'then, and what it held is delivered when it ends. If the host stops before then, the cancel is lost and it is '
       + 'still in force after the restart, unless its end time has passed by then. Your note waits with the cancel and '
       + 'goes to the resident as your mail when the tune-out ends, even if your run has ended by then. If it can\'t be '

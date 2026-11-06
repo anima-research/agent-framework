@@ -1305,7 +1305,7 @@ test('tune_out repeated for a channel already tuned out whose transport is open 
   assert.equal(again.text,
     `Nothing changed: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, backlogCap ` +
     `${backlogCap} and maxWakes ${maxWakes}. To change those, cancel it first with tune_out mode "cancel", which ` +
-    'delivers its backlog to you now, then call tune_out again with the new settings.');
+    'delivers its backlog to you when it ends (its answer says if it waits), then call tune_out again with the new settings.');
   assert.equal(calls, 0, 'its transport is open, with nothing to wait for');
 });
 
@@ -1358,7 +1358,7 @@ for (const outcome of [
     assert.deepEqual(await answering, {
       text: `Nothing changed in the tune-out: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, ` +
         `backlogCap ${backlogCap} and maxWakes ${maxWakes}. ${transport} To change those, cancel it first with tune_out ` +
-        'mode "cancel", which delivers its backlog to you now, then call tune_out again with the new settings.',
+        'mode "cancel", which delivers its backlog to you when it ends (its answer says if it waits), then call tune_out again with the new settings.',
       isError: true,
       // Its open may have run, so it's a failure, not a refusal saying
       // nothing was done.

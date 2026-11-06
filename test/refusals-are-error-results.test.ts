@@ -139,7 +139,7 @@ test("the resident's refusals reach the model as error results, and a tune-out i
   assert.deepEqual(third!.get('again'), {
     content: `Nothing changed: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, backlogCap `
       + `${backlogCap} and maxWakes ${maxWakes}. To change those, cancel it first with tune_out mode "cancel", which `
-      + 'delivers its backlog to you now, then call tune_out again with the new settings.',
+      + 'delivers its backlog to you when it ends (its answer says if it waits), then call tune_out again with the new settings.',
     isError: true,
   });
   assert.deepEqual(third!.get('open'), { content: TUNED_OUT, isError: true });
@@ -170,7 +170,7 @@ test("the subconscious's refusals reach it as error results", async (t) => {
   assert.deepEqual(round!.get('speak'), {
     content: "Nothing was posted: speak_in_channel is turned off for you in the resident's configuration, and calling "
       + "it again won't change that. The resident can speak there. deliver_summary puts your text in the resident's "
-      + 'context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident.',
+      + 'context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident (its answer says if the cancel has to wait).',
     isError: true,
   });
 });

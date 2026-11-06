@@ -31,7 +31,7 @@ import type { TraceEventInput } from '../types/trace.js';
 type TuneOutOption = 'durationSeconds' | 'cadenceSeconds' | 'backlogCap' | 'maxWakes';
 
 /** A hold asked for with no reader to watch it: there is none (a reader ended, or none was configured). */
-const NO_READER_REFUSAL = "Nothing was tuned out: no reader is configured here to read a held channel, and this host doesn't "
+const NO_READER_REFUSAL = "Nothing was tuned out: no reader is running here to read a held channel, and this host doesn't "
   + "hold one without a reader, so tune_out isn't available here, and calling it again won't change that. If "
   + 'you need channels diverted, ask whoever runs this host.';
 
@@ -160,7 +160,7 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
   const retry = 'tried again every 60 s, except while such a change or refusal lasts, and as soon as one ends, until it is ';
   return 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
     + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-    + 'doesn\'t end the wait sooner, and how long it lasts isn\'t known here. '
+    + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. '
     + `${what} stays in force until then, and what it held is delivered when it ends. If the host stops before then, `
     + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.'
     + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '')
@@ -661,7 +661,8 @@ export function alreadyTunedOutText(quoted: string, p: TuneOutParams, transport?
   return `Nothing changed${transport !== undefined ? ' in the tune-out' : ''}: ${quoted} is already `
     + `tuned out, with cadenceSeconds ${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. `
     + now
-    + 'To change those, cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call '
+    + 'To change those, cancel it first with tune_out mode "cancel", which delivers its backlog to you when it ends (its '
+    + 'answer says if it waits), then call '
     + 'tune_out again with the new settings.';
 }
 
@@ -4345,7 +4346,7 @@ export class TuneOutCoordinator {
         // server, which a re-pin reads by name when it weighs the row, as it
         // reads any message without its server.
         if (!subName && !(caller && this.hooks.deliverFromReader)) {
-          return { success: false, error: 'Nothing was delivered: no reader is configured here.', isError: true };
+          return { success: false, error: 'Nothing was delivered: no reader is running here.', isError: true };
         }
         const mine = this.channelRegistry.ownChannelFor(channelId, own, 'deliver');
         if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
@@ -4474,7 +4475,8 @@ export class TuneOutCoordinator {
             isError: true,
             error: "Nothing was posted: speak_in_channel is turned off for you in the resident's configuration, and "
               + "calling it again won't change that. The resident can speak there. deliver_summary puts your text in "
-              + "the resident's context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident.",
+              + "the resident's context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident (its "
+              + 'answer says if the cancel has to wait).',
           };
         }
         const channelId = String(input.channelId ?? '');

@@ -22,6 +22,7 @@ import {
   defaultReaderFraming,
   persistentReaderName,
   tuneOutReachWords,
+  tunedOutTrafficWords,
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
@@ -8803,10 +8804,7 @@ export class AgentFramework {
       // channel so tune_out picks it alone (ChannelRegistry.tuneOutEnd), for
       // a reader that may call tune_out.
       const end = this.canAgentUseTool(agentName, 'tune_out') ? registry.tuneOutEnd(channel) : undefined;
-      const reader = this.tuneOutReader();
-      const held = reader.kind === 'persistent'
-        ? `is still held from you, and read by ${reader.name}, until the tune-out ends.`
-        : 'is still held from you, and read by forks of your context, until the tune-out ends.';
+      const held = tunedOutTrafficWords(this.tuneOutReader());
       return `${this.channelShown(channel)} stays tuned out: your words there don't end the tune-out, so its ` +
         `traffic ${held}${end ? ` ${end}` : ''}`;
     } catch (err) {
@@ -13521,13 +13519,14 @@ export class AgentFramework {
    * without a reader (0.33.0): a tune-out is on record with none running
    * only where its release failed, after the persistent reader ended or at
    * a start with none configured. The text names the persistent reader as
-   * configured then, or by its default name (persistentReaderName).
+   * configured then, or by its default name (persistentReaderName), as one
+   * not running (`running: false`), which what its messages are says.
    */
   private tuneOutReader(): TuneOutReader {
     if (this.subconsciousAgentName) return { kind: 'persistent', name: suppliedValue(this.subconsciousAgentName) };
     if (this.readerForks) return { kind: 'forks' };
     const configured = this.subconsciousConfig;
-    return { kind: 'persistent', name: suppliedValue(persistentReaderName(configured && configured.reader !== 'forks' ? configured : {})) };
+    return { kind: 'persistent', name: suppliedValue(persistentReaderName(configured && configured.reader !== 'forks' ? configured : {})), running: false };
   }
 
   /** `focus`: the resident-facing alias for `tune_out` with scope "all-except" (#232 decision 2). */
