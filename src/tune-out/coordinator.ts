@@ -925,6 +925,15 @@ export interface TuneOutFrameworkHooks {
    */
   currentBranch?: () => string;
   /**
+   * The branch `name` was made from (`parent`, by name) and the sequence it
+   * was made at (`branchPoint`: it holds the parent's rows up to there, at
+   * the same sequences), where the store says; undefined for a branch made
+   * from none, or where the host can't say. A move to a branch made from
+   * this run's at a point past this run's start keeps that start for it
+   * (branchMoved). Left out, a move's destination is read from its head.
+   */
+  branchOrigin?: (name: string) => { parent: string; branchPoint: number } | undefined;
+  /**
    * Move the subconscious window anchor to `start`, the oldest active
    * tune-out's (never forward past active epochs): by its sequence while
    * the subconscious's window is the record, by its ordinal once that is
@@ -3028,7 +3037,8 @@ export class TuneOutCoordinator {
    * there (writePendingMarker, tried again as at boot where it fails),
    * naming the destination and its head now as where this run's rows on it
    * begin (or where they began, on a branch this run was on before: a failed
-   * surgery's restore, say), so that a crash from here on reads only what
+   * surgery's restore, say; or this run's start, on a branch made from this
+   * run's past it, which holds those rows: inheritedStart), so that a crash from here on reads only what
    * this run stored on it. The destination's kept loss notices aren't in memory: the next write
    * of the record reads them in first (lossRecordUnread), and writes this
    * run's kept ones there too; where this run keeps any, that write is
@@ -3042,10 +3052,19 @@ export class TuneOutCoordinator {
       if (branch !== undefined && this.runStarts.has(branch)) {
         this.runStartedAt = this.runStarts.get(branch);
       } else {
-        try {
-          this.runStartedAt = this.hooks.currentSequence();
-        } catch {
-          this.runStartedAt = undefined;
+        // A branch made from this run's past its start (a suppression's
+        // fork, at its head) holds this run's rows since then
+        // at their sequences: this run's start stands there (AF #844
+        // review 5, #74). Any other is read from its head.
+        const inherited = this.inheritedStart(branch);
+        if (inherited !== undefined) {
+          this.runStartedAt = inherited;
+        } else {
+          try {
+            this.runStartedAt = this.hooks.currentSequence();
+          } catch {
+            this.runStartedAt = undefined;
+          }
         }
         if (branch !== undefined) this.runStarts.set(branch, this.runStartedAt);
       }
@@ -3070,6 +3089,27 @@ export class TuneOutCoordinator {
     } catch (err) {
       console.error(`[tune-out] the stop stamp and loss record could not be moved to the store's new branch: ${thrownReason(err)}`);
     }
+  }
+
+  /**
+   * This run's start (runStartedAt), where `branch`, moved to, was made
+   * from the branch this run was on (runBranch) at a point past that start
+   * (branchOrigin): the branch holds this run's rows since then, at their
+   * sequences. Undefined otherwise, or where the store can't say.
+   */
+  private inheritedStart(branch: string | undefined): number | undefined {
+    if (branch === undefined || this.runBranch === undefined || this.runStartedAt === undefined) return undefined;
+    let origin: { parent: string; branchPoint: number } | undefined;
+    try {
+      origin = this.hooks.branchOrigin?.(branch);
+    } catch {
+      return undefined;
+    }
+    // Past the start, not at it: a branch's head only grows, so one made at
+    // a point past this run's start was made during this run; one made at
+    // the start itself may be older, holding another run's rows past it.
+    return origin && origin.parent === this.runBranch && typeof origin.branchPoint === 'number' && origin.branchPoint > this.runStartedAt
+      ? this.runStartedAt : undefined;
   }
 
   /**

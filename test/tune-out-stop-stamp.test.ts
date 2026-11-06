@@ -169,6 +169,7 @@ function stampSetup() {
     allowChannelSpeech: () => false,
     currentSequence: () => state.seq,
     currentBranch: () => state.branch,
+    branchOrigin: (name: string) => origins.get(name),
     setSubconsciousAnchor: () => {},
   };
   /**
@@ -176,9 +177,11 @@ function stampSetup() {
    * holds on record are the registry's, which a move doesn't reload (#172).
    */
   const branches = new Map<string, { states: Array<[string, unknown]>; rows: Row[]; window: Row[]; subRows: Row[]; seq: number }>();
+  /** Each branch fork made: the branch it was made from and its head then (its branch point), as the store says (branchOrigin). */
+  const origins = new Map<string, { parent: string; branchPoint: number }>();
   const snapshot = () => ({ states: [...states].map(([k, v]) => [k, structuredClone(v)] as [string, unknown]), rows: [...rows], window: [...window], subRows: [...subRows], seq: state.seq });
   /** A branch made from the one the store is on, at its head: its rows and states, as a child branch has them. */
-  const fork = (name: string): void => { branches.set(name, snapshot()); };
+  const fork = (name: string): void => { branches.set(name, snapshot()); origins.set(name, { parent: state.branch, branchPoint: state.seq }); };
   /** The store moves to branch `name`, made by fork. */
   const switchTo = (name: string): void => {
     const to = branches.get(name);
@@ -2067,3 +2070,26 @@ test("review 5 #40: a loss told while the record the boot couldn't read is still
     assert.deepEqual(h.told().map((m) => m.metadata?.epochId), [e, q], "the record's notice first, then the new loss");
   } finally { h.stopAll(); errors.mock.restore(); }
 });
+
+test("review 5 #74: a move to a branch made from this run's at its head, as a suppression's fork is, keeps this run's start there, so a crash after reads the ask the branch inherited", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    const c = h.boot();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.state.held = true;
+    assert.deepEqual(c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB), { ok: true, deferred: true });
+    // A suppression forks the branch at its head and moves the store to it, the cancel still waiting.
+    h.fork('suppressed');
+    h.switchTo('suppressed');
+    c.branchMoved();
+    assert.equal((h.states.get(STAMP) as { runStartedAt?: number; branch?: string }).branch, 'suppressed', "premise: the move wrote this run's marker there");
+    // The host dies with the cancel waiting.
+    h.state.held = false;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => (m.metadata?.stopUnrecorded as { found: string }).found), ['unknown', 'asked'],
+      "after this run's own boot's row, the ask this run made before the fork, which the branch holds, is read as this run's");
+    assert.equal(textOf(h.unrecorded().at(-1)!.content), askedRow(e, 'Look.'), 'the specific row, with the note');
+  } finally { h.stopAll(); }
+}));
