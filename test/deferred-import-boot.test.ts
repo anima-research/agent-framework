@@ -955,6 +955,19 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       writeFileSync(join(recovery, 'deferred-writes.json'), JSON.stringify({ version: 2, pending: [entry('q1', 1, 'queued-1')] }));
       const child = await runChild(storePath, 'before-rewrite', t.signal);
       assert.equal(child.status, 0, `the child exited where it was told (stderr: ${child.stderr.slice(-800)})`);
+      // AF #844 bot review 5, finding 5: the crashed boot imported the write
+      // and synced it (the child exits 5 where nothing was imported, 4 where
+      // no sync followed), so it is on disk before the next boot: read there,
+      // past any framework, as the crash cases below read theirs.
+      {
+        const store = JsStore.openOrCreate({ path: storePath });
+        try {
+          const cm = await StoreWindow.open({ store, ...residentContextOptions('agent'), strategy: new PassthroughStrategy() });
+          try {
+            assert.deepEqual(cm.getAllMessages().map(textOf).filter((x) => x === 'queued-1'), ['queued-1'], 'the write is on disk before the next boot');
+          } finally { cm.close(); }
+        } finally { store.close(); }
+      }
       const boot = () => AgentFramework.create({
         storePath, membrane: new MockMembrane().asMembrane(), modules: [], syncIntervalMs: 0,
         agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'You are agent.' }],

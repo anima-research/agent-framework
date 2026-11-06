@@ -12,7 +12,9 @@
  *                       record: every write is on disk and still queued.
  *                       Exit code 4 instead where the record's write is
  *                       reached with no store sync since the last imported
- *                       write (AF #844 bot review 4, finding 44).
+ *                       write (AF #844 bot review 4, finding 44), and 5
+ *                       where it is reached with nothing imported (bot
+ *                       review 5, finding 5).
  *   big-before-rewrite  the same, for a queue the test made large (more than
  *                       any fixed scan tail).
  *
@@ -44,22 +46,24 @@ if (mode === 'mid-import') {
     return id;
   };
 } else {
-  // Whether the store synced after the last write the importer stored.
-  let syncedSinceImported = true;
+  // Whether the importer stored a write, and whether the store synced after
+  // the last one it stored: nothing imported reads as neither.
+  let importedAny = false;
+  let syncedSinceImported = false;
   const addMessage = proto.addMessage;
   proto.addMessage = function (participant, content, metadata, opts) {
     const id = addMessage.call(this, participant, content, metadata, opts);
-    if (opts?.imported) syncedSinceImported = false;
+    if (opts?.imported) { importedAny = true; syncedSinceImported = false; }
     return id;
   };
   const storeProto = JsStore.prototype as unknown as { sync(this: JsStore): unknown };
   const sync = storeProto.sync;
   storeProto.sync = function (this: JsStore) {
     const synced = sync.call(this);
-    syncedSinceImported = true;
+    if (importedAny) syncedSinceImported = true;
     return synced;
   };
-  proto.writeImportedRecord = function () { process.exit(syncedSinceImported ? 0 : 4); };
+  proto.writeImportedRecord = function () { process.exit(!importedAny ? 5 : syncedSinceImported ? 0 : 4); };
 }
 
 await AgentFramework.create({
