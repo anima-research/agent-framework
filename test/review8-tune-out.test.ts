@@ -170,7 +170,10 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     crashAfterEnd: false,
     /** A loss notice's write meets a hold that begins at it: kept in memory, an empty id, writes held from then on. */
     noticeKept: false,
-    /** A write made while writes are held (`held`) is kept in memory, answering an empty id, as the framework keeps one. */
+    /**
+     * A write made while writes are held (`held`) is kept in memory, answering an empty id, as the framework keeps
+     * one (`heldWrites`), and stored at their release (storeHeld).
+     */
     keepWhenHeld: false,
     /** The sync after a note's row (the last one written a subconscious-note) fails, the release's before it landing. */
     noteSyncFails: false,
@@ -182,6 +185,8 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   };
   /** The writes kept in memory for an agent whose manager refuses its work (`refusing`), by agent. */
   const keptFor = new Map<string, Added[]>();
+  /** The writes kept in memory while writes were held (`keepWhenHeld`), in order, for storeHeld. */
+  const heldWrites: Added[] = [];
   /** How many of `added` the last sync that answered true made durable. */
   let durableCount = 0;
   let onTrace: ((event: Trace) => void) | undefined;
@@ -214,7 +219,10 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
       onWrite?.(metadata);
-      if (state.keepWhenHeld && state.held) return '';
+      if (state.keepWhenHeld && state.held) {
+        heldWrites.push({ participant, content, metadata, forAgent });
+        return '';
+      }
       if (forAgent !== undefined && state.gone.includes(forAgent)) return '';
       if (forAgent !== undefined && state.refusing.includes(forAgent)) {
         keptFor.set(forAgent, [...(keptFor.get(forAgent) ?? []), { participant, content, metadata, forAgent }]);
@@ -307,7 +315,17 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   const listen = (fn: (event: Trace) => void): void => { onTrace = fn; };
   /** A listener inside each write, as a host's synchronous trace listener of the store write runs: before the write lands. */
   const listenWrites = (fn: (metadata: Record<string, unknown> | undefined) => void): void => { onWrite = fn; };
-  return { coordinator, state, states, rows, added, mail, wakes, traces, keptFor, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
+  /** The writes are stored again (`held` cleared), as the framework's release stores what it kept (`heldWrites`), in order. */
+  const storeHeld = (): void => {
+    state.held = false;
+    for (const write of heldWrites.splice(0)) {
+      added.push(write);
+      if (options.stored && write.forAgent === undefined) {
+        rows.push({ id: `r${rows.length + 1}`, participant: write.participant, content: write.content, metadata: write.metadata ?? {}, sequence: rows.length + 1 });
+      }
+    }
+  };
+  return { coordinator, state, states, rows, added, mail, wakes, traces, keptFor, heldWrites, storeHeld, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
 }
 
 const LOSS_RECORD_UNIT = 'tune-out/scout/loss-notices';
@@ -1970,16 +1988,24 @@ test("review 3 #10: a queued cancel's own note kept in memory as it is written l
       else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
       h.state.held = false;
       h.state.keepWhenHeld = true;
-      h.listenWrites((metadata) => { if (metadata?.kind === 'subconscious-note') h.state.held = true; });
+      let noteWritten = false;
+      h.listenWrites((metadata) => {
+        if (metadata?.kind !== 'subconscious-note') return;
+        noteWritten = true;
+        h.state.held = true;
+      });
       h.coordinator.runDeferredCancels();
+      assert.ok(noteWritten, 'premise: the run wrote its note, which began the hold (review 4 #41)');
       assert.equal(scope ? h.scopeInForce() : h.inForce(), held, `${scope ? 'all-except' : 'channel'}: the note was kept in memory, so the end isn't recorded`);
       assert.equal(queuedOf(h), 1, 'the cancel waits for the writes');
+      assert.deepEqual(h.notes(), [], 'premise: the note is kept in memory, not stored');
       // The writes are stored (the kept note with them); the cancel's run then ends the hold.
       h.listenWrites(() => {});
-      h.state.held = false;
+      h.storeHeld();
       h.coordinator.runDeferredCancels();
       assert.equal(scope ? h.scopeInForce() : h.inForce(), null, 'its run once the writes are stored ends the hold');
       assert.deepEqual(h.lossNotices(), [], 'telling no note lost: it was settled');
+      assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], 'the note stored once, the kept one: the run writes it no second time (review 4 #40)');
     } finally {
       h.coordinator.stop();
       errors.mock.restore();
@@ -1996,8 +2022,14 @@ test("review 3 #10: a stop while the queued cancel's own note is kept in memory 
     h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
     h.state.held = false;
     h.state.keepWhenHeld = true;
-    h.listenWrites((metadata) => { if (metadata?.kind === 'subconscious-note') h.state.held = true; });
+    let noteWritten = false;
+    h.listenWrites((metadata) => {
+      if (metadata?.kind !== 'subconscious-note') return;
+      noteWritten = true;
+      h.state.held = true;
+    });
     h.coordinator.runDeferredCancels();
+    assert.ok(noteWritten, 'premise: the run wrote its note, which began the hold (review 4 #41)');
     assert.equal(h.inForce(), held, 'premise: the note was kept in memory, the hold in force');
     h.coordinator.stop();
     assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', true]], 'the stop loses the kept note with the cancel, and tells it');
