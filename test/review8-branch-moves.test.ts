@@ -388,7 +388,8 @@ describe("a no-op rollback's advice for a row of a slot the agent observes (AF #
     await assert.rejects(framework.rollbackToMessage(SUB, { messageId: own }), (e: unknown) => {
       assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
       assert.match(e.message, /was presented to Subconscious in one write with the 1 message after it in its window/);
-      assert.match(e.message, /suppress it \(suppressMessages on mira: it is in mira's own slot, which Subconscious observes\), or hide it by Discord message id/);
+      assert.match(e.message, /suppress it \(suppressMessages on mira: it is in mira's own slot, which Subconscious observes\)$/);
+      assert.doesNotMatch(e.message, /hide/, 'the row has no Discord id to hide it by (review 2 #180)');
       return true;
     });
     // As the advice says: not through the subconscious, through mira.
