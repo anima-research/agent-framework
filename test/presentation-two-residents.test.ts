@@ -37,6 +37,7 @@ import { join } from 'node:path';
 import type { CompileResult, ContextManager, MessageId, MessageMetadata, StoredMessage, WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework, audienceOf } from '../src/index.js';
+import { transcribeForeignRounds } from '../src/foreign-rounds.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { GateModule, until } from './helpers/dendrite.js';
@@ -484,6 +485,16 @@ describe("two residents' overlapping turns, each in a window of its own (#291)",
     // Its window is over the residents' slot: its second request carries
     // their turns, the rows for each of them and the held row, the
     // residents' rounds as a transcript and none of their thinking.
+    // AF #844 bot review 4, finding 16: past what its first request carried,
+    // its second carries its window's rows in the window's order, each as
+    // it is sent them (the residents' rounds as a transcript), as part B
+    // checks for the residents.
+    assert.equal(sub.windows.length, 2, 'premise: its window as each of its two requests read it');
+    const sentWindow = transcribeForeignRounds(
+      window.slice(0, sub.windows[1]!.length).map(({ participant, content }) => ({ participant, content })), (p) => p === SUB);
+    assert.deepEqual(window.slice(0, sub.windows[1]!.length).map((m) => m.id), sub.windows[1], 'premise: its window keeps what its second request read');
+    assert.deepEqual(said(second.request.messages.slice(first.request.messages.length)), said(sentWindow.slice(firstWindow.length)),
+      'its second request goes on from its first in the order its window took the rows');
     const body = second.request.messages.map((m) => rowText(m as never)).join('\n');
     for (const t of ['hello both', 'mira looks', 'oren looks', 'for mira', 'for oren', 'HELD chatter', 'oren, idle', 'mira done', 'oren done', 'round two', 'mira again', 'oren again']) {
       assert.ok(body.includes(t), `its second request carries '${t}'`);
