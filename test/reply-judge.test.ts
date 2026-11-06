@@ -208,7 +208,8 @@ describe('reply judge: a request refused as too long', () => {
     assert.strictEqual(requests.length, 0);
   });
 
-  it("starts the retry's fresh window though another call anchors one while the retry's preview is read", async () => {
+  it("starts the retry's fresh window though another call anchors one while the retry's preview is read", async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
     const { membrane, requests, size } = refusingMembrane((n) => n === 2);
     let previews = 0;
     let kept: unknown;

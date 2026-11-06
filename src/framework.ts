@@ -4110,7 +4110,7 @@ export class AgentFramework {
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
    *  its admission back; the park, woken, then finds it gone. */
   private parkedContinuations: Set<InferenceRequest> = new Set();
-  private parkedStarts: Set<{ agent: Agent; batchOnly: boolean }> = new Set();
+  private parkedStarts: Set<{ agent: Agent; batchOnly: boolean; trigger?: InferenceRequest }> = new Set();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
    *  token, and a turn that has ended isn't live (liveTurns). A later start
@@ -6232,7 +6232,7 @@ export class AgentFramework {
     }
     for (const what of batchOnly) wakes.push({ certain: false, what });
     if (held?.maybe) {
-      const what = 'a start held by a provider hold, which starts no turn if its deferred pushes give it nothing to read';
+      const what = 'a start held by a provider hold, which starts no turn if it has nothing to read then';
       wakes.push(held.until === undefined ? { when: 'when the hold on it is released', certain: false, what } : { at: held.until, certain: false, what });
     } else if (held) {
       wakes.push(held.until === undefined
@@ -6259,7 +6259,8 @@ export class AgentFramework {
     for (const parked of this.parkedStarts) {
       if (parked.agent !== agent) continue;
       parkedCount++;
-      if (parked.batchOnly) batchOnly.push('a start waiting for an auxiliary call to finish, which starts no turn if its deferred pushes give it nothing to read');
+      if (parked.trigger !== undefined && !unread(parked.trigger)) batchOnly.push('a start waiting for an auxiliary call to finish, which starts no turn if a hold, a quiesce or a turn stops it then, since it has nothing left to read');
+      else if (parked.batchOnly) batchOnly.push('a start waiting for an auxiliary call to finish, which starts no turn if its deferred pushes give it nothing to read');
       else queued.push('a start waiting for an auxiliary call to finish');
     }
     const passed: string[] = [];
@@ -23614,7 +23615,7 @@ export class AgentFramework {
         // owned and the continuation receives it after the in-flight call settles.
         const parkedContinuation = trigger !== undefined && continuesTurn(trigger);
         if (parkedContinuation) this.parkedContinuations.add(trigger);
-        const parkedStart = parkedContinuation ? undefined : { agent, batchOnly: Boolean(trigger?.coalescingBatchSubjects?.length) };
+        const parkedStart = parkedContinuation ? undefined : { agent, batchOnly: Boolean(trigger?.coalescingBatchSubjects?.length), trigger };
         if (parkedStart) this.parkedStarts.add(parkedStart);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
           if (parkedStart) this.parkedStarts.delete(parkedStart);
