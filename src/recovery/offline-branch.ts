@@ -114,9 +114,12 @@ export interface OfflineRecoveryBranchResult {
 /**
  * Create a safe Chronicle branch while the normal agent host is stopped.
  *
- * History is scanned in bounded windows and blobs are not re-inlined. The
- * affected messages are never compiled and their content is never written to
- * the recovery outbox; only Discord addressing metadata leaves Chronicle.
+ * History is scanned in bounded windows and blobs are not re-inlined, but a
+ * presented window (#291) is read whole where its order counts: for a
+ * `messages` count, and for the rows after the anchor that the cut returns
+ * to the arrivals or keeps (windowAfterCut). The affected messages are never
+ * compiled and their content is never written to the recovery outbox; only
+ * Discord addressing metadata leaves Chronicle.
  */
 export async function createOfflineRecoveryBranch(
   options: OfflineRecoveryBranchOptions,
