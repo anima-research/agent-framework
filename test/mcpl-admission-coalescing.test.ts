@@ -262,3 +262,56 @@ test('R3-4 duplicate accept rechecks authority, not fresh-work capacity', async 
   const retry = await coalescer.accept(occurrence, () => 'admission_denied', () => 'admission_stale');
   assert.deepEqual(retry, { accepted: false, reason: 'admission_stale' });
 });
+
+for (const lane of lanes) for (const saturation of ['callbacks', 'busy-chain'] as const) {
+  test(`R4-1 required ${lane}: delete at ticket cap with ${saturation} keeps removal and subject order`, async t => {
+    let release!: (v: AdmissionVerdict) => void;
+    const held = new Promise<AdmissionVerdict>(r => { release = r; });
+    let calls = 0;
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      calls++;
+      return saturation === 'callbacks' && input.item.eventId.startsWith('held-') ? held : allow;
+    }) } });
+    const inner = f.framework as any;
+    const pending: Promise<any>[] = [];
+    let unlock!: () => void;
+    t.after(async () => { release(allow); unlock?.(); await Promise.all(pending); await f.close(); });
+    await f.register();
+    // Unknown birth: the non-empty delete notice is delivered as well as removing the occupant.
+    assert.equal((await send(f, lane, 'create', 'deleted_occupant')).accepted, true);
+    if (saturation === 'busy-chain') {
+      inner.coalescingAdmission = new Promise<void>(r => { unlock = r; });
+    }
+    // Include a pending create without an occupant, to exercise that allowance too.
+    if (saturation === 'callbacks') {
+      // One slow batch callback holds 64 arrival tickets, leaving admission
+      // budget for the deletes (which must not bypass that separate budget).
+      pending.push(f.send('channels/incoming', { messages: Array.from({ length: 64 }, (_, i) =>
+        f.channel(`held-${i}`, `body_${i}_end`, { key: `held-${i}` }, 'chat', `held-${i}`)) }));
+    } else {
+      for (let i = 0; i < 64; i++) pending.push(send(f, lane, `held-${i}`, `body_${i}_end`, { key: `held-${i}` }));
+    }
+    const saturatedCalls = saturation === 'callbacks' ? 2 : 65;
+    await eventually(() => calls === saturatedCalls);
+    assert.equal(inner.coalescingTicketCounts.get('editor'), 64);
+    const unknown = await send(f, lane, 'unknown-delete', '[unknown deleted]', { key: 'unknown', retract: true });
+    assert.equal(unknown.reason, 'admission_denied');
+    assert.equal(calls, saturatedCalls, 'unknown-subject withdrawals do not bypass the cap');
+    const deletion = send(f, lane, 'delete', '[message deleted]', { retract: true });
+    const pendingDeletion = send(f, lane, 'pending-delete', '[pending deleted]', { key: 'held-0', retract: true });
+    pending.push(deletion, pendingDeletion);
+    // The baseline refuses both before policy. Yield through a later refused request rather than timing a wait.
+    await send(f, lane, 'overflow', 'never_store', { key: 'overflow' });
+    assert.equal(calls, saturatedCalls + 2, 'known and pending subjects still pass through policy at the ticket cap');
+    assert.equal((await send(f, lane, 'duplicate-delete', '[duplicate]', { key: 'held-0', retract: true })).reason, 'admission_denied', 'one over-cap withdrawal per subject');
+    release(allow); unlock?.();
+    assert.equal((await deletion).accepted, true);
+    assert.equal((await pendingDeletion).accepted, true);
+    await Promise.all(pending);
+    assert(!f.context().includes('deleted_occupant'));
+    assert(!f.context().includes('body_0_end'), 'withdrawal waits behind its pending create');
+    assert(f.context().includes('[message deleted]'));
+    assert(f.context().includes('[pending deleted]'));
+    await eventually(() => inner.coalescingTicketCounts.size === 0);
+  });
+}

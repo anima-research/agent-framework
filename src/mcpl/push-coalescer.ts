@@ -574,6 +574,13 @@ export class PushCoalescer<E = unknown> {
     return this.subjects.get(subject)?.identity;
   }
 
+  /** A withdrawal can remove an occupant or cancel pending/rendering work.
+   * Historical subject records alone do not justify an over-cap ticket. */
+  hasLiveSubject(subject: string): boolean {
+    const state = this.subjects.get(subject);
+    return !!(state?.occupant || state?.batch || state?.rendering);
+  }
+
   pendingBatches(): number {
     let n = 0;
     for (const s of this.subjects.values()) if (s.batch) n++;

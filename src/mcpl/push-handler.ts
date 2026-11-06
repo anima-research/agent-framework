@@ -158,7 +158,7 @@ export class PushHandler {
   async handleRequiredPushEvent(serverId: string, params: PushEventParams, responder: Responder | undefined, admission: RequiredIngress): Promise<void> {
     const c = params.coalesce;
     const ticket = typeof c?.key === 'string'
-      ? admission.orderCoalesced?.(c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet }, c.key)
+      ? admission.orderCoalesced?.(c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet }, c.key, c.retract === true)
       : undefined;
     try {
       try {

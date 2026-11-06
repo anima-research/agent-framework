@@ -1916,7 +1916,7 @@ export class ChannelRegistry {
       if (admission?.orderCoalesced) {
         for (const message of params.messages) {
           tickets.push(typeof message?.coalesce?.key === 'string'
-            ? admission.orderCoalesced({ kind: 'channel', id: message.channelId }, message.coalesce.key)
+            ? admission.orderCoalesced({ kind: 'channel', id: message.channelId }, message.coalesce.key, message.coalesce.retract === true)
             : undefined);
         }
       }

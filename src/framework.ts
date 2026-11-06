@@ -4299,6 +4299,7 @@ export class AgentFramework {
   private readonly requiredModuleQueues = new Map<string, RequiredModuleQueue>();
   private readonly requiredModuleReservations = new WeakMap<object, RequiredModuleSlot>();
   private readonly coalescingTicketCounts = new Map<string, number>();
+  private readonly coalescingWithdrawalTickets = new Set<string>();
   private readonly coalescingTickets = new Map<string, Promise<void>>();
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
@@ -18973,10 +18974,20 @@ export class AgentFramework {
   }
 
   /** Reserve a subject's effect order before either lane awaits admission. */
-  private takeCoalescingTicket(serverId: string, scope: CoalescingScope, key: string) {
+  private takeCoalescingTicket(serverId: string, scope: CoalescingScope, key: string, retract = false) {
     const count = this.coalescingTicketCounts.get(serverId) ?? 0;
-    if (count >= MAX_PENDING_ADMISSIONS) return { ready: Promise.resolve(), retire() {}, overloaded: true };
     const subject = coalescingSubjectKey(serverId, this.coalescingBinding(serverId), scope, key);
+    const overCap = count >= MAX_PENDING_ADMISSIONS;
+    if (overCap) {
+      // A withdrawal must still follow its create at saturation. Bound the
+      // exception to one outstanding withdrawal per live/pending subject;
+      // unknown subjects and repeated withdrawals cannot grow the queue.
+      if (!retract || this.coalescingWithdrawalTickets.has(subject)
+        || !(this.coalescingTickets.has(subject) || this.pushCoalescer?.hasLiveSubject(subject))) {
+        return { ready: Promise.resolve(), retire() {}, overloaded: true };
+      }
+      this.coalescingWithdrawalTickets.add(subject);
+    }
     this.coalescingTicketCounts.set(serverId, count + 1);
     const ready = this.coalescingTickets.get(subject) ?? Promise.resolve();
     let retire!: () => void;
@@ -18986,6 +18997,7 @@ export class AgentFramework {
     const tail = ready.then(() => retired);
     this.coalescingTickets.set(subject, tail);
     void tail.then(() => {
+      if (overCap) this.coalescingWithdrawalTickets.delete(subject);
       const remaining = this.coalescingTicketCounts.get(serverId)! - 1;
       if (remaining) this.coalescingTicketCounts.set(serverId, remaining);
       else this.coalescingTicketCounts.delete(serverId);
@@ -35900,7 +35912,7 @@ export class AgentFramework {
         const admission: RequiredIngress = {
           ...original,
           afterResponse,
-          orderCoalesced: (scope, key) => this.takeCoalescingTicket(connection.id, scope, key),
+          orderCoalesced: (scope, key, retract) => this.takeCoalescingTicket(connection.id, scope, key, retract),
           check: () => this.queue?.isClosed ? 'admission_not_ready' :
             this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' :
             original.check() ?? (registration && !registration() ? 'admission_stale' : undefined),
@@ -36095,7 +36107,7 @@ export class AgentFramework {
         const admission: RequiredIngress = {
           ...original,
           afterResponse,
-          orderCoalesced: (scope, key) => this.takeCoalescingTicket(connection.id, scope, key),
+          orderCoalesced: (scope, key, retract) => this.takeCoalescingTicket(connection.id, scope, key, retract),
           check: () => this.queue?.isClosed ? 'admission_not_ready' :
             this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
         };

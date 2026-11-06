@@ -70,7 +70,11 @@ for the subject to retire, including refusals. Channel batches reserve all their
 tickets on arrival and still admit siblings sequentially. Independent single-item subjects do not wait on one another's callbacks.
 Batch siblings remain sequential: reserving B behind a slow sibling A also delays
 later traffic for B. Outstanding coalescing tickets are capped at 64 per server id (spans reconnects);
-excess fresh occurrences refuse without joining the subject queue, after live receipt lookup. A pause or grant change during a running preflight invalidates it even if restored before the verdict.
+excess fresh occurrences refuse without joining the subject queue, after live receipt lookup.
+A withdrawal may take one over-cap ticket per subject with a live occupant or
+pending coalesced work/ticket; it still waits behind that subject's create and
+uses the ordinary per-connection admission budget. Unknown-subject withdrawals
+and additional over-cap withdrawals for the same subject refuse at the cap. A pause or grant change during a running preflight invalidates it even if restored before the verdict.
 Required connections never advertise `toolHints`, even if `toolHints: true` is
 configured. That explicit combination logs one diagnostic at connect (not on
 automatic transport retries); it is not a configuration error. Under RFC-014 §6.3 the peer must not send hints and should tailor

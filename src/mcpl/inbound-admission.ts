@@ -88,7 +88,7 @@ export interface RequiredIngress {
   /** Host-only continuation after the lane's response (or notification completion). */
   afterResponse?(work: () => void): void;
   /** Reserve at arrival, before callbacks; both lanes share the subject queue. */
-  orderCoalesced?(scope: CoalescingScope, key: string): { ready: Promise<void>; retire(): void; overloaded?: boolean };
+  orderCoalesced?(scope: CoalescingScope, key: string, retract?: boolean): { ready: Promise<void>; retire(): void; overloaded?: boolean };
   check(): RefusalCode | undefined;
   admit(lane: AdmissionLane, item: unknown, signal?: AbortSignal): Promise<AdmissionVerdict>;
 }

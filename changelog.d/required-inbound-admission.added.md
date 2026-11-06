@@ -20,6 +20,8 @@
   Independently sent live non-coalesced items without a backlog may still finish
   in callback-latency order. Plain coalesced creates, edits and withdrawals go
   through admission with per-subject arrival ordering shared across both lanes.
+  At the ticket cap, one withdrawal per live/pending subject still takes its
+  ordered ticket through the ordinary admission budget; unknown subjects refuse.
   Superseded-epoch items are refused. During initialize, data requests
   receive the existing capability error (-32002). Required connections do not
   advertise `toolHints` or carry RFC-014 toolset presence; an explicit
