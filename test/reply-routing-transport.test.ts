@@ -8,6 +8,7 @@ import { AgentFramework } from '../src/framework.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { type AdmissionInput } from '../src/mcpl/inbound-admission.js';
 import { workOf, replyWork } from '../src/mcpl/reply-routing.js';
+import { SUB } from './helpers/admission.js';
 import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { eventually, fixture as coalescingFixture } from './helpers/coalescing-fixture.js';
 const peer = fileURLToPath(new URL('./fixtures/reply-routing-server.mjs', import.meta.url));
@@ -114,7 +115,7 @@ test('real stdio: read-only arrival on another channel cannot repin a live bound
 });
 
 for (const mode of ['locus', 'hybrid']) for (const bound of [true, false]) test(`N1: successful all-except agent-tool preserves frozen reply with injected null locus (${bound}, ${mode})`, async t => {
-  const x = await wire({}, { tuneOut: { enabled: true }, agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test', proseRouting: mode }] }); t.after(x.close);
+  const x = await wire({}, { subconscious: SUB, agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test', proseRouting: mode }] }); t.after(x.close);
   const open = x.f.routingOf('assistant'); x.f.openLogical.set('assistant', open);
   if (bound) {
     // Actual ingress mints the binding, then private scaffolding installs only the open-turn precondition.
