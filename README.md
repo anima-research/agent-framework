@@ -896,7 +896,8 @@ the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot
 the agent observes, which the refusal names), or, for those with a Discord message id,
-the host's `hide` by it, takes them out. The preview's `neverPresented` counts the messages it
+the host's `hide` by it, run on the agent whose own slot holds the row (the
+refusal names it), takes them out. The preview's `neverPresented` counts the messages it
 removes that no live agent is shown: no window holds them, or only windows
 whose view leaves them out (a row a tune-out holds); a message that may be in
 a window that couldn't be read isn't counted, and is logged. The host command's

@@ -17318,12 +17318,12 @@ export class AgentFramework {
         const named = `${String(first.id)}${discordId !== undefined ? `, Discord message ${discordId}` : ''}`;
         // The host's hide matches a Discord id, so it is named only where
         // one of them has one (an API or a module's row has none), and for
-        // those alone where only some have one, each id named.
-        const discordIds = kept.map(discordIdOf).filter((id): id is string => id !== undefined);
-        const withId = discordIds.length;
-        const hideBy = `(the host's hide command: ${discordIds.join(', ')})`;
-        const hide = withId === 0 ? ''
-          : withId === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id ${hideBy}`
+        // those alone where only some have one, each id named, with the
+        // agent it is run on (hideThrough): it reads that agent's own slot.
+        const withId = kept.filter((row) => discordIdOf(row) !== undefined);
+        const hideBy = `(the host's hide command: ${this.hideThrough(agentName, cm, withId.map((row) => ({ id: row.id as MessageId, discordId: discordIdOf(row)! })))})`;
+        const hide = withId.length === 0 ? ''
+          : withId.length === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id ${hideBy}`
           : `, or hide those with a Discord message id by it ${hideBy}`;
         throw new OperatorActionError('invalid',
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
@@ -17397,6 +17397,28 @@ export class AgentFramework {
     ];
     // Each part lists ids with commas, so the parts are set apart by semicolons.
     return `suppressMessages ${parts.slice(0, -1).join('; ')}${parts.length > 1 ? '; and ' : ''}${parts.at(-1)}`;
+  }
+
+  /**
+   * On which agent the host's hide takes each of `rows` out, for a
+   * refusal's advice, each row named by its Discord message id, which the
+   * hide matches: the hide reads the own slot of the agent it is run on, so
+   * a row of a slot `agentName` observes, merged into its window, is hidden
+   * on an owner of that slot whose own slot holds it (observedRowOwner), as
+   * suppressionThrough names one for a suppression. Grouped by agent, the
+   * groups set apart by semicolons.
+   */
+  private hideThrough(agentName: string, cm: ContextManager, rows: ReadonlyArray<{ id: MessageId; discordId: string }>): string {
+    const groups = new Map<string, string[]>();
+    for (const row of rows) {
+      let inOwnSlot = true;
+      try { inOwnSlot = cm.getMessage(row.id) !== null; } catch { /* read as its own: the plain advice */ }
+      const on = inOwnSlot ? agentName : this.observedRowOwner(agentName, row.id) ?? '';
+      groups.set(on, [...(groups.get(on) ?? []), row.discordId]);
+    }
+    return [...groups].map(([on, ids]) => on === ''
+      ? `on the agent whose own slot holds ${ids.length === 1 ? 'it' : 'them'}, for ${ids.join(', ')}`
+      : `on ${on} for ${ids.join(', ')}${on === agentName ? '' : `, whose own slot holds ${ids.length === 1 ? 'it' : 'them'}`}`).join('; ');
   }
 
   /**
