@@ -161,6 +161,33 @@ class FailsAfterFirstRound extends MockMembrane {
   }
 }
 
+class EndsSilentlyAfterFirstRound extends MockMembrane {
+  endedSilently = false;
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    const inner = super.streamYielding(request);
+    let resultsGiven = false;
+    let wake: (() => void) | undefined;
+    const membrane = this;
+    return {
+      provideToolResults: () => { resultsGiven = true; wake?.(); },
+      cancel: () => { wake?.(); },
+      get isWaitingForTools() { return !resultsGiven && inner.isWaitingForTools; },
+      get pendingToolCallIds() { return resultsGiven ? [] : inner.pendingToolCallIds; },
+      get toolDepth() { return inner.toolDepth; },
+      get isCancelled() { return false; },
+      async *[Symbol.asyncIterator]() {
+        for await (const event of inner) {
+          yield event;
+          if (event.type !== 'tool-calls') continue;
+          while (!resultsGiven) await new Promise<void>((resolve) => { wake = resolve; });
+          membrane.endedSilently = true;
+          return;
+        }
+      },
+    } as unknown as YieldingStream;
+  }
+}
+
 class HeldSecond extends MockMembrane {
   primary = 0;
   override streamYielding(request: NormalizedRequest): YieldingStream {
@@ -831,6 +858,29 @@ describe('plain speech a module says it showed', () => {
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     surface.release();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
+    assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+  });
+
+  it("a turn whose stream ends with no terminal event logs the place a module named for its speech once a stop ends the turn", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    surface.heldAnswer = { sentTo: SENT_TO };
+    const membrane = new EndsSilentlyAfterFirstRound();
+    membrane.pushResponse(lookRound('Looking around.'));
+    const f = await host([surface], membrane);
+    push(f, 'hello');
+    void f.runUntilIdle();
+    await until(() => membrane.endedSilently, 'premise: the stream ended with no terminal event');
+    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
+    assert.equal(receipt(f), undefined, 'premise: no receipt');
+    surface.release();
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(errors.filter((e) => e.startsWith('[speechRouted]')), [], 'premise: nothing has logged the place while the turn sat open');
+    await f.stop();
+    framework = undefined;
+    await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the place logged once the stop ends the turn');
     assert.ok(errors.includes('[speechRouted] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
