@@ -49,7 +49,10 @@ export interface OfflineRecoveryBranchOptions {
    * branch, which needs no anchor: the branch then starts from the newest row.
    * For rolling back to a release that doesn't read the stamp, where a row
    * hidden between messages a summary covers makes that summary non-contiguous,
-   * and the store is refused at open. The source branch keeps them.
+   * and the store is refused at open. The source branch keeps them. Once this
+   * release has written its window down (MANIFEST version 2), no earlier
+   * release opens the store at all, and only a copy taken before the upgrade
+   * goes back.
    */
   removeSuppressed?: boolean;
   /** Exact Discord messages to suppress on the new branch. */

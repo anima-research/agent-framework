@@ -47,7 +47,10 @@
   stopped. A release without suppression doesn't read the stamp, and where
   compression formed a summary around a hidden row, it refuses the store at
   open (`StoreTopologyError`). The command makes and activates a branch without
-  the hidden rows; the source branch keeps them. It cleans the agent's own
+  the hidden rows; the source branch keeps them. That holds unless this release
+  has written its window down: the store's MANIFEST is then at version 2, which
+  no earlier release opens, and only a copy of the store taken before the
+  upgrade goes back (the 291-presentation-mandatory entry). It cleans the agent's own
   branch, not a derived context's (`dendrite/…`), so finish any such context
   first. With an anchor it starts at that message, where a row an earlier run
   removed is back, so run it last with no anchor. Suppress rules load as `defer`
