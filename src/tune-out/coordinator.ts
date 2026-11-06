@@ -109,10 +109,14 @@ export interface SubconsciousWindowStart {
    */
   inForceOnly?: true;
   /**
-   * At a resume that finds no start in force kept, `ordinal` being the one
-   * kept for `epochIds`: the anchor the subconscious's strategy persisted is
-   * kept where it is earlier (a cancelled tune-out's start that was set but
-   * never kept), as the start in force only.
+   * At a resume that finds no start in force kept: the anchor the
+   * subconscious's strategy persisted is kept, as the start in force only,
+   * where it is earlier than `ordinal`, the one kept for `epochIds` (a
+   * cancelled tune-out's start that was set but never kept), or, with no
+   * `ordinal` (their start fixed and set, its keeping failed), wherever it
+   * is: the sequence converted again could give a later start, once rows
+   * have been presented out of record order. Their own start is then fixed
+   * without moving the window to it.
    */
   keepEarlierAnchor?: true;
 }
@@ -1352,10 +1356,11 @@ export class TuneOutCoordinator {
     // tune-out's, say), and never past the oldest active one's own start
     // where one is kept. With none in force kept, the anchor (window-anchor)
     // keeps the one its strategy persisted where that is earlier than the
-    // oldest active one's own start.
+    // oldest active one's own start, or, where none of that is kept either,
+    // rather than converting its sequence again (AF #844 review 5, #47).
     const inForceOnly = occasion === 'resume' && state.inForce !== undefined && (own === undefined || state.inForce < own);
     if (inForceOnly) ordinal = state.inForce;
-    const keepEarlierAnchor = occasion === 'resume' && kept && state.inForce === undefined && own !== undefined;
+    const keepEarlierAnchor = occasion === 'resume' && kept && state.inForce === undefined;
     // The start in force from now: an ordinal known is kept as in force once
     // it is set (the anchor's fix reports it, subconsciousWindowFixed), not
     // before, so a set that fails leaves the record with the start the

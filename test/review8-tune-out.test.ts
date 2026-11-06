@@ -2996,3 +2996,31 @@ test("review 5 #24: a loss for an author told from a listener of that author's n
     }
   }
 });
+
+test("review 5 #47: a restart that finds no start kept for the oldest active tune-out, nor one in force, keeps the anchor the strategy persisted rather than converting the start again, and fixes that tune-out's own start without moving the window to it", () => {
+  // Y's start was fixed and set (persisted at 5), and the write keeping it failed.
+  const h = anchored({ active: [{ epochId: 'Y', sequence: 70 }], state: { starts: {} }, length: 12, persisted: 5 });
+  h.internals.anchorSubconscious('resume');
+  assert.deepEqual(h.calls, ['setAnchorOrdinal(5)'], "the window keeps the start it had, not Y's sequence converted again");
+  assert.equal(h.kept()?.inForce, 5, 'kept as the start in force');
+  assert.notEqual(h.kept()?.starts.Y, undefined, "and Y's own start is fixed and kept, for the next enter, the window not moved to it");
+
+  // The persisted anchor can't be read: the window stays where it was, nothing kept in force; Y's own start is fixed.
+  const unread = anchored({ active: [{ epochId: 'Y', sequence: 70 }], state: { starts: {} }, length: 12, persisted: 5 });
+  unread.control.persistedThrows = true;
+  const errors = mock.method(console, 'error', () => {});
+  try {
+    unread.internals.anchorSubconscious('resume');
+  } finally { errors.mock.restore(); }
+  assert.deepEqual(unread.calls, [], 'the window start is not moved');
+  assert.equal(unread.kept()?.inForce, undefined, 'nothing is kept as the start in force');
+  assert.notEqual(unread.kept()?.starts.Y, undefined, "Y's own start is fixed");
+
+  // Controls: none persisted, by sequence, as before; an enter sets the oldest active start, as it always has.
+  const none = anchored({ active: [{ epochId: 'Y', sequence: 70 }], state: { starts: {} }, length: 12 });
+  none.internals.anchorSubconscious('resume');
+  assert.equal(none.calls[0], 'setAnchor(70)');
+  const enter = anchored({ active: [{ epochId: 'Y', sequence: 70 }], state: { starts: {} }, length: 12, persisted: 5 });
+  enter.internals.anchorSubconscious('enter');
+  assert.equal(enter.calls[0], 'setAnchor(70)');
+});
