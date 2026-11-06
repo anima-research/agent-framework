@@ -2905,7 +2905,7 @@ export class TuneOutCoordinator {
       } else if (drop.reason === 'stopped') {
         why = `The host stopped while your cancel waited, so your cancel was lost, and the note with it.${nowInForce()}`;
       } else if (drop.reason === 'superseded') {
-        why = `An earlier cancel of that ${it} was running when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note goes out when it ends the ${it}.`;
+        why = `An earlier cancel of that ${it} was running when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note is to go out when it ends the ${it}; where it can't be delivered, its author is told.`;
       } else if (drop.reason === 'unstamped-stop') {
         // Written whole below.
       } else {

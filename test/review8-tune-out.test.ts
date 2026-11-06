@@ -2024,8 +2024,9 @@ test("review 3 #11: a cancel asked for with a note while an earlier one runs joi
     assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['superseded', true]], 'the later note is traced as dropped');
     assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [
       '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. An earlier cancel of that tune-out was running '
-      + "when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note goes out when it ends the tune-out.]",
-    ], 'and its author is told so');
+      + "when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note is to go out "
+      + "when it ends the tune-out; where it can't be delivered, its author is told.]",
+    ], 'and its author is told so, without a promise that the earlier note is delivered (review 4, #24)');
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
