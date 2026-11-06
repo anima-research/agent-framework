@@ -5,7 +5,9 @@
   `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.0 or earlier), each naming the range this package
   declares (the 291-chronicle-0.6 entry). An agent whose window
   can't be written down at its registration (another version's index format, a failed write) stays in legacy mode,
-  its window the whole record, as before, until a branch move writes its window down on the new branch.
+  its window the whole record, as before, until a branch move writes its window down on the new branch. A
+  conversation fork is seeded with its template's window, so a row a host writes into the template's context
+  manager directly, past the framework, reaches a fork only once the template's next point has presented it.
   - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
     agent's window, its own as undone and others' back to arrived, and `redo` puts them back. In a turn an earlier
     release recorded, whose rows carry no audience stamp, a row stored under the agent's name, one holding only

@@ -19,6 +19,7 @@
  * and where each stood, as this process saw them. Exit code 0 means the
  * exit point was hit; anything else means the scenario could not be staged.
  */
+import { writeSync } from 'node:fs';
 import { ContextManager, type MessageId, type MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework } from '../../src/index.js';
@@ -42,7 +43,8 @@ let framework: AgentFramework | undefined;
 /** Sync the store, report what this process saw, and exit hard. */
 function exitHere(report: Record<string, unknown>): never {
   framework!.getStore().sync();
-  console.log(JSON.stringify({ mode, ...report }));
+  // Written synchronously: a pipe write still pending at process.exit is lost.
+  writeSync(1, JSON.stringify({ mode, ...report }) + '\n');
   process.exit(0);
 }
 

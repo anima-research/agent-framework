@@ -40424,7 +40424,10 @@ export class AgentFramework {
         this.addMessage('user', [{ type: 'text', text }], { ...metadata }, { placement: own, forAgent: name });
         placements.set(name, own);
       }
-      // Recorded once the notice is stored: a notice that failed to be written is offered again.
+      // Recorded once the notice is written: a notice whose write threw is
+      // offered again. One a surgery's hold or a refusing manager keeps in
+      // memory counts as offered, stored at the release, and is lost with
+      // any write held so if the process ends first (store-held-lost).
       // An earlier acceptance's rule names stay on record while the new question is open.
       const prior = this.wakeDecisions.get(event.serverId);
       this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'offered', ...(prior?.rules ? { rules: prior.rules } : {}) });
