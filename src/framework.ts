@@ -39404,6 +39404,11 @@ export class AgentFramework {
     // so the next start releases it, backlog and all, rather than ending it
     // with none.
     this.makeTuneOutCoordinator({ announce: false }).releaseAll('start', 'no reader is configured');
+    // A release write that itself started a hold on writes (a listener's
+    // switch, a manager that refused it) was kept in memory, and its cancel
+    // waits on the coordinator just dropped: the release runs again once
+    // the writes are stored, for the holds still on record.
+    if (this.tuneOutWritesHeld()) this.releaseWithoutReaderWaits = true;
   }
 
   /**
