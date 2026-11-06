@@ -1098,6 +1098,37 @@ describe('a debounced batch of targeted messages', () => {
     }
   });
 
+  it("a batch for no one in particular whose delivery throws after waking one resident is logged as having woken her, and as dropped for the other (bot review 2, #89)", async () => {
+    const { framework, internals, dir } = await boot();
+    const errors: string[] = [];
+    const consoleError = console.error;
+    try {
+      const gate = (framework as unknown as { eventGate: { requestInferenceFn: (...args: unknown[]) => void } }).eventGate;
+      const wake = gate.requestInferenceFn;
+      let wakes = 0;
+      gate.requestInferenceFn = (...args: unknown[]) => {
+        if (++wakes === 2) throw new Error('the wake failed');
+        return wake.apply(gate, args);
+      };
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-u1', 'hello, all', {}));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-u2', 'anyone?', {}));
+      await waitFor(() => wakes >= 2, 'the batch to fire');
+      console.error = consoleError;
+      const woken = batchWakes(internals).map((r) => r.agentName);
+      assert.equal(woken.length, 1, `premise: one resident is woken, and the other's wake threw: ${woken.join(', ')}`);
+      const other = ['scout', 'mira'].find((name) => name !== woken[0])!;
+      const told = errors.filter((e) => e.includes('[gate]'));
+      assert.equal(told.length, 1, `the gate tells of it once: ${told.join(' | ')}`);
+      assert.ok(told[0]!.includes(`its pending batch of 2 events woke ${woken[0]}, and delivering it threw (the wake failed)`), `the log says the batch woke ${woken[0]}: ${told[0]}`);
+      assert.ok(told[0]!.includes(`so it's dropped for ${other}, who isn't woken`), `and that it's dropped for ${other}: ${told[0]}`);
+    } finally {
+      console.error = consoleError;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("a batch held for the host's quiesce whose delivery throws after waking scout is logged as having woken scout, and as dropped for mira, who isn't woken", async () => {
     const { framework, internals, dir } = await boot();
     let restore = () => {};

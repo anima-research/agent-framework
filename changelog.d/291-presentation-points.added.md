@@ -39,3 +39,6 @@
   injection whose copy an undo took out of the window is stored again at the next start.
 - `WorkspaceModule.useWindow(lookup)`: how the framework tells the workspace whether an agent's window still holds
   the turn that wrote a mount direct, so the head-move notice follows an undo that moves no branch.
+- A gate batch whose delivery throws once it has woken some of its agents (a debounced batch, one held for a turn or
+  the quiesce, a judged one) logs whom it woke, and that it is dropped for the others, who aren't woken, a batch
+  naming no agent as well as one naming its agents; it was logged as dropped whole.
