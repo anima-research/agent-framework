@@ -329,6 +329,46 @@ describe('read marks once windows are presented (#291)', () => {
     assert.equal(placement.messageId, id);
   });
 
+  // AF #844 bot review 5, finding 35: a write kept in memory, by a
+  // surgery's hold or while its agent's manager refuses its work, is in no
+  // window and no store, so no request reads it at its write. Its placement
+  // says so (`presented: false`, no id yet), so the coalescer keeps such a
+  // render out of the assembling turn and wakes the placement's agent to
+  // read it, as main's deferred placement did; read as presented, it was
+  // taken as consumed and nothing woke for it after the release.
+  it('a write kept in memory, by a surgery\'s hold or for its agent\'s recovery, is placed as not presented, for its recipient', async () => {
+    const h = await boot();
+    h.writeDown(h.mira, h.oren);
+    const internals = h.internals as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { placement?: Placement; audience?: readonly string[] }): MessageId;
+      surgeryHold: { verb: string; agentName: string; since: number } | null;
+      surgeryHeldWrites: unknown[];
+      heldForRecovery: Map<string, unknown[]>;
+    };
+    const write = (t: string, audience: string[]) => {
+      const placement: Placement = { agent: '' };
+      const id = internals.addMessage('user', text(t), {}, { placement, audience });
+      return { id, placement };
+    };
+    internals.surgeryHold = { verb: 'test', agentName: 'mira', since: Date.now() };
+    try {
+      const held = write('during a surgery, for oren', ['oren']);
+      assert.equal(held.id, '', 'premise: kept in memory');
+      assert.deepEqual(held.placement, { agent: 'oren', presented: false }, 'not presented, and placed for its recipient');
+    } finally {
+      internals.surgeryHold = null;
+      internals.surgeryHeldWrites.length = 0;
+    }
+    internals.heldForRecovery.set('mira', [{ participant: 'user', content: text('kept before'), heldFor: h.mira, heldAt: Date.now(), heldOrder: 0 }]);
+    try {
+      const kept = write("while mira's manager refuses its work, for both", ['mira', 'oren']);
+      assert.equal(kept.id, '', 'premise: kept in memory');
+      assert.deepEqual(kept.placement, { agent: 'mira', presented: false }, 'not presented');
+    } finally {
+      internals.heldForRecovery.delete('mira');
+    }
+  });
+
   // AF #844 bot review 4, finding 7: a gate's wake routed to a channel
   // carries its source as 'gate' and the channel's server as
   // channelServerId. Whether the agent spoke there after reading the row is

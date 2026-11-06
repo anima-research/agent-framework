@@ -2645,8 +2645,9 @@ interface FrameworkWriteOptions {
    *  again), and, for the wake that goes with it (readsRowFor), whether
    *  it was stored and not presented to that agent (`presented: false`):
    *  stored while a turn of the agent's was alive, outside its start's
-   *  assembly, or at rest with a presentation that failed. A write a
-   *  surgery's hold keeps names only its agent. */
+   *  assembly, or at rest with a presentation that failed. A write kept
+   *  in memory (a surgery's hold, or its agent's recovery) names only its
+   *  agent, with no id, and is not presented. */
   placement?: WritePlacement;
   /**
    * Who the message is for, when that is decided before it gets here:
@@ -19975,7 +19976,9 @@ export class AgentFramework {
    * (surgeryHeldWrites) and the hold's release stores it, and while the
    * fork's context manager refuses its work it keeps it for the move that
    * re-initializes it (heldForRecovery), so the placement names the fork
-   * alone, with no id yet. `mayBeStored`: storeInFork's.
+   * alone, with no id yet, as not presented: no request reads it before it
+   * is stored, and the fork is woken to read it, as addMessage places a
+   * write it keeps. `mayBeStored`: storeInFork's.
    */
   private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean): CoalescingPlacement {
     // Read before the write, as addMessage reads it: whether the fork's turn
@@ -19985,7 +19988,7 @@ export class AgentFramework {
     const turnLive = this.logicalTurnAlive(agent);
     const keptOut = this.keptOutOfWindow(agent, content, turnLive);
     const id = this.storeInFork(agent, content, metadata as MessageMetadata, mayBeStored);
-    if (!id) return { agent: agent.name };
+    if (!id) return { agent: agent.name, presented: false };
     return this.placedUnpresented(agent, keptOut, !turnLive, id)
       ? { agent: agent.name, messageId: id, presented: false }
       : { agent: agent.name, messageId: id };
@@ -33121,6 +33124,16 @@ export class AgentFramework {
         heldOrder: ++this.heldWritesKept,
       };
     };
+    // A write kept in memory is placed with no id, as not presented: no
+    // request reads it before it is stored, so a coalesced render kept so
+    // isn't the assembling turn's, and its recipient is woken to read it
+    // (wakeToRead), as main's deferred placement was. The replay at the
+    // release carries no placement.
+    const placeKept = (): void => {
+      if (!opts?.placement) return;
+      opts.placement.agent = this.placementReaders(agent, metadata)[0]!.name;
+      opts.placement.presented = false;
+    };
     // While the release replays what the hold kept, a write made meanwhile,
     // a listener's, waits behind the ones still to replay (replayingHeld).
     // The write the release replays, met by a hold a listener of its own
@@ -33130,7 +33143,7 @@ export class AgentFramework {
     const holdForSurgery = (): MessageId => {
       if (opts?.replayed) this.replayHeldAgain = true;
       else this.surgeryHeldWrites.push(kept());
-      if (opts?.placement) opts.placement.agent = agent.name;
+      placeKept();
       return '' as MessageId;
     };
     if (heldBySurgery()) return holdForSurgery();
@@ -33143,7 +33156,7 @@ export class AgentFramework {
     // below is kept so too.
     if (!opts?.imported && this.waitsForRecovery(agent.name)) {
       this.keepForRecovery(agent.name, kept());
-      if (opts?.placement) opts.placement.agent = agent.name;
+      placeKept();
       return '' as MessageId;
     }
 
@@ -33222,7 +33235,7 @@ export class AgentFramework {
           // the importer can't store.
           if (opts?.imported || !refusesUntilReinitialized(error)) throw error;
           this.keepForRecovery(agent.name, kept(), error);
-          if (opts?.placement) opts.placement.agent = agent.name;
+          placeKept();
           return '' as MessageId;
         }
       }
