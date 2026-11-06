@@ -58,7 +58,7 @@
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
-import { WriteLandedError, WriteOutcomeUnknownError } from '@animalabs/context-manager';
+import { WriteLandedError, WriteOutcomeUnknownError } from '../context-manager-errors.js';
 import { suppressionRecordOf } from '../gate/suppression-stats.js';
 import { isAnotherAgentsInjection } from '../stored-injections.js';
 import type { AgentName, ObserveEdge } from './types.js';
