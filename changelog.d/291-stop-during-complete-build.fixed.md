@@ -4,3 +4,8 @@
   out for the first call that was still running, and the turn ends with the stop's one `inference:aborted` (a
   caller's stop also leaves its `[turn-interrupted]` marker), with no `inference:completed`. Before, the round and its
   results were stored and the turn reported itself completed.
+- A stop made by a listener of the round's own presentation, as the round's reply and results are stored (their
+  presentation traces synchronously), ends the turn the same way, at an ordinary tool boundary and after a stream that
+  completed with its tools still running: the stream isn't resumed, and the turn ends with the stop's one
+  `inference:aborted`. What is stored by then stays, the calls with their results, so the record holds no call
+  without one. Before, the round went on: its stream was resumed after the stop.

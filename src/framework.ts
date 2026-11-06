@@ -18547,6 +18547,24 @@ export class AgentFramework {
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id), tc.name)
           );
           const resultsId = agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
+          // Storing the reply and the results presents them, and their
+          // presentation runs its listeners synchronously (presentOwn): one
+          // may have stopped the turn, as the check above asks of the build.
+          // What is stored stays, the call with its results, so the record
+          // holds no call without one; the stream isn't resumed, and the
+          // batch, never submitted, is admitted as at a turn's end. The stop's
+          // teardown does the rest.
+          const stoppedAtStore = this.roundStoppedDuringBuild(agent, currentState, currentState.stream);
+          if (stoppedAtStore !== null) {
+            console.warn(
+              `[framework] Not resuming the tool round of agent '${agent.name}' (callId=${event.callId}): its turn was ` +
+              `stopped as the round was stored (status '${agent.state.status}'` +
+              `${stoppedAtStore !== 'state-changed' ? `, stream cancelled: ${stoppedAtStore}` : ''}), so the round is ` +
+              `stored, its call with its results, and its stream isn't resumed.`,
+            );
+            agent.toolResultGuard.settleTurnEnded();
+            return;
+          }
 
           // Hear-while-acting (#291's presentation index): what arrived for
           // the agent during the round is stored already, and out of its
@@ -28764,20 +28782,10 @@ export class AgentFramework {
               // caller's, with the stop's one inference:aborted and no
               // inference:completed.
               const stopped = ready && inline ? this.roundStoppedDuringBuild(agent, readyState, stream) : null;
-              if (stopped !== null) {
-                console.warn(
-                  `[framework] Dropping the tool round of agent '${agent.name}': its turn was stopped while the results ` +
-                  `of a stream that completed with its tools still running were built (status '${agent.state.status}'` +
-                  `${stopped !== 'state-changed' ? `, stream cancelled: ${stopped}` : ''}), ` +
-                  `so neither the round, its results nor the reply after them is stored.`,
-                );
-                this.emitTrace({
-                  type: 'tool:result_dropped',
-                  agentName: agent.name,
-                  callId: stillRunning[0] ?? ready!.toolResults[0]?.id ?? '',
-                  agentStatus: agent.state.status,
-                  result: { ...notReceived },
-                });
+              // The stop ends the turn here, as a stop made during the
+              // guard's wait above does: the framework's own stop before a
+              // caller's.
+              const endStopped = (): void => {
                 if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
                   generationLost = true;
                   lifecyclePhase = 'aborted';
@@ -28798,6 +28806,22 @@ export class AgentFramework {
                   agent, myStreamId, startTime, compiledRequest,
                   reason: callerStop?.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing',
                 });
+              };
+              if (stopped !== null) {
+                console.warn(
+                  `[framework] Dropping the tool round of agent '${agent.name}': its turn was stopped while the results ` +
+                  `of a stream that completed with its tools still running were built (status '${agent.state.status}'` +
+                  `${stopped !== 'state-changed' ? `, stream cancelled: ${stopped}` : ''}), ` +
+                  `so neither the round, its results nor the reply after them is stored.`,
+                );
+                this.emitTrace({
+                  type: 'tool:result_dropped',
+                  agentName: agent.name,
+                  callId: stillRunning[0] ?? ready!.toolResults[0]?.id ?? '',
+                  agentStatus: agent.state.status,
+                  result: { ...notReceived },
+                });
+                endStopped();
                 return;
               }
               const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
@@ -28806,6 +28830,24 @@ export class AgentFramework {
                 agent.toolResultGuard.storeResults(built.blocks, ready.toolResults.map((tc) =>
                   this.toMembraneToolResult(tc.id, tc.result, inline.cap, built.spilled.get(tc.id), tc.name)), ready.toolResults,
                   turnRowMetadata, built.keptCap);
+              }
+              // Storing the round and its results presents them, and their
+              // presentation runs its listeners synchronously (presentOwn): a
+              // stop one makes ends the turn as a stop during the build does,
+              // but what is stored stays, the calls with their results, and
+              // the reply after them isn't stored.
+              const stoppedAtStore = ready && inline && built ? this.roundStoppedDuringBuild(agent, readyState, stream) : null;
+              if (stoppedAtStore !== null) {
+                console.warn(
+                  `[framework] Ending the turn of agent '${agent.name}': it was stopped as the round of a stream that ` +
+                  `completed with its tools still running was stored (status '${agent.state.status}'` +
+                  `${stoppedAtStore !== 'state-changed' ? `, stream cancelled: ${stoppedAtStore}` : ''}), so the round is ` +
+                  `stored with its results, and the reply after them isn't.`,
+                );
+                if (pending && this.pendingAssistantBlocks.get(agent.name) === pending) this.pendingAssistantBlocks.delete(agent.name);
+                agent.toolResultGuard.settleTurnEnded();
+                endStopped();
+                return;
               }
               // The entry is cleared, and the stored reply noted as the stream's
               // last, only while it still holds that round: a teardown that
