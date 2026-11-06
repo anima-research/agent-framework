@@ -3024,3 +3024,49 @@ test("review 5 #47: a restart that finds no start kept for the oldest active tun
   enter.internals.anchorSubconscious('enter');
   assert.equal(enter.calls[0], 'setAnchor(70)');
 });
+
+test("Weft's not-run on 341f99f0: the release turns a cancel asks for inside the stop's wait, the resident's and the subconscious's report, are asked again once by the next boot; none after a plain stop, and no second one where the boot releases a hold itself", () => {
+  for (const arm of ['inside the stop', 'control: before the stop', 'the boot releases a hold itself'] as const) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup();
+    const made: TuneOutCoordinator[] = [];
+    try {
+      h.enter();
+      h.state.held = true;
+      assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'duration', 'duration elapsed'), { ok: true, deferred: true });
+      // The host's stop begins (its timers quieted), and its wait lets the hold release: the cancel runs then.
+      if (arm !== 'control: before the stop') h.coordinator.stopTimers();
+      h.storeHeld();
+      h.coordinator.runDeferredCancels();
+      assert.equal(h.inForce(), null, `premise (${arm}): the cancel ran, and the hold ended`);
+      assert.deepEqual(h.wakes, [['scout', 'tune-out cancelled (duration elapsed)'], ['Subconscious', 'tune-out cancelled: disc:guild:a']],
+        `premise (${arm}): the release asked the resident's turn and the subconscious's report turn`);
+      if (arm === 'the boot releases a hold itself') {
+        // A hold entered then, whose end time passes while the host is down: the next boot releases it.
+        const entered = h.coordinator.enter('disc', 'disc:guild:a', { durationSeconds: 60 }, 'agent-tool');
+        assert.ok(entered.ok, 'premise: entered');
+        (entered.params as { expiresAtMs?: number }).expiresAtMs = Date.now() - 1;
+      }
+      h.coordinator.stop();
+      h.wakes.length = 0;
+      const next = h.reboot();
+      made.push(next);
+      next.resumeActiveEpochs();
+      const expected = arm === 'inside the stop'
+        ? [['scout', 'tune-out released (restored)'], ['Subconscious', 'tune-out (restored)']]
+        : arm === 'control: before the stop' ? []
+        : [['scout', 'tune-out cancelled (duration elapsed)'], ['Subconscious', 'tune-out cancelled: disc:guild:a']];
+      assert.deepEqual(h.wakes, expected, `${arm}: ${arm === 'inside the stop' ? 'the next boot asks both turns again' : arm.startsWith('control') ? 'nothing is asked again' : "the boot's own release asks its turns, and the dropped ones aren't asked a second time"}`);
+      next.stop();
+      h.wakes.length = 0;
+      const third = h.reboot();
+      made.push(third);
+      third.resumeActiveEpochs();
+      assert.deepEqual(h.wakes, [], `${arm}: a later boot asks nothing again`);
+    } finally {
+      for (const c of made) c.stop();
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});

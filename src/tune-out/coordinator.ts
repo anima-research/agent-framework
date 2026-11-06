@@ -549,7 +549,7 @@ const FOUND_RANK: Record<UnstampedStop['found'], number> = { unknown: 0, asked: 
 
 /**
  * What `tune-out/<primary>/stop-stamp` keeps (`{ v: 1, epochs,
- * runStartedAt?, branch? }`): the holds on record at the last stop (their
+ * runStartedAt?, branch?, wakesOwed? }`): the holds on record at the last stop (their
  * epochs) whose waiting cancels that stop accounted for, a note's loss
  * written or kept in the store (writeStopStamp), and where that run's rows
  * begin: the store's head sequence when it began, or when it moved to the
@@ -564,6 +564,16 @@ interface StopStamp {
   epochs: string[];
   runStartedAt?: number;
   branch?: string;
+  /**
+   * The turns a release asked for while this stop was under way (after
+   * stopTimers: a cancel that its wait for an operator's operation let run),
+   * the resident's and the subconscious's report's: asked in memory after
+   * the host's queue closed, so the stop dropped them, and the release row,
+   * shown at rest, is in the window, where the boot's wake for rows still
+   * owed doesn't count it. The next boot asks them again (noteUnstampedStop;
+   * Weft, #844).
+   */
+  wakesOwed?: { resident?: true; subconscious?: true };
 }
 
 /** A hold on record (holdsOnRecord): its epoch, and its channel, the all-except hold's excepted one with `scope`. */
@@ -1129,6 +1139,12 @@ export class TuneOutCoordinator {
   private readonly lossNoticesUnchecked = new Set<string>();
   /** The authors whose loss notice is being written now (writeLossNotices): a loss told for one meanwhile waits behind it. */
   private readonly lossNoticesWriting = new Set<string>();
+  /** The host's stop has begun (stopTimers): a turn asked for from here on is dropped with the stop's closed queue. */
+  private timersStopped = false;
+  /** The release turns asked for while the stop was under way (StopStamp's `wakesOwed`), for the stop's stamp. */
+  private readonly wakesInStop: { resident?: true; subconscious?: true } = {};
+  /** The release turns this run asked for, by whose: a boot that asks one for its own release asks none again for the last stop's. */
+  private readonly releaseTurnsAsked = new Set<'resident' | 'subconscious'>();
   /**
    * The one retry of the deferred cancels whose run threw (a release that
    * couldn't be made durable, a store operation that threw), and of the
@@ -2576,7 +2592,11 @@ export class TuneOutCoordinator {
         }
       }
       const onRecord = this.holdsOnRecord().map((hold) => hold.epochId);
-      const stamp: StopStamp = { v: 1, epochs: onRecord.filter((epochId) => !unaccounted.has(epochId)), ...this.runBound() };
+      const owed = this.wakesInStop;
+      const stamp: StopStamp = {
+        v: 1, epochs: onRecord.filter((epochId) => !unaccounted.has(epochId)), ...this.runBound(),
+        ...(owed.resident || owed.subconscious ? { wakesOwed: { ...owed } } : {}),
+      };
       this.channelRegistry.writeCoordinatorState(this.stopStampStateId, stamp);
       if (!this.stateDurable()) throw new Error('it was written but could not be made durable');
     } catch (err) {
@@ -2649,6 +2669,7 @@ export class TuneOutCoordinator {
         console.error(`[tune-out] no stop stamp is kept (${this.stopStampStateId}): a first start on a version that stamps its stops, `
           + 'so the holds on record count as stopped cleanly');
       }
+      if (stamp && stamp.v === 1 && stamp.wakesOwed && typeof stamp.wakesOwed === 'object') this.askWakesOwed(stamp.wakesOwed);
       // This run begins at the store's head as the boot found it, before
       // the boot's own releases (an end time passed, a wake budget spent):
       // those are this run's, not the last one's. Its marker is written last
@@ -2678,6 +2699,33 @@ export class TuneOutCoordinator {
       }
     } catch (err) {
       console.error(`[tune-out] whether the last stop recorded the holds on record could not be checked at boot: ${thrownReason(err)}`);
+    }
+  }
+
+  /**
+   * At boot, the release turns the last stop's stamp says it dropped
+   * (StopStamp's `wakesOwed`: asked while it was under way), asked again
+   * as the boot's wake for a release row still owed asks them (the
+   * framework's `tune-out released (restored)` and `tune-out (restored)`,
+   * so a row both owed and recorded is asked once), each unless this boot
+   * asked that turn for a release of its own already. Asked once: the
+   * boot's marker is written over that stamp. Never throws.
+   */
+  private askWakesOwed(owed: { resident?: unknown; subconscious?: unknown }): void {
+    const ask = (name: string | null, reason: string, whose: 'resident' | 'subconscious'): void => {
+      if (!name || this.releaseTurnsAsked.has(whose)) return;
+      try {
+        this.hooks.requestInference(name, reason, 'tune-out');
+        console.error(`[tune-out] the last stop dropped the turn a release asked for ${name} while it was under way, so it is asked for again`);
+      } catch (err) {
+        console.error(`[tune-out] the turn the last stop dropped for ${name}'s release could not be asked for again: ${thrownReason(err)}`);
+      }
+    };
+    try {
+      if (owed.resident === true) ask(this.hooks.primaryName(), 'tune-out released (restored)', 'resident');
+      if (owed.subconscious === true) ask(this.hooks.subconsciousName(), 'tune-out (restored)', 'subconscious');
+    } catch (err) {
+      console.error(`[tune-out] the turns the last stop dropped could not be asked for again: ${thrownReason(err)}`);
     }
   }
 
@@ -3582,6 +3630,19 @@ export class TuneOutCoordinator {
       + `and delivering the note then failed: ${reason}${/[.!?]$/.test(reason) ? '' : '.'}`;
   }
 
+  /**
+   * The turn a release asks for (`whose`: the resident's, or the
+   * subconscious's for its report), as requestInference asks it; one asked
+   * while the host's stop is under way (stopTimers, the stop proper not
+   * yet run) is dropped with the stop's closed queue, so the stop's stamp
+   * records it (`wakesOwed`) and the next boot asks it again.
+   */
+  private askReleaseTurn(agent: string, reason: string, whose: 'resident' | 'subconscious'): void {
+    this.hooks.requestInference(agent, reason, 'tune-out');
+    this.releaseTurnsAsked.add(whose);
+    if (this.timersStopped && !this.stopped) this.wakesInStop[whose] = true;
+  }
+
   /** A turn for the persistent subconscious to read the loss of its note that a release told (queuedNoteFirst), as a notice asks for one (writeLossNotice). */
   private askTurnForLoss(where: string): void {
     let subName: string | null;
@@ -3922,7 +3983,7 @@ export class TuneOutCoordinator {
       : !!subconsciousNote && this.deliverReaderNote(subconsciousNote, noteAuthor, noteMetadata);
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.askReleaseTurn(primary, `tune-out cancelled (${reason})`, 'resident');
     }
     // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the dump left
@@ -3949,7 +4010,7 @@ export class TuneOutCoordinator {
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
-      this.hooks.requestInference(subName, `tune-out cancelled: ${name}`, 'tune-out');
+      this.askReleaseTurn(subName, `tune-out cancelled: ${name}`, 'subconscious');
     } else if (!subName && this.forkReader) {
       // Forks are the reader: one last fork for the epoch, handed what no
       // fork has been handed yet, plus the cancel notice; its report follows
@@ -4424,11 +4485,11 @@ export class TuneOutCoordinator {
     this.lossesToldInRelease([first?.entry, queued, asQueued], 'all-except');
     if (!asQueued && note) this.deliverReaderNote(note, noteAuthor, { kind: 'subconscious-note', epochId });
     const primary = this.hooks.primaryName();
-    if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+    if (primary) this.askReleaseTurn(primary, `tune-out cancelled (${reason})`, 'resident');
     const notice = `[${NOTICE_TAG.tuneOutCancelled}: all channels except ${this.shown(except.serverId, except.channelId)} — ${reason}.]`;
     if (source !== 'subconscious' && subName) {
       this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);
-      this.hooks.requestInference(subName, 'tune-out cancelled: all-except', 'tune-out');
+      this.askReleaseTurn(subName, 'tune-out cancelled: all-except', 'subconscious');
     } else if (!subName && this.forkReader) {
       // One last look per channel with messages no fork was handed. That
       // holds for a reader's own release too: the reader that released read one channel's
@@ -5369,6 +5430,7 @@ export class TuneOutCoordinator {
    * tells and keeps what is left (Weft's hold 2, #844). Never throws.
    */
   stopTimers(): void {
+    this.timersStopped = true;
     if (this.releaseRetry) {
       clearTimeout(this.releaseRetry);
       this.releaseRetry = null;

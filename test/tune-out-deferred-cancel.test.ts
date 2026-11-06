@@ -1224,6 +1224,35 @@ describe("a stop while an operator's change keeps the waiting note in memory (AF
   });
 });
 
+// Weft's word on 341f99f0 (the item not run): with the stop's new order a
+// waiting cancel can complete inside the stop's wait, after the queue has
+// closed. The release (stored then, or before the stop with the hold
+// ending only then) is presented to the resident at rest, so the boot's
+// wake for rows its window is still owed doesn't count it, and the wake the
+// cancel asked for went with the stop.
+describe("the resident's wake for a release that a cancel completed inside the stop's wait (Weft's not-run on 341f99f0)", () => {
+  for (const mode of ['stop-held', 'stop-nohold'] as const) it(`${mode}: the next start asks the resident's turn once, as it would for a release whose wake a stop lost before it was run`, async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await weftHoldTwo(mode);
+    try {
+      assert.equal(h.inForce, false, 'premise: the cancel ran inside the stop, and the hold ended');
+      const release = stored(h.f).filter((m) => m.metadata?.kind === 'tune-out-cancel');
+      assert.equal(release.length, 1, 'premise: one release row');
+      const resident = h.f.framework.getAgent('agent')!.getContextManager();
+      const releaseId = (release[0] as unknown as { id: string }).id;
+      assert.ok(resident.getPresentedMessages().some((m) => m.id === releaseId), "premise: the release is in the resident's window, not owed");
+      const wakes = (internals(h.f).pendingRequests as Array<{ agentName: string; reason: string; source?: string }>)
+        .filter((r) => r.agentName === 'agent' && r.source === 'tune-out');
+      assert.deepEqual(wakes.map((r) => r.reason), ['tune-out released (restored)'], "the resident's turn is asked for, once");
+    } finally {
+      errors.mock.restore();
+      h.releaseA();
+      h.releaseB?.();
+      await h.f.close();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // AF #844 (Weft, Q5, her notice-dup probe): a loss notice whose own write
 // begins a hold is kept in memory; the hold's release stores it, and the
