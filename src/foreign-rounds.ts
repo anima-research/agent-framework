@@ -4,6 +4,9 @@
  *
  * An agent reads another agent's rounds only through an observe edge
  * (decision 1): the persistent subconscious watching the residents' slot.
+ * A co-resident's rows stored before audience stamps are the exception: a
+ * window written down from the record keeps them, and they go out as
+ * stored, as earlier releases sent them.
  * Those rounds are stored as the other agent's: its signed thinking, its
  * tool calls and their results. None of that is valid as the watcher's own.
  * A provider takes tool blocks only in their own pairing, in the turns of

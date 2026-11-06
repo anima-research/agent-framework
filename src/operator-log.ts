@@ -173,7 +173,8 @@ export interface SurgeryMarksPreview {
    * of every window since), or only windows whose view leaves them out (a
    * row a tune-out holds, which a window written down from the record
    * holds). Their marks tell Discord of messages no agent was being shown.
-   * Set only when the agent's context is presented.
+   * A message that may be in a window that couldn't be read isn't counted,
+   * and is logged. Set only when the agent's context is presented.
    */
   neverPresented?: number;
   /**
@@ -182,8 +183,11 @@ export interface SurgeryMarksPreview {
    * the write that presented the target, presented after it). They leave
    * the window as arrived and not presented, and enter it again at the
    * agent's next turn start, after what its window holds then; nothing at
-   * rest presents them before it (rollbackToMessage). Not removed, so not
-   * counted in `messagesRemoved`, and not marked. Set only then.
+   * rest presents them before it (rollbackToMessage). An own row of the
+   * agent's among them re-enters at the surgery's release. The hold is in
+   * memory, so a restart before then presents them at its pass at rest.
+   * Not removed, so not counted in `messagesRemoved`, and not marked. Set
+   * only then.
    */
   returnedToArrivals?: number;
   /**

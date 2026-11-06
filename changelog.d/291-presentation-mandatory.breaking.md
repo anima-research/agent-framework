@@ -1,6 +1,5 @@
-- **Hosts: every agent's context follows its own presentation index** (#291). `FrameworkConfig.presentationIndex`
-  is removed: what it turned on is how every framework runs (see the presentation index's entries), and a host's
-  configuration that still passes it is read as any unknown key is. `create()` refuses a context-manager without
+- **Hosts: every agent's context follows its own presentation index** (#291), in every framework, with no setting
+  to turn it on or off (see the presentation index's entries). `create()` refuses a context-manager without
   `ContextManager.presentRows` (one before 0.25.0), and a store handle without chronicle's
   `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.0 or earlier), each naming the range this package
   declares (the 291-chronicle-0.6 entry). An agent whose window
@@ -40,8 +39,8 @@
     291-window-batches entry). Going back to an earlier release after that needs a copy of the store taken before
     the upgrade.
 
-  **Migration:** drop `presentationIndex` from the configuration. A host that listened for `undo:completed`,
-  `redo:completed`, or `branch:switched` with reason `undo`/`redo`, to refresh a view listens for `window:undone`.
+  **Migration:** a host that listened for `undo:completed`, `redo:completed`, or `branch:switched` with reason
+  `undo`/`redo`, to refresh a view listens for `window:undone`.
   A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`. A host whose
   residents read each other's rounds sets `observes` on each resident, naming the others: an edge is one way, so
   two residents that share their rounds each name the other. Mail and messages meant for a co-resident stay out of

@@ -299,7 +299,9 @@ export interface ReaderFramingContext {
   /**
    * The traffic held since the last look, oldest first, as stored; empty
    * when nothing arrived. A held message is stored as it arrives, the
-   * resident's turn alive or not (#291), so the stored rows are all of it.
+   * resident's turn alive or not (#291), so the stored rows are all of it,
+   * but for one a surgery's hold or a manager awaiting recovery keeps in
+   * memory: it isn't stored yet, and is in the first backlog after it is.
    */
   backlog: StoredMessage[];
   /**

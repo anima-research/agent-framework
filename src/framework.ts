@@ -4574,8 +4574,9 @@ export class AgentFramework {
   // (falsified history — it later confabulated an apology for the skip), and
   // every subsequent compile diverged from the live prefix at that message
   // (KV bust). Invariant: nothing enters the window between a turn's dequeue
-  // and its settle except that turn's own blocks, and, before its checkpoint,
-  // the inputs its start presents (presentAtStart). Since #291 a write is
+  // and its settle except that turn's own blocks, the arrivals its tool
+  // boundaries present (presentAtBoundary), and, before its checkpoint, the
+  // inputs its start presents (presentAtStart). Since #291 a write is
   // stored at once whatever the turn, and the presentation index keeps it
   // out of the window until the agent's next presentation point.
   private activeTurnTokens: Map<string, number> = new Map();
@@ -10221,7 +10222,8 @@ export class AgentFramework {
    * `tune-out-note-undelivered`) are stored at once and
    * made durable (commitDeliveries), but the wake each asks for is in
    * memory. One stored while a turn of its agent's was alive stays out of
-   * that agent's window until the turn's end, and its wake runs after; a
+   * that agent's window until its next tool boundary or the turn's end,
+   * and its wake runs after; a
    * process that ended before then lost the wake, and the row is still not
    * in the window at the next boot. So each such row owes its agent a wake,
    * asked for here, before the boot's pass presents what each agent is owed
@@ -14897,7 +14899,9 @@ export class AgentFramework {
     // n messages are counted back from the newest of the agent's window on a
     // presented one (#291), where branchAt cuts at the write that presented
     // the target: rows the cut keeps return to arrivals (returnedToArrivals),
-    // which wait for the agent's next turn start, and rows presented with
+    // which wait for the agent's next turn start (an own row among them
+    // re-enters at the surgery's release; the hold is in memory, so a
+    // restart presents them at its pass at rest), and rows presented with
     // the target stay (keptInWindowAfterTarget).
     if (typeof params.messages === 'number' && params.messages > 0) {
       const agent = this.agents.get(agentName)!;
@@ -15450,7 +15454,11 @@ export class AgentFramework {
    * registration or after a branch move, or a context that couldn't follow
    * a branch move), which has no window of its own to undo on.
    *
-   * Returns `{ undone: false }` when there is nothing to undo.
+   * Returns `{ undone: false }` when there is nothing to undo. A store error
+   * before any row has left the window is thrown as it is, and the turn can
+   * still be undone. An undo that fails after rows left (cut short, or its
+   * checkpoint save failing) throws OperatorActionError 'failed', saying how
+   * many rows left, and can be redone (undoOnWindow).
    *
    * No branch moves, so nothing is reserved and no context manager is
    * re-initialized (#353's re-initialization follows a branch move, and an
@@ -16560,7 +16568,9 @@ export class AgentFramework {
   /**
    * Roll the active branch back so `messageId` becomes its tail: fork the
    * chronicle at that message (origin-sequence time-travel branch) and switch
-   * to the fork. Everything after the message stays on the source branch.
+   * to the fork. Everything after the message stays on the source branch
+   * (on a presented window, but for the rows stored before the write that
+   * presented it: returnedToArrivals).
    *
    * The rollback is local to the resident. Marking removed Discord messages
    * with an awareness reaction is a separate, explicit publication choice
@@ -16608,9 +16618,11 @@ export class AgentFramework {
      * start, which presents them after what its window holds then: the
      * surgery's release, a resume, the agent's turn ending or a row
      * stored for it while it is idle don't bring them back, so the cut
-     * holds until the agent speaks again. A restart before then presents
-     * them at its pass over every agent at rest. Not counted in
-     * `messagesRemoved`, and not marked. Set only on a presented window.
+     * holds until the agent speaks again. An own row of the agent's among
+     * them is the exception: it re-enters at the surgery's release, as own
+     * rows enter at every point. The hold is in memory: a restart before
+     * then presents them at its pass over every agent at rest. Not counted
+     * in `messagesRemoved`, and not marked. Set only on a presented window.
      */
     returnedToArrivals?: number;
     /**
@@ -16796,9 +16808,12 @@ export class AgentFramework {
    * the store folded: every other agent's context follows the fork before
    * the removals (followBranchMove), so each one's strategy hears the rows
    * leave, drops each summary that folded one and folds the rows it keeps
-   * again. In legacy mode it is not retroactive over derived state: a
-   * message already folded into an autobiographical summary stays in that
-   * summary — roll back to before it entered if that matters.
+   * again. Where a window can't be repaired, which is logged, its strategy
+   * hears at the next boot (presentation's retractAbsentRows), since the
+   * record no longer holds the rows. In legacy mode it is not retroactive
+   * over derived state: a message already folded into an autobiographical
+   * summary stays in that summary — roll back to before it entered if that
+   * matters.
    */
   async suppressMessages(
     agentName: string,
@@ -22701,7 +22716,8 @@ export class AgentFramework {
   }
 
   /**
-   * Logical turn end, after the turn's deferred notices are flushed: record
+   * Logical turn end, the turn's notices stored (each at its write since
+   * #291, with no queue to flush first): record
    * as noticed exactly the drafts a stored message names (the receipt, a
    * held-draft notice, a bounce notice), each with the message that names
    * it. One whose notice never reached the history stays unnoticed, for the
@@ -23392,9 +23408,9 @@ export class AgentFramework {
    * destination itself. A `>>` into a channel the agent closed or declined
    * leaves it closed, so the note goes wherever the turn's speech stayed in
    * such a channel, once per channel. It goes through addMessage, as the
-   * open notices do: held while the agent has a turn alive and written at
-   * that turn's next boundary, so it reaches the agent once and never
-   * mid-turn. No-op otherwise.
+   * open notices do: stored at once, and presented at the agent's next
+   * presentation point while a turn of its is alive, so it reaches the
+   * agent once. No-op otherwise.
    */
   private appendClosedChannelNoteAlone(agent: Agent, routing: TurnRouting): void {
     const seen = new Set<string>();
@@ -26387,8 +26403,8 @@ export class AgentFramework {
    * the gate released). Any other drop ends it as a start dropped before it
    * sends anything ends, and settles a registered ephemeral run's turn with
    * the drop's reason. That frame, if it hasn't let go of its token yet,
-   * ends on its own and settles nothing. What was deferred for the agent
-   * lands now, or at that frame's end.
+   * ends on its own and settles nothing. What was stored for the agent
+   * meanwhile is presented now (presentAtEndOf), or at that frame's end.
    */
   private endContinuedTurn(agentName: string, drop: ContinuationDrop): void {
     console.error(`[turn-continuation] ${agentName}: its turn ends without its continuation: ${drop.why}`);
@@ -32818,8 +32834,10 @@ export class AgentFramework {
    * - Each resident a batched wake is for (every resident, or a targeted
    *   batch's recipients) gets it, and each one's start
    *   decides and writes its own line: a co-resident's line, and her reply,
-   *   are her own rows and enter no other window, so neither can land under
-   *   the message or after another resident's answer. For an agent whose
+   *   are her own rows and enter no other window but an observer's
+   *   (AgentConfig.observes), which takes them as it takes her rounds; in
+   *   no other can either land under the message or after another
+   *   resident's answer. For an agent whose
    *   window isn't presented (its write-down failed, so its window is the
    *   record), only the delivery agent's start writes the slot's one line,
    *   and a co-resident's start places nothing.

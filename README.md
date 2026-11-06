@@ -180,10 +180,14 @@ agent-framework-recover \
 ```
 
 The specified Discord message is the last message the agent will still see;
-everything after it is left on the old branch. The command scans in bounded
-windows, never compiles message content, and activates the new Chronicle
-branch. By default the recovery is local to the resident: nothing is posted to
-Discord. To let the people involved see that the agent no longer has their
+everything after it is left on the old branch (on a window presented since
+#291, but for the rows stored before the write that presented it, which the
+new branch keeps and the window takes again after that message). The command
+scans in bounded windows (a presented window's `--messages` count and the check
+of a cut that would remove nothing read the window whole), never compiles
+message content, and activates the new Chronicle branch. By default the
+recovery is local to the resident: nothing is posted to Discord. To let the
+people involved see that the agent no longer has their
 messages, choose awareness marks explicitly with `--marks addressed` (removed
 messages that mentioned or replied to the bot, and DMs) or `--marks all`
 (every removed Discord message). The output counts what will be marked and
@@ -556,7 +560,10 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   with the host stopped, run this release's `agent-framework-recover --store
   <path> --agent <name> --remove-suppressed`: it makes and activates a branch
   without the hidden rows, which such a release opens, and the source branch
-  keeps them. Skipped where no summary spans one, the rows render again where
+  keeps them. That holds unless this release has written its window down: the
+  store's MANIFEST is then at version 2, which no earlier release opens, and
+  only a copy taken before the upgrade goes back (the 291-presentation-mandatory
+  changelog entry). Skipped where no summary spans one, the rows render again where
   they were stored (a prompt-cache miss from the first). Suppress rules load as
   `defer` in every release back to 0.22, so nothing wakes for their events.
   Releases 0.22 to 0.26 rewrite gate.json without `suppress` at their first
@@ -828,7 +835,8 @@ context managers, and membrane hot — so compression/refold/quarantine work run
 through the live machinery instead of offline scripts (issue #122). Quiesce
 persists across restarts; `resume` gates on a fresh per-agent feasibility
 preview of the current runtime settings (`force` overrides). While quiesced, a
-context write (a module event, an API `message.send`) is stored at once, and
+context write (a module event, an API `message.send`) is stored at once, unless
+a surgery's hold or a context manager refusing its work keeps it in memory, and
 enters the agents' windows at `resume` (#291).
 
 ```typescript
@@ -873,14 +881,16 @@ target leave the window (`returnedToArrivals`, on the result and the
 preview). The agent's own rows among them enter it again at its next
 presentation point, the surgery's release; the rest wait outside it until
 the agent's next turn start, so for them the cut holds until the agent
-speaks again. Rows that one write presented together with
+speaks again. That hold is in memory: a restart before then presents them
+at its pass over every agent at rest. Rows that one write presented together with
 the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot
 the agent observes, which the refusal names), or the host's `hide` by Discord message
 id, takes them out. The preview's `neverPresented` counts the messages it
 removes that no live agent is shown: no window holds them, or only windows
-whose view leaves them out (a row a tune-out holds). The host command's
+whose view leaves them out (a row a tune-out holds); a message that may be in
+a window that couldn't be read isn't counted, and is logged. The host command's
 `/undo n` counts back over the rows of the agent's own slot in its window. A
 removal in place
 (a `hide`, a suppression on its fork, a module's or the coalescer's removal)
