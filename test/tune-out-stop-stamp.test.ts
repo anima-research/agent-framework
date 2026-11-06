@@ -83,6 +83,10 @@ function stampSetup() {
     rowsFailFrom: Infinity, rowReads: 0,
     /** The subconscious's rows can't be read: its window and its stored rows (subconsciousWindow, subconsciousStoredMessages) throw. */
     subRowsUnreadable: false,
+    /** How many reads of the all-except hold's record throw, from the next on. */
+    scopeReadFails: 0,
+    /** How many reads of the loss record throw, from the next on. */
+    lossReadFails: 0,
   };
   /** Every write for the subconscious, stored, whether or not its window holds it (`frozen`). */
   const subRows: Row[] = [];
@@ -106,6 +110,8 @@ function stampSetup() {
     },
     readCoordinatorState: (id: string) => {
       if (state.stampUnreadable && id === STAMP) throw new Error('the stamp could not be read (test)');
+      if (id === SCOPE && state.scopeReadFails > 0) { state.scopeReadFails--; throw new Error("the all-except hold's record could not be read (test)"); }
+      if (id === LOSS_RECORD && state.lossReadFails > 0) { state.lossReadFails--; throw new Error('the loss record could not be read (test)'); }
       return states.get(id) ?? null;
     },
     writeCoordinatorState: (id: string, value: unknown) => {
@@ -1997,4 +2003,20 @@ test("review 5 #25: a note, or a release telling a queued note's loss, stored be
         : askedRow(e, 'Look again.')], `${before}: ${before.startsWith('control') ? 'the note after the ask is its own' : 'the ask is told lost, with its note'}`);
     } finally { h.stopAll(); }
   }
+}));
+
+test("review 5 #36: a start whose first read of the all-except hold's record throws is refused, so the next start still tells the last run's waiting cancel from its rows", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    // The host dies with that cancel waiting; the next start's first read of the all-except hold's record throws, once.
+    h.state.scopeReadFails = 1;
+    assert.throws(() => h.boot(), /the all-except hold's record could not be read/, 'the start is refused, as a later read that throws refuses it');
+    assert.deepEqual(h.unrecorded(), [], 'nothing is told by the start refused');
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')],
+      "the next start reads the last run's rows: the ask, told lost with its note");
+  } finally { h.stopAll(); }
 }));

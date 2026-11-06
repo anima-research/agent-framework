@@ -1211,6 +1211,12 @@ export class TuneOutCoordinator {
     } catch {
       bootHead = undefined;
     }
+    // The all-except hold's record first, uncaught: its first read is the
+    // store's (getAllExcept caches it once read), and one that throws
+    // refuses the start, as the read below would. Caught with the holds
+    // below, it read as no hold, and the last stop's stamp was written over
+    // unchecked, its bound with it (AF #844 review 5, #36).
+    this.getAllExcept();
     let onRecord: HoldOnRecord[] = [];
     try {
       onRecord = this.holdsOnRecord();
