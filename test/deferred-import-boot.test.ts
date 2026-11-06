@@ -1,7 +1,9 @@
 /**
  * The one-release importer (#291, AF-6): a store a release before #291 left
  * with writes still in its deferred queue boots, stores each of them once,
- * in the order they arrived, and clears the queue's record. A second boot
+ * in the order they arrived (a gone agent's are passed on or dropped,
+ * logged; one whose landing can't be checked is kept, with what follows it
+ * for that agent, for the next boot), and clears the queue's record. A second boot
  * imports nothing. Each case here writes the record by hand, as such a
  * release left it (recovery/deferred-writes.json, or the store's
  * framework/deferred-writes slot), since this release keeps no queue to
@@ -271,7 +273,9 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       queryMessages(...args: unknown[]): unknown;
       getMessageWindow(offset: number, limit: number, opts?: { resolveBlobs?: boolean }): Window;
     };
-    async function bootWithLookupFailing(h: Host, short: boolean): Promise<AgentFramework> {
+    /** `short`: the blob-free scan comes back a row short; `'unreadable'`: it
+     *  finds the row, and the read of that row with its blobs throws. */
+    async function bootWithLookupFailing(h: Host, short: boolean | 'unreadable'): Promise<AgentFramework> {
       const proto = AgentFramework.prototype as unknown as { landedCopiesById(agent: { getContextManager(): unknown }, id: string): unknown };
       const original = proto.landedCopiesById;
       proto.landedCopiesById = function (agent, id) {
@@ -279,7 +283,12 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         const query = cm.queryMessages;
         const read = cm.getMessageWindow;
         cm.queryMessages = () => { throw new Error('Blob not found: 0123'); };
-        if (short) {
+        if (short === 'unreadable') {
+          cm.getMessageWindow = function (this: unknown, offset, limit, opts) {
+            if (opts?.resolveBlobs === false) return read.call(this, offset, limit, opts);
+            throw new Error('Blob not found: 4567');
+          };
+        } else if (short) {
           cm.getMessageWindow = function (this: unknown, offset, limit, opts) {
             const window = read.call(this, offset, limit, opts);
             return opts?.resolveBlobs === false ? { ...window, messages: window.messages.slice(1) } : window;
@@ -295,11 +304,17 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       try { return await h.boot(); } finally { proto.landedCopiesById = original; }
     }
 
-    async function storedEarlier(h: Host): Promise<number> {
+    /** `ahead`: rows stored before the write, so the scan finds it past its
+     *  first window; `image`: an image block in the write, whose blob the
+     *  read of its stored copy resolves. */
+    async function storedEarlier(h: Host, options: { ahead?: number; image?: boolean } = {}): Promise<number> {
       const framework = await h.boot();
       try {
         const cm = framework.getAgent('agent')!.getContextManager();
-        cm.addMessage('user', text('found earlier'), { deferredWriteId: 'u1' } as never);
+        for (let i = 0; i < (options.ahead ?? 0); i++) cm.addMessage('user', text(`ahead ${i}`));
+        const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+        const image = { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } } as ContentBlock;
+        cm.addMessage('user', [...text('found earlier'), ...(options.image ? [image] : [])], { deferredWriteId: 'u1' } as never);
         return cm.getMessageCount();
       } finally { await framework.stop(); }
     }
@@ -317,6 +332,25 @@ describe('the deferred-write importer (#291, AF-6)', () => {
           assert.equal(withText(framework, 'found earlier').length, 1, 'not stored again');
           assert.equal(withText(framework, 'behind it').length, 1, 'what follows it is stored');
           assert.deepEqual(h.readQueue().pending, []);
+        } finally { await framework.stop(); }
+      } finally { h.close(); }
+    });
+
+    // The scan reads the store in windows of 500 rows (landedPositions).
+    it('is found past the scan\'s first window, its stored copy read with its image, and not stored again', async () => {
+      const h = await host();
+      try {
+        const count = await storedEarlier(h, { ahead: 600, image: true });
+        assert.ok(count > 600, 'premise: the write is stored past the first window of the scan');
+        h.writeQueue([
+          entry('u1', 1, 'found earlier', { landing: 'unknown' }),
+          entry('u2', 2, 'behind it'),
+        ], { agent: count });
+        const framework = await bootWithLookupFailing(h, false);
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'found, and not stored again');
+          assert.equal(withText(framework, 'behind it').length, 1, 'what follows it is stored');
+          assert.deepEqual(h.readQueue().pending, [], 'nothing kept: its copy was read, image and all');
         } finally { await framework.stop(); }
       } finally { h.close(); }
     });
@@ -343,6 +377,35 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         framework = await h.boot();
         try {
           assert.equal(withText(framework, 'found earlier').length, 1, 'once, when the next boot can search');
+          assert.equal(withText(framework, 'behind it').length, 1);
+          assert.deepEqual(h.readQueue().pending, []);
+        } finally { await framework.stop(); }
+      } finally { h.close(); }
+    });
+
+    it("whose blob-free scan finds it but whose stored copy can't be read, is kept with what follows it for the next boot, and not stored again", async () => {
+      const h = await host();
+      try {
+        const count = await storedEarlier(h);
+        h.writeQueue([
+          entry('u1', 1, 'found earlier', { landing: 'unknown' }),
+          entry('u2', 2, 'behind it'),
+        ], { agent: count });
+        const errors: string[] = [];
+        const quiet = console.error;
+        console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+        let framework: AgentFramework;
+        try { framework = await bootWithLookupFailing(h, 'unreadable'); } finally { console.error = quiet; }
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'not taken as absent and stored again');
+          assert.equal(withText(framework, 'behind it').length, 0, 'held behind it');
+          assert.deepEqual(h.readQueue().pending.map((m) => m.id), ['u1', 'u2'], 'left for the next boot, in order');
+          assert.ok(errors.some((e) => e.includes("found deferred write u1 in agent's store, but could not read its stored copy")
+            && e.includes('Blob not found: 4567')), errors.join('\n'));
+        } finally { await framework.stop(); }
+        framework = await h.boot();
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'once, when the next boot can read it');
           assert.equal(withText(framework, 'behind it').length, 1);
           assert.deepEqual(h.readQueue().pending, []);
         } finally { await framework.stop(); }
@@ -379,6 +442,50 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       } finally { await framework.stop(); }
     } finally {
       proto.landedCopiesById = original;
+      h.close();
+    }
+  });
+
+  // The import's own store write failing (not its lookup): the write and
+  // what follows it for that agent stay queued, the other agents' go on.
+  it("keeps a write whose store throws, and what follows it for that agent, for the next boot, logged, and stores the other agents'", async () => {
+    const h = await host([{ name: 'mira' }, { name: 'oren' }]);
+    const proto = StoreWindow.prototype as unknown as { addMessage(participant: string, content: ContentBlock[], ...rest: unknown[]): unknown };
+    const original = proto.addMessage;
+    const errors: string[] = [];
+    const quiet = console.error;
+    try {
+      h.writeQueue([
+        entry('k1', 1, 'unstorable', { forAgent: 'oren' }),
+        entry('k2', 2, 'behind it', { forAgent: 'oren' }),
+        entry('k3', 3, 'for mira', { forAgent: 'mira' }),
+      ]);
+      let refused = 0;
+      proto.addMessage = function (this: unknown, participant, content, ...rest) {
+        if (JSON.stringify(content).includes('unstorable')) { refused++; throw new Error('zz-store-write-failed'); }
+        return original.call(this, participant, content, ...rest);
+      };
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      let framework: AgentFramework;
+      try { framework = await h.boot(); } finally { proto.addMessage = original; console.error = quiet; }
+      try {
+        assert.equal(refused, 1, "premise: k1's store write threw");
+        assert.equal(withText(framework, 'for mira', 'mira').length, 1, 'another agent goes on');
+        assert.equal(withText(framework, 'unstorable', 'oren').length, 0);
+        assert.equal(withText(framework, 'behind it', 'oren').length, 0, 'held behind the write it follows');
+        assert.deepEqual(h.readQueue().pending.map((m) => m.id), ['k1', 'k2'], 'left for the next boot, in order');
+        assert.ok(errors.some((e) => e.includes('a context write an earlier version queued could not be stored, so it and what follows it for oren stay queued for the next boot')
+          && e.includes('zz-store-write-failed')), errors.join('\n'));
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.deepEqual(rowsOf(framework, 'oren').map(textOf).filter((t) => ['unstorable', 'behind it'].includes(t)), ['unstorable', 'behind it'], 'each once, in order');
+        assert.equal(withText(framework, 'for mira', 'mira').length, 1, 'once');
+        assert.deepEqual(h.readQueue().pending, []);
+      } finally { await framework.stop(); }
+    } finally {
+      proto.addMessage = original;
+      console.error = quiet;
       h.close();
     }
   });
@@ -779,6 +886,44 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     { mode: 'before-rewrite', label: 'after the sync, before the record is cleared', count: 4 },
     { mode: 'big-before-rewrite', label: 'after a 2,101-write import synced, before the record is cleared', count: 2_101 },
   ] as const;
+  // The crash cases above run on stores this release made. One an earlier
+  // release left has no window index: the crashed boot wrote it down and
+  // stored the queue, and the next boot finds the rows and the record both.
+  it('a process exit after the sync, before the record is cleared, on a store an earlier release left with no window index, stores the write once, after the earlier rows in the window', { timeout: 600_000 }, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'deferred-import-legacy-crash-'));
+    const storePath = join(dir, 'store');
+    try {
+      {
+        const store = JsStore.openOrCreate({ path: storePath });
+        const cm = await StoreWindow.open({ store, ...residentContextOptions('agent'), strategy: new PassthroughStrategy() });
+        for (const t of ['old-1', 'old-2']) cm.addMessage('someone', text(t), {});
+        assert.equal(cm.windowMode(), 'legacy', 'setup: the store predates the index');
+        cm.close();
+        store.close();
+      }
+      const recovery = join(storePath, 'recovery');
+      mkdirSync(recovery, { recursive: true });
+      writeFileSync(join(recovery, 'deferred-writes.json'), JSON.stringify({ version: 2, pending: [entry('q1', 1, 'queued-1')] }));
+      const child = await runChild(storePath, 'before-rewrite', t.signal);
+      assert.equal(child.status, 0, `the child exited where it was told (stderr: ${child.stderr.slice(-800)})`);
+      const boot = () => AgentFramework.create({
+        storePath, membrane: new MockMembrane().asMembrane(), modules: [], syncIntervalMs: 0,
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'You are agent.' }],
+      } as Parameters<typeof AgentFramework.create>[0]);
+      for (const pass of ['the next boot', 'another boot']) {
+        const framework = await boot();
+        try {
+          const cm = framework.getAgent('agent')!.getContextManager();
+          assert.equal(cm.windowMode(), 'presented', `${pass}: the window is written down`);
+          assert.deepEqual(withText(framework, 'queued-1').map(writeIdOf), ['q1'], `${pass}: stored once, under its queued id`);
+          assert.deepEqual(JSON.parse(readFileSync(join(recovery, 'deferred-writes.json'), 'utf8')), { version: 1, pending: [] }, `${pass}: the record is cleared`);
+          assert.deepEqual(cm.getPresentedMessages().map(textOf).filter((x) => /^old-\d$|^queued-1$/.test(x)), ['old-1', 'old-2', 'queued-1'],
+            `${pass}: the window holds the earlier rows, then the write`);
+        } finally { await framework.stop(); }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   for (const crash of CRASHES) {
     // The suite's own timeout: the 2,101-write case passes in seconds alone,
     // and ran past 120 s on a loaded full-suite run (review2 J-AF38).

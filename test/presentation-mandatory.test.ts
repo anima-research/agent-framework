@@ -2,9 +2,11 @@
  * Presentation is mandatory (#291, AF-6): FrameworkConfig.presentationIndex
  * is gone, and every agent is taken on as it is registered, its window
  * written down and presented, whatever a host's configuration still says. A
- * turn's requests are its window, which is the record when no other
- * agent's turn overlaps it and every row in the slot is meant for it, and a
- * write stamped only for agents that can't read its slot is traced once. A
+ * turn's requests are its window, and a request-only `[Continue]` where the
+ * window ends on its own reply. The window is the record when nothing
+ * arrives for the agent during a turn and every row in the slot is meant
+ * for it, and a write stamped only for agents that can't read its slot is
+ * traced once. A
  * context-manager that keeps no window index is refused, and so is a store
  * handle without chronicle's batched identity append, with which
  * context-manager writes a window. The package loads on context-manager

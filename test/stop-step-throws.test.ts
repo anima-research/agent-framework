@@ -281,6 +281,7 @@ describe('a step of stop() that throws', () => {
       assert.ok(waited < 10_000, 'the note is stored while the stream runs');
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    assert.equal(resident.windowStatusOf(note()!.id), 'out', "stored, and out of the live turn's window");
     const ended = startRun();
     // No budget, as connectome-host stops a framework. The stream runs until
     // the test releases it, so a stop() that waited for it wouldn't settle.
@@ -294,6 +295,7 @@ describe('a step of stop() that throws', () => {
     assert.match(String(ended()), /refused: the framework is stopping/, "stop()'s sweep ended the pending ephemeral run");
     assert.equal(internals(framework).ownedStoreClosed, false, 'the store stays open while the stream runs');
     assert.ok(note(), "the resident's note is kept while its stream runs");
+    assert.equal(resident.windowStatusOf(note()!.id), 'out', "and still out of the window of the turn stop() left running");
     // A later stop() waits for the stream the first one left running: its own
     // cancel has run (and thrown), and it hasn't reached the watchdog's stop,
     // which comes after the waits.

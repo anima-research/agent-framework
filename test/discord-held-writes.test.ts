@@ -3,8 +3,8 @@
  * record of the creates on their way). The framework holds a module's writes
  * while the agent's turn is alive or the host is quiesced, and a module's
  * reads now see them, marked held, and its edits and removals reach them. So
- * a message deleted while its create is held is never stored, one edited
- * then is stored as edited, a sync's held add keeps a live create from
+ * a message deleted while its create is held is removed, and none of it is
+ * stored after the resume, one edited then is stored as edited, a sync's held add keeps a live create from
  * adding a second copy, and a create whose write hasn't landed ends its
  * record once its row shows, so a sync no longer passes over the message.
  * The module runs in a real framework, which holds its writes by quiescing
@@ -106,7 +106,7 @@ const storedTexts = (framework: AgentFramework, id: string): string[] =>
     .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === id)
     .map(textOf);
 
-test('a message deleted while its create is held is never stored', async () => {
+test('a message deleted while its create is held is removed, and none of it is stored after the resume', async () => {
   await withDiscord(async ({ framework, discord, rows }) => {
     await discord.onMessageHandler!(live('m1', 'taken back'));
     await waitFor('the create to be held', () => rows('m1').length === 1);
@@ -358,6 +358,7 @@ for (const [change, kept, gone] of [['deleted', [], 'taken back'], ['edited', ['
       assert.ok(!messages.includes(gone), `the turn's request doesn't carry "${gone}"`);
       if (change === 'edited') assert.ok(messages.includes('as edited'), "the turn's request carries the edited text");
       await drained(s.framework);
+      assert.ok(membrane.calls.every((call) => !JSON.stringify(call.messages).includes(gone)), `no request of the turn's carries "${gone}"`);
       assert.deepEqual(s.texts('k5'), kept);
     } finally {
       await s.cleanup();
@@ -387,13 +388,16 @@ test("a message deleted while its create is kept in memory, whose delete is stil
     await within(firstRequest, "the turn's first request");
     assert.ok(!JSON.stringify(membrane.calls[0]!.messages).includes('taken back'), "the turn's request doesn't carry the deleted text");
     await drained(s.framework);
+    assert.ok(membrane.calls.every((call) => !JSON.stringify(call.messages).includes('taken back')), "no request of the turn's carries the deleted text");
     assert.deepEqual(s.texts('k9'), []);
   } finally {
     await s.cleanup();
   }
 });
 
-test("edits made while a create is kept in memory apply in turn at the release, so a later text-only edit keeps an earlier edit's removed attachment removed", async (t) => {
+for (const removes of [true, false]) test(removes
+  ? "edits made while a create is kept in memory apply in turn at the release, so a later text-only edit keeps an earlier edit's removed attachment removed"
+  : "the control: a text-only edit made while a create is kept in memory keeps the attachment the create carried", async (t) => {
   const original = globalThis.fetch;
   let fetched = 0;
   globalThis.fetch = (async () => { fetched++; return new Response('NOTES BODY', { status: 200, headers: { 'content-type': 'text/plain' } }); }) as typeof fetch;
@@ -408,9 +412,11 @@ test("edits made while a create is kept in memory apply in turn at the release, 
     });
     await created;
     assert.deepEqual([fetched, kept(), texts('k10')], [1, 1, []], "the create's attachment was fetched, and the create is kept in memory, not stored");
-    const first = processed('discord:edit', 'k10');
-    edit(discord, 'with notes', []);
-    await first;
+    if (removes) {
+      const first = processed('discord:edit', 'k10');
+      edit(discord, 'with notes', []);
+      await first;
+    }
     const second = processed('discord:edit', 'k10');
     edit(discord, 'edited text');
     await second;
@@ -420,7 +426,8 @@ test("edits made while a create is kept in memory apply in turn at the release, 
     const row = JSON.stringify(s.framework.getAgent('Sol')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === 'k10').map((m) => m.content));
     assert.ok(row.includes('edited text'), `the later edit's text is stored: ${row}`);
-    assert.ok(!row.includes('NOTES BODY'), `the attachment the earlier edit removed stays removed: ${row}`);
+    if (removes) assert.ok(!row.includes('NOTES BODY'), `the attachment the earlier edit removed stays removed: ${row}`);
+    else assert.ok(row.includes('NOTES BODY'), `the create's attachment is stored with the text-only edit: ${row}`);
   } finally {
     await s.cleanup();
   }

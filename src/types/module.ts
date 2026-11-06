@@ -80,9 +80,10 @@ export type ModuleMessage = StoredMessage & {
    * True on a message a tune-out holds from the residents: one that arrived
    * in a tuned-out channel, stamped `metadata.tuneOut` as it came in. The
    * store keeps it, but no resident is shown the row itself: no resident's
-   * compiled view includes it, during the tune-out or after it, and a
-   * resident's tool boundary of a turn alive when it arrived stores it
-   * without injecting it into the live turn. The subconscious reads it. Its
+   * compiled view includes it, during the tune-out or after it. It is
+   * stored as any write is, and a resident's tool boundary of a turn alive
+   * when it arrived doesn't inject it into the live turn. The subconscious
+   * reads it. Its
    * text can still reach a resident in rows of their own, which aren't
    * marked, such as the
    * cancel's `<tuned-out-backlog>` row, with the text of the tune-out's newest

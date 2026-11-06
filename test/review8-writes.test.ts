@@ -2,9 +2,10 @@
  * Write paths the AF #844 bot review (round 8) found wanting: an agent's own
  * row whose add throws with rows of it stored (storeOwnRow and the
  * tool-result guard's two writes), the boot's worker-ended notice and the
- * results it reads, the deferred-write importer and the held mail its boot
- * releases, the coalescer's failure snapshot, and the window reads whose
- * failure a caller has to be able to tell from an answer.
+ * results it reads, and the window reads whose failure a caller has to be
+ * able to tell from an answer. The same round's deferred-write importer and
+ * the held mail its boot releases are tested in deferred-import-boot, and the
+ * coalescer's failure snapshot in mcpl-coalescing.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -151,7 +152,11 @@ describe('an own row whose add throws with rows of it stored (AF #844 findings 2
   it('a row held back (present: false) stays out of the window though its add threw after it landed', async () => {
     const h = await bootOne();
     landThenThrowOnce(h.cm, 'held-back');
-    await quietly(() => { try { storeOwnRow(h.agent, 'mira', [text('held-back')], undefined, undefined, false); } catch { /* passed on */ } });
+    const { value: thrown } = await quietly(() => {
+      try { storeOwnRow(h.agent, 'mira', [text('held-back')], undefined, undefined, false); } catch (error) { return error; }
+      return undefined;
+    });
+    assert.ok(thrown instanceof WriteLandedError, 'the add threw after it landed, and its error is passed on');
     assert.equal(h.status('held-back'), 'out', 'its writer held it back for the next point\'s sweep');
   });
 

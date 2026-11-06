@@ -2,8 +2,9 @@
  * What the window holds mid-turn is what the live stream carried (#291's
  * presentation index).
  *
- * A write is stored at once, whatever its agent's turn, and enters the
- * agent's window at the agent's next presentation point. One that arrives
+ * A write is stored at once, whatever its agent's turn (unless a surgery's
+ * hold or a refusing manager keeps it in memory), and enters the agent's
+ * window at the agent's next presentation point. One that arrives
  * during a round enters at the agent's next tool boundary and is injected
  * into the resumed stream (hear-while-acting), so the next compile's prefix
  * is the request the turn's later replies were minted under. Two kinds of
@@ -45,7 +46,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { markAtOrAfter } from '../src/read-marks.js';
+import { markAtOrAfter, readMarkOf } from '../src/read-marks.js';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -64,6 +65,10 @@ class InterjectingModule implements Module {
   interjections: Interjection[] = [];
   /** Run inside the next tool call, after the interjections are delivered. */
   duringTool: (() => void) | null = null;
+  /** The first error a tool call threw: its wait for the interjections, or
+   *  an assertion in duringTool. The registry answers a throw as a tool
+   *  error and the turn goes on, so a test reads it here (assert.ifError). */
+  failure: unknown = undefined;
 
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
@@ -76,6 +81,15 @@ class InterjectingModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    try {
+      return await this.runToolCall(call);
+    } catch (err) {
+      this.failure ??= err;
+      throw err;
+    }
+  }
+
+  private async runToolCall(call: ToolCall): Promise<ToolResult> {
     const pending = this.interjections;
     this.interjections = [];
     for (const interjection of pending) {
@@ -174,6 +188,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     module.interjections = interjections;
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
     await framework.runUntilIdle();
+    assert.ifError(module.failure);
     return framework;
   }
 
@@ -311,6 +326,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     };
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
     await framework.runUntilIdle();
+    assert.ifError(module.failure);
     assert.equal(during, 'out', 'stored, and out of the live turn\'s window');
     if (carries) {
       assert.deepEqual(injected(), ['Antra: bypassed'], 'heard at the boundary');
@@ -398,6 +414,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     };
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
     await framework.runUntilIdle();
+    assert.ifError(module.failure);
     assert.ok(internals.pendingAssistantBlocks.has('builder'), "the other agent's cycle is still pending");
     assert.deepEqual(windowOf(framework).slice(-2), ['assistant: Done.', 'assistant: my own words']);
     internals.pendingAssistantBlocks.delete('builder');
@@ -452,6 +469,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     };
     try {
       await framework.puppetToolCall('assistant', 'robot--move', {});
+      assert.ifError(module.failure);
       assert.deepEqual(windowOf(framework).slice(-3), ['assistant: <tool_use>', 'user: <tool_result>', 'Antra: while puppeted']);
     } finally {
       internals.pendingAssistantBlocks.delete('builder');
@@ -533,6 +551,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       try {
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
+        assert.ifError(module.failure);
         const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
         if (landed.length <= 1) {
           differ.push(`${name}: stored as ${landed.length} shard(s), not sharded`);
@@ -547,6 +566,14 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         if (injected.length !== 1 || next.length !== 1) {
           differ.push(`${name}: ${injected.length} message(s) injected, ${next.length} in the next request, where one of each is`);
           continue;
+        }
+        // Whole: the next compile renders the body's last sentence, and its
+        // image where it was given one.
+        const rendered = next[0]!.content as ContentBlock[];
+        const renderedText = rendered.map((b) => (b.type === 'text' ? (b as { text: string }).text : '')).join('');
+        if (!renderedText.includes('Sentence 59 ')) differ.push(`${name}: the next compile renders the body without its last sentence`);
+        if (content.some((b) => b.type === 'image') && !rendered.some((b) => b.type === 'image')) {
+          differ.push(`${name}: the next compile renders the body without its image`);
         }
         if (!isDeepStrictEqual(injected[0]!.content, next[0]!.content)) differ.push(`${name}: the injection differs from the next compile`);
       } finally {
@@ -617,9 +644,16 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       return compile(...args);
     };
     const compiling = agent.compileContext();
-    cm.addMessage('Antra', text('heard at a boundary'));
+    // The mark the compile took as it started, which it applies once it ends.
+    const atStart = readMarkOf(cm)!;
+    // A row the boundary heard, presented while the compile runs (at once:
+    // no turn is alive), so the boundary's mark is past the compile's.
+    const heard = internalsOf(framework).addMessage('Antra', text('heard at a boundary'));
+    assert.equal(cm.windowStatusOf(heard as never), 'in', 'presented at once: no turn is alive');
     agent.markContextConsumed();
-    const marked = agent.getConsumedWatermark();
+    const marked = agent.getConsumedWatermark()!;
+    assert.ok(markAtOrAfter(marked, atStart) === true && markAtOrAfter(atStart, marked) === false,
+      "premise: the boundary's mark is past the compile's");
     release();
     await compiling;
     assert.deepEqual(agent.getConsumedWatermark(), marked, "the boundary's mark stands");
@@ -675,6 +709,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
     await teardown;
     await new Promise((resolve) => setImmediate(resolve));
+    assert.ifError(module.failure);
     assert.ok(!windowOf(framework).includes('assistant: my own words'), "not in the window inside the successor's cycle");
     assert.equal(statusOf(framework, held), 'out');
     // The successor's cycle and turn end: what it is owed enters its window.

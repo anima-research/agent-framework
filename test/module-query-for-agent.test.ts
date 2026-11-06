@@ -229,7 +229,7 @@ test("a module's write for another ordinary resident lands in the shared slot, w
   const x = await make(['prime', 'helper']);
   const id = x.reader.ctx!.addMessage('user', [text('FOR HELPER')], undefined, { forAgent: 'helper' });
   assert.ok(storedFor(x, 'helper', id), 'its stored id');
-  assert.deepEqual(texts(x.reader.ctx!.queryMessages({ participant: 'user' })), ['FOR HELPER'], "the primary's window is the residents' slot");
+  assert.deepEqual(texts(x.reader.ctx!.queryMessages({ participant: 'user' })), ['FOR HELPER'], "the primary's query reads the residents' slot");
   assert.equal(texts({ messages: [x.reader.ctx!.getMessage(id)!] })[0], 'FOR HELPER');
   x.reader.ctx!.editMessage(id, [text('EDITED')]);
   assert.deepEqual(texts(x.reader.ctx!.queryMessages({ participant: 'user' }, { forAgent: 'helper' })), ['EDITED']);

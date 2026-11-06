@@ -140,6 +140,8 @@ describe('read marks once windows are presented (#291)', () => {
     assert.equal(h.internals.rowDone(h.mira, row, undefined), true);
     h.internals.pendingRequests.push({ agentName: 'mira', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: row });
     assert.equal(await h.turnsStarted(), 0, 'its wake starts no turn');
+    assert.deepEqual(h.internals.pendingRequests.filter((r) => r.agentName === 'mira'), [],
+      'and is dropped, not put back in the queue');
   });
 
   it("a row presented to mira alone stays unread after oren compiles, until mira's mark covers it", async () => {

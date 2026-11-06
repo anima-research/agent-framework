@@ -147,7 +147,15 @@ async function run(duringFirstTurn: boolean): Promise<Result> {
       framework.pushEvent(message);
     }
     await framework.runUntilIdle();
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // runUntilIdle doesn't wait for the assistant's tool call, which holds
+    // until the helper's request (capped): count once it has returned and
+    // both agents are at rest, then let what that set going run.
+    const atRest = () => !module.holding
+      && ['assistant', 'helper'].every((name) => framework.getAgent(name)!.state.status === 'idle');
+    for (const deadline = Date.now() + 20_000; !atRest();) {
+      if (Date.now() > deadline) throw new Error("the assistant's tool call never returned, or an agent never came to rest");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     await framework.runUntilIdle();
     const helper = requests.filter((r) => r.agent === 'helper');
     // What the assistant's first stream, whose tool call the message arrived

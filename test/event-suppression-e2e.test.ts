@@ -118,8 +118,10 @@ describe('event suppression', () => {
       const { loop } = await blockInTool(f, gate);
       await incoming(f, 'noisy', 'n1', 'hidden while acting');
       await incoming(f, 'work', 'w2', 'shown while acting');
-      // Every write is stored at once (#291): one arriving mid-turn is in the
-      // store, out of the live turn's window until a point presents it.
+      // Every write is stored at once (#291), unless a surgery's hold or a
+      // context manager refusing its work keeps it in memory, and neither is
+      // in force here: one arriving mid-turn is in the store, out of the live
+      // turn's window until a point presents it.
       const arrived = (text: string) => () => has(f, text);
       await eventually(arrived('hidden while acting'), 'the suppressed message arrived');
       await eventually(arrived('shown while acting'), 'the control arrived');

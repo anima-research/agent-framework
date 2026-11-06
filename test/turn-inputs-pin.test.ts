@@ -747,10 +747,19 @@ test("a pin starts at the first row the agent sees, past rows it never sees unde
     await withFramework(membrane, module, agent, async (framework) => {
       const cm = cmOf(framework);
       const tunedOut = { tuneOut: { epochId: 'away' } } as never;
-      cm.addMessage('Dana', text('TUNED OUT before the aside.'), tunedOut);
-      cm.addMessage('Dana', text('An aside before.'));
-      cm.addMessage('prime', text('TUNED OUT, under the agent\'s own name.'), tunedOut);
-      cm.addMessage('Dana', text(`TUNED OUT ${PAGE.repeat(8)}`), tunedOut);
+      const written = [
+        cm.addMessage('Dana', text('TUNED OUT before the aside.'), tunedOut),
+        cm.addMessage('Dana', text('An aside before.')),
+        cm.addMessage('prime', text('TUNED OUT, under the agent\'s own name.'), tunedOut),
+        cm.addMessage('Dana', text(`TUNED OUT ${PAGE.repeat(8)}`), tunedOut),
+      ];
+      // A tuned-out row is 'elsewhere' for a resident, so no presentation
+      // point takes it in; a window written down from the record (an earlier
+      // release's) holds it, though. Put the rows in the window as that one
+      // does, so only the view filter keeps them out of the request and the
+      // budget.
+      cm.presentRows(written);
+      for (const id of written) assert.notEqual(cm.ordinalOf(id), undefined, 'the row is in the window');
       let pins: ProtectedRange[] | undefined;
       module.onCall = () => { pins = inputPins(framework); };
       ask(framework);

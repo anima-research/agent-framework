@@ -355,11 +355,16 @@ describe('round 2: a change is put back when its write fails; a record of what h
     // The record holds the row for every reader; each reader's view is what
     // compile() shows it (the view filter is strategy-facing, not the record).
     // On this branch that is the reader's window, so the rows are presented to
-    // both residents first (as a turn's end would); the injection is 'elsewhere'
-    // for nova by audience (presentation-audience) and out of its view by filter.
+    // both residents first (as a turn's end would). The injection is
+    // 'elsewhere' for nova by audience (presentation-audience), so no point
+    // takes it into nova's window; a window written down from the record (an
+    // earlier release's) holds it, though. Put it in nova's window as that one
+    // does, so only the view filter keeps it out of nova's compiles.
     const presentTo = (framework: AgentFramework, name: string): void =>
       (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent(name));
     presentTo(first, 'mira'); presentTo(first, 'nova');
+    nova.presentRows(nova.getUnpresentedMessages().map((m) => m.id));
+    assert.deepEqual(nova.getUnpresentedMessages(), [], "premise: nova's window holds every row, mira's injection included");
     const shows = async (cm: ContextManager) =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.some((m) => textOf(m.content).includes('standing context'));
     assert.equal(nova.getAllMessages().length, 7, 'the one slot holds the row');

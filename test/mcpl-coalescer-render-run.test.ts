@@ -19,8 +19,9 @@ interface Options {
  *  removed, read, or gone, whichever agent assembled it. CoalescerHost leaves
  *  placement to the host, so this is one it allows; the framework presents
  *  the assembling agent's own render before its turn's compile, which
- *  mcpl-coalescing's tests run. Its removal, like the framework's, doesn't
- *  refuse a message a request has read. Each render says which notices it
+ *  mcpl-coalescing's tests run. Its removal refuses nothing; the
+ *  framework's refuses a row a request has read, which the coalescer,
+ *  asking isUnread first, never asks it to remove. Each render says which notices it
  *  covers, as a notice-only server's does. (Before #291 such a delivery
  *  waited in the framework's deferred queue, under a `deferredId`.) */
 function makeHost(options: Options = {}) {
@@ -236,6 +237,25 @@ test('a run of three renders stays in placement order, and a retraction removes 
   const result = await coalescer.accept(retraction());
   assert.deepEqual(h.removed, ['row-3', 'row-2', 'row-1']);
   assert.equal(result.coalesce?.outcome, 'retracted');
+});
+
+// Before #291 a delivery that waited in the framework's deferred queue was
+// placed as { agent, deferredId }, with no message id, and a snapshot an
+// earlier release saved can hold one as its occupant.
+test("a snapshot an earlier release saved, whose occupant was placed in the deferred queue, restores it as read, for its agent", async () => {
+  const h = makeHost();
+  await threeRenders(new PushCoalescer<null>(h.host));
+  const snapshot = structuredClone(h.snapshot());
+  const subject = snapshot.subjects.find((s) => s.occupant)!;
+  subject.occupant = { eventId: 'n3', placement: { agent: 'other', deferredId: 'deferred-3' } as never };
+  subject.history = 'unknown';
+  delete subject.audienceAgent;
+  const restored = new PushCoalescer<null>(makeHost().host);
+  restored.restore(snapshot);
+  const state = (restored as unknown as { subjects: Map<string, { history: string; audienceAgent?: string; consumedEventId?: string }> })
+    .subjects.get(subject.subject);
+  assert.deepEqual([state?.history, state?.audienceAgent, state?.consumedEventId], ['some', 'other', 'n3'],
+    'in context, so read from here on, and its subject follows the agent it was placed for');
 });
 
 test("a render of the run that's gone without the coalescer leaves the rest of the run tracked", async () => {

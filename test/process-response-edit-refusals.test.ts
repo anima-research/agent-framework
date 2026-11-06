@@ -105,6 +105,15 @@ test("a response whose edit throws stops there, as before: its later edits and r
   assert.ok(window.includes('Antra: before') && window.includes('Antra: to remove'), `nothing after the throw applied:\n${window.join('\n')}`);
   assert.ok(x.errors.some((e) => e.startsWith("[process] refused's response to ping threw at the edit of no-such-message")), x.errors.join('\n'));
   assert.equal(refused.ctx.getState(), null, 'its state update was not applied');
+  // Where it threw is recorded with the event, as the console line says it.
+  const completed = x.traces.filter((e) => e.type === 'process:completed' && (e.processEvent as { type: string }).type === 'ping');
+  assert.equal(completed.length, 1, 'the event completed, traced');
+  const listed = completed[0]!.responses as Array<{ moduleName: string; threw?: { at: string; error: string } }>;
+  assert.deepEqual(listed.map((r) => [r.moduleName, r.threw?.at]), [['refused', 'the edit of no-such-message']], 'the trace names where the response threw');
+  assert.ok(listed[0]!.threw?.error.length, `and with what: ${JSON.stringify(listed[0]!.threw)}`);
+  const logged = x.framework.queryProcessLogs({ eventType: 'ping' }).entries
+    .map(({ entry }) => (entry.responses as Array<{ moduleName: string; threw?: { at: string } }>).map((r) => [r.moduleName, r.threw?.at]));
+  assert.deepEqual(logged, [[['refused', 'the edit of no-such-message']]], 'and so does the process log');
 });
 
 test("a response whose removals are applied in order keeps those before a throw, and not those after it", async (t) => {

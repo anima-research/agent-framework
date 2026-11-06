@@ -1365,12 +1365,16 @@ describe('notices about an agent\'s own action', () => {
       // One channel id on two servers, each with its own decision.
       decide('c-20', 'open');
       decide('c-20', 'closed', 'agent-tool', framework, 'other');
+      // A failed reply's channel, selected for opening, and tuned out since.
+      decide('c-23', 'open', 'server-bootstrap');
+      internals(framework).channelRegistry.enterTuneOut('srv', 'c-23',
+        { epochId: 'e-23', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
       await framework.stop();
       const storePath = join(tempDir, 'test.chronicle');
-      const notice = (id: string, channelId: string, label: string, serverId = 'srv') => ({
+      const notice = (id: string, channelId: string, label: string, serverId = 'srv', more: Array<{ channelId: string; label: string }> = []) => ({
         id, seq: Number(id.slice(2)), participant: 'user', forAgent: 'conversation-gone',
         content: [{ type: 'text', text: `[channels] Now open: ${label} (${channelId}): your own message into the closed channel opened it.` }],
-        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId, cause: 'opened-by-reply', channels: [{ channelId, label }] } },
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId, cause: 'opened-by-reply', channels: [{ channelId, label }, ...more] } },
       });
       const failed = (id: string, channelId: string, label: string) => ({
         id, seq: Number(id.slice(2)), participant: 'user', forAgent: 'conversation-gone',
@@ -1383,10 +1387,12 @@ describe('notices about an agent\'s own action', () => {
       writeFileSync(join(storePath, 'recovery', 'host-mode.json'), JSON.stringify({ version: 1, quiesced: false }));
       writeFileSync(join(storePath, 'recovery', 'deferred-writes.json'), JSON.stringify({
         version: 1, pending: [
-          notice('w-11', 'c-11', '#eleven'), notice('w-12', 'c-12', '#twelve'),
+          // One notice of two channels, the second closed since: told of the first alone.
+          notice('w-11', 'c-11', '#eleven', 'srv', [{ channelId: 'c-12', label: '#twelve' }]), notice('w-12', 'c-12', '#twelve'),
           failed('w-17', 'c-17', '#seventeen'), failed('w-18', 'c-18', '#eighteen'),
           notice('w-19', 'c-19', '#nineteen'),
           notice('w-20', 'c-20', '#twenty'), notice('w-21', 'c-20', '#twenty', 'other'),
+          failed('w-23', 'c-23', '#twentythree'),
         ],
       }));
       const errors: string[] = [];
@@ -1409,6 +1415,7 @@ describe('notices about an agent\'s own action', () => {
       assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown }).deferredWriteId), ['w-11', 'w-17', 'w-19', 'w-20']);
       const texts = told.map((m) => (m.content[0] as { text: string }).text);
       assert.match(texts[0]!, /^\[channels\] Now open: #eleven \(c-11\): a message from conversation-gone into the closed channel opened it; conversation-gone has ended\./);
+      assert.ok(!texts[0]!.includes('#twelve') && !texts[0]!.includes('c-12'), `the channel closed since is left out of the notice that named both: ${texts[0]}`);
       assert.match(texts[1]!, /^\[channels\] Not open: #seventeen \(c-17\)\. A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended\. It's selected for opening again/);
       assert.match(texts[2]!, /^\[channels\] Now open: #nineteen \(c-19\): a message from conversation-gone/);
       assert.match(texts[3]!, /^\[channels\] Now open: #twenty \(c-20\): a message from conversation-gone/);
@@ -1416,6 +1423,7 @@ describe('notices about an agent\'s own action', () => {
         '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#twelve (c-12)): no one is told',
         '[channel] conversation-gone has ended, and #eighteen (c-18), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told',
         '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#twenty (c-20)): no one is told',
+        '[channel] conversation-gone has ended, and #twentythree (c-23), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told',
       ]) assert.ok(errors.includes(line), line);
     });
 

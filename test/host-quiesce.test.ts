@@ -3,7 +3,8 @@
  * coverage, plus an end-to-end MCPL leg with a child server (below). Since
  * #291 a write while quiesced is stored at once, unless a surgery's hold or a
  * context manager refusing its work keeps it in memory, and kept out of every
- * window but its writer's own until resume; the deferred-write queue an earlier
+ * window but its writer's own until resume (a window a failed write-down left
+ * in legacy mode is the record, and shows it at once); the deferred-write queue an earlier
  * release persisted is imported at boot (deferred-import-boot.test.ts, whose
  * crash cases a child process stages).
  */
