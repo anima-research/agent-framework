@@ -1,7 +1,7 @@
 - **Hosts: every agent's context follows its own presentation index** (#291), in every framework, with no setting
   to turn it on or off (see the presentation index's entries). `create()` refuses a context-manager without
   `ContextManager.presentRows` (one before 0.25.0), and a store handle without chronicle's
-  `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.0 or earlier), each naming the range this package
+  `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.1 or earlier), each naming the range this package
   declares (the 291-chronicle-0.6 entry). An agent whose window
   can't be written down at its registration (another version's index format, a failed write) stays in legacy mode,
   its window the whole record, as before, until a branch move writes its window down on the new branch. A
@@ -37,7 +37,7 @@
     stored since that is another resident's own enters a resident's window only through `observes`, and one meant
     only for another resident (its mail, a message addressed to it) enters none of the others'.
   - **Context-manager's MANIFEST:** the first window write-down that holds rows, or any presentation of more than
-    one row, moves the store's MANIFEST to version 2, which chronicle 0.5.0 and earlier refuse, and so does a release
+    one row, moves the store's MANIFEST to version 2, which chronicle 0.5.1 and earlier refuse, and so does a release
     whose chronicle range resolves one, such as agent-framework 0.30.0 or context-manager 0.24.0 (context-manager's
     291-window-batches entry). Going back to an earlier release after that needs a copy of the store taken before
     the upgrade.

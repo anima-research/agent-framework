@@ -1,12 +1,12 @@
 - **Hosts and packages that install agent-framework:** it now depends on `@animalabs/chronicle` `^0.6.0` (was
-  `^0.5.0`) and `@animalabs/context-manager` `^0.25.0` (was `^0.24.0`): the chronicle release with the
+  `^0.5.1`) and `@animalabs/context-manager` `^0.25.0` (was `^0.24.0`): the chronicle release with the
   identity-stamped batched append (`appendManyToStateJsonWithIdentity`, with `appendManyToStateJson`,
   `getStateItemsJson` and `getRecords`), and the context-manager release that keeps each agent's window
   (`windowStatusOf`, `presentRows`, `retractRows`, `getPresentedMessages`), writes a window write of several rows
   as one record through that append (context-manager's 291-chronicle-0.6 and 291-window-batches entries), names
   the rows of an add that failed after storing them (`WriteLandedError`), and says when the store can't be read to
   tell what of a failed add landed (`WriteOutcomeUnknownError`), both of which the framework imports. Neither
-  floor can be lower. The published chronicle 0.5.0 (0.30.0's branch views) has none of the batched calls, and the
+  floor can be lower. The published chronicle 0.5.1 (and 0.5.0, 0.30.0's branch views) has none of the batched calls, and the
   published context-manager 0.23.x and 0.24.0 have no window index. Context-manager has no one-record-per-row path:
   on a store handle without the batched append, the first window write-down of a record that holds a row throws, and
   every agent's window is written down at its registration (#291). So `AgentFramework.create()` refuses, before any
@@ -21,4 +21,4 @@
   `JsStore` and passes it as `FrameworkConfig.store`, whose handle must come from chronicle 0.6.0 or later.
   **Migration:** take `@animalabs/chronicle` `^0.6.0` and `@animalabs/context-manager` `^0.25.0` alongside this
   release. The first window write-down that holds a row, or any presentation of more than one row, moves the store's
-  `MANIFEST` to version 2, which chronicle 0.5.0 and earlier refuse (see the 291-presentation-mandatory entry).
+  `MANIFEST` to version 2, which chronicle 0.5.1 and earlier refuse (see the 291-presentation-mandatory entry).
