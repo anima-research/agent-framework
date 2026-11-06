@@ -1880,10 +1880,10 @@ export class TuneOutCoordinator {
         }
         if (ended) {
           console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory, ended its tune-out (epoch ${entry.for.epochId}) when it ran, but a step after the end failed:`, err);
-          // The run delivers its note after the end, told lost where it
-          // can't be (deliverQueuedNote): a step that failed before then
-          // left it neither. One lost when the writes were stored is told
-          // lost with that error (lostAtRelease).
+          // The run writes its note before the end (noteNow), or, joining
+          // another cancel, after it (deliverQueuedNote); a note the throw
+          // left unsettled is told lost here. One lost when the writes were
+          // stored is told lost with that error (lostAtRelease).
           if (entry.note !== undefined && !entry.noteSettled) {
             this.dropDeferred(entry, entry.lostAtRelease
               ? { ...entry.lostAtRelease, by: 'itself' }
