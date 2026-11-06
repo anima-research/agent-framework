@@ -2378,8 +2378,8 @@ export class Agent {
     )) {
       console.error(
         `[assistant-persist] agent=${this.name}: refusing to store a thinking-only assistant ` +
-        `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
-        `output. If it was refused, see its [inference-refusal] line and failures.log record.`,
+        `message (${content.length} block(s), no text and no tool_use). If it was refused, see ` +
+        `its [inference-refusal] line and failures.log record.`,
       );
       return undefined;
     }

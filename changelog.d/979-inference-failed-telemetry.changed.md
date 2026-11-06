@@ -48,10 +48,12 @@
       that got partway has the note, which says its last call timed out, and
       no failure's note carries the advice.
     - The `[assistant-persist]` stderr line for a thinking-only reply the
-      store refuses ended "See the refusal/inference-failed record for why.",
-      though a refusal never wrote an `[inference-failed]` note. It now
-      ends "If it was refused, see its [inference-refusal] line and
-      failures.log record."
+      store refuses ended "— the turn produced no output. See the
+      refusal/inference-failed record for why.", though a turn whose earlier
+      rounds ran produced output, and a refusal never wrote an
+      `[inference-failed]` note. It now ends "(… no text and no tool_use).
+      If it was refused, see its [inference-refusal] line and failures.log
+      record."
     - Earlier entries' wording of the note for a turn that did nothing ("the
       model call failed … and produced no response, so nothing was sent")
       describes only notes already in stores.
