@@ -24374,7 +24374,11 @@ export class AgentFramework {
    * rows the store may hold besides named. Any other throw stored none of
    * the write: it is logged and lost. The rest go on either way. Each
    * agent's lost writes, and those that may be, are told of once, by a log
-   * line and an ops alert of kind `store-held-lost`.
+   * line and an ops alert of kind `store-held-lost`. Each is also given to
+   * the tune-out coordinator, by its metadata (heldWriteLost), before the
+   * deferred cancels run: a reader's note kept with a waiting cancel is
+   * told lost to the reader when that cancel ends the hold, as the cancel's
+   * waiting answer promised.
    */
   private releaseSurgeryHeldWrites(): void {
     // A release met while this one replays (a recovery with no hold, a
@@ -24426,8 +24430,10 @@ export class AgentFramework {
   /**
    * One write of releaseSurgeryHeldWrites's replay, the head of `queue`,
    * stored by the path it was held on; one that fails is noted in `lost`,
-   * by agent. It is taken off the queue once it is stored, kept for its
-   * agent's recovery, passed on or lost, before its trace; false where a
+   * by agent, and given to the tune-out coordinator (heldWriteLost), which
+   * knows its own writes by their metadata. It is taken off the queue once
+   * it is stored, kept for its agent's recovery, passed on or lost, before
+   * its trace; false where a
    * hold begun during its store (a listener of its clock row's trace)
    * keeps it at the head, unstored.
    */
@@ -24501,6 +24507,15 @@ export class AgentFramework {
       entry.writes.push(write);
       if (unknown) entry.unknown.push(unknown);
       lost.set(agentName, entry);
+      // The tune-out coordinator, by the write's metadata: a write of its
+      // own whose writer it answered as waiting (a reader's note, kept with
+      // its cancel) is told lost to that writer when the cancel runs, which
+      // the release does next (runDeferredCancels).
+      try {
+        this.tuneOutCoordinator?.heldWriteLost(write.metadata, error, unknown !== undefined);
+      } catch (hookError) {
+        console.error('[surgery] the tune-out coordinator could not be told of a write lost at the release:', hookError);
+      }
       return true;
     }
   }
