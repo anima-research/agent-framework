@@ -266,6 +266,42 @@ describe('live operator surgery', () => {
     }
   });
 
+  // AF #844 bot review 2, finding 20.
+  it("a write whose clock row's trace starts a surgery is held behind it and stored at its release", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-surgery-clock-'));
+    const clocked = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', clock: { intervalMinutes: 10 } }],
+      modules: [],
+      operatorLogPath: false,
+    });
+    const internals = clocked as unknown as {
+      surgeryHeldWrites: unknown[];
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    let switching: Promise<void> | undefined;
+    clocked.onTrace((event) => {
+      if (event.type === 'message:added' && event.source === 'clock:event' && !switching) {
+        switching = clocked.switchBranch(clocked.getStore().currentBranch().name);
+      }
+    });
+    try {
+      const id = internals.addMessage('user', [{ type: 'text', text: 'arrived as the clock struck' }]);
+      assert.ok(switching, "setup: the clock row was traced, and its listener started a switch");
+      assert.equal(id, '', 'held behind the surgery its clock row started');
+      assert.equal(internals.surgeryHeldWrites.length, 1, 'kept in memory');
+      await switching;
+      const rows = clocked.getAgent('scout')!.getContextManager().getAllMessages()
+        .filter((m) => (m.content[0] as { text?: string }).text === 'arrived as the clock struck');
+      assert.equal(rows.length, 1, 'stored once, at the release');
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      await clocked.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // Ported for #291: what the hold keeps is in memory, so there is no
   // recovery queue to acknowledge, which this test once checked.
   it("the hold's release stores what waited behind it while another agent's tool cycle is pending", { timeout: 60_000 }, async () => {

@@ -656,6 +656,72 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.ok(framework.listHeldMail().some((held) => held.id === mail.mailId), 'the mail stays held for the next boot');
   });
 
+  // AF #844 bot review 2, finding 91.
+  it('the writes kept for two agents whose managers refuse their work are stored in the order they arrived, across the agents', async () => {
+    let failing = 2;
+    for (const name of ['a', 'b']) {
+      const strategy = cmOf(name).getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+      const initialize = strategy.initialize.bind(strategy);
+      strategy.initialize = async (...args: unknown[]) => {
+        if (failing > 0) { failing--; throw new Error('injected initialization failure'); }
+        return initialize(...args);
+      };
+    }
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+      assert.deepEqual(reinitAlerts().map((alert) => alert.agentName).sort(), ['a', 'b'], 'setup: both refuse their work');
+      const order: Array<[string, string]> = [['a', 'A1'], ['b', 'B1'], ['a', 'A2']];
+      for (const [name, words] of order) {
+        assert.equal(courier.addMessage('courier', text(words), undefined, { forAgent: name }), '', `setup: ${words} kept in memory`);
+      }
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+      const sequenceOf = (name: string, words: string) => cmOf(name).getAllMessages()
+        .find((m) => m.content.some((block) => block.type === 'text' && block.text === words))?.sequence;
+      const sequences = order.map(([name, words]) => sequenceOf(name, words));
+      assert.ok(sequences.every((s) => s !== undefined), `all stored: ${JSON.stringify(sequences)}`);
+      assert.ok(sequences.every((s, i) => i === 0 || s! > sequences[i - 1]!), `stored A1, B1, A2: ${JSON.stringify(sequences)}`);
+    } finally {
+      console.error = quiet;
+    }
+  });
+
+  // AF #844 bot review 2, finding 53.
+  it("stop() names a write an alert's listener makes for an agent whose manager refuses its work, after the writes it named", async () => {
+    const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    strategy.initialize = async () => { throw new Error('injected initialization failure'); };
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', 'for b, during the hold');
+      pass.open();
+      await pass.switched;
+      let wrote = false;
+      let probe: unknown;
+      framework.onTrace((event) => {
+        if (wrote || event.type !== 'ops:alert' || event.kind !== 'store-held-lost') return;
+        wrote = true;
+        // The framework's own write path (a host's listener), modules being stopped by then.
+        probe = (framework as unknown as { addMessage(p: string, c: unknown[], m: undefined, o: { forAgent: string }): string })
+          .addMessage('courier', text("for b, from the alert's listener"), undefined, { forAgent: 'b' });
+      });
+      await framework.stop();
+      assert.ok(wrote, "setup: the listener wrote at stop's alert");
+      assert.equal(probe, '', 'setup: the write is kept in memory for b');
+    } finally {
+      console.error = quiet;
+    }
+    const lines = logged.filter((line) => line.startsWith('[stop] '));
+    assert.equal(lines.length, 2, `the listener's write is named too: ${lines.join('\n')}`);
+    says(lines[1]!, '[stop] agent=b: 1 write for b kept in memory is not stored by this stop');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.deepEqual(lost.map((alert) => (alert.data as { count: number }).count), [1, 1]);
+  });
+
   it("stop() names the writes a surgery's hold still keeps when the surgery outlives its wait", async () => {
     const logged: string[] = [];
     const quiet = console.error;

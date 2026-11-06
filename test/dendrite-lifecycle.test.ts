@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import {
   AgentFramework,
+  AgentRegistry,
   AgentSpecError,
   AgentStoppedError,
   taskForkSpec,
@@ -1040,5 +1041,40 @@ describe('Dendrite restart', () => {
     assert.equal(told(second, 'READ-BY-THE-JOB'), 0, 'one its window held stays with it');
     const third = await process(new GateModule());
     assert.equal(told(third, 'NEVER-READ-BY-THE-JOB'), 1, 'and goes once');
+  });
+
+  // AF #844 bot review 2, finding 96.
+  it("passes an interrupted job's unread write to the primary once, though the boot that passed it couldn't settle the record", async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    membrane.script('job', waitCall('job-1'), say('job done'));
+    const { agent, contextManager } = await first.createEphemeralAgent(
+      { name: 'job', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' },
+      workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'tool-result' } }),
+    );
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    first.runEphemeralToCompletion(agent, contextManager).catch(() => { /* abandoned */ });
+    await until(() => gates1.entered.has('job-1'), 'the job to block in its call');
+    const unread = (first as unknown as {
+      addModuleMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+    }).addModuleMessage('user', [{ type: 'text', text: 'NEVER-READ-BY-THE-JOB' }], { kind: 'test-note' }, { forAgent: 'job' });
+    assert.equal(contextManager.windowStatusOf(unread), 'out', 'setup: stored and out of the window');
+
+    const told = (framework: AgentFramework) => textsIn(framework, 'mira').filter((m) => m.text === 'NEVER-READ-BY-THE-JOB').length;
+    const settle = AgentRegistry.prototype.settleInterrupted;
+    AgentRegistry.prototype.settleInterrupted = () => { throw new Error('injected: the settle failed'); };
+    const error = console.error;
+    console.error = () => {};
+    let second: AgentFramework;
+    try {
+      second = await process(new GateModule());
+    } finally {
+      AgentRegistry.prototype.settleInterrupted = settle;
+      console.error = error;
+    }
+    assert.equal(told(second), 1, 'passed at the boot whose settle failed');
+    const third = await process(new GateModule());
+    assert.equal(told(third), 1, 'the next boot finds it passed, and passes it no more');
   });
 });

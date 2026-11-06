@@ -672,3 +672,30 @@ test('the position and the notice survive a clean restart, through the stop-time
   assert.equal(h.notices().length, 1);
   await h.close();
 });
+
+// AF #844 bot review 2, finding 87: a turn an earlier release stored carries
+// no audience stamp, and an undo takes it out as the agent's own by its
+// voice; the lookup reads it by the same rule.
+test("the window lookup counts an unstamped row under the agent's voice as its own, so undoing such a turn reads as the write gone", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'workspace-direct-legacy-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    modules: [],
+  });
+  t.after(async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); });
+  const cm = framework.getAgent('scout')!.getContextManager();
+  const before = cm.addMessage('user', [{ type: 'text', text: 'write it' }]);
+  cm.presentRows([before]);
+  const head = cm.getMessage(before)!.sequence;
+  // The turn as an earlier release stored it: under scout's voice, no stamp.
+  const reply = cm.addMessage('scout', [{ type: 'text', text: 'wrote it' }], {});
+  cm.presentRows([reply]);
+  const holds = (framework as unknown as { windowHoldsOwnRowsAfter(agent: string, after: number): boolean })
+    .windowHoldsOwnRowsAfter.bind(framework);
+  assert.equal(holds('scout', head), true, 'the turn is in the window');
+  cm.retractRows([reply], { undone: true });
+  assert.equal(cm.windowStatusOf(reply), 'undone', 'setup: undone');
+  assert.equal(holds('scout', head), false, 'undone, the write is no longer held');
+});

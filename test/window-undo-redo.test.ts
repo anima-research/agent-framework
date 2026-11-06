@@ -15,7 +15,8 @@ import type { ContextInjection, ContextManager, MessageId, MessageMetadata, Stor
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, OperatorActionError, asOwnRow } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { covers } from '../src/read-marks.js';
+import { covers, type ReadMark } from '../src/read-marks.js';
+import { AgentScripts } from '../src/code-execution/isolate/scripts.js';
 import { GateModule, until } from './helpers/dendrite.js';
 import { WireMembrane, final, round } from './helpers/wire-membrane.js';
 
@@ -330,6 +331,31 @@ describe('undo and redo on the window (#291)', () => {
     h.internals.presentAtEndOf(h.mira);
     assert.deepEqual(h.windowTexts().slice(-3), ['render v1', 'I saw render v1', 'after the undo']);
     assert.equal(covers(h.mira.getConsumedWatermark(), h.cm, h.cm.getMessage(since)!), 'not-covered', 'the row presented since the undo is unread');
+  });
+
+  // AF #844 bot review 2, finding 79.
+  it("a redo gives a running script's start mark again too, so its later sends are credited with the rows put back", async () => {
+    const h = await boot();
+    h.internals.recordTurnCheckpoint('mira');
+    const render = h.internals.addMessage('editor', [text('render v1')], undefined, { forAgent: 'mira' });
+    await h.mira.compileContext();
+    // A script whose run call read the render: its start mark, a copy of
+    // her mark then, as a script keeps one while her own moves on.
+    const scripts = new AgentScripts({} as never, {} as never, {} as never);
+    const startMark = { ...h.mira.getConsumedWatermark()! } as ReadMark;
+    const script = { id: 's1', agentName: 'mira', context: { startReadThrough: startMark }, run: { ended: false }, gone: false };
+    (scripts as unknown as { scripts: Map<string, unknown> }).scripts.set('s1', script);
+    (h.framework as unknown as { codeExecution: unknown }).codeExecution = { settings: {}, scripts };
+    const reply = h.cm.addMessage('mira', [text('I saw render v1')], asOwnRow(undefined, 'mira'));
+    h.cm.presentRows([reply]);
+    assert.equal(covers(startMark, h.cm, h.cm.getMessage(render)!), 'covered', "setup: the script's mark covers the render");
+
+    assert.equal(h.framework.undoLastTurn('mira').undone, true);
+    assert.deepEqual(h.framework.redo('mira').window, { retracted: 0, represented: 2 });
+    const given = script.context.startReadThrough;
+    assert.notEqual(given, startMark, "the script's mark is given again");
+    assert.equal(covers(given, h.cm, h.cm.getMessage(render)!), 'covered', 'and covers the render put back');
+    assert.equal(covers(given, h.cm, h.cm.getMessage(reply)!), 'not-covered', 'but not the reply it read before');
   });
 
   it("a stored injection that changed in the undone turn is stored again at the next start", async () => {

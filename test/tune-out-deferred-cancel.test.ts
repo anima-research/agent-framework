@@ -824,6 +824,31 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
     }
   });
 
+  // AF #844 bot review 2, finding 90.
+  it("a staged audit record whose blob is missing, unreadable or isn't JSON is logged, naming the agent and the blob, and read as absent", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub } = await heldWithPrimer();
+    try {
+      type Appending = { append(record: Record<string, unknown>): void };
+      const guard = (f.framework.getAgent(sub) as unknown as { toolResultGuard: Appending }).toolResultGuard;
+      const garbled = f.framework.getStore().storeBlob(Buffer.from('not json {'), 'application/json');
+      const gone = '0'.repeat(64);
+      guard.append({ type: 'staged', batchId: 'b-gone', content: { blobId: gone } });
+      guard.append({ type: 'staged', batchId: 'b-bad-id', content: { blobId: 'not-a-hash' } });
+      guard.append({ type: 'staged', batchId: 'b-garbled', content: { blobId: garbled } });
+      errors.mock.resetCalls();
+      const read = (f.framework as unknown as { subconsciousGuardedResults(): Map<string, unknown> }).subconsciousGuardedResults();
+      assert.deepEqual([...read.entries()], [], 'neither is read');
+      const lines = errors.mock.calls.map((c) => c.arguments.map(String).join(' '));
+      for (const blob of [gone, 'not-a-hash', garbled]) {
+        assert.ok(lines.some((l) => l.includes(sub) && l.includes(blob)), `logged, naming ${blob}: ${lines.join('\n')}`);
+      }
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
   it("control: the same cancel through executeToolCall, which stores no turn's rows, then a crash: the row stays conditional", async () => {
     const errors = mock.method(console, 'error', () => {});
     const { f, sub, epochId } = await heldWithPrimer();

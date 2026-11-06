@@ -362,6 +362,30 @@ export class AgentScripts {
     return [...this.scripts.values()].filter((s) => s.agentName === agentName && !s.gone && !s.run.ended).length;
   }
 
+  /**
+   * The marks this agent's running scripts started with (their
+   * `startReadThrough`), which each one's sends are credited with having
+   * read: a redo on the agent's window gives them again, as it gives the
+   * agent's own (Agent.heldReadMarks), over the rows it puts back.
+   */
+  readMarksOf(agentName: string): ReadMark[] {
+    const marks: ReadMark[] = [];
+    for (const s of this.scripts.values()) {
+      const mark = s.context.startReadThrough;
+      if (mark && s.agentName === agentName && !s.gone && !s.run.ended) marks.push(mark);
+    }
+    return marks;
+  }
+
+  /** Put each mark `replacements` maps in place of the start mark of this agent's scripts that hold it (readMarksOf), as Agent.replaceReadMarks does the agent's own: their later calls carry it. */
+  replaceReadMarks(agentName: string, replacements: ReadonlyMap<ReadMark, ReadMark>): void {
+    for (const s of this.scripts.values()) {
+      const mark = s.context.startReadThrough;
+      const next = mark && s.agentName === agentName ? replacements.get(mark) : undefined;
+      if (next) s.context.startReadThrough = next;
+    }
+  }
+
   /** Running scripts that no call is watching: those acting outside any turn. */
   leftRunning(): number {
     return [...this.scripts.values()].filter((s) => !s.run.ended && s.watch === null).length;

@@ -24,7 +24,9 @@
  *
  * The watcher's own rows go as stored: its rounds (its own participant's
  * messages), and the results of its own calls, which are stored under
- * another participant (`user`) and are told by the call they answer.
+ * another participant (`user`) and are told by the call they answer: the
+ * nearest call before the result with its id, since a provider (or a mock)
+ * that numbers calls per response gives two agents' calls the same id.
  */
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 import { NOTICE_TAG } from './notice-tags.js';
@@ -103,7 +105,7 @@ const NOTHING_SAID = `[${NOTICE_TAG.noText}]`;
  */
 export function foreignRowAsSent(
   content: readonly ContentBlock[],
-  context: { ownCalls?: ReadonlySet<string>; callNames?: ReadonlyMap<string, string> } = {},
+  context: { ownCalls?: { has(id: string): boolean }; callNames?: { get(id: string): string | undefined } } = {},
 ): ContentBlock[] {
   let changed = false;
   const out: ContentBlock[] = [];
@@ -149,26 +151,25 @@ export function foreignRowAsSent(
 /**
  * A request's messages as an agent that watches another's slot is sent them:
  * each message whose participant isn't the agent's own (`isOwn`) through
- * foreignRowAsSent, with the agent's own calls (those in its own messages)
- * kept, and each result named by the call it answers. A message nothing
- * changes is the same object, and so is the array when none changes.
+ * foreignRowAsSent, with the results of the agent's own calls kept, and
+ * each result named by the call it answers. A result answers the nearest
+ * call before it with its id, read in one pass in order, so another
+ * agent's result whose id an own call of the watcher's also has, before or
+ * after it, is still transcribed. A message nothing changes is the same
+ * object, and so is the array when none changes.
  */
 export function transcribeForeignRounds(
   messages: readonly NormalizedMessage[],
   isOwn: (participant: string) => boolean,
 ): NormalizedMessage[] {
-  const ownCalls = new Set<string>();
-  const callNames = new Map<string, string>();
-  for (const m of messages) {
-    for (const b of m.content) {
-      if (b.type !== 'tool_use') continue;
-      if (isOwn(m.participant)) ownCalls.add(b.id);
-      else callNames.set(b.id, b.name);
-    }
-  }
+  const latest = new Map<string, { own: boolean; name: string }>();
+  const ownCalls = { has: (id: string) => latest.get(id)?.own === true };
+  const callNames = { get: (id: string) => latest.get(id)?.name };
   let changed = false;
   const out = messages.map((m) => {
-    if (isOwn(m.participant)) return m;
+    const own = isOwn(m.participant);
+    for (const b of m.content) if (b.type === 'tool_use') latest.set(b.id, { own, name: b.name });
+    if (own) return m;
     const content = foreignRowAsSent(m.content, { ownCalls, callNames });
     if (content === m.content) return m;
     changed = true;

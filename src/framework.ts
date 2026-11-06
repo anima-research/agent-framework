@@ -13,7 +13,11 @@ import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, Yie
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn, WriteLandedError, WriteOutcomeUnknownError } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
+// Not named imports from context-manager: 0.24.0 has neither, and a named
+// import of either would fail this package's load there before create()
+// could name the release it needs.
+import { WriteLandedError, WriteOutcomeUnknownError } from './context-manager-errors.js';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import {
@@ -1154,8 +1158,9 @@ type SpillWrite = { path: string; error?: string; branchLeft?: true } | null;
  *  (AgentFramework.releasedWindow). */
 type ReleasedWindow = {
   /** Each unread message the primary takes in its place, in store order,
-   *  with what it says: a sharded body's shards' content joined. */
-  unread: Array<{ participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
+   *  with what it says: a sharded body's shards' content joined, and its
+   *  first shard's id. */
+  unread: Array<{ id: MessageId; participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
 };
 
 function passedOnBodies(messages: readonly StoredMessage[], takes: (m: StoredMessage) => boolean): ReleasedWindow['unread'] {
@@ -1166,12 +1171,12 @@ function passedOnBodies(messages: readonly StoredMessage[], takes: (m: StoredMes
   // messages make up a body is context-manager's rule (continuesBody,
   // pairwise in store order): a group id names the text, so the same text
   // stored twice is two bodies under one id.
-  const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
+  const bodies: Array<{ id: MessageId; participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
   let lastTaken = -1;
   messages.forEach((m, i) => {
     if (!takes(m)) return;
     if (!continuesBody(messages[i - 1], m)) {
-      bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
+      bodies.push({ id: m.id, participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
       lastTaken = i;
     } else if (lastTaken === i - 1) {
       bodies.at(-1)!.shards.push(m);
@@ -1999,6 +2004,8 @@ interface SurgeryHeldWrite {
    *  the write's (heldWriteTargetGone). */
   heldFor?: Agent;
   heldAt: number;
+  /** Its place among every write kept in memory, in arrival order (AgentFramework.heldWritesKept). */
+  heldOrder: number;
 }
 
 /** Where rows entered a window that its open turn weighs as arrivals (noteArrival): a tool boundary weighs what it hears itself. */
@@ -4735,6 +4742,8 @@ export class AgentFramework {
   private replayingHeld = false;
   /** A release of the tune-outs on record with no reader (releaseTuneOutsWithoutReader) that met held writes, to run once they are stored. */
   private releaseWithoutReaderWaits = false;
+  /** How many writes this process has kept in memory (SurgeryHeldWrite.heldOrder): their arrival order across agents. */
+  private heldWritesKept = 0;
   /**
    * Writes for an agent whose context manager refuses its work, by the
    * agent's name, each agent's in arrival order: its re-initialization after
@@ -5768,8 +5777,9 @@ export class AgentFramework {
     // window, then what it is owed at rest, now that the stored rows are in.
     // Each agent's window was written down at its registration, before them.
     // An agent whose owed rows couldn't be read for their wakes is left out of
-    // the pass at rest, so those rows stay out of its window and a later boot
-    // reads them again (`restExcept`).
+    // the pass at rest, and no later point at rest presents its arrivals
+    // until its next turn start, so those rows stay out of its window and a
+    // later boot reads them again (`restExcept`).
     // Then each window lets go of the rows its record no longer holds that no
     // live context heard removed (retractAbsentRows): an offline recovery's
     // suppressions, made with the host stopped through one agent's context.
@@ -12867,10 +12877,20 @@ export class AgentFramework {
         cm = await this.reopenAgentContext(record, new PassthroughStrategy());
         const opened = cm;
         const reader = recordedReaderFacts(this.registry, record.name);
-        const notices = passedOnBodies(opened.getAllMessages(), (m) => passesToPrimary(m.metadata)
+        // The record stays interrupted until the boot's settle (after a
+        // sync, reconcileAgentRegistry), so a crash before it, or a settle
+        // that fails, brings a later boot here again: each notice passed
+        // carries where it came from (`passedOn`), and one the primary's
+        // store holds a pass of goes no further.
+        const from = `${record.name}#${record.incarnation}@${record.createdAt}`;
+        const passed = this.rowsPassedOn(from);
+        const notices = passedOnBodies(opened.getAllMessages(), (m) => !passed.has(m.id)
+          && passesToPrimary(m.metadata)
           && bearingOf(m, reader, 'own') !== 'elsewhere'
           && opened.windowStatusOf(m.id) === 'out');
-        for (const { metadata, ...written } of notices) this.passNoticeToPrimary(record.name, metadata, written);
+        for (const { id, metadata, ...written } of notices) {
+          this.passNoticeToPrimary(record.name, metadata, written, { from, row: id });
+        }
       } catch (err) {
         console.error(`[route-failure] ${record.name}: could not read the context the restart interrupted for notices the primary would take; none is passed:`, err);
       } finally {
@@ -12881,6 +12901,15 @@ export class AgentFramework {
         }
       }
     }
+  }
+
+  /** The rows of the interrupted record `from` (name#incarnation@createdAt) whose pass the primary's store holds (passOnInterruptedNotices). */
+  private rowsPassedOn(from: string): Set<MessageId> {
+    const primary = this.deliveryAgent();
+    if (!primary) return new Set();
+    return new Set(primary.getContextManager().queryMessages({ metadata: { 'passedOn.from': from } }).messages
+      .map((m) => (m.metadata as { passedOn?: { row?: MessageId } } | undefined)?.passedOn?.row)
+      .filter((row): row is MessageId => typeof row === 'string'));
   }
 
   /**
@@ -13029,7 +13058,11 @@ export class AgentFramework {
    * every delivered result carries) at or after the record was created: a
    * single-use name whose counter aged out of the registry starts again at
    * incarnation 1, so an earlier agent of that name and incarnation may have
-   * delivered one to the same recipient.
+   * delivered one to the same recipient. Both times are the registry's wall
+   * clock (Date.now): the two agents are always on opposite sides of a
+   * restart, so they don't share a millisecond, but a clock stepped back
+   * between the record's creation and its result can misjudge the result
+   * as an earlier agent's.
    *
    * Undefined where the store can't be read, which is logged: whether the
    * result was handed over is unknown, so the boot leaves the record out of
@@ -15691,7 +15724,17 @@ export class AgentFramework {
   }
 
   /**
-   * The agent's marks (Agent.heldReadMarks) that cover rows of `tail` by
+   * The read marks held for `agent` (heldMarksOf's): its own
+   * (Agent.heldReadMarks), and the marks its running scripts started with
+   * (AgentScripts.readMarksOf), which each script's sends are credited with
+   * having read (publishReadThrough). A redo gives them all again.
+   */
+  private heldMarksOf(agent: Agent): ReadMark[] {
+    return [...new Set([...agent.heldReadMarks(), ...(this.codeExecution?.scripts.readMarksOf(agent.name) ?? [])])];
+  }
+
+  /**
+   * The agent's marks (heldMarksOf: its own and its running scripts') that cover rows of `tail` by
    * their ordinals in its window, read before an undo takes them out, each
    * with the bodies it covers. A mark taken in legacy mode is one of them
    * where it covers such rows: the window is presented (undo refuses one
@@ -15704,7 +15747,7 @@ export class AgentFramework {
   private marksOverTail(agent: Agent, cm: ContextManager, tail: readonly WindowBody[]): RedoEntry['marks'] {
     const marks: RedoEntry['marks'] = [];
     try {
-      for (const mark of agent.heldReadMarks()) {
+      for (const mark of this.heldMarksOf(agent)) {
         const cover = coverTest(mark, cm);
         const covered = new Set(tail.filter((row) => cover(row) === 'covered').map((row) => row.id));
         if (covered.size > 0) marks.push({ mark, covered });
@@ -15838,7 +15881,7 @@ export class AgentFramework {
    */
   private retakeMarks(agent: Agent, cm: ContextManager, entry: RedoEntry, back: readonly MessageId[], below: readonly RedoEntry[]): void {
     try {
-      const held = new Set(agent.heldReadMarks());
+      const held = new Set(this.heldMarksOf(agent));
       const replacements = new Map<ReadMark, ReadMark>();
       for (const { mark, covered } of entry.marks) {
         if (!held.has(mark) || replacements.has(mark)) continue;
@@ -15850,6 +15893,7 @@ export class AgentFramework {
       }
       if (replacements.size === 0) return;
       agent.replaceReadMarks(replacements);
+      this.codeExecution?.scripts.replaceReadMarks(agent.name, replacements);
       for (const older of [...below, entry]) {
         for (const recorded of older.marks) recorded.mark = replacements.get(recorded.mark) ?? recorded.mark;
       }
@@ -16137,6 +16181,10 @@ export class AgentFramework {
       recovered.push(...writes);
     }
     if (recovered.length === 0) return;
+    // In arrival order across the agents, as each agent's are: writes for
+    // two agents whose slot one record holds (residents) land there in the
+    // order they came.
+    recovered.sort((x, y) => x.heldOrder - y.heldOrder);
     this.surgeryHeldWrites.unshift(...recovered);
     if (!this.surgeryHold) this.releaseSurgeryHeldWrites();
   }
@@ -16181,9 +16229,21 @@ export class AgentFramework {
    * a surgery's hold still keeps (surgeryHeldWrites, a hold whose operation
    * outlived stop()'s wait for it) are stored only if it releases before the
    * process exits. Mail among them stays held in the registry, and the next
-   * boot delivers it. Says nothing when none is kept.
+   * boot delivers it. Says nothing when none is kept. An alert's listeners
+   * run as it is raised, and a write one makes is kept so too, after this
+   * read of what is kept: each round tells the writes the rounds before it
+   * didn't, until one finds none new (a few rounds at most, for a listener
+   * that writes at every alert).
    */
   private reportHeldWritesAtStop(): void {
+    const told = new Set<SurgeryHeldWrite>();
+    for (let round = 0; round < 4; round++) {
+      if (!this.reportHeldWritesOnce(told)) return;
+    }
+  }
+
+  /** One round of reportHeldWritesAtStop: tells the writes kept in memory that aren't in `told`, adding them; whether any was. */
+  private reportHeldWritesOnce(told: Set<SurgeryHeldWrite>): boolean {
     // Read defensively, as releaseSurgeryHeldWrites is.
     const kept = new Map<string, { recovery: SurgeryHeldWrite[]; hold: SurgeryHeldWrite[] }>();
     const entry = (agentName: string) => {
@@ -16191,10 +16251,15 @@ export class AgentFramework {
       if (!found) kept.set(agentName, found = { recovery: [], hold: [] });
       return found;
     };
-    for (const [agentName, writes] of this.heldForRecovery ?? []) entry(agentName).recovery.push(...writes);
+    for (const [agentName, writes] of this.heldForRecovery ?? []) {
+      entry(agentName).recovery.push(...writes.filter((write) => !told.has(write)));
+    }
     for (const write of this.surgeryHeldWrites ?? []) {
+      if (told.has(write)) continue;
       entry(write.direct?.agentName ?? write.opts?.forAgent ?? this.primaryAgentName ?? 'the primary').hold.push(write);
     }
+    for (const { recovery, hold } of kept.values()) for (const write of [...recovery, ...hold]) told.add(write);
+    let any = false;
     const verb = this.surgeryHold ? MOVE_NOUNS[this.surgeryHold.verb] ?? this.surgeryHold.verb : 'surgery';
     for (const [agentName, { recovery, hold }] of kept) {
       const writes = [...recovery, ...hold];
@@ -16210,11 +16275,13 @@ export class AgentFramework {
       ];
       const message = `${writes.length === 1 ? '1 write' : `${writes.length} writes`} for ${agentName} kept in memory ` +
         `${writes.length === 1 ? 'is' : 'are'} not stored by this stop (${parts.join('; ')}). ${told}`;
+      any = true;
       console.error(`[stop] agent=${agentName}: ${message}`);
       this.opsAlert('store-held-lost', agentName, message, {
         data: { count: writes.length, keptForRecovery: recovery.length, heldBySurgery: hold.length, kinds, mail },
       });
     }
+    return any;
   }
 
   /**
@@ -17066,14 +17133,22 @@ export class AgentFramework {
       if (kept.length > 0) {
         const n = kept.length;
         const first = kept[0]!;
-        const discordId = (first.metadata as { messageId?: unknown } | undefined)?.messageId;
-        const named = `${String(first.id)}${discordId !== undefined && discordId !== null && discordId !== '' ? `, Discord message ${String(discordId)}` : ''}`;
+        const discordIdOf = (m: StoredMessage): string | undefined => {
+          const id = (m.metadata as { messageId?: unknown } | undefined)?.messageId;
+          return id !== undefined && id !== null && id !== '' ? String(id) : undefined;
+        };
+        const discordId = discordIdOf(first);
+        const named = `${String(first.id)}${discordId !== undefined ? `, Discord message ${discordId}` : ''}`;
+        // The host's hide matches a Discord id, so it is named only where
+        // one of them has one (an API or a module's row has none).
+        const hide = kept.some((m) => discordIdOf(m) !== undefined)
+          ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`
+          : '';
         throw new OperatorActionError('invalid',
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
           `so a rollback to it would change nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-          `suppress ${n === 1 ? 'it' : 'them'} (${this.suppressionThrough(agentName, cm, kept)}), or hide ` +
-          `${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`);
+          `suppress ${n === 1 ? 'it' : 'them'} (${this.suppressionThrough(agentName, cm, kept)})${hide}`);
       }
       throw new OperatorActionError('invalid', after > 0
         // Rows follow it in the record, but the cut keeps every one of them,
@@ -17995,9 +18070,11 @@ export class AgentFramework {
   private subconsciousWindow(): StoredMessage[] {
     const sub = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
     if (!sub) return [];
-    // A subconscious whose window isn't presented (a legacy one) has its
-    // stored rows for its record (#844 round 8, Weft).
-    return this.presents(sub) ? sub.getContextManager().getPresentedMessages() : sub.getContextManager().getAllMessages();
+    // A subconscious whose window isn't presented (a legacy one) reads its
+    // record (#844 round 8, Weft), which getPresentedMessages is then: its
+    // own slot merged with the residents' slot it observes, where a
+    // release's loss line is stored. getAllMessages is its own slot alone.
+    return sub.getContextManager().getPresentedMessages();
   }
 
   /**
@@ -18020,10 +18097,16 @@ export class AgentFramework {
       if (record?.type !== 'staged' || record.agentName !== name) continue;
       let content = record.content;
       if (content && typeof content === 'object' && !Array.isArray(content) && typeof (content as { blobId?: unknown }).blobId === 'string') {
-        const blob = this.store.getBlob((content as { blobId: string }).blobId);
+        // One that can't be read (missing, not JSON, an id the store
+        // refuses) is logged and read as absent: the boot then gives the
+        // conditional row for what it held.
+        const blobId = (content as { blobId: string }).blobId;
         try {
+          const blob = this.store.getBlob(blobId);
           content = blob ? JSON.parse(blob.toString()) as unknown : undefined;
-        } catch {
+          if (!blob) console.error(`[tune-out] ${name}: a staged tool-result audit record names blob ${blobId}, which the store doesn't hold; its results are read as absent`);
+        } catch (error) {
+          console.error(`[tune-out] ${name}: a staged tool-result audit record's blob ${blobId} couldn't be read as JSON; its results are read as absent:`, error);
           content = undefined;
         }
       }
@@ -19435,6 +19518,8 @@ export class AgentFramework {
             addressed,
             ...systemNoticeMark(event.tags),
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+            // Stored for the fork, so its wake reads the row, as a resident's does.
+            ...this.readsRowFor(placement, target.name),
           });
         }
         return placement;
@@ -19642,6 +19727,7 @@ export class AgentFramework {
         addressed: isAddressedMessage(event.tags),
         ...systemNoticeMark(event.tags),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+        ...this.readsRowFor(placement, agent.name),
       });
     }
     return placement;
@@ -23918,25 +24004,30 @@ export class AgentFramework {
    * and the branch as they were and takes the turn's own rows out of the
    * window as undone, so this is where the agent's history no longer holds
    * the write. True for an agent the index doesn't present for, and where
-   * no own row of its came after. Reads the record back from its newest
-   * row, 64 at a time, to that place.
+   * no own row of its came after. A row is its own by the rule an undo
+   * takes it out by (ownWindowRow), so a turn an earlier release stored,
+   * with no stamp, counts by its voice. Reads the record back from its
+   * newest row, 64 at a time, to that place, then weighs the rows after it
+   * in store order.
    */
   private windowHoldsOwnRowsAfter(agentName: string, afterSequence: number): boolean {
     const agent = this.agents.get(agentName);
     if (!agent || !this.presents(agent)) return true;
     const cm = agent.getContextManager();
-    let first: MessageId | undefined;
+    const after: StoredMessage[] = [];
     scan: for (let end = cm.getMessageCount(); end > 0;) {
       const span = Math.min(end, 64);
       const { messages } = cm.getMessageWindow(end - span, span, { resolveBlobs: false });
       for (let i = messages.length - 1; i >= 0; i--) {
         const row = messages[i]!;
         if (row.sequence <= afterSequence) break scan;
-        if (isOwnRowOf(row.metadata, agentName)) first = row.id;
+        after.push(row);
       }
       end -= span;
     }
-    return first === undefined || cm.windowStatusOf(first) !== 'undone';
+    const ownCalls = new Set<string>();
+    const first = after.reverse().find((row) => ownWindowRow(row, agent, ownCalls));
+    return first === undefined || cm.windowStatusOf(first.id) !== 'undone';
   }
 
   /** Let a deregistered agent go from the presentation index (forget), its arrival listener with it. */
@@ -24007,7 +24098,7 @@ export class AgentFramework {
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
-      heldFor: target, heldAt: Date.now(),
+      heldFor: target, heldAt: Date.now(), heldOrder: ++this.heldWritesKept,
     });
     if (this.surgeryHold || (this.replayingHeld && !replayed)) {
       this.surgeryHeldWrites.push(kept());
@@ -32661,11 +32752,13 @@ export class AgentFramework {
         ...(opts ? { opts: rest } : {}),
         heldFor: agent,
         heldAt: Date.now(),
+        heldOrder: ++this.heldWritesKept,
       };
     };
     // While the release replays what the hold kept, a write made meanwhile,
     // a listener's, waits behind the ones still to replay (replayingHeld).
-    if ((this.surgeryHold || (this.replayingHeld && !opts?.replayed)) && !opts?.imported) {
+    const heldBySurgery = (): boolean => (!!this.surgeryHold || (this.replayingHeld && !opts?.replayed)) && !opts?.imported;
+    if (heldBySurgery()) {
       this.surgeryHeldWrites.push(kept());
       if (opts?.placement) opts.placement.agent = agent.name;
       return '' as MessageId;
@@ -32713,6 +32806,15 @@ export class AgentFramework {
       && (!turnLive || this.assembling.has(agent.name))
       && !suppressedRow(metadata as Record<string, unknown> | undefined)) {
       this.storeDueClock(agent, 'event');
+      // The clock row's trace runs its listeners now, and one may have
+      // started a surgery (switchBranch reserves the store before its first
+      // await): the write then waits for its release, as above, behind the
+      // clock row stored before it.
+      if (heldBySurgery()) {
+        this.surgeryHeldWrites.push(kept());
+        if (opts?.placement) opts.placement.agent = agent.name;
+        return '' as MessageId;
+      }
     }
     let stored: MessageId;
     // The rows the write stored: its one id, or those a store that threw
@@ -33436,17 +33538,21 @@ export class AgentFramework {
    * goes where a write that names no agent goes, stamped as one. Never
    * throws: it runs inside a release, which must complete whatever this
    * write meets. Whether the primary was told: false when no one is, or
-   * the write failed, each logged.
+   * the write failed, each logged. `passedOn`, the record and row a boot
+   * passes on (passOnInterruptedNotices), is stamped on the notice, so a
+   * later boot finds it passed.
    */
   private passNoticeToPrimary(
     speaker: string,
     metadata: MessageMetadata | undefined,
     written?: { participant: string; content: ContentBlock[] },
+    passedOn?: { from: string; row: MessageId },
   ): boolean {
     const notice = this.noticeForPrimary(speaker, metadata, written);
     if (!notice) return false;
     try {
-      this.addMessage(notice.participant, notice.content, notice.metadata,
+      this.addMessage(notice.participant, notice.content,
+        passedOn ? { ...notice.metadata, passedOn } as MessageMetadata : notice.metadata,
         this.primaryAgentName ? { audience: [this.primaryAgentName] } : undefined);
       return true;
     } catch (err) {
@@ -39096,14 +39202,7 @@ export class AgentFramework {
             .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
         },
         commitDeliveries: () => this.commitDeliveries(),
-        // A release made while a surgery's hold keeps writes in memory, or
-        // while the primary's or the subconscious's manager refuses its
-        // work, would be kept there too, and lost to a crash before it is
-        // stored, while the epoch's end is on disk at once: the cancel
-        // waits (releaseSurgeryHeldWrites runs it).
-        writesHeld: () => this.surgeryHold !== null || this.replayingHeld
-          || [this.primaryAgentName, this.subconsciousAgentName]
-            .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name))),
+        writesHeld: () => this.tuneOutWritesHeld(),
         historyTool: () => this.residentHistoryTool(),
         // Every reader of the shared slot compiles the dump with its own
         // strategy, so the dump fits the smallest of their bounds.
@@ -39147,6 +39246,22 @@ export class AgentFramework {
   }
 
   /**
+   * Whether a tune-out's release would be kept in memory now, not stored:
+   * a release made while a surgery's hold keeps writes in memory, or while
+   * the primary's or the subconscious's manager refuses its work, would be
+   * kept there too, and lost to a crash before it is stored, while the
+   * epoch's end is on disk at once. The coordinator's cancel waits for them
+   * then (its writesHeld; releaseSurgeryHeldWrites runs it), and so does a
+   * release of the holds on record with no reader
+   * (releaseTuneOutsWithoutReader).
+   */
+  private tuneOutWritesHeld(): boolean {
+    return this.surgeryHold !== null || this.replayingHeld
+      || [this.primaryAgentName, this.subconsciousAgentName]
+        .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name)));
+  }
+
+  /**
    * No reader is configured, so nothing can watch or end a hold: each hold
    * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
    * recipe no longer has) ends now, and its backlog goes to the resident,
@@ -39164,9 +39279,13 @@ export class AgentFramework {
     // waiting, each hold on record and nothing to say so. The release waits
     // as a whole instead: at a start no write is held, so this is the
     // late-connect path during an operator's change to the store.
-    if (this.surgeryHold !== null || this.replayingHeld) {
+    // The same holds as the coordinator's own (tuneOutWritesHeld): a
+    // primary's context manager that refuses its work keeps them too, and
+    // the move that re-initializes it releases them (its reservation's
+    // release runs releaseSurgeryHeldWrites, which runs this again).
+    if (this.tuneOutWritesHeld()) {
       if (!this.releaseWithoutReaderWaits) {
-        console.error('[tune-out] the tune-outs on record are released once the store takes writes again (an operator\'s change to it is in progress), so that each release is stored before the tune-out\'s end is recorded');
+        console.error('[tune-out] the tune-outs on record are released once the store takes writes again (an operator\'s change to it is in progress, or a context manager refuses its work until a branch move re-initializes it), so that each release is stored before the tune-out\'s end is recorded');
       }
       this.releaseWithoutReaderWaits = true;
       return;
@@ -40306,7 +40425,10 @@ export class AgentFramework {
         this.addMessage('user', [{ type: 'text', text }], { ...metadata }, { placement: own, forAgent: name });
         placements.set(name, own);
       }
-      // Recorded once the notice is stored: a notice that failed to be written is offered again.
+      // Recorded once the notice is written: a notice whose write threw is
+      // offered again. One a surgery's hold or a refusing manager keeps in
+      // memory counts as offered, stored at the release, and is lost with
+      // any write held so if the process ends first (store-held-lost).
       // An earlier acceptance's rule names stay on record while the new question is open.
       const prior = this.wakeDecisions.get(event.serverId);
       this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'offered', ...(prior?.rules ? { rules: prior.rules } : {}) });

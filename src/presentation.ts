@@ -456,6 +456,10 @@ interface ScanMemo {
   length: number;
   facts: string;
   scanFrom: number;
+  /** The same for a scan at rest that leaves a rollback's held arrivals out (pending's `atRest`, a hold in force):
+   *  every row at or below it was elsewhere or held. A held arrival doesn't hold it back, as one does `scanFrom`,
+   *  so such a scan doesn't walk every row stored since the arrival until the agent's next start. */
+  heldScanFrom?: number;
 }
 
 /** What adopt left for one manager. */
@@ -488,6 +492,8 @@ export class AgentPresentation {
   private readonly failedOwn = new WeakMap<WindowManager, Set<MessageId>>();
   /** Arrivals a rollback took out of each manager's window, kept out of it at rest until the agent's next turn start (holdUntilStart), on the branch the rollback left the store on. */
   private readonly heldUntilStart = new WeakMap<WindowManager, { branch: string; ids: Set<MessageId> }>();
+  /** Agents the boot's pass at rest left out (repairAndRest's `restExcept`): no point at rest presents their arrivals until their next turn start. */
+  private readonly restWithheld = new Set<AgentName>();
   /** Read-only handles on the slots a manager merges, by namespace (slotOfRow): made only for a reader whose context merges more than one. */
   private readonly slotReaders = new WeakMap<WindowManager, Map<string | null, MessageStore>>();
 
@@ -517,8 +523,10 @@ export class AgentPresentation {
    * presented: writeDown) leaves the agent in legacy mode, traced once,
    * until a move of the store's branch writes its window down on the new
    * branch (rebase): its window is the whole record, as before the index.
-   * Then, every time, the agent's own-row sink is installed, and every scan
-   * memo is dropped, since a registration can change who reads a slot.
+   * Then, every time, the agent's own-row sink is installed, one left in
+   * legacy mode's too, so the other readers of its slot hear of its rows
+   * (presentOwn), and every scan memo is dropped, since a registration can
+   * change who reads a slot.
    */
   adopt(agent: PresentedAgent): void {
     const cm = agent.getContextManager();
@@ -537,7 +545,9 @@ export class AgentPresentation {
         this.presentFramed(agent);
       }
     }
-    if (!state.pinnedLegacy) agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
+    // In legacy mode too: presentOwn presents nothing for it, and tells the
+    // other readers of its slot of its rows (afterStore).
+    agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
   }
 
   /**
@@ -645,14 +655,18 @@ export class AgentPresentation {
    * registry has no slot for. Run at every adopt and rebase, not only
    * after a write-down this process made, so a window whose write-down
    * landed and whose retraction didn't (a crash between the two records, a
-   * failed write) is repaired the next time it is taken on. No row the
-   * module presents is taken out here: it presents own rows and arrivals
-   * only, and a reader fork's framing, which is passed over. Traced as
+   * failed write) is repaired the next time it is taken on. Rows are
+   * weighed by the agent's relationships now, not by those they entered
+   * under, so a row the module presented is taken out too where it is
+   * elsewhere to the agent now: an observed agent's own row, presented
+   * through an observe edge the agent no longer has (a restart whose
+   * configuration dropped it). A reader fork's framing is passed over. Traced as
    * presentation:retracted, reason `elsewhere`; a failure is traced as
    * presentation:failed at `occasion`, and the rows stay in the window
    * until the agent's next turn start or point at rest takes them out
    * (`retractPending`, tried there until it succeeds), or the next adopt or
-   * rebase. Never throws.
+   * rebase; a fresh turn start that can't take them out fails
+   * (presentAtStart). Never throws.
    */
   private retractForeign(agent: PresentedAgent, occasion: PresentationOccasion): void {
     const cm = agent.getContextManager();
@@ -668,7 +682,7 @@ export class AgentPresentation {
       if (state) delete state.retractPending;
     } catch (error) {
       if (state) state.retractPending = true;
-      console.error(`[presentation] ${agent.name}: taking the rows that aren't its out of its window at ${occasion} failed; they stay in it until its next turn start or point at rest takes them out:`, error);
+      console.error(`[presentation] ${agent.name}: taking the rows that aren't its out of its window at ${occasion} failed; they stay in it, and no turn of its starts, until its next turn start or point at rest takes them out:`, error);
       this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: describe(error) });
     }
   }
@@ -709,6 +723,7 @@ export class AgentPresentation {
     this.slotReaders.delete(cm);
     this.framed.delete(agent.name);
     this.framedPending.delete(agent.name);
+    this.restWithheld.delete(agent.name);
     this.generation++;
   }
 
@@ -719,10 +734,14 @@ export class AgentPresentation {
    * Boot runs it once every agent is taken on and the stored rows are in,
    * whether or not an adopt repaired anything. An agent in `restExcept` has
    * its own rows swept and nothing else: the boot couldn't read what it is
-   * owed to ask the wakes its rows owe, so they stay out of its window for
-   * its next point, and a later boot reads them again.
+   * owed to ask the wakes its rows owe, so they stay out of its window until
+   * its next turn start, which no wake was asked for. Until then no point at
+   * rest presents its arrivals (a row stored for it while it is idle, a
+   * turn's end), only its own rows, so a later boot finds them out of its
+   * window and reads them again.
    */
   repairAndRest(options: { restExcept?: ReadonlySet<AgentName> } = {}): void {
+    for (const name of options.restExcept ?? []) this.restWithheld.add(name);
     for (const agent of this.host.liveAgents()) {
       if (!this.presenting(agent) || this.host.turnAlive(agent.name)) continue;
       this.repair(agent);
@@ -835,29 +854,43 @@ export class AgentPresentation {
    * fresh or resumed, its own rows only. Returns the arrivals presented, one
    * per body, for the start to weigh. A fresh start ends a rollback's hold
    * on the arrivals its cut returned (holdUntilStart): they enter with the
-   * rest, in record order. A fresh start's presentation that fails (a read
+   * rest, in record order, and the hold ends once they have, so a start
+   * that fails keeps it; so does an agent the boot's pass at rest left out
+   * (repairAndRest's `restExcept`). A fresh start's presentation that fails (a read
    * of the window or the record that throws, or a write of the window that
    * leaves a row out) is traced, and then throws, so the start fails rather
    * than compile without what it was started for, which waits outside the
-   * window for the next point. The backstop's is traced, and its compile
-   * goes on.
+   * window for the next point. So does a fresh start where rows a
+   * write-down took in that aren't the agent's are still in its window
+   * (retractForeign failed again here), rather than compile with them. The
+   * backstop's is traced, and its compile goes on.
    */
   presentAtStart(agent: PresentedAgent, occasion: 'turn-start' | 'assembly' | 'compile'): StoredMessage[] {
     if (!this.presenting(agent)) return [];
+    const cm = agent.getContextManager();
     // The sweep below decides the own rows a failed write left (presentOwn).
-    this.failedOwn.delete(agent.getContextManager());
+    this.failedOwn.delete(cm);
     const fresh = occasion !== 'compile';
-    // A fresh start is where a rollback's returned arrivals enter (holdUntilStart).
-    if (fresh) this.heldUntilStart.delete(agent.getContextManager());
-    // And where rows a write-down took in that aren't the agent's, whose
-    // retraction failed, leave before its compile, and a reader fork's
-    // framing whose presentation failed enters.
-    if (fresh) this.retryRetraction(agent, occasion);
+    // A fresh start is where rows a write-down took in that aren't the
+    // agent's, whose retraction failed, leave before its compile, and a
+    // reader fork's framing whose presentation failed enters.
+    if (fresh) {
+      this.retryRetraction(agent, occasion);
+      if (this.adopted.get(cm)?.retractPending) {
+        throw new Error(`${agent.name}'s turn start could not take the rows that aren't its out of its window (at ${occasion}); they stay in it, and it doesn't compile, until a later point takes them out`);
+      }
+    }
     if (fresh && this.framedPending.has(agent.name)) this.presentFramed(agent);
+    // A rollback's returned arrivals enter here (holdUntilStart): the hold
+    // is left out of this presentation, and ends once it hasn't failed.
     const { arrivals, failure } = this.presentPending(agent, occasion, fresh && !this.host.frozen(), false,
       fresh ? "the start fails, and what it didn't present waits for the next point" : undefined);
     if (fresh && failure !== undefined) {
       throw new Error(`${agent.name}'s turn start could not present what it is owed (at ${occasion}): ${describe(failure)}`, { cause: failure });
+    }
+    if (fresh) {
+      this.heldUntilStart.delete(cm);
+      this.restWithheld.delete(agent.name);
     }
     return arrivals;
   }
@@ -931,7 +964,8 @@ export class AgentPresentation {
    * kept in the record (its `returnedToArrivals`, #291): they are arrivals
    * again, and wait outside the window until the agent's next turn start
    * (presentAtStart's `'turn-start'` or `'assembly'`), which presents them
-   * with whatever else it is owed, in record order. Until then no point at
+   * with whatever else it is owed, in record order (a start that fails
+   * keeps them held). Until then no point at
    * rest presents them: not the surgery's release, a resume, a turn's end
    * or a row stored for the agent while it is idle, so the cut the
    * operator made is what the agent's window holds until it speaks again.
@@ -954,6 +988,8 @@ export class AgentPresentation {
       const kept = held?.branch === branch ? held.ids : new Set<MessageId>();
       for (const id of named) kept.add(id);
       this.heldUntilStart.set(cm, { branch, ids: kept });
+      // A scan at rest that left an earlier hold's rows out may have passed them.
+      this.memos.delete(cm);
     } catch (error) {
       console.error(`[presentation] ${agent.name}: could not hold ${named.length} row(s) out of its window until its next turn start; they enter at its next presentation point:`, error);
     }
@@ -1255,11 +1291,11 @@ export class AgentPresentation {
     }
   }
 
-  /** presentAtEnd under a named occasion; a rollback's held arrivals wait (holdUntilStart). */
+  /** presentAtEnd under a named occasion; a rollback's held arrivals wait (holdUntilStart), and so do all of an agent's the boot left out (restWithheld). */
   private presentAtRest(agent: PresentedAgent, occasion: 'turn-end' | 'at-rest'): StoredMessage[] {
     if (!this.presenting(agent) || this.host.turnAlive(agent.name)) return [];
     this.retryRetraction(agent, occasion);
-    return this.presentPending(agent, occasion, !this.host.frozen(), true).arrivals;
+    return this.presentPending(agent, occasion, !this.host.frozen() && !this.restWithheld.has(agent.name), true).arrivals;
   }
 
   /** The rows the agent was handed as framing (noteFramed) that its window doesn't hold yet, presented in the order handed. */
@@ -1347,7 +1383,7 @@ export class AgentPresentation {
     const branch = cm.currentBranch().name;
     // A rollback's hold is its branch's: on another the rows are arrivals as any.
     const hold = atRest ? this.heldUntilStart.get(cm) : undefined;
-    const held = hold?.branch === branch ? hold.ids : undefined;
+    const held = hold?.branch === branch && hold.ids.size > 0 ? hold.ids : undefined;
     const length = cm.indexLength();
     let memo = this.memos.get(cm);
     if (!memo || memo.generation !== this.generation || memo.branch !== branch || memo.length !== length || memo.facts !== factsKey) {
@@ -1357,13 +1393,15 @@ export class AgentPresentation {
     // Every unpresented row at or below the memo's mark was elsewhere, so the
     // listing starts after it (context-manager finds the place by a search):
     // a scan walks the rows stored since, not every row of others' the
-    // record holds.
-    const unpresented = memo.scanFrom === -Infinity
+    // record holds. A scan that leaves held arrivals out may start at its own
+    // mark too, which held rows don't hold back (heldScanFrom).
+    const from = held ? Math.max(memo.scanFrom, memo.heldScanFrom ?? -Infinity) : memo.scanFrom;
+    const unpresented = from === -Infinity
       ? cm.getUnpresentedMessages()
-      : cm.getUnpresentedMessages({ afterSequence: memo.scanFrom });
+      : cm.getUnpresentedMessages({ afterSequence: from });
     const bodies: PendingBody[] = [];
     let firstOwed: number | undefined;
-    let newest = memo.scanFrom;
+    let newest = from;
     let i = 0;
     while (i < unpresented.length) {
       const start = i;
@@ -1371,17 +1409,21 @@ export class AgentPresentation {
       while (i < unpresented.length && continuesBody(unpresented[i - 1], unpresented[i])) i++;
       const head = unpresented[start]!;
       newest = Math.max(newest, unpresented[i - 1]!.sequence);
-      if (head.sequence <= memo.scanFrom) continue;
+      if (head.sequence <= from) continue;
       const bearing = bearingOf(head, facts, this.slotOfRow(cm, facts, head.id));
       if (bearing === 'elsewhere') continue;
-      firstOwed ??= head.sequence;
-      if (bearing === 'arrival' && !arrivals) continue;
-      // Still owed (firstOwed), so a later scan starts at or before it.
-      if (bearing === 'arrival' && held && held.size > 0
-        && unpresented.slice(start, i).some((shard) => held.has(shard.id))) continue;
+      // A held arrival is still owed, and every scan but this one counts it
+      // (firstOwed, in `scanFrom`), so a scan that presents it, or counts
+      // what is owed, starts at or before it; this one passes it over.
+      const isHeld = bearing === 'arrival' && held !== undefined
+        && unpresented.slice(start, i).some((shard) => held.has(shard.id));
+      if (!isHeld) firstOwed ??= head.sequence;
+      if (isHeld || (bearing === 'arrival' && !arrivals)) continue;
       bodies.push({ shards: unpresented.slice(start, i), bearing, unstamped: audienceOf(head.metadata) === undefined });
     }
-    memo.scanFrom = firstOwed !== undefined ? Math.max(memo.scanFrom, firstOwed - 1) : newest;
+    const next = firstOwed !== undefined ? Math.max(from, firstOwed - 1) : newest;
+    if (held) memo.heldScanFrom = next;
+    else memo.scanFrom = next;
     return bodies;
   }
 

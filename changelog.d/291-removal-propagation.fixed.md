@@ -26,7 +26,8 @@
   are now exactly the rows stored after the cut, and offline recovery checks the tool pairs of those rows only. A
   rollback that would remove nothing and take nothing out of the window is refused as a no-op, saying why: when its
   target was presented in one write with rows after it, the refusal says so, names the first of them, and points to
-  `suppressMessages`, or the host's `hide` for a Discord message, to take them out.
+  `suppressMessages`, or the host's `hide` for a Discord message, to take them out; it names `hide` only where one
+  of them has a Discord message id.
 - Offline recovery with `removeSuppressed` alone (`--remove-suppressed`, no anchor) on a presented window threw a TypeError before it made anything. It now takes the newest row as on a legacy window, branching at the head with the suppressed rows removed, and a run with nothing left to suppress makes its branch, removing 0, instead of being refused as an anchor "already the tail" of the window.
 - Offline recovery's refusal of a no-op cut on a presented window told the operator to suppress the rows presented with the anchor in the same recovery, which names a row only by its Discord message id, so an agent's round or a tool row could not be taken out that way. A row with no Discord id is now named by its row id for the live `suppressMessages` once the host runs, the offline suppression advised for the rest.
 - Offline recovery on a presented window reports the rows its cut returns to the arrivals as `returnedToArrivals`, a dry run too, as the live rollback does (a row the same recovery suppresses is counted as suppressed instead): a cut that only returned rows answered `messagesRemoved: 0` and `messagesSuppressed: 0`, as if it changed nothing. `0` for a run with no anchor; absent on a window that is still the record.

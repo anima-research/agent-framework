@@ -4,7 +4,8 @@
   with the id `''`: a live operator surgery (a rollback, a suppression, a branch switch), whose release stores it in
   arrival order, and an agent's context manager that refuses its work after a failed re-initialization, which keeps
   each write for the agent until a branch move (a `switchBranch()`, a rollback or a suppression) re-initializes it
-  and that move's release stores them in arrival order. Nothing caps the writes kept for such a manager: each one
+  and that move's release stores them in arrival order (across agents too, where writes for two such managers
+  were kept: those for residents land in the one record they share in the order they came). Nothing caps the writes kept for such a manager: each one
   for its agent stays in memory until a move re-initializes it, and `HostModeStatus.deferredWrites` counts them
   (the `context-reinit-failed` alert that names the refusal says writes are kept meanwhile). An agent that ends
   while either keeps writes for it takes them out as it ends, not at the release:
@@ -57,7 +58,8 @@
   its manager refuses its work (lost) and those a surgery whose operation outlived `stop()`'s wait still holds, it
   logs one `[stop] agent=<name>: …` line and raises an `ops:alert` of kind `store-held-lost` with the counts and
   kinds (`data`: `count`, `keptForRecovery`, `heldBySurgery`, `kinds`, `mail`); mail among them stays held in the
-  registry, and the next boot delivers it. The `context-reinit-failed` alert for a conversation agent a move disposes counts the writes held for it, by
+  registry, and the next boot delivers it. A write a listener of that alert makes, kept in memory too, is named in
+  a line and an alert after it. The `context-reinit-failed` alert for a conversation agent a move disposes counts the writes held for it, by
   the move's hold or while its manager refused its work, and how many of them went to the primary, stored at the
   release; the rest, such as its channel's messages, are dropped, logged. A write made while quiesced is on the
   branch the store was on when it was made: a rollback or a branch switch later in the same quiesce leaves it there,
