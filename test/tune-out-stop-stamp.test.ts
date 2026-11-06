@@ -210,9 +210,9 @@ function stampSetup() {
     window.push({ participant: 'user', content: [{ type: 'tool_result', toolUseId: id, toolName: 'cancel_tuneout', content: JSON.stringify(answer) } as unknown as ContentBlock], sequence: ++state.seq });
     return sequence;
   };
-  /** A release of `epochId` stored by a cancel from `source`, giving `reason`. */
-  const release = (epochId: string, source: string, reason: string, by?: string): void => {
-    rows.push({ participant: 'user', content: [text(`[Tune-out: cancelled — ${reason}]`)], metadata: { system: true, kind: 'tune-out-cancel', epochId, cancel: { source, reason, ...(by !== undefined ? { by } : {}) } }, sequence: ++state.seq });
+  /** A release of `epochId` stored by a cancel from `source`, giving `reason`, crediting `by` and `askers` where given. */
+  const release = (epochId: string, source: string, reason: string, by?: string, askers?: string[]): void => {
+    rows.push({ participant: 'user', content: [text(`[Tune-out: cancelled — ${reason}]`)], metadata: { system: true, kind: 'tune-out-cancel', epochId, cancel: { source, reason, ...(by !== undefined ? { by } : {}), ...(askers !== undefined ? { askers } : {}) } }, sequence: ++state.seq });
   };
   /** The subconscious's note of `epochId`, delivered to the resident. */
   const note = (epochId: string): void => {
@@ -897,6 +897,8 @@ for (const [what, mark] of [
   ['ran, asked, with its note not delivered', (h: ReturnType<typeof stampSetup>, e: string) => { h.ask({ channelId: 'noisy', text: 'Look.' }); h.release(e, 'subconscious', 'by Subconscious'); }],
   ['ran, its note delivered', (h: ReturnType<typeof stampSetup>, e: string) => { h.note(e); h.release(e, 'subconscious', 'by Subconscious'); }],
   ["ran by another's cancel", (h: ReturnType<typeof stampSetup>, e: string) => { h.release(e, 'agent-tool', 'agent request'); }],
+  // H13 (Weft, 1f96d1f7): the record keeps whom its own release credited with it.
+  ["ran, its own, with a reader fork's", (h: ReturnType<typeof stampSetup>, e: string) => { h.release(e, 'subconscious', 'by Subconscious', SUB, [SUB, 'reader-fork-7']); }],
 ] as const) {
   test(`pin: a notice of the stop (${what}) kept in the store, its write refused, is written by the next boot as it was`, () => quiet(() => {
     const h = stampSetup();
@@ -1771,3 +1773,201 @@ test("review 4 #18: a boot that can't read the subconscious's rows writes no kep
     } finally { h.stopAll(); }
   }
 }));
+
+// ---------------------------------------------------------------------------
+// Weft's plants at 1f96d1f7 (review wave 4): lines each of her mutations
+// left green, pinned. Her names for them are in the titles.
+// ---------------------------------------------------------------------------
+
+test("pin (N30): a bare call by a hold's qualified name, its result naming no server, names that hold, though another server's channel has that name for its id", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const a = h.hold('noisy', 'editor');
+    const b = h.hold('editor:noisy', 'other');
+    h.ask({ channelId: 'editor:noisy', text: 'Look.' });
+    h.boot();
+    const byEpoch = new Map(h.unrecorded().map((m) => [m.metadata?.epochId, textOf(m.content)]));
+    assert.match(byEpoch.get(a) ?? '', /The cancel of it you asked for with your note "Look\." had not run/, "the qualified name's server names that hold");
+    assert.equal(byEpoch.get(b), conditional('the tune-out of editor:noisy', b), "not the other server's channel whose id the name is");
+  } finally { h.stopAll(); }
+}));
+
+test("pin (H5): a release that names its cancel's caller by `by` alone, as a build before askers wrote it, credits that caller: a reader fork's cancel isn't the subconscious's own", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.release(e, 'subconscious', 'by "reader-1"', 'reader-1');
+    h.boot();
+    assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}A cancel of it that wasn't yours (by "reader-1") ran: its release reached scout. ${STILL}]`);
+  } finally { h.stopAll(); }
+}));
+
+test("pin (H8): of two releases of the subconscious's own cancel, its end unrecorded, the later is the one told, with whom it credits", () => quiet(() => {
+  for (const forkFirst of [true, false]) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      const e = h.hold();
+      const withFork = () => h.release(e, 'subconscious', 'by reader-fork-7', 'reader-fork-7', ['reader-fork-7', SUB]);
+      const alone = () => h.release(e, 'subconscious', 'by Subconscious', SUB, [SUB]);
+      if (forkFirst) { withFork(); alone(); } else { alone(); withFork(); }
+      h.boot();
+      assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}Your cancel of it ran${forkFirst ? '' : " (with reader-fork-7's)"}: its release reached scout. ${STILL}]`,
+        forkFirst ? 'the later credits it alone' : "the later credits the fork's with it");
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("pin (H10): the subconscious's ask that joined another's waiting cancel, which ran, its end unrecorded, names that cancel with its own", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.hold();
+    const c = h.boot();
+    const e = h.holds[0]!.epochId;
+    h.state.held = true;
+    c.cancel('editor', 'noisy', 'agent-tool', 'agent request');
+    h.ask({ channelId: 'noisy', text: 'SUB NOTE' });
+    c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'SUB NOTE', SUB);
+    h.state.held = false;
+    h.state.endFails = true;
+    c.runDeferredCancels();
+    h.state.endFails = false;
+    assert.equal(h.holds.length, 1, 'premise: its end was not recorded');
+    h.boot();
+    assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}The cancel of it you asked for ran (with the cancel for agent request): its release `
+      + `reached scout, with the note you left with it. ${STILL}]`);
+  } finally { h.stopAll(); }
+}));
+
+test("pin (H15): a waiting cancel's release credits each caller it answered as waiting, in the order they asked, not only the one whose note it carries, a channel's or the all-except hold's", () => quiet(() => {
+  for (const scope of [false, true]) {
+    const h = stampSetup();
+    try {
+      if (scope) h.holdScope(); else h.hold();
+      const c = h.boot();
+      h.state.held = true;
+      if (scope) {
+        c.cancelAllExcept('subconscious', 'by reader-fork-7', undefined, 'reader-fork-7');
+        c.cancelAllExcept('subconscious', 'by Subconscious', 'Back.', SUB);
+      } else {
+        c.cancel('editor', 'noisy', 'subconscious', 'by reader-fork-7', undefined, 'reader-fork-7');
+        c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
+      }
+      h.state.held = false;
+      c.runDeferredCancels();
+      const release = h.rows.find((m) => m.metadata?.kind === 'tune-out-cancel')!;
+      assert.deepEqual(release.metadata?.cancel, { source: 'subconscious', reason: 'by reader-fork-7', by: 'reader-fork-7', askers: ['reader-fork-7', SUB] },
+        scope ? 'all-except' : 'channel');
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("pin (T-channel, T-all-except): a release with its backlog that tells a queued note's loss is marked so: its end unrecorded, a crash, and the boot tells nothing more of the note", () => quiet(() => {
+  for (const scope of [false, true]) {
+    const h = stampSetup();
+    try {
+      if (scope) h.holdScope(); else h.hold();
+      const c = h.boot();
+      h.state.held = true;
+      h.ask(scope ? { channelId: 'chatty', scope: 'all-except', text: 'Back.' } : { channelId: 'noisy', text: 'Look.' }, scope ? { waiting: true, scope: 'all-except' } : { waiting: true, serverId: 'editor' });
+      if (scope) c.cancelAllExcept('subconscious', 'by Subconscious', 'Back.', SUB);
+      else c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
+      h.state.held = false;
+      // Another cancel ends the hold first: the queued note goes out ahead of its release, refused, and its end isn't recorded.
+      h.state.noteRefuses = true;
+      if (scope) h.refuse.add(SCOPE); else h.state.endFails = true;
+      assert.throws(() => (scope ? c.cancelAllExcept('channel-close', 'the excepted channel was closed') : c.cancel('editor', 'noisy', 'agent-tool', 'agent request')));
+      h.refuse.delete(SCOPE);
+      h.state.endFails = false;
+      h.state.noteRefuses = false;
+      const release = h.rows.filter((m) => m.metadata?.kind === 'tune-out-cancel');
+      assert.equal(release.length, 1, 'premise: one release');
+      assert.ok(release[0]!.metadata?.released, 'premise: it carries the backlog, not the loss alone');
+      assert.match(textOf(release[0]!.content), /was not delivered/, 'premise: it tells the loss');
+      assert.equal(release[0]!.metadata?.lostNote, true, `${scope ? 'all-except' : 'channel'}: marked as telling the loss`);
+      h.boot();
+      assert.deepEqual(h.unrecorded(), [], 'so the boot, which reads the mark, tells no row of its own');
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("pin (H-channel, H-all-except): a release carrying a queued note's loss alone, made by a caller's cancel, records that caller among its askers, a channel's or the all-except hold's", () => quiet(() => {
+  for (const scope of [false, true]) {
+    const h = stampSetup();
+    try {
+      if (scope) h.holdScope(); else h.hold();
+      const c = h.boot();
+      h.state.held = true;
+      if (scope) c.cancelAllExcept('subconscious', 'by Subconscious', 'Back.', SUB);
+      else c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
+      h.state.held = false;
+      // Its own run stores its release, which isn't made durable: its note waits.
+      h.state.commitFails = true;
+      c.runDeferredCancels();
+      h.state.commitFails = false;
+      h.state.noteRefuses = true;
+      if (scope) c.cancelAllExcept('subconscious', 'by reader-fork-7', undefined, 'reader-fork-7');
+      else c.cancel('editor', 'noisy', 'subconscious', 'by reader-fork-7', undefined, 'reader-fork-7');
+      const loss = h.rows.filter((m) => m.metadata?.kind === 'tune-out-cancel' && m.metadata?.lostNote === true);
+      assert.equal(loss.length, 1, 'premise: one release tells the loss');
+      assert.equal(loss[0]!.metadata?.released, undefined, 'premise: it covers no row');
+      assert.deepEqual(loss[0]!.metadata?.cancel, { source: 'subconscious', reason: 'by reader-fork-7', by: 'reader-fork-7', askers: ['reader-fork-7'] },
+        scope ? 'all-except' : 'channel');
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("pin (N15): a boot whose notice of the last stop's stamp the subconscious refuses arms the retry that writes it", () => quiet(() => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const h = stampSetup();
+  try {
+    h.boot();
+    h.hold();
+    h.state.subThrows = true;
+    h.boot();
+    assert.deepEqual(h.unrecorded(), [], 'premise: its write refused, the notice is kept');
+    h.state.subThrows = false;
+    mock.timers.tick(60_000);
+    assert.equal(h.unrecorded().length, 1, 'the retry writes it');
+  } finally { h.stopAll(); mock.timers.reset(); }
+}));
+
+test("pin (S4): a stop whose drop of a waiting cancel throws before its note's loss is kept leaves the hold out of its stamp, so the next boot tells it", () => {
+  // The drop's own log line is the one step before the loss is kept that can throw.
+  const errors = mock.method(console, 'error', (...args: unknown[]) => {
+    const line = String(args[0]);
+    if (line.startsWith('[tune-out] stopping: the cancel of') && line.includes('ends nothing')) throw new Error('the log failed (test)');
+  });
+  const h = stampSetup();
+  try {
+    const first = h.boot();
+    const e = h.hold();
+    h.state.held = true;
+    first.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
+    first.stop();
+    assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] } | undefined)?.pendingLossNotices.length ?? 0, 0, "premise: the note's loss wasn't kept");
+    assert.ok(!(h.states.get(STAMP) as { epochs: string[] }).epochs.includes(e), 'the stamp leaves the hold out');
+    h.state.held = false;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [conditional('the tune-out of noisy', e)], 'so the next boot tells it');
+  } finally { h.stopAll(); errors.mock.restore(); }
+});
+
+test("pin (N20): after the stop, which stamps the run, a waiting answer doesn't say this run's start couldn't be recorded", async () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = stampSetup();
+  try {
+    const e = h.hold();
+    h.refuse.add(STAMP);
+    const c = h.boot();
+    h.refuse.delete(STAMP);
+    c.stop();
+    assert.ok((h.states.get(STAMP) as { epochs: string[] }).epochs.includes(e), "premise: the stop's stamp landed");
+    h.state.held = true;
+    const answer = await c.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', serverId: 'editor', text: 'Look.' }, [], SUB) as { data?: { waiting?: boolean; note?: string } };
+    assert.equal(answer.data?.waiting, true, 'premise: answered as waiting');
+    assert.doesNotMatch(answer.data?.note ?? '', /couldn't be recorded/);
+  } finally { h.stopAll(); errors.mock.restore(); }
+});
