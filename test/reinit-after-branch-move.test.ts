@@ -3352,6 +3352,18 @@ describe('the window follows a branch move (#291)', () => {
     assert.match((failed[0] as { error: string }).error, /zz-initialize-failed/);
     const alerts = h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-reinit-failed');
     assert.deepEqual(alerts.map((t) => (t as { agentName?: string }).agentName), ['oren'], "#353's alert names the agent too");
+    // AF #844 bot review 4, finding 63: side, made at the head, holds the
+    // window written down on main, so oren's manager reads it presented
+    // after its failed re-initialization. Its context isn't the whole
+    // record then: the alert says its window stays as side holds it, and
+    // that writes for it wait.
+    assert.equal(h.cm('oren').windowMode(), 'presented', "premise: oren's manager reads side's window");
+    const legacy = h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'presentation-legacy');
+    assert.deepEqual(legacy.map((t) => (t as { agentName?: string }).agentName), ['oren']);
+    const said = (legacy[0] as { message: string }).message;
+    assert.match(said, /^its context manager couldn't follow a move of the store's branch \(.*zz-initialize-failed.*\), so its window stays as that branch holds it, and isn't presented to;/, said);
+    assert.match(said, /writes for it wait in memory until a later move re-initializes it$/, said);
+    assert.doesNotMatch(said, /whole record/, said);
     assert.equal(h.internals.presents(h.framework.getAgent('oren')!), false, "oren's window isn't presented");
     assert.equal(h.internals.presents(h.framework.getAgent('mira')!), true, "mira's is");
     assert.throws(() => h.framework.undoLastTurn('oren'), /isn't presented on this branch .*couldn't follow a branch move/);

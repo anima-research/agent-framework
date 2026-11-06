@@ -34395,11 +34395,26 @@ export class AgentFramework {
     // its registration or after a branch move that failed, or a context that
     // couldn't follow a move): its context is the whole record until a later
     // move of the store's branch writes its window down. A host with no trace
-    // listener hears of it in the log and as an ops alert.
+    // listener hears of it in the log and as an ops alert. One whose context
+    // couldn't follow the move onto a branch that holds a window (one made
+    // from the head, say) still reads that window, as the branch holds it:
+    // the index presents nothing to it, and writes for it wait in memory
+    // (refusesItsWork), so the alert says that instead.
     if (event.type === 'presentation:failed' && event.legacy) {
       const after = event.occasion === 'rebase' ? "a move of the store's branch" : 'its registration';
-      const message = `its window is not presented after ${after} (${event.error}), so its context is the whole record ` +
-        "(legacy mode) until a later move of the store's branch writes its window down";
+      let readsWindow = false;
+      if (event.occasion === 'rebase' && this.refusesItsWork(event.agentName)) {
+        try {
+          readsWindow = this.agents.get(event.agentName)?.getContextManager().windowMode() === 'presented';
+        } catch {
+          // A manager that can't say: the plain alert.
+        }
+      }
+      const message = readsWindow
+        ? `its context manager couldn't follow a move of the store's branch (${event.error}), so its window stays as that ` +
+          "branch holds it, and isn't presented to; writes for it wait in memory until a later move re-initializes it"
+        : `its window is not presented after ${after} (${event.error}), so its context is the whole record ` +
+          "(legacy mode) until a later move of the store's branch writes its window down";
       console.error(`[presentation] agent=${event.agentName} ${boundFailureText(message)}`);
       this.opsAlert('presentation-legacy', event.agentName, message, { data: { occasion: event.occasion } });
     }
