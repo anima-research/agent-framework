@@ -15407,6 +15407,7 @@ export class AgentFramework {
     let failures: ManagerReinitFailure[] = [];
     try {
       this.subconsciousAnchor?.branchMoved();
+      this.tuneOutCoordinator?.branchMoved();
       this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
       // The agent the move was made through initialized its own manager,
@@ -39116,6 +39117,7 @@ export class AgentFramework {
           return chars;
         },
         currentSequence: () => this.store.currentSequence(),
+        currentBranch: () => this.store.currentBranch().name,
         // By sequence while its window is the record; by a fixed ordinal
         // once the presentation index presents for it (window-anchor.ts).
         setSubconsciousAnchor: (start, others) => this.subconsciousAnchor?.set(start, others),

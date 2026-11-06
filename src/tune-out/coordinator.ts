@@ -435,17 +435,21 @@ const FOUND_RANK: Record<UnstampedStop['found'], number> = { unknown: 0, asked: 
 
 /**
  * What `tune-out/<primary>/stop-stamp` keeps (`{ v: 1, epochs,
- * runStartedAt? }`): the holds on record at the last stop (their epochs)
- * whose waiting cancels that stop accounted for, a note's loss written or
- * kept in the store (writeStopStamp), and the store's head sequence when
- * that run began. Each boot reads it and writes it again covering no hold,
+ * runStartedAt?, branch? }`): the holds on record at the last stop (their
+ * epochs) whose waiting cancels that stop accounted for, a note's loss
+ * written or kept in the store (writeStopStamp), and where that run's rows
+ * begin: the store's head sequence when it began, or when it moved to the
+ * branch it is on (branchMoved), and that branch, as sequences are each
+ * branch's own. Each boot reads it and writes it again covering no hold,
  * with its own run's start (noteUnstampedStop), so a crash leaves a stamp
- * that covers nothing and bounds the rows the next boot reads.
+ * that covers nothing and bounds the rows the next boot reads; a start on
+ * another branch than the boot's bounds nothing there.
  */
 interface StopStamp {
   v: 1;
   epochs: string[];
   runStartedAt?: number;
+  branch?: string;
 }
 
 /** A hold on record (holdsOnRecord): its epoch, and its channel, the all-except hold's excepted one with `scope`. */
@@ -749,6 +753,12 @@ export interface TuneOutFrameworkHooks {
   /** Current chronicle head sequence (window anchor for new epochs). */
   currentSequence: () => number;
   /**
+   * The name of the store's branch now, whose sequences currentSequence
+   * counts: the stop stamp names it with its run's start (StopStamp). Left
+   * out, none is named, and a stamp's start is read on any branch.
+   */
+  currentBranch?: () => string;
+  /**
    * Move the subconscious window anchor to `start`, the oldest active
    * tune-out's (never forward past active epochs): by its sequence while
    * the subconscious's window is the record, by its ordinal once that is
@@ -907,6 +917,20 @@ export class TuneOutCoordinator {
    * couldn't be read.
    */
   private runStartedAt: number | undefined;
+  /** The branch `runStartedAt` is a place on (currentBranch), where the host names one. */
+  private runBranch: string | undefined;
+  /** Where this run's rows begin on each branch it has been on, by branch (branchMoved): a move back to one keeps its start. */
+  private readonly runStarts = new Map<string, number | undefined>();
+  /**
+   * The bound the last stop's stamp gave this boot's reading of that run
+   * (its `runStartedAt` and `branch`), kept while a notice the boot derived
+   * from it is kept in memory only (stampNoticesUnkept): this run's stamp
+   * carries it then (runBound), so a crash meanwhile leaves the next boot
+   * reading the same rows, and telling the same.
+   */
+  private carriedBound: Pick<StopStamp, 'runStartedAt' | 'branch'> | undefined;
+  /** The ids of the notices the store's loss record holds, as last written or read (writeLossRecord, readLossRecord). */
+  private lossRecordIds = new Set<string>();
   /**
    * This run's stamp (noteUnstampedStop) where the store refused it at boot,
    * tried again until it lands (writePendingMarker); a stop's own stamp
@@ -1536,8 +1560,15 @@ export class TuneOutCoordinator {
       clearTimeout(this.deferredRetry);
       this.deferredRetry = undefined;
     }
-    this.writePendingMarker();
+    // The loss notices first: the marker after them names this run's own
+    // start once those a boot read from the last stop's stamp are told or
+    // kept (runBound).
     this.writeLossNotices();
+    if (this.carriedBound && !this.stampNoticesUnkept()) {
+      this.carriedBound = undefined;
+      this.markerPending = this.runMarker();
+    }
+    this.writePendingMarker();
     let failed = false;
     for (const key of [...this.deferredCancels.keys()]) {
       if (this.stopped) break;
@@ -1872,6 +1903,7 @@ export class TuneOutCoordinator {
       const all = this.persistedLossNotices();
       this.channelRegistry.writeCoordinatorState(this.lossNoticesStateId, { v: 1, pendingLossNotices: all });
       this.lossRecordShape = JSON.stringify(all);
+      this.lossRecordIds = new Set(all.map((n) => n.id));
       this.lossRecordStale = false;
       return true;
     } catch (err) {
@@ -1904,6 +1936,7 @@ export class TuneOutCoordinator {
       return false;
     }
     this.lossRecordUnread = false;
+    this.lossRecordIds = new Set();
     if (raw == null) return true;
     const record = raw as { v?: unknown; pendingLossNotices?: unknown };
     if (record.v !== 1 || !Array.isArray(record.pendingLossNotices)) {
@@ -1919,6 +1952,7 @@ export class TuneOutCoordinator {
         unreadable++;
         continue;
       }
+      this.lossRecordIds.add(entry.id);
       if (known.has(entry.id)) continue;
       known.add(entry.id);
       const { epochId, serverId, channelId, scope } = entry.for;
@@ -2001,10 +2035,7 @@ export class TuneOutCoordinator {
         }
       }
       const onRecord = this.holdsOnRecord().map((hold) => hold.epochId);
-      const stamp: StopStamp = {
-        v: 1, epochs: onRecord.filter((epochId) => !unaccounted.has(epochId)),
-        ...(this.runStartedAt !== undefined ? { runStartedAt: this.runStartedAt } : {}),
-      };
+      const stamp: StopStamp = { v: 1, epochs: onRecord.filter((epochId) => !unaccounted.has(epochId)), ...this.runBound() };
       this.channelRegistry.writeCoordinatorState(this.stopStampStateId, stamp);
     } catch (err) {
       console.error(`[tune-out] stopping: the stop could not be stamped (${this.stopStampStateId}), so the next boot tells the subconscious, `
@@ -2037,12 +2068,18 @@ export class TuneOutCoordinator {
    * (its notice in the subconscious's window, or kept to be written) is told
    * again only what says more (FOUND_RANK), or another note. A reader fork
    * is told nothing: none outlives the stop. The stamp is then written again
-   * covering no hold and naming this run's start (`runStartedAt`), so it
-   * can't cover a later stop and a crash during this run leaves it so; a
-   * write that fails is kept and tried again as the loss notices are
+   * covering no hold and naming this run's start (`runStartedAt`, and its
+   * `branch`), so it can't cover a later stop and a crash during this run
+   * leaves it so: last, once those notices are written or kept in the store,
+   * and, while one is neither, naming the last stop's bound instead
+   * (runBound), so a crash meanwhile reads the same rows again. A write that
+   * fails is kept and tried again as the loss notices are
    * (writePendingMarker), and meanwhile a waiting cancel's answer says so.
    * A stamp that can't be read, or isn't in this version's form, covers
-   * nothing. Never throws.
+   * nothing; one whose run start is on another branch than the store's now
+   * bounds nothing here, sequences being each branch's own, so no row is
+   * read as that run's and each hold it doesn't cover is told conditionally
+   * (`unknown`). Never throws.
    */
   private noteUnstampedStop(onRecord: readonly HoldOnRecord[], stopKept: ReadonlySet<string>, bootHead: number | undefined): void {
     try {
@@ -2057,10 +2094,12 @@ export class TuneOutCoordinator {
       const stamp = raw as Partial<StopStamp> | null | undefined;
       const covered = new Set<string>();
       let since: number | undefined;
+      let stampBranch: string | undefined;
       const firstBoot = readable && raw == null;
       if (stamp && stamp.v === 1 && Array.isArray(stamp.epochs)) {
         for (const epochId of stamp.epochs) if (typeof epochId === 'string') covered.add(epochId);
         if (typeof stamp.runStartedAt === 'number') since = stamp.runStartedAt;
+        if (typeof stamp.branch === 'string') stampBranch = stamp.branch;
       } else if (raw != null) {
         console.error(`[tune-out] the last stop's stamp (${this.stopStampStateId}) isn't in a form this version reads, so it covers no hold`);
       }
@@ -2070,164 +2109,283 @@ export class TuneOutCoordinator {
       }
       // This run begins at the store's head as the boot found it, before
       // the boot's own releases (an end time passed, a wake budget spent):
-      // those are this run's, not the last one's.
+      // those are this run's, not the last one's. Its marker is written last
+      // (finally, below), once what this boot reads of the last stop's
+      // stamp is told or kept: written first, a crash or a refused record
+      // between the two left the next boot reading from this run's start,
+      // past what the notice told of.
       this.runStartedAt = bootHead;
-      this.markerPending = { v: 1, epochs: [], ...(this.runStartedAt !== undefined ? { runStartedAt: this.runStartedAt } : {}) };
-      this.writePendingMarker();
-      if (this.markerPending) this.armDeferredRetry();
-      let author: string | null;
+      this.runBranch = this.branchNow();
+      if (this.runBranch !== undefined) this.runStarts.set(this.runBranch, bootHead);
+      this.carriedBound = {
+        ...(since !== undefined ? { runStartedAt: since } : {}), ...(stampBranch !== undefined ? { branch: stampBranch } : {}),
+      };
+      // A run start on another branch is a place on that branch: this one's
+      // sequences say nothing of it, so no row here is read as that run's.
+      const elsewhere = stampBranch !== undefined && this.runBranch !== undefined && stampBranch !== this.runBranch;
       try {
-        author = this.hooks.subconsciousName();
-      } catch {
-        author = null;
+        this.tellUnstampedHolds(onRecord, stopKept, bootHead, { covered, since, firstBoot, elsewhere, stampBranch });
+      } finally {
+        if (!this.stampNoticesUnkept()) this.carriedBound = undefined;
+        this.markerPending = this.runMarker();
+        this.writePendingMarker();
+        if (this.markerPending) this.armDeferredRetry();
       }
-      if (!author || firstBoot) return;
-      const uncovered = onRecord.filter((hold) => !covered.has(hold.epochId));
-      if (uncovered.length === 0) return;
-      // What that run's residents' rows show, by epoch: from its start to
-      // this boot's (`bootHead`), so a release this boot made isn't read as
-      // the last run's.
-      const notes = new Map<string, number>();
-      const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string; askers: string[] }>>();
-      const toldInRelease = new Set<string>();
-      try {
-        for (const m of this.hooks.getStoredMessages()) {
-          if (since !== undefined && typeof m.sequence === 'number' && m.sequence <= since) continue;
-          if (bootHead !== undefined && typeof m.sequence === 'number' && m.sequence > bootHead) continue;
-          const meta = m.metadata as { kind?: unknown; epochId?: unknown; lostNote?: unknown; cancel?: { source?: unknown; reason?: unknown; by?: unknown; askers?: unknown } } | undefined;
-          if (typeof meta?.epochId !== 'string') continue;
-          if (meta.kind === 'subconscious-note') notes.set(meta.epochId, Math.max(notes.get(meta.epochId) ?? -Infinity, m.sequence));
-          else if (meta.kind === 'tune-out-cancel') {
-            if (meta.lostNote === true) toldInRelease.add(meta.epochId);
-            releases.set(meta.epochId, [...(releases.get(meta.epochId) ?? []), {
-              sequence: m.sequence,
-              ...(typeof meta.cancel?.source === 'string' ? { source: meta.cancel.source } : {}),
-              ...(typeof meta.cancel?.reason === 'string' ? { reason: meta.cancel.reason } : {}),
-              askers: Array.isArray(meta.cancel?.askers) ? (meta.cancel.askers as unknown[]).filter((a): a is string => typeof a === 'string')
-                : typeof meta.cancel?.by === 'string' ? [meta.cancel.by] : [],
-            }]);
-          }
-        }
-      } catch (err) {
-        console.error(`[tune-out] the residents' rows could not be read at boot, so what became of a note waiting at the last stop isn't known: ${thrownReason(err)}`);
-      }
-      // What the subconscious's own window shows: its calls, and what it was told already.
-      let window: readonly WindowRow[] = [];
-      try {
-        window = this.hooks.subconsciousWindow?.() ?? [];
-      } catch (err) {
-        console.error(`[tune-out] the subconscious's window could not be read at boot, so a cancel it asked for isn't named: ${thrownReason(err)}`);
-      }
-      let archived: ReadonlyMap<string, unknown> | undefined;
-      try {
-        archived = this.hooks.subconsciousGuardedResults?.();
-      } catch (err) {
-        console.error(`[tune-out] the tool-result guard's audit could not be read at boot, so a result it withheld isn't read from it: ${thrownReason(err)}`);
-      }
-      const asks = cancelAsksIn(window, author, archived);
-      // What it was told of a hold's unrecorded stop already, and when: by
-      // the store's head when the boot that told it decided it
-      // (keptAtSequence), on its row or on a notice kept to be written; a
-      // row with none by its own sequence, a kept notice with none as told
-      // now. A notice written late, its writes held, was told then.
-      const toldBefore = (epochId: string): Array<{ found: UnstampedStop['found']; note?: string; at: number }> => [
-        ...window.flatMap((m) => {
-          const meta = m.metadata as { kind?: unknown; epochId?: unknown; stopUnrecorded?: { found?: unknown; note?: unknown; keptAtSequence?: unknown } } | undefined;
-          if (meta?.kind !== 'tune-out-note-undelivered' || meta.epochId !== epochId || !meta.stopUnrecorded) return [];
-          const found = meta.stopUnrecorded.found;
-          return found === 'delivered' || found === 'ran' || found === 'asked' || found === 'unknown'
-            ? [{
-              found: found as UnstampedStop['found'], ...(typeof meta.stopUnrecorded.note === 'string' ? { note: meta.stopUnrecorded.note } : {}),
-              at: typeof meta.stopUnrecorded.keptAtSequence === 'number' ? meta.stopUnrecorded.keptAtSequence : m.sequence,
-            }] : [];
-        }),
-        ...(this.lossNotices.get(author) ?? []).flatMap((n) => (n.drop.reason === 'unstamped-stop' && n.for.epochId === epochId
-          ? [{ found: n.drop.found, ...(n.drop.note !== undefined ? { note: n.drop.note } : {}), at: n.keptAtSequence ?? Infinity }] : [])),
-      ];
-      for (const hold of uncovered) {
-        const { epochId, serverId, channelId, scope } = hold;
-        const what = scope ? `the all-except hold (epoch ${epochId})` : `the tune-out of ${this.shown(serverId, channelId)} (epoch ${epochId})`;
-        if (toldInRelease.has(epochId)) {
-          console.error(`[tune-out] the last stop did not record the state of ${what}, but a release of it already told ${author} that its waiting note was lost`);
-          continue;
-        }
-        if (stopKept.has(epochId)) {
-          console.error(`[tune-out] the last stop's stamp doesn't cover ${what}, but the stop kept the loss of its waiting note in the store, which is told`);
-          continue;
-        }
-        const asked = this.askedCancelOf(hold, since, asks, onRecord);
-        // With no ask found, a release of the epoch in that run is after the
-        // hold and the run began by construction (an epoch's release follows
-        // its entry, and the rows are that run's), so this bound can't be
-        // told from none by any store; it is kept for the reading's sake.
-        const after = asked ? asked.sequence : Math.max(hold.startedAt ?? -Infinity, since ?? -Infinity);
-        const ranAfter = (releases.get(epochId) ?? []).filter((r) => r.sequence > after);
-        // The subconscious's own cancel: one whose askers name it (a call of
-        // its joined to another's waiting cancel among them), or one its
-        // tool asked for (`subconscious`) under no name. A release with no
-        // askers recorded is one a build before them wrote (unreleased
-        // builds of #844 only), read as its tool's. A reader fork's, under
-        // the fork's name, is another's, as anyone else's is.
-        const ownRelease = ranAfter.filter((r) => r.askers.includes(author) || (r.source === 'subconscious' && r.askers.length === 0)).at(-1);
-        const own = ownRelease !== undefined;
-        // Credited to the latest that ran.
-        const by = own ? undefined : ranAfter.at(-1);
-        // Who else its own release credits: the other askers, and the cancel
-        // it joined where that wasn't the subconscious's tool's.
-        const joined = ownRelease
-          ? [...ownRelease.askers.filter((a) => a !== author).map((a) => `${a}'s`),
-            ...(ownRelease.source !== 'subconscious' && ownRelease.reason !== undefined ? [`the cancel for ${ownRelease.reason}`] : [])]
-          : [];
-        const noteAt = notes.get(epochId);
-        const drop: UnstampedStop = ranAfter.length > 0
-          ? {
-            reason: 'unstamped-stop', found: 'ran', ...(asked ? { asked: true as const } : {}),
-            ...(asked?.note !== undefined ? { note: asked.note } : {}), ...(noteAt !== undefined ? { noteDelivered: true as const } : {}),
-            ...(own ? { own: true as const, ...(joined.length > 0 ? { joined } : {}) } : by?.reason !== undefined ? { ranBy: by.reason } : {}),
-          }
-          : noteAt !== undefined ? { reason: 'unstamped-stop', found: 'delivered' }
-          : asked ? { reason: 'unstamped-stop', found: 'asked', ...(asked.note !== undefined ? { note: asked.note } : {}) }
-          : { reason: 'unstamped-stop', found: 'unknown' };
-        const found = drop.found;
-        // What it was told silences this only where it was told after what
-        // this reads (the newest ask of the hold, the release, the note): a
-        // row older than a later ask never does, so a loss asked again
-        // after it was told is told again.
-        const evidence = Math.max(asked?.newest ?? -Infinity, ranAfter.at(-1)?.sequence ?? -Infinity, noteAt ?? -Infinity);
-        const said = toldBefore(epochId).filter((told) => told.at > evidence);
-        if (said.some((told) => FOUND_RANK[told.found] > FOUND_RANK[found] || (told.found === found && told.note === drop.note))) {
-          console.error(`[tune-out] the last stop did not record the state of ${what}, which ${author} was told already, with nothing more to say now`);
-          continue;
-        }
-        console.error(`[tune-out] the last stop did not record the state of ${what}, so ${author} is told `
-          + (found === 'delivered' ? 'that the note it left with a cancel of it was delivered, and its end not recorded'
-            : found === 'ran' ? 'that a cancel of it ran, its release stored and its end not recorded'
-            : found === 'asked' ? 'that the cancel of it it asked for, answered as waiting, was lost, with its note'
-            : 'that a cancel of it then waiting, if it asked for one, was lost, with any note'));
-        try {
-          this.hooks.emitTrace({ type: 'tune-out:stop-unrecorded', serverId, channelId, epochId, ...(scope ? { scope } : {}), noteAuthor: author, found });
-        } catch (err) {
-          console.error(`[tune-out] that the last stop did not record the state of ${what} could not be traced: ${thrownReason(err)}`);
-        }
-        const notice: LossNotice = {
-          id: randomUUID(),
-          for: { epochId, serverId, channelId, ...(scope ? { scope } : {}), current: this.epochHoldingAt(serverId, channelId, scope) },
-          what, drop, keptAtMs: Date.now(), ...(bootHead !== undefined ? { keptAtSequence: bootHead } : {}), persistent: true,
-        };
-        this.lossNotices.set(author, [...(this.lossNotices.get(author) ?? []), notice]);
-      }
-      this.writeLossNotices(author);
-      // Kept, not written (writes held, or the subconscious's context
-      // refusing them), each is kept in the store at once, held writes or
-      // not, as the boot's stamp is: a crash before the writes land then
-      // leaves it for the next boot's replay (restoreLossNotices), whose scan
-      // reads only the run that crashed. Where the store refuses the record
-      // too, it is tried again when writes land (writeLossNotices); a crash
-      // before then loses it, which nothing here can help.
-      this.writeLossRecord('boot');
-      if (this.lossNotices.size > 0) this.armDeferredRetry();
     } catch (err) {
       console.error(`[tune-out] whether the last stop recorded the holds on record could not be checked at boot: ${thrownReason(err)}`);
+    }
+  }
+
+  /**
+   * noteUnstampedStop's telling, for the holds on record (`onRecord`) the
+   * last stop's stamp doesn't cover (`covered`), reading that run's rows
+   * from its start (`since`) to this boot's (`bootHead`), none where its
+   * start is on another branch (`elsewhere`). May throw.
+   */
+  private tellUnstampedHolds(
+    onRecord: readonly HoldOnRecord[],
+    stopKept: ReadonlySet<string>,
+    bootHead: number | undefined,
+    last: { covered: ReadonlySet<string>; since: number | undefined; firstBoot: boolean; elsewhere: boolean; stampBranch: string | undefined },
+  ): void {
+    const { covered, since, firstBoot, elsewhere } = last;
+    let author: string | null;
+    try {
+      author = this.hooks.subconsciousName();
+    } catch {
+      author = null;
+    }
+    if (!author || firstBoot) return;
+    const uncovered = onRecord.filter((hold) => !covered.has(hold.epochId));
+    if (uncovered.length === 0) return;
+    if (elsewhere) {
+      console.error(`[tune-out] the last stop's stamp names its run's start on branch ${JSON.stringify(last.stampBranch)}, not this one `
+        + `(${JSON.stringify(this.runBranch)}), so no row here can be told to be that run's: each hold it doesn't cover is told conditionally`);
+    }
+    // What that run's residents' rows show, by epoch: from its start to
+    // this boot's (`bootHead`), so a release this boot made isn't read as
+    // the last run's.
+    const notes = new Map<string, number>();
+    const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string; askers: string[] }>>();
+    const toldInRelease = new Set<string>();
+    try {
+      for (const m of elsewhere ? [] : this.hooks.getStoredMessages()) {
+        if (since !== undefined && typeof m.sequence === 'number' && m.sequence <= since) continue;
+        if (bootHead !== undefined && typeof m.sequence === 'number' && m.sequence > bootHead) continue;
+        const meta = m.metadata as { kind?: unknown; epochId?: unknown; lostNote?: unknown; cancel?: { source?: unknown; reason?: unknown; by?: unknown; askers?: unknown } } | undefined;
+        if (typeof meta?.epochId !== 'string') continue;
+        if (meta.kind === 'subconscious-note') notes.set(meta.epochId, Math.max(notes.get(meta.epochId) ?? -Infinity, m.sequence));
+        else if (meta.kind === 'tune-out-cancel') {
+          if (meta.lostNote === true) toldInRelease.add(meta.epochId);
+          releases.set(meta.epochId, [...(releases.get(meta.epochId) ?? []), {
+            sequence: m.sequence,
+            ...(typeof meta.cancel?.source === 'string' ? { source: meta.cancel.source } : {}),
+            ...(typeof meta.cancel?.reason === 'string' ? { reason: meta.cancel.reason } : {}),
+            askers: Array.isArray(meta.cancel?.askers) ? (meta.cancel.askers as unknown[]).filter((a): a is string => typeof a === 'string')
+              : typeof meta.cancel?.by === 'string' ? [meta.cancel.by] : [],
+          }]);
+        }
+      }
+    } catch (err) {
+      console.error(`[tune-out] the residents' rows could not be read at boot, so what became of a note waiting at the last stop isn't known: ${thrownReason(err)}`);
+    }
+    // What the subconscious's own window shows: its calls, and what it was told already.
+    let window: readonly WindowRow[] = [];
+    try {
+      window = this.hooks.subconsciousWindow?.() ?? [];
+    } catch (err) {
+      console.error(`[tune-out] the subconscious's window could not be read at boot, so a cancel it asked for isn't named: ${thrownReason(err)}`);
+    }
+    let archived: ReadonlyMap<string, unknown> | undefined;
+    try {
+      archived = this.hooks.subconsciousGuardedResults?.();
+    } catch (err) {
+      console.error(`[tune-out] the tool-result guard's audit could not be read at boot, so a result it withheld isn't read from it: ${thrownReason(err)}`);
+    }
+    const asks = elsewhere ? [] : cancelAsksIn(window, author, archived);
+    // What it was told of a hold's unrecorded stop already, and when: by
+    // the store's head when the boot that told it decided it
+    // (keptAtSequence), on its row or on a notice kept to be written; a
+    // row with none by its own sequence, a kept notice with none as told
+    // now. A notice written late, its writes held, was told then.
+    const toldBefore = (epochId: string): Array<{ found: UnstampedStop['found']; note?: string; at: number }> => [
+      ...window.flatMap((m) => {
+        const meta = m.metadata as { kind?: unknown; epochId?: unknown; stopUnrecorded?: { found?: unknown; note?: unknown; keptAtSequence?: unknown } } | undefined;
+        if (meta?.kind !== 'tune-out-note-undelivered' || meta.epochId !== epochId || !meta.stopUnrecorded) return [];
+        const found = meta.stopUnrecorded.found;
+        return found === 'delivered' || found === 'ran' || found === 'asked' || found === 'unknown'
+          ? [{
+            found: found as UnstampedStop['found'], ...(typeof meta.stopUnrecorded.note === 'string' ? { note: meta.stopUnrecorded.note } : {}),
+            at: typeof meta.stopUnrecorded.keptAtSequence === 'number' ? meta.stopUnrecorded.keptAtSequence : m.sequence,
+          }] : [];
+      }),
+      ...(this.lossNotices.get(author) ?? []).flatMap((n) => (n.drop.reason === 'unstamped-stop' && n.for.epochId === epochId
+        ? [{ found: n.drop.found, ...(n.drop.note !== undefined ? { note: n.drop.note } : {}), at: n.keptAtSequence ?? Infinity }] : [])),
+    ];
+    for (const hold of uncovered) {
+      const { epochId, serverId, channelId, scope } = hold;
+      const what = scope ? `the all-except hold (epoch ${epochId})` : `the tune-out of ${this.shown(serverId, channelId)} (epoch ${epochId})`;
+      if (toldInRelease.has(epochId)) {
+        console.error(`[tune-out] the last stop did not record the state of ${what}, but a release of it already told ${author} that its waiting note was lost`);
+        continue;
+      }
+      if (stopKept.has(epochId)) {
+        console.error(`[tune-out] the last stop's stamp doesn't cover ${what}, but the stop kept the loss of its waiting note in the store, which is told`);
+        continue;
+      }
+      const asked = this.askedCancelOf(hold, since, asks, onRecord);
+      // With no ask found, a release of the epoch in that run is after the
+      // hold and the run began by construction (an epoch's release follows
+      // its entry, and the rows are that run's), so this bound can't be
+      // told from none by any store; it is kept for the reading's sake.
+      const after = asked ? asked.sequence : Math.max(hold.startedAt ?? -Infinity, since ?? -Infinity);
+      const ranAfter = (releases.get(epochId) ?? []).filter((r) => r.sequence > after);
+      // The subconscious's own cancel: one whose askers name it (a call of
+      // its joined to another's waiting cancel among them), or one its
+      // tool asked for (`subconscious`) under no name. A release with no
+      // askers recorded is one a build before them wrote (unreleased
+      // builds of #844 only), read as its tool's. A reader fork's, under
+      // the fork's name, is another's, as anyone else's is.
+      const ownRelease = ranAfter.filter((r) => r.askers.includes(author) || (r.source === 'subconscious' && r.askers.length === 0)).at(-1);
+      const own = ownRelease !== undefined;
+      // Credited to the latest that ran.
+      const by = own ? undefined : ranAfter.at(-1);
+      // Who else its own release credits: the other askers, and the cancel
+      // it joined where that wasn't the subconscious's tool's.
+      const joined = ownRelease
+        ? [...ownRelease.askers.filter((a) => a !== author).map((a) => `${a}'s`),
+          ...(ownRelease.source !== 'subconscious' && ownRelease.reason !== undefined ? [`the cancel for ${ownRelease.reason}`] : [])]
+        : [];
+      const noteAt = notes.get(epochId);
+      const drop: UnstampedStop = ranAfter.length > 0
+        ? {
+          reason: 'unstamped-stop', found: 'ran', ...(asked ? { asked: true as const } : {}),
+          ...(asked?.note !== undefined ? { note: asked.note } : {}), ...(noteAt !== undefined ? { noteDelivered: true as const } : {}),
+          ...(own ? { own: true as const, ...(joined.length > 0 ? { joined } : {}) } : by?.reason !== undefined ? { ranBy: by.reason } : {}),
+        }
+        : noteAt !== undefined ? { reason: 'unstamped-stop', found: 'delivered' }
+        : asked ? { reason: 'unstamped-stop', found: 'asked', ...(asked.note !== undefined ? { note: asked.note } : {}) }
+        : { reason: 'unstamped-stop', found: 'unknown' };
+      const found = drop.found;
+      // What it was told silences this only where it was told after what
+      // this reads (the newest ask of the hold, the release, the note): a
+      // row older than a later ask never does, so a loss asked again
+      // after it was told is told again.
+      const evidence = Math.max(asked?.newest ?? -Infinity, ranAfter.at(-1)?.sequence ?? -Infinity, noteAt ?? -Infinity);
+      const said = toldBefore(epochId).filter((told) => told.at > evidence);
+      if (said.some((told) => FOUND_RANK[told.found] > FOUND_RANK[found] || (told.found === found && told.note === drop.note))) {
+        console.error(`[tune-out] the last stop did not record the state of ${what}, which ${author} was told already, with nothing more to say now`);
+        continue;
+      }
+      console.error(`[tune-out] the last stop did not record the state of ${what}, so ${author} is told `
+        + (found === 'delivered' ? 'that the note it left with a cancel of it was delivered, and its end not recorded'
+          : found === 'ran' ? 'that a cancel of it ran, its release stored and its end not recorded'
+          : found === 'asked' ? 'that the cancel of it it asked for, answered as waiting, was lost, with its note'
+          : 'that a cancel of it then waiting, if it asked for one, was lost, with any note'));
+      try {
+        this.hooks.emitTrace({ type: 'tune-out:stop-unrecorded', serverId, channelId, epochId, ...(scope ? { scope } : {}), noteAuthor: author, found });
+      } catch (err) {
+        console.error(`[tune-out] that the last stop did not record the state of ${what} could not be traced: ${thrownReason(err)}`);
+      }
+      const notice: LossNotice = {
+        id: randomUUID(),
+        for: { epochId, serverId, channelId, ...(scope ? { scope } : {}), current: this.epochHoldingAt(serverId, channelId, scope) },
+        what, drop, keptAtMs: Date.now(), ...(bootHead !== undefined ? { keptAtSequence: bootHead } : {}), persistent: true,
+      };
+      this.lossNotices.set(author, [...(this.lossNotices.get(author) ?? []), notice]);
+    }
+    this.writeLossNotices(author);
+    // Kept, not written (writes held, or the subconscious's context
+    // refusing them), each is kept in the store at once, held writes or
+    // not, as the boot's stamp is: a crash before the writes land then
+    // leaves it for the next boot's replay (restoreLossNotices), whose scan
+    // reads only the run that crashed. Where the store refuses the record
+    // too, it is tried again when writes land (writeLossNotices); a crash
+    // before then loses it, which nothing here can help.
+    this.writeLossRecord('boot');
+    if (this.lossNotices.size > 0) this.armDeferredRetry();
+  }
+
+  /** The store's branch now (currentBranch), or undefined where the host names none or it can't be read. */
+  private branchNow(): string | undefined {
+    try {
+      return this.hooks.currentBranch?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether a notice a boot derived from the last stop's stamp
+   * (`unstamped-stop`) is kept in memory only: not written to the
+   * subconscious yet, nor in the store's loss record (lossRecordIds).
+   */
+  private stampNoticesUnkept(): boolean {
+    for (const kept of this.lossNotices.values()) {
+      for (const n of kept) if (n.persistent && n.drop.reason === 'unstamped-stop' && !this.lossRecordIds.has(n.id)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Where the next boot reads this run's rows from (StopStamp's
+   * `runStartedAt` and `branch`): this run's start, or, while a notice this
+   * boot derived from the last stop's stamp is kept in memory only
+   * (stampNoticesUnkept), that stamp's bound (carriedBound), so a crash then
+   * leaves the next boot reading what this boot read.
+   */
+  private runBound(): Pick<StopStamp, 'runStartedAt' | 'branch'> {
+    const bound = this.carriedBound && this.stampNoticesUnkept()
+      ? this.carriedBound
+      : { runStartedAt: this.runStartedAt, branch: this.runBranch };
+    return {
+      ...(bound.runStartedAt !== undefined ? { runStartedAt: bound.runStartedAt } : {}),
+      ...(bound.branch !== undefined ? { branch: bound.branch } : {}),
+    };
+  }
+
+  /** This run's marker: a stamp covering no hold, bounded where this run's rows begin (runBound). */
+  private runMarker(): StopStamp {
+    return { v: 1, epochs: [], ...this.runBound() };
+  }
+
+  /**
+   * The store's branch moved under this run (the framework's
+   * followBranchMove), so the snapshot states the coordinator keeps are the
+   * destination's now. Its stamp may cover a hold this run holds, and
+   * bounds the rows by another run's sequence: this run's marker is written
+   * there (writePendingMarker, tried again as at boot where it fails),
+   * naming the destination and its head now as where this run's rows on it
+   * begin (or where they began, on a branch this run was on before: a failed
+   * surgery's restore, say), so that a crash from here on reads only what
+   * this run stored on it. The destination's kept loss notices aren't in memory: the next write
+   * of the record reads them in first (lossRecordUnread), and writes this
+   * run's kept ones there too. Never throws.
+   */
+  branchMoved(): void {
+    if (this.stopped) return;
+    try {
+      const branch = this.branchNow();
+      if (branch !== undefined && this.runStarts.has(branch)) {
+        this.runStartedAt = this.runStarts.get(branch);
+      } else {
+        try {
+          this.runStartedAt = this.hooks.currentSequence();
+        } catch {
+          this.runStartedAt = undefined;
+        }
+        if (branch !== undefined) this.runStarts.set(branch, this.runStartedAt);
+      }
+      this.runBranch = branch;
+      this.carriedBound = undefined;
+      this.markerPending = this.runMarker();
+      this.writePendingMarker();
+      if (this.markerPending) this.armDeferredRetry();
+      this.lossRecordUnread = true;
+      this.lossRecordIds = new Set();
+      if (this.persistedLossNotices().length > 0) this.lossRecordStale = true;
+    } catch (err) {
+      console.error(`[tune-out] the stop stamp and loss record could not be moved to the store's new branch: ${thrownReason(err)}`);
     }
   }
 
@@ -2235,8 +2393,8 @@ export class TuneOutCoordinator {
    * This run's stamp (noteUnstampedStop), written; one the store refused is
    * kept (`markerPending`) and tried again at each release and by the retry
    * timer, as the loss notices are (runDeferredCancels), never while writes
-   * are held but at boot, until it lands or the stop writes its own. Never
-   * throws.
+   * are held but at boot and at a branch move (branchMoved), until it lands
+   * or the stop writes its own. Never throws.
    */
   private writePendingMarker(): void {
     const marker = this.markerPending;
@@ -2388,8 +2546,10 @@ export class TuneOutCoordinator {
    * logged and traced (`author-gone`). It is written only while writes
    * aren't held (writeLossNotices), so an empty id is no write kept in
    * memory, unless this write began such a hold (a context manager that
-   * refuses its work from it on), which writesHeld then says, and which
-   * stores the write at its release. A reader fork's own context manager
+   * refuses its work from it on), which writesHeld then says: memory alone
+   * holds it then, which a crash or a stop loses, so it answers `failed`,
+   * kept in the store's record and written again once writes are stored
+   * (twice, where the kept write is stored too). A reader fork's own context manager
    * refusing its work isn't told apart from its end here: the framework
    * answers an empty id for both. A turn that can't be asked for is
    * logged. Never throws.
@@ -2521,7 +2681,12 @@ export class TuneOutCoordinator {
       }
       return 'failed';
     }
-    if (id === '' && !this.writesHeldNow()) {
+    if (id === '' && this.writesHeldNow()) {
+      console.error(`[tune-out] ${author} could not be told ${lossSubject(notice)} yet: the notice was kept in memory as it was written `
+        + '(writes are held from it on), so it stays kept, in the store too, and is written again once writes are stored');
+      return 'failed';
+    }
+    if (id === '') {
       console.error(`[tune-out] ${author} is no agent the framework writes to any more, so the notice ${lossSubject(notice)} reaches no one`);
       try {
         this.hooks.emitTrace({

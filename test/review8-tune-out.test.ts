@@ -165,6 +165,8 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     gone: [] as string[],
     /** The process dies just after a hold's end is recorded: the end lands, and the step throws. */
     crashAfterEnd: false,
+    /** A loss notice's write meets a hold that begins at it: kept in memory, an empty id, writes held from then on. */
+    noticeKept: false,
   };
   let onTrace: ((event: Trace) => void) | undefined;
   let channel: { params: { epochId: string }; wakeCount: number } | null = null;
@@ -198,6 +200,10 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
       if (state.noteFails && metadata?.kind === 'subconscious-note') throw new Error('the store refused the row (test)');
       if (state.noticeFails && metadata?.kind === 'tune-out-note-undelivered') throw new Error('the store refused the notice too (test)');
       if (state.releaseFails && metadata?.kind === 'tune-out-cancel') throw new Error('the store refused the release (test)');
+      if (state.noticeKept && metadata?.kind === 'tune-out-note-undelivered') {
+        state.held = true;
+        return '';
+      }
       added.push({ participant, content, metadata, forAgent });
       if (options.stored && forAgent === undefined) rows.push({ participant, content, metadata: metadata ?? {}, sequence: rows.length + 1 });
       return `m${added.length}`;
@@ -1711,6 +1717,26 @@ test("review 2 #56: a note whose loss a release told, that release not made dura
       [['Subconscious', 'tune-out note not delivered: disc:guild:a']], 'with a turn to read it');
     assert.deepEqual(h.lossNotices(), [], 'no notice of its own: the release tells it');
     assert.deepEqual(h.notes(), [], 'and the note is not delivered after its loss was told');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("review 2 #32: a loss notice whose write meets a hold beginning at it is kept, not counted as written, so a stop keeps it in the store", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup();
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+    h.endOtherwise();
+    h.state.held = false;
+    h.state.noticeKept = true;
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.state.held, true, "premise: the notice's write was kept in memory, writes held from it on");
+    h.coordinator.stop();
+    assert.equal(h.lossRecord()?.pendingLossNotices.length, 1, "the notice is kept in the store for the next boot: memory alone held its write");
   } finally {
     h.coordinator.stop();
     errors.mock.restore();

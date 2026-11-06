@@ -60,6 +60,8 @@ function stampSetup() {
     commitFails: false,
     /** The holds' channels are registered, as a boot after #900 may find them, with this wake count. */
     registered: false, wakeCount: 0,
+    /** The store's branch now (switchTo). */
+    branch: 'main',
   };
   const key = (s: string, c: string) => `${s}\0${c}`;
   const registry = {
@@ -108,7 +110,28 @@ function stampSetup() {
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
     currentSequence: () => state.seq,
+    currentBranch: () => state.branch,
     setSubconsciousAnchor: () => {},
+  };
+  /**
+   * The store's branches: each its own states, rows, window and head; the
+   * holds on record are the registry's, which a move doesn't reload (#172).
+   */
+  const branches = new Map<string, { states: Array<[string, unknown]>; rows: Row[]; window: Row[]; seq: number }>();
+  const snapshot = () => ({ states: [...states].map(([k, v]) => [k, structuredClone(v)] as [string, unknown]), rows: [...rows], window: [...window], seq: state.seq });
+  /** A branch made from the one the store is on, at its head: its rows and states, as a child branch has them. */
+  const fork = (name: string): void => { branches.set(name, snapshot()); };
+  /** The store moves to branch `name`, made by fork. */
+  const switchTo = (name: string): void => {
+    const to = branches.get(name);
+    assert.ok(to, `premise: branch ${name} was made`);
+    branches.set(state.branch, snapshot());
+    states.clear();
+    for (const [k, v] of to.states) states.set(k, v);
+    rows.splice(0, rows.length, ...to.rows);
+    window.splice(0, window.length, ...to.window);
+    state.seq = to.seq;
+    state.branch = name;
   };
   const made: TuneOutCoordinator[] = [];
   const make = (): TuneOutCoordinator => { const c = new TuneOutCoordinator(registry as never, {} as never, hooks as never); made.push(c); return c; };
@@ -146,7 +169,7 @@ function stampSetup() {
   const unrecorded = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered' && textOf(m.content).includes('without recording'));
   const told = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered');
   const stopAll = (): void => { for (const c of made) c.stop(); };
-  return { states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll };
+  return { states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll, fork, switchTo };
 }
 
 const conditional = (hold: string, epochId: string, it = 'tune-out') => `[Tune-out: the host stopped without recording the state of ${hold} `
@@ -1194,3 +1217,162 @@ test("pin: a kept notice silences by when its boot decided it: one kept before a
   } finally { h.stopAll(); }
 }));
 
+// ---------------------------------------------------------------------------
+// AF #844 bot review 2 (at caf5a48f): the stamp, the loss record and a
+// branch move.
+// ---------------------------------------------------------------------------
+
+const askedRow = (epochId: string, note: string) => `[Tune-out: the host stopped without recording the state of the tune-out of noisy `
+  + `(epoch ${epochId}). The cancel of it you asked for with your note ${JSON.stringify(note)} had not run when the host stopped: it was `
+  + 'lost, and the note you left with it. That tune-out is still in force.]';
+
+test("review 2 #26: a boot that can neither write the notice it reads from the last stop's stamp nor keep it in the store leaves a marker that still reads that run, so a crash then gives the next boot the same row", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    // The host dies with the cancel waiting. The next boot can't write to
+    // the subconscious, and the store refuses the loss record.
+    h.state.subRefuses = true;
+    h.refuse.add(LOSS_RECORD);
+    h.boot();
+    assert.deepEqual(h.told(), [], 'premise: the notice could not be written');
+    assert.equal(h.states.get(LOSS_RECORD), undefined, 'premise: nor kept in the store');
+    // It dies too, before either lands.
+    h.state.subRefuses = false;
+    h.refuse.delete(LOSS_RECORD);
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')],
+      "the third boot still reads the first run's ask: the specific row, not the conditional one");
+  } finally { h.stopAll(); }
+}));
+
+test("review 2 #26, control: once the boot's notice is written, the marker names this run's start", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    const head = h.state.seq;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')]);
+    assert.equal((h.states.get(STAMP) as { runStartedAt?: number }).runStartedAt, head, "the marker bounds the next boot's reading at this run's start");
+  } finally { h.stopAll(); }
+}));
+
+test("review 2 #42: a branch move writes this run's marker on the branch moved to, so a crash after a cancel waits there is told, though that branch's stamp covered the hold", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.fork('other');
+    h.switchTo('other');
+    // An earlier stop on `other` stamped the hold.
+    h.states.set(STAMP, { v: 1, epochs: [e], runStartedAt: 1, branch: 'other' });
+    h.state.seq += 50;
+    h.switchTo('main');
+    const c = h.boot();
+    h.switchTo('other');
+    c.branchMoved();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.state.held = true;
+    assert.deepEqual(c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB), { ok: true, deferred: true });
+    // The host dies with the cancel waiting, on `other`.
+    h.state.held = false;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')], "the move's marker covers no hold, so the boot tells it");
+  } finally { h.stopAll(); }
+}));
+
+test("review 2 #43: after a branch move, the loss record written there keeps the notices that branch kept", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    h.hold();
+    h.fork('other');
+    h.switchTo('other');
+    const theirs = {
+      id: 'kept-on-other', author: SUB, what: 'the tune-out of quiet (epoch e-q)',
+      for: { epochId: 'e-q', serverId: 'editor', channelId: 'quiet' }, drop: { reason: 'stopped' }, keptAtMs: 1,
+    };
+    h.states.set(LOSS_RECORD, { v: 1, pendingLossNotices: [theirs] });
+    h.switchTo('main');
+    const c = h.boot();
+    h.state.held = true;
+    assert.deepEqual(c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB), { ok: true, deferred: true });
+    h.switchTo('other');
+    c.branchMoved();
+    c.stop();
+    const kept = (h.states.get(LOSS_RECORD) as { pendingLossNotices: Array<{ id: string }> }).pendingLossNotices;
+    assert.equal(kept.length, 2, `the stop's notice and the one the branch kept: ${JSON.stringify(kept)}`);
+    assert.ok(kept.some((n) => n.id === 'kept-on-other'), "the branch's own notice is not written over");
+  } finally { h.stopAll(); }
+}));
+
+test("review 2 #171: after a move to a branch whose head is past this run's start, an earlier run's release there isn't read as this run's", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.fork('other');
+    h.switchTo('other');
+    // An earlier run on `other` stored a release of the hold there, past
+    // where this run starts on `main`.
+    h.state.seq += 300;
+    h.release(e, 'subconscious', 'by Subconscious');
+    h.state.seq += 50;
+    h.switchTo('main');
+    const c = h.boot();
+    h.switchTo('other');
+    c.branchMoved();
+    h.state.held = true;
+    assert.deepEqual(c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB), { ok: true, deferred: true });
+    // A stop whose loss record the store refuses: the stamp leaves the hold out.
+    h.refuse.add(LOSS_RECORD);
+    c.stop();
+    h.refuse.delete(LOSS_RECORD);
+    h.state.held = false;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [conditional('the tune-out of noisy', e)],
+      "the conditional row: nothing of this run's on `other` says more, and the earlier run's release isn't taken for a cancel that ran");
+  } finally { h.stopAll(); }
+}));
+
+test("review 2 #171: a stamp that names its run's start on another branch bounds nothing here: each hold it doesn't cover gets the conditional row", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    const start = h.state.seq;
+    h.fork('other');
+    h.switchTo('other');
+    h.state.seq += 300;
+    h.release(e, 'subconscious', 'by Subconscious');
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    // The stamp `main`'s run left, which `other` inherited: its start is a place on `main`.
+    h.states.set(STAMP, { v: 1, epochs: [], runStartedAt: start, branch: 'main' });
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [conditional('the tune-out of noisy', e)],
+      "neither the release nor the ask is read as that run's");
+  } finally { h.stopAll(); }
+}));
+
+test("review 2 #42, control: a move back to the branch this run began on keeps that start, so a crash after reads what this run asked there", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    const c = h.boot();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.fork('other');
+    h.switchTo('other');
+    c.branchMoved();
+    h.switchTo('main');
+    c.branchMoved();
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => (m.metadata?.stopUnrecorded as { found: string }).found), ['unknown', 'asked'],
+      "the ask made on `main` before the moves is this run's: the specific row");
+    assert.equal(h.unrecorded().at(-1)!.metadata?.epochId, e);
+  } finally { h.stopAll(); }
+}));
