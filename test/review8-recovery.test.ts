@@ -6,6 +6,11 @@
  *     after it) is refused, as the live rollback refuses it, pointing at a
  *     suppression.
  * 17: a suppression may name a row the cut keeps after the anchor.
+ *
+ * Bot review 2:
+ * 1: `removeSuppressed` with no anchor takes the newest row on a presented
+ *    window as on a legacy one, and a run with nothing to suppress isn't
+ *    refused as an anchor "already the tail".
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -153,5 +158,40 @@ describe('AF #844 review 8 — offline recovery at a presented cut', () => {
     assert.equal(result.messagesRemoved, 1, 'D, presented after the cut');
     assert.equal(result.messagesSuppressed, 2);
     assert.deepEqual((await recordOn(storePath)).texts, ['P', 'A']);
+  });
+});
+
+describe('AF #844 bot review 2 — offline recovery on a presented window', () => {
+  it('1: removeSuppressed with no anchor removes the hidden row and branches at the head; a second run removes 0 and is not refused', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-review8-recovery-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'agent.chronicle');
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.presentRows([]);
+    const kept = cm.addMessage('user', [{ type: 'text', text: 'kept' } as ContentBlock]);
+    const hidden = cm.addMessage('user', [{ type: 'text', text: 'HIDDEN' } as ContentBlock], { suppressed: { rule: 'r', eventType: 'x' } } as never);
+    const newest = cm.addMessage('agent', [{ type: 'text', text: 'newest' } as ContentBlock]);
+    cm.presentRows([kept, hidden, newest]);
+    assert.equal(cm.windowMode(), 'presented');
+    cm.close();
+    store.close();
+
+    const dry = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', removeSuppressed: true, dryRun: true });
+    assert.equal(dry.messagesRemoved, 0);
+    assert.equal(dry.messagesSuppressed, 1, 'a dry run counts the hidden row');
+    const first = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', removeSuppressed: true, branchName: 'recovery/cairn/hidden' });
+    assert.equal(first.messagesRemoved, 0);
+    assert.equal(first.messagesSuppressed, 1);
+    const after = await recordOn(storePath);
+    assert.equal(after.branch, 'recovery/cairn/hidden');
+    assert.deepEqual(after.texts, ['kept', 'newest']);
+    assert.deepEqual(after.window, ['kept', 'newest'], 'the branch starts at the head, its window as it was but the hidden row');
+
+    const second = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', removeSuppressed: true, branchName: 'recovery/cairn/again' });
+    assert.equal(second.messagesRemoved, 0);
+    assert.equal(second.messagesSuppressed, 0);
+    assert.equal(second.sourceBranch, 'recovery/cairn/hidden');
+    assert.deepEqual((await recordOn(storePath)).window, ['kept', 'newest'], 'the second run brings back neither');
   });
 });

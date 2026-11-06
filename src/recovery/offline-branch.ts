@@ -182,7 +182,7 @@ export async function createOfflineRecoveryBranch(
       const firstRemoved = firstRemovedAfter(targetIndex, target);
       removedCount = total - firstRemoved;
       carriers = collectDiscordCarriers(contextManager, firstRemoved, total);
-    } else if (presented) {
+    } else if (presented && count !== undefined) {
       // Counted back in the agent's window, whose order isn't the record's:
       // the anchor is the window's row `count` before its newest. Only the
       // rows of the context's own slot count, as the live undo counts them:
@@ -210,7 +210,9 @@ export async function createOfflineRecoveryBranch(
     } else {
       // Count mode remains for compatibility. Read only the target plus suffix,
       // avoiding full-history materialization and attachment blob inflation.
-      // With no anchor (removeSuppressed alone), the target is the newest row.
+      // With no anchor (removeSuppressed alone), the target is the newest row,
+      // on a presented window too: nothing is cut, the branch starting at the
+      // head.
       const dropping = count ?? 0;
       const window = contextManager.getMessageWindow(total - dropping - 1, dropping + 1, {
         resolveBlobs: false,
@@ -239,7 +241,10 @@ export async function createOfflineRecoveryBranch(
       options.suppressRanges ?? [],
       options.removeSuppressed === true,
     );
-    if (presented && removedCount === 0 && suppression.intervals.length === 0) {
+    // A run with no anchor cuts nothing, so there is no anchor to name: one
+    // with nothing to suppress makes a branch at the head, as on a legacy
+    // window.
+    if (presented && anchorCount > 0 && removedCount === 0 && suppression.intervals.length === 0) {
       refuseIneffectiveCut(contextManager, target, options.agentName);
     }
     validateRemovalIntegrity(

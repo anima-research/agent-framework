@@ -27,3 +27,4 @@
   rollback that would remove nothing and take nothing out of the window is refused as a no-op, saying why: when its
   target was presented in one write with rows after it, the refusal says so, names the first of them, and points to
   `suppressMessages`, or the host's `hide` for a Discord message, to take them out.
+- Offline recovery with `removeSuppressed` alone (`--remove-suppressed`, no anchor) on a presented window threw a TypeError before it made anything. It now takes the newest row as on a legacy window, branching at the head with the suppressed rows removed, and a run with nothing left to suppress makes its branch, removing 0, instead of being refused as an anchor "already the tail" of the window.
