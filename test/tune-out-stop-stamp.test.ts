@@ -11,7 +11,9 @@
  *    waiting answer's server, or the call's, names one.
  * 4. A boot whose stamp the store refused tries it again, and a waiting
  *    cancel's answer says so meanwhile.
- * 5. One account of a lost note, not two; one row per hold across crashes.
+ * 5. One account of a lost note, not two; one row per hold across crashes,
+ *    but where a later boot finds more than it told, or the loss is asked
+ *    again after it was told.
  *
  * And the pins: each test below goes red when the line it names breaks.
  */

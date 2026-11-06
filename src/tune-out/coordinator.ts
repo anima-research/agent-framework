@@ -745,13 +745,17 @@ export interface TuneOutFrameworkHooks {
    * Read the primary's stored messages (shared slot, unfiltered). A held
    * message is stored as it arrives, even during the resident's turn, so
    * this is every message an epoch holds (#232 gap 7), but for those a live
-   * surgery's hold keeps in memory (getSurgeryHeldMessages).
+   * surgery's hold keeps in memory, or that the primary's context manager,
+   * refusing its work, keeps until a branch move re-initializes it
+   * (heldForRecovery): getSurgeryHeldMessages.
    */
   getStoredMessages: () => StoredMessage[];
   /**
-   * The writes for the primary's store that a live surgery's hold keeps in
-   * memory, in arrival order: made while the operator's switch is awaited,
-   * and stored, in that order, only at its release. A check during the hold
+   * The writes for the primary's store kept in memory, in arrival order:
+   * those the primary's context manager, refusing its work, keeps until a
+   * branch move re-initializes it (heldForRecovery), which come first, then
+   * those a live surgery's hold keeps, made while the operator's switch is
+   * awaited, and stored, in that order, only at its release. A check during the hold
    * counts and peeks a tune-out's held messages among them as it does the
    * stored ones (#232 gap 7). A cancel waits for the release (writesHeld),
    * so a dump lists them only where writesHeld throws and the cancel goes
@@ -1581,7 +1585,8 @@ export class TuneOutCoordinator {
    * later note is dropped, with a log line, and this answers 'note-dropped'
    * so its caller can be told. One waiting for an earlier epoch there,
    * whose hold ended without it, is dropped (dropDeferred), and this one
-   * waits in its place.
+   * waits in its place. Once stopped (a listener of that drop's trace, say),
+   * none waits: this one is told as the stop tells a waiting cancel.
    */
   private deferCancel(
     key: string,
@@ -1767,7 +1772,9 @@ export class TuneOutCoordinator {
    * dropDeferred tells it, its note as it stands: one whose loss a release
    * told is told so (lossesToldInRelease), where its hold has ended
    * (`hold-ended`); one delivered, or told lost already, isn't told lost
-   * again: its drop is logged and traced as one with no note.
+   * again: its drop is logged and traced as one with no note, unless the
+   * write that settled it is kept in memory at a stop (heldInMemory), which
+   * loses it.
    */
   private dropQueued(entry: DeferredCancel, drop: DeferredDrop): void {
     if (entry.lostInRelease && drop.reason === 'hold-ended') {
@@ -1887,7 +1894,9 @@ export class TuneOutCoordinator {
    * and the trace of the drop (dropDeferred) still names the fork. An
    * author not known is logged. One told at the stop is kept, not written:
    * the stop keeps it in the store with the others (writeLossRecord), for
-   * the next boot. Where the store refuses that record too, the stop's
+   * the next boot; one told after the stop has kept those (a trace
+   * listener's stop, during the run of a cancel it found off its queue) is
+   * added to that record (keepAfterStop). Where the store refuses that record too, the stop's
    * stamp leaves the hold out (writeStopStamp), and the next boot tells the
    * subconscious, for a hold still on record, what that run's rows show of
    * a cancel of it then waiting (noteUnstampedStop); a stop that can't write
@@ -2016,8 +2025,9 @@ export class TuneOutCoordinator {
    * changed since the record was last written or read, or a write of it
    * failed; never while writes are held (writesHeld): the release, the
    * retry or the stop writes it then. Not over a record that couldn't be
-   * read (readLossRecord, tried again first). A write that fails is logged,
-   * and the notices stay kept in memory, written or tried again as before;
+   * read (readLossRecord, tried again first). A write that fails, or can't
+   * be made durable at once (stateDurable), is logged, and the notices stay
+   * kept in memory, written or tried again as before;
    * a stop meanwhile loses them. At `stop`, written whenever one is kept,
    * held writes or not, and answers whether the record holds them. At
    * `boot`, written where they changed, held writes or not, as the boot's
@@ -2198,7 +2208,8 @@ export class TuneOutCoordinator {
   /**
    * At the stop, once the loss notices are written or kept: the stamp
    * (StopStamp) naming the holds on record now, a channel's and the
-   * all-except hold, whose waiting cancels this stop accounted for. Left
+   * all-except hold, whose waiting cancels this stop accounted for, written
+   * and made durable (stateDurable), as the loss record before it is. Left
    * out are the epochs of a note whose loss couldn't be kept (`unaccounted`;
    * every persistent notice's where the store refused the record,
    * `recorded` false), so the next boot tells the subconscious of them
@@ -2740,7 +2751,10 @@ export class TuneOutCoordinator {
    * fails stays, kept and tried again at the next release and at the retry,
    * which this arms. A notice whose author is no agent the framework writes
    * to now reaches no one, which is traced (`author-gone`), and leaves the
-   * record. Never throws.
+   * record. One whose row the subconscious's rows hold already
+   * (`lossNoticeId`: written, its record not brought in line before the
+   * stop) leaves the record, not written again. The notices of an
+   * unrecorded stop written here count as told (restoredTold). Never throws.
    */
   private restoreLossNotices(): Set<string> {
     // The holds whose waiting cancel's loss the last stop kept (`stopped`),

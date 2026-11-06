@@ -12,8 +12,9 @@
   waits in its place. Each drop is logged and traced as `tune-out:deferred-cancel-dropped`, with the epoch it was
   for and why, and the author of a note the dropped cancel carried, where it still exists (not a reader fork whose
   run has ended), is told in its own context that the note was dropped with it. A run that recorded its tune-out's
-  end and failed after it is logged and no longer queued again. A run that ends its tune-out and then can't write
-  its note, or fails before it does, tells the note's author so and why, where it still exists, and the loss is
+  end and failed after it is logged and no longer queued again. A run delivers its note once its release is
+  durable, and makes it durable before the end is recorded (the 844-queued-note-loss-in-release entry); a note it
+  can't write is told lost to its author, and why, where it still exists, once the hold has ended, and the loss is
   traced (`note-undelivered`); a note that can't be written no longer stops the rest of that cancel.
 - A reader's note queued with a tune-out cancel that waits for held writes now reaches the resident when another
   cancel ends that tune-out first, unless writing it then fails; its author is then told so, and why, unless it is a
