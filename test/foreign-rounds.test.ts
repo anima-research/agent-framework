@@ -83,6 +83,19 @@ describe('foreign rounds as a transcript', () => {
     assert.deepEqual(sent[2]!.content, [text('[a tool returned: green]')], 'the later c1 result is transcribed, not sent as a second result of it');
   });
 
+  // AF #844 bot review 4, finding 81: a call answers one result, read block
+  // by block: a second result for it in the same message names no call.
+  it("sends one result of a watcher's call as stored and transcribes a second one for it in the same message", () => {
+    const own = (p: string) => p === 'Subconscious';
+    const messages: NormalizedMessage[] = [
+      { participant: 'Subconscious', content: [call('x', 'note_disposition', { key: 'k' })] },
+      { participant: 'user', content: [result('x', '{"noted":"k"}'), result('x', 'green')] },
+    ];
+    const sent = transcribeForeignRounds(messages, own);
+    assert.deepEqual(sent[1]!.content, [result('x', '{"noted":"k"}'), text('[a tool returned: green]')],
+      'the first answers the call, as stored; the second answers none, and is a line');
+  });
+
   it('leaves a request with no other agent\'s blocks as it is, and keeps a row with nothing left as a line', () => {
     const messages: NormalizedMessage[] = [{ participant: 'antra', content: [text('hello')] }];
     assert.equal(transcribeForeignRounds(messages, () => false), messages, 'the same array');
