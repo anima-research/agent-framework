@@ -4,8 +4,9 @@
  * The subconscious reads a tune-out's held traffic through a windowed
  * passthrough strategy: everything from the anchor on, the anchor at the
  * oldest active tune-out's start (the coordinator's anchorSubconscious), or
- * at an earlier start kept in force (a cancelled tune-out's, never moved
- * forward while one is active; below).
+ * at an earlier start kept in force: a cancelled tune-out's, kept while
+ * another stays active and across a restart, until the next enter sets the
+ * oldest active one's (below).
  * While its window is the record, a start is a sequence, and the window is
  * every row stored at it or after. Once its window follows the presentation
  * index, the window is the rows in the order it was shown them, and a start

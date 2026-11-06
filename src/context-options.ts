@@ -27,8 +27,9 @@
  *   residents' stored context injections and what a suppress rule hid,
  *   which renders for no reader, this one included. Its strategy is a windowed
  *   passthrough, anchored at the oldest active tune-out's start, or at an
- *   earlier start kept in force (a cancelled tune-out's, never moved forward
- *   while one is active; window-anchor.ts).
+ *   earlier start kept in force: a cancelled tune-out's, kept while another
+ *   stays active and across a restart, until the next enter sets the oldest
+ *   active one's (window-anchor.ts).
  *
  * Each call returns a new object and, for the subconscious, a new strategy:
  * a strategy keeps state for the manager it is opened with.
