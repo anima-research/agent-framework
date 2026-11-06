@@ -2868,3 +2868,52 @@ test("review 5 #18: a release that told a queued note's loss, kept in memory and
     }
   }
 });
+
+test("review 5 #22: a queued cancel whose run delivered its note and then failed takes a later cancel's note, joining it during the run or after: nothing is dropped, and both notes go out", () => {
+  for (const scope of [false, true]) for (const joins of ['during the run', 'after it'] as const) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup();
+    const where = `${scope ? 'all-except' : 'channel'}, ${joins}`;
+    try {
+      const epochId = scope ? h.enterScope() : h.enter();
+      const inForce = () => (scope ? h.scopeInForce() : h.inForce());
+      const cancel = (note: string) => (scope
+        ? h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', note, 'Subconscious')
+        : h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', note, 'Subconscious'));
+      h.state.held = true;
+      cancel('First.');
+      h.state.held = false;
+      // The run delivers its note, and the sync after it fails: the run throws before the end, and the cancel waits on.
+      h.state.noteSyncFails = true;
+      let asked: unknown;
+      if (joins === 'during the run') {
+        h.listenWrites((metadata) => {
+          if (metadata?.kind !== 'subconscious-note' || asked !== undefined) return;
+          h.state.held = true;
+          asked = cancel('Second.');
+          h.state.held = false;
+        });
+      }
+      h.coordinator.runDeferredCancels();
+      h.listenWrites(() => {});
+      assert.equal(inForce(), epochId, `premise (${where}): its note's sync failed, so the hold stays in force`);
+      assert.deepEqual(h.notes().map((n) => n.text), ['First.'], `premise (${where}): the first note was delivered`);
+      if (joins === 'after it') {
+        h.state.held = true;
+        asked = cancel('Second.');
+        h.state.held = false;
+      }
+      assert.deepEqual(asked, { ok: true, deferred: true }, `${where}: the later cancel waits with its note, not told it is dropped`);
+      assert.equal(queuedOf(h), 1, `premise (${where}): one cancel waits`);
+      h.state.noteSyncFails = false;
+      h.coordinator.runDeferredCancels();
+      assert.equal(inForce(), null, `${where}: the hold ends`);
+      assert.deepEqual(h.notes().map((n) => n.text), ['First.', 'Second.'], `${where}: the later note goes out too, once`);
+      assert.deepEqual(h.dropped(), [], `${where}: nothing is dropped`);
+      assert.deepEqual(h.lossNotices(), [], `${where}: and no author is told of a loss`);
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});

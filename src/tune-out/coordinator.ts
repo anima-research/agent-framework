@@ -459,6 +459,28 @@ function withUnknownNote(drop: DeferredDrop, lost: DeferredCancel['lostAtRelease
 }
 
 /**
+ * Whether a queued cancel's note went out already: settled, neither by a
+ * release that told its loss (lostInRelease) nor by a write kept in memory
+ * (heldInMemory). A cancel settled by a loss told is off the queue by then
+ * (dropDeferred's callers), so on the queue settled means delivered. Such a
+ * cancel, waiting on after its run (its end not recorded), carries nothing
+ * more to deliver: a later cancel that joins it gives it its note, which
+ * goes out when the hold ends, rather than being dropped beside one
+ * delivered (deferCancel, requeue; AF #844 review 5, #22).
+ */
+function noteDelivered(entry: DeferredCancel): boolean {
+  return entry.note !== undefined && entry.noteSettled === true && !entry.lostInRelease && !entry.heldInMemory;
+}
+
+/** A later cancel's note (`note`, `noteAuthor`) given to a waiting cancel whose own went out already (noteDelivered), unsettled. */
+function takeLaterNote(entry: DeferredCancel, note: string, noteAuthor: string | undefined): void {
+  entry.note = note;
+  delete entry.noteSettled;
+  if (noteAuthor !== undefined) entry.noteAuthor = noteAuthor;
+  else delete entry.noteAuthor;
+}
+
+/**
  * A reader's note row's metadata (deliverReaderNote): its hold's epoch and
  * channel; and, for the note a queued cancel's own run delivers, that
  * cancel (`cancel`: its source, reason and every asker), which a run that
@@ -1678,7 +1700,8 @@ export class TuneOutCoordinator {
    * (`target`). The first one asked for a hold stands, with its reason and
    * source. A later one for the same hold (an end time's retry, a wake past
    * the budget, an agent's cancel) adds nothing, except a note: the waiting
-   * cancel takes it, with its author, when it has none, and otherwise the
+   * cancel takes it, with its author, when it has none or its own went out
+   * already (noteDelivered), and otherwise the
    * later note is dropped, with a log line, and this answers 'note-dropped'
    * so its caller can be told. One waiting for an earlier epoch there,
    * whose hold ended without it, is dropped (dropDeferred), and this one
@@ -1724,6 +1747,12 @@ export class TuneOutCoordinator {
     if (waiting.note === undefined) {
       waiting.note = note;
       if (noteAuthor !== undefined) waiting.noteAuthor = noteAuthor;
+      return 'waits';
+    }
+    // One whose note went out already (its run delivered it, and failed
+    // before the end) takes this one's, which goes out when the hold ends.
+    if (noteDelivered(waiting)) {
+      takeLaterNote(waiting, note, noteAuthor);
       return 'waits';
     }
     console.error(`[tune-out] a later cancel of ${what} is dropped with its note: the cancel already waiting carries a note of its own`);
@@ -1934,7 +1963,10 @@ export class TuneOutCoordinator {
    * during the run), joins it, as a later cancel joins one waiting
    * (deferCancel): the run's stands, with its reason and its note, as it
    * was (settled, or told in a release), and takes the later one's askers,
-   * and its note where it has none; a later note beside its own is dropped,
+   * and its note where it has none, or where its own went out already
+   * (noteDelivered: the run delivered it, and failed before the end), the
+   * later note then going out when the hold ends; a later note beside its
+   * own still to go out is dropped,
    * told (dropDeferred, `superseded`), its caller having been answered as
    * waiting. One queued for a later epoch leaves the run nothing to end: it
    * is dropped, told (dropQueued).
@@ -1956,6 +1988,13 @@ export class TuneOutCoordinator {
           ...(lostInRelease ? { lostInRelease } : {}), ...(heldInMemory ? { heldInMemory } : {}),
           ...(lostAtRelease ? { lostAtRelease } : {}),
         });
+        return;
+      }
+      // The run's own note went out (its sync, or a step after, failed
+      // before the end): the later note isn't dropped beside it, and its
+      // author isn't told that one is still to go out.
+      if (noteDelivered(entry) && !waiting.noteSettled) {
+        takeLaterNote(entry, waiting.note, waiting.noteAuthor);
         return;
       }
       this.dropDeferred(waiting, { reason: 'superseded' });
