@@ -1149,7 +1149,10 @@ export type TraceEvent =
    * which the next boot resumes without running it. `superseded`: it was
    * asked for while an earlier cancel of the same hold ran, and joined that
    * one when it was queued again, whose note stands.
-   * `noteLost`: it carried a reader's note, which is not delivered; its
+   * `noteLost`: it carried a reader's note, which is not delivered, or,
+   * with `noteMayBeStored`, may be stored after all: the store couldn't tell
+   * whether its write landed (`error` says what it couldn't read), as the
+   * author's notice then says it may be lost. Its
    * author is told so in its own context where the author still exists,
    * and a reader fork that has ended is not, the loss reaching no one
    * (`tune-out:note-loss-untold`, `author-gone`). The persistent
@@ -1169,6 +1172,7 @@ export type TraceEvent =
       reason: 'hold-ended' | 'note-undelivered' | 'stopped' | 'superseded';
       currentEpochId?: string;
       noteLost: boolean;
+      noteMayBeStored?: true;
       noteAuthor?: string;
       error?: string;
     })
