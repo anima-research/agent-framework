@@ -21,6 +21,7 @@ import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { Module, ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolCall, ToolDefinition, ToolResult } from '../src/types/events.js';
 import type { TraceEvent } from '../src/types/trace.js';
+import { RecordJournal } from '../src/record-journal.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 const NOTICE = 'from turns the history no longer holds are still on disk';
@@ -257,6 +258,42 @@ test("a host's direct write outside any turn gives no notice at an undo of a lat
     assert.equal(h.notices().length, 0);
     assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
   }
+});
+
+// AF #844 bot review 5, finding 46: main saved a direct write's position
+// with no word of whether a turn made it, and judged it by the branch
+// alone. A record an earlier release saved is judged so after the upgrade:
+// its head isn't taken for a later turn's, so an undo of that turn gives no
+// notice for a write no turn of the agent's made.
+test("a position an earlier release saved, with no word of a turn, is judged by the branch alone: an undo of a later turn gives no notice", async (t) => {
+  const h = new Harness();
+  t.after(() => h.cleanup());
+  await h.open();
+  await h.turn([say('hello')]);
+  const written = await h.framework.executeToolCall({ id: 'direct-1', name: 'workspace--write', input: { path: 'ref/a.txt', content: 'one\n' }, callerAgentName: 'scout' } as Parameters<AgentFramework['executeToolCall']>[0]);
+  assert.equal(written.success, true, written.error);
+  await h.close();
+  // The record as main saved it: each entry's mount, root and positions, no more.
+  const store = JsStore.openOrCreate({ path: join(h.dir, 'store') });
+  try {
+    const journal = new RecordJournal<never, Array<{ mount: string; root: string; agents: Record<string, Record<string, unknown>> }>>(store, { type: 'workspace/direct-heads' });
+    const saved = journal.load().snapshot!;
+    assert.ok(saved.some((entry) => entry.agents.scout !== undefined), 'premise: the stop saved the position');
+    journal.checkpoint(saved.map(({ mount, root, agents }) => ({
+      mount, root,
+      agents: Object.fromEntries(Object.entries(agents).map(([agent, { branchId, after, notice }]) => [agent, { branchId, after, ...(notice !== undefined ? { notice } : {}) }])),
+    })), { durable: true });
+  } finally {
+    store.close();
+  }
+  await h.open();
+  await h.turn([say('a later turn')]);
+  assert.equal(h.framework.undoLastTurn('scout').undone, true);
+  assert.equal(h.workspace.headMoveNotice('scout'), null, 'no notice is due: the branch holds the write');
+  const [first] = await h.turn([say('back')]);
+  assert.equal(carries(first), false);
+  assert.equal(h.notices().length, 0);
+  await h.close();
 });
 
 for (const [tool, input, landed] of [

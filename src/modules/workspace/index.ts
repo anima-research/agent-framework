@@ -1234,8 +1234,13 @@ export class WorkspaceModule implements Module {
         carried.push(saved);
         continue;
       }
+      // An entry an earlier release saved (no `v`) doesn't say whether a
+      // turn made each write, and that release judged a position by the
+      // branch alone: so is it judged here (outsideTurn), so its head
+      // isn't taken for a later turn's.
+      const fromEarlier = saved.v === undefined;
       restored.set(saved.mount, new Map(Object.entries(saved.agents).map(([agent, head]) =>
-        [agent, { branchId: head.branchId, after: head.after, notice: head.notice ?? null, ...(head.outsideTurn ? { outsideTurn: true as const } : {}) }])));
+        [agent, { branchId: head.branchId, after: head.after, notice: head.notice ?? null, ...(head.outsideTurn || fromEarlier ? { outsideTurn: true as const } : {}) }])));
     }
     this.headsJournal = journal;
     this.loadedHeads = text;
@@ -1827,9 +1832,10 @@ export class WorkspaceModule implements Module {
     if (!this.headsJournal) return;
     const snapshot: DirectHeadsSnapshot = [
       ...this.carriedHeads,
-      ...[...this.directHeads].filter(([, heads]) => heads.size > 0).map(([name, heads]) => ({
+      ...[...this.directHeads].filter(([, heads]) => heads.size > 0).map(([name, heads]): DirectHeadsEntry => ({
         mount: name,
         root: resolve(this.mounts.get(name)!.config.path),
+        v: DIRECT_HEADS_VERSION,
         agents: Object.fromEntries([...heads].map(([agent, { branchId, after, notice, outsideTurn }]) =>
           [agent, { branchId, after, ...(notice !== null ? { notice } : {}), ...(outsideTurn ? { outsideTurn } : {}) }])),
       })),
@@ -6846,7 +6852,7 @@ interface DirectHead {
   branchId: string;
   after: number;
   notice: string | null;
-  /** Set where P was written while no turn of the agent's was alive (recordDirectWrite): the window isn't asked of it. */
+  /** Set where P was written while no turn of the agent's was alive (recordDirectWrite), or read from a record an earlier release saved, which doesn't say (loadDirectHeads): the window isn't asked of it. */
   outsideTurn?: true;
 }
 
@@ -6856,10 +6862,19 @@ type DirectPosition = Pick<DirectHead, 'branchId' | 'after'>;
 /** The global record type directHeads is saved as: a checkpoint at a clean stop that changed it. */
 const DIRECT_HEADS_RECORD_TYPE = 'workspace/direct-heads';
 
+/**
+ * The saved entries' version: an entry this release saves carries it, and
+ * says of each position whether a turn of its agent's made it (`outsideTurn`
+ * where none did). An entry an earlier release saved has none.
+ */
+const DIRECT_HEADS_VERSION = 2;
+
 /** One mount's positions at one root (resolved, as DiskAgreement keeps a root), by agent, with N only where it's set. */
 interface DirectHeadsEntry {
   mount: string;
   root: string;
+  /** DIRECT_HEADS_VERSION, absent on an entry an earlier release saved. */
+  v?: typeof DIRECT_HEADS_VERSION;
   agents: Record<string, { branchId: string; after: number; notice?: string; outsideTurn?: true }>;
 }
 
@@ -6877,7 +6892,8 @@ function checkedHeads(value: unknown): DirectHeadsSnapshot {
   const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
   if (!Array.isArray(value)) throw new Error("the record isn't of the shape saved");
   for (const saved of value as unknown[]) {
-    if (!isObject(saved) || typeof saved.mount !== 'string' || typeof saved.root !== 'string' || !isObject(saved.agents)) {
+    if (!isObject(saved) || typeof saved.mount !== 'string' || typeof saved.root !== 'string' || !isObject(saved.agents)
+      || (saved.v !== undefined && saved.v !== DIRECT_HEADS_VERSION)) {
       throw new Error(`an entry isn't of the shape saved: ${JSON.stringify(saved)?.slice(0, 200)}`);
     }
     for (const [agent, head] of Object.entries(saved.agents)) {
@@ -6893,7 +6909,7 @@ function checkedHeads(value: unknown): DirectHeadsSnapshot {
 
 /** A saved record's content, whatever order its mounts and agents were written in, to tell whether a save would change it. */
 function canonicalHeads(snapshot: DirectHeadsSnapshot): string {
-  return JSON.stringify(snapshot.map(({ mount, root, agents }) => [mount, root, Object.keys(agents).sort().map((agent) => {
+  return JSON.stringify(snapshot.map(({ mount, root, v, agents }) => [mount, root, v ?? null, Object.keys(agents).sort().map((agent) => {
     const { branchId, after, notice, outsideTurn } = agents[agent]!;
     return [agent, branchId, after, notice ?? null, outsideTurn === true];
   })]).sort((a, b) => {
