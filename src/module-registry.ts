@@ -9,7 +9,7 @@ import type {
   StoredMessage,
   WindowStatus,
 } from '@animalabs/context-manager';
-import { WriteOutcomeUnknownError } from '@animalabs/context-manager';
+import { WriteOutcomeUnknownError } from './context-manager-errors.js';
 import type {
   Module,
   ModuleContext,

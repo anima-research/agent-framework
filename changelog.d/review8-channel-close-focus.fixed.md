@@ -37,7 +37,8 @@
   `channel_close({ channelId: "work" })` outside a turn of that channel closed `other`'s `work`, answered
   `{ channelId: "work", serverId: "other", status: "closed" }`, and left the focus in force. It now ends the
   focus as the vanished-channel close above does, sends `other` no close, and adds "Channel "work" on server
-  "other" was not closed: name its server to close it." With the hold's channel still registered beside
+  "other" was not closed: to close it, call again with channelId "work" and serverId "other"." (the channel's own
+  id, which a focus on `other:work` beside `other`'s `work` doesn't share). With the hold's channel still registered beside
   another server's `work`, the bare id, refused before as on more than one server, now closes the hold's
   channel and adds the same sentence to the answer's `note`. A close that names `other` (`serverId: "other"`
   or `"other:work"`) closes `other`'s `work` and leaves the focus alone. A name the calling turn's own channel

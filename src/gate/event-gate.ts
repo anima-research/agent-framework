@@ -2140,6 +2140,20 @@ class PartialDelivery extends Error {
   }
 }
 
+/**
+ * Runs a batch's delivery to `woken`, which pushes each agent it wakes to
+ * `woke`: a throw once any is woken is a PartialDelivery naming them and the
+ * rest; one before any wake is thrown as it is.
+ */
+function deliveredTracking(woke: string[], woken: readonly string[], deliver: () => void): void {
+  try {
+    deliver();
+  } catch (err) {
+    if (woke.length === 0) throw err;
+    throw new PartialDelivery(woke, woken.filter((name) => !woke.includes(name)), err);
+  }
+}
+
 function deliveredInPart(err: unknown): string | undefined {
   if (!(err instanceof PartialDelivery)) return undefined;
   const one = err.notWoken.length === 1;
@@ -4105,8 +4119,13 @@ export class EventGate {
       });
     }
     if (events.length === 0) return;
+    // Who each delivery woke, so that a throw after a wake is told as a
+    // delivery in part (PartialDelivery), the batch dropped only for those
+    // it didn't wake.
+    const woke: string[] = [];
     if (events.every((e) => e.recipients === undefined)) {
-      this.deliverBatch(events, this.getAgentNamesFn());
+      const names = this.getAgentNamesFn();
+      deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
       return;
     }
     const woken = new Set(events.flatMap((e) => e.recipients ?? []));
@@ -4119,13 +4138,9 @@ export class EventGate {
       group.agents.push(agentName);
       groups.set(key, group);
     }
-    const woke: string[] = [];
-    try {
+    deliveredTracking(woke, [...woken], () => {
       for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents, woke);
-    } catch (err) {
-      if (woke.length === 0) throw err;
-      throw new PartialDelivery(woke, [...woken].filter((name) => !woke.includes(name)), err);
-    }
+    });
   }
 
   private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {

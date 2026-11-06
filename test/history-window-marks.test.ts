@@ -169,6 +169,23 @@ describe("the history tools' window marks (#291, AF-7)", () => {
     assert.deepEqual(marks(forOren.messages), [[undone, '-'], [orens, '-']]);
   });
 
+  for (const regex of [false, true]) {
+    it(`a ${regex ? 'regex ' : ''}search stopped at its limit counts the rows left out up to its last scanned candidate, so leftOut adds up across its resumes (bot review 2, #86)`, async () => {
+      const h = await boot();
+      const { both, undone, miras, out } = h.ids;
+      // limit 2: both and undone are the matches; oren's round, left out
+      // for mira, lies after undone, where the resume starts.
+      const first = await h.call('search', { query: 'zz-', regex, limit: 2 }, 'mira');
+      assert.deepEqual(marks(first.matches).map(([id]) => id), [both, undone]);
+      const resume = first.resume as Record<string, unknown>;
+      assert.ok(resume, 'premise: stopped at the limit, with more');
+      assert.equal('leftOut' in first, false, "oren's round lies past the last scanned candidate, so it isn't counted here");
+      const second = await h.call('search', { query: 'zz-', regex, limit: 2, ...resume }, 'mira');
+      assert.deepEqual(marks(second.matches).map(([id]) => id), [miras, out]);
+      assert.equal(second.leftOut, 1, 'it is counted once, on the page that scans it');
+    });
+  }
+
   it('search marks its matches, and counts what it left out', async () => {
     const h = await boot();
     const { both, undone, out, miras } = h.ids;

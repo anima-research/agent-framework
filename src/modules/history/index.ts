@@ -1567,14 +1567,28 @@ export class HistoryModule implements Module {
     }
     const candidatePoolSize = windowMessages.length;
     const byAuthor = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
-    // A row left out for the caller (viewFor) is no candidate.
-    const candidates = view ? byAuthor.filter((m) => !view.leaves(m)) : byAuthor;
-    const leftOut = byAuthor.length - candidates.length;
-    const poolInfo = {
-      candidatePoolSize,
-      ...(authorFilter ? { afterAuthorFilter: byAuthor.length } : {}),
-      ...(leftOut > 0 ? { leftOut } : {}),
-      order,
+    // A row left out for the caller (viewFor) is no candidate. Beside each
+    // candidate, how many were left out before it.
+    const candidates: StoredMessage[] = [];
+    const leftOutBefore: number[] = [];
+    let leftOutOfPool = 0;
+    for (const m of byAuthor) {
+      if (view?.leaves(m)) { leftOutOfPool++; continue; }
+      candidates.push(m);
+      leftOutBefore.push(leftOutOfPool);
+    }
+    // A scan stopped at `limit` resumes after its last scanned candidate, so
+    // the rows left out past it are the next call's to count, as extract's
+    // page-full stop counts them (leftOutAtPage): counts add up across a
+    // chain of resumes.
+    const poolInfo = (scanned: number) => {
+      const leftOut = scanned > 0 && scanned < candidates.length ? leftOutBefore[scanned - 1]! : leftOutOfPool;
+      return {
+        candidatePoolSize,
+        ...(authorFilter ? { afterAuthorFilter: byAuthor.length } : {}),
+        ...(leftOut > 0 ? { leftOut } : {}),
+        order,
+      };
     };
     // Where the scan stopped, when it stopped before the end of the window
     // the caller asked about: either `limit` matches came first (the rest of
@@ -1643,7 +1657,7 @@ export class HistoryModule implements Module {
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
       const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit, view);
-      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches } };
+      return { success: true, data: { scanned, ...poolInfo(scanned), truncated, ...resumeInfo(scanned, matches.length), matches } };
     }
 
     // Plain substring search (String.prototype.indexOf) is inherently
@@ -1676,7 +1690,7 @@ export class HistoryModule implements Module {
 
     return {
       success: true,
-      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches },
+      data: { scanned, ...poolInfo(scanned), truncated, ...resumeInfo(scanned, matches.length), matches },
     };
   }
 
