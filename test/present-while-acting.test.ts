@@ -1261,8 +1261,9 @@ describe('present while acting', () => {
     assert.ok(!cm.getPresentedMessages().some((m) => m.id === arrival.id), 'and waits outside the window for the next point');
 
     // The failed start's trigger is dropped, as main drops one whose start
-    // throws (startAgentStream), the arrival's wake merged into it: a later
-    // wake's start presents the arrival before its compile.
+    // throws (startAgentStream), the arrival's wake merged into it: the next
+    // point presents it, the trigger's own write at rest or the start before
+    // its compile, and the next request carries it.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answering it.' }] as ContentBlock[]));
     trigger(framework);
     await framework.runUntilIdle();

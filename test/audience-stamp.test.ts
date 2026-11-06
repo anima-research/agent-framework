@@ -16,13 +16,18 @@
  *
  * And the deferred queue an earlier version left: its entries carry no
  * stamp, and are stamped as the boot's importer stores them through
- * addMessage, and one a tune-out holds is for nobody.
+ * addMessage, and one a tune-out holds is for nobody, unless it is for an
+ * agent whose view keeps held traffic (the subconscious), which it is
+ * stamped for.
  *
  * And a write that names no agent: it is for every agent that takes
  * untargeted inbound in the slot it lands in, so the record tells it from a
- * write for the primary; a process response's messages are for the agents
- * its inference request names that are registered, else the agent it is
- * delivered to. With one resident, nothing changes.
+ * write for the primary; a process response's messages are for the
+ * registered agents its inference request names, or, where it names only
+ * unregistered ones, the agent it is delivered to; a request for every
+ * agent, for none, or an empty list leaves them for every agent that takes
+ * untargeted inbound, as a write that names no agent. With one resident,
+ * nothing changes.
  *
  * And held mail's copies: a copy for another recipient than the mail's
  * (`dendrite.to`) is not its delivery, whether stored, queued or landing.
@@ -504,7 +509,10 @@ describe('the audience stamp (#291)', () => {
     // #291's one-release importer stores each entry through addMessage, with
     // the stamp addMessage gives any write: for the agent it is queued for;
     // for every resident when it names none, as a write that names no agent
-    // is; and for nobody when a tune-out holds it. Nobody's own row.
+    // is; and for nobody when a tune-out holds it, unless it is for an agent
+    // whose view keeps held traffic (the subconscious), which it is stamped
+    // for. Nobody's own row here: a queued tool-block pair, the puppet's
+    // round, would be its agent's own (isToolBlockEntry).
     const framework = await bootOnOlderQueue([olderPlain, olderHeld, olderForOren], { quiesced: true });
     const plain = rowNamed(framework, 'OLD-PLAIN');
     assert.deepEqual(plain?.metadata?.audience, ['mira', 'oren'], 'for every resident: it names no agent');

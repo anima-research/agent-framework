@@ -1,14 +1,16 @@
 /**
  * The Discord module over writes the framework holds (F198, with #516's
- * record of the creates on their way). The framework holds a module's writes
- * while the agent's turn is alive or the host is quiesced, and a module's
- * reads now see them, marked held, and its edits and removals reach them. So
- * a message deleted while its create is held is removed, and none of it is
- * stored after the resume, one edited then is stored as edited, a sync's held add keeps a live create from
- * adding a second copy, and a create whose write hasn't landed ends its
+ * record of the creates on their way). The framework stores a module's write
+ * at once and holds it from the agent's window while the agent's turn is
+ * alive or the host is quiesced (#291), and a module's reads see it, marked
+ * held, and its edits and removals reach it. So a message deleted while its
+ * create is held is removed, and none of it is stored after the resume, one
+ * edited then is stored as edited, a sync's held add keeps a live create
+ * from adding a second copy, and a create stored while quiesced ends its
  * record once its row shows, so a sync no longer passes over the message.
  * The module runs in a real framework, which holds its writes by quiescing
- * the host, the same branch of addMessage a live turn takes.
+ * the host, the same branch of addMessage a live turn takes. A create that
+ * a surgery's or a recovery's hold keeps unstored is withKeptCreate's.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -147,7 +149,7 @@ test("a live create that comes after a sync's held add of its message adds no se
   });
 });
 
-test("a create whose write hasn't landed ends its record once its held row shows, so a sync then reaches the message", async () => {
+test("a create stored while quiesced, its row held from the agent's window, ends its record once the row shows, so a sync then reaches the message", async () => {
   await withDiscord(async ({ discord, module, rows }) => {
     await discord.onMessageHandler!(live('m4', 'as sent'));
     await waitFor('the create to be held', () => rows('m4').length === 1);

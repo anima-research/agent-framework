@@ -2,9 +2,10 @@
  * The one-release importer (#291, AF-6): a store a release before #291 left
  * with writes still in its deferred queue boots, stores each of them once,
  * in the order they arrived (a gone agent's are passed on or dropped,
- * logged; one whose landing can't be checked is kept, with what follows it
- * for that agent, for the next boot), and clears the queue's record. A second boot
- * imports nothing. Each case here writes the record by hand, as such a
+ * logged; one whose landing can't be checked, or whose store write throws,
+ * is kept, with what follows it for that agent, for the next boot), and
+ * rewrites the record with what it kept. A second boot imports only that.
+ * Each case here writes the record by hand, as such a
  * release left it (recovery/deferred-writes.json, or the store's
  * framework/deferred-writes slot), since this release keeps no queue to
  * leave one. The reader's own rules are deferred-import.test.ts; the crash

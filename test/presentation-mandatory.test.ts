@@ -1,7 +1,9 @@
 /**
- * Presentation is mandatory (#291, AF-6): FrameworkConfig.presentationIndex
- * is gone, and every agent is taken on as it is registered, its window
- * written down and presented, whatever a host's configuration still says. A
+ * Presentation is mandatory (#291, AF-6): there is no option for it, and
+ * every agent is taken on as it is registered, its window written down and
+ * presented, whatever a host's configuration still says (one whose
+ * write-down fails stays in legacy mode, its window the record, until a
+ * branch move: review8-presentation). A
  * turn's requests are its window, and a request-only `[Continue]` where the
  * window ends on its own reply. The window is the record when nothing
  * arrives for the agent during a turn and every row in the slot is meant
@@ -79,9 +81,10 @@ async function run(extra: Record<string, unknown> = {}) {
 const CONTEXT_MANAGER_IMPORT = /(?:import|export)\s+(type\s+)?\{([^}]*)\}\s*from\s*(['"])@animalabs\/context-manager\3/g;
 
 describe('presentation is mandatory (#291)', () => {
-  // A host may still pass the option an earlier release took: it is read as
-  // any unknown key is, and turns nothing off.
-  for (const [label, extra] of [['with no option', {}], ["with the removed presentationIndex: false a host's configuration still passes", { presentationIndex: false }]] as const) {
+  // A host may pass presentationIndex, the option this work's earlier
+  // commits took and no release had: it is read as any unknown key is, and
+  // turns nothing off.
+  for (const [label, extra] of [['with no option', {}], ['with presentationIndex: false, a key no release took', { presentationIndex: false }]] as const) {
     it(`each agent's window is written down at its registration and presented, ${label}`, async () => {
       const r = await run(extra);
       try {

@@ -369,8 +369,9 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
   // its own. Until AF-5 the message was queued behind the turn and handed
   // to the report as a row of its own. That path is gone for a quiesce and
   // a surgery too: a quiesce stores the message at once, and a surgery's
-  // release stores it before a cancel asked for meanwhile runs, so no held
-  // row follows the notice (tune-out-cancel-held asserts none does).
+  // release stores it, or tells it lost where its store throws, before a
+  // cancel asked for meanwhile runs, so no held row follows the notice
+  // (tune-out-cancel-held asserts none does).
   it("leaves the older held message, which the cap leaves out of the dump, to the subconscious's view, which holds it stored", async () => {
     const { framework, ctx, module, membrane, internals, emit, close } = await open(1);
     let release: () => void = () => {};
