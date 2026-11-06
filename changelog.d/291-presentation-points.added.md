@@ -13,6 +13,11 @@
   results; a boundary or hand-off whose read of the store throws is traced as `presentation:failed`, hears
   nothing or vouches for nothing, and the turn goes on; and a window write-down that throws once its record is
   written (a snapshot after the write failing) leaves the window presented rather than the agent in legacy mode.
+  A fresh turn start where the rows a write-down took in that aren't the agent's can't be taken out of its window
+  (their retraction failed at its registration and fails again there) fails, as a start whose presentation fails
+  does, rather than compile with them.
+  An agent whose window couldn't be written down at its registration, left in legacy mode, still has each idle
+  reader of its slot presented its own rows as it writes them.
   Two residents of one slot whose turns overlap each keep a window that is what their requests carried, so each
   request starts with the one before it and their rounds' signed thinking is sent again. A wake for a row stored where it would have been queued reads
   that row (`WritePlacement.presented` false); a write stored during a turn, the gap before a budget restart's

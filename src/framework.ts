@@ -5771,8 +5771,9 @@ export class AgentFramework {
     // window, then what it is owed at rest, now that the stored rows are in.
     // Each agent's window was written down at its registration, before them.
     // An agent whose owed rows couldn't be read for their wakes is left out of
-    // the pass at rest, so those rows stay out of its window and a later boot
-    // reads them again (`restExcept`).
+    // the pass at rest, and no later point at rest presents its arrivals
+    // until its next turn start, so those rows stay out of its window and a
+    // later boot reads them again (`restExcept`).
     // Then each window lets go of the rows its record no longer holds that no
     // live context heard removed (retractAbsentRows): an offline recovery's
     // suppressions, made with the host stopped through one agent's context.

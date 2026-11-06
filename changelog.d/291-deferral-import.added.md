@@ -28,3 +28,5 @@
   source `dendrite`), before the boot's pass presents it. Earlier releases kept such mail held while its write
   waited, and the boot's redelivery woke the recipient. An interrupted job whose result is stored this way still
   tells its recipient nothing about ending without a result.
+  Where the boot can't read what an agent is owed to ask those wakes, the agent's arrivals stay out of its window
+  until its next turn start, at the boot's pass and at every point at rest after it, so a later boot asks them.

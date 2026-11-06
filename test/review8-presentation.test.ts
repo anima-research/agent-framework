@@ -212,7 +212,7 @@ describe('an agent left in legacy mode (AF #844 bot review finding 6)', () => {
 });
 
 describe("the boot's pass over an agent whose owed rows couldn't be read for their wakes (AF #844 bot review finding 36)", () => {
-  it('leaves them out of its window, so the next boot asks the wake they owe', async () => {
+  it('leaves them out of its window, and a later write at rest leaves them out too, so the next boot asks the wake they owe', async () => {
     const storePath = join(dir(), 'store');
     const boot = () => AgentFramework.create({
       storePath,
@@ -247,6 +247,12 @@ describe("the boot's pass over an agent whose owed rows couldn't be read for the
       assert.ok(release, 'setup: the release is stored');
       assert.ok(first.lines.some((line) => line.includes("could not read what agent's window is owed at boot")), first.lines.join('\n'));
       assert.equal(cm.windowStatusOf(release.id), 'out', "the boot's pass leaves it out of the agent's window");
+      // Review 2 #51: a row stored for the idle agent later presents no
+      // arrival at rest, the release among them, until its next turn start.
+      const later = (first.result as unknown as Internals).addMessage('alice', text('a later message'));
+      assert.notEqual(later, '', 'setup: the later row is stored');
+      assert.equal(cm.windowStatusOf(release.id), 'out', 'a later write at rest leaves the release out');
+      assert.equal(cm.windowStatusOf(later), 'out', 'and that write too');
     } finally {
       await first.result.stop();
     }
