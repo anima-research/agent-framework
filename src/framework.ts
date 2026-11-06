@@ -16504,19 +16504,26 @@ export class AgentFramework {
    * release, as any write. The rest are dropped, which is logged and, unless
    * the caller's own alert counts them (`counted`: a move's disposal of the
    * fork), told of by an ops alert of kind `store-held-lost`: unlike a
-   * released window's unread rows, they never reach the record. Never
+   * released window's unread rows, they never reach the record. Each write
+   * goes on by itself: one whose notice can't be built (passNoticeToPrimary
+   * doesn't guard that, and a channel notice's words read the store) is
+   * logged and counted among the dropped, and the rest still go on. Never
    * throws.
    */
   private passHeldWritesOn(agentName: string, writes: readonly SurgeryHeldWrite[], opts?: { counted?: boolean }): { passed: number; dropped: number } {
     let passed = 0;
     const lost: SurgeryHeldWrite[] = [];
     for (const write of writes) {
-      if (passesToPrimary(write.metadata)
-        && this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content }) === 'passed') {
-        passed++;
-      } else {
-        lost.push(write);
+      let outcome: 'passed' | 'declined' | 'failed' = 'declined';
+      try {
+        if (passesToPrimary(write.metadata)) {
+          outcome = this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content });
+        }
+      } catch (error) {
+        console.error(`[surgery] a write kept in memory for ${agentName}, which has ended, couldn't be passed on to the primary, and is dropped:`, error);
       }
+      if (outcome === 'passed') passed++;
+      else lost.push(write);
     }
     const dropped = lost.length;
     if (dropped > 0) {
