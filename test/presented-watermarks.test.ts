@@ -223,6 +223,44 @@ describe('read marks once windows are presented (#291)', () => {
     assert.equal(h.internals.rowDone(h.mira, row, room), true, 'she spoke there having read it');
   });
 
+  // AF #844 bot review 4, finding 1: a write stored in the delivery agent's
+  // slot for other agents only (a coalesced render targeted to a
+  // co-resident) is placed for its recipient, not for the delivery agent:
+  // whether it was presented is that recipient's window's answer, and the
+  // wake to read it, and its readsRow, name that recipient. A write the
+  // delivery agent is among the recipients of is placed for it, as before.
+  it("a write in the shared slot for a co-resident alone is placed for her: presented by her window's answer, whatever the delivery agent's turn", async () => {
+    const h = await boot();
+    h.writeDown(h.mira, h.oren);
+    const internals = h.internals as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { placement?: Placement; audience?: readonly string[] }): MessageId;
+      activeTurnTokens: Map<string, number>;
+    };
+    const write = (t: string, audience: string[]) => {
+      const placement: Placement = { agent: '' };
+      const id = internals.addMessage('user', text(t), {}, { placement, audience });
+      return { id, placement };
+    };
+    internals.activeTurnTokens.set('mira', -1);
+    try {
+      const atRest = write('for oren, mira busy', ['oren']);
+      assert.deepEqual(atRest.placement, { agent: 'oren', messageId: atRest.id }, "oren is at rest, so it entered her window: presented, and hers");
+      assert.equal(h.oren.getContextManager().windowStatusOf(atRest.id), 'in', 'premise: in her window');
+      assert.deepEqual(h.internals.rowDone(h.oren, atRest.id, undefined), false, 'her wake for it stays until a request of hers carries it');
+      const both = write('for both, mira busy', ['mira', 'oren']);
+      assert.deepEqual(both.placement, { agent: 'mira', messageId: both.id, presented: false }, 'one the delivery agent is among the recipients of is hers, as before');
+    } finally {
+      internals.activeTurnTokens.delete('mira');
+    }
+    internals.activeTurnTokens.set('oren', -1);
+    try {
+      const busy = write('for oren, oren busy', ['oren']);
+      assert.deepEqual(busy.placement, { agent: 'oren', messageId: busy.id, presented: false }, "kept out of oren's live turn: not presented to her");
+    } finally {
+      internals.activeTurnTokens.delete('oren');
+    }
+  });
+
   // AF #844 bot review 4, finding 7: a gate's wake routed to a channel
   // carries its source as 'gate' and the channel's server as
   // channelServerId. Whether the agent spoke there after reading the row is
