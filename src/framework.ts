@@ -11386,9 +11386,11 @@ export class AgentFramework {
    *   the agent keeps running and is not affected by anything done to it.
    * - An ended agent: the context it left, reopened where it lives.
    *
-   * The returned manager uses a passthrough strategy: it shows what is
-   * stored, raw. An ended agent's context is the real one — treat it as
-   * read-only unless you mean to change what a later resume starts from.
+   * The returned manager uses a passthrough strategy: compilation applies
+   * the agent's view filters, including legacy reasoning-loss omission; raw
+   * accessors such as getAllMessages() still return the stored rows. An ended
+   * agent's context is the real one — treat it as read-only unless you mean
+   * to change what a later resume starts from.
    */
   async inspectAgentContext(name: string, options: { atSequence?: number } = {}): Promise<ContextManager> {
     const live = this.registry.has(name) ? this.agents.get(name) : undefined;
@@ -16275,8 +16277,9 @@ export class AgentFramework {
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
-    // Suppressed rows and legacy reasoning-loss notices are never rendered
-    // for anyone, the reader of held traffic included.
+    // This held-traffic reader excludes suppressed rows, as residents do;
+    // isolated and conversation views may still render suppressed rows.
+    // Legacy reasoning-loss notices are excluded from every compiled view.
     const sees = (metadata: unknown): boolean =>
       subconsciousViewFilter({ metadata: metadata as StoredMessage['metadata'] }, name);
     const contextManager = await ContextManager.open({
