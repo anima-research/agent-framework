@@ -337,9 +337,11 @@ async function noteWaitingAfterFailedRelease() {
   assert.equal(answer.success, true, answer.error);
   assert.equal(waiting(answer).waiting, true, 'premise: accepted as waiting');
   const commit = fw.commitDeliveries.bind(fw);
-  fw.commitDeliveries = () => false;
+  let commits = 0;
+  fw.commitDeliveries = () => { commits++; return false; };
   release();
   fw.commitDeliveries = commit;
+  assert.ok(commits > 0, "premise: the waiting cancel ran at the release, and its release's durability check was asked (review 2, #106)");
   assert.equal(registry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'premise: the first release failed its durability check, the tune-out stays in force');
   assert.ok(!has(f, 'Someone asked for you.'), 'premise: the note is not delivered');
   return { f, fw, sub, epochId, coordinator, release };

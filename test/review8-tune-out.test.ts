@@ -111,7 +111,10 @@ test('65: with no later release, one retry timer runs the waiting cancel again; 
     const second = deferredSetup();
     second.coordinator.cancel('disc', 'disc:guild:a', 'duration', 'duration elapsed');
     second.state.held = false;
+    const waits = () => errors.mock.calls.filter((c) => String(c.arguments[0]).includes('stays waiting')).length;
+    const before = waits();
     second.coordinator.runDeferredCancels();
+    assert.equal(waits(), before + 1, 'premise: its run failed and it stays waiting, a retry armed (review 2, #102)');
     second.coordinator.stop();
     second.state.durable = true;
     mock.timers.tick(120_000);
@@ -171,7 +174,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   let onTrace: ((event: Trace) => void) | undefined;
   let channel: { params: { epochId: string }; wakeCount: number } | null = null;
   const states = new Map<string, unknown>();
-  const rows: Array<{ participant: string; content: ContentBlock[]; metadata: Record<string, unknown>; sequence: number }> = [];
+  const rows: Array<{ id: string; participant: string; content: ContentBlock[]; metadata: Record<string, unknown>; sequence: number }> = [];
   const added: Added[] = [];
   const mail: Array<{ reader: string; text: string }> = [];
   const wakes: Array<[string, string]> = [];
@@ -205,7 +208,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
         return '';
       }
       added.push({ participant, content, metadata, forAgent });
-      if (options.stored && forAgent === undefined) rows.push({ participant, content, metadata: metadata ?? {}, sequence: rows.length + 1 });
+      if (options.stored && forAgent === undefined) rows.push({ id: `r${rows.length + 1}`, participant, content, metadata: metadata ?? {}, sequence: rows.length + 1 });
       return `m${added.length}`;
     },
     requestInference: (agentName: string, reason: string) => {
@@ -239,7 +242,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   const coordinator = new TuneOutCoordinator(registry as never, {} as never, hooks as never);
   const hold = (epochId: string, channelId: string): void => {
     rows.push({
-      participant: 'user', content: [text(`held in ${epochId}`)], sequence: rows.length + 1,
+      id: `r${rows.length + 1}`, participant: 'user', content: [text(`held in ${epochId}`)], sequence: rows.length + 1,
       metadata: { author: { name: 'Ann' }, tuneOut: { epochId }, channelId, serverId: 'disc' },
     });
   };
@@ -311,6 +314,7 @@ test('65 follow-up: a cancel accepted for one tune-out, still queued after its f
     assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'duration', 'duration elapsed'), { ok: true, deferred: true });
     failFirstRelease(h);
     assert.equal(h.inForce(), a, 'premise: its release failed, A stays in force');
+    assert.ok(errors.mock.calls.some((c) => String(c.arguments[0]).includes('stays waiting')), 'premise: and the cancel stays waiting for its retry (review 2, #101)');
     assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), { ok: true }, 'a direct cancel ends A');
     const b = h.enter();
     assert.notEqual(b, a);
@@ -342,6 +346,7 @@ test("65 follow-up: an all-except hold's cancel, still queued after its first re
     assert.deepEqual(h.coordinator.cancelAllExcept('subconscious', 'by Subconscious'), { ok: true, deferred: true });
     failFirstRelease(h);
     assert.equal(h.scopeInForce(), a, 'premise: its release failed, A stays in force');
+    assert.ok(errors.mock.calls.some((c) => String(c.arguments[0]).includes('stays waiting')), 'premise: and the cancel stays waiting for its retry (review 2, #101)');
     assert.deepEqual(h.coordinator.cancelAllExcept('agent-tool', 'agent request'), { ok: true });
     const b = h.enterScope();
     mock.timers.tick(60_000);
@@ -525,7 +530,8 @@ test("65 follow-up: a queued note that can't be delivered when another cancel en
 
 test("65 follow-up (Isaac-3593; Ivy-3594, round 8): the subconscious whose queued note can't be delivered when another cancel ends its hold is told so in that cancel's release, naming the hold and why, with a turn to read it, and no notice of its own", () => {
   const errors = mock.method(console, 'error', () => {});
-  const h = epochSetup();
+  // The store shows the coordinator's own rows, the failed first release among them (review 2, #100).
+  const h = epochSetup({ stored: true });
   try {
     const a = h.enter();
     h.state.held = true;
@@ -542,11 +548,11 @@ test("65 follow-up (Isaac-3593; Ivy-3594, round 8): the subconscious whose queue
     assert.equal(release.metadata?.epochId, a);
     assert.equal(release.metadata?.lostNote, true, 'marked as telling the loss, for a boot to read (Weft, pin)');
     assert.deepEqual(release.metadata?.cancel, { source: 'agent-tool', reason: 'agent request' }, 'and whose cancel made it (Weft, pin)');
-    assert.ok(release.metadata?.released, 'premise: a release with rows');
-    assert.ok(textOf(release.content).startsWith('[Tune-out: disc:guild:a cancelled — agent request, 0 wakes]\n\n'
+    assert.equal(release.metadata?.released, undefined, 'premise: the failed first release covered the rows, so this one carries the loss alone');
+    assert.equal(textOf(release.content), '[Tune-out: disc:guild:a cancelled — agent request, 0 wakes]\n\n'
       + 'The note Subconscious left with an earlier cancel of disc:guild:a was not delivered to scout. This cancel ended '
-      + 'that tune-out while that one waited, and delivering the note then failed: the store refused the row (test).\n\n'
-      + '<tuned-out-backlog '), `the release names the author, the hold, the resident and the reason: ${textOf(release.content)}`);
+      + 'that tune-out while that one waited, and delivering the note then failed: the store refused the row (test).',
+      'the release names the author, the hold, the resident and the reason');
     assert.deepEqual(h.lossNotices(), [], 'no notice of its own: the release tells it, stored and made durable with it');
     assert.equal(h.lossRecord(), undefined, 'nor one kept in the store');
     assert.deepEqual(h.wakes.filter(([, why]) => why.startsWith('tune-out note not delivered')),
@@ -563,7 +569,7 @@ test("65 follow-up (Isaac-3593; Ivy-3594, round 8): the subconscious whose queue
 
 test("65 follow-up (Isaac-3593; Ivy-3594, round 8): a queued note of the all-except hold's cancel that can't be delivered is told lost in the release of the cancel that ended the hold, naming the hold", () => {
   const errors = mock.method(console, 'error', () => {});
-  const h = epochSetup();
+  const h = epochSetup({ stored: true });
   try {
     const a = h.enterScope();
     h.state.held = true;
@@ -578,11 +584,11 @@ test("65 follow-up (Isaac-3593; Ivy-3594, round 8): a queued note of the all-exc
     assert.equal(release.metadata?.epochId, a);
     assert.equal(release.metadata?.lostNote, true, 'marked as telling the loss, for a boot to read (Weft, pin)');
     assert.deepEqual(release.metadata?.cancel, { source: 'channel-close', reason: 'the excepted channel was closed' }, 'and whose cancel made it (Weft, pin)');
-    assert.ok(release.metadata?.released, 'premise: a release with rows');
-    assert.ok(textOf(release.content).startsWith('[Tune-out: all channels except disc:guild:x released — the excepted channel was closed, 0 wakes]\n\n'
+    assert.equal(release.metadata?.released, undefined, 'premise: the failed first release covered the rows, so this one carries the loss alone');
+    assert.equal(textOf(release.content), '[Tune-out: all channels except disc:guild:x released — the excepted channel was closed, 0 wakes]\n\n'
       + 'The note Subconscious left with an earlier cancel of the all-except hold (all channels except disc:guild:x) was not '
       + 'delivered to scout. This cancel ended that hold while that one waited, and delivering the note then failed: '
-      + 'the store refused the row (test).\n\n'), textOf(release.content));
+      + 'the store refused the row (test).');
     assert.deepEqual(h.lossNotices(), [], 'no notice of its own');
     assert.deepEqual(h.wakes.filter(([, why]) => why.startsWith('tune-out note not delivered')),
       [['Subconscious', 'tune-out note not delivered: all-except']]);

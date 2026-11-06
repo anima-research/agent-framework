@@ -48,6 +48,8 @@ function stampSetup() {
   const added: Row[] = [];
   const wakes: Array<[string, string]> = [];
   const traces: Trace[] = [];
+  /** Each write of the stamp tried, refused or not. */
+  const stampTries = { count: 0 };
   const state = {
     held: false, seq: 100, endFails: false,
     /** The subconscious's context refuses writes. */
@@ -80,6 +82,7 @@ function stampSetup() {
       return states.get(id) ?? null;
     },
     writeCoordinatorState: (id: string, value: unknown) => {
+      if (id === STAMP) stampTries.count++;
       if (refuse.has(id)) throw new Error(`the store refused ${id} (test)`);
       if (value === null) states.delete(id); else states.set(id, structuredClone(value));
     },
@@ -169,7 +172,7 @@ function stampSetup() {
   const unrecorded = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered' && textOf(m.content).includes('without recording'));
   const told = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered');
   const stopAll = (): void => { for (const c of made) c.stop(); };
-  return { states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll, fork, switchTo };
+  return { states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll, fork, switchTo, stampTries };
 }
 
 const conditional = (hold: string, epochId: string, it = 'tune-out') => `[Tune-out: the host stopped without recording the state of ${hold} `
@@ -310,7 +313,9 @@ test("4 (Weft): a boot whose stamp the store refuses tries it again at the relea
     h.refuse.add(STAMP);
     const c = h.boot();
     assert.deepEqual(h.states.get(STAMP), { v: 1, epochs: ['old'], runStartedAt: 1 }, 'premise: refused, the last stop\'s stamp stays');
+    const tries = h.stampTries.count;
     c.runDeferredCancels();
+    assert.equal(h.stampTries.count, tries + 1, 'the release tries it (review 2, #105)');
     assert.deepEqual((h.states.get(STAMP) as { epochs: unknown }).epochs, ['old'], 'still refused at the release');
     h.refuse.delete(STAMP);
     mock.timers.tick(60_000);
@@ -728,7 +733,10 @@ test('pin: a notice of the stop kept to be written, its write refused, counts as
     h.hold();
     h.state.subRefuses = true;
     h.boot();
+    const kept = () => (h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length;
+    assert.equal(kept(), 1, 'the second boot kept its notice (review 2, #104)');
     const c = h.boot();
+    assert.equal(kept(), 1, 'and the third added none: the kept one counts as told');
     h.state.subRefuses = false;
     c.runDeferredCancels();
     assert.equal(h.unrecorded().length, 1);
@@ -753,10 +761,15 @@ test("pin: a release that can't write the boot's stamp arms the retry again", ()
   try {
     h.refuse.add(STAMP);
     const c = h.boot();
+    mock.timers.tick(30_000);
+    const tries = h.stampTries.count;
     c.runDeferredCancels();
+    assert.equal(h.stampTries.count, tries + 1, 'premise: the release tried the stamp (review 2, #105)');
     h.refuse.delete(STAMP);
-    mock.timers.tick(60_000);
-    assert.ok(h.states.has(STAMP));
+    mock.timers.tick(30_000);
+    assert.ok(!h.states.has(STAMP), "not at the boot's own retry, which the release replaced");
+    mock.timers.tick(30_000);
+    assert.ok(h.states.has(STAMP), '60 s after the release');
   } finally { h.stopAll(); mock.timers.reset(); }
 }));
 
@@ -972,6 +985,7 @@ test("2 (Weft, e825ed1c): a told row written late, its writes held, counts as to
       h.ask({ channelId: 'noisy', text: 'Look.' });
       h.state.held = late;
       const c = h.boot();
+      assert.equal(h.unrecorded().length, late ? 0 : 1, late ? 'premise: kept while writes are held, not written yet (review 2, #103)' : 'control: written at once');
       h.ask({ channelId: 'noisy', text: 'Look.' });
       h.state.held = false;
       c.runDeferredCancels();
@@ -990,6 +1004,8 @@ test("3 (Weft, e825ed1c): a notice a boot keeps while writes are held is kept in
       const e = h.hold();
       h.state.held = held;
       h.boot();
+      assert.equal(h.unrecorded().length, held ? 0 : 1, held ? 'premise: kept, not written, while writes are held (review 2, #103)' : 'control: written at once');
+      if (held) assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, 'and kept in the store');
       h.ask({ channelId: 'noisy', text: 'B.' });
       h.state.held = false;
       h.boot();
