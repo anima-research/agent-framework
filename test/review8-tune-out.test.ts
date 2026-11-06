@@ -189,6 +189,8 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
   const heldWrites: Added[] = [];
   /** How many of `added` the last sync that answered true made durable. */
   let durableCount = 0;
+  /** The syncs that answered false with a note the last row written (`noteSyncFails`). */
+  const syncs = { noteFailed: 0 };
   let onTrace: ((event: Trace) => void) | undefined;
   let onWrite: ((metadata: Record<string, unknown> | undefined) => void) | undefined;
   let channel: { params: { epochId: string }; wakeCount: number } | null = null;
@@ -263,7 +265,11 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     emitTrace: (event: Trace) => { traces.push(event); onTrace?.(event); },
     writesHeld: (forAgent?: string) => state.held || (forAgent !== undefined && state.refusing.includes(forAgent)),
     commitDeliveries: () => {
-      if (!state.durable || (state.noteSyncFails && added.at(-1)?.metadata?.kind === 'subconscious-note')) return false;
+      if (state.durable && state.noteSyncFails && added.at(-1)?.metadata?.kind === 'subconscious-note') {
+        syncs.noteFailed++;
+        return false;
+      }
+      if (!state.durable) return false;
       durableCount = added.length;
       return true;
     },
@@ -325,7 +331,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
       }
     }
   };
-  return { coordinator, state, states, rows, added, mail, wakes, traces, keptFor, heldWrites, storeHeld, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
+  return { coordinator, state, states, rows, added, mail, wakes, traces, keptFor, heldWrites, storeHeld, syncs, enter, enterScope, inForce, scopeInForce, releasesOf, notes, durableNotes, dropped, lossNotices, untold, endOtherwise, reboot, lossRecord, listen, listenWrites };
 }
 
 const LOSS_RECORD_UNIT = 'tune-out/scout/loss-notices';
@@ -1700,6 +1706,7 @@ test("review 3 #2: a queued cancel's own run whose note can't be made durable le
       h.state.held = false;
       h.coordinator.runDeferredCancels();
       assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], 'premise: the note was written, after the release was made durable');
+      assert.equal(h.syncs.noteFailed, 1, 'premise: the sync after the note ran, and failed (review 4 #42)');
       assert.equal(scope ? h.scopeInForce() : h.inForce(), held, `${scope ? 'all-except' : 'channel'}: its sync failed, so the hold stays in force`);
       assert.equal(queuedOf(h), 1, 'and the cancel waits on');
       assert.ok(!h.traces.some((t) => t.type === 'tune-out:cancelled'), 'no end is recorded');
