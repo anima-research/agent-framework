@@ -13,8 +13,7 @@
 const SPEECH_TOOLS: ReadonlyMap<string, { words: readonly string[]; silences: boolean }> = new Map([
   // channel_publish still takes `text` from older callers.
   ['channel_publish', { words: ['content', 'text'], silences: true }],
-  // telegram-mcpl's send_message takes `message`; other servers, and the
-  // framework's own test servers, send `text`.
+  // telegram-mcpl's send_message takes `message`.
   ['send_message', { words: ['content', 'message', 'text'], silences: true }],
   ['reply_message', { words: ['content', 'text'], silences: true }],
   ['send_dm', { words: ['content', 'text'], silences: true }],
