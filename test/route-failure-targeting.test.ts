@@ -233,6 +233,32 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(messages, UNDELIVERABLE), 0);
     });
 
+    // AF #844 bot review 4, finding 10: a channel notice told to the primary
+    // by name (in an ended agent's place, or beside a reader that can't close
+    // the channel) is the primary's: stamped for it alone, as
+    // passNoticeToPrimary stamps its notices, not for every resident that
+    // takes untargeted inbound, so its advice reaches only the agent it was
+    // judged for.
+    it("stamps a channel notice told to the primary by name for the primary alone: the co-resident isn't shown it", async () => {
+      const state = internals(framework);
+      const fork = await spawnFork();
+      const rows = () => framework.getAgent('primary')!.getContextManager().getAllMessages();
+      const cases: Array<[string, () => void, string]> = [
+        ['an ended agent\'s failed reply open', () => state.recordReplyOpenFailedNotice('released-run', 'srv', { channelId: 'x1', label: '#one' }, 'subscription-policy'), 'Not open: #one'],
+        ['a fork that can\'t close the channel its reply failed to open', () => state.recordReplyOpenFailedNotice(fork.name, 'srv', { channelId: 'x2', label: '#two' }, 'subscription-policy'), 'Not open: #two'],
+        ['an ended agent\'s open', () => state.recordChannelAutoOpenNotice('released-run', 'srv', [{ channelId: 'x3', label: '#three' }], 'opened-by-reply'), 'Now open: #three'],
+        ['a fork that can\'t close the channel its message opened', () => state.recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'x4', label: '#four' }], 'opened-by-reply'), 'Now open: #four'],
+      ];
+      for (const [what, write, needle] of cases) {
+        write();
+        const stored = rows().filter((m) => JSON.stringify(m.content).includes(needle));
+        assert.equal(stored.length, 1, `${what}: the primary's copy is stored in the residents' slot`);
+        assert.deepEqual(audienceOf(stored[0]!.metadata)?.audience, ['primary'], `${what}: stamped for the primary alone`);
+        assert.equal(inWindow(framework, 'primary', needle), 1, `${what}: in the primary's window`);
+        assert.equal(inWindow(framework, 'secondary', needle), 0, `${what}: not in the co-resident's`);
+      }
+    });
+
     for (const speaker of ['secondary', 'primary'] as const) {
       it(`keeps ${speaker}'s notice out of its window while its own tool cycle is pending`, async () => {
         const state = internals(framework);

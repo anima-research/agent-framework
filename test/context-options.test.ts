@@ -91,14 +91,19 @@ async function boot() {
 }
 
 describe('the open shapes of a resident and the subconscious (#291, AF-5)', () => {
-  it("a resident's view leaves out held traffic and another resident's stored injections; the subconscious's only the injections", () => {
+  it("a resident's view leaves out held traffic and another resident's stored injections; the subconscious's only the injections, and both a suppressed row", () => {
     const held = { metadata: { tuneOut: { epochId: 'e1' } } } as never;
     const orens = { metadata: { [STORED_INJECTION_KEY]: { agent: 'oren', namespace: 'n', contentHash: 'h', part: 0, parts: 1 } } } as never;
     const plain = { metadata: {} } as never;
+    // AF #844 bot review 4, finding 91: a row a suppress rule took renders
+    // for no reader.
+    const suppressed = { metadata: { suppressed: { rule: 'r' } } } as never;
     assert.deepEqual([residentViewFilter('mira')(held), residentViewFilter('mira')(orens), residentViewFilter('mira')(plain), residentViewFilter('oren')(orens)],
       [false, false, true, true]);
     assert.deepEqual([subconsciousViewFilter('Subconscious')(held), subconsciousViewFilter('Subconscious')(orens), subconsciousViewFilter('Subconscious')(plain)],
       [true, false, true]);
+    assert.deepEqual([residentViewFilter('mira')(suppressed), subconsciousViewFilter('Subconscious')(suppressed)], [false, false],
+      "neither view keeps a suppressed row");
     const resident = residentContextOptions('mira');
     assert.equal(resident.namespace, 'agents/mira');
     assert.equal(resident.isolate, undefined, "the residents' shared slot");

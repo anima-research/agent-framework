@@ -6,7 +6,9 @@
  * the ordinary channel/push path the moment it is admitted, exactly as today;
  * the coalescer only remembers WHERE it landed. A later occurrence of the same
  * subject edits or removes that message in place while it is still unread
- * (above the agent's consumed watermark, not folded by compression), and
+ * (above the agent's consumed watermark, a position in the agent's window,
+ * #291: a row not in the window yet is unread wherever it is in the store;
+ * not folded by compression), and
  * appends once it has been read. Nothing is staged, journaled or capped: on
  * any uncertainty (restart, branch switch, eviction) the host behaves as an
  * append-only host would, which is what the RFC's principle 4 asks for.

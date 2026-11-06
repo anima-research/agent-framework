@@ -2,9 +2,10 @@
  * The one-release importer (#291, AF-6): a store a release before #291 left
  * with writes still in its deferred queue boots, stores each of them once,
  * in the order they arrived (a gone agent's are passed on or dropped,
- * logged; one whose landing can't be checked is kept, with what follows it
- * for that agent, for the next boot), and clears the queue's record. A second boot
- * imports nothing. Each case here writes the record by hand, as such a
+ * logged; one whose landing can't be checked, or whose store write throws,
+ * is kept, with what follows it for that agent, for the next boot), and
+ * rewrites the record with what it kept. A second boot imports only that.
+ * Each case here writes the record by hand, as such a
  * release left it (recovery/deferred-writes.json, or the store's
  * framework/deferred-writes slot), since this release keeps no queue to
  * leave one. The reader's own rules are deferred-import.test.ts; the crash
@@ -649,15 +650,21 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent' } },
       })]);
       // Every sync from the import on fails, through the boot's check of held mail.
+      // AF #844 bot review 4, finding 45: the held-mail check's own sync is
+      // counted, so a boot that skipped that check after the failed import
+      // (and left the mail held for the later boot) fails here.
+      let heldMailSyncsRefused = 0;
       proto.sync = function (this: JsStore) {
         const stack = new Error().stack ?? '';
         if (stack.includes('importPersistedDeferredWrites') || stack.includes('deliverHeldMail')) {
+          if (stack.includes('deliverHeldMail')) heldMailSyncsRefused++;
           throw Object.assign(new Error('injected EIO syncing'), { code: 'EIO' });
         }
         return sync.call(this);
       };
       console.error = () => {};
       try { framework = await h.boot(); } finally { proto.sync = sync; console.error = quiet; }
+      assert.ok(heldMailSyncsRefused > 0, "the boot's check of held mail reached its sync, which was refused");
       try {
         assert.equal(withText(framework, 'unsynced mail').length, 1, 'the import stored it, in memory');
         assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mailId], 'the mail stays held: its copy never reached the disk');
@@ -976,6 +983,21 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         assert.equal(child.status, 0, `the child exited where it was told (stderr: ${child.stderr.slice(-800)})`);
         const want = Array.from({ length: crash.count }, (_, i) => `CRASH-${i}`);
         const crashed = (f: AgentFramework) => rowsOf(f).map(textOf).filter((x) => x.startsWith('CRASH-'));
+        if (crash.mode !== 'mid-import') {
+          // AF #844 bot review 4, finding 44: the child exited past the
+          // importer's sync (it exits 4 where the record's write comes with
+          // no sync since the last imported write), so every row is on disk
+          // before the next boot opens the store: read it there, past any
+          // framework, so the next boot is shown to store none of them twice
+          // rather than to store them once.
+          const store = JsStore.openOrCreate({ path: h.storePath });
+          try {
+            const cm = await StoreWindow.open({ store, ...residentContextOptions('agent'), strategy: new PassthroughStrategy() });
+            try {
+              assert.deepEqual(cm.getAllMessages().map(textOf).filter((x) => x.startsWith('CRASH-')), want, 'every row is on disk before the next boot');
+            } finally { cm.close(); }
+          } finally { store.close(); }
+        }
         let framework = await h.boot();
         try {
           assert.equal(framework.getHostModeStatus().quiesced, true);

@@ -159,16 +159,26 @@ export function foreignRowAsSent(
  * call before it with its id, read in one pass in order, so another
  * agent's result whose id an own call of the watcher's also has, before or
  * after it, is still transcribed. A call answers one result: a result after
- * the one that answered it names no call (another agent's, whose call the
- * request doesn't carry), and is transcribed. A message nothing changes is
- * the same object, and so is the array when none changes.
+ * the one that answered it, in the same message or a later one, names no
+ * call (another agent's, whose call the request doesn't carry), and is
+ * transcribed. A message nothing changes is the same object, and so is the
+ * array when none changes.
  */
 export function transcribeForeignRounds(
   messages: readonly NormalizedMessage[],
   isOwn: (participant: string) => boolean,
 ): NormalizedMessage[] {
   const latest = new Map<string, { own: boolean; name: string }>();
-  const ownCalls = { has: (id: string) => latest.get(id)?.own === true };
+  // The watcher's own call is answered by the first result read for it,
+  // block by block: that result takes its entry, so a second result for it
+  // in the same message names no call.
+  const ownCalls = {
+    has: (id: string) => {
+      if (latest.get(id)?.own !== true) return false;
+      latest.delete(id);
+      return true;
+    },
+  };
   const callNames = { get: (id: string) => latest.get(id)?.name };
   let changed = false;
   const out = messages.map((m) => {

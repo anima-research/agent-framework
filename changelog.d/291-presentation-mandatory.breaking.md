@@ -46,5 +46,7 @@
   `undo`/`redo`, to refresh a view listens for `window:undone`.
   A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`. A host whose
   residents read each other's rounds sets `observes` on each resident, naming the others: an edge is one way, so
-  two residents that share their rounds each name the other. Mail and messages meant for a co-resident stay out of
+  two residents that share their rounds each name the other. It sets `foreignRounds: 'raw'` too where they should
+  read those rounds as stored: the default, `'transcript'`, sends a line per call and per result and none of their
+  thinking. Mail and messages meant for a co-resident stay out of
   a resident's window either way.

@@ -253,8 +253,9 @@ test("a removed module's findMessageByExternalId() answers as before without cha
     const ctx = gone.ctx();
     const stale = ctx.addMessage('user', text('removed later'), { external: { source: 'probe', id: 'stale' } } as never);
     // A write kept in memory maps to '' (#291 stores every other write at
-    // once, a quiesce's included): a surgery's hold keeps it, and its
-    // release stores it.
+    // once, a quiesce's included): a surgery's hold keeps it, as a manager
+    // refusing its work after a failed re-initialization does
+    // (heldForRecovery), and its release stores it.
     const release = (framework as unknown as { reserveStoreForSurgery(verb: string, agentName: string): () => void })
       .reserveStoreForSurgery('test-surgery', 'assistant');
     ctx.addMessage('user', text('held'), { external: { source: 'probe', id: 'held' } } as never);

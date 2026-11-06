@@ -304,6 +304,8 @@ async function startTurn(opts: {
   inlineBound?: number;
   world?: (module: SnapModule) => void;
   workspace?: (workspace: WorkspaceModule) => void;
+  /** Residents beside prime, whose rounds prime observes (AgentConfig.observes). */
+  observes?: string[];
 }): Promise<Harness> {
   const tempDir = mkdtempSync(join(tmpdir(), opts.prefix));
   const mountDir = join(tempDir, 'mount');
@@ -321,7 +323,10 @@ async function startTurn(opts: {
   const framework = await AgentFramework.create({
     storePath: join(tempDir, 'store'),
     membrane: membrane.asMembrane(),
-    agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+    agents: [
+      { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', ...(opts.observes ? { observes: opts.observes } : {}) },
+      ...(opts.observes ?? []).map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.` })),
+    ],
     modules: [world, workspace as unknown as Module],
     syncIntervalMs: 0,
     ...(opts.toolResultInlineMaxChars !== undefined ? { toolResultInlineMaxChars: opts.toolResultInlineMaxChars } : {}),
@@ -507,6 +512,43 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(first[0]!.sha256, sha(GIF));
       assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not oren's image");
       assert.strictEqual(h.framework.getAgent('prime')!.getContextManager().windowStatusOf(orens as never), 'out', "prime's window never held oren's row");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // AF #844 bot review 4, finding 51: an observed agent's round is in the
+  // caller's window, but its tool results' images are that agent's, whose
+  // refs the caller's ledger doesn't hold: they take no slot, so index 0 is
+  // the caller's own newest image, not a ref that can't be saved.
+  it("an observed agent's tool result in the caller's window takes no slot: index 0 is the attachment (#291)", async () => {
+    let orens = '';
+    const h = await startTurn({
+      prefix: 'sri-observed-round-',
+      observes: ['oren'],
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      // After the attachment, oren's tool result, as its own row: prime
+      // observes oren, so its turn's start presents it.
+      seedHistory: (framework) => {
+        orens = String(framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_oren_snap',
+          toolName: 'world--snap',
+          content: 'oren\'s snapshot\n[image: image/png, ~1KB, ref img_orenzz_1]',
+          isError: false,
+        }] as ContentBlock[], asOwnRow(undefined, 'oren')));
+      },
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(h.framework.getAgent('prime')!.getContextManager().windowStatusOf(orens as never), 'in', "premise: oren's round is in prime's window");
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+      assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not oren's ref");
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

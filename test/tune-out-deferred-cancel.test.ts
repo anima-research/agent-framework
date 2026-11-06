@@ -5,6 +5,7 @@ import { createMockResponse } from './helpers/mock-membrane.js';
 import { AgentFramework } from '../src/framework.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { SUB, internals, textOf, stored, has, find, registerOpen, enter, type Fixture, type Stored } from './helpers/admission.js';
+import { WriteOutcomeUnknownError } from '../src/context-manager-errors.js';
 
 type Answer = { success: boolean; data?: unknown; error?: string };
 type Framework = {
@@ -863,6 +864,272 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
     } finally {
       errors.mock.restore();
       await f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (nissa's house's fault arm): a queued cancel's own run writes its
+// note while writes are held again, so the note is kept in memory, and
+// storing it at their release fails. The waiting answer promised the reader
+// that it is told if the note can't be delivered, and why: the operator's
+// `message:lost` and `store-held-lost` aren't that. The note isn't written
+// again.
+// ---------------------------------------------------------------------------
+
+const HELD_NOTE = 'Antra asked for you in #noisy (held note 5c1e).';
+
+type Held = Restartable & {
+  reserveStoreForSurgery(verb: string, agentName: string): () => void;
+  surgeryHeldWrites: Array<{ metadata?: Record<string, unknown> }>;
+};
+
+/**
+ * The subconscious's cancel_tuneout with a note, accepted as waiting during
+ * a surgery's hold. At the release its run stores its release and makes it
+ * durable, and a second hold begins then (an operator's next change), so
+ * the note it writes next is kept in memory, the tune-out still in force.
+ * `fault`: storing that note at the second hold's release throws, a plain
+ * error (`lost`) or one that can't tell what of it landed (`unknown`).
+ */
+async function noteKeptByItsOwnRun(fault?: 'lost' | 'unknown') {
+  const { f, registry, release, coordinator } = await heldDuringSurgery();
+  const fw = f.framework as unknown as Held;
+  const sub = fw.subconsciousAgentName!;
+  assert.ok(sub, 'premise: a persistent subconscious');
+  const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+  fw.addMessage('user', [{ type: 'text', text: 'primer 7a2d: the subconscious read this before the hold' }], { system: true }, { forAgent: sub });
+  const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: HELD_NOTE }, [], sub);
+  assert.equal(answer.success, true, answer.error);
+  assert.equal(waiting(answer).waiting, true, 'premise: accepted as waiting');
+  assert.match(waiting(answer).note ?? '', /If it can't be delivered then, you are told so in your context, and why/,
+    'premise: the waiting answer promises the reader is told of a loss');
+  // Every write of the note the coordinator makes; the release's replay of a kept one isn't another.
+  let noteWrites = 0;
+  const add = fw.addMessage.bind(fw);
+  fw.addMessage = (participant, content, metadata, opts) => {
+    if (metadata?.kind === 'subconscious-note' && !(opts as { replayed?: boolean } | undefined)?.replayed) noteWrites++;
+    return add(participant, content, metadata, opts);
+  };
+  const commit = fw.commitDeliveries.bind(fw);
+  let again: (() => void) | undefined;
+  fw.commitDeliveries = () => {
+    const durable = commit();
+    if (durable && !again && has(f, '<tuned-out-backlog')) again = fw.reserveStoreForSurgery('roll back', 'agent');
+    return durable;
+  };
+  release();
+  fw.commitDeliveries = commit;
+  assert.ok(again, 'premise: a second hold began once the release was durable');
+  assert.equal(fw.surgeryHeldWrites.filter((w) => w.metadata?.kind === 'subconscious-note').length, 1, 'premise: the note is kept in memory');
+  assert.equal(registry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'premise: the hold stays in force while the note is kept');
+  assert.equal(noteWrites, 1, 'premise: the note was written once');
+  // Storing the note at the second hold's release throws.
+  let attempts = 0;
+  if (fault) {
+    const manager = f.framework.getAgent('agent')!.getContextManager() as unknown as { addMessage(...args: unknown[]): string };
+    const store = manager.addMessage;
+    manager.addMessage = (...args: unknown[]) => {
+      const [participant, , metadata] = args as [string, unknown, Record<string, unknown> | undefined];
+      if (participant === sub && metadata?.kind === 'subconscious-note') {
+        attempts++;
+        throw fault === 'unknown'
+          ? new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed: 1 }, new Error('the store read failed (test)'))
+          : new Error('EIO: the store refused the held note (test)');
+      }
+      return store.apply(manager, args);
+    };
+  }
+  const traces: Array<{ type: string; source?: string; kind?: string; mayBeStored?: boolean }> = [];
+  const off = f.framework.onTrace((t) => { traces.push(t as never); });
+  return {
+    f, fw, sub, epochId, registry, traces, off,
+    noteWrites: () => noteWrites, attempts: () => attempts,
+    release: () => { release(); again!(); },
+  };
+}
+
+/** The text blocks of the subconscious's next model request: a turn of its, with every call answered. */
+async function subconsciousRequest(f: Fixture, sub: string): Promise<string[]> {
+  const before = f.membrane.calls.length;
+  f.alwaysRespond();
+  if (!internals(f).pendingRequests.some((r) => r.agentName === sub)) {
+    internals(f).pendingRequests.push({ agentName: sub, reason: 'test: a turn of the subconscious' } as never);
+  }
+  await f.framework.runUntilIdle();
+  const request = f.membrane.calls.slice(before).find((r) => r.assistantParticipant === sub);
+  assert.ok(request, "premise: the subconscious's turn made a model request");
+  return (request.messages as unknown as Array<{ content: Array<{ type: string; text?: string }> }>)
+    .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+}
+
+const lostHeldNote = '[Tune-out: the note you left with your cancel of noisy was not delivered to agent. Your cancel ended '
+  + 'that tune-out when it ran, and delivering the note then failed: EIO: the store refused the held note (test).]';
+
+describe("a note kept in memory by its cancel's own run, whose store fails when the writes are stored (AF #844, nissa's house's fault arm)", () => {
+  it("is told lost to the subconscious, with the reason, in its next request, and the hold ends; the note is written once, and the operator still hears of the lost write", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun('lost');
+    try {
+      h.release();
+      assert.equal(h.registry.getTuneOutState('editor', 'noisy'), null, 'the hold ends once the writes are stored');
+      assert.equal(h.attempts(), 1, 'storing the kept note was tried once');
+      assert.equal(h.noteWrites(), 1, 'and the note is not written again');
+      assert.ok(!has(h.f, HELD_NOTE), 'premise: the note did not land');
+      assert.equal(h.traces.filter((t) => t.type === 'message:lost' && t.source === 'surgery-release').length, 1,
+        'the framework still traces the lost write');
+      assert.equal(h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'store-held-lost').length, 1,
+        'and alerts the operator');
+      assert.deepEqual(presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost')), [lostHeldNote],
+        "the subconscious is told the note was lost, and why, once");
+      assert.ok(internals(h.f).pendingRequests.some((r) => r.agentName === h.sub && r.reason === 'tune-out note not delivered: noisy'),
+        'with a turn to read it');
+      const request = await subconsciousRequest(h.f, h.sub);
+      assert.ok(request.some((t) => t.includes(lostHeldNote)), `its next request carries the notice: ${JSON.stringify(request)}`);
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+
+  it("whose store can't tell whether it landed is told as a note that may be lost, with the reason", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun('unknown');
+    try {
+      h.release();
+      assert.equal(h.registry.getTuneOutState('editor', 'noisy'), null, 'the hold ends once the writes are stored');
+      assert.equal(h.attempts(), 1, 'storing the kept note was tried once');
+      assert.equal(h.noteWrites(), 1, 'and the note is not written again');
+      assert.equal(h.traces.filter((t) => t.type === 'message:lost' && t.mayBeStored === true).length, 1,
+        'the framework traces the write as one that may be stored');
+      const told = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost'));
+      assert.equal(told.length, 1, `told once: ${JSON.stringify(told)}`);
+      assert.match(told[0]!, /^\[Tune-out: the note you left with your cancel of noisy may be lost\. Your cancel ended that tune-out when it ran, and whether the note was delivered to agent isn't known here, as what the store holds of it can't be read here: addMessage failed, and the manager can't tell whether the store holds a row of the append that threw: the store read failed \(test\)\.\]$/,
+        'as one that may be lost, saying why it is not known');
+      assert.doesNotMatch(told[0]!, /was not delivered/, 'never as one known lost');
+      const request = await subconsciousRequest(h.f, h.sub);
+      assert.ok(request.some((t) => t === told[0]), `its next request carries the notice: ${JSON.stringify(request)}`);
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+
+  for (const told of [true, false]) it(told
+    ? "a stop and a start after the loss is told tell it no second time"
+    : "a stop before its run tells the loss (its end not recorded at the release) tells it once, as the stop's loss, and the start writes that once", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun('lost');
+    try {
+      if (!told) endNotRecorded(h.f);
+      h.release();
+      assert.equal(h.registry.getTuneOutState('editor', 'noisy')?.params.epochId ?? null, told ? null : h.epochId,
+        told ? 'premise: the hold ended, and the loss was told' : "premise: the cancel's run couldn't record the end, so it waits on");
+      await h.f.framework.stop();
+      await h.f.create();
+      const notices = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.deepEqual(notices, [told ? lostHeldNote
+        : '[Tune-out: the note you left with your cancel of noisy was not delivered to agent. The host stopped while your '
+          + 'cancel waited, so your cancel was lost, and the note with it. That tune-out is still in force.]'],
+      'the subconscious is told of the note once');
+      assert.ok(!has(h.f, HELD_NOTE), 'and the note is not written after the restart');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (nissa's house, the follow-up): the same kept note, stored when
+// the writes are stored. The cancel can still wait after that: its run
+// can't record the end, or writes are held again before it runs. A stop
+// then must not tell the reader its note was lost: the resident has it.
+// ---------------------------------------------------------------------------
+
+describe("a note kept in memory by its cancel's own run and stored when the writes are stored (AF #844, nissa's house)", () => {
+  for (const waits of ['its run can\'t record the end', 'writes are held again before it runs', 'a crash, its run unable to record the end'] as const) it(`counts as delivered: its cancel still waiting (${waits}), ${waits.startsWith('a crash') ? 'the next start reads the note as delivered' : 'a stop tells the subconscious no note lost, and the next start tells nothing of the hold'}`, async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun();
+    try {
+      if (waits === 'writes are held again before it runs') {
+        // Writes are held again as soon as the kept note is stored, so the
+        // release's run of the deferred cancels finds them held.
+        const hooks = (internals(h.f).tuneOutCoordinator as unknown as { hooks: { writesHeld?: () => boolean } }).hooks;
+        const off = h.f.framework.onTrace((t) => {
+          if (t.type === 'message:added' && (t as { source?: string }).source === 'surgery-release' && has(h.f, HELD_NOTE)) hooks.writesHeld = () => true;
+        });
+        h.release();
+        off();
+      } else {
+        endNotRecorded(h.f);
+        h.release();
+      }
+      assert.equal(stored(h.f).filter((m) => textOf(m) === HELD_NOTE).length, 1, 'premise: the kept note was stored at the release, once');
+      assert.equal(h.registry.getTuneOutState('editor', 'noisy')?.params.epochId, h.epochId, 'premise: the cancel still waits, the hold in force');
+      if (waits.startsWith('a crash')) await crashLosingStopWrites(h.f);
+      else await h.f.framework.stop();
+      const lines = errors.mock.calls.map((c) => String(c.arguments[0])).filter((l) => l.includes('stopping:'));
+      assert.ok(!lines.some((l) => l.includes('is not delivered')), `the stop says no note is lost: ${lines.join('\n')}`);
+      await h.f.create();
+      assert.equal(internals(h.f).channelRegistry.getTuneOutState('editor', 'noisy')?.params.epochId, h.epochId, 'the hold is still in force after the restart');
+      const told = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.deepEqual(told, waits.startsWith('a crash') ? [ranWithNote(h.epochId)] : [],
+        waits.startsWith('a crash')
+          ? "the next start reads that run's rows: its cancel ran, with the note delivered"
+          : 'the subconscious is told nothing: the note was delivered, and the stop accounted for the hold');
+      const record = (h.f.framework as unknown as Restartable).channelRegistry.readCoordinatorState(LOSS_RECORD) as { pendingLossNotices?: unknown[] } | null;
+      assert.deepEqual(record?.pendingLossNotices ?? [], [], 'no loss is kept in the store');
+      assert.equal(stored(h.f).filter((m) => textOf(m) === HELD_NOTE).length, 1, 'the resident has the note once');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (nissa's house, the third finding): the kept note's store throws
+// a WriteOutcomeUnknownError at the release, and its cancel still waits
+// (its run can't record the end). An orderly stop and a start in the same
+// process: the subconscious is told the note may be lost, never that it
+// was not delivered.
+// ---------------------------------------------------------------------------
+
+describe("a kept note whose store couldn't tell whether it landed, its cancel still waiting at an orderly stop (AF #844, nissa's house)", () => {
+  it("is told after the start as a note that may be lost, with the reason, never as one that was not delivered", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun('unknown');
+    try {
+      endNotRecorded(h.f);
+      h.release();
+      assert.equal(h.attempts(), 1, 'premise: storing the kept note was tried once, and threw');
+      assert.equal(h.traces.filter((t) => t.type === 'message:lost' && t.mayBeStored === true).length, 1, 'premise: as a write that may be stored');
+      assert.equal(h.registry.getTuneOutState('editor', 'noisy')?.params.epochId, h.epochId, "premise: the cancel's run couldn't record the end, so it waits on");
+      assert.deepEqual(presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost')), [], 'premise: nothing is told before the stop');
+      await h.f.framework.stop();
+      await h.f.create();
+      const told = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.deepEqual(told, [
+        '[Tune-out: the note you left with your cancel of noisy may be lost. The host stopped while your cancel waited, so your cancel was lost. '
+        + "Whether the note was delivered to agent isn't known here, as what the store holds of it can't be read here: addMessage failed, and the "
+        + "manager can't tell whether the store holds a row of the append that threw: the store read failed (test). That tune-out is still in force.]",
+      ], 'the subconscious is told once that the note may be lost, and why it is not known');
+      assert.ok(!told.some((t) => t.includes('was not delivered')), 'never as a note known lost');
+      assert.ok(internals(h.f).pendingRequests.some((r) => r.agentName === h.sub && r.reason === 'tune-out note not delivered: noisy'), 'with a turn to read it');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
     }
   });
 });

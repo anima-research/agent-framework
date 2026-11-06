@@ -156,6 +156,19 @@ describe("the history tools' window marks (#291, AF-7)", () => {
     assert.equal('leftOut' in forMira, false);
   });
 
+  // AF #844 bot review 4, finding 34: a call by an agent the framework no
+  // longer knows (its lookup throws) is answered as from a window holding
+  // nothing: each row it returns is marked not shown, as WINDOW_NOTE says
+  // of a row outside the caller's window, rather than unmarked, which reads
+  // as shown.
+  it("a call by an agent the framework doesn't know marks every row it returns not shown", async () => {
+    const h = await boot();
+    const { both, undone, out } = h.ids;
+    const forGone = await h.call('extract', {}, 'zz-gone');
+    assert.deepEqual(marks(forGone.messages), [[both, 'not-shown'], [undone, 'not-shown'], [out, 'not-shown']]);
+    assert.equal(forGone.leftOut, 2, "each resident's own round is left out: neither is in a window that holds nothing");
+  });
+
   it('extract around an id carries the same marks, and an id left out reads as not there', async () => {
     const h = await boot();
     const { both, undone, out, orens, miras } = h.ids;

@@ -3089,9 +3089,12 @@ test("a render whose store write keeps being refused waits longer before each re
   f.renderer(async () => ({ content: [{ type: 'text', text: 'backoff_render' }] }));
   const cm = f.framework.getAgent('agent')!.getContextManager();
   const add = cm.addMessage.bind(cm);
+  // AF #844 bot review 4, finding 61: eight refusals, so the wakes reach
+  // the cap (60 x the 20 ms base, at the seventh) and stay at it: about
+  // 3.7 s of waits in all.
   let refused = 0;
   (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
-    if (refused < 3 && JSON.stringify(args[1]).includes('backoff_')) {
+    if (refused < 8 && JSON.stringify(args[1]).includes('backoff_')) {
       refused++;
       throw new Error('zz-store-refused');
     }
@@ -3110,9 +3113,10 @@ test("a render whose store write keeps being refused waits longer before each re
     await settles(f.framework.runUntilIdle(), `the drain after wake ${pass + 1}`);
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(refused, 3, 'the store refused three writes');
-  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3], 'each recovery wake counts the failures before it');
-  assert(wakes[1]!.delayMs > wakes[0]!.delayMs && wakes[2]!.delayMs > wakes[1]!.delayMs, 'and waits longer than the one before');
+  assert.equal(refused, 8, 'the store refused eight writes');
+  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3, 4, 5, 6, 7, 8], 'each recovery wake counts the failures before it');
+  assert.deepEqual(wakes.map((w) => w.delayMs), [20, 40, 80, 160, 320, 640, 1_200, 1_200],
+    'and waits twice as long as the one before, up to its cap, 60 times the base, where it stays');
 });
 
 test("a render whose store write is refused leaves a batch opened while it rendered to be delivered as its fallback, not rendered on top of the render the agent never got", { timeout: 120_000 }, async (t) => {

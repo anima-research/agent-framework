@@ -1179,6 +1179,76 @@ describe('the presentation module at the point after one that failed', () => {
     assert.deepEqual(heard, [['write', ["oren's reply"]]], 'and its listeners hear it');
   });
 
+  // AF #844 bot review 4, finding 100: tell reads the window to name each
+  // row's body, after the rows are counted as entered. A read that throws
+  // there no longer keeps the listeners untold: they hear each entered row
+  // by its first shard, and the presentation isn't a failure.
+  it("a window read that throws as the listeners are told still tells them the rows that entered: an own row, and a sharded arrival by its first shard", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('oren');
+    const heard: Record<string, Array<[string, string[]]>> = { oren: [], mira: [] };
+    for (const name of ['oren', 'mira'] as const) {
+      r.presentation.onPresented(name, (event) => heard[name]!.push([event.occasion, event.rows.map(textOf)]));
+    }
+    // An own row named alone: tell reads the window for its body.
+    const ocm = r.oren.cm;
+    const realPresent = ocm.presentRows.bind(ocm);
+    const realWindow = ocm.getPresentedMessages.bind(ocm);
+    let armed = false;
+    ocm.presentRows = (ids) => { const ordinals = realPresent(ids); armed = true; return ordinals; };
+    ocm.getPresentedMessages = (...args: Parameters<typeof realWindow>) => {
+      if (armed) { armed = false; throw new Error('a transient read failure'); }
+      return realWindow(...args);
+    };
+    const reply = quietly(() => storeOwnRow(r.oren, 'oren', text("oren's reply")));
+    ocm.presentRows = realPresent;
+    ocm.getPresentedMessages = realWindow;
+    assert.equal(r.oren.has(reply), true, 'setup: the write presented it');
+    assert.deepEqual(heard.oren, [['write', ["oren's reply"]]], 'its listeners hear it');
+    // A sharded arrival for mira at rest: tell reads which of its shards
+    // the window holds.
+    r.shardOn(r.orenStrategy, 'part one');
+    const mcm = r.mira.cm;
+    const miraPresent = mcm.presentRows.bind(mcm);
+    const realOrdinal = mcm.ordinalOf.bind(mcm);
+    armed = false;
+    mcm.presentRows = (ids) => { const ordinals = miraPresent(ids); armed = true; return ordinals; };
+    mcm.ordinalOf = (id) => {
+      if (armed) { armed = false; throw new Error('a transient read failure'); }
+      return realOrdinal(id);
+    };
+    const body = quietly(() => r.write(r.oren, 'someone', [...text('part one'), ...text(' part two')], ['mira']));
+    mcm.presentRows = miraPresent;
+    mcm.ordinalOf = realOrdinal;
+    assert.equal(r.mira.has(body), true, 'setup: mira was presented the arrival at rest');
+    assert.deepEqual(heard.mira, [['at-rest', ['part one']]], "her listeners hear it, by its first shard, the window's read having failed");
+    assert.deepEqual(ofType(r.traces, 'presentation:failed'), [], 'neither is a failure: the store took both');
+  });
+
+  // AF #844 bot review 4, finding 26: a listener of an own row's
+  // presentation that stores an own row of its own, whose presentation
+  // fails, has that row kept; the outer write, back from its listeners,
+  // keeps it too rather than replacing what is kept with what it tried. So
+  // the listener's row enters ahead of the next own row.
+  it("an own row a listener stores, whose presentation fails, stays kept after the write whose listener stored it, and enters ahead of the next own row", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('oren');
+    let nested: MessageId | undefined;
+    r.presentation.onPresented('oren', () => {
+      if (nested !== undefined) return;
+      failNextPresent(r.oren.cm);
+      nested = quietly(() => storeOwnRow(r.oren, 'oren', text('B')));
+    });
+    const first = quietly(() => storeOwnRow(r.oren, 'oren', text('A')));
+    assert.ok(nested, "setup: A's presentation was heard, and its listener stored B");
+    assert.deepEqual([r.oren.has(first), r.oren.has(nested)], [true, false], 'setup: A entered, and B missed its write');
+    const third = storeOwnRow(r.oren, 'oren', text('C'));
+    assert.deepEqual([r.oren.has(nested), r.oren.has(third)], [true, true], 'B enters with C');
+    assert.deepEqual(r.oren.window().slice(-3), ['A', 'B', 'C'], 'B ahead of C, as the record has them');
+  });
+
   // AF #844 bot review 3, finding 46.
   it("an own row kept after a failed write still enters ahead of the next own row when a fresh start throws at its retraction", async () => {
     const r = await rig();

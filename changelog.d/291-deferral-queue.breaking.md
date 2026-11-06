@@ -46,7 +46,8 @@
   the cancel writes to refuses writes until the host re-initializes it; cancelling again doesn't end the wait
   sooner while that lasts (once writes are stored, a cancel whose run failed is retried, and another can end the
   hold first: review8-operator-close-wait); the tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap; and a host that stops
-  first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed.
+  first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed, or the
+  host starts again with no reader, which ends every hold on record.
   `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A `channel_close` of the
   channel an all-except hold excepts carries what became of the focus, whatever became of the close (`note` on a
   success, where it said nothing, and after the error on a failure): that the focus ended, or that it ends once the
@@ -89,8 +90,9 @@
     `ReaderFramingContext.queuedCount` is deprecated and never set. A cancel's notice to the subconscious no longer
     carries held messages as `tune-out-cancel-held` rows after it: its view holds them stored. The trace
     `tune-out:reader-fork` loses `queued`. With no queue, a cancel's release fails to be stored or made durable
-    only where its write throws or the store's sync fails (`commitDeliveries` answers false), so no queue over its
-    cap keeps a tune-out in force
+    only where its write throws or the store's sync fails (`commitDeliveries` answers false); a release, or a
+    queued run's note, kept in memory as it is written (a hold that begins with that write) makes the cancel wait,
+    as above, so no queue over its cap keeps a tune-out in force
     (the tune-out-cancel-order entry); a dump's record of what it covered (`released`) names a held message by its
     id, and one an earlier release queued, which the boot's import stores, by its queued write's id, as that
     release's records name it.

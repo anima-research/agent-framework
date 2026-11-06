@@ -1,7 +1,9 @@
 /**
- * Presentation is mandatory (#291, AF-6): FrameworkConfig.presentationIndex
- * is gone, and every agent is taken on as it is registered, its window
- * written down and presented, whatever a host's configuration still says. A
+ * Presentation is mandatory (#291, AF-6): there is no option for it, and
+ * every agent is taken on as it is registered, its window written down and
+ * presented, whatever a host's configuration still says (one whose
+ * write-down fails stays in legacy mode, its window the record, until a
+ * branch move: review8-presentation). A
  * turn's requests are its window, and a request-only `[Continue]` where the
  * window ends on its own reply. The window is the record when nothing
  * arrives for the agent during a turn and every row in the slot is meant
@@ -16,7 +18,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -79,9 +81,10 @@ async function run(extra: Record<string, unknown> = {}) {
 const CONTEXT_MANAGER_IMPORT = /(?:import|export)\s+(type\s+)?\{([^}]*)\}\s*from\s*(['"])@animalabs\/context-manager\3/g;
 
 describe('presentation is mandatory (#291)', () => {
-  // A host may still pass the option an earlier release took: it is read as
-  // any unknown key is, and turns nothing off.
-  for (const [label, extra] of [['with no option', {}], ["with the removed presentationIndex: false a host's configuration still passes", { presentationIndex: false }]] as const) {
+  // A host may pass presentationIndex, the option this work's earlier
+  // commits took and no release had: it is read as any unknown key is, and
+  // turns nothing off.
+  for (const [label, extra] of [['with no option', {}], ['with presentationIndex: false, a key no release took', { presentationIndex: false }]] as const) {
     it(`each agent's window is written down at its registration and presented, ${label}`, async () => {
       const r = await run(extra);
       try {
@@ -182,6 +185,10 @@ describe('presentation is mandatory (#291)', () => {
     };
     const version = manifestOf('../../node_modules/@animalabs/chronicle/package.json').version;
     const declared = manifestOf('../../package.json').dependencies['@animalabs/chronicle']!;
+    // AF #844 bot review 4, finding 72: refused before create() writes
+    // anything, the framework's state registrations included.
+    const states = () => store.listStates().map((s) => s.id).sort();
+    const before = states();
     try {
       await assert.rejects(AgentFramework.create({
         store,
@@ -202,6 +209,7 @@ describe('presentation is mandatory (#291)', () => {
       for (const name of ['mira', 'oren']) {
         assert.equal(store.getStateLen(`agents/${name}/window`) ?? 0, 0, `nothing written to ${name}'s window`);
       }
+      assert.deepEqual(states(), before, 'no state registered: the refusal comes before any write');
     } finally {
       store.close();
     }
@@ -258,6 +266,9 @@ describe('presentation is mandatory (#291)', () => {
         assert.ok(error.message.includes(`Install @animalabs/context-manager ${declared}, which this package declares`), error.message);
         return true;
       });
+      // AF #844 bot review 4, finding 72: it needs no store, so it comes
+      // before create() opens one.
+      assert.ok(!existsSync(join(dir, 'store.chronicle')), 'no store was made');
     } finally {
       proto.presentRows = presentRows;
     }

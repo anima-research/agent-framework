@@ -10,8 +10,11 @@
  * no recovery path, to the store's `framework/deferred-writes` slot. This
  * release stores every write at once and keeps no queue, so a record such a
  * release left is read here, and the framework stores each of its writes
- * once at boot (AgentFramework.importPersistedDeferredWrites) and clears the
- * record. Like that importer, this module is for one release: the release
+ * once at boot (AgentFramework.importPersistedDeferredWrites), passes on or
+ * drops, logged, a write for an agent gone or one refused as malformed,
+ * keeps for the next boot one it can't store or check, with what follows it
+ * for that agent, and rewrites the record with only those. Like that
+ * importer, this module is for one release: the release
  * after it deletes both.
  *
  * Nothing here touches a store. It reads the record's value, refuses one

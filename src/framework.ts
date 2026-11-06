@@ -25,6 +25,7 @@ import {
   SUBCONSCIOUS_TOOL_NAMES,
   defaultReaderFraming,
   persistentReaderName,
+  tuneOutNoReaderAnswer,
   tuneOutReachWords,
   tunedOutTrafficWords,
   type SubconsciousConfig,
@@ -2723,9 +2724,12 @@ interface FrameworkWriteOptions {
    * is kept behind the writes still waiting (replayingHeld). A hold that a
    * listener of its own traces begins (its clock row's, its audience
    * check's) leaves it unstored at the head of the queue, ahead of the
-   * writes that came after it. Never kept on a write.
+   * writes that came after it. The function takes the write off that queue,
+   * and is called as soon as its store returns, before its rows are
+   * presented: a listener of its presentation finds it stored and not held.
+   * Never kept on a write.
    */
-  replayed?: true;
+  replayed?: () => void;
   /**
    * A suppress rule took this message as it arrived (the gate's
    * suppressionFor, asked by the lane that wrote it): stamped as
@@ -4072,7 +4076,10 @@ interface ChannelNotice {
   text: string;
   untold?: string;
   metadata: MessageMetadata;
-  target?: { forAgent: string };
+  /** Who it's for: the agent it's addressed to (`forAgent`), or, for one
+   *  told to the primary by name, the primary as its audience, as
+   *  passNoticeToPrimary stamps it (#291). */
+  target?: { forAgent: string } | { audience: readonly string[] };
   told: string;
   shown: string;
 }
@@ -5244,6 +5251,16 @@ export class AgentFramework {
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
     assertObservedAgentsConfigured(config.agents);
+    // The presentation index (#291) needs a context-manager that keeps a
+    // window index per agent (presentRows): 0.25.0 on, since 0.23.x and
+    // 0.24.0 were published without one. It needs no store, so it is
+    // checked before one is opened.
+    if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
+      throw new Error(
+        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
+          'Install @animalabs/context-manager ^0.25.0, which this package declares (0.23.x and 0.24.0 have no window index)',
+      );
+    }
 
     // Create or use existing store
     let store: JsStore;
@@ -5326,6 +5343,14 @@ export class AgentFramework {
     config: FrameworkConfig,
     building: { framework?: AgentFramework },
   ): Promise<AgentFramework> {
+    // A store handle with chronicle's batched identity append (0.6.0 on):
+    // context-manager writes a window of several rows with it alone, so on
+    // a handle without it (chronicle 0.5.0 or earlier, or a host's handle
+    // from one) the first agent's write-down would throw. Refused before
+    // anything is written to the store, the state registrations below
+    // included.
+    const unbatched = unbatchedStoreRefusal(store);
+    if (unbatched !== undefined) throw new Error(unbatched);
     // Register framework states. The deferred-write slot is an earlier
     // release's, which the importer reads and clears (one release).
     ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
@@ -5442,21 +5467,8 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
-    // The presentation index (#291), before any agent exists. It needs a
-    // context-manager that keeps a window index per agent (presentRows):
-    // 0.25.0 on, since 0.23.x and 0.24.0 were published without one.
-    if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
-      throw new Error(
-        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
-          'Install @animalabs/context-manager ^0.25.0, which this package declares (0.23.x and 0.24.0 have no window index)',
-      );
-    }
-    // And a store handle with chronicle's batched identity append (0.6.0
-    // on): context-manager writes a window of several rows with it alone,
-    // so on a handle without it (chronicle 0.5.0 or earlier, or a host's
-    // handle from one) the first agent's write-down would throw.
-    const unbatched = unbatchedStoreRefusal(store);
-    if (unbatched !== undefined) throw new Error(unbatched);
+    // The presentation index (#291), before any agent exists: its
+    // context-manager and store handle are checked at the start of create().
     framework.bootFreeze = true;
     framework.presentation = new AgentPresentation({
       liveAgents: () => framework.agents.values(),
@@ -10270,7 +10282,9 @@ export class AgentFramework {
           error,
         );
         this.opsAlert('deferred-import', 'framework',
-          `the deferred-write record ${where} could not be written with the ids given to its writes that had none: ${thrownText(error)}`,
+          `the deferred-write record ${where} could not be written with the ids given to its writes that had none, so those ` +
+            `writes, and what follows each for its agent, stay queued for the next boot, which imports them once the record ` +
+            `can be written: ${thrownText(error)}`,
           { data: { record: where } });
       }
     }
@@ -10482,9 +10496,11 @@ export class AgentFramework {
    * mail named its recipient counts for an agent its audience names, so a
    * slot's observer isn't woken for a resident's mail. Mail whose sender
    * asked for no wake (sendAgentMessage's `wake: false`, recorded on the row
-   * as `dendrite.wake: false`) asks for none, as main's queued mail asked
-   * none; reconcile's redelivery of held mail doesn't ask, as the registry
-   * doesn't record it.
+   * as `dendrite.wake: false`) asks for none; reconcile's redelivery of held
+   * mail doesn't ask, as the registry doesn't record it. Mail an earlier
+   * release left queued records no such ask (that release didn't queue
+   * it), so it is woken for whatever its sender asked, where main asked no
+   * boot wake for any queued mail.
    * Mail in the window already was presented at rest, or sent in a request
    * of the turn's (at its tool boundary), its wake run or lost as before
    * #291, and asks for none; nor does a wake with the same reason already
@@ -15160,10 +15176,12 @@ export class AgentFramework {
     // n messages are counted back from the newest of the agent's window on a
     // presented one (#291), where branchAt cuts at the write that presented
     // the target: rows the cut keeps return to arrivals (returnedToArrivals),
-    // which wait for the agent's next turn start (an own row among them
-    // re-enters at the surgery's release; the hold is in memory, so a
-    // restart presents them at its pass at rest), and rows presented with
-    // the target stay (keptInWindowAfterTarget).
+    // which wait for the agent's next turn start on the rollback's branch
+    // (an own row among them re-enters at the surgery's release; a later
+    // move of the store's branch ends the hold; it is in memory, so a
+    // restart presents them at its pass at rest, or at the resume where it
+    // boots quiesced), and rows presented with the target stay
+    // (keptInWindowAfterTarget).
     if (typeof params.messages === 'number' && params.messages > 0) {
       const agent = this.agents.get(agentName)!;
       if (agent.state.status !== 'idle') {
@@ -16946,10 +16964,13 @@ export class AgentFramework {
      * start, which presents them after what its window holds then: the
      * surgery's release, a resume, the agent's turn ending or a row
      * stored for it while it is idle don't bring them back, so the cut
-     * holds until the agent speaks again. An own row of the agent's among
+     * holds until the agent speaks again, on the rollback's branch: a later
+     * move of the store's branch, a suppression or rollback through another
+     * agent included, ends it. An own row of the agent's among
      * them is the exception: it re-enters at the surgery's release, as own
      * rows enter at every point. The hold is in memory: a restart before
-     * then presents them at its pass over every agent at rest. Not counted
+     * then presents them at its pass over every agent at rest, or, where it
+     * boots quiesced, at the resume. Not counted
      * in `messagesRemoved`, and not marked. Set only on a presented window.
      */
     returnedToArrivals?: number;
@@ -17351,8 +17372,11 @@ export class AgentFramework {
    * the target: they leave the window (`returnedToArrivals`, named by
    * `returnedIds`); the agent's own rows among them enter it again at its
    * next presentation point (the surgery's release), and the rest, as
-   * arrived and not presented, at the agent's next turn start (the hold is
-   * in memory: a restart presents them at its pass at rest). The rows of
+   * arrived and not presented, at the agent's next turn start on the
+   * rollback's branch (a later move of the store's branch, a suppression or
+   * rollback through another agent included, ends the hold; it is in
+   * memory: a restart presents them at its pass at rest, or, where it boots
+   * quiesced, at the resume). The rows of
    * the agent's window after the
    * target that the write presenting it presented too (`keptInWindow`, a
    * batch: one write, one presentation point) stay in the window, since no
@@ -17418,11 +17442,13 @@ export class AgentFramework {
         const named = `${String(first.id)}${discordId !== undefined ? `, Discord message ${discordId}` : ''}`;
         // The host's hide matches a Discord id, so it is named only where
         // one of them has one (an API or a module's row has none), and for
-        // those alone where only some have one.
-        const withId = kept.filter((m) => discordIdOf(m) !== undefined).length;
+        // those alone where only some have one, each id named.
+        const discordIds = kept.map(discordIdOf).filter((id): id is string => id !== undefined);
+        const withId = discordIds.length;
+        const hideBy = `(the host's hide command: ${discordIds.join(', ')})`;
         const hide = withId === 0 ? ''
-          : withId === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`
-          : ", or hide those with a Discord message id by it (the host's hide command)";
+          : withId === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id ${hideBy}`
+          : `, or hide those with a Discord message id by it ${hideBy}`;
         throw new OperatorActionError('invalid',
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
@@ -17448,38 +17474,53 @@ export class AgentFramework {
 
   /**
    * Through which agent a suppression takes `rows` of `agentName`'s window
-   * out, for a refusal's advice: a suppression looks for its ids in the
-   * agent's own slot (planSuppression), so a row of a slot the agent
-   * observes, merged into its window, is suppressed through an owner of
-   * that slot whose own slot holds it (observedRowOwner). Plain
-   * `suppressMessages` when every row is in the agent's own slot.
+   * out, for a refusal's advice, each row named by its id, which
+   * suppressMessages takes: a suppression looks for its ids in the agent's
+   * own slot (planSuppression), so a row of a slot the agent observes,
+   * merged into its window, is suppressed through an owner of that slot
+   * whose own slot holds it (observedRowOwner). Plain `suppressMessages`
+   * with the ids when every row is in the agent's own slot. Where an
+   * owner's slot holds no row but those named for it, the advice says the
+   * suppression there is refused, as planSuppression refuses one that
+   * would leave no row.
    */
   private suppressionThrough(agentName: string, cm: ContextManager, rows: readonly StoredMessage[]): string {
-    let own = 0;
-    const merged = new Map<string | undefined, number>();
+    const own: string[] = [];
+    const merged = new Map<string | undefined, string[]>();
     for (const row of rows) {
       let inOwnSlot = true;
       try { inOwnSlot = cm.getMessage(row.id as MessageId) !== null; } catch { /* read as its own: the plain advice */ }
-      if (inOwnSlot) { own++; continue; }
+      if (inOwnSlot) { own.push(String(row.id)); continue; }
       const owner = this.observedRowOwner(agentName, row.id as MessageId);
-      merged.set(owner, (merged.get(owner) ?? 0) + 1);
+      merged.set(owner, [...(merged.get(owner) ?? []), String(row.id)]);
     }
-    if (merged.size === 0) return 'suppressMessages';
+    const listed = (ids: readonly string[]): string => ids.join(', ');
+    // Read defensively: a count that can't be read says nothing.
+    const refusedThere = (owner: string, ids: readonly string[]): string => {
+      let count: number | undefined;
+      try { count = this.agents.get(owner)?.getContextManager().getMessageCount(); } catch { /* unknown */ }
+      return count !== undefined && count <= ids.length
+        ? `, but a suppression there is refused, since ${owner}'s own slot holds no other row and one must remain`
+        : '';
+    };
+    if (merged.size === 0) return `suppressMessages for ${listed(own)}`;
     const observed = `a slot ${agentName} observes`;
-    if (own === 0 && merged.size === 1) {
-      const [[owner, n]] = [...merged];
-      const pronoun = n === 1 ? 'it is' : 'they are';
+    if (own.length === 0 && merged.size === 1) {
+      const [[owner, ids]] = [...merged];
+      const pronoun = ids.length === 1 ? 'it is' : 'they are';
       return owner
-        ? `suppressMessages on ${owner}: ${pronoun} in ${owner}'s own slot, which ${agentName} observes`
-        : `suppressMessages on an agent whose own slot holds ${n === 1 ? 'it' : 'them'}: ${pronoun} in ${observed}`;
+        ? `suppressMessages on ${owner} for ${listed(ids)}: ${pronoun} in ${owner}'s own slot, which ${agentName} observes` +
+          refusedThere(owner, ids)
+        : `suppressMessages on an agent whose own slot holds ${listed(ids)}: ${pronoun} in ${observed}`;
     }
     const parts = [
-      ...(own > 0 ? [`on ${agentName} for the ${own} in its own slot`] : []),
-      ...[...merged].map(([owner, n]) => owner
-        ? `on ${owner} for the ${n} in ${owner}'s own slot, which ${agentName} observes`
-        : `on an agent whose own slot holds the ${n} in ${observed}`),
+      ...(own.length > 0 ? [`on ${agentName} for ${listed(own)}, in its own slot`] : []),
+      ...[...merged].map(([owner, ids]) => owner
+        ? `on ${owner} for ${listed(ids)}, in ${owner}'s own slot, which ${agentName} observes${refusedThere(owner, ids)}`
+        : `on an agent whose own slot holds ${listed(ids)}, in ${observed}`),
     ];
-    return `suppressMessages ${parts.slice(0, -1).join(', ')}${parts.length > 1 ? ' and ' : ''}${parts.at(-1)}`;
+    // Each part lists ids with commas, so the parts are set apart by semicolons.
+    return `suppressMessages ${parts.slice(0, -1).join('; ')}${parts.length > 1 ? '; and ' : ''}${parts.at(-1)}`;
   }
 
   /**
@@ -19357,6 +19398,21 @@ export class AgentFramework {
           const clock = injects ? this.storeDueClock(agent, 'tool-boundary') : undefined;
           if (presentsWindow) {
             heard.push(...this.presentation!.presentAtBoundary(agent, [replyId, resultsId, clock?.id], { injects }).heard);
+          }
+          // The clock's store and the boundary's presentations run their
+          // listeners synchronously too, and one may have stopped the turn,
+          // as at the round's store above: the clock and what was presented
+          // stay, in the window, and the stream isn't resumed with them.
+          const stoppedAtBoundary = this.roundStoppedDuringBuild(agent, currentState, currentState.stream);
+          if (stoppedAtBoundary !== null) {
+            console.warn(
+              `[framework] Not resuming the tool round of agent '${agent.name}' (callId=${event.callId}): its turn was ` +
+              `stopped as its boundary presented what arrived (status '${agent.state.status}'` +
+              `${stoppedAtBoundary !== 'state-changed' ? `, stream cancelled: ${stoppedAtBoundary}` : ''}), so the round ` +
+              `is stored, its call with its results, and its stream isn't resumed.`,
+            );
+            agent.toolResultGuard.settleTurnEnded();
+            return;
           }
           if (injects) {
             // Rendered in one call: a render prepares as a compile does, so
@@ -22074,11 +22130,12 @@ export class AgentFramework {
     // whose own slot it is in and those that observe that slot (the
     // registry's readersOf), the subconscious among them for the residents'
     // slot, each one whose own view keeps the message (agentSees, main's
-    // #853). A row in an isolated slot, the subconscious's own included, is
-    // its owner's alone. A tune-out-diverted message never enters a
+    // #853). A row in an isolated slot is read by its owner and by the
+    // agents that observe that slot (readersOf), the subconscious's own slot
+    // included. A tune-out-diverted message never enters a
     // resident's compiled view; only the subconscious reads it through its
-    // merged view (or another observer whose edge shows held traffic) — no
-    // subconscious, nobody reads it. Once windows are presented (#291), an
+    // merged view (or another observer whose edge shows held traffic) — with
+    // no such reader, nobody reads it. Once windows are presented (#291), an
     // agent whose window holds the row reads it too (the presentation
     // index's holders, a reader fork's framing among them, which shows the
     // row its view leaves out), whoever the slot's readers are; an agent the
@@ -22807,9 +22864,10 @@ export class AgentFramework {
         if (r.readsRow === undefined) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
         // speech is routed by it, so waiting for one in its channel would
-        // keep its wake forever.
+        // keep its wake forever. The channel is on its own server where the
+        // wake names one (a gate's routed wake, whose source is 'gate').
         const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
-          ? undefined : { serverId: r.source, channelId: r.channelId };
+          ? undefined : { serverId: r.channelServerId ?? r.source, channelId: r.channelId };
         return this.rowDone(agent, r.readsRow, to);
       });
       if (read.length > 0) {
@@ -23406,7 +23464,8 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: ${destination}, confirmDuplicate: true))`),
     ];
-    // Named: residents that share one message slot (#197) share this window.
+    // Named: residents share one message slot (#197), and an agent that
+    // observes the writer's slot is shown the notice too.
     // "Not sent" only when no copied words may already have been posted.
     return (
       `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
@@ -24768,9 +24827,14 @@ export class AgentFramework {
    * Record, at an agent's registration, the mode its requests send other
    * agents' rounds in (foreignRoundsConfigured). An agent that takes its
    * context from another (`from`: a derived agent's parent, a conversation
-   * fork's template) is sent them as that agent is, its inheritance holding
-   * what that agent's window held of them, a shared derivation's as a
-   * window and a copy's or a fork's seed as its own rows. Otherwise, an
+   * fork's template) is sent them in the mode configured for that agent,
+   * the one its window uses when presented (a source left in legacy mode by
+   * a failed write-down is sent them as stored meanwhile; a child it
+   * derives, presented, isn't), its inheritance holding what that agent's
+   * window held of them, a shared derivation's as a window and a copy's or
+   * a fork's seed as its own rows. The source is live here: the registry
+   * admits a derived agent only while its context source is, but for a
+   * resumption, which takes its configuration's mode as below. Otherwise, an
    * agent that observes another is sent them as its configuration's
    * foreignRounds says, a transcript by default, as the persistent
    * subconscious is (foreign-rounds.ts). Any other agent reads no other
@@ -24918,7 +24982,8 @@ export class AgentFramework {
    * routes), stamped for the fork alone. While a surgery holds the store it
    * is held in memory instead (surgeryHeldWrites) and '' returned, and so
    * is it while a hold's release replays what the hold kept, but for the
-   * write the replay stores (`replayed`), and while the fork's context
+   * write the replay stores (`replayed`, called as soon as its store
+   * returns, as addMessage calls it), and while the fork's context
    * manager refuses its work after a failed re-initialization
    * (heldForRecovery, as addMessage keeps a write);
    * stored, it enters the fork's window at once when no turn of the fork's
@@ -24928,7 +24993,7 @@ export class AgentFramework {
    * presented (landedThoughThrown), as addMessage's. `mayBeStored`: as
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
-  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: boolean): MessageId {
+  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: () => void): MessageId {
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
@@ -24966,6 +25031,7 @@ export class AgentFramework {
           return '' as MessageId;
         }
         if ('unknown' in thrown) {
+          replayed?.();
           this.presentation?.afterStore(target, presentedThoughUnknown(thrown.unknown));
           throw error;
         }
@@ -24973,6 +25039,7 @@ export class AgentFramework {
         rows = thrown.landed;
       }
     }
+    replayed?.();
     this.presentation?.afterStore(target, rows);
     return id;
   }
@@ -25022,7 +25089,13 @@ export class AgentFramework {
    * rows the store may hold besides named. Any other throw stored none of
    * the write: it is logged and lost. The rest go on either way. Each
    * agent's lost writes, and those that may be, are told of once, by a log
-   * line and an ops alert of kind `store-held-lost`.
+   * line and an ops alert of kind `store-held-lost`. Each is also given to
+   * the tune-out coordinator, by its metadata (heldWriteLost), before the
+   * deferred cancels run: a reader's note kept with a waiting cancel is
+   * told lost to the reader when that cancel ends the hold, as the cancel's
+   * waiting answer promised. So is each write stored (heldWriteStored),
+   * before its trace: such a note counts as delivered then, and a stop
+   * while its cancel still waits doesn't tell it lost.
    */
   private releaseSurgeryHeldWrites(): void {
     // A release met while this one replays (a recovery with no hold, a
@@ -25074,8 +25147,11 @@ export class AgentFramework {
   /**
    * One write of releaseSurgeryHeldWrites's replay, the head of `queue`,
    * stored by the path it was held on; one that fails is noted in `lost`,
-   * by agent. It is taken off the queue once it is stored, kept for its
-   * agent's recovery, passed on or lost, before its trace; false where a
+   * by agent, and given to the tune-out coordinator (heldWriteLost), which
+   * knows its own writes by their metadata; one stored is given to it too
+   * (heldWriteStored). It is taken off the queue once
+   * it is stored, kept for its agent's recovery, passed on or lost, before
+   * its trace; false where a
    * hold begun during its store (a listener of its clock row's trace)
    * keeps it at the head, unstored.
    */
@@ -25105,16 +25181,27 @@ export class AgentFramework {
         if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
-        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, true);
+        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, settle);
       } else {
-        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: true });
+        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: settle });
       }
       if (this.replayHeldAgain) {
         this.replayHeldAgain = false;
         return false;
       }
       settle();
-      if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
+      if (id) {
+        // The tune-out coordinator, by the write's metadata, before the
+        // trace (whose listener may stop the host): a write of its own kept
+        // in memory with a waiting cancel (a reader's note) is stored now,
+        // so a stop while that cancel waits doesn't tell it lost.
+        try {
+          this.tuneOutCoordinator?.heldWriteStored(write.metadata);
+        } catch (hookError) {
+          console.error('[surgery] the tune-out coordinator could not be told of a write stored at the release:', hookError);
+        }
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
+      }
       return true;
     } catch (error) {
       settle();
@@ -25149,6 +25236,15 @@ export class AgentFramework {
       entry.writes.push(write);
       if (unknown) entry.unknown.push(unknown);
       lost.set(agentName, entry);
+      // The tune-out coordinator, by the write's metadata: a write of its
+      // own whose writer it answered as waiting (a reader's note, kept with
+      // its cancel) is told lost to that writer when the cancel runs, which
+      // the release does next (runDeferredCancels).
+      try {
+        this.tuneOutCoordinator?.heldWriteLost(write.metadata, error, unknown !== undefined);
+      } catch (hookError) {
+        console.error('[surgery] the tune-out coordinator could not be told of a write lost at the release:', hookError);
+      }
       return true;
     }
   }
@@ -25765,6 +25861,8 @@ export class AgentFramework {
         text: `[${NOTICE_TAG.channels}] Now open: ${shown}: a message from ${sender.first} into the closed channel opened it; ${sender.again} has ended.` +
           optOut(this.holdsChannelTraffic(primary, refs), this.canCloseChannels(primary, refs)),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
+        // The primary's, judged for it: stamped for it alone (#291).
+        target: { audience: [primary] },
         told: `the primary, by name (${agentName} has ended)`,
         shown,
       }];
@@ -25808,6 +25906,7 @@ export class AgentFramework {
         text: `[${NOTICE_TAG.channels}] Now open: ${shown}: a message from ${sender.first} into the closed channel opened it, and ${sender.again} can't close ${plural ? 'them' : 'it'}.` +
           optOut(this.holdsChannelTraffic(primary, refs), true),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
+        target: { audience: [primary] },
         told: `the primary, by name (${agentName} can't close ${plural ? 'them' : 'it'})`,
         shown,
       });
@@ -25935,8 +26034,9 @@ export class AgentFramework {
    * to can call it: a conversation fork's channel_open is refused outright
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
    * Where several residents share one slot it is stored in the slot they
-   * share, but stamped for the agent it's addressed to (#291); a fork's
-   * seed leaves it out (primaryNoticeTexts).
+   * share, but stamped for the agent it's addressed to (#291), the primary
+   * alone where it's told by name; a fork's seed leaves it out
+   * (primaryNoticeTexts).
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
    * record putting the channel's decision back, a later delivery or
@@ -26023,7 +26123,9 @@ export class AgentFramework {
             ? { passOn: { notice: 'reply-open-failed', serverId, channel, selectedForOpening } satisfies ChannelNoticePassOn }
             : {}),
         }) as MessageMetadata,
-      ...(agentName && !ended ? { target: { forAgent: agentName } } : {}),
+      // An ended agent's is the primary's, told by name: stamped for it
+      // alone (#291), as the primary's copy below is.
+      ...(agentName && !ended ? { target: { forAgent: agentName } } : ended ? { target: { audience: [primary!] } } : {}),
       told: ended ? `the primary, by name (${agentName} has ended)` : who ?? 'no agent',
       shown,
     };
@@ -26036,6 +26138,7 @@ export class AgentFramework {
           selected + ', and channel_close withdraws that.' +
           (primaryCanOpen && !hostRetries ? ' channel_open tries again.' : ''),
         metadata: { system: true, kind: 'channel-notice', speaker: who } as MessageMetadata,
+        target: { audience: [primary!] },
         told: `the primary, by name (${who} can't close it)`,
         shown,
       });
@@ -27110,8 +27213,9 @@ export class AgentFramework {
           // is the one gap in which another turn-alive holder can take the
           // agent (puppetToolCall's reservation, #145). Never replace its
           // token — the re-entry would set ours over it, and a short turn
-          // here ends and flushes before the puppeted tool returns, leaving
-          // its pair queued behind a flush that already happened. Give
+          // here ends before the puppeted tool returns, so the pair is
+          // stored under a turn that isn't the puppet's, kept out of its
+          // window only by puppetToolCall's defensive path. Give
           // admission back and hand the wake to the scheduler, which keeps
           // it queued while the agent is turn-alive and starts it normally
           // once the holder releases.
@@ -33736,6 +33840,7 @@ export class AgentFramework {
           // answered by that error, not as stored, and the rows the error
           // names are presented as a landed write's are (an imported write's
           // by the boot's pass, and its next boot finds it by its id).
+          opts?.replayed?.();
           if (!opts?.imported) this.presentation?.afterStore(agent, presentedThoughUnknown(thrown.unknown));
           throw error;
         } else {
@@ -33750,8 +33855,15 @@ export class AgentFramework {
         }
       }
     }
+    // The write a release replays is off its queue from here (`replayed`):
+    // the listeners of what follows find it stored, not held as well.
+    opts?.replayed?.();
+    // Whose placement it is (placementReaders): the delivery agent's, or,
+    // for a write in its slot for other agents only, its one recipient
+    // there, whose wake reads it (wakeToRead, readsRowFor).
+    const placedFor = opts?.placement ? this.placementReaders(agent, metadata) : [];
     if (opts?.placement) {
-      opts.placement.agent = agent.name;
+      opts.placement.agent = placedFor.length === 1 ? placedFor[0]!.name : agent.name;
       opts.placement.messageId = stored;
     }
     this.releaseLandedMail(metadata, agent.name);
@@ -33767,11 +33879,35 @@ export class AgentFramework {
     // for that turn isn't materialized by it; or stored at rest and left out
     // of the window by its presentation, which failed. Never for a write a
     // start assembled for itself, which its start presents before its
-    // compile, but while the host is quiesced, when it doesn't.
-    if (opts?.placement && this.placedUnpresented(agent, midTurn, !turnLive && !opts.imported, stored)) {
+    // compile, but while the host is quiesced, when it doesn't. For a write
+    // placed for its recipients rather than the delivery agent, each
+    // recipient's turn and window answer, as the delivery agent's would.
+    if (opts?.placement && placedFor.some((reader) => {
+      if (reader === agent) return this.placedUnpresented(agent, midTurn, !turnLive && !opts.imported, stored);
+      const live = this.logicalTurnAlive(reader);
+      return this.placedUnpresented(reader, this.keptOutOfWindow(reader, content, live), !live && !opts.imported, stored);
+    })) {
       opts.placement.presented = false;
     }
     return stored;
+  }
+
+  /**
+   * The agents a write's placement is judged by (addMessage's out-param,
+   * #291): its delivery agent, or, for a write stored in that agent's slot
+   * for other agents only (its stamp names them and not it, as a coalesced
+   * render targeted to a co-resident is: inboundAudience), those of them
+   * that read the slot. With one, the placement is that agent's: whether
+   * the write was presented is its window's answer, and the wake to read
+   * it names it. With none there, the delivery agent's, as before.
+   */
+  private placementReaders(agent: Agent, metadata: MessageMetadata | undefined): Agent[] {
+    const audience = audienceOf(metadata)?.audience;
+    if (!audience || audience.length === 0 || audience.includes(agent.name)) return [agent];
+    const slot = this.registry.ownSlotOf(agent.name);
+    const readers = new Set(slot ? this.registry.readersOf(slot) : []);
+    const named = audience.map((name) => this.agents.get(name)).filter((a): a is Agent => a !== undefined && readers.has(a.name));
+    return named.length > 0 ? named : [agent];
   }
 
   /**
@@ -33897,9 +34033,11 @@ export class AgentFramework {
    *  is in legacy mode, its window is the slot's record, read from its
    *  newest row. Once it presents rows (#291), the window's own order
    *  decides, as the agent's next request will hold it (windowTail): the
-   *  rows presented to it, then the rows stored for it and not presented
-   *  yet, which its next start presents; a row stored in a shared slot for
-   *  another agent, such as a co-resident's own round, isn't in it. */
+   *  rows presented to it, then its own rows and its arrivals not presented
+   *  yet (bearingOf), an observed co-resident's rounds among them, which its
+   *  next start presents; a row stored in a shared slot for another agent,
+   *  such as the own round of a co-resident it doesn't observe, isn't in
+   *  it. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
     // A clock row the framework wrote after it (a turn start's, an event's),
     // or a stored context injection (any agent's, a start's), isn't a
@@ -33924,18 +34062,15 @@ export class AgentFramework {
 
   /**
    * The newest `limit` rows of a presented window as the agent's next
-   * request will hold them, newest first: the rows stored for it and not
-   * presented yet (its arrivals and own rows, whose audience names it, or
-   * unstamped ones), after the rows its window holds. A row presented later
-   * than a newer one comes after it here, as in the window.
+   * request will hold them, newest first: the rows it is owed and not
+   * presented yet (its own rows and its arrivals, one per body, as the
+   * presentation index reads them: owedOf, so an observed co-resident's
+   * round is among them), after the rows its window holds. A row presented
+   * later than a newer one comes after it here, as in the window.
    */
   private windowTail(agent: Agent, limit: number): StoredMessage[] {
     const cm = agent.getContextManager();
-    const meantFor = (m: StoredMessage): boolean => {
-      const stamp = audienceOf(m.metadata);
-      return stamp === undefined || stamp.audience.includes(agent.name);
-    };
-    const pending = cm.getUnpresentedMessages().filter(meantFor);
+    const pending = this.presentation?.owedOf(agent) ?? [];
     const tail: StoredMessage[] = [];
     for (let i = pending.length - 1; i >= 0 && tail.length < limit; i--) tail.push(pending[i]!);
     const presented = cm.getPresentedMessages();
@@ -34951,11 +35086,26 @@ export class AgentFramework {
     // its registration or after a branch move that failed, or a context that
     // couldn't follow a move): its context is the whole record until a later
     // move of the store's branch writes its window down. A host with no trace
-    // listener hears of it in the log and as an ops alert.
+    // listener hears of it in the log and as an ops alert. One whose context
+    // couldn't follow the move onto a branch that holds a window (one made
+    // from the head, say) still reads that window, as the branch holds it:
+    // the index presents nothing to it, and writes for it wait in memory
+    // (refusesItsWork), so the alert says that instead.
     if (event.type === 'presentation:failed' && event.legacy) {
       const after = event.occasion === 'rebase' ? "a move of the store's branch" : 'its registration';
-      const message = `its window is not presented after ${after} (${event.error}), so its context is the whole record ` +
-        "(legacy mode) until a later move of the store's branch writes its window down";
+      let readsWindow = false;
+      if (event.occasion === 'rebase' && this.refusesItsWork(event.agentName)) {
+        try {
+          readsWindow = this.agents.get(event.agentName)?.getContextManager().windowMode() === 'presented';
+        } catch {
+          // A manager that can't say: the plain alert.
+        }
+      }
+      const message = readsWindow
+        ? `its context manager couldn't follow a move of the store's branch (${event.error}), so its window stays as that ` +
+          "branch holds it, and isn't presented to; writes for it wait in memory until a later move re-initializes it"
+        : `its window is not presented after ${after} (${event.error}), so its context is the whole record ` +
+          "(legacy mode) until a later move of the store's branch writes its window down";
       console.error(`[presentation] agent=${event.agentName} ${boundFailureText(message)}`);
       this.opsAlert('presentation-legacy', event.agentName, message, { data: { occasion: event.occasion } });
     }
@@ -40100,7 +40250,7 @@ export class AgentFramework {
             .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
         },
         commitDeliveries: () => this.commitDeliveries(),
-        writesHeld: () => this.tuneOutWritesHeld(),
+        writesHeld: (forAgent) => this.tuneOutWritesHeld(forAgent),
         historyTool: () => this.residentHistoryTool(),
         // Every reader of the shared slot compiles the dump with its own
         // strategy, so the dump fits the smallest of their bounds.
@@ -40152,11 +40302,12 @@ export class AgentFramework {
    * epoch's end is on disk at once. The coordinator's cancel waits for them
    * then (its writesHeld; releaseSurgeryHeldWrites runs it), and so does a
    * release of the holds on record with no reader
-   * (releaseTuneOutsWithoutReader).
+   * (releaseTuneOutsWithoutReader). With `forAgent`, a write for that agent
+   * too (a loss notice for a reader fork whose manager refuses its work).
    */
-  private tuneOutWritesHeld(): boolean {
+  private tuneOutWritesHeld(forAgent?: string): boolean {
     return this.surgeryHold !== null || this.replayingHeld
-      || [this.primaryAgentName, this.subconsciousAgentName]
+      || [this.primaryAgentName, this.subconsciousAgentName, forAgent]
         .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name)));
   }
 
@@ -40960,8 +41111,9 @@ export class AgentFramework {
     if (!coordinator || !channelRegistry) {
       return { success: false, error: 'tune-out is not available (no MCPL channels)', isError: true };
     }
-    // An open that throws is answered too, never left unhandled.
-    const openThrew = (err: unknown): string =>
+    // An open that throws is answered too, never left unhandled; where no
+    // reader runs, by that alone (tuneOutNoReaderAnswer).
+    const openThrew = (err: unknown): string => tuneOutNoReaderAnswer(this.tuneOutReader()) ??
       `The tune-out is recorded, but its messages ${tuneOutReachWords(this.tuneOutReader(), 'may not reach')}, since ` +
       `opening its channel failed: ${thrownText(err)}`;
     const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
@@ -41075,7 +41227,8 @@ export class AgentFramework {
         const error = now?.params.epochId === tuneOut.params.epochId
           // A name in a sentence is quoted as tune_out takes it back (main's #852).
           ? alreadyTunedOutText(channelRegistry.quotedShown(resolved), now.params,
-            openError ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
+            openError ?? tuneOutNoReaderAnswer(this.tuneOutReader())
+              ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
           : TUNE_OUT_REPLACED;
         return { success: false, error, isError: true };
       }
@@ -42087,6 +42240,12 @@ export class AgentFramework {
             // compiled view (agentSees, main's #853), so its images aren't
             // either.
             if (!this.agentSees(agent, messages[i]?.metadata)) continue;
+            // An observed agent's round (AgentConfig.observes) is in the
+            // window, but the images of its tool results are that agent's:
+            // their refs are in its ledger, not this agent's, so they take no
+            // slot. A row from before the stamp names no owner, and counts.
+            const rowOwner = audienceOf(messages[i]?.metadata)?.ownRowOf;
+            const othersRound = rowOwner !== undefined && rowOwner !== agentName;
             const messagesBack = total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {
@@ -42108,7 +42267,7 @@ export class AgentFramework {
                   mediaType: (typeof claimed === 'string' ? sanitizeLabel(claimed, REFERENCE_LIMITS.mimeType) : '') || 'image/png',
                   messagesBack,
                 });
-              } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
+              } else if (block?.type === 'tool_result' && typeof block.content === 'string' && !othersRound) {
                 considerToolResultImages(
                   block.toolUseId ?? 'unknown',
                   block.toolName ?? 'unknown tool',

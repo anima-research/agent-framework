@@ -27,7 +27,9 @@
   finishing) wakes that agent again, once per sender and kind (`agent-result:<sender>`, `agent-message:<sender>`,
   source `dendrite`), before the boot's pass presents it. Earlier releases kept such mail held while its write
   waited, and the boot's redelivery woke the recipient. Mail sent with `wake: false` asks for no wake at the boot
-  either, as such queued mail asked none: its row records it (`dendrite.wake: false`). An interrupted job whose
+  either: its row records it (`dendrite.wake: false`). Mail an earlier release left queued records no such ask (that
+  release didn't queue it), so the boot wakes its recipient for it whatever its sender asked; main asked no boot wake
+  for any queued mail. An interrupted job whose
   result is stored this way still
   tells its recipient nothing about ending without a result.
   Where the boot can't read what an agent is owed to ask those wakes, the agent's arrivals stay out of its window

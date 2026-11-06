@@ -349,10 +349,15 @@ describe('after a branch move, every agent on the store compiles without a resta
       (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('b'));
       const events: Array<Record<string, unknown>> = [];
       const reads: Array<Promise<{ context: unknown[] }>> = [];
+      // AF #844 bot review 4, finding 49: the event is about a's window, so
+      // a's context, read as the event arrives, already has the change.
+      const readsOfA: Array<Promise<{ context: unknown[] }>> = [];
+      const aBefore = (await api.cmdAgentContext({ agentName: 'a' })).context.length;
       api.broadcast = (event, data) => {
         if (event !== 'window:undone') return;
         events.push(data as Record<string, unknown>);
         reads.push(api.cmdAgentContext({ agentName: 'b' }));
+        readsOfA.push(api.cmdAgentContext({ agentName: 'a' }));
       };
       const undone = await api.cmdUndo({ agentName: 'a' });
       assert.equal(undone.undone, true);
@@ -366,6 +371,9 @@ describe('after a branch move, every agent on the store compiles without a resta
       assert.deepEqual([ofRedo!.agentName, ofRedo!.retracted, ofRedo!.represented], ['a', redone.window!.retracted, redone.window!.represented], 'the redo says what left and what came back');
       assert.ok(undone.window!.retracted > 0 && redone.window!.represented > 0, 'the turn left and came back');
       for (const read of await Promise.all(reads)) assert.ok(read.context.length > 0, "b's context compiled");
+      const [aAtUndo, aAtRedo] = (await Promise.all(readsOfA)).map((read) => read.context.length);
+      assert.ok(aAtUndo! < aBefore, `a's context read at the undo's event lacks the turn's rows (${aAtUndo} of ${aBefore})`);
+      assert.equal(aAtRedo, aBefore, "a's context read at the redo's event has them again");
       assert.deepEqual(reinitAlerts(), []);
     } finally {
       await api.stop();
@@ -3352,6 +3360,18 @@ describe('the window follows a branch move (#291)', () => {
     assert.match((failed[0] as { error: string }).error, /zz-initialize-failed/);
     const alerts = h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-reinit-failed');
     assert.deepEqual(alerts.map((t) => (t as { agentName?: string }).agentName), ['oren'], "#353's alert names the agent too");
+    // AF #844 bot review 4, finding 63: side, made at the head, holds the
+    // window written down on main, so oren's manager reads it presented
+    // after its failed re-initialization. Its context isn't the whole
+    // record then: the alert says its window stays as side holds it, and
+    // that writes for it wait.
+    assert.equal(h.cm('oren').windowMode(), 'presented', "premise: oren's manager reads side's window");
+    const legacy = h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'presentation-legacy');
+    assert.deepEqual(legacy.map((t) => (t as { agentName?: string }).agentName), ['oren']);
+    const said = (legacy[0] as { message: string }).message;
+    assert.match(said, /^its context manager couldn't follow a move of the store's branch \(.*zz-initialize-failed.*\), so its window stays as that branch holds it, and isn't presented to;/, said);
+    assert.match(said, /writes for it wait in memory until a later move re-initializes it$/, said);
+    assert.doesNotMatch(said, /whole record/, said);
     assert.equal(h.internals.presents(h.framework.getAgent('oren')!), false, "oren's window isn't presented");
     assert.equal(h.internals.presents(h.framework.getAgent('mira')!), true, "mira's is");
     assert.throws(() => h.framework.undoLastTurn('oren'), /isn't presented on this branch .*couldn't follow a branch move/);
@@ -3364,13 +3384,19 @@ describe('the window follows a branch move (#291)', () => {
   it('a branch move drops every redo entry: each undid a window of the branch the store left', async () => {
     const h = await boot();
     await h.bothServe('a round');
-    assert.equal(h.framework.undoLastTurn('mira').undone, true);
-    assert.equal(h.framework.getUndoRedoState('mira').canRedo, true, 'setup');
+    // AF #844 bot review 4, finding 50: both agents' entries, so a move
+    // that dropped only one agent's (the primary's, or the mover's) fails.
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.undoLastTurn(name).undone, true);
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `setup: ${name} can redo`);
+    }
     const main = h.store.currentBranch().name;
     h.store.createBranchAt('side', main, h.store.currentSequence());
     await h.framework.switchBranch('side');
-    assert.equal(h.framework.getUndoRedoState('mira').canRedo, false);
-    assert.deepEqual(h.framework.redo('mira'), { redone: false });
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, false, `${name}'s entry is dropped`);
+      assert.deepEqual(h.framework.redo(name), { redone: false });
+    }
   });
 
   /** An autobiographical strategy that folds small chunks into L1s and merges four of them into an L2, compressing only when ticked. */
@@ -3521,12 +3547,18 @@ describe('the window follows a branch move (#291)', () => {
       const first = h.internals.addMessage('someone', blocks('zz-first'), {}, { forAgent: 'oren' });
       const second = h.internals.addMessage('someone', blocks('zz-second'), {}, { forAgent: 'oren' });
       await h.bothServe('a round');
-      assert.equal(h.framework.undoLastTurn('mira').undone, true);
-      assert.equal(h.framework.getUndoRedoState('mira').canRedo, true, 'setup');
+      // AF #844 bot review 4, finding 50: both agents' entries, the agent
+      // the move goes through among them.
+      for (const name of ['mira', 'oren']) {
+        assert.equal(h.framework.undoLastTurn(name).undone, true);
+        assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `setup: ${name} can redo`);
+      }
       if (move === 'rollback') await h.framework.rollbackToMessage('oren', { messageId: first });
       else await h.framework.suppressMessages('oren', { messageIds: [second] });
-      assert.equal(h.framework.getUndoRedoState('mira').canRedo, false);
-      assert.deepEqual(h.framework.redo('mira'), { redone: false });
+      for (const name of ['mira', 'oren']) {
+        assert.equal(h.framework.getUndoRedoState(name).canRedo, false, `${name}'s entry is dropped`);
+        assert.deepEqual(h.framework.redo(name), { redone: false });
+      }
     });
   }
 });

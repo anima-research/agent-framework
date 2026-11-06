@@ -49,7 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
-import { persistentReaderName, tuneOutHeldWords, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
+import { persistentReaderName, tuneOutHeldWords, tuneOutNoReaderAnswer, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
 import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
@@ -3325,7 +3325,8 @@ export class ChannelRegistry {
     // that took effect would have its traffic diverted. `again` where calling
     // tune_out again tries the open now: the channel is registered here and
     // its server up.
-    const notYet = (later: string, why: string, again = false): string => withStop(
+    // Where no reader runs, each answer is that alone (tuneOutNoReaderAnswer).
+    const notYet = (later: string, why: string, again = false): string => tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
       `The tune-out is recorded, but its messages ${this.tuneOutReach('may not reach')} until this host opens the ` +
       `channel, which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
     );
@@ -3359,7 +3360,7 @@ export class ChannelRegistry {
       // established.
       const reach = this.serverReach(serverId);
       if (reach !== 'up') {
-        return withStop(
+        return tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
           `The tune-out is recorded, but its messages ${this.tuneOutReach("don't reach")} until the "${serverId}" server ` +
           `is connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
           (reach === 'gone' ? unreachableRemedy(reach) : ''),
@@ -3368,7 +3369,7 @@ export class ChannelRegistry {
       const transportOpen = this.tuneOutReadsOpen(entry);
       if (!this.directsLifecycle(serverId)) {
         return transportOpen ? undefined
-          : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages ` +
+          : tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages ` +
             `${this.tuneOutReach('reach')} only as that server sends them, and calling tune_out again won't change ` +
             'that. If you need this host to open it, ask whoever runs this host.';
       }
@@ -4179,7 +4180,7 @@ export class ChannelRegistry {
     return entry ? this.tuneOutEndText(entry) : undefined;
   }
 
-  private tuneOutEndText(entry: ChannelEntry, tool?: string): string {
+  private tuneOutEndText(entry: ChannelEntry, tool?: string, closeWith?: string): string {
     const close = tool === 'channel_close';
     // A name is written as a literal tune_out's channelId takes back
     // (quotedValue, main's #852); one no name picks alone, by its id and
@@ -4189,7 +4190,7 @@ export class ChannelRegistry {
       ? `channelId ${quotedValue(name)}`
       : `channelId ${quotedValue(entry.descriptor.id)}, serverId ${JSON.stringify(entry.serverId)}`;
     return `Call tune_out with ${names} and mode "cancel" for it to resume normal ` +
-      `attention; cancelling delivers the diverted backlog${close ? ', and channel_close closes it after that.' : '.'}`;
+      `attention; cancelling delivers the diverted backlog${close ? `, and channel_close${closeWith ? ` with ${closeWith}` : ''} closes it after that.` : '.'}`;
   }
 
   /**
@@ -5481,6 +5482,11 @@ export class ChannelRegistry {
    * Undefined where no hold is in force, where the name isn't the hold
    * channel's, and where the hold's record can't be read, which leaves the
    * name to resolve as any other (resolveToolChannelEntry).
+   *
+   * Another channel the name reaches that has a tune-out of its own is
+   * refused by a close until that tune-out is cancelled (tunedOutRefusal),
+   * so its sentence says it is tuned out, and names the cancel first, then
+   * the close by its id and server.
    */
   private focusNamedBare(
     name: string,
@@ -5499,8 +5505,18 @@ export class ChannelRegistry {
     if (!focus || (name !== focus.channelId && name !== qualifiedChannelName(focus))) return undefined;
     if (mine) return sameChannel(mine.channel, focus) ? undefined : { refusal: this.focusOrOwnRefusal(name, focus, mine.channel, own) };
     const held = focus;
-    const others = this.entriesNamed(name).map(refOf).filter((ref) => !sameChannel(ref, held));
-    return { focus: held, ...(others.length > 0 ? { notClosed: notClosedText(others) } : {}) };
+    const others = this.entriesNamed(name).filter((entry) => !sameChannel(refOf(entry), held));
+    const tunedOut = others.filter((entry) => this.getDesiredState(entry.serverId, entry.descriptor.id) === 'tuned-out');
+    const closable = others.filter((entry) => !tunedOut.includes(entry)).map(refOf);
+    const sentences = [
+      ...(closable.length > 0 ? [notClosedText(closable)] : []),
+      ...tunedOut.map((entry) => {
+        const ref = refOf(entry);
+        return `Channel ${channelOnServer(ref)} was not closed: it is tuned out, and a close doesn't change that. ` +
+          this.tuneOutEndText(entry, 'channel_close', `channelId ${quotedValue(ref.channelId)} and serverId ${quotedValue(ref.serverId)}`);
+      }),
+    ];
+    return { focus: held, ...(sentences.length > 0 ? { notClosed: sentences.join(' ') } : {}) };
   }
 
   /**

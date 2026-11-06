@@ -643,6 +643,36 @@ describe('a stop at a tool boundary', () => {
     }
   });
 
+  // AF #844 bot review 4, finding 14: after the round is stored, the
+  // boundary stores the clock due and presents what arrived, and those
+  // presentations run their listeners synchronously too. A stop made there
+  // ends the turn as one at the store does: what is stored and presented
+  // stays, and the stream isn't resumed with the results.
+  it("a stop made by a listener of the boundary's presentation of an arrival ends the turn, and the stream isn't resumed", async () => {
+    const b = await holdAtToolBoundary();
+    try {
+      const agent = b.framework.getAgent('prime')!;
+      let stopped = false;
+      b.framework.onTrace((event) => {
+        if (stopped || event.type !== 'presentation:presented' || event.agentName !== 'prime' || event.occasion !== 'tool-boundary') return;
+        stopped = true;
+        agent.cancelStream();
+      });
+      b.module.say('meanwhile');
+      await b.releaseWrite();
+      await waitFor('the turn to end', b.turnEnded);
+      assert.ok(stopped, "setup: the arrival's presentation at the boundary was traced, and its listener stopped the turn");
+      assert.ok(b.streams[0].cancelled, 'the stop cancelled the stream');
+      assert.equal(b.streams[0].resumeAttempts, 0, 'the round was not resumed');
+      assert.equal(b.requests(), 1, 'no other request was made');
+      assert.deepEqual(b.roundRows(), ['tool_use', 'tool_result'], 'the call is stored with its result');
+      assert.ok(b.windowBlocks().includes('text:meanwhile'), 'the arrival presented at the boundary stays in the window');
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
   it("an ephemeral run's disposal at its tool boundary cancels the stream, and the round isn't resumed or stored", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'stop-at-boundary-ephemeral-'));
     const mountDir = join(tempDir, 'mount');

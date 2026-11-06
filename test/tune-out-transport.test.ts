@@ -383,6 +383,57 @@ test('the texts about where a tuned-out channel\'s messages go name the reader t
   }
 });
 
+/** The reader the host has where none runs: a hold its failed release left on record (TuneOutReader's `running: false`). */
+const NONE: TuneOutReader = { kind: 'persistent', name: 'Muse', running: false };
+/** tune_out's answer about the transport where no reader runs, in place of each other one (tuneOutNoReaderAnswer). */
+const NO_READER = 'The tune-out is recorded, but its messages are held, with no reader running here to read them, until the ' +
+  "tune-out's release, which failed, is tried again; opening its channel doesn't change that.";
+
+/**
+ * A registry's answers about a tuned-out channel's transport with `reader`:
+ * the channel isn't registered here, its server isn't up, this host can't
+ * open its channels, and this host's open failed.
+ */
+async function transportAnswers(reader: TuneOutReader): Promise<string[]> {
+  const texts: string[] = [];
+  const unregistered = await closedChannel();
+  unregistered.host.reader = reader;
+  unregistered.registry.enterTuneOut('a', 'nope', PARAMS, 'agent-tool');
+  texts.push((await unregistered.registry.openForTuneOut('a', 'nope'))!);
+  const down = await closedChannel();
+  down.host.reader = reader;
+  down.servers.set('a', { ...up(), grant: CapabilityGrant.empty(), isConnected: false, willReconnect: true });
+  down.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  texts.push((await down.registry.openForTuneOut('a', 'y'))!);
+  const ungranted = await closedChannel();
+  ungranted.host.reader = reader;
+  ungranted.servers.set('a', up(['channels.lifecycle']));
+  ungranted.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  texts.push((await ungranted.registry.openForTuneOut('a', 'y'))!);
+  const failing = await closedChannel();
+  failing.host.reader = reader;
+  failing.server.sendChannelsOpen = async () => { throw new McplRequestError('The "a" server refused the open.', 'error-response'); };
+  failing.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  texts.push((await failing.registry.openForTuneOut('a', 'y'))!);
+  return texts;
+}
+
+test("where no reader runs, each of tune_out's answers about the transport is one sentence, not the no-reader words run on into a transport clause (AF #844 review 4, #37)", async () => {
+  const texts = await transportAnswers(NONE);
+  assert.equal(texts.length, 4);
+  for (const text of texts) {
+    assert.ok(!/tried again (until|only as)|tried again, since/.test(text), `no clause follows "is tried again": ${text}`);
+    assert.ok((text.match(/\buntil\b/g) ?? []).length <= 1, `one "until", not a hold until one thing until another: ${text}`);
+  }
+});
+
+test('where no reader runs, each answer about the transport says so alone, and names no reader (AF #844 review 4, #37)', async () => {
+  assert.deepEqual(await transportAnswers(NONE), [NO_READER, NO_READER, NO_READER, NO_READER]);
+  // A reader that runs: the answers say where the messages go, as before.
+  const running = await transportAnswers({ kind: 'persistent', name: 'Muse' });
+  assert.ok(running.every((text) => text.includes('Muse') && text !== NO_READER), running.join('\n'));
+});
+
 test('a tune-out whose channel\'s registration goes while the work queued before it runs says so, and sends nothing', async () => {
   const f = await closedChannel();
   await f.registry.handleChannelToolCall('channel_open', { channelId: 'y' });
@@ -1366,6 +1417,57 @@ for (const outcome of [
     });
   });
 }
+
+/**
+ * tune_out's answers where its reader ends while the open is out (the
+ * framework's tuneOutReader then reads `running: false`): a tune_out whose
+ * open throws, and a repeat for a channel already tuned out whose transport
+ * isn't open, whose open then answers success or throws.
+ */
+async function answersAfterReaderEnds(t: { after(fn: () => Promise<void>): void }): Promise<string[]> {
+  const f = await framework(t);
+  const registry = f.i.channelRegistry as unknown as {
+    openForTuneOut(serverId: string, channelId: string): Promise<string | undefined>;
+    tuneOutTransportOpen(serverId: string, channelId: string): boolean;
+  };
+  const host = f.i as unknown as { tuneOutReader?: () => TuneOutReader };
+  const ends = () => { host.tuneOutReader = () => ({ kind: 'persistent', name: 'Subconscious', running: false }); };
+  const runsAgain = () => { delete host.tuneOutReader; };
+  const texts: string[] = [];
+  registry.openForTuneOut = async () => { ends(); throw new Error('the store went away'); };
+  const fresh = await f.script('tune_out', { channelId: CHANNEL });
+  assert.equal(fresh.isError, false, 'premise: the tune-out is recorded');
+  texts.push((JSON.parse(fresh.text) as { openError: string }).openError);
+  registry.tuneOutTransportOpen = () => false;
+  for (const outcome of ['opens it', 'throws'] as const) {
+    runsAgain();
+    registry.openForTuneOut = async () => {
+      ends();
+      if (outcome === 'throws') throw new Error('the store went away');
+      return undefined;
+    };
+    const again = await f.script('tune_out', { channelId: CHANNEL });
+    assert.equal(again.isError, true, `premise (${outcome}): a repeat, which changes nothing`);
+    texts.push(again.text);
+  }
+  runsAgain();
+  return texts;
+}
+
+test("where the reader ends while tune_out's open is out, no answer runs the no-reader words on into a transport clause (AF #844 review 4, #37)", async (t) => {
+  const texts = await answersAfterReaderEnds(t);
+  for (const text of texts) {
+    assert.ok(!/tried again, since|open now, so its messages are held/.test(text), `one sentence: ${text}`);
+  }
+});
+
+test("where the reader ends while tune_out's open is out, its answer says no reader runs, alone (AF #844 review 4, #37)", async (t) => {
+  const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
+  const repeat = `Nothing changed in the tune-out: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, ` +
+    `backlogCap ${backlogCap} and maxWakes ${maxWakes}. ${NO_READER} To change those, cancel it first with tune_out ` +
+    'mode "cancel", which delivers its backlog to you when it ends (its answer says if it waits), then call tune_out again with the new settings.';
+  assert.deepEqual(await answersAfterReaderEnds(t), [NO_READER, repeat, repeat]);
+});
 
 test('an agent\'s close of a tuned-out channel is refused, and after the cancel delivers the backlog, the close goes through', async (t) => {
   const f = await framework(t);
