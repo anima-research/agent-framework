@@ -39,7 +39,8 @@
   after the redone turn, so undos redone in turn give back the window they took, in its order. The agent's read
   marks that covered the undone rows (consumed, shown, answered, and each destination's) cover them again once a
   redo puts them back, so a row the redone reply answered isn't taken back as unread; so does the mark each of its
-  running scripts started with, which its sends are credited with. An undo cut short after rows
+  running scripts started with, which its sends are credited with, and the mark of a `channel_publish` still out
+  when the redo runs, which the publish is credited with once it is delivered. An undo cut short after rows
   left the window (its second retraction refused) is refused with `OperatorActionError` `'failed'` and can be
   redone, or finished by another undo. A redo is refused on another branch than its undo's, where
   `getUndoRedoState().canRedo` is false, and every branch move the framework makes drops the redo entries. A stored

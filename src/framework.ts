@@ -4881,6 +4881,12 @@ export class AgentFramework {
    *  publish the call makes is credited with (publishReadThrough). Kept only
    *  while the dispatch runs (dispatchScriptToolCall). */
   private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: ReadMark | null }>();
+  /** The marks of channel_publish calls still out (publishReadThrough's,
+   *  taken at the call), by agent, until their delivery settles: a redo
+   *  gives them again (heldMarksOf, retakeMarks), as it gives a running
+   *  script's, so a script's publish that settles after the redo is credited
+   *  with the rows put back (holdPublishMark). */
+  private readonly publishMarksInFlight = new Map<string, Set<{ mark: ReadMark | null }>>();
   /** Per agent, the unexpected thinking drops its last operator alert counted (noteThinkingLoss). */
   private readonly thinkingLossIncidents = new ThinkingLossIncidents();
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
@@ -15768,12 +15774,35 @@ export class AgentFramework {
 
   /**
    * The read marks held for `agent` (heldMarksOf's): its own
-   * (Agent.heldReadMarks), and the marks its running scripts started with
+   * (Agent.heldReadMarks), the marks its running scripts started with
    * (AgentScripts.readMarksOf), which each script's sends are credited with
-   * having read (publishReadThrough). A redo gives them all again.
+   * having read (publishReadThrough), and those of its channel_publish calls
+   * still out (publishMarksInFlight). A redo gives them all again.
    */
   private heldMarksOf(agent: Agent): ReadMark[] {
-    return [...new Set([...agent.heldReadMarks(), ...(this.codeExecution?.scripts.readMarksOf(agent.name) ?? [])])];
+    // Read defensively, as releaseSurgeryHeldWrites is.
+    const inFlight = [...(this.publishMarksInFlight?.get(agent.name) ?? [])]
+      .map((held) => held.mark).filter((mark): mark is ReadMark => mark !== null);
+    return [...new Set([...agent.heldReadMarks(), ...(this.codeExecution?.scripts.readMarksOf(agent.name) ?? []), ...inFlight])];
+  }
+
+  /**
+   * Hold a publish's mark (publishReadThrough's) while its call is out
+   * (publishMarksInFlight), so a redo meanwhile gives it again. `release`
+   * lets it go and returns the mark as it stands then, for notePublished.
+   */
+  private holdPublishMark(agent: Agent, mark: ReadMark | null): { release(): ReadMark | null } {
+    const held = { mark };
+    let marks = this.publishMarksInFlight.get(agent.name);
+    if (!marks) this.publishMarksInFlight.set(agent.name, (marks = new Set()));
+    marks.add(held);
+    return {
+      release: () => {
+        marks!.delete(held);
+        if (marks!.size === 0 && this.publishMarksInFlight.get(agent.name) === marks) this.publishMarksInFlight.delete(agent.name);
+        return held.mark;
+      },
+    };
   }
 
   /**
@@ -15937,6 +15966,9 @@ export class AgentFramework {
       if (replacements.size === 0) return;
       agent.replaceReadMarks(replacements);
       this.codeExecution?.scripts.replaceReadMarks(agent.name, replacements);
+      for (const held of this.publishMarksInFlight?.get(agent.name) ?? []) {
+        if (held.mark) held.mark = replacements.get(held.mark) ?? held.mark;
+      }
       for (const older of [...below, entry]) {
         for (const recorded of older.marks) recorded.mark = replacements.get(recorded.mark) ?? recorded.mark;
       }
@@ -39627,7 +39659,9 @@ export class AgentFramework {
     // delivered. One made outside the turn, as a background script's is,
     // isn't: its words were written before what the agent may have read since.
     const publisher = call.name === 'channel_publish' && callingTurn ? this.agents.get(agentName) : undefined;
-    const readThrough = publisher ? this.publishReadThrough(publisher, call.id) : null;
+    // Held while the call is out, so a redo before it settles gives it again
+    // (holdPublishMark): a script's call outlives the turn it was made in.
+    const readThrough = publisher ? this.holdPublishMark(publisher, this.publishReadThrough(publisher, call.id)) : undefined;
     const published: { outcome?: PublishOutcome } = {};
 
     const channelInput = call.name === 'channel_publish'
@@ -39638,7 +39672,8 @@ export class AgentFramework {
     }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
-        if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
+        const credited = readThrough?.release() ?? null;
+        if (publisher && destination) publisher.notePublished(destinationKey(destination), credited);
         const durationMs = Date.now() - startTime;
         this.traceToolOutcome('channels', call.name, call.id, result, durationMs);
         // A successful channel_open plants the agent's feet in the opened
@@ -39724,6 +39759,7 @@ export class AgentFramework {
         });
       })
       .catch((error) => {
+        readThrough?.release();
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
