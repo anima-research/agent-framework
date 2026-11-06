@@ -19570,6 +19570,8 @@ export class AgentFramework {
             channelId: event.channelId, channelServerId: event.serverId,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
             addressed,
+            // As a resident's: an ambient message asks no answer in its channel (rowDone).
+            ...ambientMark(event.tags),
             ...systemNoticeMark(event.tags),
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
             // Stored for the fork, so its wake reads the row, as a resident's does.
@@ -19779,6 +19781,8 @@ export class AgentFramework {
         channelId: event.channelId, channelServerId: event.serverId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags),
+        // As a resident's: an ambient message asks no answer in its channel (rowDone).
+        ...ambientMark(event.tags),
         ...systemNoticeMark(event.tags),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         ...this.readsRowFor(placement, agent.name),

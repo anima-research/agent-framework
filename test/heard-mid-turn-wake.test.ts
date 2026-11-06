@@ -1152,6 +1152,17 @@ describe("a fork's channel wake", () => {
         assert.ok(wake, `${body}: setup: the fork's wake is queued`);
         assert.ok(rowOf(body), `${body}: setup: stored in the fork`);
         assert.equal(wake.readsRow, rowOf(body), `${body}: the wake reads its row`);
+        assert.equal((wake as { ambient?: true }).ambient, undefined, `${body}: an untagged message's wake is not ambient`);
+      }
+      // AF #844 bot review 3, finding 40: a message its server tagged
+      // ambient asks nothing of the fork, as of a resident, so a turn that
+      // heard it needn't publish in its channel for the wake to be done.
+      for (const [body, extra] of [['ambient, routed', {}], ['ambient, by name', { deliverTo: fork }]] as const) {
+        fw.pendingRequests.length = 0;
+        await fw.handleMcplChannelIncoming(dm(body, { ...extra, tags: ['chat:ambient'] }));
+        const wake = fw.pendingRequests.find((r) => r.agentName === fork);
+        assert.ok(wake, `${body}: setup: the fork's wake is queued`);
+        assert.equal((wake as { ambient?: true }).ambient, true, `${body}: the wake is marked ambient`);
       }
     } finally {
       await framework.stop();
