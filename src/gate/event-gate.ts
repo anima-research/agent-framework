@@ -4517,7 +4517,7 @@ export class EventGate {
     if (failed) {
       console.error(
         `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${reason}), so its batch of ${state.events.length} `
-        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : 'is dropped without waking the agent'} (judge onError "${this.judgeOnError}")`,
       );
     }
     this.emitTrace({
