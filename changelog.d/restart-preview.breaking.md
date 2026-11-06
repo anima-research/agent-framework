@@ -4,7 +4,15 @@
   preview fails other than by having no fold plan to preview: the stream
   goes on, each boundary that declines it emits
   an `inference:restart_declined` trace, and the next tool boundary over
-  the budget considers the restart again. Before this release a restart
+  the budget considers the restart again. A decline because the compile
+  won't fit, whose preview doesn't name a newer message as what would make
+  room, is remembered for the stream: later boundaries over the budget take
+  it without previewing until the budget, the compression holds, the live
+  context settings, the strategy's compression state, or the pins and
+  document marks change (the turn's own input pin aside), or a stored row
+  is edited or removed. Rows added to the store, the stream's own among them,
+  and context-manager's calibration multiplier aren't among those. Before
+  this release a restart
   whose compile the preview now says won't fit was taken too, and its compile
   refused, ending the turn with an `over_budget` failure row, unless
   something it rested on changed after the cancel, such as a compression
