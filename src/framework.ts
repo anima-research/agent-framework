@@ -19440,6 +19440,8 @@ export class AgentFramework {
             addressed,
             ...systemNoticeMark(event.tags),
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+            // Stored for the fork, so its wake reads the row, as a resident's does.
+            ...this.readsRowFor(placement, target.name),
           });
         }
         return placement;
@@ -19647,6 +19649,7 @@ export class AgentFramework {
         addressed: isAddressedMessage(event.tags),
         ...systemNoticeMark(event.tags),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+        ...this.readsRowFor(placement, agent.name),
       });
     }
     return placement;

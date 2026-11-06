@@ -1078,3 +1078,47 @@ describe('a wake for a write heard mid-turn', () => {
     });
   }
 });
+
+// AF #844 bot review 2, finding 14: a fork's channel message marks its wake
+// with the row it was stored as, as a resident's does, so a live turn that
+// reads and answers it can drop the wake (rowDone) rather than start a turn.
+describe("a fork's channel wake", () => {
+  let tempDir: string;
+  beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'heard-wake-fork-')); });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  it('carries the id its message was stored as, routed to the fork or delivered to it by name', async () => {
+    const membrane = new MockMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+      modules: [],
+      conversations: { templateAgent: 'trunk' },
+    });
+    try {
+      const dm = (body: string, extra: Record<string, unknown> = {}) => ({
+        type: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'srv:dm:alice', messageId: `m-${body}`,
+        author: { id: 'U1', name: 'alice' }, content: [text(body)], timestamp: new Date().toISOString(),
+        metadata: { channel_type: 'im' }, triggerInference: true, ...extra,
+      }) as unknown as ProcessEvent;
+      membrane.pushResponse(createMockResponse([text('Hello.')]));
+      framework.pushEvent(dm('hello there'));
+      await framework.runUntilIdle();
+      const fork = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'srv:dm:alice' })!.agentName;
+      const fw = internals(framework) as Internals & { handleMcplChannelIncoming(event: unknown): Promise<unknown> };
+      const rowOf = (body: string) => framework.getAgent(fork)!.getContextManager().getAllMessages()
+        .find((m) => JSON.stringify(m.content).includes(body))?.id;
+      for (const [body, extra] of [['routed again', {}], ['a correction', { deliverTo: fork }]] as const) {
+        fw.pendingRequests.length = 0;
+        await fw.handleMcplChannelIncoming(dm(body, extra));
+        const wake = fw.pendingRequests.find((r) => r.agentName === fork);
+        assert.ok(wake, `${body}: setup: the fork's wake is queued`);
+        assert.ok(rowOf(body), `${body}: setup: stored in the fork`);
+        assert.equal(wake.readsRow, rowOf(body), `${body}: the wake reads its row`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+});
