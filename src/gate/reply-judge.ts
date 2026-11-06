@@ -71,7 +71,6 @@ const CHUNK_TOKENS = 6_000;
 const FIXED_TOKENS_RESERVE = 3_000;
 /** Longest text block (characters) a message renders whole; a longer one keeps its head and tail. */
 const MAX_TEXT_CHARS = 6_000;
-/** Longest message (characters) rendered, its participant's name and all its blocks together. */
 const MAX_MESSAGE_CHARS = 12_000;
 /** Longest tool call input / tool result (characters) rendered. */
 const MAX_TOOL_CHARS = 600;
@@ -191,12 +190,12 @@ function renderBlock(block: ContentBlock): string {
     case 'video':
       return '[video]';
     case 'tool_use':
-      return `[calls ${oneLine(String(block.name))}] ${cut(safeJson(block.input), MAX_TOOL_CHARS)}`;
+      return `[calls ${labelName(block.name)}] ${cut(safeJson(block.input), MAX_TOOL_CHARS)}`;
     case 'tool_result': {
       const body = typeof block.content === 'string'
         ? unlabelled(block.content)
         : block.content.map((b) => (b.type === 'text' ? unlabelled(b.text) : `[${b.type}]`)).join('\n');
-      return `[${oneLine(String(block.toolName ?? 'tool'))} ${block.isError ? 'failed' : 'returned'}] ${cut(body, MAX_TOOL_CHARS)}`;
+      return `[${labelName(block.toolName ?? 'tool')} ${block.isError ? 'failed' : 'returned'}] ${cut(body, MAX_TOOL_CHARS)}`;
     }
     default:
       // thinking, redacted thinking, system changes: not the conversation.
@@ -205,6 +204,10 @@ function renderBlock(block: ContentBlock): string {
 }
 
 const LINE_OPENING_BRACKET = new RegExp(`(^|\\n)((?:(?!\\n)${SKIPPED})*)\\[`, 'gu');
+
+function labelName(name: unknown): string {
+  return oneLine(String(name)).replace(/[[\]]/g, '\\$&');
+}
 
 function unlabelled(text: string): string {
   return normalizeLineBreaks(text).replace(LINE_OPENING_BRACKET, '$1$2\\[');
@@ -477,7 +480,6 @@ export class ReplyJudge {
     );
     const fixedChars = system.length + question.length;
 
-    // The budget the document may fill, in characters at the ratio it's built at.
     const docTokens = Math.max(1_000, this.maxInputTokens - FIXED_TOKENS_RESERVE - Math.ceil(fixedChars / ratio));
     const docChars = Math.floor(docTokens * ratio);
 
