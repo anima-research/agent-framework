@@ -1,3 +1,4 @@
+import type { ReplyAuthorityConfig } from './reply-routing.js';
 /**
  * MCPL (MCP Live) Protocol Types — v0.4.0-draft
  *
@@ -240,6 +241,8 @@ export interface McplServerConfig {
    * share one host-wide chain/mutex: an unconfigured server's hung coalesced
    * module delivery can stall required coalesced effects. */
   inboundAdmission?: InboundAdmissionConfig;
+  /** Host-only automatic-reply consumer; requires inboundAdmission. */
+  replyAuthority?: ReplyAuthorityConfig;
   /** Unique server identifier */
   id: string;
 
