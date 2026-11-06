@@ -650,15 +650,21 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent' } },
       })]);
       // Every sync from the import on fails, through the boot's check of held mail.
+      // AF #844 bot review 4, finding 45: the held-mail check's own sync is
+      // counted, so a boot that skipped that check after the failed import
+      // (and left the mail held for the later boot) fails here.
+      let heldMailSyncsRefused = 0;
       proto.sync = function (this: JsStore) {
         const stack = new Error().stack ?? '';
         if (stack.includes('importPersistedDeferredWrites') || stack.includes('deliverHeldMail')) {
+          if (stack.includes('deliverHeldMail')) heldMailSyncsRefused++;
           throw Object.assign(new Error('injected EIO syncing'), { code: 'EIO' });
         }
         return sync.call(this);
       };
       console.error = () => {};
       try { framework = await h.boot(); } finally { proto.sync = sync; console.error = quiet; }
+      assert.ok(heldMailSyncsRefused > 0, "the boot's check of held mail reached its sync, which was refused");
       try {
         assert.equal(withText(framework, 'unsynced mail').length, 1, 'the import stored it, in memory');
         assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mailId], 'the mail stays held: its copy never reached the disk');
