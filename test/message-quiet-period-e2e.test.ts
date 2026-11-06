@@ -254,6 +254,43 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
     });
   }
 
+  it("with the option off, a start parked behind an auxiliary call assembles the batch that arrived meanwhile, as without the option (slimepriestess's pin)", async () => {
+    // Pins `quietLeftSubjects`' `if (!this.quietPeriod) return undefined;`:
+    // without it, a host that never set the option would leave every queued
+    // batch for a later turn, where main's start takes it.
+    const f = await fixture({
+      framework: { gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
+      mcpl: {},
+    });
+    try {
+      f.alwaysRespond();
+      await f.register('room');
+      await f.register('general');
+      await f.framework.start();
+      const x = f.framework as unknown as { providerGate(agent: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> } };
+      const gate = x.providerGate('agent');
+      gate.auxiliaryInFlight++;
+      await f.send('channels/incoming', { messages: [{
+        channelId: 'room', messageId: 'r1', eventId: 'r1', timestamp: TS, author: { id: 'u', name: 'U' },
+        tags: ['chat:mention', 'chat:addressed'], content: [{ type: 'text', text: 'ROOMQ agent?' }],
+      }] });
+      await sleep(300);
+      assert.equal(f.membrane.calls.length, 0, 'the start is parked');
+      await f.send('push/event', batch('b1', 'GENQ batch question', 'general'));
+      await sleep(200);
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor(() => f.published.length >= 1, "the room's reply", 6_000);
+      await sleep(1_500);
+      assert.deepEqual(f.published.map((p) => p.channelId), ['room'], "one turn: the room's start took the batch, as main's does");
+      assert.equal(f.membrane.calls.length, 1);
+      const carries = f.membrane.calls.map((c) => JSON.stringify((c as { messages?: unknown }).messages).includes('document_diff'));
+      assert.deepEqual(carries, [true], "the batch is in the room's turn");
+    } finally {
+      await f.close();
+    }
+  });
+
   it("a notice to the held batch while the other burst's start is parked behind an auxiliary call: still left for its own turn (R4-1a)", async () => {
     const f = await fixture({
       framework: { messageQuietPeriod: { quietMs: 600 }, gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
