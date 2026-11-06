@@ -17,7 +17,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { ChannelRegistry, type TuneOutParams } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
-import { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
+import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/coordinator.js';
 
 const CHANNEL = 'disc:guild:a';
 const NOW = Date.UTC(2026, 9, 29);
@@ -38,7 +38,7 @@ function registryOn(store: JsStore): ChannelRegistry {
   return new ChannelRegistry(servers, {} as FeatureSetManager, () => {}, () => {}, { store });
 }
 
-function coordinatorOn(registry: ChannelRegistry, window: Row[], anchors: number[] = []): TuneOutCoordinator {
+function coordinatorOn(registry: ChannelRegistry, window: Row[], anchors: number[] = [], sequence: () => number = () => 9): TuneOutCoordinator {
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => {
       if (metadata?.kind === 'tune-out-cancel') window.push({ id: `dump-${window.length}`, participant, content, metadata });
@@ -50,8 +50,8 @@ function coordinatorOn(registry: ChannelRegistry, window: Row[], anchors: number
     getStoredMessages: () => window,
     getDeferredMessages: () => [],
     emitTrace: () => {},
-    currentSequence: () => 9,
-    setSubconsciousAnchor: (sequence: number) => { anchors.push(sequence); },
+    currentSequence: sequence,
+    setSubconsciousAnchor: ((start) => { anchors.push(start); }) satisfies TuneOutFrameworkHooks['setSubconsciousAnchor'],
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
@@ -133,5 +133,19 @@ test("the subconscious keeps its window's start and its last look for a tune-out
     assert.equal(coordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:work' }, { durationSeconds: 120 }, 'agent-tool').ok, true);
     coordinator.stop();
     assert.deepEqual(anchors, Array(3).fill(PARAMS.startedAtSequence), "a later tune-out or all-except hold doesn't move the window's start past it");
+  });
+});
+
+test("a tune-out entered while an older all-except hold is in force leaves the subconscious's window start at the hold's start", async () => {
+  await withStore((store) => {
+    const registry = registryOn(store);
+    const anchors: number[] = [];
+    let sequence = 3;
+    const coordinator = coordinatorOn(registry, [], anchors, () => sequence);
+    assert.equal(coordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:work' }, { durationSeconds: 120 }, 'agent-tool').ok, true);
+    sequence = 20;
+    assert.equal(coordinator.enter('disc', 'disc:guild:b', {}, 'agent-tool').ok, true);
+    coordinator.stop();
+    assert.deepEqual(anchors, [3, 3], "the hold's start, at the hold and at the later tune-out");
   });
 });
