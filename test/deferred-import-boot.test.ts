@@ -599,7 +599,12 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     }
   });
 
-  it('releases the mail an imported write carries as it is stored, so the boot delivers it no second time', async () => {
+  // AF #844 bot review 5, finding 48: main's mail stamp names no recipient
+  // (`to`), so the queue an earlier release left holds it that way; the
+  // importer finds the mail's copy by the write's agent (isMailCopyFor) and
+  // the boot's wake by the stamp's fallback. A stamp with `to` is checked
+  // too.
+  for (const withTo of [false, true]) it(`releases the mail an imported write carries as it is stored, so the boot delivers it no second time${withTo ? ' (a stamp that names its recipient)' : " (main's stamp, no recipient named)"}`, async () => {
     const h = await host();
     try {
       let framework = await h.boot();
@@ -611,7 +616,7 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       } finally { await framework.stop(); }
       h.writeQueue([entry('mail-1', 1, 'queued mail', {
         participant: 'helper', forAgent: 'agent',
-        metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent' } },
+        metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, ...(withTo ? { to: 'agent' } : {}) } },
       })]);
       framework = await h.boot();
       const traces: TraceEvent[] = [];
