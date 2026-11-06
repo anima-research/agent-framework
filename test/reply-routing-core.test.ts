@@ -10,13 +10,14 @@ function fixture(overrides: Partial<ReplyAuthorityConfig> = {}, mayWake = true) 
   const admission = new RequiredAdmission({ timeoutMs: 1000, bind: connection => ({ connection, admit: () => ({ store: true, mayWake, replyIntent: 'private' }) }), isReplyIntent: () => true }, 'endpoint:a/β');
   admission.bind(1);
   const transport = new AbortController();
-  const consumer = replyConsumer({ timeoutMs: 30, resolve: () => ({ channelId: 'room|one' }), authorize: () => true, ...overrides }, key => admission.isCurrent(key));
+  const traces: string[] = [];
+  const consumer = replyConsumer({ timeoutMs: 30, resolve: () => ({ channelId: 'room|one' }), authorize: () => true, ...overrides }, key => admission.isCurrent(key), {}, reason => traces.push(reason));
   const ingress = withReplyConsumer(admission.capture(() => undefined), consumer, transport.signal);
   const run = async () => {
     const verdict = await ingress.admit('channels/incoming', {});
     return { verdict, binding: admissionRoutingFields(verdict).routing as ReplyBinding };
   };
-  return { admission, transport, ingress, run };
+  return { admission, transport, ingress, run, traces };
 }
 
 test('core: destination is detached, frozen, connection-qualified and cannot be forged', async () => {
@@ -273,6 +274,7 @@ test('#12 timeout and overload have fixed bounded diagnostics', async t => {
   const timed = fixture({ timeoutMs: 1, resolve: () => new Promise(() => {}) });
   assert.equal((await timed.run()).binding.destination, undefined);
   assert(logs.some(line => line.includes('timeout')));
+  assert.deepEqual(timed.traces, ['timeout']);
   logs.length = 0;
   let entered = 0;
   const x = fixture({ timeoutMs: 5000, resolve: () => { entered++; return new Promise(() => {}); } });
@@ -282,6 +284,7 @@ test('#12 timeout and overload have fixed bounded diagnostics', async t => {
     assert.equal((await x.run()).binding.destination, undefined);
     await x.run();
     assert.equal(logs.length, 1); assert(logs[0].includes('overload'));
+    assert.deepEqual(x.traces, ['overload']);
     assert(logs.every(line => line.length < 200));
   } finally { x.transport.abort(); await Promise.all(pending); }
 });
@@ -298,7 +301,9 @@ test('#13 diagnostic throttling ignores backward wall-clock steps', async t => {
 
 test('R1-5 class authority callbacks retain the configured receiver through snapshotting', async () => {
   class HostRouter {
-    channel = 'room|one';
+    #channel = 'room|one';
+    get channel() { return this.#channel; }
+    set channel(value: string) { this.#channel = value; }
     timeoutMs = 100;
     resolve() { return { channelId: this.channel }; }
     authorize(_input: unknown, destination: { channelId: string }) { return destination.channelId === this.channel; }
@@ -309,6 +314,9 @@ test('R1-5 class authority callbacks retain the configured receiver through snap
   const result = await x.run();
   assert.equal(result.binding.destination?.channelId, host.channel);
   assert.equal(replyBindingCurrent(result.binding), true);
+  const direct = await replyConsumer(host, () => true)({ connection: x.ingress.key, lane: 'push/event', item: {} as any, signal: x.transport.signal }, { store: true, mayWake: true });
+  assert(isReplyBinding(direct.routing));
+  assert.equal(direct.routing.destination?.channelId, host.channel);
   host.channel = 'changed';
   assert.equal(replyBindingCurrent(result.binding), false);
 });
@@ -322,6 +330,11 @@ test('R1-5 private fault trace is bounded with fixed codes and no callback detai
   await run(); await run();
   assert.deepEqual(traces, [{ type: 'reply:private', serverId: 'endpoint:a/β', reason: 'authority' }]);
   now += 60_000; await run(); assert.equal(traces.length, 2);
+  const broken = withReplyConsumer(x.ingress, async () => { throw Error('secret consumer'); }, x.transport.signal, scope);
+  await broken.admit('push/event', {});
+  assert.equal(traces.length, 2, 'consumer fault shares the connection throttle');
+  now += 60_000; await broken.admit('push/event', {});
+  assert.deepEqual(traces[2], { type: 'reply:private', serverId: 'endpoint:a/β', reason: 'consumer' });
   assert(!JSON.stringify(traces).includes('secret'));
 });
 

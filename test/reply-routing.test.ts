@@ -310,8 +310,11 @@ for (const mode of ['same private work', 'same approved destination', 'private t
         [replyWork]: [carried], [replyOwner]: open.turnId };
       const shouldRun = mode === 'same private work' || mode === 'same approved destination';
       if (!shouldRun) {
-        assert.equal(shareReplyTurn({ [replyWork]: [opening] }, { [replyWork]: [carried] }), false);
-        assert.equal(shareReplyTurn({ [replyWork]: [carried] }, { [replyWork]: [opening] }), false);
+        // Private causes may share a fresh turn, but cannot join an already
+        // open turn unless they belong to its original work set.
+        const mayShareFreshTurn = mode === 'different private work';
+        assert.equal(shareReplyTurn({ [replyWork]: [opening] }, { [replyWork]: [carried] }), mayShareFreshTurn);
+        assert.equal(shareReplyTurn({ [replyWork]: [carried] }, { [replyWork]: [opening] }), mayShareFreshTurn);
       }
       x.f.pendingRequests.push(continuation);
       await x.f.processInferenceRequests();
@@ -1002,10 +1005,19 @@ test('R1-3 prose-bounce successor retains all work without the ended owner', asy
   ], [], undefined, { proseRouting: 'hybrid' });
   try {
     const request = await x.request(reply());
-    x.f.pendingRequests.push(request);
+    const other = await x.request(reply());
+    const bounceWakes: any[] = [];
+    const bounce = x.f.bounceProse.bind(x.f);
+    x.f.bounceProse = (...args: any[]) => {
+      bounce(...args);
+      bounceWakes.push(...x.f.pendingRequests.filter((request: any) => request.reason === 'prose-bounce'));
+    };
+    x.f.pendingRequests.push(request, other);
     await x.framework.runUntilIdle();
     assert.equal(x.membrane.calls.length, 2);
-    assert.deepEqual(x.f.turnRouting.get('assistant').replyWorks, workOf(request));
+    assert.deepEqual(x.f.turnRouting.get('assistant').replyWorks, [...workOf(request), ...workOf(other)]);
+    assert.equal(bounceWakes.length, 1);
+    assert.equal(bounceWakes[0][replyOwner], undefined);
     assert.equal(x.publishes.length, 1);
     assert.equal(x.publishes[0].channelId, 'room/one');
   } finally { await x.close(); }
