@@ -4272,12 +4272,13 @@ export class TuneOutCoordinator {
     const notice = trigger === 'wake'
       ? `[${NOTICE_TAG.tuneOutWake}: ${shown} — ${count} addressed message${count === 1 ? '' : 's'}]`
       : `[${NOTICE_TAG.tuneOutCadence}: ${shown} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
+    const ofChannel = inChannelOf(serverId, channelId);
+    const heldIn = (epochId: string) => (m: Pick<StoredMessage, 'metadata'>): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId && ofChannel(m);
     if (!subName) {
       const hold = this.holdFor(serverId, channelId);
       if (!hold) return;
-      const ofChannel = inChannelOf(serverId, channelId);
-      const inChannel = (m: Pick<StoredMessage, 'metadata'>): boolean =>
-        (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === hold.epochId && ofChannel(m);
+      const inChannel = heldIn(hold.epochId);
       // A held message is stored as it arrives, the resident's turn alive or
       // not, and what arrives while the resident is busy is the traffic a
       // reader is there for.
@@ -4307,9 +4308,12 @@ export class TuneOutCoordinator {
     );
     this.hooks.requestInference(subName, `tune-out ${trigger}: ${shown}`, 'tune-out');
     // Counted from here only once the turn has been asked for, so a turn that
-    // throws leaves its messages for the next period's turn.
-    this.divertedSinceInvocation.set(key, 0);
+    // throws leaves its messages for the next period's turn. A held message
+    // kept in memory isn't in the subconscious's window yet, so it still
+    // counts, as for a fork above, and the first period after it is stored
+    // looks again.
     const epochId = this.holdFor(serverId, channelId)?.epochId;
+    this.divertedSinceInvocation.set(key, epochId ? this.keptInMemory(heldIn(epochId)) : 0);
     if (epochId) this.markLook(epochId, serverId, channelId);
   }
 

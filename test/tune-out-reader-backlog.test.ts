@@ -469,6 +469,28 @@ describe('a cadence look for held messages no reader has looked at, though nothi
     w.coordinator.stop();
   });
 
+  // AF #844 review 4, #8: the persistent subconscious's look reset the tally
+  // to 0 as AF-C-2 found for forks, though a held message kept in memory
+  // during the look wasn't in its window yet; after the release, no cadence
+  // period looked again for it.
+  it("a held message a surgery's hold keeps in memory still counts after the persistent subconscious's look during the hold, and the first period after the release looks again", (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const w = world({ subconscious: true });
+    w.tuneOut();
+    w.startCadence(30);
+    w.keep('ann', 'KEPT-1 during the hold');
+    w.coordinator.recordHeld(SERVER, NOISY, 'x1', [], 'ann', true);
+    w.wake();
+    assert.equal(w.looks.length, 1, 'a wake during the hold asks the subconscious to look');
+    w.releaseHold();
+    t.mock.timers.tick(30_000);
+    assert.equal(w.looks.length, 2, 'the first period after the release looks again, for the message stored then');
+    assert.match(w.looks[1]!.text, /— 1 diverted message since your last look/);
+    t.mock.timers.tick(30_000);
+    assert.equal(w.looks.length, 2, 'and the next is quiet');
+    w.coordinator.stop();
+  });
+
   it("a failed fork's messages get the next cadence look", (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const w = world();
