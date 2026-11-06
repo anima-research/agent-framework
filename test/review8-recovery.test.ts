@@ -249,20 +249,22 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
         return true;
       },
     );
-    // Mixed: C by its Discord id here, the agent's note by row id live.
-    const mixed = await store(['B', 'C', 'agent:note']);
+    // Mixed: C and D by their Discord ids here, the agent's note, between
+    // them, by row id live.
+    const mixed = await store(['B', 'C', 'agent:note', 'D']);
     await assert.rejects(
       createOfflineRecoveryBranch({ storePath: mixed.storePath, agentName: 'cairn', messageId: 'd-B', dryRun: true }),
       (error: Error) => {
-        assert.match(error.message, /in one write with the 2 messages after it .*Discord message d-C\)/);
+        assert.match(error.message, /in one write with the 3 messages after it .*Discord message d-C\)/);
         // AF #844 bot review 4, finding 64: no --suppress-range here, which
-        // would take the agent's note between its ends too, and the live
-        // suppression of the note advised beside it would then fail.
+        // would take the agent's note between its ends (C..D) too, and the
+        // live suppression of the note advised beside it would then fail.
         assert.ok(error.message.endsWith(
-          'suppress the 1 with a Discord message id in the same recovery (--suppress / suppressMessageIds), ' +
+          'suppress the 2 with a Discord message id in the same recovery (--suppress / suppressMessageIds), ' +
           `and the 1 without one by row id with the live suppressMessages (${String(mixed.ids.get('agent:note'))}) ` +
           `once the host runs, since the offline recovery suppresses only by Discord message id. ${OWN_SLOT_ONLY}`,
         ), error.message);
+        assert.doesNotMatch(error.message, /--suppress-range/);
         return true;
       },
     );
