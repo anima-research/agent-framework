@@ -32673,7 +32673,8 @@ export class AgentFramework {
     };
     // While the release replays what the hold kept, a write made meanwhile,
     // a listener's, waits behind the ones still to replay (replayingHeld).
-    if ((this.surgeryHold || (this.replayingHeld && !opts?.replayed)) && !opts?.imported) {
+    const heldBySurgery = (): boolean => (!!this.surgeryHold || (this.replayingHeld && !opts?.replayed)) && !opts?.imported;
+    if (heldBySurgery()) {
       this.surgeryHeldWrites.push(kept());
       if (opts?.placement) opts.placement.agent = agent.name;
       return '' as MessageId;
@@ -32721,6 +32722,15 @@ export class AgentFramework {
       && (!turnLive || this.assembling.has(agent.name))
       && !suppressedRow(metadata as Record<string, unknown> | undefined)) {
       this.storeDueClock(agent, 'event');
+      // The clock row's trace runs its listeners now, and one may have
+      // started a surgery (switchBranch reserves the store before its first
+      // await): the write then waits for its release, as above, behind the
+      // clock row stored before it.
+      if (heldBySurgery()) {
+        this.surgeryHeldWrites.push(kept());
+        if (opts?.placement) opts.placement.agent = agent.name;
+        return '' as MessageId;
+      }
     }
     let stored: MessageId;
     // The rows the write stored: its one id, or those a store that threw
@@ -39104,14 +39114,7 @@ export class AgentFramework {
             .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
         },
         commitDeliveries: () => this.commitDeliveries(),
-        // A release made while a surgery's hold keeps writes in memory, or
-        // while the primary's or the subconscious's manager refuses its
-        // work, would be kept there too, and lost to a crash before it is
-        // stored, while the epoch's end is on disk at once: the cancel
-        // waits (releaseSurgeryHeldWrites runs it).
-        writesHeld: () => this.surgeryHold !== null || this.replayingHeld
-          || [this.primaryAgentName, this.subconsciousAgentName]
-            .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name))),
+        writesHeld: () => this.tuneOutWritesHeld(),
         historyTool: () => this.residentHistoryTool(),
         // Every reader of the shared slot compiles the dump with its own
         // strategy, so the dump fits the smallest of their bounds.
@@ -39154,6 +39157,22 @@ export class AgentFramework {
   }
 
   /**
+   * Whether a tune-out's release would be kept in memory now, not stored:
+   * a release made while a surgery's hold keeps writes in memory, or while
+   * the primary's or the subconscious's manager refuses its work, would be
+   * kept there too, and lost to a crash before it is stored, while the
+   * epoch's end is on disk at once. The coordinator's cancel waits for them
+   * then (its writesHeld; releaseSurgeryHeldWrites runs it), and so does a
+   * release of the holds on record with no reader
+   * (releaseTuneOutsWithoutReader).
+   */
+  private tuneOutWritesHeld(): boolean {
+    return this.surgeryHold !== null || this.replayingHeld
+      || [this.primaryAgentName, this.subconsciousAgentName]
+        .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name)));
+  }
+
+  /**
    * No reader is configured, so nothing can watch or end a hold: each hold
    * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
    * recipe no longer has) ends now, and its backlog goes to the resident,
@@ -39171,9 +39190,13 @@ export class AgentFramework {
     // waiting, each hold on record and nothing to say so. The release waits
     // as a whole instead: at a start no write is held, so this is the
     // late-connect path during an operator's change to the store.
-    if (this.surgeryHold !== null || this.replayingHeld) {
+    // The same holds as the coordinator's own (tuneOutWritesHeld): a
+    // primary's context manager that refuses its work keeps them too, and
+    // the move that re-initializes it releases them (its reservation's
+    // release runs releaseSurgeryHeldWrites, which runs this again).
+    if (this.tuneOutWritesHeld()) {
       if (!this.releaseWithoutReaderWaits) {
-        console.error('[tune-out] the tune-outs on record are released once the store takes writes again (an operator\'s change to it is in progress), so that each release is stored before the tune-out\'s end is recorded');
+        console.error('[tune-out] the tune-outs on record are released once the store takes writes again (an operator\'s change to it is in progress, or a context manager refuses its work until a branch move re-initializes it), so that each release is stored before the tune-out\'s end is recorded');
       }
       this.releaseWithoutReaderWaits = true;
       return;
