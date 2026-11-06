@@ -2020,3 +2020,50 @@ test("review 5 #36: a start whose first read of the all-except hold's record thr
       "the next start reads the last run's rows: the ask, told lost with its note");
   } finally { h.stopAll(); }
 }));
+
+/** A stop while the subconscious's cancel of the hold on noisy waits with its note: the stop keeps the loss in the store and stamps the hold. */
+function stopKeepingLoss(h: ReturnType<typeof stampSetup>): string {
+  const c = h.boot();
+  const e = h.hold();
+  h.state.held = true;
+  assert.deepEqual(c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB), { ok: true, deferred: true });
+  c.stop();
+  h.state.held = false;
+  assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, 'premise: the stop kept the loss in the store');
+  assert.ok((h.states.get(STAMP) as { epochs: string[] }).epochs.includes(e), 'premise: and stamped the hold');
+  return e;
+}
+
+test("review 5 #39: a boot whose read of the loss record throws arms the retry, which reads it and writes the notice the last stop kept", () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const errors = mock.method(console, 'error', () => {});
+  const h = stampSetup();
+  try {
+    const e = stopKeepingLoss(h);
+    h.state.lossReadFails = 1;
+    h.boot();
+    assert.deepEqual(h.told(), [], 'premise: the boot, unable to read the record, writes nothing');
+    mock.timers.tick(60_000);
+    assert.deepEqual(h.told().map((m) => [m.metadata?.epochId, (m.metadata?.lossNoticeId !== undefined)]), [[e, true]],
+      'the retry reads the record and writes the notice it keeps');
+    assert.deepEqual((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices, [], 'and it leaves the record');
+  } finally { h.stopAll(); errors.mock.restore(); mock.timers.reset(); }
+});
+
+test("review 5 #40: a loss told while the record the boot couldn't read is still unread is written after the notices that record keeps, in the order the losses came", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = stampSetup();
+  try {
+    const e = stopKeepingLoss(h);
+    h.state.lossReadFails = 1;
+    const c = h.boot();
+    // A new loss for the subconscious, once the store reads again: its cancel of quiet waits, and that hold ends without it.
+    const q = h.hold('quiet');
+    h.state.held = true;
+    assert.deepEqual(c.cancel('editor', 'quiet', 'subconscious', 'by Subconscious', 'Quiet, please.', SUB), { ok: true, deferred: true });
+    h.holds.splice(h.holds.findIndex((x) => x.epochId === q), 1);
+    h.state.held = false;
+    c.runDeferredCancels();
+    assert.deepEqual(h.told().map((m) => m.metadata?.epochId), [e, q], "the record's notice first, then the new loss");
+  } finally { h.stopAll(); errors.mock.restore(); }
+});

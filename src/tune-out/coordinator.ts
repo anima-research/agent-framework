@@ -1791,7 +1791,7 @@ export class TuneOutCoordinator {
    */
   runDeferredCancels(): void {
     if (this.stopped) return;
-    if ((this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending) || this.writesHeldNow()) return;
+    if ((this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && !this.lossRecordUnread) || this.writesHeldNow()) return;
     if (this.deferredRetry !== undefined) {
       clearTimeout(this.deferredRetry);
       this.deferredRetry = undefined;
@@ -1860,7 +1860,7 @@ export class TuneOutCoordinator {
         console.error(`[tune-out] a cancel asked for while writes were held in memory failed when it ran, so it stays waiting, the tune-out in force, and is tried again in ${EXPIRY_RETRY_MS / 1000} s or at the next release:`, err);
       }
     }
-    if (!this.stopped && (failed || this.lossNotices.size > 0 || this.markerPending)) this.armDeferredRetry();
+    if (!this.stopped && (failed || this.lossNotices.size > 0 || this.markerPending || this.lossRecordUnread)) this.armDeferredRetry();
   }
 
   /**
@@ -2227,7 +2227,10 @@ export class TuneOutCoordinator {
    * empty id, which then couldn't tell a kept write from an ended author's
    * dropped one. The release or the retry writes them. Nor is one the boot
    * read from the store's record while whether it was written before the
-   * stop can't be read (checkLossNoticesWritten). Then the store's
+   * stop can't be read (checkLossNoticesWritten). The store's record, where
+   * it wasn't read in yet, is read first, and while it can't be, none of
+   * the persistent subconscious's is written, as one it keeps would come
+   * after it. Then the store's
    * record of the persistent subconscious's kept notices is brought in
    * line (writeLossRecord). A loss told for an author while its notice is
    * being written (a listener of that write) waits behind it, written next
@@ -2239,6 +2242,10 @@ export class TuneOutCoordinator {
    * throws.
    */
   private writeLossNotices(author?: string): void {
+    // A record not read in yet (a read at boot threw, or a branch move) is
+    // read first: the notices it keeps are older than any kept since, and
+    // are written first (AF #844 review 5, #40).
+    if (this.lossRecordUnread) this.readLossRecord();
     this.checkLossNoticesWritten();
     for (const name of author !== undefined ? [author] : [...this.lossNotices.keys()]) {
       // A loss told for this author from a listener of its notice's write
@@ -2255,7 +2262,10 @@ export class TuneOutCoordinator {
         // One the boot read from the record, which may be written already,
         // waits until that can be read (checkLossNoticesWritten), and those
         // after it with it.
-        if (!kept || !notice || this.stopped || this.writesHeldNow(name) || this.lossNoticesUnchecked.has(notice.id)) break;
+        // Nor is the persistent subconscious's while that record can't be
+        // read: one it keeps would be written after it.
+        if (!kept || !notice || this.stopped || this.writesHeldNow(name) || this.lossNoticesUnchecked.has(notice.id)
+          || (notice.persistent && this.lossRecordUnread)) break;
         kept.shift();
         if (kept.length === 0) this.lossNotices.delete(name);
         this.lossNoticesWriting.add(name);
@@ -2369,13 +2379,16 @@ export class TuneOutCoordinator {
   /**
    * Read the persistent subconscious's kept loss notices from the store
    * (writeLossRecord) into memory (lossNotices), ahead of any kept since for
-   * the same author: at boot (restoreLossNotices), and before the record is
-   * written where it couldn't be read before. Answers whether it was read.
+   * the same author: at boot (restoreLossNotices), and, where it couldn't
+   * be read before (a boot's read threw, or a branch move), before the
+   * notices are written (writeLossNotices) and before the record is
+   * written. Answers whether it was read.
    * One that throws is logged and answers false: nothing is written over it
    * until it is read. A record not in this format (`{ v: 1,
    * pendingLossNotices }`) reads as none kept, logged, and is written over
    * at the next change; an entry this version can't read is logged and left
-   * out, so the next write drops it.
+   * out, so the next write drops it. Those read in wait to be checked
+   * against the subconscious's rows (lossNoticesUnchecked), as a boot's do.
    */
   private readLossRecord(): boolean {
     let raw: unknown;
@@ -2418,7 +2431,13 @@ export class TuneOutCoordinator {
       };
       restored.set(entry.author, [...(restored.get(entry.author) ?? []), notice]);
     }
-    for (const [author, notices] of restored) this.lossNotices.set(author, [...notices, ...(this.lossNotices.get(author) ?? [])]);
+    for (const [author, notices] of restored) {
+      this.lossNotices.set(author, [...notices, ...(this.lossNotices.get(author) ?? [])]);
+      // Written before the record was last read may be (a stop, or a
+      // record the store refused, between the two): each waits until the
+      // subconscious's rows say whether (checkLossNoticesWritten).
+      for (const notice of notices) this.lossNoticesUnchecked.add(notice.id);
+    }
     if (unreadable > 0) {
       console.error(`[tune-out] ${unreadable} of the loss notices kept for the subconscious (${this.lossNoticesStateId}) can't be read by this version, `
         + 'so they are not written, and the next write of the record leaves them out');
@@ -3123,7 +3142,13 @@ export class TuneOutCoordinator {
     // which accounts for them (noteUnstampedStop).
     const stopKept = new Set<string>();
     try {
-      if (!this.readLossRecord() || this.lossNotices.size === 0) return stopKept;
+      // One that can't be read is read again by the retry, which this arms:
+      // nothing else may read it before the stop (AF #844 review 5, #39).
+      if (!this.readLossRecord()) {
+        this.armDeferredRetry();
+        return stopKept;
+      }
+      if (this.lossNotices.size === 0) return stopKept;
       for (const kept of this.lossNotices.values()) {
         for (const notice of kept) if (notice.persistent && notice.drop.reason === 'stopped') stopKept.add(notice.for.epochId);
       }
@@ -3387,7 +3412,7 @@ export class TuneOutCoordinator {
     const entry = this.deferredCancels.get(key);
     if (!entry) return undefined;
     this.deferredCancels.delete(key);
-    if (this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && this.deferredRetry !== undefined) {
+    if (this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && !this.lossRecordUnread && this.deferredRetry !== undefined) {
       clearTimeout(this.deferredRetry);
       this.deferredRetry = undefined;
     }
@@ -3570,7 +3595,8 @@ export class TuneOutCoordinator {
 
   /**
    * Arm the one retry of the deferred cancels and the loss notices not
-   * written (lossNotices), unless it is armed; it arms itself again while
+   * written (lossNotices), and of the loss record not read yet
+   * (lossRecordUnread), unless it is armed; it arms itself again while
    * one still waits.
    */
   private armDeferredRetry(): void {
@@ -3580,7 +3606,7 @@ export class TuneOutCoordinator {
       this.runDeferredCancels();
       // Writes held again at the retry: the cancels and notices wait on,
       // for the next release or this retry.
-      if (this.deferredCancels.size > 0 || this.lossNotices.size > 0 || this.markerPending) this.armDeferredRetry();
+      if (this.deferredCancels.size > 0 || this.lossNotices.size > 0 || this.markerPending || this.lossRecordUnread) this.armDeferredRetry();
     }, EXPIRY_RETRY_MS);
     timer.unref?.();
     this.deferredRetry = timer;
