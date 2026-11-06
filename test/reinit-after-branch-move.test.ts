@@ -349,10 +349,15 @@ describe('after a branch move, every agent on the store compiles without a resta
       (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('b'));
       const events: Array<Record<string, unknown>> = [];
       const reads: Array<Promise<{ context: unknown[] }>> = [];
+      // AF #844 bot review 4, finding 49: the event is about a's window, so
+      // a's context, read as the event arrives, already has the change.
+      const readsOfA: Array<Promise<{ context: unknown[] }>> = [];
+      const aBefore = (await api.cmdAgentContext({ agentName: 'a' })).context.length;
       api.broadcast = (event, data) => {
         if (event !== 'window:undone') return;
         events.push(data as Record<string, unknown>);
         reads.push(api.cmdAgentContext({ agentName: 'b' }));
+        readsOfA.push(api.cmdAgentContext({ agentName: 'a' }));
       };
       const undone = await api.cmdUndo({ agentName: 'a' });
       assert.equal(undone.undone, true);
@@ -366,6 +371,9 @@ describe('after a branch move, every agent on the store compiles without a resta
       assert.deepEqual([ofRedo!.agentName, ofRedo!.retracted, ofRedo!.represented], ['a', redone.window!.retracted, redone.window!.represented], 'the redo says what left and what came back');
       assert.ok(undone.window!.retracted > 0 && redone.window!.represented > 0, 'the turn left and came back');
       for (const read of await Promise.all(reads)) assert.ok(read.context.length > 0, "b's context compiled");
+      const [aAtUndo, aAtRedo] = (await Promise.all(readsOfA)).map((read) => read.context.length);
+      assert.ok(aAtUndo! < aBefore, `a's context read at the undo's event lacks the turn's rows (${aAtUndo} of ${aBefore})`);
+      assert.equal(aAtRedo, aBefore, "a's context read at the redo's event has them again");
       assert.deepEqual(reinitAlerts(), []);
     } finally {
       await api.stop();
