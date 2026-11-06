@@ -133,11 +133,10 @@ function derivedSlot(inherit: ContextInheritance | undefined): MessageSlotRef | 
  * resident was declared; a shared derivation's slot; else the isolated slot
  * of its namespace. A subconscious declared its reading of the shared slot
  * as an observe edge from the start (subconsciousSpec), so it reads as
- * isolated, as it was opened. An edge on the shared slot here is one that
- * names neither a slot nor an agent. One that names an agent reads that
- * agent's slot, which isn't looked up here, so a spec reads as the same
- * record does when it is restored, where that agent's record may not be
- * loaded yet.
+ * isolated, as it was opened. An edge on the shared slot here is one with
+ * no `slot`, whatever agent it names: when the flag was all there was, such
+ * an edge read the shared slot, and that is how withOwnSlot restores it, so
+ * a spec reads as the same record does when it is restored.
  */
 function resolveOwnSlot(declared: {
   ownSlot?: MessageSlotRef;
@@ -150,7 +149,7 @@ function resolveOwnSlot(declared: {
   if (own) return { namespace: own.namespace, ...(own.branch !== undefined ? { branch: own.branch } : {}) };
   const derived = derivedSlot(declared.inherit);
   if (derived) return derived;
-  if (declared.readsSharedSlot === true && !(declared.observes ?? []).some((edge) => sameSlot(observedSlot(edge), RESIDENTS_SLOT))) {
+  if (declared.readsSharedSlot === true && !(declared.observes ?? []).some((edge) => edge.slot === undefined)) {
     return { namespace: null };
   }
   return typeof declared.namespace === 'string' ? { namespace: declared.namespace } : undefined;
