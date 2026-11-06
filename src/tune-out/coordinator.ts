@@ -2683,7 +2683,8 @@ export class TuneOutCoordinator {
     // wrote no release of its own records its askers nowhere else.
     const noteRuns = new Map<string, { sequence: number; askers: string[] }>();
     const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string; askers: string[] }>>();
-    const toldInRelease = new Set<string>();
+    // The newest release of each epoch that told a queued note's loss (`lostNote`).
+    const toldInRelease = new Map<string, number>();
     // Whether that run's rows were read: not where they are another
     // branch's, or the read throws, and then whether a cancel ran isn't known.
     let rowsRead = !elsewhere;
@@ -2699,7 +2700,7 @@ export class TuneOutCoordinator {
             ? (meta.cancel.askers as unknown[]).filter((a): a is string => typeof a === 'string') : undefined;
           if (askers && (noteRuns.get(meta.epochId)?.sequence ?? -Infinity) < m.sequence) noteRuns.set(meta.epochId, { sequence: m.sequence, askers });
         } else if (meta.kind === 'tune-out-cancel') {
-          if (meta.lostNote === true) toldInRelease.add(meta.epochId);
+          if (meta.lostNote === true) toldInRelease.set(meta.epochId, Math.max(toldInRelease.get(meta.epochId) ?? -Infinity, m.sequence));
           releases.set(meta.epochId, [...(releases.get(meta.epochId) ?? []), {
             sequence: m.sequence,
             ...(typeof meta.cancel?.source === 'string' ? { source: meta.cancel.source } : {}),
@@ -2768,10 +2769,6 @@ export class TuneOutCoordinator {
     for (const hold of uncovered) {
       const { epochId, serverId, channelId, scope } = hold;
       const what = scope ? `the all-except hold (epoch ${epochId})` : `the tune-out of ${this.shown(serverId, channelId)} (epoch ${epochId})`;
-      if (toldInRelease.has(epochId)) {
-        console.error(`[tune-out] the last stop did not record the state of ${what}, but a release of it already told ${author} that its waiting note was lost`);
-        continue;
-      }
       if (kept.has(epochId)) {
         console.error(`[tune-out] the last stop's stamp doesn't cover ${what}, but the stop kept the loss of its waiting note in the store, which is told`);
         continue;
@@ -2782,6 +2779,15 @@ export class TuneOutCoordinator {
       // its entry, and the rows are that run's), so this bound can't be
       // told from none by any store; it is kept for the reading's sake.
       const after = asked ? asked.sequence : Math.max(hold.startedAt ?? -Infinity, since ?? -Infinity);
+      // A release that told a queued note's loss, and a note, count for
+      // this ask only where stored after it, as a release that ran does
+      // (ranAfter): one stored before is an earlier cancel's, its end
+      // unrecorded, and says nothing of the note left with a later ask
+      // (AF #844 review 5, #25).
+      if ((toldInRelease.get(epochId) ?? -Infinity) > after) {
+        console.error(`[tune-out] the last stop did not record the state of ${what}, but a release of it already told ${author} that its waiting note was lost`);
+        continue;
+      }
       const ranAfter = (releases.get(epochId) ?? []).filter((r) => r.sequence > after);
       // The subconscious's own cancel: one whose askers name it (a call of
       // its joined to another's waiting cancel among them), or one its
@@ -2808,7 +2814,7 @@ export class TuneOutCoordinator {
         ? [...others.map((a) => `${a}'s`),
           ...(ownRelease.source !== 'subconscious' && ownRelease.reason !== undefined ? [`the cancel for ${ownRelease.reason}`] : [])]
         : [];
-      const noteAt = notes.get(epochId);
+      const noteAt = (notes.get(epochId) ?? -Infinity) > after ? notes.get(epochId) : undefined;
       const drop: UnstampedStop = ranAfter.length > 0
         ? {
           reason: 'unstamped-stop', found: 'ran', ...(asked ? { asked: true as const } : {}),

@@ -1971,3 +1971,30 @@ test("pin (N20): after the stop, which stamps the run, a waiting answer doesn't 
     assert.doesNotMatch(answer.data?.note ?? '', /couldn't be recorded/);
   } finally { h.stopAll(); errors.mock.restore(); }
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 5 (at 1f96d1f7).
+// ---------------------------------------------------------------------------
+
+test("review 5 #25: a note, or a release telling a queued note's loss, stored before the subconscious's newest ask isn't read as that ask's: the ask is told lost with its note; control, a note after it is delivered", () => quiet(() => {
+  for (const before of ['a note', 'a release telling a queued note\'s loss', 'control: a note after the ask'] as const) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      const e = h.hold();
+      // An earlier cancel's run stored this, its end not recorded; then the subconscious asks again, with another note.
+      if (before === 'a note') h.note(e);
+      if (before === 'a release telling a queued note\'s loss') {
+        h.rows.push({ participant: 'user', content: [text('[Tune-out: cancelled, and the note was not delivered]')], metadata: { system: true, kind: 'tune-out-cancel', channelId: 'noisy', epochId: e, lostNote: true }, sequence: ++h.state.seq });
+      }
+      h.ask({ channelId: 'noisy', text: 'Look again.' });
+      if (before === 'control: a note after the ask') h.note(e);
+      // The host dies with that cancel waiting.
+      h.boot();
+      assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [before.startsWith('control')
+        ? `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${e}). The note you left with your cancel of it `
+          + "was delivered to scout before the stop. The cancel's end was not recorded, so that tune-out is still in force.]"
+        : askedRow(e, 'Look again.')], `${before}: ${before.startsWith('control') ? 'the note after the ask is its own' : 'the ask is told lost, with its note'}`);
+    } finally { h.stopAll(); }
+  }
+}));
