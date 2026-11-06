@@ -45,8 +45,10 @@ Null, malformed output, a throw, timeout, overload, denied approval or an
 unavailable destination means **admitted and wakeable as before, but private**.
 Automatic prose remains in context/archive and a readable agent notice explains
 that no unique currently approved destination exists and explicit send tools
-remain available. Callback exceptions produce one fixed, bounded diagnostic per
-configured connection; exception content is never included in agent context.
+remain available. Callback exceptions produce a fixed, bounded diagnostic at
+most once per 60 seconds per connection while the fault persists. Consumer and
+authority faults share this window, including across reconnects. Exception
+content is never included in agent context.
 Cancellation aborts resolution; late results are discarded. The admission layer's
 existing final current/epoch/registration checks still govern stale ingress. Callbacks must
 honor cancellation, avoid reentering ingress, and have no external side effects;

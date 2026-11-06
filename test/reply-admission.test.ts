@@ -65,13 +65,14 @@ for (const outcome of ['refused', 'read-only', 'stale'] as const) test(`reply ad
   assert.equal(reads, 0);
 });
 
-test('reply admission: a throwing consumer retains private work and the accepted verdict', async () => {
+test('reply admission: persistent consumer throws retain private work and log once per minute', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
   const x = fixture(), logs: unknown[][] = [], original = console.error;
   const consume = async () => { throw Error('private callback detail'); };
   console.error = (...args: unknown[]) => { logs.push(args); };
   try {
     const ingress = withReplyConsumer(x.ingress, consume, x.transport.signal);
-    for (let i = 0; i < 2; i++) {
+    const admit = async () => {
       const verdict = await ingress.admit('channels/incoming', {});
       assert.equal(verdict.store, true);
       assert.deepEqual(Reflect.ownKeys(verdict), ['store', 'mayWake']);
@@ -79,7 +80,13 @@ test('reply admission: a throwing consumer retains private work and the accepted
       assert(isReplyBinding(binding)); assert.equal(binding.destination, undefined);
       assert.equal(replyBindingCurrent(binding), false);
       assert.equal((x.admission as any).pending.size, 0);
-    }
-    assert.equal(logs.length, 1); assert(!JSON.stringify(logs).includes('private callback detail'));
+    };
+    await admit(); await admit();
+    assert.equal(logs.length, 1);
+    t.mock.timers.tick(59_999); await admit();
+    assert.equal(logs.length, 1, 'repeated faults within the minute are suppressed');
+    t.mock.timers.tick(1); await admit();
+    assert.equal(logs.length, 2, 'a persistent fault is visible again after 60 seconds');
+    assert(!JSON.stringify(logs).includes('private callback detail'));
   } finally { console.error = original; }
 });

@@ -1215,7 +1215,7 @@ export class McplServerConnection extends EventEmitter {
           if (revision !== this.admissionRevision) return 'admission_stale';
         });
         this.admissionReceipts.set(params as object, this.postAdmissionConsumer && name !== 'inference-request'
-          ? withReplyConsumer(admission, this.postAdmissionConsumer, this.transportEnded.signal) : admission);
+          ? withReplyConsumer(admission, this.postAdmissionConsumer, this.transportEnded.signal, this) : admission);
       }
       if (requiredCap && !this.grant.has(requiredCap)) {
         this.refuseCapability(name, requiredCap, args[1]);
