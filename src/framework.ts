@@ -24195,7 +24195,10 @@ export class AgentFramework {
     }
     const lock = mode === 'locked' ? this.proseLockLocus(agent) : undefined;
     const text = lock !== undefined
-      ? lockedModePrimer(this.proseLockShown(lock, agent.name), this.mayCallTool(agent.name, PROSE_LOCUS_TOOL.name))
+      ? lockedModePrimer(this.proseLockShown(lock, agent.name), this.mayCallTool(agent.name, PROSE_LOCUS_TOOL.name)) +
+        (this.mcplServerRegistry?.getAllServers().some(server => server.replyAuthority)
+          ? ' If the locked connection requires admitted reply authority, automatic speech needs a current binding matching that lock; otherwise it stays private. Locks on connections without reply authority keep their existing routing.'
+          : '')
       : proseModePrimer(mode as Exclude<typeof mode, 'locked'>, this.canAgentUseTool(agent.name, 'prose_help'));
     try {
       const id = agent.getContextManager().addMessage(
@@ -25280,8 +25283,14 @@ export class AgentFramework {
         return false;
       }
       this.nameUnpostedSpeech(agent, routing);
-      if (routing.reply && !replyBindingCurrent(routing.reply)) {
-        injections = [...(injections ?? []), { namespace: 'automatic-reply', position: 'afterUser', content: [{ type: 'text', text: `[${NOTICE_TAG.proseRouting}] ${privateReplyNotice}` }] }];
+      const lockMismatch = routing.locked && routing.locus &&
+        this.mcplServerRegistry?.getServer(routing.locus.serverId)?.requiresReplyBinding &&
+        !sameChannel(routing.reply?.destination, routing.locus);
+      if (lockMismatch || routing.reply && !replyBindingCurrent(routing.reply)) {
+        const notice = lockMismatch
+          ? 'Automatic reply not sent: your locked destination requires matching admitted reply authority. Your prose stays private; explicit send tools remain available and are authorized separately.'
+          : privateReplyNotice;
+        injections = [...(injections ?? []), { namespace: 'automatic-reply', position: 'afterUser', content: [{ type: 'text', text: `[${NOTICE_TAG.proseRouting}] ${notice}` }] }];
       }
 
       // The subconscious's standing dispositions ride a fixed system-position

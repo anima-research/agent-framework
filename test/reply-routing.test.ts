@@ -970,3 +970,28 @@ test('R1-1 merged private continuations recognize every owned cause, not other o
   } finally { x.f.openLogical.delete('assistant'); await x.close(); }
 });
 
+for (const mode of ['locus', 'locked'] as const) test(`R1-2 bound ${mode} turn keeps legacy lock on non-opted-in peer`, async () => {
+  const x = await frameworkFor(undefined, [], undefined, { proseRouting: mode });
+  try {
+    x.peers.get('endpoint-b')!.requiresReplyBinding = false;
+    x.f.readProseLock = () => at('room/other', 'endpoint-b');
+    await x.enqueue(reply());
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1, 'no extra bounce turn');
+    assert.deepEqual(x.publishes.map(p => [p.serverId, p.channelId]),
+      mode === 'locked' ? [['endpoint-b', 'room/other']] : [['endpoint-a', 'room/one']]);
+  } finally { await x.close(); }
+});
+
+test('R1-2 opted-in mismatching lock explains refusal before inference', async () => {
+  const x = await frameworkFor(undefined, [], undefined, { proseRouting: 'locked' });
+  try {
+    x.f.mcplServerRegistry = { getServer: (id: string) => x.peers.get(id), getAllServers: () => [...x.peers.values()] };
+    x.f.readProseLock = () => at('room/other', 'endpoint-b');
+    await x.enqueue(reply());
+    await x.framework.runUntilIdle();
+    assert.match(JSON.stringify(x.membrane.calls[0]), /locked destination requires matching admitted reply authority/);
+    assert.deepEqual(x.publishes, []);
+  } finally { x.f.mcplServerRegistry = null; await x.close(); }
+});
+

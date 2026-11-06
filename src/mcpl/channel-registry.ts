@@ -6039,7 +6039,7 @@ export class ChannelRegistry {
     const routingRefusal = (): string | undefined => {
       const peer = target.serverId ? this.serverRegistry.getServer(target.serverId) : undefined;
       const binding = target.binding;
-      if (target.routed && (binding || peer?.requiresReplyBinding)) {
+      if (target.routed && peer?.requiresReplyBinding) {
         if (!isReplyBinding(binding)) return 'automatic_reply_binding_missing';
         if (!binding.destination) return 'automatic_reply_destination_missing';
         if (!sameChannel(binding.destination, target as ChannelRef)) return 'automatic_reply_target_mismatch';

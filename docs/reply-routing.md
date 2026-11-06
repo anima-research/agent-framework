@@ -85,7 +85,12 @@ Each original cause must still authorize that same destination at send time.
 connection incarnation, registered descriptor identity and the current publish
 grant are also rechecked after waits. If any cause loses approval, the shared
 turn's prose stays private with a notice. The resolver is not called again and
-there is no fallback to a home, locus, latest inbound or another connection.
+there is no fallback to a home, locus or latest inbound destination on an opted-in connection.
+In `locked` prose mode the lock remains the target: a lock on an opted-in
+connection requires a current matching binding (otherwise prose stays private
+and the agent is told why). A lock on a connection without `replyAuthority`
+keeps posting as before, even when another connection woke the bound turn.
+Destination-less admitted work remains private in locked mode too.
 
 The logical turn owns in-turn continuations (setup retries, tool waits, budget
 restarts and provider holds). Exhausted-turn re-arms, post-turn continuations and rewind retries carry
@@ -103,8 +108,9 @@ Automatic sleep announcements use its frozen binding or fail closed. Explicit
 send tools keep their chosen targets and their existing, separate authorization;
 they neither require nor inherit automatic-reply authority. Prose envelopes
 (`>>` in explicit mode, `>>>` in hybrid mode) are still automatic speech, not
-send tools: they cannot override a binding, and unbound envelopes aimed at an
-opted-in connection fail closed. For a different destination or an unbound turn,
+send tools: on an opted-in connection they cannot override a binding, and
+unbound envelopes aimed there fail closed. Connections without `replyAuthority`
+keep their existing automatic envelope routing. For a different destination or an unbound turn,
 use a separately authorized send tool, for example `drafts(action: "resend", ...)`;
 `>>#channel {{unsent}}` cannot bypass these checks.
 
