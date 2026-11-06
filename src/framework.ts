@@ -19114,6 +19114,21 @@ export class AgentFramework {
             const vouched = presentsWindow
               ? this.presentation!.handOff(agent, [replyId, resultsId, ...midTurnInjections.map((injection) => injection.id)]).vouched
               : true;
+            // The routing notices stored above and the hand-off's
+            // presentation run their listeners synchronously too, after the
+            // boundary's check: a stop made there ends the turn the same way.
+            // What was stored stays, and the stream isn't resumed.
+            const stoppedAtHandOff = this.roundStoppedDuringBuild(agent, currentState, currentState.stream);
+            if (stoppedAtHandOff !== null) {
+              console.warn(
+                `[framework] Not resuming the tool round of agent '${agent.name}' (callId=${event.callId}): its turn was ` +
+                `stopped as its boundary stored its notices or handed the stream its rows (status '${agent.state.status}'` +
+                `${stoppedAtHandOff !== 'state-changed' ? `, stream cancelled: ${stoppedAtHandOff}` : ''}), so the round ` +
+                `is stored, its call with its results, and its stream isn't resumed.`,
+              );
+              agent.toolResultGuard.settleTurnEnded();
+              return;
+            }
             // Before the round's reply exists, so the reply that comes next is the reply to this request.
             this.noteRoundSent(agent, currentState.stream, [
               { kind: 'reply', id: replyId, sent: replySent ?? [] },

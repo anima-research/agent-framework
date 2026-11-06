@@ -611,6 +611,49 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  // AF #844 bot review 5, finding 3: after the boundary's last stop check,
+  // the routing notices (addressedElsewhereNotice, repinTurnLocus) are
+  // stored and the hand-off presents what the stream is given, and their
+  // traces run their listeners synchronously. A stop made there ends the
+  // turn as one made earlier does: what is stored stays, and the stream
+  // isn't resumed with the results.
+  it("a stop made by a listener of a boundary's routing notice ends the turn, and the stream isn't resumed", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Never sent.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+    const agent = framework.getAgent('assistant')!;
+    // The first routing notice is the turn's boot-baseline announcement;
+    // the second is the boundary's.
+    let notices = 0;
+    let stopped = false;
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type !== 'message:added' || e.source !== 'routing-notice' || ++notices !== 2) return;
+      stopped = agent.state.status === 'ready';
+      agent.cancelStream();
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.ok(stopped, "setup: the boundary's routing notice was traced while the round's results were in, and its listener stopped the turn");
+    assert.equal(membrane.lastStream!.receivedToolResults.length, 0, 'the round was not resumed');
+    const texts = agent.getContextManager().getAllMessages().flatMap((m) => m.content.map((b) => (b as { text?: string }).text ?? ''));
+    assert.ok(texts.some((t) => t.includes('Someone addressed you from discord:dm:antra')), 'the notice stays stored');
+    assert.ok(!texts.some((t) => t.includes('Never sent.')), 'no reply after it');
+
+    await framework.stop();
+  });
+
   it("the addressed-from-elsewhere notice a boundary injects is noted by its stored id, last, with no row of the round noted unstored", async () => {
     // #785's notes: noteRoundSent names each row the stream's next request
     // carries by its stored id. The notice is stored as the agent's own row
