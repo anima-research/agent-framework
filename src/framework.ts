@@ -15442,7 +15442,7 @@ export class AgentFramework {
   private async followBranchMove(except?: string): Promise<ManagerReinitFailure[]> {
     let failures: ManagerReinitFailure[] = [];
     try {
-      this.subconsciousAnchor?.branchMoved();
+      this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
       this.tuneOutCoordinator?.branchMoved();
       this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);

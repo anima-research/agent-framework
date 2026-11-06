@@ -1116,6 +1116,11 @@ export class TuneOutCoordinator {
     this.noteUnstampedStop(onRecord, this.restoreLossNotices(), bootHead);
   }
 
+  /** The epochs of the tune-outs active now, a channel's and the all-except hold (the anchor's branchMoved reads them). */
+  activeEpochIds(): string[] {
+    return this.activeStarts().map((e) => e.epochId);
+  }
+
   /** The tune-outs active now, a channel's and the all-except hold, with where each started in the record. */
   private activeStarts(): Array<{ epochId: string; sequence: number }> {
     const starts = this.listActive().map(({ params }) => ({ epochId: params.epochId, sequence: params.startedAtSequence }));
