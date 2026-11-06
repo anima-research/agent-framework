@@ -611,7 +611,8 @@ export class AgentPresentation {
    * down: the manager reads its index again after any throw, so a window
    * that reads as presented then is taken as one, and the agent is
    * presented for, with a log line. A write-down at a rebase is traced as
-   * presented, with the bodies the window holds.
+   * presented, with the bodies the window holds; a read for that trace
+   * which throws is logged and the trace skipped, the window presented.
    */
   private writeDown(agent: PresentedAgent, state: Adopted, occasion: 'adopt' | 'rebase'): boolean {
     const cm = agent.getContextManager();
@@ -636,7 +637,14 @@ export class AgentPresentation {
       return false;
     }
     if (wrote && occasion === 'rebase') {
-      const count = bodyHeadCount(cm.getPresentedMessages());
+      // The trace's read is the trace's: a throw there leaves the window
+      // presented, as written down, and skips the trace.
+      let count = 0;
+      try {
+        count = bodyHeadCount(cm.getPresentedMessages());
+      } catch (error) {
+        console.error(`[presentation] ${agent.name}: its window was written down at ${occasion}, and reading it back for the trace failed (${describe(error)}); its window is presented, and the write-down isn't traced`);
+      }
       if (count > 0) this.host.emitTrace({ type: 'presentation:presented', agentName: agent.name, occasion, count });
     }
     return true;
