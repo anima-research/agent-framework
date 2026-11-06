@@ -8,6 +8,7 @@ import * as packageEntry from '../src/index.js';
 import { Agent, AgentFramework, type AgentConfig, type Module, type ProcessEvent } from '../src/index.js';
 import { ContextManager, PassthroughStrategy, AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { GateModule, until, waitCall, say } from './helpers/dendrite.js';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); });
@@ -347,6 +348,47 @@ it('omits stored notices when an ended isolated agent resumes', async () => {
   assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('after')])));
   assert.ok(!JSON.stringify(contents).includes(notice));
   assert.equal(x.framework.getAgentRecord('isolated')!.incarnation, 2);
+});
+
+it('omits stored notices when a shared child of an isolated parent resumes', async () => {
+  const gates = new GateModule();
+  const x = await fixture(false, {}, new MockMembrane(), [gates]);
+  const config = { model: 'test-model', systemPrompt: 'Test.' };
+  const parent = await x.framework.createEphemeralAgent({ name: 'isolated-parent', ...config });
+  cleanups.push(async () => parent.cleanup());
+  parent.contextManager.addMessage('user', [text('before')]);
+  parent.contextManager.addMessage('user', [text(notice)], flags);
+  parent.contextManager.addMessage('user', [text('after')]);
+  x.membrane.pushResponse(waitCall('parent'));
+  x.membrane.pushResponse(say('parent reply'));
+  const parentRun = x.framework.runEphemeralToCompletion(parent.agent, parent.contextManager);
+  try {
+    await until(() => gates.entered.has('parent'), 'isolated parent to block mid-turn');
+    const child = await x.framework.deriveAgent({ name: 'shared-child', from: 'isolated-parent', mode: 'shared' });
+    cleanups.push(async () => child.cleanup());
+    x.membrane.pushResponse(say('child reply'));
+    await x.framework.runEphemeralToCompletion(child.agent, child.contextManager);
+    const ended = x.framework.getAgentRecord('shared-child')!;
+    assert.equal(ended.ended?.reason, 'completed');
+    assert.equal(ended.inherit?.mode, 'shared');
+    const derivation = ended.inherit?.derivation as { slots: { messageNamespace: string | null } };
+    assert.equal(typeof derivation.slots.messageNamespace, 'string', 'the child reopens an isolated source namespace');
+    const resumed = await x.framework.resumeAgent('shared-child', config);
+    cleanups.push(async () => resumed.cleanup());
+    const stored = structuredClone(resumed.contextManager.getAllMessages());
+    assert.ok(stored.some(m => m.metadata?.kind === 'reasoning-loss'), 'the notice before the checkpoint remains stored');
+    x.membrane.pushResponse(say('resumed reply'));
+    await x.framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+    const contents = x.membrane.calls.at(-1)!.messages.map(m => m.content);
+    assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('before')])));
+    assert.ok(contents.some(c => JSON.stringify(c) === JSON.stringify([text('after')])));
+    assert.ok(!JSON.stringify(contents).includes(notice));
+    assert.deepEqual(resumed.contextManager.getAllMessages().slice(0, stored.length), stored);
+    assert.equal(x.framework.getAgentRecord('shared-child')!.incarnation, 2);
+  } finally {
+    gates.release('parent');
+    await parentRun;
+  }
 });
 
 it('omits persisted notices from a reopened resident after a framework restart', async () => {
