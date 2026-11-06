@@ -262,6 +262,16 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     assert.deepEqual([withHeld.messagesRemoved, withHeld.neverPresented], [3, 1]);
     const suppress = h.framework.previewSurgeryMarks('scout', { suppress: [t] });
     assert.deepEqual([suppress.messagesRemoved, suppress.neverPresented, suppress.returnedToArrivals], [1, 0, undefined]);
+    // AF #844 bot review 3, finding 39: another agent's stored context
+    // injection in scout's window (a write-down from the record keeps an
+    // unstamped one), which its view leaves out too.
+    const injection = h.cm().addMessage('user', [{ type: 'text', text: 'injected' } as ContentBlock], {
+      system: true, contextInjection: { agent: 'oren', namespace: 'notes', contentHash: 'h1', part: 0, parts: 1 },
+    } as never);
+    h.cm().presentRows([injection]);
+    assert.equal(h.cm().windowStatusOf(injection), 'in');
+    const withInjection = h.framework.previewSurgeryMarks('scout', { rollbackTo: t });
+    assert.deepEqual([withInjection.messagesRemoved, withInjection.neverPresented], [4, 2], "another agent's injection is never presented to scout");
   });
 
   it("a host's message-granular undo counts back in the window, whose order isn't the record's", async () => {

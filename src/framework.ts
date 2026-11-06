@@ -17419,9 +17419,10 @@ export class AgentFramework {
   /**
    * The live agents whose window holds a row now (#291): each whose context
    * reads it `'in'` (windowStatusOf), every agent whose window is still the
-   * record and whose record holds it among them (`names`). A row a tune-out
-   * holds from residents is held by no agent whose window leaves such rows
-   * out: a write-down took them in, and its view never shows them. A row a
+   * record and whose record holds it among them (`names`). A row an agent's
+   * view leaves out (agentSees) is held by no such agent, though its window
+   * holds it: one a tune-out holds from residents, or another agent's stored
+   * context injection, which a write-down from the record took in. A row a
    * suppress rule hid is held by no agent: no view shows it. An agent
    * whose lookup throws is in `unreadable`, with the error: whether its
    * window holds the row isn't known.
@@ -17439,7 +17440,7 @@ export class AgentFramework {
         unreadable.push({ agent: agent.name, error: thrownText(error) });
         continue;
       }
-      if (held && readerFacts(this.registry, agent.name).hidesHeld) continue;
+      if ((held && readerFacts(this.registry, agent.name).hidesHeld) || !this.agentSees(agent, metadata)) continue;
       names.push(agent.name);
     }
     return { names, unreadable };
