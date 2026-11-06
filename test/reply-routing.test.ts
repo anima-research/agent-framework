@@ -38,7 +38,7 @@ function registryFor(active?: (name: string) => any) {
   }
   const binding = async (root: { channelId: string }, serverId = 'endpoint-a'): Promise<ReplyBinding> => {
     const admission = admissions.get(serverId)!;
-    const ingress = withReplyConsumer(admission.capture(() => undefined), replyConsumer({ timeoutMs: 1000, authorize: () => true, resolve: input => input.replyIntent as any }, (_, target) => !!registry.getDescriptor(target)), new AbortController().signal);
+    const ingress = withReplyConsumer(admission.capture(() => undefined), replyConsumer({ timeoutMs: 1000, authorize: () => true, resolve: input => input.replyIntent as any }, (key, target) => admission.isCurrent(key) && !!registry.getDescriptor(target)), new AbortController().signal);
     const verdict = await ingress.admit('channels/incoming', root);
     assert.equal(verdict.store, true);
     return admissionRoutingFields(verdict).routing as ReplyBinding;
@@ -1072,4 +1072,19 @@ test('R1-4 unconfigured channel_publish description is byte-identical to the bas
     x.peers.get('endpoint-a')!.replyAuthority = undefined;
     assert.equal(description(), baseline);
   } finally { x.registry.stopAll(); }
+});
+
+test('R1-2 stale source authority does not claim legacy locked speech is private', async () => {
+  const x = await frameworkFor(undefined, [], undefined, { proseRouting: 'locked' });
+  try {
+    x.peers.get('endpoint-b')!.requiresReplyBinding = false;
+    x.f.mcplServerRegistry = { getServer: (id: string) => x.peers.get(id), getAllServers: () => [...x.peers.values()] };
+    x.f.readProseLock = () => at('room/other', 'endpoint-b');
+    await x.enqueue(reply());
+    x.admissions.get('endpoint-a')!.invalidate();
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1);
+    assert.equal(x.publishes[0]?.serverId, 'endpoint-b');
+    assert(!JSON.stringify(x.membrane.calls[0]).includes('Your prose stays private'));
+  } finally { x.f.mcplServerRegistry = null; await x.close(); }
 });

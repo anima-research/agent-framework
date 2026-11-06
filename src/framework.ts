@@ -25284,10 +25284,11 @@ export class AgentFramework {
         return false;
       }
       this.nameUnpostedSpeech(agent, routing);
-      const lockMismatch = routing.locked && routing.locus &&
-        this.mcplServerRegistry?.getServer(routing.locus.serverId)?.requiresReplyBinding &&
-        !sameChannel(routing.reply?.destination, routing.locus);
-      if (lockMismatch || routing.reply && !replyBindingCurrent(routing.reply)) {
+      const lockPeer = routing.locked && routing.locus
+        ? this.mcplServerRegistry?.getServer(routing.locus.serverId) : undefined;
+      const lockMismatch = lockPeer?.requiresReplyBinding && !sameChannel(routing.reply?.destination, routing.locus);
+      const legacyLock = !!lockPeer && !lockPeer.requiresReplyBinding;
+      if (lockMismatch || routing.reply && (!routing.reply.destination || !legacyLock && !replyBindingCurrent(routing.reply))) {
         const notice = lockMismatch
           ? 'Automatic reply not sent: your locked destination requires matching admitted reply authority. Your prose stays private; explicit send tools remain available and are authorized separately.'
           : privateReplyNotice;
