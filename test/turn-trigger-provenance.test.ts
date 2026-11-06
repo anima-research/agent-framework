@@ -51,14 +51,14 @@ describe('Turn trigger provenance', () => {
 
   /** Spy on startAgentStream: capture the merged trigger and the value the
    *  getter exposes while the turn is alive. */
-  function spy(framework: AgentFramework) {
+  function spy(framework: AgentFramework, agentName = 'scout') {
     const i = internals(framework);
     const captured: { handed?: InferenceRequest; exposed?: InferenceRequest } = {};
     const orig = i.startAgentStream.bind(framework);
     i.startAgentStream = async (agent: unknown, trigger?: InferenceRequest) => {
       captured.handed = trigger;
       const p = orig(agent, trigger);
-      captured.exposed = framework.getActiveTurnTrigger('scout');
+      captured.exposed = framework.getActiveTurnTrigger(agentName);
       return p;
     };
     return captured;
@@ -273,19 +273,27 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("three parked pushes with one key, a plain one, a silent heartbeat's and another plain one, name both plain pushes' channels at resume, the first's carried on by the silent push the park kept between them", async () => {
+  it("three pushes parked with one key for an agent their messages aren't written to, a plain one, a silent heartbeat's and another plain one, name both plain pushes' channels at resume, the first's carried on by the silent push the park kept between them", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
-    const framework = await makeFramework();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'second', model: 'test-model', systemPrompt: 'You are second.' },
+      ],
+      modules: [],
+    });
     const i = internals(framework);
-    const captured = spy(framework);
+    const captured = spy(framework, 'second');
     const room = { serverId: 'discord', channelId: 'discord:g:room' };
     const general = { serverId: 'discord', channelId: 'discord:g:general' };
     await framework.quiesce({ reason: 'test window' });
     const t = Date.now();
     i.pendingRequests.push(
-      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t, addressed: false, wakeChannels: [room] },
-      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 1, suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } },
-      { agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 2, addressed: false, wakeChannels: [general] },
+      { agentName: 'second', reason: 'mcpl:push-event', source: 'discord', timestamp: t, addressed: false, wakeChannels: [room] },
+      { agentName: 'second', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 1, suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } },
+      { agentName: 'second', reason: 'mcpl:push-event', source: 'discord', timestamp: t + 2, addressed: false, wakeChannels: [general] },
     );
     await i.processInferenceRequests();
     assert.equal(membrane.calls.length, 0, 'premise: parked while quiesced');
