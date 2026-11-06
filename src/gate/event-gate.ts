@@ -4202,6 +4202,11 @@ export class EventGate {
     const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
+    // Where a line stored now landed, for the delivery agent's wake, as the
+    // self-wake's notice places its own (readsRowFor): a live turn that
+    // carried and answered the line drops the wake. Other agents' wakes stay
+    // plain by readsRowFor's rule.
+    const placement: WritePlacement = {};
     if (only && this.newestEntry(only, audience)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
       line = {
@@ -4215,7 +4220,7 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
-      }, undefined, undefined, audience);
+      }, undefined, placement, audience);
     }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
@@ -4230,7 +4235,7 @@ export class EventGate {
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of woken) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance, line ? undefined : placement);
       woke?.push(agentName);
     }
   }
@@ -4358,7 +4363,8 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires; a judge rule's goes to the judge, so it only may).
+   * when it fires; a judge rule's goes to the judge, so it only may). A batch,
+   * and a sleep with no agent named, reach the gate's recipients alone.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4366,19 +4372,21 @@ export class EventGate {
     for (const name of agentNames) {
       const due = this.selfWakeDue.get(name);
       if (due && this.selfWakeTimers.has(name)) {
-        wakes.push({ at: due.at, certain: true, what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
+        wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
       }
     }
-    if (this.sleepUntil > now && (this.sleepAgent === undefined || agentNames.includes(this.sleepAgent))) {
-      wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
+    const recipients = this.getAgentNamesFn();
+    const recipient = agentNames.some((name) => recipients.includes(name));
+    if (this.sleepUntil > now && (this.sleepAgent === undefined ? recipient : agentNames.includes(this.sleepAgent))) {
+      wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep' });
     }
     for (const [name, state] of this.debounceTimers) {
-      if (name === exceptPolicy || state.events.length === 0) continue;
+      if (!recipient || name === exceptPolicy || state.events.length === 0) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
+        : { at: state.dueAt, certain: true, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }

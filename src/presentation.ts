@@ -809,12 +809,12 @@ export class AgentPresentation {
    * Rows `writer` just stored, in its own slot: each other reader of that
    * slot (its owners and its observers) whose turn isn't alive, and the
    * writer itself, is presented what it is owed at once, when one of the
-   * rows is an arrival for it (present at rest). A reader with a turn alive
-   * takes them at its next point. Frozen, only own rows present. The module
-   * needn't present for the writer: one left in legacy mode tells the
-   * readers of its slot too. Each reader is weighed apart, so one whose
-   * window can't be read is traced and the others are still told. Never
-   * throws.
+   * rows is its own or an arrival for it (present at rest). A reader with a
+   * turn alive takes them at its next point. Frozen, only own rows present.
+   * The module needn't present for the writer: one left in legacy mode
+   * tells the readers of its slot too. Each reader is weighed apart, so one
+   * whose window can't be read is traced and the others are still told.
+   * Never throws.
    */
   afterStore(writer: PresentedAgent, ids: ReadonlyArray<MessageId | undefined>): void {
     try {
@@ -855,7 +855,8 @@ export class AgentPresentation {
    * per body, for the start to weigh. A fresh start ends a rollback's hold
    * on the arrivals its cut returned (holdUntilStart): they enter with the
    * rest, in record order, and the hold ends once they have, so a start
-   * that fails keeps it; so does an agent the boot's pass at rest left out
+   * that fails keeps it, and so does one while frozen, which presents no
+   * arrival; so does an agent the boot's pass at rest left out
    * (repairAndRest's `restExcept`). A fresh start's presentation that fails (a read
    * of the window or the record that throws, or a write of the window that
    * leaves a row out) is traced, and then throws, so the start fails rather
@@ -868,9 +869,12 @@ export class AgentPresentation {
   presentAtStart(agent: PresentedAgent, occasion: 'turn-start' | 'assembly' | 'compile'): StoredMessage[] {
     if (!this.presenting(agent)) return [];
     const cm = agent.getContextManager();
-    // The sweep below decides the own rows a failed write left (presentOwn).
-    this.failedOwn.delete(cm);
     const fresh = occasion !== 'compile';
+    // The sweep below decides the own rows a failed write left (presentOwn):
+    // the backstop's at once, as its compile goes on whatever it presents; a
+    // fresh start's once it hasn't thrown, so the next own row's write still
+    // puts them first after a start that presented nothing.
+    if (!fresh) this.failedOwn.delete(cm);
     // A fresh start is where rows a write-down took in that aren't the
     // agent's, whose retraction failed, leave before its compile, and a
     // reader fork's framing whose presentation failed enters.
@@ -882,13 +886,16 @@ export class AgentPresentation {
     }
     if (fresh && this.framedPending.has(agent.name)) this.presentFramed(agent);
     // A rollback's returned arrivals enter here (holdUntilStart): the hold
-    // is left out of this presentation, and ends once it hasn't failed.
-    const { arrivals, failure } = this.presentPending(agent, occasion, fresh && !this.host.frozen(), false,
+    // is left out of this presentation, and ends once it hasn't failed, at a
+    // start that could present arrivals (none while frozen).
+    const withArrivals = fresh && !this.host.frozen();
+    const { arrivals, failure } = this.presentPending(agent, occasion, withArrivals, false,
       fresh ? "the start fails, and what it didn't present waits for the next point" : undefined);
     if (fresh && failure !== undefined) {
       throw new Error(`${agent.name}'s turn start could not present what it is owed (at ${occasion}): ${describe(failure)}`, { cause: failure });
     }
-    if (fresh) {
+    if (fresh) this.failedOwn.delete(cm);
+    if (withArrivals) {
       this.heldUntilStart.delete(cm);
       this.restWithheld.delete(agent.name);
     }
@@ -1458,9 +1465,11 @@ export class AgentPresentation {
   }
 
   /**
-   * One presentRows call for `ids` in the agent's window: on a throw, the
-   * rows that entered before it count, and the failure is traced. Traces
-   * what entered and tells the listeners.
+   * One presentRows call for `ids` in the agent's window: every row named
+   * counts once it returns (it refuses a row already in the window, and
+   * returns one ordinal per row named); on a throw, the rows that entered
+   * before it count, as far as the window can be read then, and the
+   * failure is traced. Traces what entered and tells the listeners.
    */
   private present(
     agent: PresentedAgent,
@@ -1474,14 +1483,30 @@ export class AgentPresentation {
     const cm = agent.getContextManager();
     const lengthBefore = cm.indexLength();
     let error: unknown;
+    let entered: Set<MessageId>;
     try {
       cm.presentRows(ids);
+      // Read from the write's return, not the window: a read that throws
+      // now mustn't keep rows the store holds from being traced and told.
+      entered = new Set(ids);
     } catch (thrown) {
       error = thrown;
+      try {
+        entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
+      } catch (readError) {
+        console.error(`[presentation] ${agent.name}'s window couldn't be read after a failed presentation, so none of it is counted as entered:`, readError);
+        entered = new Set();
+      }
     }
-    const entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
     const memo = this.memos.get(cm);
-    if (memo && memo.length === lengthBefore) memo.length = cm.indexLength();
+    if (memo && memo.length === lengthBefore) {
+      try {
+        memo.length = cm.indexLength();
+      } catch {
+        // The scan's memo can't be moved past the rows: the next scan reads them again.
+        this.memos.delete(cm);
+      }
+    }
     if (error !== undefined) this.failed(agent, occasion, error, ids.filter((id) => !entered.has(id)), extra?.next);
     if (entered.size > 0) {
       if (!quiet) {

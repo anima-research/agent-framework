@@ -1055,6 +1055,9 @@ export class WorkspaceModule implements Module {
   /** Whether an agent's window still holds what it did after a place in the record, as the framework hands it over (useWindow). */
   private windowLookup: ((agentName: string, afterSequence: number) => boolean) | null = null;
 
+  /** Whether a turn of an agent's is alive now, as the framework hands it over with the window lookup (useWindow). */
+  private turnLookup: ((agentName: string) => boolean) | null = null;
+
   constructor(config: WorkspaceConfig) {
     for (const mount of config.mounts) {
       const cap: unknown = mount.walkCap;
@@ -1232,7 +1235,7 @@ export class WorkspaceModule implements Module {
         continue;
       }
       restored.set(saved.mount, new Map(Object.entries(saved.agents).map(([agent, head]) =>
-        [agent, { branchId: head.branchId, after: head.after, notice: head.notice ?? null }])));
+        [agent, { branchId: head.branchId, after: head.after, notice: head.notice ?? null, ...(head.outsideTurn ? { outsideTurn: true as const } : {}) }])));
     }
     this.headsJournal = journal;
     this.loadedHeads = text;
@@ -1827,7 +1830,8 @@ export class WorkspaceModule implements Module {
       ...[...this.directHeads].filter(([, heads]) => heads.size > 0).map(([name, heads]) => ({
         mount: name,
         root: resolve(this.mounts.get(name)!.config.path),
-        agents: Object.fromEntries([...heads].map(([agent, { branchId, after, notice }]) => [agent, { branchId, after, ...(notice !== null ? { notice } : {}) }])),
+        agents: Object.fromEntries([...heads].map(([agent, { branchId, after, notice, outsideTurn }]) =>
+          [agent, { branchId, after, ...(notice !== null ? { notice } : {}), ...(outsideTurn ? { outsideTurn } : {}) }])),
       })),
     ];
     const text = canonicalHeads(snapshot);
@@ -5091,7 +5095,10 @@ export class WorkspaceModule implements Module {
    * changed meanwhile, the head moved under the call, and P is set there,
    * so the next start judges the deletion by the branch its turn was on,
    * unless the history doesn't hold P already, whose notice is owed. A write no agent
-   * made tells no one. The store's reads here come after the write landed,
+   * made tells no one. A write made while no turn of the agent's is alive (a
+   * host's executeToolCall naming it) is marked so (`outsideTurn`): no round
+   * of the agent's history made it, so the window can't say it was undone,
+   * and only the branch's position decides. The store's reads here come after the write landed,
    * so one that throws is logged and P stays, as for a history that can't
    * be read, and the write still answers that it landed.
    */
@@ -5103,12 +5110,13 @@ export class WorkspaceModule implements Module {
       if (!heads) this.directHeads.set(mount.config.name, (heads = new Map()));
       const head = heads.get(agentName);
       const branchId = store.currentBranch().id;
+      const outsideTurn = this.turnLookup?.(agentName) === false ? { outsideTurn: true as const } : {};
       if (since && since.branchId !== branchId) {
-        if (!head || this.historyHoldsWrites(agentName, head) === true) heads.set(agentName, { ...since, notice: null });
+        if (!head || this.historyHoldsWrites(agentName, head) === true) heads.set(agentName, { ...since, notice: null, ...outsideTurn });
         return;
       }
       if (head && this.historyHoldsWrites(agentName, head) !== true) return;
-      heads.set(agentName, { branchId, after: store.currentSequence(), notice: null });
+      heads.set(agentName, { branchId, after: store.currentSequence(), notice: null, ...outsideTurn });
     } catch (err) {
       console.error('[workspace] could not record a direct write\'s position:', err);
     }
@@ -5138,10 +5146,11 @@ export class WorkspaceModule implements Module {
     if (this.holdsPosition(head)) {
       // The branch holds the write, but an undo on the agent's window (the
       // framework's presentation index) moves no branch: it takes the turn
-      // that wrote out of the window, which the framework's lookup says.
+      // that wrote out of the window, which the framework's lookup says. A
+      // write made outside any turn of the agent's has no turn to take out.
       let held: boolean;
       try {
-        held = this.windowLookup?.(agentName, head.after) !== false;
+        held = head.outsideTurn === true || this.windowLookup?.(agentName, head.after) !== false;
       } catch (err) {
         console.error('[workspace] window lookup for the head-move notice failed:', err);
         return null;
@@ -5232,10 +5241,14 @@ export class WorkspaceModule implements Module {
    * when it wrote a mount direct): false once an undo on its window took
    * that turn out, though the branch still holds the write. Handed over
    * once, by a framework with the presentation index. Without it, the
-   * branch's position alone decides.
+   * branch's position alone decides. `turnAlive` says whether a turn of the
+   * agent's is alive at a write: one made outside any (a host's
+   * executeToolCall naming the agent) has no turn in the window, so the
+   * branch's position alone decides for it too.
    */
-  useWindow(lookup: (agentName: string, afterSequence: number) => boolean): void {
+  useWindow(lookup: (agentName: string, afterSequence: number) => boolean, turnAlive?: (agentName: string) => boolean): void {
     this.windowLookup = lookup;
+    this.turnLookup = turnAlive ?? null;
   }
 
   private async handleDelete(input: DeleteInput, callerAgentName?: string): Promise<ToolResult> {
@@ -6833,6 +6846,8 @@ interface DirectHead {
   branchId: string;
   after: number;
   notice: string | null;
+  /** Set where P was written while no turn of the agent's was alive (recordDirectWrite): the window isn't asked of it. */
+  outsideTurn?: true;
 }
 
 /** A store position: a branch and its head. */
@@ -6845,7 +6860,7 @@ const DIRECT_HEADS_RECORD_TYPE = 'workspace/direct-heads';
 interface DirectHeadsEntry {
   mount: string;
   root: string;
-  agents: Record<string, { branchId: string; after: number; notice?: string }>;
+  agents: Record<string, { branchId: string; after: number; notice?: string; outsideTurn?: true }>;
 }
 
 /** directHeads as saved: an entry per mount and root its agents wrote direct under. */
@@ -6867,7 +6882,8 @@ function checkedHeads(value: unknown): DirectHeadsSnapshot {
     }
     for (const [agent, head] of Object.entries(saved.agents)) {
       if (!isObject(head) || typeof head.branchId !== 'string' || typeof head.after !== 'number'
-        || (head.notice !== undefined && typeof head.notice !== 'string')) {
+        || (head.notice !== undefined && typeof head.notice !== 'string')
+        || (head.outsideTurn !== undefined && head.outsideTurn !== true)) {
         throw new Error(`agent ${JSON.stringify(agent)}'s position on mount ${JSON.stringify(saved.mount)} isn't of the shape saved`);
       }
     }
@@ -6878,8 +6894,8 @@ function checkedHeads(value: unknown): DirectHeadsSnapshot {
 /** A saved record's content, whatever order its mounts and agents were written in, to tell whether a save would change it. */
 function canonicalHeads(snapshot: DirectHeadsSnapshot): string {
   return JSON.stringify(snapshot.map(({ mount, root, agents }) => [mount, root, Object.keys(agents).sort().map((agent) => {
-    const { branchId, after, notice } = agents[agent]!;
-    return [agent, branchId, after, notice ?? null];
+    const { branchId, after, notice, outsideTurn } = agents[agent]!;
+    return [agent, branchId, after, notice ?? null, outsideTurn === true];
   })]).sort((a, b) => {
     const [x, y] = [JSON.stringify(a.slice(0, 2)), JSON.stringify(b.slice(0, 2))];
     return x < y ? -1 : x > y ? 1 : 0;

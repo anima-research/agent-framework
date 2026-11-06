@@ -230,19 +230,33 @@ test('on the window, a redo of the turn that wrote finds nothing due, and a head
   assert.equal(h.notices().length, 0);
 });
 
-test('an undo whose fork lands at exactly the store head the write saw gives the notice', async (t) => {
-  const h = await harness(t);
-  await h.turn([say('hello')]);
-  const written = await h.framework.executeToolCall({ id: 'direct-1', name: 'workspace--write', input: { path: 'ref/a.txt', content: 'one\n' }, callerAgentName: 'scout' } as Parameters<AgentFramework['executeToolCall']>[0]);
-  assert.equal(written.success, true, written.error);
-  const head = (h.workspace as unknown as { directHeads: Map<string, Map<string, { after: number }>> }).directHeads.get('ref')!.get('scout')!;
-  // A turn with nothing recorded between the write and its start.
-  await h.turn([say('nothing new')], 'scout', { user: false });
-  const checkpoint = (h.framework as unknown as { getTurnCheckpoints(agent: string): Array<{ sequenceBefore: number }> }).getTurnCheckpoints('scout').at(-1)!;
-  assert.equal(checkpoint.sequenceBefore, head.after, 'the undo forks at exactly the head the write saw');
-  assert.equal(h.framework.undoLastTurn('scout').undone, true);
-  const [first] = await h.turn([say('back')]);
-  assert.equal(carries(first), true);
+// AF #844 bot review 3, finding 5: a host's direct write outside any turn
+// (executeToolCall naming the agent) has no round in the agent's history,
+// so the first own row after its head is a later turn's, which the write
+// isn't part of. An undo of that turn takes nothing of the write out, and
+// gives no notice, whether the turn's checkpoint is the store head the
+// write saw or past it. (Before #291 an undo forked a branch at its turn's
+// checkpoint, and one at exactly that head gave the notice; a rollback cut
+// there still does, holdsPosition.)
+test("a host's direct write outside any turn gives no notice at an undo of a later turn, at the write's head or past it", async (t) => {
+  for (const gap of [true, false]) {
+    const h = await harness(t);
+    await h.turn([say('hello')]);
+    const written = await h.framework.executeToolCall({ id: 'direct-1', name: 'workspace--write', input: { path: 'ref/a.txt', content: 'one\n' }, callerAgentName: 'scout' } as Parameters<AgentFramework['executeToolCall']>[0]);
+    assert.equal(written.success, true, written.error);
+    const head = (h.workspace as unknown as { directHeads: Map<string, Map<string, { after: number }>> }).directHeads.get('ref')!.get('scout')!;
+    // A user message between the write and the turn, or nothing recorded between.
+    await h.turn([say('a later turn')], 'scout', { user: gap });
+    const checkpoint = (h.framework as unknown as { getTurnCheckpoints(agent: string): Array<{ sequenceBefore: number }> }).getTurnCheckpoints('scout').at(-1)!;
+    if (gap) assert.ok(checkpoint.sequenceBefore > head.after, 'premise: a row came between the write and the turn');
+    else assert.equal(checkpoint.sequenceBefore, head.after, "premise: the turn's checkpoint is exactly the head the write saw");
+    assert.equal(h.framework.undoLastTurn('scout').undone, true);
+    assert.equal(h.workspace.headMoveNotice('scout'), null, `${gap ? 'past' : 'at'} its head: no notice is due`);
+    const [first] = await h.turn([say('back')]);
+    assert.equal(carries(first), false);
+    assert.equal(h.notices().length, 0);
+    assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
+  }
 });
 
 for (const [tool, input, landed] of [

@@ -13,8 +13,9 @@
  *
  * Since #291 a write is stored at once (unless a surgery's hold or a context
  * manager refusing its work keeps it in memory until that is over), and the
- * presentation index keeps it out of the agent's window until the agent's
- * next presentation point; the
+ * presentation index keeps it out of the agent's window (a write for it:
+ * one a tune-out holds is for no resident, and enters no resident's window)
+ * until the agent's next presentation point; the
  * deferral queue these invariants were first written against is gone, and
  * the tests read the window instead.
  *

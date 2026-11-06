@@ -259,8 +259,9 @@ export interface FrameworkConfig {
    * for a run or a fork, and is dropped otherwise, logged. It then rewrites
    * the record with what it left for the next boot: a write it couldn't
    * store, or couldn't tell had already landed, with that agent's later
-   * writes. When the store doesn't sync after the import, the record is left
-   * as it was.
+   * writes. A write the store refuses as malformed is dropped, logged, as an
+   * earlier release's flush dropped it. When the store doesn't sync after
+   * the import, the record is left as it was.
    *
    * @deprecated Read once at boot by the deferred-write importer; removed in
    * the next release.

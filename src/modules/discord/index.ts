@@ -406,17 +406,22 @@ export class DiscordModule implements Module {
   // the moment the live path takes one up, through its conversion and the
   // event queue, until a query shows the row onProcess answered with. The
   // framework stores a module's write at once, whatever the agent's turn or
-  // the host's mode (#291); only a live operator surgery holds it, in memory,
-  // and its release stores it. So the next Discord event once it is stored
+  // the host's mode (#291); only a live operator surgery's hold, or a context
+  // manager refusing its work, keeps it in memory, which a restart loses,
+  // until the release or the branch move that re-initializes the manager
+  // stores it. So the next Discord event once it is stored
   // finds its row, marked held while the agent hasn't been shown it, and
   // ends its entry. A history sync stores none of these messages, so no message is
   // stored twice. A delete before the create is handled drops it: nothing is
   // stored and nobody is woken. Any message's entry ends when its delete is
   // handled, since a sync running then skips the message (noteLive) and a
-  // later one doesn't fetch it. An edit while it converts is folded into it.
+  // later one doesn't fetch it, but for an answered create with no row yet
+  // (`writing`), whose entry keeps its delete for the release that stores
+  // it (LiveCreate.unapplied). An edit while it converts is folded into it.
   // A create whose answer the framework fails to write shows no row,
-  // and keeps its entry, and the sync off its message, until its delete is
-  // handled or the module stops.
+  // and keeps its entry, and the sync off its message, until the module
+  // stops, but for one a surgery's hold kept, whose release, losing it,
+  // ends its entry (`message:lost`, endLostCreate).
   private readonly creating = new Map<string, LiveCreate>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
@@ -453,6 +458,10 @@ export class DiscordModule implements Module {
     // (including tool-call cycles) and stops cleanly whether the agent
     // responds, errors, or decides to stay silent.
     this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
+      // The edits and deletes kept for a held create are applied, or its
+      // record ended, on the trace of the surgery's release that stores or
+      // loses it (applyUnapplied, endLostCreate): the exception the README
+      // names to traces being observability-only.
       if (event.type === 'message:added' && event.source === 'surgery-release') {
         this.applyUnapplied();
         return;
@@ -782,8 +791,12 @@ export class DiscordModule implements Module {
     // A stopped module answers nothing (stop()).
     if (!this.ctx) return {};
 
-    // Each Discord event ends the entries whose row a query shows now.
+    // Each Discord event ends the entries whose row a query shows now,
+    // having applied what was kept for them first (applyUnapplied): an
+    // entry kept where its lost create's read threw (endLostCreate) still
+    // holds the edits or the delete made while its create was held.
     if (event.type.startsWith('discord:')) {
+      this.applyUnapplied();
       for (const [id, live] of this.creating) if (live.phase === 'writing' && this.storedRow(id)) this.creating.delete(id);
     }
 
@@ -1213,7 +1226,9 @@ export class DiscordModule implements Module {
   }
 
   /** The stored rows of a Discord message, by its id in the row's metadata,
-   *  in store order. Every write is stored (#291): a row the agent hasn't
+   *  in store order. Every write is stored (#291), but for one a surgery's
+   *  hold or a context manager refusing its work keeps in memory, which a
+   *  restart loses: a row the agent hasn't
    *  been shown yet reads `held`, in its place, and an edit or a removal
    *  reaches it as any other, and every window that holds it. The
    *  module context's findMessageByExternalId holds only rows the module

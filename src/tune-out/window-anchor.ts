@@ -34,7 +34,9 @@
  * longer: it is set by sequence and fixed at the next enter or restart once
  * the window presents. One whose setting or keeping failed before a branch
  * move is fixed again on the branch moved to, from its window there, as one
- * never fixed is: an ordinal is a place on the branch it was fixed on. A
+ * never fixed is: an ordinal is a place on the branch it was fixed on; one
+ * for tune-outs none of which is active then, and a cancelled tune-out's
+ * start set in force by its kept ordinal, are dropped at the move. A
  * restart that finds a start in force kept sets that one, and fixes the
  * oldest active tune-out's start, if it isn't kept, without moving the
  * window to it; one that finds none kept, the oldest's start being kept,
@@ -168,10 +170,24 @@ export class SubconsciousWindowAnchor {
    * agents follow it): an ordinal is a place on the branch it was fixed on,
    * so a start pending at one (its setting or keeping failed), or set by one
    * kept there (`known`), waits again to be fixed, from the window it
-   * presents on now, as a start never fixed does (tryFix).
+   * presents on now, as a start never fixed does (tryFix): one for a
+   * tune-out still active (`active`, the coordinator's, where the framework
+   * says). One fixed for tune-outs none of which is active any more, and
+   * the start in force only (a cancelled tune-out's, set by its kept
+   * ordinal: fixed again, it would be the active one's start), are dropped,
+   * as every start fixed at an ordinal was before (AF #844 review 3, #30
+   * and #44): the anchor the destination's strategy keeps stands until the
+   * next enter or restart sets one.
    */
-  branchMoved(): void {
-    this.pending = this.pending.map((p) => ({ start: p.start, inForce: p.inForce }));
+  branchMoved(active?: readonly string[]): void {
+    const holds = active === undefined ? undefined : new Set(active);
+    this.pending = this.pending
+      .filter((p) => {
+        if (p.known && p.known.keep.length === 0) return false;
+        const fixedThere = p.ordinal !== undefined || p.known !== undefined;
+        return !fixedThere || holds === undefined || p.start.epochIds.some((id) => holds.has(id));
+      })
+      .map((p) => ({ start: p.start, inForce: p.inForce }));
   }
 
   /** Rows entered the subconscious's window (the presentation index's onPresented): a start waiting to be fixed may be fixable now. */

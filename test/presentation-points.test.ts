@@ -372,6 +372,35 @@ describe('presentation points (#291)', () => {
     assert.deepEqual(['one', 'two', 'three'].map((t) => h.windowStatusOf('oren', t)), ['in', 'in', 'out'], "in oren's: what's for him");
   });
 
+  // AF #844 bot review 3, finding 24: the direct path's twin of
+  // operator-surgery's addMessage case. A write into a fork's store takes its
+  // clock at its replay; a hold the clock row's listener begins keeps the
+  // write at the head of the queue, ahead of the writes that came after it.
+  it("a replayed write into a fork's store whose clock row's listener begins a hold stays ahead of the writes behind it", async () => {
+    const h = await boot({ clock: true });
+    const release = h.internals.reserveStoreForSurgery('test-surgery', 'mira');
+    assert.equal(h.internals.storeInFork(h.agent('mira'), [text('one')], {}), '', 'held');
+    assert.equal(h.internals.addMessage('user', [text('two')]), '', 'held');
+    assert.equal(h.internals.addMessage('user', [text('three')]), '', 'held');
+    let second: (() => void) | undefined;
+    h.framework.onTrace((event) => {
+      if (event.type === 'message:added' && event.source === 'clock:event' && !second) {
+        second = h.internals.reserveStoreForSurgery('test-surgery-2', 'mira');
+      }
+    });
+    const landed = () => h.cm('mira').getAllMessages().map((m) => textOf(m)).filter((t) => ['one', 'two', 'three'].includes(t));
+    try {
+      release();
+      assert.ok(second, "setup: one's clock row was traced at its replay, and its listener began a hold");
+      assert.deepEqual(landed(), [], 'none stored under the new hold');
+      assert.deepEqual((h.internals.surgeryHeldWrites as Array<{ content: ContentBlock[] }>).map(textOf),
+        ['one', 'two', 'three'], 'one stays at the head');
+    } finally {
+      second?.();
+    }
+    assert.deepEqual(landed(), ['one', 'two', 'three'], 'stored in the order they arrived');
+  });
+
   // B5: frozen() reads the quiesce alone. A surgery's hold freezes every
   // window by its own refusals: its reservation holds a turn token for each
   // agent, so each is turn-alive and a point at rest presents it nothing, and

@@ -47,7 +47,8 @@
   held channel's messages, in a channel tool's refusal and the `[tuned out]` send note, were "read by <name>" after
   the persistent reader ended, or at a start with none configured, for a hold whose release failed; they are now
   held "with no reader running here to read them, until the tune-out's release, which failed, is tried again"
-  (`TuneOutReader`'s `running: false`). `tune_out`'s refusal with no reader says none "is running here", a reader
+  (`TuneOutReader`'s `running: false`), and so are they in tune_out's answers about the channel's transport, which
+  said they "reach <name>". `tune_out`'s refusal with no reader says none "is running here", a reader
   that ended included. `cancel_tuneout`'s description no longer says it ends the tune-out "now": its answer says
   when the cancel has to wait, and whether the note waits with it, and the channel's traffic reaches the resident
   again unless the all-except hold holds it too; `speak_in_channel`'s refusal where speech is off, and `tune_out`'s

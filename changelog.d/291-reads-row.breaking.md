@@ -35,7 +35,8 @@
     291-reads-row changed entry).
   - `WritePlacement.messageId` names the stored row of every write stored at
     once, and `WritePlacement` gains `presented?: false` (a row stored and not
-    presented to its agent, whose turn was alive).
+    presented to its agent: its turn was alive, or, at rest, its presentation
+    at the write failed).
 
   **Migration:** compare marks through `covers` and `markAtOrAfter` instead
   of reading `.sequence`; rename `readsDeferredWrite` and

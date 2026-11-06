@@ -92,7 +92,7 @@ describe('event suppression', () => {
       await settle(f);
       const row = find(f, 'noise one');
       assert.deepEqual(suppressedOf(row), { rule: 'hide-noisy', eventType: 'mcpl:channel-incoming', source: 'editor' });
-      assert.deepEqual(audienceOf(row.metadata)?.audience, [], 'stamped for nobody (#291), so no window presents it');
+      assert.deepEqual(audienceOf(row.metadata)?.audience, [], "stamped for nobody (#291); suppressed, it is presented in no window, an observer's included");
       assert.equal(await inView(f, 'noise one'), false, 'not in the compiled view');
 
       await incoming(f, 'noisy', 'n2', 'agent, look at this', MENTION);

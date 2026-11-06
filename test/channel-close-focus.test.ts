@@ -497,6 +497,31 @@ describe("a bare channel_close id that both the focus's channel and the calling 
     });
   }
 
+  // AF #844 bot review 3, finding 57: a bare id answers to the turn's own
+  // channels first, so where another of them has the id "other:work" (on a
+  // server that no longer registers it), that name doesn't reach other's
+  // `work`, and the refusal doesn't offer it; the serverId it offers does.
+  it("in a turn with another own channel whose id is other's qualified name, the refusal doesn't offer that name, and its serverId advice closes other's `work`", async () => {
+    const f = await focused();
+    const other = await otherServer(f);
+    const turn = { kind: 'agent', agentName: 'agent', own: [{ serverId: 'other', channelId: 'work' }, { serverId: 'gone', channelId: 'other:work' }] };
+    const call = (input: Record<string, unknown>) => framework(f).channelRegistry.handleChannelToolCall('channel_close', input, turn);
+    try {
+      await other.registerOpen('work');
+      await firstCloseFails(f);
+      const refused = await call({ channelId: 'work' });
+      assert.equal(refused.success, false, `nothing ran: ${JSON.stringify(refused)}`);
+      assert.ok(!refused.error!.includes('"other:work"'), `"other:work" reaches the turn's other channel, so it isn't offered: ${refused.error}`);
+      assert.ok(refused.error!.includes('Call again with channelId "editor:work", or with serverId set to "editor" or "other".'), refused.error);
+      const byName = await call({ channelId: 'other:work' });
+      assert.equal(byName.success, false, 'premise: the name reaches the turn\'s channel on "gone"');
+      const result = await call({ channelId: 'work', serverId: 'other' });
+      assert.equal(result.success, true, result.error);
+      assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'closed');
+      assert.ok(coordinatorOf(f).getAllExcept(), 'the focus is in force');
+    } finally { await f.close(); await other.stop(); }
+  });
+
   it("control: a turn whose own channel is the focus's: the bare id closes it and ends the focus", async () => {
     const f = await focused();
     const other = await otherServer(f);

@@ -596,6 +596,36 @@ describe('SubconsciousWindowAnchor', () => {
     assert.deepEqual(h.calls.filter((c) => c.startsWith('setAnchorOrdinal')), ['setAnchorOrdinal(1)', 'setAnchorOrdinal(2)'], 't1, in force, is set at the new ordinal');
   });
 
+  it("a start fixed but not kept for a tune-out that has ended since isn't fixed again on the branch moved to, as before #28's fix; an active one's is (AF #844 review 3, #30)", () => {
+    const h = host({ rows: [{ sequence: 10, ordinal: 0 }] });
+    h.state.keepFails = 2;
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] }, [{ sequence: 70, epochIds: ['t2'] }]);
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t2'], ordinal: 1 }], 'premise: both fixed at 1, neither kept');
+    // t1 ends; the store moves to a branch whose window holds more rows.
+    h.anchor.branchMoved(['t2']);
+    h.state.rows.push({ sequence: 20, ordinal: 1 }, { sequence: 60, ordinal: 2 });
+    h.anchor.presented();
+    assert.deepEqual(h.fixed.slice(2), [{ epochIds: ['t2'], ordinal: 3 }], "only t2, still active, is fixed again there, on the window it presents on");
+    assert.deepEqual(h.calls.filter((c) => c.startsWith('setAnchorOrdinal')), ['setAnchorOrdinal(1)'],
+      "t1's start, fixed on the branch left, isn't set in force on the one moved to");
+  });
+
+  it("a start in force only (a cancelled tune-out's, set by its kept ordinal) whose setting failed isn't fixed again from the active tune-out's start after a branch move (AF #844 review 3, #44)", () => {
+    // Row 1 (sequence 40) is the cancelled tune-out's traffic; Y, active, began at 60.
+    const h = host({ rows: [{ sequence: 10, ordinal: 0 }, { sequence: 40, ordinal: 1 }, { sequence: 50, ordinal: 2 }] });
+    h.state.setFails = 1;
+    const errors = console.error;
+    console.error = () => {};
+    try {
+      h.anchor.set({ sequence: 60, ordinal: 1, epochIds: ['Y'], inForceOnly: true }, [{ sequence: 60, epochIds: ['Y'] }]);
+    } finally { console.error = errors; }
+    assert.deepEqual(h.calls, ['setAnchorOrdinal(1)'], 'premise: setting the start in force failed');
+    h.anchor.branchMoved(['Y']);
+    h.anchor.presented();
+    assert.deepEqual(h.calls, ['setAnchorOrdinal(1)'], "the window isn't moved to Y's start, past the cancelled tune-out's rows: the destination's anchor stands");
+    assert.deepEqual(h.fixed, [{ epochIds: ['Y'], ordinal: 3 }], "Y's own start is fixed there, not in force");
+  });
+
   it('a start whose setting or keeping fails is set and kept at the next presentation, at the ordinal it was fixed at', () => {
     const failedSet = host({ rows: [{ sequence: 10, ordinal: 0 }] });
     failedSet.state.setFails = 1;

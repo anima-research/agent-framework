@@ -63,6 +63,9 @@ async function recordOn(storePath: string): Promise<{ branch: string; texts: str
   }
 }
 
+/** What the no-op refusal says of the slots an offline recovery reads (AF #844 bot review 3, #58). */
+const OWN_SLOT_ONLY = "Offline, only cairn's own slot is read: a row of a slot it observes, which the live rollback weighs, isn't weighed here.";
+
 describe('AF #844 review 8 — offline recovery at a presented cut', () => {
   it('16: a count whose anchor shares its presentation write with the rows after it is refused, naming the suppression', async () => {
     const storePath = await batchStore();
@@ -99,7 +102,11 @@ describe('AF #844 review 8 — offline recovery at a presented cut', () => {
     store.close();
     await assert.rejects(
       createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'd-A', dryRun: true }),
-      /already the tail of cairn's window/,
+      (error: Error) => {
+        assert.match(error.message, /already the tail of cairn's window/);
+        assert.ok(error.message.endsWith(OWN_SLOT_ONLY), error.message);
+        return true;
+      },
     );
   });
 
@@ -226,10 +233,12 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
       createOfflineRecoveryBranch({ storePath: lone.storePath, agentName: 'cairn', messageId: 'd-A', dryRun: true }),
       (error: Error) => {
         assert.match(error.message, /in one write with the 1 message after it in its window \(the first: [^,)]+\)/);
-        assert.ok(error.message.endsWith(
+        assert.ok(error.message.includes(
           `suppress it by row id with the live suppressMessages (${String(lone.ids.get('agent:reply'))}) once the host runs, ` +
-          'since the offline recovery suppresses only by Discord message id and it has none',
+          'since the offline recovery suppresses only by Discord message id and it has none. ',
         ), error.message);
+        // AF #844 bot review 3, finding 58: the run reads the agent's own slot only.
+        assert.ok(error.message.endsWith(OWN_SLOT_ONLY), error.message);
         assert.doesNotMatch(error.message, /--suppress/);
         return true;
       },
@@ -243,29 +252,46 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
         assert.ok(error.message.endsWith(
           'suppress the 1 with a Discord message id in the same recovery (--suppress / suppressMessageIds, or a ' +
           `--suppress-range), and the 1 without one by row id with the live suppressMessages (${String(mixed.ids.get('agent:note'))}) ` +
-          'once the host runs, since the offline recovery suppresses only by Discord message id',
+          `once the host runs, since the offline recovery suppresses only by Discord message id. ${OWN_SLOT_ONLY}`,
         ), error.message);
+        return true;
+      },
+    );
+    // AF #844 bot review 3, finding 105: every row without one is named, not
+    // five and a count, so following the advice leaves none.
+    const six = ['agent:1', 'agent:2', 'agent:3', 'agent:4', 'agent:5', 'agent:6'];
+    const many = await store(['D', ...six]);
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath: many.storePath, agentName: 'cairn', messageId: 'd-D', dryRun: true }),
+      (error: Error) => {
+        assert.ok(error.message.includes(`the live suppressMessages (${six.map((t) => String(many.ids.get(t))).join(', ')}) once the host runs`), error.message);
+        assert.doesNotMatch(error.message, /\(\+\d+\)/, 'no count stands in for a row');
         return true;
       },
     );
   });
 
   it('85: a cut that only returns rows to the arrivals reports them as returnedToArrivals, a dry run too', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'af-review8-recovery-'));
-    dirs.push(dir);
-    const storePath = join(dir, 'agent.chronicle');
-    const store = JsStore.openOrCreate({ path: storePath });
-    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
-    cm.presentRows([]);
-    const meta = (t: string) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId: `d-${t}` });
-    const a = cm.addMessage('user', [{ type: 'text', text: 'A' } as ContentBlock], meta('A'));
-    const b = cm.addMessage('user', [{ type: 'text', text: 'B' } as ContentBlock], meta('B'));
-    const c = cm.addMessage('user', [{ type: 'text', text: 'C' } as ContentBlock], meta('C'));
-    cm.presentRows([a]);
-    cm.presentRows([b]);
-    cm.presentRows([c]);
-    cm.close();
-    store.close();
+    /** A, B and C stored, each presented in a write of its own. */
+    const built = async (): Promise<string> => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-review8-recovery-'));
+      dirs.push(dir);
+      const at = join(dir, 'agent.chronicle');
+      const store = JsStore.openOrCreate({ path: at });
+      const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+      cm.presentRows([]);
+      const meta = (t: string) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId: `d-${t}` });
+      const a = cm.addMessage('user', [{ type: 'text', text: 'A' } as ContentBlock], meta('A'));
+      const b = cm.addMessage('user', [{ type: 'text', text: 'B' } as ContentBlock], meta('B'));
+      const c = cm.addMessage('user', [{ type: 'text', text: 'C' } as ContentBlock], meta('C'));
+      cm.presentRows([a]);
+      cm.presentRows([b]);
+      cm.presentRows([c]);
+      cm.close();
+      store.close();
+      return at;
+    };
+    const storePath = await built();
 
     const dry = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'd-A', dryRun: true });
     assert.equal(dry.messagesRemoved, 0);
@@ -280,6 +306,16 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
     const after = await recordOn(storePath);
     assert.deepEqual(after.texts, ['A', 'B', 'C']);
     assert.deepEqual(after.window, ['A']);
+    // AF #844 bot review 3, finding 60: the same suppression run live, on a
+    // store of its own: C is removed, and B alone returns.
+    const livePath = await built();
+    const live = await createOfflineRecoveryBranch({
+      storePath: livePath, agentName: 'cairn', messageId: 'd-A', suppressMessageIds: ['d-C'], branchName: 'recovery/cairn/suppressed',
+    });
+    assert.deepEqual([live.messagesSuppressed, live.returnedToArrivals], [1, 1]);
+    const suppressed = await recordOn(livePath);
+    assert.deepEqual(suppressed.texts, ['A', 'B'], 'C is out of the record');
+    assert.deepEqual(suppressed.window, ['A'], 'and B waits outside the window, an arrival again');
   });
 
   it('85: a window that is still the record reports no returnedToArrivals', async () => {

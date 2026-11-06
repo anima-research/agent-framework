@@ -358,6 +358,31 @@ describe('undo and redo on the window (#291)', () => {
     assert.equal(covers(given, h.cm, h.cm.getMessage(reply)!), 'not-covered', 'but not the reply it read before');
   });
 
+  // AF #844 bot review 3, finding 51: a channel_publish a script makes is
+  // credited, once its delivery settles, with the mark taken at its call; a
+  // redo while it is in flight gives that mark again too, as it gives the
+  // script's own.
+  it("a redo gives an in-flight publish's mark again, so the publish is credited with the rows put back", async () => {
+    const h = await boot();
+    h.internals.recordTurnCheckpoint('mira');
+    const render = h.internals.addMessage('editor', [text('render v1')], undefined, { forAgent: 'mira' });
+    await h.mira.compileContext();
+    const callMark = { ...h.mira.getConsumedWatermark()! } as ReadMark;
+    const inFlight = (h.framework as unknown as {
+      holdPublishMark(agent: unknown, mark: ReadMark | null): { release(): ReadMark | null };
+    }).holdPublishMark(h.mira, callMark);
+    const reply = h.cm.addMessage('mira', [text('I saw render v1')], asOwnRow(undefined, 'mira'));
+    h.cm.presentRows([reply]);
+    assert.equal(covers(callMark, h.cm, h.cm.getMessage(render)!), 'covered', "setup: the call's mark covers the render");
+
+    assert.equal(h.framework.undoLastTurn('mira').undone, true);
+    assert.deepEqual(h.framework.redo('mira').window, { retracted: 0, represented: 2 });
+    const credited = inFlight.release();
+    assert.ok(credited && credited !== callMark, "the publish's mark is given again");
+    assert.equal(covers(credited, h.cm, h.cm.getMessage(render)!), 'covered', 'and covers the render put back');
+    assert.equal(covers(credited, h.cm, h.cm.getMessage(reply)!), 'not-covered', 'but not the reply it read before');
+  });
+
   it("a stored injection that changed in the undone turn is stored again at the next start", async () => {
     const lessons = new LessonModule();
     const h = await boot({ modules: [lessons] });

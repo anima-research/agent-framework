@@ -583,6 +583,34 @@ test("a kept create whose release can't say it landed, though it did, applies th
   }
 });
 
+// AF #844 bot review 3, finding 15: where the lookup endLostCreate makes
+// throws, the entry stays with its edit unapplied; the next Discord event's
+// sweep applies it to the row it finds before it ends the entry.
+test("a kept create whose release can't say it landed, and whose read then throws, has its edit applied by the next event's sweep", async () => {
+  const s = await withLostRelease('w1', async ({ discord, processed }) => {
+    const edited = processed('discord:edit', 'w1');
+    discord.onEditHandler!('w1', 'after edit');
+    await edited;
+  }, {
+    store: (add) => {
+      const landed = add();
+      throw new WriteOutcomeUnknownError({ landed: [], unknown: [landed], unnamed: 0 }, new Error('zz-read-failed (test)'));
+    },
+    readThrows: true,
+  });
+  try {
+    assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
+    assert.deepEqual(s.texts('w1'), ['zz-kept-create'], 'premise: the row landed as created');
+    const next = s.processed('discord:message', 'w2');
+    await s.discord.onMessageHandler!(live('w2', 'next message'));
+    await next;
+    assert.equal(s.module.creating.has('w1'), false, 'the sweep ends the entry');
+    assert.deepEqual(s.texts('w1'), ['after edit'], 'having applied the edit kept for it');
+  } finally {
+    await s.cleanup();
+  }
+});
+
 test("a kept create lost at its release ends its record with no store read, so a read that throws then doesn't keep it (bot review 2, #12)", async () => {
   const s = await withLostRelease('d1', async () => {}, {
     store: () => { throw new Error('zz-store-refused (test)'); },

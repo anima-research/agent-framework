@@ -409,8 +409,9 @@ export type TraceEvent =
   /** A write kept in memory until a live surgery's release (source
    *  `surgery-release`) whose store threw there: none of it was stored, or,
    *  with `mayBeStored`, context-manager couldn't tell what of it landed (the
-   *  rows it names as stored are traced as `message:added`). `external` is
-   *  the address the write's metadata gave it, for the module that wrote it
+   *  first row it names as stored is traced as `message:added`, as a stored
+   *  write is). `external` is the address the write's metadata gave it, for
+   *  the module that wrote it
    *  (the Discord module ends its record of a create with no row). The
    *  agent's writes lost at a release are told of once besides, by an ops
    *  alert of kind `store-held-lost`. */
@@ -1145,7 +1146,9 @@ export type TraceEvent =
    * was). `note-undelivered`: its hold ended, by another cancel or by its
    * own run, and delivering the note it carried failed (`error`).
    * `stopped`: the host stopped while it waited, its hold still in force,
-   * which the next boot resumes without running it.
+   * which the next boot resumes without running it. `superseded`: it was
+   * asked for while an earlier cancel of the same hold ran, and joined that
+   * one when it was queued again, whose note stands.
    * `noteLost`: it carried a reader's note, which is not delivered; its
    * author is told so in its own context where the author still exists,
    * and a reader fork that has ended is not, the loss reaching no one
@@ -1163,7 +1166,7 @@ export type TraceEvent =
       channelId: string;
       epochId: string;
       scope?: 'all-except';
-      reason: 'hold-ended' | 'note-undelivered' | 'stopped';
+      reason: 'hold-ended' | 'note-undelivered' | 'stopped' | 'superseded';
       currentEpochId?: string;
       noteLost: boolean;
       noteAuthor?: string;

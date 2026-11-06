@@ -42,4 +42,5 @@
   another server's `work`, the bare id, refused before as on more than one server, now closes the hold's
   channel and adds the same sentence to the answer's `note`. A close that names `other` (`serverId: "other"`
   or `"other:work"`) closes `other`'s `work` and leaves the focus alone. A name the calling turn's own channel
-  answers to, a module's close, and any close while no focus is in force resolve as before.
+  answers to (but for one the focus's channel answers to too, which the 844-close-focus-or-own entry refuses), a
+  module's close, and any close while no focus is in force resolve as before.

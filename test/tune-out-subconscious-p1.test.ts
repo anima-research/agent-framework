@@ -11,11 +11,11 @@
  * no request of the resident's any of them. Until AF-5 a held message was
  * deferred behind the resident's live turn, and the subconscious's view,
  * which reads stored rows, was missing exactly the traffic that came while
- * the resident was busy (P1b). A held message is stored at once now, with
- * the flag off and on. The number of requests per wake isn't pinned: the
- * probe saw several, in both arms, which nothing here explains or needs.
+ * the resident was busy (P1b). A held message is stored at once now. The
+ * number of requests per wake isn't pinned: the probe saw several, which
+ * nothing here explains or needs.
  *
- * P1' (the window, flag on): a row stored in the residents' slot during the
+ * P1' (the window): a row stored in the residents' slot during the
  * subconscious's own turn isn't in that turn's request. It enters at the
  * turn's tool boundary, where the stream is given it, at an ordinal past
  * the round's; the turn's signed thinking is sent again at its next

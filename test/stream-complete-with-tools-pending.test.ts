@@ -408,6 +408,40 @@ describe('a stream that completes while its tools run', () => {
       await run.cleanup();
     }
   });
+  // AF #844 bot review 3, finding 67: storing the round presents it, and
+  // its presentation's listeners run synchronously. A stop one makes then
+  // ends the turn as a stop during the build does, but the round stored by
+  // then keeps its results, so no call is left without one.
+  it("ends the turn when a listener of the round's presentation stops it, the round stored with its results", async () => {
+    const run = await primeCompletedWhileSpillHeld();
+    const { framework, blocks } = run;
+    const traces: TraceEvent[] = [];
+    let stopped = false;
+    framework.onTrace((event) => {
+      traces.push(event);
+      if (stopped || event.type !== 'presentation:presented' || event.agentName !== 'prime' || event.occasion !== 'write') return;
+      stopped = true;
+      assert.equal(framework.abortInference('prime', 'test'), true);
+    });
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      await run.finish();
+      assert.ok(stopped, "setup: the round's presentation was traced, and its listener stopped the turn");
+      const all = blocks();
+      for (const block of ['tool_use:call_fetch', 'tool_use:call_slow', 'tool_result:call_fetch', 'tool_result:call_slow']) {
+        assert.ok(all.includes(block), `${block} is stored: no call without its result`);
+      }
+      const forPrime = traces.filter((t) => (t as { agentName?: string }).agentName === 'prime');
+      assert.deepEqual(forPrime.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason), ['test'],
+        "the stop's one inference:aborted");
+      assert.deepEqual(forPrime.filter((t) => t.type === 'inference:completed'), [], 'and the turn did not complete');
+    } finally {
+      console.warn = warn;
+      await run.cleanup();
+    }
+  });
+
   for (const [label, stop, reason] of [
     ["a caller's stop", (framework: AgentFramework) => { assert.equal(framework.abortInference('prime', 'test'), true); return undefined; }, 'test'],
     ["an operator's abandon", async (framework: AgentFramework) => {
