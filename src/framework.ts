@@ -25358,7 +25358,7 @@ export class AgentFramework {
       ) {
         this.cancelUnsentStream(agent, started.stream, 'compiled while private input was stored');
         agent.reset();
-        this.makeTurnPrivate(agent, routing, trigger?.suppressProse === true);
+        this.makeTurnPrivate(agent, routing);
         notedBeforeCompile = this.privateInputNoted.get(agent.name);
         started = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, compileOptions);
       }
