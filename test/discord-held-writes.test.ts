@@ -486,6 +486,8 @@ async function withLostRelease(
 ): Promise<{
   framework: AgentFramework; discord: FakeDiscord; module: LostCreateInternals; traces: TraceEvent[];
   processed: (type: string, id: string) => Promise<void>; texts: (id: string) => string[]; cleanup: () => Promise<void>;
+  /** How many store reads `readThrows` refused at the release. */
+  readsRefused: () => number;
 }> {
   const dir = mkdtempSync(join(tmpdir(), 'discord-lost-release-'));
   const discord = new FakeDiscord();
@@ -518,6 +520,7 @@ async function withLostRelease(
   const strategy = framework.getAgent('Sol')!.getContextManager().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
   const initialize = strategy.initialize;
   const quiet = console.error;
+  let readsRefused = 0;
   let open: (() => void) | undefined;
   try {
     framework.start();
@@ -538,7 +541,7 @@ async function withLostRelease(
     fw.addMessage = (participant, content, ...rest) => JSON.stringify(content).includes('zz-kept-create')
       ? atRelease.store(() => addMessage(participant, content, ...rest))
       : addMessage(participant, content, ...rest);
-    if (atRelease.readThrows) internals.storedRow = () => { throw new Error('zz-read-refused (test)'); };
+    if (atRelease.readThrows) internals.storedRow = () => { readsRefused++; throw new Error('zz-read-refused (test)'); };
     console.error = () => {};
     open!();
     await within(move, 'the move');
@@ -552,7 +555,7 @@ async function withLostRelease(
     internals.storedRow = storedRow;
     if (initialize) strategy.initialize = initialize; else delete strategy.initialize;
   }
-  return { framework, discord, module: internals, traces, processed, texts, cleanup };
+  return { framework, discord, module: internals, traces, processed, texts, cleanup, readsRefused: () => readsRefused };
 }
 
 const lostTraces = (traces: TraceEvent[]) =>
@@ -601,6 +604,7 @@ test("a kept create whose release can't say it landed, and whose read then throw
     readThrows: true,
   });
   try {
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
     assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
     assert.deepEqual(s.texts('w1'), ['zz-kept-create'], 'premise: the row landed as created');
     const next = s.processed('discord:message', 'w2');
@@ -626,6 +630,7 @@ test("a kept create whose release can't say it landed, and whose read then throw
     assert.deepEqual(lostTraces(s.traces).map((t) => [t.external, t.mayBeStored]), [[{ source: 'discord', id: 'x1' }, true]],
       'premise: the release traced the write as maybe stored');
     assert.deepEqual(s.texts('x1'), [], 'premise: no row landed');
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
     assert.equal(s.module.creating.has('x1'), true, 'premise: kept, its read having thrown');
     const next = s.processed('discord:message', 'x2');
     await s.discord.onMessageHandler!(live('x2', 'next message'));
@@ -658,6 +663,7 @@ test("a lookup that throws for one kept create at an event's sweep leaves the ot
   });
   const quiet = console.error;
   try {
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
     assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
     // A second answered create whose row is stored, with an edit kept for it.
     s.framework.getAgent('Sol')!.getContextManager().addMessage('User', [{ type: 'text', text: 'k9 as created' }],
@@ -732,6 +738,7 @@ test("a kept create lost at its release ends its record with no store read, so a
       'premise: a definite loss');
     assert.deepEqual(s.texts('d1'), [], 'premise: no row landed');
     assert.equal(s.module.creating.has('d1'), false, 'the record of the create ends');
+    assert.equal(s.readsRefused(), 0, 'with no store read');
     // A history sync now stores the message, which it would pass over while the record stayed.
     s.discord.history = [history('d1', 'from the sync')];
     const synced = await s.module.syncChannelHistory('c1');
