@@ -27,7 +27,8 @@
   `tune-out:deferred-cancel-dropped` (`note-undelivered`, with the reason and the author), and the note's author is
   told so: the persistent subconscious in the release itself, a reader fork in its own context, with the hold, the
   resident and the error's text, where it still exists. A reader fork whose run has ended is written nothing, and the
-  loss, reaching no one, is traced as `tune-out:note-loss-untold` (`author-gone`). The cancel still ends the tune-out. Each notice of a lost note gives
+  loss, reaching no one, is traced as `tune-out:note-loss-untold` (`author-gone`); one still running whose context
+  manager refuses its work has the notice kept for it, written once that ends. The cancel still ends the tune-out. Each notice of a lost note gives
   the persistent subconscious a turn to read it. No notice is written while writes are held: it waits for their
   release. A notice of a lost note that can't be written was only logged; it is now kept, traced as
   `tune-out:note-loss-untold` (`write-failed`, with the author and the error) at its first failure, and tried again

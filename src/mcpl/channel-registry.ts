@@ -49,7 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
-import { persistentReaderName, tuneOutHeldWords, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
+import { persistentReaderName, tuneOutHeldWords, tuneOutNoReaderAnswer, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
 import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
@@ -3325,7 +3325,8 @@ export class ChannelRegistry {
     // that took effect would have its traffic diverted. `again` where calling
     // tune_out again tries the open now: the channel is registered here and
     // its server up.
-    const notYet = (later: string, why: string, again = false): string => withStop(
+    // Where no reader runs, each answer is that alone (tuneOutNoReaderAnswer).
+    const notYet = (later: string, why: string, again = false): string => tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
       `The tune-out is recorded, but its messages ${this.tuneOutReach('may not reach')} until this host opens the ` +
       `channel, which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
     );
@@ -3359,7 +3360,7 @@ export class ChannelRegistry {
       // established.
       const reach = this.serverReach(serverId);
       if (reach !== 'up') {
-        return withStop(
+        return tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
           `The tune-out is recorded, but its messages ${this.tuneOutReach("don't reach")} until the "${serverId}" server ` +
           `is connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
           (reach === 'gone' ? unreachableRemedy(reach) : ''),
@@ -3368,7 +3369,7 @@ export class ChannelRegistry {
       const transportOpen = this.tuneOutReadsOpen(entry);
       if (!this.directsLifecycle(serverId)) {
         return transportOpen ? undefined
-          : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages ` +
+          : tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages ` +
             `${this.tuneOutReach('reach')} only as that server sends them, and calling tune_out again won't change ` +
             'that. If you need this host to open it, ask whoever runs this host.';
       }

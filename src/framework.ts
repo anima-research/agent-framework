@@ -25,6 +25,7 @@ import {
   SUBCONSCIOUS_TOOL_NAMES,
   defaultReaderFraming,
   persistentReaderName,
+  tuneOutNoReaderAnswer,
   tuneOutReachWords,
   tunedOutTrafficWords,
   type SubconsciousConfig,
@@ -39467,7 +39468,7 @@ export class AgentFramework {
             .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
         },
         commitDeliveries: () => this.commitDeliveries(),
-        writesHeld: () => this.tuneOutWritesHeld(),
+        writesHeld: (forAgent) => this.tuneOutWritesHeld(forAgent),
         historyTool: () => this.residentHistoryTool(),
         // Every reader of the shared slot compiles the dump with its own
         // strategy, so the dump fits the smallest of their bounds.
@@ -39519,11 +39520,12 @@ export class AgentFramework {
    * epoch's end is on disk at once. The coordinator's cancel waits for them
    * then (its writesHeld; releaseSurgeryHeldWrites runs it), and so does a
    * release of the holds on record with no reader
-   * (releaseTuneOutsWithoutReader).
+   * (releaseTuneOutsWithoutReader). With `forAgent`, a write for that agent
+   * too (a loss notice for a reader fork whose manager refuses its work).
    */
-  private tuneOutWritesHeld(): boolean {
+  private tuneOutWritesHeld(forAgent?: string): boolean {
     return this.surgeryHold !== null || this.replayingHeld
-      || [this.primaryAgentName, this.subconsciousAgentName]
+      || [this.primaryAgentName, this.subconsciousAgentName, forAgent]
         .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name)));
   }
 
@@ -40327,8 +40329,9 @@ export class AgentFramework {
     if (!coordinator || !channelRegistry) {
       return { success: false, error: 'tune-out is not available (no MCPL channels)', isError: true };
     }
-    // An open that throws is answered too, never left unhandled.
-    const openThrew = (err: unknown): string =>
+    // An open that throws is answered too, never left unhandled; where no
+    // reader runs, by that alone (tuneOutNoReaderAnswer).
+    const openThrew = (err: unknown): string => tuneOutNoReaderAnswer(this.tuneOutReader()) ??
       `The tune-out is recorded, but its messages ${tuneOutReachWords(this.tuneOutReader(), 'may not reach')}, since ` +
       `opening its channel failed: ${thrownText(err)}`;
     const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
@@ -40442,7 +40445,8 @@ export class AgentFramework {
         const error = now?.params.epochId === tuneOut.params.epochId
           // A name in a sentence is quoted as tune_out takes it back (main's #852).
           ? alreadyTunedOutText(channelRegistry.quotedShown(resolved), now.params,
-            openError ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
+            openError ?? tuneOutNoReaderAnswer(this.tuneOutReader())
+              ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
           : TUNE_OUT_REPLACED;
         return { success: false, error, isError: true };
       }

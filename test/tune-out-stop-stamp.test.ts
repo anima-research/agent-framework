@@ -16,6 +16,10 @@
  *    again after it was told.
  *
  * And the pins: each test below goes red when the line it names breaks.
+ *
+ * The subconscious that can't take a write is the fake's two ways (REFUSALS):
+ * a store that throws, and the host's refusing context manager, whose writes
+ * are held and kept in memory with an empty id (review 4 #38).
  */
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -54,8 +58,13 @@ function stampSetup() {
   const stampTries = { count: 0 };
   const state = {
     held: false, seq: 100, endFails: false,
-    /** The subconscious's context refuses writes. */
-    subRefuses: false,
+    /** The subconscious's store throws at a write for it: a store that throws, not the host's refusal (`subHeld`). */
+    subThrows: false,
+    /**
+     * The subconscious's context manager refuses its work, as the host has it: writes are held (writesHeld answers
+     * true), and a write for it is kept in memory, answering an empty id, until the refusal ends (storeHeld).
+     */
+    subHeld: false,
     /** The store refuses a note's row (`subconscious-note`). */
     noteRefuses: false,
     /** The stamp can't be read. */
@@ -72,9 +81,13 @@ function stampSetup() {
     frozen: false,
     /** The residents' rows can't be read from this read on (getStoredMessages throws); the reads so far are `rowReads`. */
     rowsFailFrom: Infinity, rowReads: 0,
+    /** The subconscious's rows can't be read: its window and its stored rows (subconsciousWindow, subconsciousStoredMessages) throw. */
+    subRowsUnreadable: false,
   };
   /** Every write for the subconscious, stored, whether or not its window holds it (`frozen`). */
   const subRows: Row[] = [];
+  /** The writes for the subconscious kept in memory while it refuses its work (`subHeld`), stored by storeHeld. */
+  const heldSub: Row[] = [];
   /** Each state write and each sync, in order: `write:<id>`, `sync`. */
   const log: string[] = [];
   const key = (s: string, c: string) => `${s}\0${c}`;
@@ -110,8 +123,12 @@ function stampSetup() {
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
-      if (forAgent === SUB && state.subRefuses) throw new Error("the subconscious's context refused the write (test)");
+      if (forAgent === SUB && state.subThrows) throw new Error("the subconscious's store threw at the write (test)");
       if (metadata?.kind === 'subconscious-note' && state.noteRefuses) throw new Error('the store refused the note (test)');
+      if (forAgent === SUB && state.subHeld) {
+        heldSub.push({ participant, content, ...(metadata ? { metadata } : {}), sequence: 0, forAgent });
+        return '';
+      }
       const row: Row = { participant, content, ...(metadata ? { metadata } : {}), sequence: ++state.seq, ...(forAgent ? { forAgent } : {}) };
       onWrite?.(row);
       added.push(row);
@@ -130,10 +147,16 @@ function stampSetup() {
     },
     getSurgeryHeldMessages: () => [],
     unseenBySubconscious: () => 0,
-    subconsciousWindow: () => window,
-    subconsciousStoredMessages: () => subRows,
+    subconsciousWindow: () => {
+      if (state.subRowsUnreadable) throw new Error("the subconscious's window could not be read (test)");
+      return window;
+    },
+    subconsciousStoredMessages: () => {
+      if (state.subRowsUnreadable) throw new Error("the subconscious's rows could not be read (test)");
+      return subRows;
+    },
     emitTrace: (event: Trace) => { traces.push(event); },
-    writesHeld: () => state.held,
+    writesHeld: () => state.held || state.subHeld,
     commitDeliveries: () => { log.push('sync'); return !state.commitFails; },
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
@@ -199,9 +222,29 @@ function stampSetup() {
   const unrecorded = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered' && textOf(m.content).includes('without recording'));
   const told = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered');
   const stopAll = (): void => { for (const c of made) c.stop(); };
+  /** The subconscious's refusal ends (`subHeld`), as a move that re-initializes it: what was kept for it is stored, in order. */
+  const storeHeld = (): void => {
+    state.subHeld = false;
+    for (const kept of heldSub.splice(0)) {
+      const row: Row = { ...kept, sequence: ++state.seq };
+      added.push(row);
+      subRows.push(row);
+      if (!state.frozen) window.push(row);
+    }
+  };
   const listenWrites = (fn: (row: Row) => void): void => { onWrite = fn; };
-  return { subRows, log, listenWrites, states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll, fork, switchTo, stampTries };
+  return { subRows, heldSub, storeHeld, log, listenWrites, states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll, fork, switchTo, stampTries };
 }
+
+/**
+ * The subconscious can't take a write, two ways (review 4 #38): its store throws (`subThrows`, the coordinator's
+ * thrown-write path), or, as the host has it, its context manager refuses its work (`subHeld`: writes held, a write
+ * kept in memory with an empty id). `on` starts it, `off` ends it, storing what the host kept.
+ */
+const REFUSALS = [
+  { name: 'its store throws', on: (h: ReturnType<typeof stampSetup>) => { h.state.subThrows = true; }, off: (h: ReturnType<typeof stampSetup>) => { h.state.subThrows = false; } },
+  { name: 'its manager refuses its work', on: (h: ReturnType<typeof stampSetup>) => { h.state.subHeld = true; }, off: (h: ReturnType<typeof stampSetup>) => h.storeHeld() },
+] as const;
 
 const conditional = (hold: string, epochId: string, it = 'tune-out') => `[Tune-out: the host stopped without recording the state of ${hold} `
   + `(epoch ${epochId}). If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and any note `
@@ -726,6 +769,7 @@ test('pin: told that its cancel ran, a boot that finds less (nothing in its run)
     const e = h.hold();
     h.release(e, 'subconscious', 'by Subconscious');
     h.boot();
+    assert.equal(h.unrecorded().length, 1, 'premise: the second boot told that its cancel ran (review 4 #39)');
     h.boot();
     assert.equal(h.unrecorded().length, 1);
   } finally { h.stopAll(); }
@@ -756,20 +800,22 @@ test("pin: one hold's told row doesn't silence another hold's", () => quiet(() =
 }));
 
 test('pin: a notice of the stop kept to be written, its write refused, counts as told: one row once written', () => quiet(() => {
-  const h = stampSetup();
-  try {
-    h.boot();
-    h.hold();
-    h.state.subRefuses = true;
-    h.boot();
-    const kept = () => (h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length;
-    assert.equal(kept(), 1, 'the second boot kept its notice (review 2, #104)');
-    const c = h.boot();
-    assert.equal(kept(), 1, 'and the third added none: the kept one counts as told');
-    h.state.subRefuses = false;
-    c.runDeferredCancels();
-    assert.equal(h.unrecorded().length, 1);
-  } finally { h.stopAll(); }
+  for (const refusal of REFUSALS) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      h.hold();
+      refusal.on(h);
+      h.boot();
+      const kept = () => (h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length;
+      assert.equal(kept(), 1, `${refusal.name}: the second boot kept its notice (review 2, #104)`);
+      const c = h.boot();
+      assert.equal(kept(), 1, `${refusal.name}: and the third added none: the kept one counts as told`);
+      refusal.off(h);
+      c.runDeferredCancels();
+      assert.equal(h.unrecorded().length, 1, `${refusal.name}: one row`);
+    } finally { h.stopAll(); }
+  }
 }));
 
 test("pin: the boot arms the retry of its refused stamp itself", () => quiet(() => {
@@ -865,9 +911,9 @@ for (const [what, mark] of [
       h.boot();
       const e = h.hold();
       mark(h, e);
-      h.state.subRefuses = true;
+      h.state.subThrows = true;
       h.boot();
-      h.state.subRefuses = false;
+      h.state.subThrows = false;
       h.boot();
       assert.deepEqual(h.unrecorded().map((m) => textOf(m.content).replace(e, '<epoch>')), [want]);
     } finally { h.stopAll(); g.stopAll(); }
@@ -881,10 +927,10 @@ test('pin: a notice of the stop written after its hold ended says it has ended s
       h.boot();
       const e = h.hold();
       if (ran) h.release(e, 'subconscious', 'by Subconscious');
-      h.state.subRefuses = true;
+      h.state.subThrows = true;
       const c = h.boot();
       h.holds.length = 0;
-      h.state.subRefuses = false;
+      h.state.subThrows = false;
       c.runDeferredCancels();
       assert.match(textOf(h.unrecorded()[0]!.content), ran ? /Its end was not recorded, and that tune-out has ended since\.\]$/ : /That tune-out has ended since\.\]$/);
     } finally { h.stopAll(); }
@@ -1082,9 +1128,9 @@ test('pin: a kept notice of the stop with no sequence of its own counts as told 
       id: 'n1', author: SUB, what: `the tune-out of noisy (epoch ${e})`, for: { epochId: e, serverId: 'editor', channelId: 'noisy' },
       drop: { reason: 'unstamped-stop', found: 'unknown' }, keptAtMs: 1,
     }] });
-    h.state.subRefuses = true;
+    h.state.subThrows = true;
     const c = h.boot();
-    h.state.subRefuses = false;
+    h.state.subThrows = false;
     c.runDeferredCancels();
     assert.equal(h.unrecorded().length, 1);
   } finally { h.stopAll(); }
@@ -1127,9 +1173,9 @@ test("pin: a notice of the stop kept through the store and written by a later bo
     h.boot();
     h.hold();
     h.ask({ channelId: 'noisy', text: 'Look.' });
-    h.state.subRefuses = true;
+    h.state.subThrows = true;
     h.boot();
-    h.state.subRefuses = false;
+    h.state.subThrows = false;
     h.ask({ channelId: 'noisy', text: 'Look.' });
     h.boot();
     assert.equal(h.unrecorded().length, 2);
@@ -1252,11 +1298,11 @@ test("pin: a kept notice silences by when its boot decided it: one kept before a
     h.boot();
     h.hold();
     h.ask({ channelId: 'noisy', text: 'Look.' });
-    h.state.subRefuses = true;
+    h.state.subThrows = true;
     h.boot();
     h.ask({ channelId: 'noisy', text: 'Look.' });
     const c = h.boot();
-    h.state.subRefuses = false;
+    h.state.subThrows = false;
     c.runDeferredCancels();
     assert.equal(h.unrecorded().length, 2);
   } finally { h.stopAll(); }
@@ -1279,13 +1325,13 @@ test("review 2 #26: a boot that can neither write the notice it reads from the l
     h.ask({ channelId: 'noisy', text: 'Look.' });
     // The host dies with the cancel waiting. The next boot can't write to
     // the subconscious, and the store refuses the loss record.
-    h.state.subRefuses = true;
+    h.state.subThrows = true;
     h.refuse.add(LOSS_RECORD);
     h.boot();
     assert.deepEqual(h.told(), [], 'premise: the notice could not be written');
     assert.equal(h.states.get(LOSS_RECORD), undefined, 'premise: nor kept in the store');
     // It dies too, before either lands.
-    h.state.subRefuses = false;
+    h.state.subThrows = false;
     h.refuse.delete(LOSS_RECORD);
     h.boot();
     assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')],
@@ -1435,10 +1481,10 @@ test("review 3 R2: a stop from a listener of a loss notice's write keeps its sta
     // The host dies with the cancel waiting. The next boot can neither
     // write the notice nor keep it in the store: it carries the last stop's
     // bound (review 2, #26).
-    h.state.subRefuses = true;
+    h.state.subThrows = true;
     h.refuse.add(LOSS_RECORD);
     const c = h.boot();
-    h.state.subRefuses = false;
+    h.state.subThrows = false;
     h.refuse.delete(LOSS_RECORD);
     let stopped = false;
     h.listenWrites((row) => {
@@ -1458,14 +1504,14 @@ test("review 3 #13: a branch move back to the stamp's own branch, while the boot
     h.boot();
     const e = h.hold();
     h.ask({ channelId: 'noisy', text: 'Look.' });
-    h.state.subRefuses = true;
+    h.state.subThrows = true;
     h.refuse.add(LOSS_RECORD);
     const c = h.boot();
     assert.deepEqual(h.told(), [], 'premise: the notice could not be written, nor kept in the store');
     // A failed surgery's restore: the store moves back to the branch it was on.
     c.branchMoved();
     // The host dies before either lands.
-    h.state.subRefuses = false;
+    h.state.subThrows = false;
     h.refuse.delete(LOSS_RECORD);
     h.boot();
     assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')], "the next boot still reads the first run's ask");
@@ -1519,39 +1565,46 @@ test("review 3 #9: where the boot can't read that run's rows, an ask is told as 
 }));
 
 test("review 3 #107: a boot that kept its notice in the store and died before its marker, the release the last row it read, gives one row, not two", () => quiet(() => {
-  const h = stampSetup();
-  try {
-    h.boot();
-    const e = h.hold();
-    h.ask({ channelId: 'noisy', text: 'Look.' });
-    h.release(e, 'subconscious', 'by Subconscious', SUB);
-    // The boot can't write its notice to the subconscious, keeps it in the store, and its marker is refused: it dies.
-    h.state.subRefuses = true;
-    h.refuse.add(STAMP);
-    h.boot();
-    assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, 'premise: kept in the store');
-    h.state.subRefuses = false;
-    h.refuse.delete(STAMP);
-    h.boot();
-    assert.deepEqual(h.unrecorded().map((m) => (m.metadata?.stopUnrecorded as { found: string }).found), ['ran'],
-      'the kept one, written now, tells what the release says; the same release, at the head that boot read, tells nothing more');
-  } finally { h.stopAll(); }
+  for (const refusal of REFUSALS) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      const e = h.hold();
+      h.ask({ channelId: 'noisy', text: 'Look.' });
+      h.release(e, 'subconscious', 'by Subconscious', SUB);
+      // The boot can't write its notice to the subconscious, keeps it in the store, and its marker is refused: it dies.
+      refusal.on(h);
+      h.refuse.add(STAMP);
+      h.boot();
+      assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, `${refusal.name}: premise: kept in the store`);
+      refusal.off(h);
+      h.refuse.delete(STAMP);
+      h.boot();
+      assert.deepEqual(h.unrecorded().map((m) => (m.metadata?.stopUnrecorded as { found: string }).found), ['ran'],
+        `${refusal.name}: the kept one, written now, tells what the release says; the same release, at the head that boot read, tells nothing more`);
+    } finally { h.stopAll(); }
+  }
 }));
 
 test("review 3 #8: the kept notice a quiesced boot writes, not in the subconscious's window, still counts as told: one row", () => quiet(() => {
-  const h = stampSetup();
-  try {
-    h.boot();
-    h.hold();
-    h.state.subRefuses = true;
-    h.refuse.add(STAMP);
-    h.boot();
-    assert.equal(h.subRows.length, 0, 'premise: the notice was kept in the store, not written');
-    h.state.subRefuses = false;
-    h.state.frozen = true;
-    h.boot();
-    assert.equal(h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length, 1, 'one notice row, the kept one, though its window holds none');
-  } finally { h.stopAll(); }
+  for (const refusal of REFUSALS) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      h.hold();
+      refusal.on(h);
+      h.refuse.add(STAMP);
+      h.boot();
+      assert.equal(h.subRows.length, 0, `${refusal.name}: premise: the notice was kept in the store, not written`);
+      assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1,
+        `${refusal.name}: premise: the second boot kept it in the store (review 4 #39)`);
+      h.state.frozen = true;
+      refusal.off(h);
+      h.boot();
+      assert.equal(h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length, 1,
+        `${refusal.name}: one notice row, the kept one, though its window holds none`);
+    } finally { h.stopAll(); }
+  }
 }));
 
 test("review 3 #64: a notice written whose record the store then refuses isn't written again by the next boot", () => quiet(() => {
@@ -1570,6 +1623,8 @@ test("review 3 #64: a notice written whose record the store then refuses isn't w
       h.state.frozen = frozen;
       h.boot();
       h.refuse.delete(LOSS_RECORD);
+      assert.equal(h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length, 1,
+        'premise: the boot that dies wrote the notice (review 4 #39)');
       assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, 'premise: the record still keeps it');
       h.boot();
       assert.equal(h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length, 1,
@@ -1625,4 +1680,94 @@ test("review 3 #80: a stop whose record can't be made durable leaves its hold ou
     first.stop();
     assert.ok(!(h.states.get(STAMP) as { epochs: string[] }).epochs.includes(e), 'the stamp leaves it out, so a crash before the record lands is told');
   } finally { h.stopAll(); }
+}));
+
+// ---------------------------------------------------------------------------
+// AF #844 bot review 4 (at 0f7e2711).
+// ---------------------------------------------------------------------------
+
+test("review 4 #13: a branch move to a branch whose loss record lacks the boot's kept notice writes the record there before the marker, so a crash after gives the next boot that notice", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    // A branch made before the next boot keeps its notice: no loss record there.
+    h.fork('other');
+    // The host dies with the cancel waiting. The next boot can't write its notice to the subconscious, and keeps it in the store.
+    h.state.subThrows = true;
+    const c = h.boot();
+    assert.deepEqual(h.told(), [], 'premise: the notice could not be written');
+    assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, "premise: kept in this branch's record");
+    h.switchTo('other');
+    h.log.length = 0;
+    c.branchMoved();
+    const record = h.log.indexOf(`write:${LOSS_RECORD}`);
+    assert.ok(record >= 0 && record < h.log.indexOf(`write:${STAMP}`), `the record is written there before the marker: ${h.log.join(', ')}`);
+    // The host dies before anything else is written there.
+    h.state.subThrows = false;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [askedRow(e, 'Look.')], 'the next boot writes the kept notice, once');
+  } finally { h.stopAll(); }
+}));
+
+test("review 4 #13: a bound still carried where the record left holds the notice is judged by the destination's record: refused there, the marker keeps it", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    const start = h.state.seq;
+    h.boot();
+    h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.fork('other');
+    h.state.subThrows = true;
+    h.refuse.add(LOSS_RECORD);
+    const c = h.boot();
+    assert.deepEqual(h.told(), [], 'premise: the notice could not be written, nor kept in the store');
+    h.refuse.delete(LOSS_RECORD);
+    // The record is written on this branch by a write that leaves the bound for the next check (a loss told meanwhile, say).
+    assert.equal((c as unknown as { writeLossRecord(): boolean }).writeLossRecord(), true);
+    assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, "premise: kept in this branch's record now");
+    const carried = () => (c as unknown as { carriedBound?: unknown }).carriedBound;
+    assert.ok(carried(), 'premise: the bound is still carried');
+    // The move: the destination refuses the record.
+    h.switchTo('other');
+    h.refuse.add(LOSS_RECORD);
+    c.branchMoved();
+    assert.ok(carried(), 'the notice is in no record there, so the bound stays');
+    assert.equal((h.states.get(STAMP) as { runStartedAt?: number }).runStartedAt, start, 'and the marker there reads the last run, from where it began');
+  } finally { h.stopAll(); }
+}));
+
+test("review 4 #18: a boot that can't read the subconscious's rows writes no kept notice until they read, so one written before the stop isn't written again", () => quiet(() => {
+  for (const writtenBefore of [true, false]) {
+    const h = stampSetup();
+    try {
+      const first = h.boot();
+      h.hold();
+      h.state.held = true;
+      first.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
+      first.stop();
+      h.state.held = false;
+      const record = () => (h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices;
+      const rows = () => h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length;
+      if (writtenBefore) {
+        // The next boot writes the notice, and the store refuses the record that would drop it: it dies so.
+        h.refuse.add(LOSS_RECORD);
+        h.boot();
+        h.refuse.delete(LOSS_RECORD);
+        assert.equal(rows(), 1, 'premise: written once, still in the record');
+      }
+      assert.equal(record().length, 1, 'premise: the record keeps it');
+      h.state.subRowsUnreadable = true;
+      const c = h.boot();
+      assert.equal(rows(), writtenBefore ? 1 : 0, `${writtenBefore ? 'written before' : 'not written'}: not written while its rows can't be read`);
+      assert.equal(record().length, 1, 'and kept in the record');
+      c.runDeferredCancels();
+      assert.equal(rows(), writtenBefore ? 1 : 0, 'nor at a retry while they still can\'t');
+      h.state.subRowsUnreadable = false;
+      c.runDeferredCancels();
+      assert.equal(rows(), 1, writtenBefore ? 'once they read, its row is found: it is not written again' : 'once they read, it is written');
+      assert.deepEqual(record(), [], 'and it leaves the record');
+    } finally { h.stopAll(); }
+  }
 }));

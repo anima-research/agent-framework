@@ -96,15 +96,22 @@ describe('what a held channel\'s messages are, said to the resident (AF #844 rev
     assert.deepEqual(tuneOutTool(none), tuneOutTool({ kind: 'persistent', name: 'Muse' }));
   });
 
-  it("says none reads them in tune_out's transport answers too, where none runs (AF #844 review 3, #94)", () => {
-    const reach = (readerWords as unknown as { tuneOutReachWords: (r: unknown, form: string) => string }).tuneOutReachWords;
-    assert.equal(reach({ kind: 'persistent', name: 'Muse' }, 'reach'), 'reach Muse');
-    assert.equal(reach({ kind: 'forks' }, 'may not reach'), 'may not reach the reader');
-    const none = { kind: 'persistent', name: 'Muse', running: false };
-    for (const form of ['reach', 'may not reach', "don't reach"]) {
-      assert.equal(reach(none, form), "are held, with no reader running here to read them, until the tune-out's release, which failed, is tried again",
-        `${form}: no reader is named where none runs`);
-    }
+  it("says none reads them in tune_out's transport answers too, where none runs, in a sentence of its own (AF #844 review 3, #94; review 4, #37)", () => {
+    const words = readerWords as unknown as {
+      tuneOutReachWords: (r: unknown, form: string) => string;
+      tuneOutNoReaderAnswer?: (r: unknown) => string | undefined;
+    };
+    // The words a transport answer puts after "its messages": a predicate, which the answer's own clause follows.
+    assert.equal(words.tuneOutReachWords({ kind: 'persistent', name: 'Muse' }, 'reach'), 'reach Muse');
+    assert.equal(words.tuneOutReachWords({ kind: 'forks' }, 'may not reach'), 'may not reach the reader');
+    assert.equal(words.tuneOutReachWords({ kind: 'persistent', name: 'Muse' }, "don't reach"), "don't reach Muse");
+    // Where none runs, the answer is a sentence of its own, given in place of those answers: it names no reader.
+    assert.equal(typeof words.tuneOutNoReaderAnswer, 'function');
+    assert.equal(words.tuneOutNoReaderAnswer!({ kind: 'persistent', name: 'Muse', running: false }),
+      "The tune-out is recorded, but its messages are held, with no reader running here to read them, until the tune-out's "
+      + "release, which failed, is tried again; opening its channel doesn't change that.");
+    assert.equal(words.tuneOutNoReaderAnswer!({ kind: 'persistent', name: 'Muse' }), undefined, 'a reader runs: the transport answers say where the messages go');
+    assert.equal(words.tuneOutNoReaderAnswer!({ kind: 'forks' }), undefined);
   });
 });
 
