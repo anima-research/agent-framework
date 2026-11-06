@@ -15834,13 +15834,17 @@ export class AgentFramework {
    */
   private holdPublishMark(agent: Agent, mark: ReadMark | null): { release(): ReadMark | null } {
     const held = { mark };
-    let marks = this.publishMarksInFlight.get(agent.name);
-    if (!marks) this.publishMarksInFlight.set(agent.name, (marks = new Set()));
+    // Read defensively: a framework built from its prototype, as some suites
+    // build one, has no field initializers, so the map is made on first use.
+    const inFlight = this.publishMarksInFlight
+      ?? ((this as unknown as { publishMarksInFlight: Map<string, Set<{ mark: ReadMark | null }>> }).publishMarksInFlight = new Map());
+    let marks = inFlight.get(agent.name);
+    if (!marks) inFlight.set(agent.name, (marks = new Set()));
     marks.add(held);
     return {
       release: () => {
         marks!.delete(held);
-        if (marks!.size === 0 && this.publishMarksInFlight.get(agent.name) === marks) this.publishMarksInFlight.delete(agent.name);
+        if (marks!.size === 0 && inFlight.get(agent.name) === marks) inFlight.delete(agent.name);
         return held.mark;
       },
     };
