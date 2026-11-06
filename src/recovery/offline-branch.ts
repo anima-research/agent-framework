@@ -27,8 +27,10 @@ export interface OfflineRecoveryBranchOptions {
    * before that write stay on the branch: those the window took after the
    * anchor enter it again at the agent's next presentation point, after the
    * anchor. Only rows stored after the cut are removed and counted. A
-   * suppression may name any row the branch keeps, one the cut keeps after
-   * the anchor too. A recovery on that window that would change nothing (no
+   * suppression may name any row the branch keeps that has a Discord
+   * message id, one the cut keeps after the anchor too; one without (an
+   * agent's round, a tool row) takes the live suppressMessages, by its row
+   * id. A recovery on that window that would change nothing (no
    * row removed, none an arrival again, no suppression) is refused, as the
    * live rollback refuses it.
    */

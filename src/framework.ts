@@ -3187,7 +3187,11 @@ interface HostCommandParams {
   agentName?: string;
   turns?: number;
   /** Message-granular undo: branch the chronicle so the last N messages
-   *  (regardless of participant) are no longer on the active branch.
+   *  (regardless of participant) are no longer on the active branch (on a
+   *  presented window, but for the rows stored before the write that
+   *  presented the new tail: those the window took after that write,
+   *  `returnedToArrivals`, and those it presented with the tail,
+   *  `keptInWindowAfterTarget`).
    *  Counted in the agent's window once it is presented (#291), over the
    *  rows of the agent's own slot. Mutually exclusive with `turns`. */
   messages?: number;
@@ -9828,7 +9832,9 @@ export class AgentFramework {
       // NOTE: parked wakes and gate buffers are in-memory only — a restart
       // mid-quiesce boots quiesced but with these queues empty (sources like
       // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
-      // Context WRITES made while quiesced are in the store, and survive.
+      // Context WRITES made while quiesced are in the store, and survive,
+      // unless a surgery's hold or a context manager refusing its work keeps
+      // one in memory, which a restart loses.
       console.error(this.queue?.isClosed
         ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
         : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
@@ -10299,8 +10305,9 @@ export class AgentFramework {
    * synced the row (releaseLandedMail); the wake the delivery asks for is in
    * memory. Mail stored while a turn of its recipient's was alive stays out
    * of that agent's window until the turn's next point (its tool boundary
-   * or its end), and its wake runs after the turn; a process that ended
-   * before then lost the wake, and the next boot has nothing left to
+   * or its end), and its wake runs after the turn, unless a request of
+   * the turn carried the row and was answered (rowDone); a process that
+   * ended before then lost the wake, and the next boot has nothing left to
    * deliver: the mail is no longer held (or is released there, its copy
    * found in the store), and an interrupted job's result, stored, needs no
    * "ended without a result" notice (resultStoredFor). So each agent the
@@ -14514,7 +14521,8 @@ export class AgentFramework {
    *
    *   undo — revert the last N inference turns on the agent's window (see
    *   `undoLastTurn`; no branch moves), or with `messages`, the last N rows
-   *   of the agent's own slot, by a rollback onto a new branch (see
+   *   of its window that are in its own slot (the record's, on a window that
+   *   is still the record), by a rollback onto a new branch (see
    *   `rollbackToMessage`). The response includes the last message the agent
    *   would see in its context after the undo, obtained via the transparent
    *   `previewActivation` render (no inference, no Chronicle writes).
@@ -16657,7 +16665,9 @@ export class AgentFramework {
    * chronicle at that message (origin-sequence time-travel branch) and switch
    * to the fork. Everything after the message stays on the source branch
    * (on a presented window, but for the rows stored before the write that
-   * presented it: returnedToArrivals).
+   * presented it: those the window took after that write,
+   * returnedToArrivals, and those it presented with the message,
+   * keptInWindowAfterTarget).
    *
    * The rollback is local to the resident. Marking removed Discord messages
    * with an awareness reaction is a separate, explicit publication choice
@@ -17110,7 +17120,8 @@ export class AgentFramework {
    * the target: they leave the window (`returnedToArrivals`, named by
    * `returnedIds`); the agent's own rows among them enter it again at its
    * next presentation point (the surgery's release), and the rest, as
-   * arrived and not presented, at the agent's next turn start. The rows of
+   * arrived and not presented, at the agent's next turn start (the hold is
+   * in memory: a restart presents them at its pass at rest). The rows of
    * the agent's window after the
    * target that the write presenting it presented too (`keptInWindow`, a
    * batch: one write, one presentation point) stay in the window, since no
@@ -17347,8 +17358,9 @@ export class AgentFramework {
       ? plan.discarded
       : this.planSuppression(agentName, [...new Set((target as { suppress: string[] }).suppress.map(String))]).targeted;
     // On a presented window (#291): which of the rows no live window holds,
-    // and, for a rollback, which rows the cut keeps that leave the window
-    // and which it keeps in it, after the target. A row no window is read
+    // or every view that holds them hides, and, for a rollback, which rows
+    // the cut keeps that leave the window and which it keeps in it, after
+    // the target. A row no window is read
     // to hold, where a window's lookup failed, isn't known to be in none:
     // it is left out of the count, and logged.
     const presented = this.presents(this.agents.get(agentName));
@@ -18560,7 +18572,9 @@ export class AgentFramework {
           // this stream.
           //
           // A held message is no resident's arrival, so it is never presented
-          // to one, nor heard (#232 gap 5), and neither is another agent's
+          // to one (one stored before audience stamps stays in a window
+          // written down from the record; the view still leaves it out), nor
+          // heard (#232 gap 5), and neither is another agent's
           // stored context injection: what the agent's own view leaves out
           // (agentSees, main's #853) is never its arrival (bearingOf reads the
           // same facts: a resident's hidesHeld, isAnotherAgentsInjection, an
@@ -24343,8 +24357,8 @@ export class AgentFramework {
       // answered, by addMessage and storeInFork (landedThoughThrown). One
       // whose store can't tell what of it landed is answered by
       // context-manager's error, the rows it names presented: it may be
-      // lost, and the rows it names as stored are traced. Any other throw
-      // stored none of it.
+      // lost, and the first row it names as stored is traced, as a stored
+      // write is. Any other throw stored none of it.
       const unknown = error instanceof WriteOutcomeUnknownError ? error : undefined;
       if (unknown) {
         console.error(
@@ -27339,7 +27353,8 @@ export class AgentFramework {
       // With the presentation index, the backstop before every compile,
       // fresh or resumed: the agent's own rows stored since its start and not
       // in its window yet (a write whose presentation failed) enter it now,
-      // before the compile takes its read mark.
+      // before the compile takes its read mark (one whose presentation fails
+      // here is traced, and the compile goes on without it).
       if (this.presents(agent)) this.presentation!.presentAtStart(agent, 'compile');
 
       if (carry && this.heardSince(agent, routing, carry.read)) carry = undefined;
@@ -34055,7 +34070,8 @@ export class AgentFramework {
   /**
    * A module's view lookup (ModuleContext.viewKeeps, #291): whether the
    * delivery agent's view, or the named agent's, which must be registered,
-   * as for windowStatusFor, keeps a row, so its requests carry it while its
+   * as for windowStatusFor, keeps a row, so its requests carry it, as its
+   * strategy renders it (a row it has folded, as that summary), while its
    * window holds it. The view is the one its context was opened with, as
    * recorded for it (agentSees, main's #853: liveViewFilterOf's choice,
    * through the agent a shared derivation's view came from): a resident's
@@ -40467,7 +40483,8 @@ export class AgentFramework {
    * those of them that read that slot (readersNamed), stamped for them; a
    * recipient that doesn't read it (a conversation fork, on its own slot)
    * gets its own copy where it reads (`forAgent`), stamped for it, so a
-   * recipient is woken to a notice it is shown and no one else is shown it.
+   * recipient is woken to a notice it is shown and no one else is shown it
+   * but an agent observing that slot (the persistent subconscious).
    * Mixed recipients get it in both places, once each. An event with no
    * recipients is for the residents that take untargeted messages, as
    * before. It goes through addMessage, which stores it at once and

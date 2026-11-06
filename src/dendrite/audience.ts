@@ -30,10 +30,14 @@
  *   message's target is stamped as named even where it doesn't read the
  *   slot the row lands in (a worker or a conversation fork, stored in the
  *   residents' slot): how such a row is presented is left to the
- *   presentation index. A process response's messages, the gate's batched
- *   line and the wake-onboarding notice are stamped for the agents they
- *   name that read that slot, and as a write that names no agent when none
- *   of them does, so they reach the windows that read the slot, as on main.
+ *   presentation index. A process response's messages and the gate's
+ *   batched line are stamped for the agents they name that read that slot,
+ *   and as a write that names no agent when none of them does, so they
+ *   reach the windows that read the slot, as on main. The wake-onboarding
+ *   notice is stamped for its recipients that read that slot; one that
+ *   doesn't (a conversation fork) gets its own copy where it reads, stamped
+ *   for it, and the notice for an event with no recipients is for the
+ *   agents that take untargeted inbound.
  * - `metadata.ownRowOf` names the agent whose own row it is: one stored by
  *   that agent's turn or act (its rounds, its tool results, a puppeted
  *   call), or by the framework for that agent's own turn (a clock row, a
@@ -46,15 +50,16 @@
  *
  * Both keys are the framework's. A write through the framework's
  * `addMessage` is stamped there and a stamp its metadata carried (a copy of
- * a stored row's, say) is replaced, as `deferredWriteId` is. The compile
+ * a stored row's, say) is replaced, as `deferredWriteId` is, but on an
+ * imported write, which keeps the stamp it was queued with. The compile
  * (context-manager's) doesn't read the stamp, so a window compiles as the
  * same rows unstamped do; the presentation index does, so another
  * resident's own rows no longer enter a resident's window unless it
  * observes that resident (AgentConfig.observes). Rows stored before the
  * stamp existed carry none; `audienceOf` says so by returning undefined. A
  * write an earlier version left in its deferred queue is stamped when the
- * importer stores it at boot, as any write through `addMessage` is, so it
- * isn't stored unstamped after the upgrade.
+ * importer stores it at boot, as any write through `addMessage` is, unless
+ * it was queued stamped, so it isn't stored unstamped after the upgrade.
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';

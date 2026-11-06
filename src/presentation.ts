@@ -809,12 +809,12 @@ export class AgentPresentation {
    * Rows `writer` just stored, in its own slot: each other reader of that
    * slot (its owners and its observers) whose turn isn't alive, and the
    * writer itself, is presented what it is owed at once, when one of the
-   * rows is an arrival for it (present at rest). A reader with a turn alive
-   * takes them at its next point. Frozen, only own rows present. The module
-   * needn't present for the writer: one left in legacy mode tells the
-   * readers of its slot too. Each reader is weighed apart, so one whose
-   * window can't be read is traced and the others are still told. Never
-   * throws.
+   * rows is its own or an arrival for it (present at rest). A reader with a
+   * turn alive takes them at its next point. Frozen, only own rows present.
+   * The module needn't present for the writer: one left in legacy mode
+   * tells the readers of its slot too. Each reader is weighed apart, so one
+   * whose window can't be read is traced and the others are still told.
+   * Never throws.
    */
   afterStore(writer: PresentedAgent, ids: ReadonlyArray<MessageId | undefined>): void {
     try {

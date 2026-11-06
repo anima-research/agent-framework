@@ -297,7 +297,8 @@ export interface AgentSpec {
   /**
    * The slot this agent's own rows are stored in: the residents' shared
    * slot for a resident, its own namespace's slot for an isolated agent, the
-   * parent's slot on its own branch for a shared fork. The presets set it,
+   * parent's slot on its own branch for a shared fork. The resident and
+   * subconscious presets set it (the others leave it to the reading below),
    * and the framework fills it for the agents it derives or creates from
    * how it opens their context. Absent, the registry reads it as an older
    * spec meant it: a shared derivation's slot; the shared slot when
