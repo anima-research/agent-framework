@@ -23,7 +23,8 @@
     a new setting, `subconscious.foreignRounds`: `'raw'` sends a resident's rounds as stored, its thinking and
     tool blocks included, as 0.30.0 did, and any other value is refused at `create()`. A thinking block's
     signature rules out sending the block as part of another agent's prefix, not its text; leaving the text out is
-    the transcript's choice.
+    the transcript's choice. A result is told by the nearest call before it with its id, so a resident's result
+    whose id a call of the subconscious's also has (calls numbered per response, `c1`, `call_0`) is transcribed.
   - A reader fork's framing hand-off presents the held rows it is handed into the fork's window when its run takes
     it on: the fork holds them while it lives (`presentedToAnyone`), so a coalescer doesn't withdraw a row a reader
     was handed, and its view keeps them out of its compile, where the framing shows them. A fork its run refuses
