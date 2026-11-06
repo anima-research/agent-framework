@@ -746,6 +746,7 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].addressed, true, 'addressed by the mention');
     assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:room');
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:1');
+    assert.strictEqual(inferenceRequests[0].at, 100, "the mention's arrival, not the newer pin's");
 
     arriving(400, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
       content: 'chatter', metadata: { authorId: '7' } })));
@@ -755,6 +756,9 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, "an addressed notice takes no route, and makes no batch addressed");
     assert.strictEqual(inferenceRequests[1].addressed, undefined);
     assert.deepStrictEqual(inferenceRequests[1].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }]);
+    assert.strictEqual(inferenceRequests[1].at, 400, "the chatter's arrival, not the newer pin's");
+    assert.strictEqual(inferenceRequests[1].counterparty, 'discord:user:7', "the chatter's author, not the pin's");
+    assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
 
     arriving(1_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
       content: 'pat joined', tags: ['chat:system'], metadata: { authorId: '6' } })));
