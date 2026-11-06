@@ -33231,11 +33231,12 @@ export class AgentFramework {
     // the listeners of what follows find it stored, not held as well.
     opts?.replayed?.();
     // Whose placement it is (placementReaders): the delivery agent's, or,
-    // for a write in its slot for other agents only, its one recipient
-    // there, whose wake reads it (wakeToRead, readsRowFor).
+    // for a write in its slot for other agents only, a recipient whose own
+    // slot that is, whose wake reads it (wakeToRead, readsRowFor); which
+    // one is settled below, once each is presented it or not.
     const placedFor = opts?.placement ? this.placementReaders(agent, metadata) : [];
     if (opts?.placement) {
-      opts.placement.agent = placedFor.length === 1 ? placedFor[0]!.name : agent.name;
+      opts.placement.agent = placedFor[0]!.name;
       opts.placement.messageId = stored;
     }
     this.releaseLandedMail(metadata, agent.name);
@@ -33253,32 +33254,43 @@ export class AgentFramework {
     // start assembled for itself, which its start presents before its
     // compile, but while the host is quiesced, when it doesn't. For a write
     // placed for its recipients rather than the delivery agent, each
-    // recipient's turn and window answer, as the delivery agent's would.
-    if (opts?.placement && placedFor.some((reader) => {
+    // recipient's turn and window answer, as the delivery agent's would, and
+    // the placement names the first it wasn't presented to, so `presented`
+    // is that agent's answer and its wake is the one that reads the row.
+    const unpresented = opts?.placement && placedFor.find((reader) => {
       if (reader === agent) return this.placedUnpresented(agent, midTurn, !turnLive && !opts.imported, stored);
       const live = this.logicalTurnAlive(reader);
       return this.placedUnpresented(reader, this.keptOutOfWindow(reader, content, live), !live && !opts.imported, stored);
-    })) {
+    });
+    if (opts?.placement && unpresented) {
+      opts.placement.agent = unpresented.name;
       opts.placement.presented = false;
     }
     return stored;
   }
 
   /**
-   * The agents a write's placement is judged by (addMessage's out-param,
-   * #291): its delivery agent, or, for a write stored in that agent's slot
-   * for other agents only (its stamp names them and not it, as a coalesced
-   * render targeted to a co-resident is: inboundAudience), those of them
-   * that read the slot. With one, the placement is that agent's: whether
-   * the write was presented is its window's answer, and the wake to read
-   * it names it. With none there, the delivery agent's, as before.
+   * The agents a write's placement may name (addMessage's out-param,
+   * #291), never none: its delivery agent, or, for a write stored in that
+   * agent's slot for other agents only (its stamp names them and not it,
+   * as a coalesced render targeted to a co-resident is: inboundAudience),
+   * those of them whose own slot it is. The placement names one agent,
+   * whose store the coalescer reads the row in and removes it from
+   * (isUnreadPlacement, removePlacement), whose wake reads it, and to whom
+   * `presented` refers: the first of these the write wasn't presented to,
+   * else the first. An agent that only observes the slot (the subconscious
+   * over the residents' slot) has no copy of the row in its own store, so
+   * a write for such agents alone is placed for the delivery agent, as
+   * before.
    */
   private placementReaders(agent: Agent, metadata: MessageMetadata | undefined): Agent[] {
     const audience = audienceOf(metadata)?.audience;
     if (!audience || audience.length === 0 || audience.includes(agent.name)) return [agent];
     const slot = this.registry.ownSlotOf(agent.name);
-    const readers = new Set(slot ? this.registry.readersOf(slot) : []);
-    const named = audience.map((name) => this.agents.get(name)).filter((a): a is Agent => a !== undefined && readers.has(a.name));
+    if (!slot) return [agent];
+    const named = audience
+      .map((name) => this.agents.get(name))
+      .filter((a): a is Agent => a !== undefined && sameSlot(this.registry.ownSlotOf(a.name), slot));
     return named.length > 0 ? named : [agent];
   }
 

@@ -50,7 +50,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(options: { subconscious?: boolean; miraObservesOren?: boolean } = {}) {
+async function boot(options: { subconscious?: boolean; miraObservesOren?: boolean; tova?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-presented-watermarks-'));
   dirs.push(dir);
   const framework = await AgentFramework.create({
@@ -59,6 +59,7 @@ async function boot(options: { subconscious?: boolean; miraObservesOren?: boolea
     agents: [
       { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', ...(options.miraObservesOren ? { observes: ['oren'] } : {}) },
       { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
+      ...(options.tova ? [{ name: 'tova', model: 'test-model', systemPrompt: 'You are tova.' }] : []),
     ],
     modules: [],
     syncIntervalMs: 0,
@@ -259,6 +260,73 @@ describe('read marks once windows are presented (#291)', () => {
     } finally {
       internals.activeTurnTokens.delete('oren');
     }
+  });
+
+  // AF #844 bot review 5, findings 1 and 13 (dca00719's cases): a placement
+  // names one agent, whose store the coalescer looks the row up in and
+  // removes it from, whose wake reads it, and to whom `presented` refers.
+  // With several co-residents named and the delivery agent not among them,
+  // it names the one the write wasn't presented to, never the delivery
+  // agent, which isn't a recipient. A recipient that only observes the slot
+  // (the subconscious over the residents' slot) has no copy in its own
+  // store, so the delivery agent's store places the row, as before.
+  const severalFor = async () => {
+    const h = await boot({ tova: true });
+    const tova = h.framework.getAgent('tova')!;
+    h.writeDown(h.mira, h.oren, tova);
+    const internals = h.internals as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { placement?: Placement; audience?: readonly string[] }): MessageId;
+      activeTurnTokens: Map<string, number>;
+    };
+    const write = (t: string, audience: string[]) => {
+      const placement: Placement = { agent: '' };
+      const id = internals.addMessage('user', text(t), {}, { placement, audience });
+      return { id, placement };
+    };
+    /** A write for oren and tova while tova's turn is alive, mira (the delivery agent) at rest. */
+    const tovaBusy = () => {
+      internals.activeTurnTokens.set('tova', -1);
+      try {
+        return write('for oren and tova, tova busy, mira at rest', ['oren', 'tova']);
+      } finally {
+        internals.activeTurnTokens.delete('tova');
+      }
+    };
+    return { h, write, tovaBusy };
+  };
+
+  it('a write for several co-residents, the delivery agent at rest and not among them, asks no wake of the delivery agent', async () => {
+    const { h, tovaBusy } = await severalFor();
+    const busy = tovaBusy();
+    assert.equal(h.oren.getContextManager().windowStatusOf(busy.id), 'in', 'premise: oren, at rest, was presented it');
+    assert.ok(
+      busy.placement.presented !== false || ['oren', 'tova'].includes(busy.placement.agent),
+      `a placement left unpresented names a recipient, whose wake reads it, never mira (placed for ${busy.placement.agent})`,
+    );
+    assert.equal(h.internals.isUnreadPlacement(busy.placement), true, 'unread: no request carried it');
+  });
+
+  it("a write in the shared slot for several co-residents, the delivery agent not among them, is placed for the one it wasn't presented to", async () => {
+    const { write, tovaBusy } = await severalFor();
+    const busy = tovaBusy();
+    assert.deepEqual(busy.placement, { agent: 'tova', messageId: busy.id, presented: false }, "kept out of tova's live turn: hers");
+    const idle = write('for oren and tova, both at rest', ['oren', 'tova']);
+    assert.deepEqual(idle.placement, { agent: 'oren', messageId: idle.id }, 'presented to both: placed for the first, a recipient');
+  });
+
+  it("a write in the residents' slot for the subconscious alone is placed in the delivery agent's store, which holds it: unread until the subconscious reads it", async () => {
+    const h = await boot({ subconscious: true });
+    const subconscious = h.framework.getAgent('Subconscious')!;
+    h.writeDown(h.mira, h.oren, subconscious);
+    const internals = h.internals as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { placement?: Placement; audience?: readonly string[] }): MessageId;
+    };
+    const placement: Placement = { agent: '' };
+    const id = internals.addMessage('user', text('for the subconscious alone'), {}, { placement, audience: ['Subconscious'] });
+    assert.equal(subconscious.getContextManager().getMessage(id), null, "premise: the subconscious's own store has no copy");
+    assert.equal(h.internals.isUnreadPlacement(placement), true, 'unread: no request of the subconscious carried it');
+    assert.equal(placement.agent, 'mira', "the delivery agent's store holds it");
+    assert.equal(placement.messageId, id);
   });
 
   // AF #844 bot review 4, finding 7: a gate's wake routed to a channel
