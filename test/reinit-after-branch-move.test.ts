@@ -3384,13 +3384,19 @@ describe('the window follows a branch move (#291)', () => {
   it('a branch move drops every redo entry: each undid a window of the branch the store left', async () => {
     const h = await boot();
     await h.bothServe('a round');
-    assert.equal(h.framework.undoLastTurn('mira').undone, true);
-    assert.equal(h.framework.getUndoRedoState('mira').canRedo, true, 'setup');
+    // AF #844 bot review 4, finding 50: both agents' entries, so a move
+    // that dropped only one agent's (the primary's, or the mover's) fails.
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.undoLastTurn(name).undone, true);
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `setup: ${name} can redo`);
+    }
     const main = h.store.currentBranch().name;
     h.store.createBranchAt('side', main, h.store.currentSequence());
     await h.framework.switchBranch('side');
-    assert.equal(h.framework.getUndoRedoState('mira').canRedo, false);
-    assert.deepEqual(h.framework.redo('mira'), { redone: false });
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, false, `${name}'s entry is dropped`);
+      assert.deepEqual(h.framework.redo(name), { redone: false });
+    }
   });
 
   /** An autobiographical strategy that folds small chunks into L1s and merges four of them into an L2, compressing only when ticked. */
@@ -3541,12 +3547,18 @@ describe('the window follows a branch move (#291)', () => {
       const first = h.internals.addMessage('someone', blocks('zz-first'), {}, { forAgent: 'oren' });
       const second = h.internals.addMessage('someone', blocks('zz-second'), {}, { forAgent: 'oren' });
       await h.bothServe('a round');
-      assert.equal(h.framework.undoLastTurn('mira').undone, true);
-      assert.equal(h.framework.getUndoRedoState('mira').canRedo, true, 'setup');
+      // AF #844 bot review 4, finding 50: both agents' entries, the agent
+      // the move goes through among them.
+      for (const name of ['mira', 'oren']) {
+        assert.equal(h.framework.undoLastTurn(name).undone, true);
+        assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `setup: ${name} can redo`);
+      }
       if (move === 'rollback') await h.framework.rollbackToMessage('oren', { messageId: first });
       else await h.framework.suppressMessages('oren', { messageIds: [second] });
-      assert.equal(h.framework.getUndoRedoState('mira').canRedo, false);
-      assert.deepEqual(h.framework.redo('mira'), { redone: false });
+      for (const name of ['mira', 'oren']) {
+        assert.equal(h.framework.getUndoRedoState(name).canRedo, false, `${name}'s entry is dropped`);
+        assert.deepEqual(h.framework.redo(name), { redone: false });
+      }
     });
   }
 });
