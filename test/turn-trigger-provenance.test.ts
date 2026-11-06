@@ -2673,16 +2673,17 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a private surface's message stored for one resident while another resident's channel start compiles, after the compile read the store, keeps that start and the next one out of every channel", async () => {
-      const rig = await surfaceRig({ otherAgents: ['aide'] });
-      try {
+    describe("a private surface's message stored for one resident while another resident's channel start compiles, after the compile read the store", () => {
+      const compileRig = async () => {
+        const rig = await surfaceRig({ otherAgents: ['aide'] });
         const aide = rig.framework.getAgent('aide')! as unknown as { startStreamWithInjections: (...args: unknown[]) => Promise<unknown> };
         const compile = aide.startStreamWithInjections.bind(aide);
-        let during: (() => void) | undefined;
+        const during: Array<() => void> = [];
+        let compiles = 0;
         aide.startStreamWithInjections = async (...args: unknown[]) => {
           const started = await compile(...args);
-          during?.();
-          during = undefined;
+          compiles++;
+          during.shift()?.();
           return started;
         };
         const aideStarts = () => rig.starts.filter((s) => s.agentName === 'aide').length;
@@ -2695,16 +2696,55 @@ describe('private wins, one way', () => {
           await rig.framework.runUntilIdle();
           return rig.routed.slice(before).map((r) => r.locus);
         };
-        assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
-        during = () => { storeOperatorMessage(rig.framework); };
-        assert.deepEqual(await aideTurn(), [], 'the start whose compile was running speaks in no channel');
-        assert.ok(!JSON.stringify(rig.membrane.calls.at(-1)).includes('for your eyes only'), "control: that start's request didn't hold the message");
-        assert.deepEqual(await aideTurn(), [], 'the next start, which reads it, speaks in no channel');
-        assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('for your eyes only'), "control: the next start's request held the message");
-        assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
-      } finally {
-        await rig.close();
-      }
+        const store = (text: string) => (rig.framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown })
+          .addMessage('user', [{ type: 'text', text }], { inboundSource: { kind: 'surface', surface: 'tui', acceptedAt: Date.now() } });
+        const note = () => ((rig.framework as unknown as { store: { getStateJson(id: string): unknown } }).store
+          .getStateJson('framework/state') as { privateInputWaiting?: Record<string, unknown> } | null)?.privateInputWaiting?.aide;
+        return { rig, during, compiles: () => compiles, aideStarts, aideTurn, store, note };
+      };
+
+      it('makes that start compile again, private, before it sends anything, and leaves the next channel turn in its channel', async () => {
+        const { rig, during, compiles, aideStarts, aideTurn, store, note } = await compileRig();
+        try {
+          assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+          const calls = rig.membrane.calls.length;
+          const ran = compiles();
+          const starts = aideStarts();
+          during.push(() => { store('for your eyes only'); });
+          assert.deepEqual(await aideTurn(), [], 'the start speaks in no channel');
+          assert.equal(compiles() - ran, 2, 'it compiled twice');
+          assert.equal(aideStarts() - starts, 1, 'as one start');
+          assert.equal(rig.membrane.calls.length - calls, 2, 'control: each compile made a request');
+          assert.ok(!JSON.stringify(rig.membrane.calls.at(-2)).includes('for your eyes only'), "control: the first compile's request didn't hold the message");
+          const request = JSON.stringify(rig.membrane.calls.at(-1));
+          assert.ok(request.includes('for your eyes only'), 'the request it compiled again holds the message');
+          assert.ok(request.includes(PRIVATE_FROM_HERE), 'and tells it the turn is private');
+          assert.equal(note(), false, 'the stored note says nothing waits once the private start answered');
+          assert.deepEqual(await aideTurn(), [ROOM], 'the next channel turn speaks in its channel');
+        } finally {
+          await rig.close();
+        }
+      });
+
+      it('compiles that start at most twice, and a message stored while it compiles again keeps the next start out of every channel', async () => {
+        const { rig, during, compiles, aideStarts, aideTurn, store, note } = await compileRig();
+        try {
+          assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+          const ran = compiles();
+          const starts = aideStarts();
+          during.push(() => { store('for your eyes only'); }, () => { store('and this one too'); });
+          assert.deepEqual(await aideTurn(), [], 'the start speaks in no channel');
+          assert.equal(compiles() - ran, 2, 'it compiled twice');
+          assert.equal(aideStarts() - starts, 1, 'as one start');
+          assert.ok(!JSON.stringify(rig.membrane.calls.at(-1)).includes('and this one too'), "control: its request didn't hold the second message");
+          assert.equal(note(), true, 'the stored note says input waits');
+          assert.deepEqual(await aideTurn(), [], 'the next start speaks in no channel');
+          assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('and this one too'), "control: the next start's request held the second message");
+          assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await rig.close();
+        }
+      });
     });
 
     it("a private-marked row that only its own resident's view keeps leaves another resident's channel turn speaking in its channel", async () => {

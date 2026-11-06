@@ -25343,7 +25343,22 @@ export class AgentFramework {
       if (carry && this.heardSince(agent, routing, carry.read)) carry = undefined;
       const streamCarry: TurnCarry = { silence: carry?.silence ?? null, sends: carry?.sends ?? null, read: lastHeardAt };
       if (this.privateInputStored.has(agent.name) && !routing.nonChannelOrigin) this.makeTurnPrivate(agent, routing, trigger?.suppressProse === true);
-      const notedBeforeCompile = this.privateInputNoted.get(agent.name);
+      const compileOptions = {
+        silentHeartbeat: trigger?.silentHeartbeat,
+        // This turn's retries are the framework's (errorPolicy below), not
+        // membrane's inside each attempt.
+        membraneRetries: false,
+        inferenceBounds: this.inferenceBounds,
+      };
+      let notedBeforeCompile = this.privateInputNoted.get(agent.name);
+      let started = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, compileOptions);
+      if (!routing.nonChannelOrigin && this.privateInputNoted.get(agent.name) !== notedBeforeCompile) {
+        this.cancelUnsentStream(agent, started.stream, 'compiled while private input was stored');
+        agent.reset();
+        this.makeTurnPrivate(agent, routing, trigger?.suppressProse === true);
+        notedBeforeCompile = this.privateInputNoted.get(agent.name);
+        started = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, compileOptions);
+      }
       const {
         stream,
         request: compiledRequest,
@@ -25355,13 +25370,7 @@ export class AgentFramework {
         thinkingBranch,
         noteRequestSent,
         carriedBodies,
-      } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
-        silentHeartbeat: trigger?.silentHeartbeat,
-        // This turn's retries are the framework's (errorPolicy below), not
-        // membrane's inside each attempt.
-        membraneRetries: false,
-        inferenceBounds: this.inferenceBounds,
-      });
+      } = started;
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
@@ -25459,10 +25468,7 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-      if (!trigger?.suppressProse) {
-        if (this.privateInputNoted.get(agent.name) === notedBeforeCompile) this.privateInputStored.delete(agent.name);
-        else if (!routing.nonChannelOrigin) this.makeTurnPrivate(agent, routing);
-      }
+      if (!trigger?.suppressProse && this.privateInputNoted.get(agent.name) === notedBeforeCompile) this.privateInputStored.delete(agent.name);
       const handle = this.driveStream(
         agent,
         stream,

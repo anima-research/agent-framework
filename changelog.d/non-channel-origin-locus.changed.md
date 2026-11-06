@@ -18,9 +18,10 @@
   its context, though the message's
   own wake may still wait in a gate window, or the message woke nothing, and
   for an ordinary resident whose view keeps the message, whichever resident
-  of its shared slot it was stored for. A message stored while a start's
-  request compiles, which that request may or may not hold, makes the turn
-  private as its stream begins, and the resident's next start too. So is a
+  of its shared slot it was stored for. A start that isn't private, where
+  such a message is stored while its request compiles, compiles again,
+  private, before it sends anything; a message stored while it compiles
+  again keeps the resident's next start private too. So is a
   resident's first start in a
   framework made on its store, as after a restart, when the earlier run left
   private input stored for it that no start has answered. The framework keeps
