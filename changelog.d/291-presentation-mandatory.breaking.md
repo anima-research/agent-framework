@@ -19,8 +19,9 @@
     wants them marked rolls back instead, with `rollbackToMessage`'s `marks` or a `host/command` undo by messages
     with `marks`. The result's `fromBranch` and `toBranch`
     are both the store's branch and its `window` says how many rows left or entered; the `undo:completed` and
-    `redo:completed` traces are removed in favour of `window:undone`, and the API server broadcasts `window:undone`
-    in place of `branch:switched` for them. Both are refused while a turn of the agent's is alive, and for an agent
+    `redo:completed` traces are removed in favour of `window:undone` (the one exception to the 899-trace-union
+    entry's unchanged trace names), and the API server broadcasts `window:undone` in place of `branch:switched` for
+    them. Both are refused while a turn of the agent's is alive, and for an agent
     whose window isn't presented; a redo also on another branch than its undo's, which the base redo switched back
     to. Moving no branch, an undo or redo reserves nothing and re-initializes no context manager, as a branch move
     does (0.28.0's entry on the context managers after a branch move), so every other agent goes on compiling, and

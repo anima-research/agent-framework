@@ -28,7 +28,8 @@
   (never presented to it, in a slot it doesn't read, or held by its window and left out by its view) or `window:
   'undone'` (taken out by an undo or a refusal rewind), relative to the calling agent, or to the delivery agent for a
   call no agent made. Their descriptions say so in one more sentence, and `overview`'s says when its summaries' text
-  is left out. `stats` stays an aggregate over the record, as do `overview`'s counts. Without the lookup (a context
+  is left out, so the tool block changes, and the first request after the upgrade misses the prompt cache. `stats`
+  stays an aggregate over the record, as do `overview`'s counts. Without the lookup (a context
   of an earlier framework, or a host's own) every tool and every answer is as it was.
 - `PresentationRetractReason`, the reasons `presentation:retracted` gives: `hide`, `suppress`, `coalescer`, `module`,
   `resume`, `rewind`, `shed`, `boot` and `elsewhere` (rows stamped for other agents, taken out of an agent's window
