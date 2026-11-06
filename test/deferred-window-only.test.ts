@@ -592,8 +592,16 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
           }
           from = at + given.length;
         }
-        if (content.some((b) => b.type === 'image') && !rendered.some((b) => b.type === 'image')) {
+        // Its image, where it was given one, with the source given (AF #844
+        // bot review 5, finding 69); the injection is checked against the
+        // next compile below. Not its place among the text: context-manager's
+        // ingress chunking stores a body's image in its first shard, and its
+        // render sends it ahead of the body's text, wherever it was given.
+        const renderedImage = rendered.find((b) => b.type === 'image');
+        if (content.some((b) => b.type === 'image') && !renderedImage) {
           differ.push(`${name}: the next compile renders the body without its image`);
+        } else if (renderedImage && (renderedImage as { source?: { data?: unknown } }).source?.data !== PNG) {
+          differ.push(`${name}: the next compile renders an image whose source isn't the one given`);
         }
         if (!isDeepStrictEqual(injected[0]!.content, next[0]!.content)) differ.push(`${name}: the injection differs from the next compile`);
       } finally {
