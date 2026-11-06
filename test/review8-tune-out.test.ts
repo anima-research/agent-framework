@@ -931,7 +931,7 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
       + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
       + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. ';
     const stop = 'If the host stops before then, the cancel is lost and it is still in force after the restart, unless its '
-      + 'end time has passed by then.';
+      + 'end time has passed by then, or the host starts again with no reader, which ends every hold on record.';
     const kept = (hold: string) => ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be `
       + 'delivered then, you are told so in your context, and why. If writing that notice fails too, the failure is '
       + 'traced for the host, and the notice is tried again every 60 s, except while such a change or refusal lasts, and '
@@ -1245,7 +1245,8 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
       + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
       + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. The tune-out stays in force until '
       + 'then, and what it held is delivered when it ends, up to its backlog cap. If the host stops before then, the cancel is lost and it is '
-      + 'still in force after the restart, unless its end time has passed by then. Your note waits with the cancel and '
+      + 'still in force after the restart, unless its end time has passed by then, or the host starts again with no reader, '
+      + 'which ends every hold on record. Your note waits with the cancel and '
       + 'goes to the resident as your mail when the tune-out ends, even if your run has ended by then. If it can\'t be '
       + 'delivered then, you are told so in your context, and why, but only while your run lasts: once it has ended, '
       + 'nothing can be written to you, so the loss reaches no one and is only traced for the host. If writing that '
