@@ -265,3 +265,35 @@ describe("the boot's pass over an agent whose owed rows couldn't be read for the
     }
   });
 });
+
+// AF #844 bot review 2, finding 95.
+describe("a persistent subconscious whose window is the record", () => {
+  it("reads the residents' slot it observes at boot, where a release's loss line is stored, as well as its own", async () => {
+    // Its window's index in another version's format: its write-down leaves it in legacy mode.
+    const store = JsStore.openOrCreate({ path: join(dir(), 'store.chronicle') });
+    store.registerState({ id: 'subconscious/mira/window', strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 100 });
+    store.appendToStateJson('subconscious/mira/window', { v: 99 });
+    const framework = await logged(() => AgentFramework.create({
+      store,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+      modules: [],
+      subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for mira.' },
+      syncIntervalMs: 0,
+      operatorLogPath: false,
+    } as Parameters<typeof AgentFramework.create>[0]));
+    try {
+      const f = framework.result;
+      const sub = f.getAgent('Subconscious')!.getContextManager();
+      assert.equal(sub.windowMode(), 'legacy', "setup: the subconscious's window is the record");
+      const loss = f.getAgent('mira')!.getContextManager().addMessage('user', text('[Tune-out: #room cancelled; a note was lost]'), {
+        system: true, kind: 'tune-out-cancel', lostNote: true, audience: ['Subconscious'],
+      } as MessageMetadata);
+      const window = (f as unknown as { subconsciousWindow(): Array<{ id: string }> }).subconsciousWindow();
+      assert.ok(window.some((m) => m.id === loss), "the release in the residents' slot is in what its boot reads");
+    } finally {
+      await framework.result.stop();
+      store.close();
+    }
+  });
+});

@@ -1157,8 +1157,9 @@ type SpillWrite = { path: string; error?: string; branchLeft?: true } | null;
  *  (AgentFramework.releasedWindow). */
 type ReleasedWindow = {
   /** Each unread message the primary takes in its place, in store order,
-   *  with what it says: a sharded body's shards' content joined. */
-  unread: Array<{ participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
+   *  with what it says: a sharded body's shards' content joined, and its
+   *  first shard's id. */
+  unread: Array<{ id: MessageId; participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
 };
 
 function passedOnBodies(messages: readonly StoredMessage[], takes: (m: StoredMessage) => boolean): ReleasedWindow['unread'] {
@@ -1169,12 +1170,12 @@ function passedOnBodies(messages: readonly StoredMessage[], takes: (m: StoredMes
   // messages make up a body is context-manager's rule (continuesBody,
   // pairwise in store order): a group id names the text, so the same text
   // stored twice is two bodies under one id.
-  const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
+  const bodies: Array<{ id: MessageId; participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
   let lastTaken = -1;
   messages.forEach((m, i) => {
     if (!takes(m)) return;
     if (!continuesBody(messages[i - 1], m)) {
-      bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
+      bodies.push({ id: m.id, participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
       lastTaken = i;
     } else if (lastTaken === i - 1) {
       bodies.at(-1)!.shards.push(m);
@@ -12878,10 +12879,20 @@ export class AgentFramework {
         cm = await this.reopenAgentContext(record, new PassthroughStrategy());
         const opened = cm;
         const reader = recordedReaderFacts(this.registry, record.name);
-        const notices = passedOnBodies(opened.getAllMessages(), (m) => passesToPrimary(m.metadata)
+        // The record stays interrupted until the boot's settle (after a
+        // sync, reconcileAgentRegistry), so a crash before it, or a settle
+        // that fails, brings a later boot here again: each notice passed
+        // carries where it came from (`passedOn`), and one the primary's
+        // store holds a pass of goes no further.
+        const from = `${record.name}#${record.incarnation}@${record.createdAt}`;
+        const passed = this.rowsPassedOn(from);
+        const notices = passedOnBodies(opened.getAllMessages(), (m) => !passed.has(m.id)
+          && passesToPrimary(m.metadata)
           && bearingOf(m, reader, 'own') !== 'elsewhere'
           && opened.windowStatusOf(m.id) === 'out');
-        for (const { metadata, ...written } of notices) this.passNoticeToPrimary(record.name, metadata, written);
+        for (const { id, metadata, ...written } of notices) {
+          this.passNoticeToPrimary(record.name, metadata, written, { from, row: id });
+        }
       } catch (err) {
         console.error(`[route-failure] ${record.name}: could not read the context the restart interrupted for notices the primary would take; none is passed:`, err);
       } finally {
@@ -12892,6 +12903,15 @@ export class AgentFramework {
         }
       }
     }
+  }
+
+  /** The rows of the interrupted record `from` (name#incarnation@createdAt) whose pass the primary's store holds (passOnInterruptedNotices). */
+  private rowsPassedOn(from: string): Set<MessageId> {
+    const primary = this.deliveryAgent();
+    if (!primary) return new Set();
+    return new Set(primary.getContextManager().queryMessages({ metadata: { 'passedOn.from': from } }).messages
+      .map((m) => (m.metadata as { passedOn?: { row?: MessageId } } | undefined)?.passedOn?.row)
+      .filter((row): row is MessageId => typeof row === 'string'));
   }
 
   /**
@@ -13040,7 +13060,11 @@ export class AgentFramework {
    * every delivered result carries) at or after the record was created: a
    * single-use name whose counter aged out of the registry starts again at
    * incarnation 1, so an earlier agent of that name and incarnation may have
-   * delivered one to the same recipient.
+   * delivered one to the same recipient. Both times are the registry's wall
+   * clock (Date.now): the two agents are always on opposite sides of a
+   * restart, so they don't share a millisecond, but a clock stepped back
+   * between the record's creation and its result can misjudge the result
+   * as an earlier agent's.
    *
    * Undefined where the store can't be read, which is logged: whether the
    * result was handed over is unknown, so the boot leaves the record out of
@@ -18027,9 +18051,11 @@ export class AgentFramework {
   private subconsciousWindow(): StoredMessage[] {
     const sub = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
     if (!sub) return [];
-    // A subconscious whose window isn't presented (a legacy one) has its
-    // stored rows for its record (#844 round 8, Weft).
-    return this.presents(sub) ? sub.getContextManager().getPresentedMessages() : sub.getContextManager().getAllMessages();
+    // A subconscious whose window isn't presented (a legacy one) reads its
+    // record (#844 round 8, Weft), which getPresentedMessages is then: its
+    // own slot merged with the residents' slot it observes, where a
+    // release's loss line is stored. getAllMessages is its own slot alone.
+    return sub.getContextManager().getPresentedMessages();
   }
 
   /**
@@ -18052,10 +18078,16 @@ export class AgentFramework {
       if (record?.type !== 'staged' || record.agentName !== name) continue;
       let content = record.content;
       if (content && typeof content === 'object' && !Array.isArray(content) && typeof (content as { blobId?: unknown }).blobId === 'string') {
-        const blob = this.store.getBlob((content as { blobId: string }).blobId);
+        // One that can't be read (missing, not JSON, an id the store
+        // refuses) is logged and read as absent: the boot then gives the
+        // conditional row for what it held.
+        const blobId = (content as { blobId: string }).blobId;
         try {
+          const blob = this.store.getBlob(blobId);
           content = blob ? JSON.parse(blob.toString()) as unknown : undefined;
-        } catch {
+          if (!blob) console.error(`[tune-out] ${name}: a staged tool-result audit record names blob ${blobId}, which the store doesn't hold; its results are read as absent`);
+        } catch (error) {
+          console.error(`[tune-out] ${name}: a staged tool-result audit record's blob ${blobId} couldn't be read as JSON; its results are read as absent:`, error);
           content = undefined;
         }
       }
@@ -33482,17 +33514,21 @@ export class AgentFramework {
    * goes where a write that names no agent goes, stamped as one. Never
    * throws: it runs inside a release, which must complete whatever this
    * write meets. Whether the primary was told: false when no one is, or
-   * the write failed, each logged.
+   * the write failed, each logged. `passedOn`, the record and row a boot
+   * passes on (passOnInterruptedNotices), is stamped on the notice, so a
+   * later boot finds it passed.
    */
   private passNoticeToPrimary(
     speaker: string,
     metadata: MessageMetadata | undefined,
     written?: { participant: string; content: ContentBlock[] },
+    passedOn?: { from: string; row: MessageId },
   ): boolean {
     const notice = this.noticeForPrimary(speaker, metadata, written);
     if (!notice) return false;
     try {
-      this.addMessage(notice.participant, notice.content, notice.metadata,
+      this.addMessage(notice.participant, notice.content,
+        passedOn ? { ...notice.metadata, passedOn } as MessageMetadata : notice.metadata,
         this.primaryAgentName ? { audience: [this.primaryAgentName] } : undefined);
       return true;
     } catch (err) {
