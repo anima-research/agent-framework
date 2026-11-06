@@ -17,7 +17,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { ChannelRegistry, type TuneOutParams } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
-import { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
+import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/coordinator.js';
 
 const CHANNEL = 'disc:guild:a';
 const NOW = Date.UTC(2026, 9, 29);
@@ -51,7 +51,7 @@ function coordinatorOn(registry: ChannelRegistry, window: Row[], anchors: number
     getDeferredMessages: () => [],
     emitTrace: () => {},
     currentSequence: sequence,
-    setSubconsciousAnchor: (sequence: number) => { anchors.push(sequence); },
+    setSubconsciousAnchor: ((start) => { anchors.push(start); }) satisfies TuneOutFrameworkHooks['setSubconsciousAnchor'],
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
