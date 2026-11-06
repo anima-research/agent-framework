@@ -5791,8 +5791,8 @@ export class AgentFramework {
     framework.bootFreeze = false;
     framework.presentation?.repairAndRest({ restExcept: unreadAtBoot });
     framework.presentation?.retractAbsentRows();
-    await framework.passOnInterruptedNotices(interruptedAgents);
-    framework.reconcileAgentRegistry(interruptedAgents);
+    const unpassed = await framework.passOnInterruptedNotices(interruptedAgents);
+    framework.reconcileAgentRegistry(interruptedAgents, unpassed);
 
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Check every server's config before any is brought up: its boolean
@@ -12905,7 +12905,8 @@ export class AgentFramework {
     return this.registry.restore(snapshot as RegistrySnapshot | null, ended as AgentRecord[]).interrupted;
   }
 
-  private async passOnInterruptedNotices(interrupted: readonly AgentRecord[]): Promise<void> {
+  private async passOnInterruptedNotices(interrupted: readonly AgentRecord[]): Promise<AgentRecord[]> {
+    const unpassed: AgentRecord[] = [];
     for (const record of interrupted) {
       let cm: ContextManager | undefined;
       try {
@@ -12923,11 +12924,17 @@ export class AgentFramework {
           && passesToPrimary(m.metadata)
           && bearingOf(m, reader, 'own') !== 'elsewhere'
           && opened.windowStatusOf(m.id) === 'out');
+        let failed = 0;
         for (const { id, metadata, ...written } of notices) {
-          this.passNoticeToPrimary(record.name, metadata, written, { from, row: id });
+          if (this.passNoticeToPrimary(record.name, metadata, written, { from, row: id }) === 'failed') failed++;
+        }
+        if (failed > 0) {
+          unpassed.push(record);
+          console.error(`[route-failure] ${record.name}: ${failed} of the notices the primary would take couldn't be written; its record stays interrupted, and the next boot passes them again`);
         }
       } catch (err) {
-        console.error(`[route-failure] ${record.name}: could not read the context the restart interrupted for notices the primary would take; none is passed:`, err);
+        unpassed.push(record);
+        console.error(`[route-failure] ${record.name}: could not read the context the restart interrupted, or pass on the notices the primary would take; its record stays interrupted, and the next boot passes those not yet passed:`, err);
       } finally {
         try {
           cm?.close();
@@ -12936,6 +12943,7 @@ export class AgentFramework {
         }
       }
     }
+    return unpassed;
   }
 
   /** The rows of the interrupted record `from` (name#incarnation@createdAt) whose pass the primary's store holds (passOnInterruptedNotices). */
@@ -12954,7 +12962,7 @@ export class AgentFramework {
    * recipient of an interrupted job's result is told so. Results held from
    * before the restart are delivered now, exactly once.
    */
-  private reconcileAgentRegistry(interrupted: AgentRecord[]): void {
+  private reconcileAgentRegistry(interrupted: AgentRecord[], unpassed: readonly AgentRecord[]): void {
     for (const outcome of this.registry.reconcile().unconfigured) this.settleEndedAgent(outcome);
 
     const byRecipient = new Map<string, AgentRecord[]>();
@@ -13027,7 +13035,7 @@ export class AgentFramework {
     if (interrupted.length > 0) {
       try {
         this.store.sync();
-        this.registry.settleInterrupted(unread);
+        this.registry.settleInterrupted([...unread, ...unpassed]);
       } catch (error) {
         console.error('[dendrite] the restart notices could not be synced; the interrupted records stay in the registry, and the next boot tells their recipients again unless the notice is found:', error);
       }
@@ -16399,7 +16407,7 @@ export class AgentFramework {
     const lost: SurgeryHeldWrite[] = [];
     for (const write of writes) {
       if (passesToPrimary(write.metadata)
-        && this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content })) {
+        && this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content }) === 'passed') {
         passed++;
       } else {
         lost.push(write);
@@ -33586,29 +33594,32 @@ export class AgentFramework {
    * learns of it (noticeForPrimary). The notice is the primary's alone
    * (#291's audience stamp): a co-resident sharing the primary's slot isn't
    * the agent who takes the speaker's place. On a host with no primary it
-   * goes where a write that names no agent goes, stamped as one. Never
-   * throws: it runs inside a release, which must complete whatever this
-   * write meets. Whether the primary was told: false when no one is, or
-   * the write failed, each logged. `passedOn`, the record and row a boot
-   * passes on (passOnInterruptedNotices), is stamped on the notice, so a
-   * later boot finds it passed.
+   * goes where a write that names no agent goes, stamped as one. A failed
+   * write is logged and returned, not thrown: it runs inside a release,
+   * which must complete whatever this write meets. Building the notice isn't
+   * guarded, so a throw there, as a store read for a channel notice's words
+   * can make at boot, reaches the caller. Whether the primary was told:
+   * `declined` when no one is, `failed` when the write failed, each logged.
+   * `passedOn`, the record and row a boot passes on
+   * (passOnInterruptedNotices), is stamped on the notice, so a later boot
+   * finds it passed.
    */
   private passNoticeToPrimary(
     speaker: string,
     metadata: MessageMetadata | undefined,
     written?: { participant: string; content: ContentBlock[] },
     passedOn?: { from: string; row: MessageId },
-  ): boolean {
+  ): 'passed' | 'declined' | 'failed' {
     const notice = this.noticeForPrimary(speaker, metadata, written);
-    if (!notice) return false;
+    if (!notice) return 'declined';
     try {
       this.addMessage(notice.participant, notice.content,
         passedOn ? { ...notice.metadata, passedOn } as MessageMetadata : notice.metadata,
         this.primaryAgentName ? { audience: [this.primaryAgentName] } : undefined);
-      return true;
+      return 'passed';
     } catch (err) {
       console.error(`[route-failure] failed to tell the primary ${notice.about}:`, err);
-      return false;
+      return 'failed';
     }
   }
 

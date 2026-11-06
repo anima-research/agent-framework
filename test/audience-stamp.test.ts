@@ -345,7 +345,7 @@ describe('the audience stamp (#291)', () => {
     const framework = await boot();
     const internals = framework as unknown as {
       registry: AgentRegistry;
-      reconcileAgentRegistry(interrupted: unknown[]): void;
+      reconcileAgentRegistry(interrupted: unknown[], unpassed: unknown[]): void;
     };
     const cm = framework.getAgent('mira')!.getContextManager();
     const hold = (text: string): HeldMail => internals.registry.holdMail({
@@ -359,7 +359,7 @@ describe('the audience stamp (#291)', () => {
     const legacy = hold('for oren, stored before `to`');
     cm.addMessage('mira', [{ type: 'text', text: 'for oren, stored before `to`' }], { kind: 'agent-message', dendrite: { mailId: legacy.id } });
 
-    internals.reconcileAgentRegistry([]);
+    internals.reconcileAgentRegistry([], []);
     await framework.runUntilIdle();
 
     const copies = (id: string) => cm.getAllMessages().filter((m) => (m.metadata as { dendrite?: { mailId?: string } } | undefined)?.dendrite?.mailId === id);
@@ -389,13 +389,13 @@ describe('the audience stamp (#291)', () => {
 
   it('a copy of held mail for another resident that lands doesn\'t release the mail: its own delivery does', async () => {
     const framework = await boot();
-    const internals = framework as unknown as { reconcileAgentRegistry(interrupted: unknown[]): void };
+    const internals = framework as unknown as { reconcileAgentRegistry(interrupted: unknown[], unpassed: unknown[]): void };
     const mail = mailForOrenWithACopyForMira(framework, 'for oren, a copy for mira that lands');
 
     assert.deepEqual(copiesOf(framework, mail), ['mira'], 'mira\'s copy landed');
     assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mail.id], 'still held for oren: the copy wasn\'t his');
 
-    internals.reconcileAgentRegistry([]);
+    internals.reconcileAgentRegistry([], []);
     await framework.runUntilIdle();
     assert.deepEqual(copiesOf(framework, mail), ['mira', 'oren'], 'boot\'s check delivers it to oren');
     assert.deepEqual(framework.listHeldMail(), [], 'which releases it');
