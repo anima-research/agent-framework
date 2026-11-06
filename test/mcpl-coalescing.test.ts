@@ -20,6 +20,21 @@ import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
 import { coverTest, readMarkForTest, type ReadMark } from '../src/read-marks.js';
 
+/**
+ * Drain the framework (`drain`, named for its failure) until `settled`,
+ * polling every 20 ms on a time budget read from the monotonic clock
+ * rather than a count of passes, so a slow machine isn't failed by a pass
+ * count that fits a fast one (AF #844 bot review 5, #29).
+ */
+async function drainUntil(settled: () => boolean, drain: (what: string) => Promise<unknown>, what: string, budgetMs = 10_000): Promise<void> {
+  const deadline = performance.now() + budgetMs;
+  for (let pass = 1; !settled(); pass++) {
+    assert(performance.now() < deadline, `${what} was settled within ${budgetMs / 1000} s`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await drain(`${what}, the drain after pass ${pass}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
 // ---------------------------------------------------------------------------
@@ -2729,11 +2744,8 @@ for (const when of ['after', 'before'] as const) {
     try {
       await f.send('push/event', f.params('1', 'throwing_fallback', { deferred: true, initial: true }));
       await settles(f.framework.runUntilIdle(), 'the first drain');
-      for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
-        assert(pass < 100, 'the batch was settled within 100 passes');
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        await settles(f.framework.runUntilIdle(), `the drain after pass ${pass + 1}`);
-      }
+      await drainUntil(() => coalescer.pendingBatches() === 0 && internals.pendingRequests.length === 0,
+        (what) => settles(f.framework.runUntilIdle(), what), 'the batch');
     } finally {
       console.error = error;
     }
@@ -2843,11 +2855,8 @@ for (const atRecovery of ['readable', 'unreadable'] as const) {
     try {
       await f.send('push/event', f.params('1', 'unknown_fallback', { deferred: true, initial: true }));
       await settles(f.framework.runUntilIdle(), 'the first drain');
-      for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
-        assert(pass < 100, 'the batch was settled within 100 passes');
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        await settles(f.framework.runUntilIdle(), `the drain after pass ${pass + 1}`);
-      }
+      await drainUntil(() => coalescer.pendingBatches() === 0 && internals.pendingRequests.length === 0,
+        (what) => settles(f.framework.runUntilIdle(), what), 'the batch');
     } finally {
       console.error = error;
       own.handleMessageStoreEvent = handle;
@@ -2905,11 +2914,8 @@ test("a render whose store can't tell whether its row landed, where none did, ha
   f.renderer(async (params) => ({ content: [{ type: 'text', text: `subject_render_${String(params.eventId)}` }] }));
   const settle = async (what: string) => {
     await settles(f.framework.runUntilIdle(), what);
-    for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
-      assert(pass < 100, `${what}: the batch was settled within 100 passes`);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      await settles(f.framework.runUntilIdle(), `${what}, the drain after pass ${pass + 1}`);
-    }
+    await drainUntil(() => coalescer.pendingBatches() === 0 && internals.pendingRequests.length === 0,
+      (drained) => settles(f.framework.runUntilIdle(), drained), what);
   };
   const cm = f.framework.getAgent('agent')!.getContextManager();
   const rowsWith = (text: string) => cm.getAllMessages().filter((m) => JSON.stringify(m.content).includes(text));
