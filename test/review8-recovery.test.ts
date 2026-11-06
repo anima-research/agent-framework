@@ -97,13 +97,19 @@ describe('AF #844 review 8 — offline recovery at a presented cut', () => {
     const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
     cm.presentRows([]);
     const a = cm.addMessage('user', [{ type: 'text', text: 'A' } as ContentBlock], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-A' });
+    // AF #844 bot review 4, finding 103: a later record row, B, stored
+    // after A and presented before it, so A is the window's tail and B a
+    // row the cut at A's presentation keeps: "all kept" holds of a row.
+    const b = cm.addMessage('user', [{ type: 'text', text: 'B' } as ContentBlock], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-B' });
+    cm.presentRows([b]);
     cm.presentRows([a]);
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [b, a], 'premise: A is the tail of the window, B a later record row before it');
     cm.close();
     store.close();
     await assert.rejects(
       createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'd-A', dryRun: true }),
       (error: Error) => {
-        assert.match(error.message, /already the tail of cairn's window/);
+        assert.match(error.message, /already the tail of cairn's window: every message stored after it was stored before the write that presented it/);
         assert.ok(error.message.endsWith(OWN_SLOT_ONLY), error.message);
         return true;
       },
