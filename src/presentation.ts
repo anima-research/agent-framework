@@ -874,8 +874,11 @@ export class AgentPresentation {
     // The sweep below decides the own rows a failed write left (presentOwn):
     // the backstop's at once, as its compile goes on whatever it presents; a
     // fresh start's once it hasn't thrown, so the next own row's write still
-    // puts them first after a start that presented nothing.
+    // puts them first after a start that presented nothing. Only those kept
+    // before it: a listener of its presentation, which runs inside it, may
+    // store an own row whose presentation fails, kept by that nested write.
     if (!fresh) this.failedOwn.delete(cm);
+    const keptBefore = fresh ? new Set(this.failedOwn.get(cm) ?? []) : undefined;
     // A fresh start is where rows a write-down took in that aren't the
     // agent's, whose retraction failed, leave before its compile, and a
     // reader fork's framing whose presentation failed enters.
@@ -895,7 +898,11 @@ export class AgentPresentation {
     if (fresh && failure !== undefined) {
       throw new Error(`${agent.name}'s turn start could not present what it is owed (at ${occasion}): ${describe(failure)}`, { cause: failure });
     }
-    if (fresh) this.failedOwn.delete(cm);
+    if (keptBefore) {
+      const keptMeanwhile = [...(this.failedOwn.get(cm) ?? [])].filter((id) => !keptBefore.has(id));
+      if (keptMeanwhile.length > 0) this.failedOwn.set(cm, new Set(keptMeanwhile));
+      else this.failedOwn.delete(cm);
+    }
     if (withArrivals) {
       this.heldUntilStart.delete(cm);
       this.restWithheld.delete(agent.name);
