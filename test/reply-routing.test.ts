@@ -13,7 +13,7 @@ import { MembraneError, type NormalizedRequest, type NormalizedResponse } from '
 import { wakeProvenance } from '../src/gate/event-gate.js';
 import { RequiredAdmission } from '../src/mcpl/inbound-admission.js';
 import { withReplyConsumer, admissionRoutingFields } from '../src/mcpl/reply-admission.js';
-import { replyConsumer, replyWork, replyOwner, workOf, shareReplyTurn, type ReplyBinding } from '../src/mcpl/reply-routing.js';
+import { replyConsumer, turnReply, replyWork, replyOwner, workOf, shareReplyTurn, type ReplyBinding } from '../src/mcpl/reply-routing.js';
 const reply = (channelId = 'room/one', override = channelId) => ({ channelId: override });
 const at = (channelId = 'room/one', serverId = 'endpoint-a') => ({ serverId, channelId });
 /** Private scaffolding: real admission mints bindings; a recording double replaces transport. */
@@ -31,7 +31,7 @@ function registryFor(active?: (name: string) => any) {
       sendChannelsOpen: async (p: any) => ({ opened: true, channel: { id: p.channelId, type: 'synthetic', label: p.channelId } }),
     });
   }
-  const registry = new ChannelRegistry({ getServer: (id: string) => peers.get(id) } as any, {} as any, () => {}, () => {}, { activeChannelResolver: active });
+  const registry = new ChannelRegistry({ getServer: (id: string) => peers.get(id), getAllServers: () => [...peers.values()] } as any, {} as any, () => {}, () => {}, { activeChannelResolver: active });
   for (const serverId of peers.keys()) for (const channelId of ['room/one', 'room/other', 'topic:second', 'topic:alpha/β|room/other']) {
     (registry as any).channels.set(destinationKey(at(channelId, serverId)), { serverId, open: true,
       descriptor: { id: channelId, label: channelId, type: 'synthetic', address: {} } });
@@ -938,3 +938,35 @@ test('#3 taken-back merged batches are partitioned after expansion', async () =>
     assert.deepEqual(x.publishes.map(p => p.channelId), ['room/one', 'topic:second']);
   } finally { await x.close(); }
 });
+
+// R1 regressions: production scheduler/publication, with transport replaced only.
+test('R1-1 private debounce causes share one private model call', async () => {
+  const x = await frameworkFor();
+  try {
+    const events = await Promise.all(Array.from({ length: 3 }, () => x.request(reply(''))));
+    const causes = workOf(wakeProvenance(events as any));
+    assert.equal(causes.length, 3);
+    for (const cause of causes) x.f.pendingRequests.push({ ...events[0], [replyWork]: [cause] });
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1);
+    assert.equal(x.f.turnRouting.get('assistant').replyWorks.length, 3);
+    assert.deepEqual(x.publishes, []);
+  } finally { await x.close(); }
+});
+
+test('R1-1 merged private continuations recognize every owned cause, not other owners', async () => {
+  const x = await frameworkFor();
+  try {
+    const works = [await x.binding(reply('')), await x.binding(reply(''))];
+    const open = x.f.routingOf('assistant');
+    open.replyWorks = works; open.reply = turnReply(works);
+    x.f.openLogical.set('assistant', open);
+    for (const work of works) {
+      const request = { [replyWork]: [work], [replyOwner]: open.turnId };
+      assert.equal(x.f.replyStartDisposition('assistant', request), 'run');
+      assert.equal(shareReplyTurn(request, { [replyWork]: [works[0]], [replyOwner]: open.turnId + 1 }), false);
+    }
+    assert.equal(x.f.replyStartDisposition('assistant', { [replyWork]: [await x.binding(reply(''))], [replyOwner]: open.turnId }), 'defer');
+  } finally { x.f.openLogical.delete('assistant'); await x.close(); }
+});
+

@@ -20114,7 +20114,7 @@ export class AgentFramework {
     if (work && owner !== undefined && open?.turnId !== owner) return 'stale';
     if (!open || (!open.reply && !work)) return 'run';
     // Private continuations own the same work, not a publishable destination.
-    const samePrivateWork = !!open.reply && !open.reply.destination && open.reply === work;
+    const samePrivateWork = !!open.reply && !open.reply.destination && (open.replyWorks ?? [open.reply]).includes(work!);
     return owner === open.turnId && (samePrivateWork || sameDestination(open.reply, work)) ? 'run' : 'defer';
   }
 

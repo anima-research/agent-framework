@@ -58,7 +58,8 @@ export function sameWork(a: object, b: object): boolean {
 export function shareReplyTurn(a: object, b: object): boolean {
   const aa = workOf(a), bb = workOf(b);
   return (a as ReplyWork)[replyOwner] === (b as ReplyWork)[replyOwner] &&
-    (sameWork(a, b) || aa.length > 0 && bb.length > 0 && [...aa, ...bb].every(w => sameDestination(aa[0], w)));
+    (sameWork(a, b) || aa.length > 0 && bb.length > 0 && [...aa, ...bb].every(w =>
+      !aa[0].destination && !w.destination || sameDestination(aa[0], w)));
 }
 function mint(connection: ConnectionKey, destination?: ReplyDestination, current: () => boolean = () => false): ReplyBinding {
   const binding = Object.freeze({ connection, ...(destination ? { destination } : {}), workId: Symbol('admitted work') });
