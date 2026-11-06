@@ -88,7 +88,7 @@ export interface RequiredIngress {
   /** Host-only continuation after the lane's response is written or abandoned (or notification completion). */
   afterResponse?(work: () => void): void;
   /** Reserve at arrival, before callbacks; both lanes share the subject queue. */
-  orderCoalesced?(scope: CoalescingScope, key: string, retract?: boolean): { ready: Promise<void>; retire(): void; overloaded?: boolean };
+  orderCoalesced?(scope: CoalescingScope, key: string, retract?: boolean): { ready: Promise<void>; retire(): void; overloaded?: 'admission_ticket_capacity' | 'admission_withdrawal_capacity' };
   check(): RefusalCode | undefined;
   admit(lane: AdmissionLane, item: unknown, signal?: AbortSignal): Promise<AdmissionVerdict>;
 }
@@ -197,7 +197,7 @@ export class RequiredAdmission {
 
 /** Fixed refusal codes only: never log payload, callback errors or private intent.
  * Every refusal is traced; repeated lines are bounded per server/lane/code. */
-export type AdmissionDiagnosticCode = RefusalCode | 'admission_ticket_capacity' | 'admission_module_capacity';
+export type AdmissionDiagnosticCode = RefusalCode | 'admission_ticket_capacity' | 'admission_withdrawal_capacity' | 'admission_module_capacity';
 
 export class AdmissionRefusals {
   private readonly lines = new RefusalLines();

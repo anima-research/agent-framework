@@ -222,7 +222,7 @@ export class PushHandler {
       const receipt = replay();
       if (receipt) { await ticket?.ready; await receipt; return; }
       if (ticket?.overloaded) {
-        this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', 'admission_ticket_capacity', params);
+        this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', ticket.overloaded, params);
         responder?.respond({ accepted: false, reason: 'admission_denied' });
         return;
       }

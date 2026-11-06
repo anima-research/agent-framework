@@ -2013,7 +2013,7 @@ export class ChannelRegistry {
             continue;
           }
           if (ticket?.overloaded) {
-            this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', 'admission_ticket_capacity', message);
+            this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', ticket.overloaded, message);
             results.push({ messageId: message.messageId, accepted: false, reason: 'admission_denied' });
             continue;
           }

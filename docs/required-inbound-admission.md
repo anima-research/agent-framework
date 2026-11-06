@@ -73,8 +73,14 @@ later traffic for B. Outstanding coalescing tickets are capped at 64 per server 
 excess fresh occurrences refuse without joining the subject queue, after live receipt lookup.
 A withdrawal may take one over-cap ticket per subject with a live occupant or
 pending coalesced work/ticket; it still waits behind that subject's create and
-uses the ordinary per-connection admission budget. Unknown-subject withdrawals
-and additional over-cap withdrawals for the same subject refuse at the cap. A pause or grant change during a running preflight invalidates it even if restored before the verdict.
+uses the ordinary per-connection admission budget. The separate exported allowance
+`MAX_OVERCAP_WITHDRAWAL_TICKETS = 16` bounds these extra tickets per server id,
+across reconnect epochs, for at most 64+16 outstanding tickets. Every retract item
+in a channel batch that needs an over-cap ticket consumes its own allowance slot
+at arrival reservation, before callbacks; slots release only when their tickets
+retire. Beyond this allowance, withdrawals refuse with wire reason `admission_denied` and trace reason
+`admission_withdrawal_capacity`. Unknown-subject withdrawals and additional
+over-cap withdrawals for the same subject refuse at the cap. A pause or grant change during a running preflight invalidates it even if restored before the verdict.
 Required connections never advertise `toolHints`, even if `toolHints: true` is
 configured. That explicit combination logs one diagnostic at connect (not on
 automatic transport retries); it is not a configuration error. Under RFC-014 §6.3 the peer must not send hints and should tailor
@@ -152,9 +158,10 @@ Withdrawals are never refused at the module cap: removal stands, and if the
 withdrawal delivers a notice, only that notice's module work is dropped with
 `mcpl:module-work-dropped`, count 1, reason `admission_module_capacity`.
 No reservation exceeds either allowance at admission. Pure withdrawals deliver no module work.
-The lane diagnostic/trace reasons `admission_ticket_capacity` and
-`admission_module_capacity` distinguish the two bounds from policy denials;
-both capacity refusals retain wire reason `admission_denied` (no wire schema change).
+The lane diagnostic/trace reasons `admission_ticket_capacity`,
+`admission_withdrawal_capacity` and `admission_module_capacity` distinguish the
+bounds from policy denials; all capacity refusals retain wire reason
+`admission_denied` (no wire schema change).
 Receipt retries create no work and still replay at capacity, after current
 authority (not the callback verdict or capacity) is checked under the mutex,
 after its subject ticket is ready. The receipt stays pinned during that wait.

@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { MAX_PENDING_REQUIRED_MODULE_WORK, AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export { MAX_OVERCAP_WITHDRAWAL_TICKETS, MAX_PENDING_REQUIRED_MODULE_WORK, AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';

@@ -22,6 +22,9 @@
   through admission with per-subject arrival ordering shared across both lanes.
   At the ticket cap, one withdrawal per live/pending subject still takes its
   ordered ticket through the ordinary admission budget; unknown subjects refuse.
+  A separate 16-ticket withdrawal allowance per server id spans reconnect epochs,
+  counts each batch item at reservation, and releases on ticket retirement.
+  Overflow refuses with `admission_denied` / trace `admission_withdrawal_capacity`.
   Module backlog counts released/running work separately from the bounded
   reservations awaiting a lane response, so a batch does not refuse its own
   later siblings as module backlog.
@@ -37,8 +40,8 @@
   `mayWake: true` does not override gate declines or prevent a module-driven wake.
   Admission refusals are traced with fixed codes and rate-limited diagnostics.
   The package exports read-only `admissionOf(event)`, `AdmittedEnvelope`,
-  `AdmissionConnectError`, `MAX_ADMISSION_TIMEOUT_MS`, `MAX_PENDING_ADMISSIONS`
-  and `MAX_PENDING_REQUIRED_MODULE_WORK`.
+  `AdmissionConnectError`, `MAX_ADMISSION_TIMEOUT_MS`, `MAX_PENDING_ADMISSIONS`,
+  `MAX_PENDING_REQUIRED_MODULE_WORK` and `MAX_OVERCAP_WITHDRAWAL_TICKETS`.
   Missing bindings and attestation refusals abort startup even if cleanup also
   fails; ordinary transport failures keep the existing non-fatal startup and
   configured reconnect policy. Pending inference admission is cancelled by stop
@@ -51,7 +54,7 @@
   (feature-set scope for plain pushes). Overflow refuses new deliveries before
   content acceptance; withdrawals still remove occupants, dropping only a
   delivered notice's module work at capacity, with diagnostics. Capacity
-  diagnostics distinguish ticket/module limits from policy denials; wire
+  diagnostics distinguish ticket/withdrawal/module limits from policy denials; wire
   refusals remain `admission_denied`. Live receipts replay even at capacity,
   subject to current authority rechecked under the coalescer mutex.
   Stop/disconnect drop queued work with diagnostics; close/reconnect preserve

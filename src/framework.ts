@@ -1081,6 +1081,8 @@ type CoalescedDelivery =
 /** Required coalesced released module work per channel/feature-set scope,
  * including the running call. Unreleased reservations have a separate equal bound. */
 export const MAX_PENDING_REQUIRED_MODULE_WORK = MAX_PENDING_ADMISSIONS;
+/** Extra ordered withdrawal tickets per server id, shared across reconnect epochs. */
+export const MAX_OVERCAP_WITHDRAWAL_TICKETS = 16;
 type RequiredModuleSlot = {
   connection: ConnectionKey;
   queue: RequiredModuleQueue;
@@ -4300,6 +4302,7 @@ export class AgentFramework {
   private readonly requiredModuleReservations = new WeakMap<object, RequiredModuleSlot>();
   private readonly coalescingTicketCounts = new Map<string, number>();
   private readonly coalescingWithdrawalTickets = new Set<string>();
+  private readonly coalescingWithdrawalTicketCounts = new Map<string, number>();
   private readonly coalescingTickets = new Map<string, Promise<void>>();
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
@@ -18974,19 +18977,24 @@ export class AgentFramework {
   }
 
   /** Reserve a subject's effect order before either lane awaits admission. */
-  private takeCoalescingTicket(serverId: string, scope: CoalescingScope, key: string, retract = false) {
+  private takeCoalescingTicket(serverId: string, scope: CoalescingScope, key: string, retract = false): ReturnType<NonNullable<RequiredIngress['orderCoalesced']>> {
     const count = this.coalescingTicketCounts.get(serverId) ?? 0;
     const subject = coalescingSubjectKey(serverId, this.coalescingBinding(serverId), scope, key);
     const overCap = count >= MAX_PENDING_ADMISSIONS;
     if (overCap) {
-      // A withdrawal must still follow its create at saturation. Bound the
-      // exception to one outstanding withdrawal per live/pending subject;
-      // unknown subjects and repeated withdrawals cannot grow the queue.
+      // A withdrawal must still follow its create at saturation. Deduplicate
+      // live/pending subjects, then reserve from a separate per-server allowance.
+      // Like the normal ticket count, this allowance spans reconnect epochs.
       if (!retract || this.coalescingWithdrawalTickets.has(subject)
         || !(this.coalescingTickets.has(subject) || this.pushCoalescer?.hasLiveSubject(subject))) {
-        return { ready: Promise.resolve(), retire() {}, overloaded: true };
+        return { ready: Promise.resolve(), retire() {}, overloaded: 'admission_ticket_capacity' };
+      }
+      const withdrawals = this.coalescingWithdrawalTicketCounts.get(serverId) ?? 0;
+      if (withdrawals >= MAX_OVERCAP_WITHDRAWAL_TICKETS) {
+        return { ready: Promise.resolve(), retire() {}, overloaded: 'admission_withdrawal_capacity' };
       }
       this.coalescingWithdrawalTickets.add(subject);
+      this.coalescingWithdrawalTicketCounts.set(serverId, withdrawals + 1);
     }
     this.coalescingTicketCounts.set(serverId, count + 1);
     const ready = this.coalescingTickets.get(subject) ?? Promise.resolve();
@@ -18997,7 +19005,12 @@ export class AgentFramework {
     const tail = ready.then(() => retired);
     this.coalescingTickets.set(subject, tail);
     void tail.then(() => {
-      if (overCap) this.coalescingWithdrawalTickets.delete(subject);
+      if (overCap) {
+        this.coalescingWithdrawalTickets.delete(subject);
+        const withdrawals = this.coalescingWithdrawalTicketCounts.get(serverId)! - 1;
+        if (withdrawals) this.coalescingWithdrawalTicketCounts.set(serverId, withdrawals);
+        else this.coalescingWithdrawalTicketCounts.delete(serverId);
+      }
       const remaining = this.coalescingTicketCounts.get(serverId)! - 1;
       if (remaining) this.coalescingTicketCounts.set(serverId, remaining);
       else this.coalescingTicketCounts.delete(serverId);
