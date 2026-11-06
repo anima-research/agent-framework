@@ -2935,9 +2935,12 @@ export class TuneOutCoordinator {
       if (toScope || typeof ask.input.channelId !== 'string') return false;
       const name = ask.input.channelId;
       if (!namesOf(h).includes(name)) return false;
-      // The qualified name's server: without it, the bare-name check below
-      // reaches the same answer, as no other hold answers to this hold's
-      // qualified name; it is kept so the server is read where it is named.
+      // The qualified name's server: a name that is this hold's qualified
+      // one names its server, which is read here. Without it, the bare-name
+      // check below can reach another answer: another server's channel can
+      // have that name as its id (`editor:noisy` on server `other`), and
+      // then two holds answer to the name, so the ask would count for
+      // neither.
       const server = ask.serverId
         ?? (typeof ask.input.serverId === 'string' && ask.input.serverId ? ask.input.serverId : undefined)
         ?? (name === qualifiedChannelName({ serverId: h.serverId, channelId: h.channelId }) ? h.serverId : undefined);
