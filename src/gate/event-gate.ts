@@ -4420,8 +4420,8 @@ export class EventGate {
     }
     for (const [name, state] of this.judging) {
       if (name === leftOut.policy || state === leftOut.batch) continue;
-      const queued = state.queued.length > 0 ? `, with ${count(state.queued.length)} queued behind it` : '';
-      wakes.push({ certain: false, when: 'once the judge decides it', what: `rule ${quotedValue(name)}'s batch of ${count(state.events.length)}${queued}, which the judge is deciding` });
+      const queued = state.queued.length > 0 ? `, with ${count(state.queued.length)} queued behind it, sent to the judge unless the call wakes the agent` : '';
+      wakes.push({ certain: false, when: 'once the judge decides it', what: `rule ${quotedValue(name)}'s batch of ${count(state.events.length)}, which the judge is deciding${queued}` });
     }
     const refusal = this.judgeHeldForRefusal() ? this.judgeRefusal : null;
     const unjudged = this.judgeOnError === 'wake' && this.judgeRefusing() ? ', or delivered without it if its calls are still refused then' : '';

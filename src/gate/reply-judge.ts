@@ -31,9 +31,10 @@
  * which stays put while the window grows into its budget: the chunks before
  * the newest stay byte-identical from one request to the next, and a cache
  * breakpoint after the last full one lets every later request read them from
- * the prompt cache. Only when the window outgrows its budget does the anchor
- * move, to leave the window a share of the budget to grow into again, or,
- * for a request refused as too long, does the retry go without it.
+ * the prompt cache. Only when the window outgrows its budget, or its first
+ * messages are no longer found, does the anchor move, to leave the window a
+ * share of the budget to grow into again, or, for a request refused as too
+ * long, does the retry go without it.
  *
  * The judge reads; it never writes into the agent's context and never speaks.
  */
