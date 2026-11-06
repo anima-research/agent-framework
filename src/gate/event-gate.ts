@@ -4202,6 +4202,11 @@ export class EventGate {
     const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
+    // Where a line stored now landed, for the delivery agent's wake, as the
+    // self-wake's notice places its own (readsRowFor): a live turn that
+    // carried and answered the line drops the wake. Other agents' wakes stay
+    // plain by readsRowFor's rule.
+    const placement: WritePlacement = {};
     if (only && this.newestEntry(only, audience)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
       line = {
@@ -4215,7 +4220,7 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
-      }, undefined, undefined, audience);
+      }, undefined, placement, audience);
     }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
@@ -4230,7 +4235,7 @@ export class EventGate {
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of woken) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance, line ? undefined : placement);
       woke?.push(agentName);
     }
   }

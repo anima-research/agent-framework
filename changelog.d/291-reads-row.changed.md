@@ -31,4 +31,6 @@
   its turn. A conversation fork's channel message, routed to it or delivered
   to it by name (`deliverTo`), marks the fork's wake the same way, and one its
   server tagged `chat:ambient` marks it ambient, as a resident's, so it asks
-  no answer in its channel.
+  no answer in its channel. A gate batch's `[Gate: …]` line, stored with its
+  batch, marks the delivery agent's wake with its row, as the self-wake's
+  notice does; other agents' wakes for the batch stay plain.
