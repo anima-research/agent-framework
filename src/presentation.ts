@@ -1527,7 +1527,14 @@ export class AgentPresentation {
     return { entered, ...(error !== undefined ? { error } : {}) };
   }
 
-  /** Tell the agent's listeners of the rows that entered its window, in order. */
+  /**
+   * Tell the agent's listeners of the rows that entered its window, in
+   * order, each body as the window holds it. Where the window can't be
+   * read for that, they are told of each entered row by its first shard
+   * (a body's later shards left out), and that is logged: the rows are in
+   * the window whatever the read, so the listeners (noteArrival, the
+   * subconscious's anchor) still hear them.
+   */
   private tell(
     agent: PresentedAgent,
     occasion: PresentationOccasion,
@@ -1540,17 +1547,33 @@ export class AgentPresentation {
     const cm = agent.getContextManager();
     const byHead = new Map((bodies ?? []).map((body) => [body.shards[0]!.id, body.shards] as const));
     let window: StoredMessage[] | undefined;
-    const rows = ids.filter((id) => entered.has(id)).flatMap((id) => {
-      const shards = byHead.get(id);
-      if (shards) return shards.filter((shard) => cm.ordinalOf(shard.id) !== undefined);
-      // A row named alone (an own row at its write): its body as the window now holds it.
-      window ??= cm.getPresentedMessages();
-      const at = window.findIndex((m) => m.id === id);
-      if (at === -1) return [];
-      let end = at + 1;
-      while (end < window.length && continuesBody(window[end - 1], window[end])) end++;
-      return window.slice(at, end);
-    });
+    const named = ids.filter((id) => entered.has(id));
+    let rows: StoredMessage[];
+    try {
+      rows = named.flatMap((id) => {
+        const shards = byHead.get(id);
+        if (shards) return shards.filter((shard) => cm.ordinalOf(shard.id) !== undefined);
+        // A row named alone (an own row at its write): its body as the window now holds it.
+        window ??= cm.getPresentedMessages();
+        const at = window.findIndex((m) => m.id === id);
+        if (at === -1) return [];
+        let end = at + 1;
+        while (end < window.length && continuesBody(window[end - 1], window[end])) end++;
+        return window.slice(at, end);
+      });
+    } catch (error) {
+      console.error(`[presentation] ${agent.name}'s window couldn't be read to tell its listeners which rows entered it, so they are told of each by its first shard:`, error);
+      rows = named.flatMap((id) => {
+        const head = byHead.get(id)?.[0];
+        if (head) return [head];
+        try {
+          const row = cm.getMessage(id);
+          return row ? [row] : [];
+        } catch {
+          return [];
+        }
+      });
+    }
     for (const listener of [...listeners]) {
       try {
         listener({ agentName: agent.name, occasion, rows });
