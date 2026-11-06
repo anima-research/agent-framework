@@ -41492,6 +41492,12 @@ export class AgentFramework {
             // compiled view (agentSees, main's #853), so its images aren't
             // either.
             if (!this.agentSees(agent, messages[i]?.metadata)) continue;
+            // An observed agent's round (AgentConfig.observes) is in the
+            // window, but the images of its tool results are that agent's:
+            // their refs are in its ledger, not this agent's, so they take no
+            // slot. A row from before the stamp names no owner, and counts.
+            const rowOwner = audienceOf(messages[i]?.metadata)?.ownRowOf;
+            const othersRound = rowOwner !== undefined && rowOwner !== agentName;
             const messagesBack = total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {
@@ -41513,7 +41519,7 @@ export class AgentFramework {
                   mediaType: (typeof claimed === 'string' ? sanitizeLabel(claimed, REFERENCE_LIMITS.mimeType) : '') || 'image/png',
                   messagesBack,
                 });
-              } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
+              } else if (block?.type === 'tool_result' && typeof block.content === 'string' && !othersRound) {
                 considerToolResultImages(
                   block.toolUseId ?? 'unknown',
                   block.toolName ?? 'unknown tool',
