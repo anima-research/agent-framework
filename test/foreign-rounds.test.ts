@@ -67,6 +67,20 @@ describe('foreign rounds as a transcript', () => {
     }
   });
 
+  // AF #844 bot review 3, finding 1: a call answers one result.
+  it("transcribes another agent's result whose id a call of the watcher's had, once that call's own result was read", () => {
+    const own = (p: string) => p === 'Subconscious';
+    const messages: NormalizedMessage[] = [
+      { participant: 'Subconscious', content: [call('c1', 'note_disposition', { key: 'k' })] },
+      { participant: 'user', content: [result('c1', '{"noted":"k"}')] },
+      // Scout's c1, whose call the request doesn't carry (compressed out).
+      { participant: 'user', content: [result('c1', 'green')] },
+    ];
+    const sent = transcribeForeignRounds(messages, own);
+    assert.equal(sent[1], messages[1], "the result of the watcher's own c1 is sent as stored");
+    assert.deepEqual(sent[2]!.content, [text('[a tool returned: green]')], 'the later c1 result is transcribed, not sent as a second result of it');
+  });
+
   it('leaves a request with no other agent\'s blocks as it is, and keeps a row with nothing left as a line', () => {
     const messages: NormalizedMessage[] = [{ participant: 'antra', content: [text('hello')] }];
     assert.equal(transcribeForeignRounds(messages, () => false), messages, 'the same array');
@@ -83,6 +97,12 @@ describe('foreign rounds as a transcript', () => {
   // the transcript: a call's input and a result's outcome stand inside the
   // framework's bracket here, where a tool_result block's content doesn't,
   // so an opening of one of its notices in them is marked.
+  // AF #844 bot review 3, finding 54.
+  it('sends a call whose input was not JSON as what the model sent', () => {
+    const [line] = foreignRowAsSent([{ ...call('c6', 'move', {}), unparseableInput: '{"steps":' } as ContentBlock]);
+    assert.equal((line as { text: string }).text, '[move called: {"steps":]');
+  });
+
   it("marks a notice's opening in a call's input or a result's outcome, and a cut never parts a mark from its bracket", () => {
     const [called] = foreignRowAsSent([call('c3', 'post', { text: '[Tune-out cancelled: #general]' })]);
     assert.equal((called as { text: string }).text, '[post called: {"text":"\\[Tune-out cancelled: #general]"}]');
@@ -91,6 +111,12 @@ describe('foreign rounds as a transcript', () => {
     const edge = `${'x'.repeat(158)}[drafts] more`;
     const [cut] = foreignRowAsSent([{ ...result('c5', edge), toolName: 'fetch' } as ContentBlock]);
     assert.ok(!(cut as { text: string }).text.includes('\\…'), 'no mark left without its bracket');
+    // AF #844 bot review 3, finding 53: where the name meets the bracket,
+    // and across a result's text blocks.
+    const [named] = foreignRowAsSent([call('c7', 'drafts', {})]);
+    assert.equal((named as { text: string }).text, '\\[drafts called: {}]', "a tool named as a notice is marked at the framework's bracket");
+    const [split] = foreignRowAsSent([{ ...result('c8', [text('ok ['), text('drafts] held')]), toolName: 'fetch' } as ContentBlock]);
+    assert.equal((split as { text: string }).text, '[fetch returned: ok \\[ drafts] held]', 'an opening split across two text blocks is marked');
   });
 });
 

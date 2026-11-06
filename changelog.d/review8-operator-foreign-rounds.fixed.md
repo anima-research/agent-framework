@@ -6,3 +6,6 @@
   calls went out to it as stored. Each branch move sets the mode again: the
   configured one where the agent's window is presented, `'raw'` where it
   stays the record.
+- In a transcript, a call answers one result: another agent's result whose id a call of the watcher's had, and
+  which comes after that call's own result (its own call compressed out of the request), is now sent as a line
+  ("a tool returned: …") rather than as a second result of the watcher's call (#291).
