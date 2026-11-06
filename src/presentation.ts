@@ -1465,9 +1465,11 @@ export class AgentPresentation {
   }
 
   /**
-   * One presentRows call for `ids` in the agent's window: on a throw, the
-   * rows that entered before it count, and the failure is traced. Traces
-   * what entered and tells the listeners.
+   * One presentRows call for `ids` in the agent's window: every row named
+   * counts once it returns (it refuses a row already in the window, and
+   * returns one ordinal per row named); on a throw, the rows that entered
+   * before it count, as far as the window can be read then, and the
+   * failure is traced. Traces what entered and tells the listeners.
    */
   private present(
     agent: PresentedAgent,
@@ -1481,14 +1483,30 @@ export class AgentPresentation {
     const cm = agent.getContextManager();
     const lengthBefore = cm.indexLength();
     let error: unknown;
+    let entered: Set<MessageId>;
     try {
       cm.presentRows(ids);
+      // Read from the write's return, not the window: a read that throws
+      // now mustn't keep rows the store holds from being traced and told.
+      entered = new Set(ids);
     } catch (thrown) {
       error = thrown;
+      try {
+        entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
+      } catch (readError) {
+        console.error(`[presentation] ${agent.name}'s window couldn't be read after a failed presentation, so none of it is counted as entered:`, readError);
+        entered = new Set();
+      }
     }
-    const entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
     const memo = this.memos.get(cm);
-    if (memo && memo.length === lengthBefore) memo.length = cm.indexLength();
+    if (memo && memo.length === lengthBefore) {
+      try {
+        memo.length = cm.indexLength();
+      } catch {
+        // The scan's memo can't be moved past the rows: the next scan reads them again.
+        this.memos.delete(cm);
+      }
+    }
     if (error !== undefined) this.failed(agent, occasion, error, ids.filter((id) => !entered.has(id)), extra?.next);
     if (entered.size > 0) {
       if (!quiet) {

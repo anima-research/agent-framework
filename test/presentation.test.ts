@@ -1155,6 +1155,30 @@ describe('the presentation module at the point after one that failed', () => {
   });
 
 
+  // AF #844 bot review 3, finding 48.
+  it("rows a presentation wrote count as entered though a read of the window throws right after, so its listeners hear them", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('oren');
+    const heard: Array<[string, string[]]> = [];
+    r.presentation.onPresented('oren', (event) => heard.push([event.occasion, event.rows.map(textOf)]));
+    const cm = r.oren.cm;
+    const realPresent = cm.presentRows.bind(cm);
+    const realOrdinal = cm.ordinalOf.bind(cm);
+    let armed = false;
+    cm.presentRows = (ids) => { const ordinals = realPresent(ids); armed = true; return ordinals; };
+    cm.ordinalOf = (id) => {
+      if (armed) { armed = false; throw new Error('a transient read failure'); }
+      return realOrdinal(id);
+    };
+    const reply = quietly(() => storeOwnRow(r.oren, 'oren', text("oren's reply")));
+    cm.ordinalOf = realOrdinal;
+    assert.equal(r.oren.has(reply), true, 'setup: the write presented it');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed'), [], 'a write the store accepted is no failure');
+    assert.deepEqual(ofType(r.traces, 'presentation:presented').filter((t) => t.agentName === 'oren').map((t) => [t.occasion, t.count]), [['write', 1]]);
+    assert.deepEqual(heard, [['write', ["oren's reply"]]], 'and its listeners hear it');
+  });
+
   // AF #844 bot review 3, finding 46.
   it("an own row kept after a failed write still enters ahead of the next own row when a fresh start throws at its retraction", async () => {
     const r = await rig();
