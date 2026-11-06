@@ -223,6 +223,28 @@ describe('read marks once windows are presented (#291)', () => {
     assert.equal(h.internals.rowDone(h.mira, row, room), true, 'she spoke there having read it');
   });
 
+  // AF #844 bot review 4, finding 7: a gate's wake routed to a channel
+  // carries its source as 'gate' and the channel's server as
+  // channelServerId. Whether the agent spoke there after reading the row is
+  // asked of that server, so a turn that read the batch's line and answered
+  // in the routed channel before the wake ran leaves the wake nothing to do.
+  it("a gate's routed wake whose row was read and answered in its channel starts no turn: its channel is looked up on its server, not on 'gate'", async () => {
+    const h = await boot();
+    h.writeDown(h.mira, h.oren);
+    const cm = h.mira.getContextManager();
+    const row = h.store('[Gate: two messages]', ['mira']);
+    cm.presentRows([row]);
+    await h.mira.compileContext();
+    h.mira.markAnswered(h.mira.getConsumedWatermark());
+    const room: Destination = { serverId: 'chat', channelId: 'chat:room' };
+    h.mira.notePublished(destinationKey(room), h.mira.getConsumedWatermark());
+    const wake = { agentName: 'mira', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsRow: row };
+    h.internals.pendingRequests.push({ ...wake, channelId: room.channelId, channelServerId: room.serverId, addressed: true });
+    assert.equal(await h.turnsStarted(), 0, 'read, and answered where it was routed: no turn');
+    h.internals.pendingRequests.push({ ...wake, channelId: 'chat:elsewhere', channelServerId: room.serverId, addressed: true });
+    assert.equal(await h.turnsStarted(), 1, 'routed to a channel she has not spoken in since: its turn starts');
+  });
+
   describe("the window's own order and audience, not the record's", () => {
     const entry = { eventType: 'mcpl:push-event', serverId: 'discord', eventId: 'ev-1' };
     const event = { serverId: 'discord', eventId: 'ev-1' } as unknown as MessageMetadata;

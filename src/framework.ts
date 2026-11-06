@@ -22177,9 +22177,10 @@ export class AgentFramework {
         if (r.readsRow === undefined) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
         // speech is routed by it, so waiting for one in its channel would
-        // keep its wake forever.
+        // keep its wake forever. The channel is on its own server where the
+        // wake names one (a gate's routed wake, whose source is 'gate').
         const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
-          ? undefined : { serverId: r.source, channelId: r.channelId };
+          ? undefined : { serverId: r.channelServerId ?? r.source, channelId: r.channelId };
         return this.rowDone(agent, r.readsRow, to);
       });
       if (read.length > 0) {
