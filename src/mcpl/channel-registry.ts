@@ -570,7 +570,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's or private admitted work with no host-approved reply destination, has no default, so it names one. Automatic reply bindings override legacy routing defaults; this tool still authorizes explicit sends separately. A subagent has no default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2527,7 +2527,11 @@ export class ChannelRegistry {
    * Get synthesized tool definitions for channel operations.
    */
   getChannelTools(): ToolDefinition[] {
-    return this.channelTools;
+    if (!this.serverRegistry.getAllServers?.().some(server => server.replyAuthority)) return this.channelTools;
+    return this.channelTools.map(tool => tool.name !== 'channel_publish' ? tool : {
+      ...tool,
+      description: tool.description + ' A turn carrying private admitted work with no host-approved reply destination has no default. On connections with reply authority, automatic reply bindings override legacy routing defaults (locked prose still requires a matching lock); this tool still authorizes explicit sends separately.',
+    });
   }
 
   /**

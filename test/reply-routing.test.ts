@@ -1047,3 +1047,17 @@ test('R1-3 tune-out aggregate release is explicitly private on opted-in hosts', 
 });
 
 
+test('R1-4 unconfigured channel_publish description is byte-identical to the base', () => {
+  const x = registryFor();
+  try {
+    for (const peer of x.peers.values()) peer.replyAuthority = undefined;
+    const description = () => x.registry.getChannelTools().find(tool => tool.name === 'channel_publish')!.description;
+    const baseline = "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.";
+    assert.equal(description(), baseline);
+    x.peers.get('endpoint-a')!.replyAuthority = {};
+    assert.match(description(), /private admitted work/);
+    assert.match(description(), /explicit sends separately/);
+    x.peers.get('endpoint-a')!.replyAuthority = undefined;
+    assert.equal(description(), baseline);
+  } finally { x.registry.stopAll(); }
+});
