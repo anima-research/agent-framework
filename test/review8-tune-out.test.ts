@@ -2084,8 +2084,8 @@ test("review 3 #11: a cancel asked for with a note while an earlier one runs joi
     assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [
       '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. An earlier cancel of that tune-out was running '
       + "when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note is to go out "
-      + "when it ends the tune-out; where it can't be delivered, its author is told.]",
-    ], 'and its author is told so, without a promise that the earlier note is delivered (review 4, #24)');
+      + "when it ends the tune-out; where it can't be delivered, its author is told, if it still runs.]",
+    ], 'and its author is told so, without a promise that the earlier note is delivered (review 4, #24), or that its author is told where it has ended (review 5, #38)');
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -2915,5 +2915,42 @@ test("review 5 #22: a queued cancel whose run delivered its note and then failed
       h.coordinator.stop();
       errors.mock.restore();
     }
+  }
+});
+
+test("review 5 #38 (regression of 21eb8f86): the notice of a note dropped beside an earlier cancel's promises that note's author is told of its loss only while it runs, as an ended reader fork is told nothing", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ forks: true });
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-1', 'First.', 'reader-1');
+    h.state.held = false;
+    let asked = false;
+    h.listenWrites((metadata) => {
+      if (metadata?.kind !== 'tune-out-cancel' || asked) return;
+      asked = true;
+      // The release's write begins a hold, and another fork's cancel of the same hold, with a note, waits.
+      h.state.held = true;
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-2', 'Second.', 'reader-2');
+    });
+    h.coordinator.runDeferredCancels();
+    h.listenWrites(() => {});
+    assert.ok(asked, 'premise: the second cancel was asked for during the run');
+    // reader-1's run ends before its note goes out, and the note can't be delivered then.
+    h.state.gone.push('reader-1');
+    h.state.noteFails = true;
+    h.state.held = false;
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null, 'premise: the hold ends');
+    assert.deepEqual(h.untold().map((t) => [t.noteAuthor, t.reason]), [['reader-1', 'author-gone']],
+      "premise: the earlier note's author, ended, is told nothing of its loss");
+    const told = h.lossNotices().filter((m) => m.forAgent === 'reader-2').map((m) => textOf(m.content));
+    assert.equal(told.length, 1, 'premise: the later note\'s author is told its note was dropped');
+    assert.ok(!/its author is told/.test(told[0]!) || /its author is told, if it still runs/.test(told[0]!),
+      `the notice promises the earlier note's author is told only while it runs: ${told[0]}`);
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
   }
 });
