@@ -36,7 +36,8 @@
   re-admission is supported; `eventCoalescing.deferred` is not offered. Generic
   result taps remain intact. Channel-scoped pushes require channel authorization
   before admission or receipt replay; initialize refusals name the denied capability.
-  `mayWake: false` caps downstream wakes, including module requests;
+  `mayWake: false` caps direct downstream wakes, including module requests; held
+  content still contributes to later tune-out reader cadence wakes;
   `mayWake: true` does not override gate declines or prevent a module-driven wake.
   Admission refusals are traced with fixed codes and rate-limited diagnostics.
   The package exports read-only `admissionOf(event)`, `AdmittedEnvelope`,

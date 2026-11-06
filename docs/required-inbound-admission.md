@@ -133,11 +133,14 @@ key.
 
 The channel adapter checks actual registration before preflight and rechecks the
 entry, connection, epoch, readiness and grant afterward. No effect runs on a
-refusal. `mayWake: false` skips wake policy and caps downstream wake requests;
+refusal. `mayWake: false` skips immediate wake policy and caps direct downstream wake requests;
 `mayWake: true` does not override gate declines: their decision remains visible,
 but a module may request inference just as on an unconfigured connection. The cap
 is only `mayWake: false`. It is **not** context-only delivery and does not suppress existing open/locus
-maintenance.
+maintenance. Held messages still increment tune-out bookkeeping: even with
+`mayWake: false`, a later cadence tick may wake the subconscious reader for that
+backlog. The ceiling is not a promise of no indirect reader wake attributable to
+the stored message. No tune-out cadence behavior is changed by admission.
 
 Admitted work goes out with the round's results only on a stream that declares
 `supportsInjectedMessages: true`; otherwise it arrives at turn end, except that a direct API boundary with no
