@@ -1353,7 +1353,10 @@ test("with no locus, a batch's channel the host no longer has registered is name
 
   const lost = { channel: discord('discord:g1:lost'), shown: '#lost (discord:g1:lost)' };
   assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room, gone, lost] }), null);
-  assert.ok(failures.at(-1)!.reason.startsWith('this turn came from #room (discord:g1:room), #gone (discord:g1:gone) and #lost (discord:g1:lost), and no channel was chosen for its reply; '), failures.at(-1)!.reason);
+  assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room), #gone (discord:g1:gone) and #lost (discord:g1:lost), ' +
+    'and no channel was chosen for its reply; to reply in #room (discord:g1:room), send your reply to that channel explicitly; ' +
+    "#gone (discord:g1:gone) isn't registered with this host now, so this host has no channel there to send to; " +
+    "#lost (discord:g1:lost) isn't registered with this host now, so this host has no channel there to send to");
 });
 
 test("with no locus, a batch's channel whose server can't take a send is named with why, and while its server is connecting, told to send there once it's back", async () => {
