@@ -27363,8 +27363,7 @@ export class AgentFramework {
       // operator's quiesce abandon settle as stops; endTurn writes its turn's
       // receipt and starts a continuation it was asked for; a budget restart
       // keeps the gate window its successor owns, which the finally would
-      // otherwise end. Only a silent end nobody asked for keeps the prior
-      // behaviour.
+      // otherwise end. A silent end nobody asked for is a failure (below).
       // Greptile on #172, 2026-09-28; Anarchid's review, 2026-10-12.
       if (!streamTerminal && this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
         const callerCancel = agent.takeCancel();
@@ -27380,6 +27379,33 @@ export class AgentFramework {
             closes: streamRouting,
             log: logStream,
           });
+        } else {
+          // Nobody cancelled the stream, and it ended without saying how:
+          // a failure (§10.5), settled as the `aborted` case settles one,
+          // so the agent stops streaming and a later wake starts a new
+          // inference. Nothing retries it or starts its turn again (#907).
+          lifecyclePhase = 'failed';
+          const terminal = 'Stream ended without a terminal event';
+          this.abandonAgentScripts(agent.name, 'stream ended without a terminal event', streamRouting);
+          agent.reset();
+          this.noteFailedTurnEnd(agent, streamRouting);
+          this.settleAgent(agent.name, {
+            stopReason: 'exhausted',
+            speech: '',
+            error: terminal,
+          }, streamRouting);
+          this.emitTrace({
+            type: 'inference:exhausted',
+            agentName: agent.name,
+            error: terminal,
+          });
+          logStream({
+            success: false,
+            error: terminal,
+            request: compiledRequest ?? { note: 'streaming request ended without a terminal event' },
+            durationMs: Date.now() - startTime,
+          });
+          if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         }
       }
     } catch (error) {

@@ -59,12 +59,26 @@ class EndingStream implements YieldingStream {
   }
 }
 
+/** A stream that ends at once with no event at all, and that nobody cancels (#907). */
+class SilentStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  provideToolResults(): void { throw new Error('not waiting'); }
+  cancel(): void {}
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> { /* no events */ }
+}
+
+/** In `ends`, a stream that ends as a SilentStream does. */
+const silentEnd = {} as StreamEvent;
+
 /** Each stream it opens ends as the next of `ends` says; past them, a completion. */
 class ScriptedMembrane extends MockMembrane {
   constructor(private readonly ends: StreamEvent[]) { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
     const last = this.ends.shift();
+    if (last === silentEnd) return new SilentStream();
     return last ? new EndingStream(last) : new MockYieldingStream([createMockResponse([{ type: 'text', text: 'Done' }])]);
   }
 }
@@ -250,4 +264,51 @@ test('a stream that times out ends failed', async () => {
 
 test('a stream that reports its abort as a stop (reason user) ends aborted (control)', async () => {
   assert.deepEqual(await phasesOf([{ type: 'aborted', reason: 'user' } as StreamEvent], noRetry), [['started', 'aborted']]);
+});
+
+/** Polls `done` every 10 ms for up to `ms`: whether it came true. */
+async function settles(done: () => boolean, ms = 10_000): Promise<boolean> {
+  const start = Date.now();
+  while (!done()) {
+    if (Date.now() - start > ms) return false;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return true;
+}
+
+// Issue #907: a stream whose iterator just ends, with no `complete`, `error` or `aborted` event, and
+// that nobody cancelled, left its agent `streaming` and its lifecycle `completed`, so a later nudge started
+// nothing. retryOnce retries at once, so a retry the silent end took would show before its terminal.
+test('a stream that ends with no event, and nobody cancelled, ends failed, and a later nudge starts a new inference', { timeout: 60_000 }, async () => {
+  const { framework, membrane, traces, phases, teardown } = await frameworkOver([silentEnd], retryOnce);
+  const types = (): string[] => traces.map((t) => t.type);
+  const logged = (): string[] => framework.queryInferenceLogs({ agentName: 'resident' }).entries
+    .map((e) => (e.entry.success === false ? 'failed' : 'ok'))
+    .reverse();
+  const status = (): string | undefined => framework.getAgent('resident')?.state.status;
+  const ended = (inferences: number): boolean => phases().length === inferences
+    && phases().every((p) => p.length === 2) && status() === 'idle' && framework.getHostModeStatus().activeTurns === 0;
+  try {
+    framework.start();
+    framework.nudgeAgent('resident', 'operator');
+    assert.ok(await settles(() => ended(1)), `the silent stream's turn ends: ${JSON.stringify({ phases: phases(), status: status() })}`);
+    // Room for a retry, which nothing should start.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(membrane.calls.length, 1, 'nothing retries the silent stream or starts its turn again');
+    assert.equal(status(), 'idle', 'the agent no longer streams');
+    assert.deepEqual(phases(), [['started', 'failed']], 'its lifecycle ends failed, not completed');
+    assert.ok(!types().includes('inference:completed'), `no completion is reported: ${JSON.stringify(types())}`);
+    assert.ok(types().includes('inference:exhausted'), `the failure is reported: ${JSON.stringify(types())}`);
+    assert.deepEqual(logged(), ['failed'], 'the inference log holds the failure');
+
+    framework.nudgeAgent('resident', 'operator');
+    assert.ok(await settles(() => ended(2)), `the next nudge's turn ends: ${JSON.stringify({ phases: phases(), status: status() })}`);
+    assert.equal(membrane.calls.length, 2, 'the nudge starts one new inference');
+    assert.deepEqual(phases(), [['started', 'failed'], ['started', 'completed']]);
+    assert.deepEqual(types().filter((t) => t === 'inference:completed'), ['inference:completed']);
+    assert.deepEqual(logged(), ['failed', 'ok']);
+    assert.equal(status(), 'idle');
+  } finally {
+    await teardown();
+  }
 });
