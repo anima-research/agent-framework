@@ -682,11 +682,18 @@ test("a refusal's rewind sheds the newest exchange, not a stored injection after
   const cm = agent.getContextManager();
   cm.addMessage('user', [text('hello')]);
   cm.addMessage('prime', [text('poisoned reply')]);
+  // Written past the framework, the exchange enters the window at the
+  // agent's next point (#291): present it, so the shed has a reply to take.
+  presentAll(x);
   internals(x.framework).storeInjections(agent, [injection()]);
+  const windowTexts = () => cm.getPresentedMessages().map(textOf);
+  assert.deepEqual(windowTexts(), ['hello', 'poisoned reply', 'LESSON one'], 'premise: the exchange, then the injection, in the window');
   internals(x.framework).shedNewestTurn(agent);
   // #291: the shed is the window's; the record keeps the row.
-  assert.ok(!cm.getPresentedMessages().some((m) => textOf(m) === 'poisoned reply'), 'the reply is shed');
-  assert.deepEqual(storedInjections(agent).map(textOf), ['LESSON one'], 'the injection stays');
+  assert.ok(!windowTexts().includes('poisoned reply'), 'the reply is shed');
+  assert.ok(cm.getAllMessages().some((m) => textOf(m) === 'poisoned reply'), 'the record keeps it');
+  assert.ok(windowTexts().includes('LESSON one'), 'the injection stays in the window');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['LESSON one'], 'and in the record');
 });
 
 test('a preview puts a stand-in where the start would store it: before what compile() places at the end of a window with no user message', async () => {
