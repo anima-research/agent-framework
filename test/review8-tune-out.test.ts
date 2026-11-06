@@ -182,6 +182,12 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
      * answering an empty id (`keptFor`), and writesHeld(agent) says so, as the framework's tuneOutWritesHeld.
      */
     refusing: [] as string[],
+    /**
+     * The primary's (or the subconscious's) context manager refuses its work: writes are held as the release asks
+     * (writesHeld()), while a write for another agent isn't (writesHeld(agent) answers for that agent alone, as the
+     * framework's tuneOutWritesHeld does with `forAgent`).
+     */
+    primaryRefuses: false,
   };
   /** The writes kept in memory for an agent whose manager refuses its work (`refusing`), by agent. */
   const keptFor = new Map<string, Added[]>();
@@ -263,7 +269,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     getSurgeryHeldMessages: () => [],
     unseenBySubconscious: () => 0,
     emitTrace: (event: Trace) => { traces.push(event); onTrace?.(event); },
-    writesHeld: (forAgent?: string) => state.held || (forAgent !== undefined && state.refusing.includes(forAgent)),
+    writesHeld: (forAgent?: string) => state.held || (forAgent === undefined ? state.primaryRefuses : state.refusing.includes(forAgent)),
     commitDeliveries: () => {
       if (state.durable && state.noteSyncFails && added.at(-1)?.metadata?.kind === 'subconscious-note') {
         syncs.noteFailed++;
@@ -3065,6 +3071,42 @@ test("Weft's not-run on 341f99f0: the release turns a cancel asks for inside the
       assert.deepEqual(h.wakes, [], `${arm}: a later boot asks nothing again`);
     } finally {
       for (const c of made) c.stop();
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("review 5 #53: a reader fork's kept loss notice is written while the primary's context manager refuses its work, which holds the cancels' writes but not the fork's; an ended fork's is traced as reaching no one", () => {
+  for (const ended of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ forks: true });
+    try {
+      const a = h.enter();
+      h.state.held = true;
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-1', 'For A.', 'reader-1');
+      failFirstRelease(h);
+      h.endOtherwise();
+      const b = h.enter();
+      h.state.held = true;
+      // B's cancel, waiting, drops A's: reader-1's notice is kept while writes are held.
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-2', undefined, 'reader-2');
+      assert.deepEqual(h.dropped().map((t) => [t.epochId, t.reason, t.noteAuthor]), [[a, 'hold-ended', 'reader-1']], 'premise: A\'s cancel was dropped with its note');
+      assert.deepEqual(h.lossNotices(), [], 'premise: its notice is kept, not written into the hold');
+      // The surgery's hold ends, and the primary's context manager refuses its work from then on.
+      if (ended) h.state.gone.push('reader-1');
+      h.state.held = false;
+      h.state.primaryRefuses = true;
+      h.coordinator.runDeferredCancels();
+      assert.equal(h.inForce(), b, 'the cancel still waits while the primary refuses its work');
+      assert.equal(queuedOf(h), 1);
+      if (ended) {
+        assert.deepEqual(h.lossNotices(), [], 'an ended fork is written nothing');
+        assert.deepEqual(h.untold().map((t) => [t.noteAuthor, t.reason]), [['reader-1', 'author-gone']], 'and its loss is traced as reaching no one');
+      } else {
+        assert.deepEqual(h.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId]), [['reader-1', a]], 'the fork is told, its own writes not held');
+      }
+    } finally {
       h.coordinator.stop();
       errors.mock.restore();
     }

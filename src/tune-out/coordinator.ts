@@ -889,12 +889,17 @@ export interface TuneOutFrameworkHooks {
   /**
    * Whether a write the coordinator made now would be kept in memory rather
    * than stored: a live surgery's hold, or a context manager of the primary
-   * or the subconscious refusing its work until a branch move re-initializes it,
-   * and with `forAgent`, that agent's too (a reader fork a loss notice is
-   * written for). A cancel then waits (deferCancel), the tune-out still in
+   * or the subconscious refusing its work until a branch move re-initializes it.
+   * A cancel then waits (deferCancel), the tune-out still in
    * force, until the framework says the writes are stored again, or told of
    * where storing one fails (runDeferredCancels), so the release is in the
-   * store before the epoch's end is recorded. Left out, never.
+   * store before the epoch's end is recorded. With `forAgent` (a loss
+   * notice's author, a reader fork's or the subconscious's), whether a write
+   * for that agent would be kept: a surgery's hold or its replay, or that
+   * agent's own manager refusing its work or waiting for its recovery; not
+   * the primary's or the subconscious's, which keep their own agent's writes
+   * alone. The loss notices are written by that answer, even while the
+   * release's is true (AF #844 review 5, #53). Left out, never.
    */
   writesHeld?: (forAgent?: string) => boolean;
   /**
@@ -1812,7 +1817,17 @@ export class TuneOutCoordinator {
    */
   runDeferredCancels(): void {
     if (this.stopped) return;
-    if ((this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && !this.lossRecordUnread) || this.writesHeldNow()) return;
+    if (this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && !this.lossRecordUnread) return;
+    if (this.writesHeldNow()) {
+      // Writes are held for some agent. A loss notice is held only where
+      // its author's are (writeLossNotices asks writesHeld of the author):
+      // a reader fork is told while the primary's or the subconscious's
+      // context manager refuses its work, which holds the cancels' writes
+      // but not the fork's (AF #844 review 5, #53). The cancels, the marker
+      // and the record wait.
+      if (this.lossNotices.size > 0 || this.lossRecordUnread) this.writeLossNotices();
+      return;
+    }
     if (this.deferredRetry !== undefined) {
       clearTimeout(this.deferredRetry);
       this.deferredRetry = undefined;
@@ -2243,8 +2258,8 @@ export class TuneOutCoordinator {
    * author's, each author's in the order its losses came: one written, or
    * whose author has ended, leaves the queue; one whose write fails stays
    * for the next try (writeLossNotice), and that author's later ones with
-   * it, behind it. None is written while writes are
-   * held (writesHeld): the framework would keep it in memory and answer an
+   * it, behind it. None is written while its author's writes are
+   * held (writesHeld(author)): the framework would keep it in memory and answer an
    * empty id, which then couldn't tell a kept write from an ended author's
    * dropped one. The release or the retry writes them. Nor is one the boot
    * read from the store's record while whether it was written before the
