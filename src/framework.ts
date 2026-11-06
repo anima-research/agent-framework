@@ -6259,7 +6259,15 @@ export class AgentFramework {
     step(() => this.queue.close());
     let inferences: Array<{ label: string; promise: Promise<void> }> = [];
     step(() => { inferences = this.inferenceRouter?.stopAll() ?? []; });
-    step(() => this.tuneOutCoordinator?.stop());
+    // The tune-out coordinator's timers stop now (an end time, a reader's
+    // cadence or wake, a retry), so no hold ends and no reader is invoked by
+    // a timer while the host is torn down. Its stop proper (each waiting
+    // cancel told and kept, the stop stamped) waits until the operator's
+    // operations below have settled: a hold that keeps a waiting cancel's
+    // writes in memory, released during that wait, stores them and runs the
+    // cancel (runDeferredCancels), which a stop made first would have told
+    // lost though its note then lands (Weft's hold 2, #844).
+    step(() => this.tuneOutCoordinator?.stopTimers());
 
     // Stop running code_execution scripts before cancelling streams: a
     // zombie script must not keep firing side-effectful tool calls into a
@@ -6409,6 +6417,13 @@ export class AgentFramework {
     } catch (error) {
       shutdownErrors.push(error);
     }
+    // Now the tune-out coordinator's stop proper (see its timers' stop
+    // above): the cancels still waiting are those whose writes no operation
+    // stored, each told and kept, and the stop's stamp names the holds as
+    // they are now, before the registry forgets its channels below. A wait
+    // whose budget ran out leaves its hold's writes in memory: a note among
+    // them is told lost here, as before.
+    step(() => this.tuneOutCoordinator?.stop());
 
     // A stream's `complete` waits for the deliveries it queued, and the
     // teardown below would leave it nowhere to go: the registry forgets its
@@ -18424,8 +18439,13 @@ export class AgentFramework {
   }
 
 
-  /** A reader fork's own words to the resident: attributed mail when it has a route, else under its name. */
-  private deliverFromReader(reader: string, content: ContentBlock[], metadata: Record<string, unknown>): void {
+  /**
+   * A reader fork's own words to the resident: attributed mail when it has a
+   * route, else under its name. Answers the row's id for the latter (empty
+   * where the write was kept in memory), and nothing for mail, which the
+   * registry keeps until it is delivered.
+   */
+  private deliverFromReader(reader: string, content: ContentBlock[], metadata: Record<string, unknown>): string | void {
     const route = this.registry.inspect(reader)?.relationships.resultTo;
     if (route?.as === 'message') {
       const mail = this.registry.holdMail({
@@ -18437,7 +18457,7 @@ export class AgentFramework {
       this.attemptMailDelivery(mail);
       return;
     }
-    this.addMessage(reader, content, metadata as MessageMetadata);
+    return this.addMessage(reader, content, metadata as MessageMetadata);
   }
 
   private async runLoop(): Promise<void> {

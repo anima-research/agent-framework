@@ -1133,3 +1133,337 @@ describe("a kept note whose store couldn't tell whether it landed, its cancel st
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 (Weft's hold 2, her q4-stop-held probe): the waiting note is
+// written into a second hold (B), and the host stops during B. stop()
+// waits for the operator's operation, and B releases then, storing the
+// note. The subconscious must not be told the note was lost.
+// ---------------------------------------------------------------------------
+
+type Probe = Restartable & {
+  reserveStoreForSurgery(verb: string, agentName: string): () => void;
+  surgeryHeldWrites: Array<{ metadata?: Record<string, unknown> }>;
+};
+
+/**
+ * Weft's probe: a hold (A) during which the subconscious's cancel_tuneout
+ * with a note waits. `stop-held`: A releases, the cancel's run stores its
+ * release, and a second hold (B, a switch of every agent) begins at its
+ * commit, so the note is kept in memory by B. `stop-nohold`: A is still
+ * held. Either way the host stops then, the stop waits for the operator's
+ * operation, and that hold releases during the wait; then a start on the
+ * same store.
+ */
+async function weftHoldTwo(mode: 'stop-held' | 'stop-nohold') {
+  const { f, registry, release: releaseA, coordinator } = await heldDuringSurgery();
+  const fw = f.framework as unknown as Probe;
+  const sub = fw.subconsciousAgentName!;
+  const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+  const note = `NOTE-q4-${mode}`;
+  fw.addMessage('user', [{ type: 'text', text: 'primer' }], { system: true }, { forAgent: sub });
+  const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: note }, [], sub);
+  assert.equal(waiting(answer).waiting, true, 'premise: the cancel waits');
+  let releaseB: (() => void) | undefined;
+  if (mode === 'stop-held') {
+    const commit = fw.commitDeliveries.bind(fw);
+    fw.commitDeliveries = () => {
+      const durable = commit();
+      const hasRelease = stored(f).some((m) => m.metadata?.kind === 'tune-out-cancel' && m.metadata.epochId === epochId);
+      if (!releaseB && hasRelease) releaseB = fw.reserveStoreForSurgery('switch branch', 'every agent');
+      return durable;
+    };
+    releaseA();
+    fw.commitDeliveries = commit;
+    assert.ok(releaseB, 'premise: hold B began at the release commit');
+    assert.equal(fw.surgeryHeldWrites.filter((w) => w.metadata?.kind === 'subconscious-note').length, 1, 'premise: B keeps the note in memory');
+  }
+  assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the hold is in force at the stop');
+  const stopping = f.framework.stop();
+  const raced = await Promise.race([stopping.then(() => 'stopped'), new Promise((r) => setTimeout(() => r('still stopping'), 300))]);
+  assert.equal(raced, 'still stopping', "premise: the stop waits for the operator's operation");
+  if (releaseB) releaseB(); else releaseA();
+  await stopping;
+  await f.create();
+  const noteRows = stored(f).filter((m) => m.metadata?.kind === 'subconscious-note' && textOf(m) === note).length;
+  const told = presentedTo(f, sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+  const lossTurns = internals(f).pendingRequests.filter((r) => r.agentName === sub && r.reason.startsWith('tune-out note not delivered'));
+  return { f, sub, note, noteRows, told, lossTurns, inForce: !!internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), releaseA, releaseB };
+}
+
+describe("a stop while an operator's change keeps the waiting note in memory (AF #844, Weft's hold 2)", () => {
+  it("the stop's wait lets the change release and store the note: after the start the resident has it, and the subconscious is told no loss and asked no turn for one", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await weftHoldTwo('stop-held');
+    try {
+      assert.equal(h.noteRows, 1, "the note is in the resident's store once");
+      assert.deepEqual(h.told, [], 'the subconscious is told no loss');
+      assert.deepEqual(h.lossTurns, [], 'and asked no turn to read one');
+      assert.equal(h.inForce, false, "the waiting cancel ran once the change released, before the stop finished: the hold ended");
+    } finally {
+      errors.mock.restore();
+      h.releaseA();
+      h.releaseB?.();
+      await h.f.close();
+    }
+  });
+
+  it("with the cancel still waiting for the first change, which the stop's wait lets release, the cancel runs then: the note is stored once, the hold ends, and nothing is told", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await weftHoldTwo('stop-nohold');
+    try {
+      assert.equal(h.noteRows, 1, "the note is in the resident's store once");
+      assert.deepEqual(h.told, [], 'nothing is told: the cancel ran, with its note');
+      assert.deepEqual(h.lossTurns, [], 'and no turn is asked for a loss');
+      assert.equal(h.inForce, false, 'the hold ended');
+    } finally {
+      errors.mock.restore();
+      h.releaseA();
+      await h.f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (Weft, Q5, her notice-dup probe): a loss notice whose own write
+// begins a hold is kept in memory; the hold's release stores it, and the
+// notice, still kept, was written again: the subconscious had it twice,
+// under one lossNoticeId.
+// ---------------------------------------------------------------------------
+
+describe("a loss notice whose own write begins a hold (AF #844, Weft's notice-dup)", () => {
+  for (const dup of [true, false]) it(dup
+    ? "is written once: the hold's release stores the kept write, and the notice isn't written again"
+    : 'control: a notice whose write begins no hold is written once', async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, release: releaseA, coordinator } = await heldDuringSurgery();
+    const fw = f.framework as unknown as Probe;
+    const sub = fw.subconsciousAgentName!;
+    let releaseB: (() => void) | undefined;
+    try {
+      const note = 'NOTE-q5';
+      const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: note }, [], sub);
+      assert.equal(waiting(answer).waiting, true, 'premise: the cancel waits');
+      const manager = f.framework.getAgent('agent')!.getContextManager() as unknown as { addMessage(...args: unknown[]): string };
+      const store = manager.addMessage;
+      manager.addMessage = (...args: unknown[]) => {
+        const [participant, , metadata] = args as [string, unknown, Record<string, unknown> | undefined];
+        if (participant === sub && metadata?.kind === 'subconscious-note') throw new Error('EIO: note refused (probe)');
+        return store.apply(manager, args);
+      };
+      if (dup) {
+        const add = fw.addMessage.bind(fw);
+        fw.addMessage = (participant, content, metadata, opts) => {
+          if (metadata?.kind === 'tune-out-note-undelivered' && !releaseB) releaseB = fw.reserveStoreForSurgery('switch branch', 'every agent');
+          return add(participant, content, metadata, opts);
+        };
+      }
+      releaseA();
+      const notices = () => (f.framework.getAgent(sub)!.getContextManager().getAllMessages() as unknown as Stored[])
+        .filter((m) => m.metadata?.kind === 'tune-out-note-undelivered');
+      if (dup) {
+        assert.ok(releaseB, 'premise: the notice began hold B as it was written');
+        assert.equal(notices().length, 0, 'premise: the notice is kept in memory by B');
+        releaseB!();
+      }
+      internals(f).tuneOutCoordinator!.runDeferredCancels();
+      const ids = notices().map((m) => m.metadata?.lossNoticeId);
+      assert.equal(ids.length, 1, `the subconscious has the notice once: ${JSON.stringify(ids)}`);
+      assert.match(textOf(notices()[0]!), /was not delivered to agent\. Your cancel ended that tune-out when it ran, and delivering the note then failed: EIO: note refused \(probe\)\.\]$/);
+    } finally {
+      errors.mock.restore();
+      releaseA();
+      releaseB?.();
+      await f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (Weft): the subconscious's cancel joins a waiting cancel (an end
+// time's) after that one's first attempt wrote its release and failed, so
+// no release names the subconscious. The run then delivers its note and
+// can't record the end, and the host crashes. The boot read that release
+// as another's: "a cancel of it that wasn't yours (duration elapsed) ran".
+// ---------------------------------------------------------------------------
+
+describe("a cancel the subconscious joined after the waiting one's release was written (AF #844, Weft)", () => {
+  it("is told after a crash as its own cancel that ran, with the cancel it joined and the note it left", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, registry, release: releaseA, coordinator } = await heldDuringSurgery();
+    const fw = f.framework as unknown as Probe;
+    const sub = fw.subconsciousAgentName!;
+    const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+    let releaseB: (() => void) | undefined;
+    try {
+      fw.addMessage('user', [{ type: 'text', text: 'primer 7a2d' }], { system: true }, { forAgent: sub });
+      assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true }, 'premise: the end time\'s cancel waits');
+      // Its first attempt at the release writes its release, which isn't made durable: it waits on.
+      const commit = fw.commitDeliveries.bind(fw);
+      fw.commitDeliveries = () => false;
+      releaseA();
+      fw.commitDeliveries = commit;
+      assert.equal(stored(f).filter((m) => m.metadata?.kind === 'tune-out-cancel' && m.metadata.epochId === epochId).length, 1, 'premise: its release is written');
+      assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the hold is in force');
+      // Writes are held again, and the subconscious's cancel, with a note, joins the one waiting.
+      releaseB = fw.reserveStoreForSurgery('roll back', 'agent');
+      const answer = await f.framework.executeToolCall({ id: 'c1', name: 'cancel_tuneout', input: { channelId: 'noisy', text: 'Joined note 9b1.' }, callerAgentName: sub } as never) as { data?: { waiting?: unknown } };
+      assert.equal(answer.data?.waiting, true, `premise: answered as waiting: ${JSON.stringify(answer)}`);
+      // The run delivers the note and can't record the end; the host crashes.
+      endNotRecorded(f);
+      releaseB();
+      assert.ok(has(f, 'Joined note 9b1.'), 'premise: the note was delivered');
+      assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the end was not recorded');
+      await crashLosingStopWrites(f);
+      await f.create();
+      assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [
+        `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${epochId}). Your cancel of it ran `
+        + '(with the cancel for duration elapsed): its release reached agent, with the note you left with it. Its end was not recorded, '
+        + 'so that tune-out is still in force.]',
+      ], 'the row says the cancel that ran was its own, joined to the end time\'s');
+    } finally {
+      errors.mock.restore();
+      releaseA();
+      releaseB?.();
+      await f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (Weft's hold-2 siblings, her p2 and p3 probes). p2: a hold begins
+// at a write of the waiting cancel's run, its note or its release, either
+// before the write lands (the write is kept in memory) or just after it
+// returns (the write is stored, and only then are writes held); then the
+// host stops, and the stop's wait lets the hold release. p3: the release
+// that tells the queued note's loss is the one kept. With no stop (the
+// controls) nothing false is told; with one, nothing false may be either.
+// ---------------------------------------------------------------------------
+
+const P2_NOTE = 'Antra asked for you in #noisy (note 9b3f).';
+
+async function weftP2(kind: 'note' | 'release', when: 'kept' | 'after', stop: boolean) {
+  const { f, registry, release, coordinator } = await heldDuringSurgery();
+  const fw = f.framework as unknown as Probe;
+  const sub = fw.subconsciousAgentName!;
+  const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+  const wantKind = kind === 'note' ? 'subconscious-note' : 'tune-out-cancel';
+  fw.addMessage('user', [{ type: 'text', text: 'primer 7a2d' }], { system: true }, { forAgent: sub });
+  const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: P2_NOTE }, [], sub);
+  assert.equal(waiting(answer).waiting, true, 'premise: the cancel waits');
+  const add = fw.addMessage.bind(fw);
+  let again: (() => void) | undefined;
+  let returned: string | undefined;
+  fw.addMessage = (participant, content, metadata, opts) => {
+    if (!again && metadata?.kind === wantKind && !(opts as { replayed?: boolean } | undefined)?.replayed) {
+      if (when === 'kept') {
+        again = fw.reserveStoreForSurgery('roll back', 'agent');
+        return (returned = add(participant, content, metadata, opts));
+      }
+      returned = add(participant, content, metadata, opts);
+      again = fw.reserveStoreForSurgery('roll back', 'agent');
+      return returned;
+    }
+    return add(participant, content, metadata, opts);
+  };
+  release();
+  fw.addMessage = add;
+  assert.ok(again, `premise: a second hold began at the ${wantKind} write`);
+  assert.equal(returned === '', when === 'kept', `premise: the write ${when === 'kept' ? 'was kept in memory' : 'was stored'}`);
+  assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the hold is in force');
+  const rowsOf = () => stored(f).filter((m) => m.metadata?.kind === wantKind && m.metadata.epochId === epochId).length;
+  if (stop) {
+    const stopping = f.framework.stop();
+    again!();
+    await stopping;
+    await f.create();
+  } else {
+    again!();
+  }
+  const told = presentedTo(f, sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+  const notes = stored(f).filter((m) => textOf(m) === P2_NOTE).length;
+  return { f, told, notes, rows: rowsOf(), inForce: !!internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), release, again };
+}
+
+describe("a hold begun at a write of the waiting cancel's run, then a stop (AF #844, Weft's p2)", () => {
+  for (const kind of ['note', 'release'] as const) for (const when of ['kept', 'after'] as const) for (const stop of [true, false]) {
+    it(`${stop ? '' : 'control (no stop): '}a hold begun ${when === 'kept' ? 'as' : 'just after'} the ${kind} is written${when === 'kept' ? ', keeping it in memory' : ', which lands'}${stop ? ', then a stop whose wait lets it release' : ', then released'}: the note is stored once, the hold ends, and nothing is told`, async () => {
+      const errors = mock.method(console, 'error', () => {});
+      const h = await weftP2(kind, when, stop);
+      try {
+        assert.equal(h.notes, 1, "the note is in the resident's store once");
+        assert.equal(h.rows, 1, `one ${kind} row of the hold`);
+        assert.deepEqual(h.told, [], 'the subconscious is told nothing');
+        assert.equal(h.inForce, false, 'the hold ended');
+      } finally {
+        errors.mock.restore();
+        h.release();
+        h.again?.();
+        await h.f.close();
+      }
+    });
+  }
+});
+
+describe("a release that tells a queued note's loss, kept in memory, then a stop (AF #844, Weft's p3)", () => {
+  for (const stop of [true, false]) it(stop
+    ? "the stop's wait lets it release: the subconscious holds that release once, no stop notice beside it, and the hold has ended"
+    : 'control (no stop): the release stored at the hold\'s release tells the loss once, and the hold ends', async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, registry, release, coordinator } = await heldDuringSurgery();
+    const fw = f.framework as unknown as Probe;
+    const sub = fw.subconsciousAgentName!;
+    const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+    let again: (() => void) | undefined;
+    try {
+      fw.addMessage('user', [{ type: 'text', text: 'primer 7a2d' }], { system: true }, { forAgent: sub });
+      const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'Antra asked for you in #noisy (note 4d1c).' }, [], sub);
+      assert.equal(waiting(answer).waiting, true, 'premise: the cancel waits');
+      // Its first run at the release can't make the release durable: it waits on.
+      const commit = fw.commitDeliveries.bind(fw);
+      let failOnce = true;
+      fw.commitDeliveries = () => { if (failOnce) { failOnce = false; return false; } return commit(); };
+      release();
+      fw.commitDeliveries = commit;
+      assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the hold is in force, the cancel waiting');
+      // The note's store refuses it, and a hold begins as the release telling the loss is written.
+      const manager = f.framework.getAgent('agent')!.getContextManager() as unknown as { addMessage(...args: unknown[]): string };
+      const store = manager.addMessage;
+      manager.addMessage = (...args: unknown[]) => {
+        if ((args[2] as Record<string, unknown> | undefined)?.kind === 'subconscious-note') throw new Error('EIO: the store refused the note (probe)');
+        return store.apply(manager, args);
+      };
+      const add = fw.addMessage.bind(fw);
+      fw.addMessage = (participant, content, metadata, opts) => {
+        if (!again && metadata?.kind === 'tune-out-cancel' && metadata.lostNote === true && !(opts as { replayed?: boolean } | undefined)?.replayed) {
+          again = fw.reserveStoreForSurgery('roll back', 'agent');
+        }
+        return add(participant, content, metadata, opts);
+      };
+      const ending = coordinator.cancel('editor', 'noisy', 'agent-tool', 'agent request');
+      fw.addMessage = add;
+      manager.addMessage = store;
+      assert.deepEqual(ending, { ok: true, deferred: true }, "premise: the resident's cancel waits, its release kept in memory");
+      assert.ok(again, 'premise: a hold began at the release telling the loss');
+      if (stop) {
+        const stopping = f.framework.stop();
+        again!();
+        await stopping;
+        await f.create();
+      } else {
+        again!();
+      }
+      const s2 = (f.framework as unknown as Probe).subconsciousAgentName!;
+      const told = presentedTo(f, s2).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.equal(told.length, 1, `the subconscious is told once: ${JSON.stringify(told)}`);
+      assert.match(told[0]!, /^\[Tune-out: noisy cancelled — agent request, 0 wakes\]\n\nThe note Subconscious left with an earlier cancel of noisy was not delivered to agent\. This cancel ended that tune-out while that one waited, and delivering the note then failed: EIO: the store refused the note \(probe\)\.$/,
+        'by the release that ended the hold');
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), null, 'and the hold has ended, as that release says');
+    } finally {
+      errors.mock.restore();
+      release();
+      again?.();
+      await f.close();
+    }
+  });
+});

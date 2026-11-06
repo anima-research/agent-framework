@@ -2501,6 +2501,201 @@ test("nissa's house on #844, control: a stored write of another epoch, of anothe
   }
 });
 
+// ---------------------------------------------------------------------------
+// AF #844 (Weft, on the held-note route): a pin on queuedNoteFirst's guard,
+// a loss notice whose own write begins a hold, and the framework's stop
+// quieting the timers before it waits for an operator's operation.
+// ---------------------------------------------------------------------------
+
+test("Weft's pin on #844: a kept note lost when the writes are stored, its cancel's run failing before the end, isn't written again by another cancel that ends the hold: it is told lost", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    try {
+      const { epochId, noteWrites } = ownNoteKeptInMemory(h, scope);
+      noteLostAtRelease(h, epochId, scope, new Error('EIO: the store refused the note (test)'));
+      // The cancel's run, once the writes are stored, can't make its release durable: it waits on.
+      h.state.held = false;
+      h.state.durable = false;
+      h.coordinator.runDeferredCancels();
+      const where = scope ? 'all-except' : 'channel';
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), epochId, `premise (${where}): the hold stays in force`);
+      assert.equal(queuedOf(h), 1, `premise (${where}): the cancel waits on`);
+      assert.deepEqual(h.lossNotices(), [], `premise (${where}): the loss isn't told yet`);
+      h.state.durable = true;
+      const ending = scope ? h.coordinator.cancelAllExcept('agent-tool', 'agent request') : h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request');
+      assert.equal(ending.ok, true, `${where}: another cancel ends the hold`);
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), null, `${where}: the hold ended`);
+      assert.equal(noteWrites(), 1, `${where}: the lost note is not written again ahead of that release`);
+      const hold = scope ? 'the all-except hold (all channels except disc:guild:x)' : 'disc:guild:a';
+      assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [
+        `[Tune-out: the note you left with your cancel of ${hold} was not delivered to scout. Another cancel ended that ${scope ? 'hold' : 'tune-out'} `
+        + 'while yours waited, and delivering the note then failed: EIO: the store refused the note (test).]',
+      ], `${where}: its author is told it was lost, with the error`);
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("Weft's Q5 on #844: a loss notice whose own write begins a hold is stored by the hold's release, and not written again", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+    h.state.held = false;
+    h.state.noteFails = true;
+    h.state.keepWhenHeld = true;
+    h.listenWrites((metadata) => { if (metadata?.kind === 'tune-out-note-undelivered') h.state.held = true; });
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null, 'premise: the run ended the hold, its note lost');
+    assert.deepEqual(h.lossNotices(), [], 'premise: the notice, its write beginning a hold, is kept in memory');
+    assert.equal(h.heldWrites.filter((w) => w.metadata?.kind === 'tune-out-note-undelivered').length, 1, 'premise: as the framework keeps a write');
+    h.listenWrites(() => {});
+    h.storeHeld();
+    h.coordinator.runDeferredCancels();
+    const ids = h.lossNotices().map((m) => m.metadata?.lossNoticeId);
+    assert.equal(ids.length, 1, `the notice is written once, the kept write stored: ${JSON.stringify(ids)}`);
+    assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], 'and the store keeps it no longer');
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.lossNotices().length, 1, 'nor is it written at a later try');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("Weft's hold 2 on #844: the timers quieted at the stop's start, a waiting cancel still runs when the writes are stored, before the stop proper", () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  try {
+    const r = h.coordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:x' }, { durationSeconds: 60 }, 'agent-tool');
+    assert.ok(r.ok, 'premise: entered');
+    h.coordinator.stopTimers();
+    mock.timers.tick(120_000);
+    assert.ok(h.scopeInForce(), 'its end time, passed after the timers were quieted, ends nothing');
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+    h.state.held = false;
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.inForce(), null, 'a waiting cancel runs once the writes are stored');
+    assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], 'with its note');
+    h.coordinator.stop();
+    assert.deepEqual(h.lossNotices(), [], 'and the stop tells nothing of it');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+    mock.timers.reset();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (Weft's hold-2 sibling A): a write of the cancel's run that lands,
+// writes held only after it returns (a listener's hold), isn't kept in
+// memory: judged by what the write answered, not by whether writes are
+// held after it, so a stop while the cancel waits tells nothing false.
+// ---------------------------------------------------------------------------
+
+/** Writes held from just after the coordinator's next write of `kind` returns, as a listener's hold begun then. */
+function holdAfterWrite(h: ReturnType<typeof epochSetup>, kind: string, lostNote = false): void {
+  const hooks = (h.coordinator as unknown as { hooks: { addMessage: (...args: unknown[]) => string } }).hooks;
+  const add = hooks.addMessage;
+  let done = false;
+  hooks.addMessage = (...args: unknown[]) => {
+    const id = add(...args);
+    const metadata = args[2] as Record<string, unknown> | undefined;
+    if (!done && metadata?.kind === kind && (!lostNote || metadata.lostNote === true)) {
+      done = true;
+      h.state.held = true;
+    }
+    return id;
+  };
+}
+
+test("Weft's sibling A on #844: a queued cancel's own note that lands, writes held only after it, isn't kept in memory: the cancel waits, and a stop tells no note lost", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    try {
+      const epochId = scope ? h.enterScope() : h.enter();
+      h.state.held = true;
+      if (scope) h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      h.state.held = false;
+      holdAfterWrite(h, 'subconscious-note');
+      h.coordinator.runDeferredCancels();
+      const where = scope ? 'all-except' : 'channel';
+      assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], `premise (${where}): the note landed`);
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), epochId, `${where}: writes held since, the cancel waits, the hold in force`);
+      assert.equal(queuedOf(h), 1, `${where}: the cancel waits`);
+      h.coordinator.stop();
+      assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], `${where}: the stop loses no note`);
+      assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], `${where}: and keeps none in the store`);
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("Weft's sibling A on #844: a queued note another cancel writes ahead of its release, which lands, writes held only after it, isn't kept in memory: a stop tells no note lost", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    try {
+      const epochId = scope ? h.enterScope() : h.enter();
+      h.state.held = true;
+      if (scope) h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      failFirstRelease(h);
+      holdAfterWrite(h, 'subconscious-note');
+      const ending = scope ? h.coordinator.cancelAllExcept('agent-tool', 'agent request') : h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request');
+      const where = scope ? 'all-except' : 'channel';
+      assert.deepEqual(ending, { ok: true, deferred: true }, `premise (${where}): writes held since the note, the cancel waits`);
+      assert.deepEqual(h.notes().map((n) => n.text), ['Someone asked for you.'], `premise (${where}): the note landed`);
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), epochId, `premise (${where}): the hold is in force`);
+      h.coordinator.stop();
+      assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], `${where}: the stop loses no note`);
+      assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], `${where}: and keeps none in the store`);
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("Weft's sibling A on #844: a release telling a queued note's loss that lands, writes held only after it, isn't kept in memory: a stop doesn't tell the loss again", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    try {
+      const epochId = scope ? h.enterScope() : h.enter();
+      h.state.held = true;
+      if (scope) h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+      failFirstRelease(h);
+      h.state.noteFails = true;
+      holdAfterWrite(h, 'tune-out-cancel', true);
+      const ending = scope ? h.coordinator.cancelAllExcept('agent-tool', 'agent request') : h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request');
+      const where = scope ? 'all-except' : 'channel';
+      assert.deepEqual(ending, { ok: true, deferred: true }, `premise (${where}): writes held since the release, the cancel waits`);
+      assert.equal(h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel' && m.metadata.lostNote === true).length, 1, `premise (${where}): the release telling the loss landed`);
+      assert.equal(scope ? h.scopeInForce() : h.inForce(), epochId, `premise (${where}): the hold is in force`);
+      h.coordinator.stop();
+      assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], `${where}: the stop tells the loss no second time`);
+      assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], `${where}: and keeps none in the store`);
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
 test("review 3 #45: a window-starts record whose start or start in force is ill-formed logs each one it drops, naming the epoch", () => {
   const h = anchored({ active: [{ epochId: 'X', sequence: 30 }], state: { starts: { X: 3, Y: 'seven', Z: -1 } as never, inForce: 2.5 as never }, length: 12 });
   const errors = mock.method(console, 'error', () => {});
