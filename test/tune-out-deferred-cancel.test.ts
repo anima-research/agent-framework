@@ -161,7 +161,7 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
         `told what becomes of its note: ${waiting(answer).note}`);
       assert.match(waiting(answer).note ?? '', /The notice is kept in the store as well, unless the store refuses that too: if the host stops before the notice is written, the host writes it when it starts again/,
         `told that a loss notice that can't be written survives a stop (Ivy-3594, round 6): ${waiting(answer).note}`);
-      assert.match(waiting(answer).note ?? '', /The waiting cancel isn't kept in the store: if the host stops before the tune-out ends, the cancel and your note are lost, and you are told so by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told when it starts again that any cancel of the tune-out then waiting was lost, with any note left with it\.$/,
+      assert.match(waiting(answer).note ?? '', /The waiting cancel isn't kept in the store: if the host stops before the tune-out ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told when it starts again that any cancel of the tune-out then waiting was lost, with any note left with it that had not been delivered\.$/,
         `and that a stop before the hold ends loses the cancel and the note, but not the notice of the note's loss (Ivy-3594, round 8): ${waiting(answer).note}`);
       assert.doesNotMatch(waiting(answer).note ?? '', /or the host stops/, `no longer says a stop ends the notice's retries: ${waiting(answer).note}`);
       release();

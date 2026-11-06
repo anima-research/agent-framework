@@ -154,7 +154,9 @@ interface WindowStartsState {
  * hold ends loses both, unless the stop's own wait for an operator's
  * operation lets the hold end, which runs the cancel first (the
  * framework's stop calls stop() only after that wait; stopTimers before
- * it), and the subconscious is told of the note's loss
+ * it), or the note went out already (the cancel's run delivered it and
+ * failed before the end: the stop drops the cancel alone, dropQueued; AF
+ * #844 review 5, #26), and the subconscious is told of the note's loss
  * as of any other, by a notice kept in the store for the next boot (stop),
  * or, where the store refuses that or the host crashes, by the next boot's
  * notice that any cancel then waiting was lost (noteUnstampedStop).
@@ -164,7 +166,7 @@ interface WindowStartsState {
  * ended (deliverReaderNote), but a notice of its loss reaches it only while
  * it runs: an ended fork is no agent the framework writes to, and the loss
  * is then traced only (writeLossNotice); a stop drops a fork's notice not
- * yet written.
+ * yet written, and a fork's note not delivered yet is lost with the cancel.
  */
 export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'persistent' | 'fork', unmarked = false): string {
   const hold = what.charAt(0).toLowerCase() + what.slice(1);
@@ -182,9 +184,10 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
         + `the notice is ${retry}written. The notice is kept in the store as well, unless the store refuses that too: `
         + 'if the host stops before the notice is written, the host writes it when it starts again, or keeps trying as '
         + 'above. The waiting cancel isn\'t kept in the store: if the host stops before '
-        + `${hold} ends, the cancel and your note are lost, and you are told so by such a notice, kept in the store `
-        + 'for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told '
-        + `when it starts again that any cancel of ${hold} then waiting was lost, with any note left with it.`
+        + `${hold} ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note `
+        + 'by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or '
+        + `the host crashes, you are told when it starts again that any cancel of ${hold} then waiting was lost, with any `
+        + 'note left with it that had not been delivered.'
         + (unmarked
           ? ' This run\'s start couldn\'t be recorded in the store yet: if the host stops or dies before the cancel runs '
             + 'while the store still refuses it, you may not be told so when it starts again.'
@@ -196,7 +199,7 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
         + 'your run lasts: once it has ended, nothing can be written to you, so the loss reaches no one and is only '
         + 'traced for the host. If writing that notice fails while you still run, the failure is traced for the host, '
         + `and the notice is ${retry}written, your run ends, or the host stops. If the host stops before ${hold} ends, `
-        + 'your note is lost with the cancel, and you are not told.'
+        + 'your note is lost with the cancel, unless it was delivered already, and you are not told.'
       : '');
 }
 

@@ -927,7 +927,7 @@ test("65 follow-up (Isaac-3593, round 3): a kept notice of a cancel dropped for 
   }
 });
 
-test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, that a loss is told, that a notice that can't be written is kept in the store for the next boot, and that a stop loses the waiting cancel and the note, but tells the loss", async () => {
+test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, that a loss is told, that a notice that can't be written is kept in the store for the next boot, and that a stop loses the waiting cancel and the note, unless it was delivered already (review 5 #26), but tells the loss", async () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup();
   try {
@@ -944,9 +944,10 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
       + 'as soon as one ends, until it is written. The notice is kept in the store as well, unless the store refuses '
       + 'that too: if the host stops before the notice is written, the host writes it when it starts again, or keeps '
       + 'trying as above. The waiting cancel isn\'t kept in the store: if the host stops before '
-      + `${hold} ends, the cancel and your note are lost, and you are told so by such a notice, kept in the store `
-      + 'for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told '
-      + `when it starts again that any cancel of ${hold} then waiting was lost, with any note left with it.`;
+      + `${hold} ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note `
+      + 'by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or '
+      + `the host crashes, you are told when it starts again that any cancel of ${hold} then waiting was lost, with any `
+      + 'note left with it that had not been delivered.';
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc', text: 'Look here.' }, [], 'Subconscious'),
       { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}${kept('the tune-out')}` } });
@@ -1258,8 +1259,8 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
       + 'nothing can be written to you, so the loss reaches no one and is only traced for the host. If writing that '
       + 'notice fails while you still run, the failure is traced for the host, and the notice is tried again every '
       + '60 s, except while such a change or refusal lasts, and as soon as one ends, until it is written, your run '
-      + 'ends, or the host stops. If the host stops before the tune-out ends, your note is lost with the cancel, and '
-      + 'you are not told.' } });
+      + 'ends, or the host stops. If the host stops before the tune-out ends, your note is lost with the cancel, unless '
+      + 'it was delivered already, and you are not told.' } });
   } finally {
     h.coordinator.stop();
     errors.mock.restore();

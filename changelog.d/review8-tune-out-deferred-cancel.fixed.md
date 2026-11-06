@@ -43,7 +43,7 @@
   either, the failure is traced and the notice is tried again until it is written. The persistent subconscious is
   told that such a notice is also kept in the store, unless the store refuses that too, so a stop before it is
   written leaves it for the next boot to write; and that the waiting cancel isn't kept in the store, so a stop before
-  the hold ends loses it, and the note with it, told by such a notice kept for the next boot to write. A reader fork is told that its note goes out as its mail even after
+  the hold ends loses it, and the note with it unless the cancel's run delivered the note already, a lost note told by such a notice kept for the next boot to write. A reader fork is told that its note goes out as its mail even after
   its run has ended, but that a loss reaches it only while it runs: after its end the loss reaches no one and is only
-  traced, and a stop before the hold ends loses the note with the cancel, untold. The answer said only that the
+  traced, and a stop before the hold ends loses the note with the cancel, untold, unless it was delivered already. The answer said only that the
   cancel waits.
