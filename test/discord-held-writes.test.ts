@@ -688,6 +688,40 @@ test("a lookup that throws for one kept create at an event's sweep leaves the ot
   }
 });
 
+// AF #844 bot review 5, finding 45: an edit kept for an answered create
+// waits for a sweep that finds the row; one whose lookup throws leaves it
+// for the next event. An edit of the same message that comes meanwhile goes
+// behind the kept ones, so the next sweep applies them in the order they
+// were made and the row ends with the newest text.
+test("an edit that comes while edits kept for its message wait for a sweep goes behind them, so the row ends with the newest text", async () => {
+  const s = await withLostRelease('w1', async () => {}, { store: (add) => add() });
+  const quiet = console.error;
+  try {
+    s.framework.getAgent('Sol')!.getContextManager().addMessage('User', [{ type: 'text', text: 'k9 as created' }],
+      { external: { source: 'discord', id: 'k9' } } as never);
+    (s.module.creating as Map<string, unknown>).set('k9', { phase: 'writing', deleted: false, unapplied: [{ text: 'k9 older edit' }] });
+    const storedRow = s.module.storedRow.bind(s.module);
+    let refuseOnce = true;
+    s.module.storedRow = (id: string) => {
+      if (id === 'k9' && refuseOnce) { refuseOnce = false; throw new Error('zz-read-refused (test)'); }
+      return storedRow(id);
+    };
+    console.error = () => {};
+    const edited = s.processed('discord:edit', 'k9');
+    s.discord.onEditHandler!('k9', 'k9 newer edit');
+    await edited;
+    assert.equal(refuseOnce, false, "setup: the edit's sweep couldn't read k9's row, so the older edit waits");
+    const next = s.processed('discord:message', 'w3');
+    await s.discord.onMessageHandler!(live('w3', 'another message'));
+    await next;
+    assert.deepEqual(s.texts('k9'), ['k9 newer edit'], 'the newer edit is applied after the older one');
+    assert.equal(s.module.creating.has('k9'), false, 'and the entry ended');
+  } finally {
+    console.error = quiet;
+    await s.cleanup();
+  }
+});
+
 test("a kept create lost at its release ends its record with no store read, so a read that throws then doesn't keep it (bot review 2, #12)", async () => {
   const s = await withLostRelease('d1', async () => {}, {
     store: () => { throw new Error('zz-store-refused (test)'); },

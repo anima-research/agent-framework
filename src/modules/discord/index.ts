@@ -1476,22 +1476,27 @@ export class DiscordModule implements Module {
     // An edit that comes while the live path converts the message's create
     // is folded into that create (handleDiscordMessageEdit). One that comes
     // once onProcess answered the create and finds no row is kept on its
-    // entry (LiveCreate.unapplied), unless a delete is kept there already.
-    // Any other edit
+    // entry (LiveCreate.unapplied), unless a delete is kept there already,
+    // and so is one that comes while edits kept there wait for a sweep that
+    // finds the row (sweptRow threw, or the row came after the sweep): it
+    // goes behind them, and applyUnapplied applies them in order, so an
+    // older kept edit never lands over it. Any other edit
     // to a message with no row is dropped: a history sync
     // running now stores the text it fetched, and the next sync's text rule
     // changes it. A row stored in shards can't be edited one shard at a
     // time, so it keeps its text, and the host's log says so. Only an edit
     // that writes marks the message live, so an update that changes nothing
     // leaves a running sync free to rewrite the row.
-    const stored = this.storedRow(edit.discordMessageId);
-    if (!stored) {
-      const live = this.creating.get(edit.discordMessageId);
-      if (live?.phase === 'writing' && live.unapplied !== 'delete') {
-        live.unapplied = [...(live.unapplied ?? []), { text: edit.newContent, ...(edit.attachments ? { attachments: edit.attachments } : {}) }];
+    const kept = this.creating.get(edit.discordMessageId);
+    const keep = () => {
+      if (kept?.phase === 'writing' && kept.unapplied !== 'delete') {
+        kept.unapplied = [...(kept.unapplied ?? []), { text: edit.newContent, ...(edit.attachments ? { attachments: edit.attachments } : {}) }];
       }
       return {};
-    }
+    };
+    if (kept?.phase === 'writing' && Array.isArray(kept.unapplied)) return keep();
+    const stored = this.storedRow(edit.discordMessageId);
+    if (!stored) return keep();
     if (stored.bodyGroupId) {
       console.warn(`Discord: An update to message ${edit.discordMessageId} wasn't applied: it's stored in shards, which can't be edited, so if its text changed, the agent still has the earlier text`);
       return {};
