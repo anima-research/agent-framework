@@ -1,12 +1,13 @@
 /**
  * #291's reproduction: two residents of one slot whose turns overlap. With
  * the presentation index, which every framework has since AF-6, each
- * resident's window is the rows its own requests carried, in the order they
- * carried them, whatever the shared record's order: a row another writer
- * stored during a resident's turn enters its window at its tool boundary,
- * where its stream is given it, or at its turn's end, never inside the
- * turn. So each request a resident makes starts with the one before it (the
- * prompt cache's prefix), and its rounds' signed thinking is sent again
+ * resident's window is the rows its own requests carried, or will carry
+ * next, in the order they carried them, whatever the shared record's order:
+ * a row for it another writer stored during a resident's turn enters its
+ * window at its tool boundary, where its stream is given it, or at its
+ * turn's end, never inside the turn. So each request a resident makes
+ * starts with the one before it (the prompt cache's prefix; an operator's
+ * removal aside), and its rounds' signed thinking is sent again
  * under the prefix it was minted under. Without the index, the record's
  * order is every resident's window, and the other resident's rounds land
  * inside each turn.
@@ -268,8 +269,12 @@ async function overlappingTurns(dir: string, own: (framework: AgentFramework) =>
     gates.release('o');
     await until(() => stored('oren', 'oren done'), "oren's turn");
     if (options.subconscious) await until(() => receipts('oren') === 1, "oren's turn's receipt");
-    // oren is idle now, mira still waits on her tool.
-    surface.ctx.addMessage('user', [text('oren, idle')], {}, { forAgent: 'oren' });
+    // oren is idle now, mira still waits on her tool. His reply is stored
+    // before his turn's teardown, so wait for him to be at rest: a write for
+    // an idle resident enters his window at once.
+    await until(() => framework.getAgent('oren')!.state.status === 'idle', 'oren at rest');
+    const idleRow = surface.ctx.addMessage('user', [text('oren, idle')], {}, { forAgent: 'oren' });
+    assert.notEqual(cmOf('oren').ordinalOf(idleRow), undefined, "presented to oren at its write: he's at rest");
     gates.release('m');
     await until(() => stored('mira', 'mira done'), "mira's turn");
     if (options.subconscious) {

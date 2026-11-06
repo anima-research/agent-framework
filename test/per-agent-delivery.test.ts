@@ -5,7 +5,8 @@
  * deferral queue, turn-alive guard, and every flush point evaluated the
  * primary's turn state. The seam adds an optional forAgent target with the
  * guard evaluated against THAT agent's state. Since #291 a write is stored
- * at once, and the guard decides only when it enters the target's window:
+ * at once (unless a surgery's hold or a refusing manager keeps it in
+ * memory), and the guard decides only when it enters the target's window:
  * at once while the target is at rest, at the target's own next point while
  * its turn is alive. These tests once read the deferral queue; they read the
  * target's window now.
@@ -108,17 +109,19 @@ describe('per-agent message delivery', () => {
 
     // Write a message for shade while shade is busy.
     i.activeTurnTokens.set('shade', 7);
-    i.addMessage('user', [{ type: 'text', text: 'note for shade' }], undefined, {
+    const id = i.addMessage('user', [{ type: 'text', text: 'note for shade' }], undefined, {
       forAgent: 'shade',
     });
-    assert.equal(inWindow(framework, 'shade', 'note for shade'), false);
+    assert.notEqual(id, '', 'stored at once');
+    const status = () => framework.getAgent('shade')!.getContextManager().windowStatusOf(id as never);
+    assert.equal(status(), 'out', "stored, out of shade's live turn");
 
     // Scout (primary) runs a full turn: its points present nothing into
     // shade's window.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout says hi' }]));
     framework.pushEvent(channelIncoming('wake scout', ['scout']));
     await framework.runUntilIdle();
-    assert.equal(inWindow(framework, 'shade', 'note for shade'), false, 'shade\'s message waits past the primary\'s boundary');
+    assert.equal(status(), 'out', 'shade\'s message waits past the primary\'s boundary, stored');
 
     // Shade's own turn presents it (at its turn's start).
     i.activeTurnTokens.delete('shade');

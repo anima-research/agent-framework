@@ -190,6 +190,11 @@ describe('the presentation module', () => {
     const reply = storeOwnRow(r.mira, 'mira', [...text('calling'), toolUse('c1')]);
     assert.equal(r.mira.has(reply), true, 'presented at its write, while its turn is alive');
     assert.equal(r.oren.has(reply), false, "another agent's round is not oren's (decision 1)");
+    // oren's live turn would keep an arrival out until its next point, so
+    // end it and run that point: the round isn't oren's arrival either.
+    r.alive.delete('oren');
+    r.presentation.presentAtEnd(r.oren);
+    assert.equal(r.oren.has(reply), false, "nor once oren's turn has ended and its point has run");
     assert.deepEqual(r.mira.sinkCalls, [[reply]], 'the sink heard it once, by its id');
     const held = storeOwnRow(r.mira, 'user', text('held back'), undefined, undefined, false);
     assert.equal(r.mira.has(held), false, "a row written with present: false isn't");
