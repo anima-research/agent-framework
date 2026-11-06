@@ -370,6 +370,17 @@ export interface JudgeEventSummary {
   at: number;
 }
 
+/** The kinds of UpcomingWake. */
+export type UpcomingWakeKind =
+  | 'heartbeat'
+  | 'reminder'
+  | 'self-wake'
+  | 'sleep-end'
+  | 'debounce'
+  | 'judge-batch'
+  | 'queued'
+  | 'provider-hold';
+
 /**
  * Something that will (or, for a batch going to the judge, may) wake the
  * agent with no new event: what the judge is told would happen if it answers
@@ -382,6 +393,9 @@ export interface UpcomingWake {
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
+  /** What it is, in a word that quotes nothing, for healthSnapshot: `what` can
+   *  quote a reminder or a queue reason. The judge isn't told it. */
+  kind?: UpcomingWakeKind;
 }
 
 /** What the gate asks the reply judge for one batch. */
