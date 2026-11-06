@@ -387,6 +387,48 @@ describe('live operator surgery', () => {
     }
   });
 
+  // AF #844 bot review 4, finding 107: the write a release replays is taken
+  // off the queue as soon as its store returns, before it is presented, so a
+  // listener of its presentation (an idle reader's, which may count the
+  // stored rows and the held ones, as a tune-out's check does) finds it
+  // stored and not listed as held too. It was listed both ways from the
+  // store until addMessage returned.
+  it("a replayed write is no longer listed as held once it is stored, when its presentation is traced", async () => {
+    const internals = framework as unknown as {
+      surgeryHeldWrites: Array<{ content: Array<{ text?: string }> }>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    const c = cm() as unknown as { setStrategy: (strategy: unknown) => Promise<void> };
+    const originalSetStrategy = c.setStrategy;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let armed = true;
+    c.setStrategy = async function (this: unknown, strategy: unknown) {
+      if (armed) { armed = false; await gate; }
+      return originalSetStrategy.call(this, strategy);
+    };
+    const seen: Array<{ stored: number; held: number }> = [];
+    framework.onTrace((event) => {
+      if (event.type !== 'presentation:presented' || event.agentName !== 'scout') return;
+      const stored = remainingTexts().filter((t) => t === 'R').length;
+      if (stored === 0) return;
+      seen.push({ stored, held: internals.surgeryHeldWrites.filter((w) => w.content[0]?.text === 'R').length });
+    });
+    try {
+      const switching = framework.switchBranch(framework.getStore().currentBranch().name);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'R' }]), '', 'held while the switch holds the store');
+      assert.equal(internals.surgeryHeldWrites.length, 1);
+      release();
+      await switching;
+      assert.ok(seen.length > 0, 'setup: the replayed write was presented to scout, at rest, as its release stored it');
+      assert.deepEqual(seen, seen.map(() => ({ stored: 1, held: 0 })), 'stored once and listed as held nowhere as it is presented');
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      c.setStrategy = originalSetStrategy;
+    }
+  });
+
   // Ported for #291: what the hold keeps is in memory, so there is no
   // recovery queue to acknowledge, which this test once checked.
   it("the hold's release stores what waited behind it while another agent's tool cycle is pending", { timeout: 60_000 }, async () => {

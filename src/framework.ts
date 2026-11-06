@@ -2678,9 +2678,12 @@ interface FrameworkWriteOptions {
    * is kept behind the writes still waiting (replayingHeld). A hold that a
    * listener of its own traces begins (its clock row's, its audience
    * check's) leaves it unstored at the head of the queue, ahead of the
-   * writes that came after it. Never kept on a write.
+   * writes that came after it. The function takes the write off that queue,
+   * and is called as soon as its store returns, before its rows are
+   * presented: a listener of its presentation finds it stored and not held.
+   * Never kept on a write.
    */
-  replayed?: true;
+  replayed?: () => void;
   /**
    * A suppress rule took this message as it arrived (the gate's
    * suppressionFor, asked by the lane that wrote it): stamped as
@@ -24270,7 +24273,8 @@ export class AgentFramework {
    * routes), stamped for the fork alone. While a surgery holds the store it
    * is held in memory instead (surgeryHeldWrites) and '' returned, and so
    * is it while a hold's release replays what the hold kept, but for the
-   * write the replay stores (`replayed`), and while the fork's context
+   * write the replay stores (`replayed`, called as soon as its store
+   * returns, as addMessage calls it), and while the fork's context
    * manager refuses its work after a failed re-initialization
    * (heldForRecovery, as addMessage keeps a write);
    * stored, it enters the fork's window at once when no turn of the fork's
@@ -24280,7 +24284,7 @@ export class AgentFramework {
    * presented (landedThoughThrown), as addMessage's. `mayBeStored`: as
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
-  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: boolean): MessageId {
+  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: () => void): MessageId {
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
@@ -24318,6 +24322,7 @@ export class AgentFramework {
           return '' as MessageId;
         }
         if ('unknown' in thrown) {
+          replayed?.();
           this.presentation?.afterStore(target, presentedThoughUnknown(thrown.unknown));
           throw error;
         }
@@ -24325,6 +24330,7 @@ export class AgentFramework {
         rows = thrown.landed;
       }
     }
+    replayed?.();
     this.presentation?.afterStore(target, rows);
     return id;
   }
@@ -24457,9 +24463,9 @@ export class AgentFramework {
         if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
-        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, true);
+        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, settle);
       } else {
-        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: true });
+        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: settle });
       }
       if (this.replayHeldAgain) {
         this.replayHeldAgain = false;
@@ -33088,6 +33094,7 @@ export class AgentFramework {
           // answered by that error, not as stored, and the rows the error
           // names are presented as a landed write's are (an imported write's
           // by the boot's pass, and its next boot finds it by its id).
+          opts?.replayed?.();
           if (!opts?.imported) this.presentation?.afterStore(agent, presentedThoughUnknown(thrown.unknown));
           throw error;
         } else {
@@ -33102,6 +33109,9 @@ export class AgentFramework {
         }
       }
     }
+    // The write a release replays is off its queue from here (`replayed`):
+    // the listeners of what follows find it stored, not held as well.
+    opts?.replayed?.();
     if (opts?.placement) {
       opts.placement.agent = agent.name;
       opts.placement.messageId = stored;
