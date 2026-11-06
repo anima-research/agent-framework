@@ -1131,7 +1131,8 @@ export class TuneOutCoordinator {
    * same across a restart. An enter sets the oldest active tune-out's, as it
    * always has. Where the window presents, the other active tune-outs whose
    * start isn't kept yet go with it, for the framework to fix as soon as
-   * each can be.
+   * each can be: the oldest one's too, where a resume sets the start in
+   * force instead of it.
    */
   private anchorSubconscious(occasion: 'enter' | 'resume' = 'enter'): void {
     const active = this.activeStarts();
@@ -1172,7 +1173,9 @@ export class TuneOutCoordinator {
     if (kept) {
       const bySequence = new Map<number, string[]>();
       for (const e of active) {
-        if (e.sequence === sequence || state.starts[e.epochId] !== undefined) continue;
+        // The oldest active start goes with them where the start in force is
+        // set in its place (inForceOnly), so it is fixed too, unmoved to.
+        if ((e.sequence === sequence && !inForceOnly) || state.starts[e.epochId] !== undefined) continue;
         bySequence.set(e.sequence, [...(bySequence.get(e.sequence) ?? []), e.epochId]);
       }
       for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });

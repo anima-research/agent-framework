@@ -1457,7 +1457,7 @@ function anchored(options: { active: Array<{ epochId: string; sequence: number }
   const states = new Map<string, unknown>();
   if (options.state) states.set(STARTS, { v: 1, ...options.state });
   const writes: unknown[] = [];
-  const control = { readFails: 0, setFails: 0, length: options.length, persisted: options.persisted, active: options.active };
+  const control = { readFails: 0, setFails: 0, length: options.length, persisted: options.persisted, persistedThrows: false, active: options.active };
   const channels = () => control.active.map((a) => ({ serverId: 'disc', descriptor: { id: `disc:guild:${a.epochId}` } }));
   const registry = {
     listChannelsRaw: channels,
@@ -1479,7 +1479,10 @@ function anchored(options: { active: Array<{ epochId: string; sequence: number }
       calls.push(`setAnchorOrdinal(${ordinal})`);
       if (control.setFails > 0) { control.setFails--; throw new Error('the slot refused it (test)'); }
     },
-    getAnchorOrdinal: () => control.persisted,
+    getAnchorOrdinal: () => {
+      if (control.persistedThrows) throw new Error('the strategy could not read its anchor (test)');
+      return control.persisted;
+    },
   };
   let coordinator!: TuneOutCoordinator;
   const anchor = new SubconsciousWindowAnchor({
@@ -1743,3 +1746,24 @@ test("review 2 #32: a loss notice whose write meets a hold beginning at it is ke
   }
 });
 
+test("review 2 #28: a restart that sets a cancelled tune-out's start in force fixes the oldest active one's own start too, without moving the window to it", () => {
+  const h = anchored({ active: [{ epochId: 'Y', sequence: 70 }], state: { starts: {}, inForce: 3 }, length: 12 });
+  h.internals.anchorSubconscious('resume');
+  assert.deepEqual(h.calls, ['setAnchorOrdinal(3)'], 'the window keeps the start in force');
+  assert.equal(h.kept()?.inForce, 3);
+  assert.notEqual(h.kept()?.starts.Y, undefined, "and Y's own start is fixed and kept, for the next anchor to set");
+});
+
+test("review 2 #35: a restart whose read of the strategy's persisted anchor throws leaves the window where it was, nothing set or kept in force", () => {
+  const h = anchored({ active: [{ epochId: 'Y', sequence: 70 }], state: { starts: { Y: 7 } }, length: 12, persisted: 2 });
+  h.control.persistedThrows = true;
+  const errors = mock.method(console, 'error', () => {});
+  try {
+    h.internals.anchorSubconscious('resume');
+  } finally { errors.mock.restore(); }
+  assert.deepEqual(h.calls, [], "Y's later start isn't set over an earlier one the strategy may hold");
+  assert.deepEqual(h.kept(), { v: 1, starts: { Y: 7 } }, 'and nothing is kept as the start in force');
+  h.control.persistedThrows = false;
+  h.internals.anchorSubconscious('resume');
+  assert.deepEqual(h.calls, ['setAnchorOrdinal(2)'], 'the next restart that can read it keeps the earlier one');
+});

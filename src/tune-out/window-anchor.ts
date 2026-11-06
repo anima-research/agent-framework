@@ -29,16 +29,19 @@
  * rollback), the clamped ordinal then kept as the start, never converted
  * again. A kept ordinal is kept as the start in force once it is set, not
  * before, and one whose setting or keeping fails is tried again at the next
- * presentation, as a fix is. Two starts wait longer: one set while
- * the window is the record (a branch move whose re-initialization of the
- * subconscious failed) is set by sequence and fixed at the next enter or
- * restart once the window presents; and one whose setting or keeping
- * failed before a branch move is fixed again at the next enter or restart.
- * A restart that finds a start in force kept sets that one, and the oldest
- * active tune-out's start, if it isn't kept, waits for the next enter; one
- * that finds none kept, the oldest's start being kept, sets the anchor the
- * strategy persisted where that is earlier (a cancelled tune-out's start
- * that was set but never kept), as the start in force.
+ * presentation, as a fix is. One set while the window is the record (a
+ * branch move whose re-initialization of the subconscious failed) waits
+ * longer: it is set by sequence and fixed at the next enter or restart once
+ * the window presents. One whose setting or keeping failed before a branch
+ * move is fixed again on the branch moved to, from its window there, as one
+ * never fixed is: an ordinal is a place on the branch it was fixed on. A
+ * restart that finds a start in force kept sets that one, and fixes the
+ * oldest active tune-out's start, if it isn't kept, without moving the
+ * window to it; one that finds none kept, the oldest's start being kept,
+ * sets the anchor the strategy persisted where that is earlier (a cancelled
+ * tune-out's start that was set but never kept), as the start in force,
+ * and where that anchor can't be read, sets nothing, the window left where
+ * it was until the next enter or restart.
  */
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { SubconsciousWindowStart } from './coordinator.js';
@@ -127,6 +130,15 @@ export class SubconsciousWindowAnchor {
       let inForceOnly = start.inForceOnly === true;
       if (known !== undefined && start.keepEarlierAnchor) {
         const persisted = persistedOrdinal(strategy);
+        if (persisted === null) {
+          // Whether the strategy holds an earlier start (a cancelled
+          // tune-out's, set and never kept) can't be told: the kept one set
+          // over it would drop the rows it held from the window, and be kept
+          // in force. The window stays where it was, nothing set or kept in
+          // force; the next enter or restart sets it. The others are fixed.
+          this.tryFix();
+          return;
+        }
         if (persisted !== undefined && persisted < known) {
           known = persisted;
           inForceOnly = true;
@@ -151,8 +163,15 @@ export class SubconsciousWindowAnchor {
     }
   }
 
+  /**
+   * The store's branch moved (the framework's followBranchMove, before the
+   * agents follow it): an ordinal is a place on the branch it was fixed on,
+   * so a start pending at one (its setting or keeping failed), or set by one
+   * kept there (`known`), waits again to be fixed, from the window it
+   * presents on now, as a start never fixed does (tryFix).
+   */
   branchMoved(): void {
-    this.pending = this.pending.filter((p) => p.ordinal === undefined);
+    this.pending = this.pending.map((p) => ({ start: p.start, inForce: p.inForce }));
   }
 
   /** Rows entered the subconscious's window (the presentation index's onPresented): a start waiting to be fixed may be fixable now. */
@@ -211,13 +230,13 @@ export class SubconsciousWindowAnchor {
   }
 }
 
-/** The anchor the strategy persisted, as an ordinal, or undefined when it can't say. */
-function persistedOrdinal(strategy: AnchoredStrategy): number | undefined {
+/** The anchor the strategy persisted, as an ordinal: undefined where it persisted none, null where it can't be read. */
+function persistedOrdinal(strategy: AnchoredStrategy): number | undefined | null {
   try {
     return strategy.getAnchorOrdinal();
   } catch (error) {
-    console.error(`[tune-out] the subconscious's persisted window start couldn't be read, so the start kept is set:`, error);
-    return undefined;
+    console.error(`[tune-out] the subconscious's persisted window start couldn't be read, so the window start stays where it was; the next enter or restart sets it:`, error);
+    return null;
   }
 }
 
