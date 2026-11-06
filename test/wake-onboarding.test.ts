@@ -230,7 +230,7 @@ async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; onto
     .flatMap((m) => (m.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text' && b.text?.startsWith('[wake onboarding]')).map((b) => b.text!));
   /** The notices the agent was shown (#291): those in its window. */
   const notices = (agent = 'agent') => noticesIn(f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Row[]);
-  /** The notices stored, whoever they are for: none means none was written. */
+  /** The notices stored in the agent's slot, whoever there they are for (a fork's own copy is in its own slot): none means none was written there. */
   const stored = () => noticesIn(f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Row[]);
   /** The window's texts, in order. */
   const window = (agent = 'agent') => (f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Row[])

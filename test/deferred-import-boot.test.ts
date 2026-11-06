@@ -3,7 +3,9 @@
  * with writes still in its deferred queue boots, stores each of them once,
  * in the order they arrived (a gone agent's are passed on or dropped,
  * logged; one whose landing can't be checked, or whose store write throws,
- * is kept, with what follows it for that agent, for the next boot), and
+ * is kept, with what follows it for that agent, for the next boot; one
+ * context-manager refuses as malformed is dropped, logged, as the queue's
+ * flush dropped it), and
  * rewrites the record with what it kept. A second boot imports only that.
  * Each case here writes the record by hand, as such a
  * release left it (recovery/deferred-writes.json, or the store's

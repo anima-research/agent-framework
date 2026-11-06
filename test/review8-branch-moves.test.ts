@@ -250,7 +250,7 @@ describe("a surgery's release, while it replays the writes its hold kept (AF #84
 // and read as presented though its strategy refuses, and writes kept for it
 // would have gone to the release as recovered.
 describe('a branch move made through an agent whose manager its restore left refusing its work (AF #844 bot review 61)', () => {
-  it("doesn't count that manager recovered: its window stays in legacy mode, traced with the cause, until a move re-initializes it", async () => {
+  it("doesn't count that manager recovered: it stays unpresented (legacy), traced with the cause, until a move re-initializes it", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-review8-2b-fenced-'));
     dirs.push(dir);
     const autobiographical = () => new AutobiographicalStrategy({

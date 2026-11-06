@@ -1,7 +1,8 @@
 /**
  * A removal from the record leaves every window that held the row (#291,
- * AF-7); a window that can't be repaired is logged, and the next boot takes
- * the row out of it. context-manager tombstones a removal in the window of
+ * AF-7); a window that can't be repaired is logged, and each boot tries again
+ * to take the row out of it (retractAbsentRows), logging a window it still
+ * can't repair. context-manager tombstones a removal in the window of
  * the context it was made through, and another context on the same slot, or
  * merging it, keeps the row's place (CM-T): its listing and its compile
  * leave the row out, but its ordinal stays issued, and every cursor or

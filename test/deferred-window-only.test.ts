@@ -5,11 +5,14 @@
  * A write is stored at once, whatever its agent's turn (unless a surgery's
  * hold or a refusing manager keeps it in memory), and enters the agent's
  * window (a write for it: one a tune-out holds is for no resident, and
- * enters no resident's window) at the agent's next presentation point.
+ * enters no resident's window) at the agent's next presentation point, or,
+ * while the host is quiesced, at the resume.
  * One that arrives
  * during a round enters at the agent's next tool boundary and is injected
  * into the resumed stream (hear-while-acting), so the next compile's prefix
- * is the request the turn's later replies were minted under. Two kinds of
+ * is the request the turn's later replies were minted under, save where the
+ * render places a message before its window (its images and cap) and a
+ * body stored in parts. Two kinds of
  * message can't be injected: one carrying tool blocks (it would break the
  * tool cycle membrane enforces) and one named as the agent itself (a
  * prefill). Those wait for the turn's end, and so does everything that

@@ -7,8 +7,8 @@
  * window at its tool boundary, where its stream is given it, or at its
  * turn's end, never inside the turn. So each request a resident makes
  * starts with the one before it (the prompt cache's prefix; an operator's
- * removal, the strategy's folding, or a module injection placed at each
- * compile aside), and its rounds' signed
+ * removal, an undo or a redo, the strategy's folding, or a module injection
+ * placed at each compile aside), and its rounds' signed
  * thinking is sent again under the prefix it was minted under. Without the index, the record's
  * order is every resident's window, and the other resident's rounds land
  * inside each turn.

@@ -275,7 +275,7 @@ describe('the audience stamp (#291)', () => {
     }
   }
 
-  it("a window compiles byte for byte as its rows unstamped do: context-manager's compile doesn't read the stamp", async () => {
+  it("a window compiles to the same participants and content as its rows unstamped do: context-manager's compile doesn't read the stamp", async () => {
     const framework = await boot();
     framework.start();
     membrane.script('mira', ping('call-1'), say('mira done'));

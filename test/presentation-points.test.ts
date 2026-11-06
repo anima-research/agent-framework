@@ -1,11 +1,13 @@
 /**
  * The presentation points (#291, AF-4; mandatory since AF-6): a write is
- * stored at once and enters each reader's window at that
+ * stored at once, unless a surgery's hold or a context manager refusing its
+ * work keeps it in memory, and enters each reader's window at that
  * reader's points (its turn's start, its tool boundary as a prefix its
  * stream can carry, its turn's end, and at once while no turn of it is
  * alive); an agent's own rows enter as they are written, but for one written
  * where a turn it isn't part of may be alive, which waits; a surgery's hold
- * keeps writes in memory and replays them at its release; a quiesce freezes
+ * keeps writes in memory and replays them at its release, as a refusing
+ * manager's recovery does; a quiesce freezes
  * every window but for each agent's own rows; an undo takes a turn out of
  * the agent's window and a redo puts it back, moving no branch.
  */
