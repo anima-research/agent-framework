@@ -402,4 +402,26 @@ describe('AF #844 bot review 5 — the offline no-op refusal', () => {
     );
   });
 
+  // Finding 9: a tool boundary presents a round's reply and its results in
+  // one write, so an anchor at the call keeps its result. Suppressing the
+  // result would leave the call without it (the recovery itself refuses
+  // that split): the advice is to anchor before the call.
+  it("9: a kept result of the anchor's own call is not advised for suppression: the refusal says to anchor before the call", async () => {
+    const { storePath, ids, p } = await presentedTogether([
+      { participant: 'agent', content: [{ type: 'text', text: 'Fetching.' } as ContentBlock, { type: 'tool_use', id: 'call-1', name: 'test--fetch', input: {} } as ContentBlock] },
+      { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock] },
+    ]);
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', contextId: String(ids[0]), dryRun: true }),
+      (error: Error) => {
+        assert.ok(error.message.endsWith(
+          `to take that message out, anchor the recovery before ${String(ids[0])}, which holds the call it answers, instead ` +
+          `(at ${String(p)}, the message before it in the window): ${String(ids[1])} holds a result of a call at or before ` +
+          `the anchor, and suppressing it would leave that call without its result. ${OWN_SLOT_ONLY}`,
+        ), error.message);
+        assert.doesNotMatch(error.message, /suppressMessages|--suppress/);
+        return true;
+      },
+    );
+  });
 });

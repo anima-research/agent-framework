@@ -252,6 +252,38 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     });
   });
 
+  // AF #844 bot review 5, finding 9: a tool boundary presents a round's
+  // reply and its results in one write, so a rollback to the call keeps
+  // its result. Suppressing the result would leave the call without it:
+  // the refusal says to roll back before the call, and offers suppression
+  // for the rest only, which keeps the call and its result.
+  it("the refusal of a rollback to a call kept with its result says to roll back before the call, not to suppress the result", async () => {
+    const h = await boot();
+    const p = h.store('p');
+    h.cm().presentRows([p]);
+    const call = h.cm().addMessage('scout', [
+      { type: 'text', text: 'Fetching.' } as ContentBlock,
+      { type: 'tool_use', id: 'call-1', name: 'surface--fetch', input: {} } as ContentBlock,
+    ]);
+    const result = h.cm().addMessage('user', [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock]);
+    const after = h.store('after');
+    h.cm().presentRows([call, result, after]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: call }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.ok(e.message.endsWith(
+        `to take those messages out, roll back before ${call}, which holds the call it answers, instead (to ${p}, the message ` +
+        `before it in the window): ${result} holds a result of a call at or before the anchor, and suppressing it would leave ` +
+        `that call without its result; or, to keep that call and its results, suppress the rest (suppressMessages for ${after}), ` +
+        `or hide the rest by Discord message id (the host's hide command: on scout for d-after)`,
+      ), e.message);
+      return true;
+    });
+    // As it says: the rollback to p takes the call and its result out together.
+    const back = await h.framework.rollbackToMessage('scout', { messageId: p });
+    assert.equal(back.messagesRemoved, 3);
+    assert.deepEqual(h.windowTexts(), ['p']);
+  });
+
   it('a rollback to a row presented together with every row after it changes nothing, and is refused saying so', async () => {
     const h = await boot();
     const x = h.store('x');

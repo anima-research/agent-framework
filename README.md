@@ -899,7 +899,10 @@ separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot
 the agent observes, which the refusal names), or, for those with a Discord message id,
 the host's `hide` by it, run on the agent whose own slot holds the row (the
-refusal names it), takes them out. The preview's `neverPresented` counts the messages it
+refusal names it), takes them out. A row holding a result of a call at or
+before the target (a tool boundary presents a round's reply and its results
+in one write) isn't advised for suppression, which would leave the call
+without its result: the refusal says to roll back before the call. The preview's `neverPresented` counts the messages it
 removes that no live agent is shown: no window holds them, or only windows
 whose view leaves them out (a row a tune-out holds); a message that may be in
 a window that couldn't be read isn't counted, and is logged. The host command's

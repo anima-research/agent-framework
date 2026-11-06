@@ -1043,6 +1043,7 @@ import {
   type DiscordAwarenessScope,
   type DiscordAwarenessSettlement,
 } from './recovery/discord-awareness-outbox.js';
+import { anchorBefore, resultsOfAnchoredCalls } from './recovery/offline-branch.js';
 import {
   OperatorActionError,
   OperatorLog,
@@ -17316,20 +17317,36 @@ export class AgentFramework {
         };
         const discordId = discordIdOf(first);
         const named = `${String(first.id)}${discordId !== undefined ? `, Discord message ${discordId}` : ''}`;
+        // A row holding a result of a call at or before the target (a tool
+        // boundary presents a round's reply and its results in one write)
+        // isn't to be suppressed, which would leave the call without its
+        // result: the advice is to roll back before the call. A window that
+        // can't be read gives no such advice.
+        let split: ReturnType<typeof resultsOfAnchoredCalls<StoredMessage>>;
+        try {
+          split = resultsOfAnchoredCalls(cm.getPresentedMessages(), tailMessageId, kept);
+        } catch {
+          split = undefined;
+        }
+        const suppressible = split ? kept.filter((row) => !split!.rows.includes(row)) : kept;
+        const m = suppressible.length;
+        const them = m === n ? (n === 1 ? 'it' : 'them') : 'the rest';
         // The host's hide matches a Discord id, so it is named only where
         // one of them has one (an API or a module's row has none), and for
         // those alone where only some have one, each id named, with the
         // agent it is run on (hideThrough): it reads that agent's own slot.
-        const withId = kept.filter((row) => discordIdOf(row) !== undefined);
+        const withId = suppressible.filter((row) => discordIdOf(row) !== undefined);
         const hideBy = `(the host's hide command: ${this.hideThrough(agentName, cm, withId.map((row) => ({ id: row.id as MessageId, discordId: discordIdOf(row)! })))})`;
         const hide = withId.length === 0 ? ''
-          : withId.length === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id ${hideBy}`
+          : withId.length === m ? `, or hide ${them} by Discord message id ${hideBy}`
           : `, or hide those with a Discord message id by it ${hideBy}`;
+        const how = m === 0 ? '' : `suppress ${them} (${this.suppressionThrough(agentName, cm, suppressible)})${hide}`;
+        const before = split ? anchorBefore(split, 'roll back', 'to') : '';
         throw new OperatorActionError('invalid',
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
           `so a rollback to it would change nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-          `suppress ${n === 1 ? 'it' : 'them'} (${this.suppressionThrough(agentName, cm, kept)})${hide}`);
+          (before && how ? `${before}; or, to keep that call and its results, ${how}` : before || how));
       }
       throw new OperatorActionError('invalid', after > 0
         // Rows follow it in the record, but the cut keeps every one of them,
