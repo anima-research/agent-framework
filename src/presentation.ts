@@ -1069,7 +1069,8 @@ export class AgentPresentation {
    * however its window filters held rows, until it is let go (forget). A
    * fork framed before it is taken on has them presented at its adopt. Its
    * window's filter (the residents', which a reader fork inherits) keeps
-   * them out of its compiles, where its framing row shows them; nothing
+   * them out of its compiles, as it keeps all held traffic; its framing row
+   * shows them where the framing puts them (the default's does); nothing
    * else of its window moves. Rows whose presentation fails enter at the
    * fork's next turn start, or after a move of the store's branch (rebase).
    */

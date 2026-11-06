@@ -39753,6 +39753,16 @@ export class AgentFramework {
         },
         currentSequence: () => this.store.currentSequence(),
         currentBranch: () => this.store.currentBranch().name,
+        // Where a branch was forked from (its parent's name and the
+        // parent's head at the fork, chronicle's branch point), so a move to
+        // a branch forked from the run's at or after its start keeps the
+        // run's start (the coordinator's branchMoved).
+        branchOrigin: (name) => {
+          const branches = this.store.listBranches();
+          const branch = branches.find((b) => b.name === name);
+          const parent = branch?.parentId !== undefined ? branches.find((b) => b.id === branch.parentId) : undefined;
+          return parent && branch!.branchPoint !== undefined ? { parent: parent.name, branchPoint: branch!.branchPoint } : undefined;
+        },
         // By sequence while its window is the record; by a fixed ordinal
         // once the presentation index presents for it (window-anchor.ts).
         setSubconsciousAnchor: (start, others) => this.subconsciousAnchor?.set(start, others),
@@ -39791,12 +39801,15 @@ export class AgentFramework {
    * epoch's end is on disk at once. The coordinator's cancel waits for them
    * then (its writesHeld; releaseSurgeryHeldWrites runs it), and so does a
    * release of the holds on record with no reader
-   * (releaseTuneOutsWithoutReader). With `forAgent`, a write for that agent
-   * too (a loss notice for a reader fork whose manager refuses its work).
+   * (releaseTuneOutsWithoutReader). With `forAgent` (a loss notice's
+   * author), whether a write for that agent would be kept: a surgery's hold
+   * or its replay, or that agent's own manager refusing its work or waiting
+   * for its recovery; not the primary's or the subconscious's, which hold
+   * their own agent's writes alone.
    */
   private tuneOutWritesHeld(forAgent?: string): boolean {
     return this.surgeryHold !== null || this.replayingHeld
-      || [this.primaryAgentName, this.subconsciousAgentName, forAgent]
+      || (forAgent !== undefined ? [forAgent] : [this.primaryAgentName, this.subconsciousAgentName])
         .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name)));
   }
 
