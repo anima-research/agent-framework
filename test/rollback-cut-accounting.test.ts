@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework, OperatorActionError, storeOwnRow } from '../src/index.js';
+import { AgentFramework, OperatorActionError, asOwnRow, storeOwnRow } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, OperatorLogEntry, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { until } from './helpers/dendrite.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -182,7 +182,7 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
         assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
         assert.match(e.message, new RegExp(`Message ${a} was presented to scout in one write with the 1 message after it in its window \\(the first: ${b}, Discord message d-B\\)`));
         assert.match(e.message, /a branch cut can't separate the rows one write presented/);
-        assert.match(e.message, /suppress it \(suppressMessages\), or hide it by Discord message id/);
+        assert.ok(e.message.endsWith(`suppress it (suppressMessages for ${b}), or hide it by Discord message id (the host's hide command: d-B)`), e.message);
         assert.doesNotMatch(e.message, /already the tail/);
         return true;
       });
@@ -204,10 +204,33 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
       assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
       assert.ok(e.message.includes(`(the first: ${y})`), e.message);
-      assert.match(e.message, /suppress it \(suppressMessages\)$/, 'suppression is the removal named');
+      assert.ok(e.message.endsWith(`suppress it (suppressMessages for ${y})`), `suppression is the removal named: ${e.message}`);
       assert.doesNotMatch(e.message, /Discord message id|hide command/);
       return true;
     });
+  });
+
+  // AF #844 bot review 4, finding 6: suppressMessages takes row ids, so the
+  // refusal names every row it advises suppressing, not only the first, and
+  // every Discord id its hide would match.
+  it("the refusal of a rollback the rows presented with its target make empty names each of them for the suppression, and each Discord id for the hide", async () => {
+    const h = await boot();
+    const x = h.store('x');
+    const y = h.store('y');
+    const z = h.store('z');
+    h.cm().presentRows([x, y, z]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.match(e.message, /the 2 messages after it/, e.message);
+      assert.ok(e.message.endsWith(
+        `suppress them (suppressMessages for ${y}, ${z}), or hide them by Discord message id (the host's hide command: d-y, d-z)`,
+      ), e.message);
+      return true;
+    });
+    // As it says: both go.
+    const suppressed = await h.framework.suppressMessages('scout', { messageIds: [y, z] });
+    assert.equal(suppressed.messagesRemoved, 2);
+    assert.deepEqual(h.windowTexts(), ['x']);
   });
 
   // AF #844 bot review 3, finding 23: a batch where only some rows have a
@@ -221,7 +244,7 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
       assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
       assert.match(e.message, /the 2 messages after it/, e.message);
-      assert.ok(e.message.endsWith(", or hide those with a Discord message id by it (the host's hide command)"), e.message);
+      assert.ok(e.message.endsWith(", or hide those with a Discord message id by it (the host's hide command: d-y)"), e.message);
       return true;
     });
   });
@@ -238,7 +261,7 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
       h.framework.rollbackToMessage('scout', { messageId: x }),
       (e: unknown) => e instanceof OperatorActionError && e.code === 'invalid'
         && e.message.includes(`was presented to scout in one write with the 1 message after it in its window (the first: ${y}, Discord message d-y)`)
-        && /suppress it \(suppressMessages\)/.test(e.message),
+        && e.message.includes(`suppress it (suppressMessages for ${y})`),
     );
     assert.equal(h.cm().currentBranch().name, 'main', 'no branch was made');
     // Nothing follows y, in the record or the window.
@@ -387,6 +410,37 @@ describe("a host's message-granular undo on a window that merges an observed slo
     const last = await h.undo(1);
     assert.equal(last.ok, false);
     assert.match(String(last.error), /Cannot remove 1 message\(s\) — history has 1/);
+  });
+
+  // AF #844 bot review 4, findings 6 and 54: the refusal of a no-op rollback
+  // names each row it advises suppressing, under the agent the suppression
+  // goes through (a row of the residents' slot through the resident whose own
+  // slot holds it), and says where that suppression is refused because it
+  // would leave the slot empty, as planSuppression refuses one.
+  it("a no-op rollback's refusal names each row by the agent its suppression goes through, and says where that would empty the slot", async () => {
+    const h = await bootWithSubconscious();
+    const SUB = 'Subconscious';
+    const text = (t: string) => [{ type: 'text', text: t } as ContentBlock];
+    const mcm = h.framework.getAgent('mira')!.getContextManager();
+    assert.equal(mcm.getMessageCount(), 0, "premise: the residents' slot holds nothing yet");
+    // Its own target and its own note, and a residents' row, presented to it
+    // in one write.
+    const target = h.scm().addMessage(SUB, text('its target'), asOwnRow(undefined, SUB));
+    const note = h.scm().addMessage(SUB, text('its own note'), asOwnRow(undefined, SUB));
+    const residents = mcm.addMessage('someone', text("a residents' row"), {});
+    h.scm().presentRows([target, note, residents]);
+    await assert.rejects(h.framework.rollbackToMessage(SUB, { messageId: target }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.ok(e.message.endsWith(
+        `suppress them (suppressMessages on ${SUB} for ${note}, in its own slot; and on mira for ${residents}, in mira's own ` +
+        `slot, which ${SUB} observes, but a suppression there is refused, since mira's own slot holds no other row and one must remain)`,
+      ), e.message);
+      return true;
+    });
+    // As it says: through mira the suppression is refused; through the
+    // subconscious its note goes.
+    await assert.rejects(h.framework.suppressMessages('mira', { messageIds: [residents] }), /at least one must remain/);
+    assert.equal((await h.framework.suppressMessages(SUB, { messageIds: [note] })).messagesRemoved, 1);
   });
 
   it("a rollback to a residents' row in its window is refused as not its own, not as off the branch", async () => {

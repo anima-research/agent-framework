@@ -17274,11 +17274,13 @@ export class AgentFramework {
         const named = `${String(first.id)}${discordId !== undefined ? `, Discord message ${discordId}` : ''}`;
         // The host's hide matches a Discord id, so it is named only where
         // one of them has one (an API or a module's row has none), and for
-        // those alone where only some have one.
-        const withId = kept.filter((m) => discordIdOf(m) !== undefined).length;
+        // those alone where only some have one, each id named.
+        const discordIds = kept.map(discordIdOf).filter((id): id is string => id !== undefined);
+        const withId = discordIds.length;
+        const hideBy = `(the host's hide command: ${discordIds.join(', ')})`;
         const hide = withId === 0 ? ''
-          : withId === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`
-          : ", or hide those with a Discord message id by it (the host's hide command)";
+          : withId === n ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id ${hideBy}`
+          : `, or hide those with a Discord message id by it ${hideBy}`;
         throw new OperatorActionError('invalid',
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
@@ -17304,38 +17306,53 @@ export class AgentFramework {
 
   /**
    * Through which agent a suppression takes `rows` of `agentName`'s window
-   * out, for a refusal's advice: a suppression looks for its ids in the
-   * agent's own slot (planSuppression), so a row of a slot the agent
-   * observes, merged into its window, is suppressed through an owner of
-   * that slot whose own slot holds it (observedRowOwner). Plain
-   * `suppressMessages` when every row is in the agent's own slot.
+   * out, for a refusal's advice, each row named by its id, which
+   * suppressMessages takes: a suppression looks for its ids in the agent's
+   * own slot (planSuppression), so a row of a slot the agent observes,
+   * merged into its window, is suppressed through an owner of that slot
+   * whose own slot holds it (observedRowOwner). Plain `suppressMessages`
+   * with the ids when every row is in the agent's own slot. Where an
+   * owner's slot holds no row but those named for it, the advice says the
+   * suppression there is refused, as planSuppression refuses one that
+   * would leave no row.
    */
   private suppressionThrough(agentName: string, cm: ContextManager, rows: readonly StoredMessage[]): string {
-    let own = 0;
-    const merged = new Map<string | undefined, number>();
+    const own: string[] = [];
+    const merged = new Map<string | undefined, string[]>();
     for (const row of rows) {
       let inOwnSlot = true;
       try { inOwnSlot = cm.getMessage(row.id as MessageId) !== null; } catch { /* read as its own: the plain advice */ }
-      if (inOwnSlot) { own++; continue; }
+      if (inOwnSlot) { own.push(String(row.id)); continue; }
       const owner = this.observedRowOwner(agentName, row.id as MessageId);
-      merged.set(owner, (merged.get(owner) ?? 0) + 1);
+      merged.set(owner, [...(merged.get(owner) ?? []), String(row.id)]);
     }
-    if (merged.size === 0) return 'suppressMessages';
+    const listed = (ids: readonly string[]): string => ids.join(', ');
+    // Read defensively: a count that can't be read says nothing.
+    const refusedThere = (owner: string, ids: readonly string[]): string => {
+      let count: number | undefined;
+      try { count = this.agents.get(owner)?.getContextManager().getMessageCount(); } catch { /* unknown */ }
+      return count !== undefined && count <= ids.length
+        ? `, but a suppression there is refused, since ${owner}'s own slot holds no other row and one must remain`
+        : '';
+    };
+    if (merged.size === 0) return `suppressMessages for ${listed(own)}`;
     const observed = `a slot ${agentName} observes`;
-    if (own === 0 && merged.size === 1) {
-      const [[owner, n]] = [...merged];
-      const pronoun = n === 1 ? 'it is' : 'they are';
+    if (own.length === 0 && merged.size === 1) {
+      const [[owner, ids]] = [...merged];
+      const pronoun = ids.length === 1 ? 'it is' : 'they are';
       return owner
-        ? `suppressMessages on ${owner}: ${pronoun} in ${owner}'s own slot, which ${agentName} observes`
-        : `suppressMessages on an agent whose own slot holds ${n === 1 ? 'it' : 'them'}: ${pronoun} in ${observed}`;
+        ? `suppressMessages on ${owner} for ${listed(ids)}: ${pronoun} in ${owner}'s own slot, which ${agentName} observes` +
+          refusedThere(owner, ids)
+        : `suppressMessages on an agent whose own slot holds ${listed(ids)}: ${pronoun} in ${observed}`;
     }
     const parts = [
-      ...(own > 0 ? [`on ${agentName} for the ${own} in its own slot`] : []),
-      ...[...merged].map(([owner, n]) => owner
-        ? `on ${owner} for the ${n} in ${owner}'s own slot, which ${agentName} observes`
-        : `on an agent whose own slot holds the ${n} in ${observed}`),
+      ...(own.length > 0 ? [`on ${agentName} for ${listed(own)}, in its own slot`] : []),
+      ...[...merged].map(([owner, ids]) => owner
+        ? `on ${owner} for ${listed(ids)}, in ${owner}'s own slot, which ${agentName} observes${refusedThere(owner, ids)}`
+        : `on an agent whose own slot holds ${listed(ids)}, in ${observed}`),
     ];
-    return `suppressMessages ${parts.slice(0, -1).join(', ')}${parts.length > 1 ? ' and ' : ''}${parts.at(-1)}`;
+    // Each part lists ids with commas, so the parts are set apart by semicolons.
+    return `suppressMessages ${parts.slice(0, -1).join('; ')}${parts.length > 1 ? '; and ' : ''}${parts.at(-1)}`;
   }
 
   /**
