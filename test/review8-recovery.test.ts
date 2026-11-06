@@ -72,7 +72,7 @@ describe('AF #844 review 8 — offline recovery at a presented cut', () => {
     for (const dryRun of [true, false]) {
       await assert.rejects(
         createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messages: 1, dryRun, branchName: 'recovery/cairn/one' }),
-        /presented to cairn in one write with the 1 message after it in its window \(the first: .*Discord message d-C\).*remove nothing.*suppress it in the same recovery/,
+        /presented to cairn in one write with the 1 message after it in its window \(the first: .*Discord message d-C\).*remove nothing.*suppress it in the same recovery \(--suppress \/ suppressMessageIds: d-C\)/,
       );
     }
     await assert.rejects(
@@ -260,7 +260,7 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
         // would take the agent's note between its ends (C..D) too, and the
         // live suppression of the note advised beside it would then fail.
         assert.ok(error.message.endsWith(
-          'suppress the 2 with a Discord message id in the same recovery (--suppress / suppressMessageIds), ' +
+          'suppress the 2 with a Discord message id in the same recovery (--suppress / suppressMessageIds: d-C, d-D), ' +
           `and the 1 without one by row id with the live suppressMessages (${String(mixed.ids.get('agent:note'))}) ` +
           `once the host runs, since the offline recovery suppresses only by Discord message id. ${OWN_SLOT_ONLY}`,
         ), error.message);
@@ -344,4 +344,62 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
     assert.equal(dry.messagesRemoved, 1);
     assert.equal(dry.returnedToArrivals, undefined);
   });
+});
+
+describe('AF #844 bot review 5 — the offline no-op refusal', () => {
+  /** P presented by the write-down, then each of `rows` stored and all presented in one write, with their ids. */
+  const presentedTogether = async (rows: Array<{ participant: string; content: ContentBlock[]; discordId?: string }>): Promise<{ storePath: string; ids: MessageId[]; p: MessageId }> => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-review8-recovery-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'agent.chronicle');
+    const st = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store: st, namespace: 'agents/cairn' });
+    const p = cm.addMessage('user', [{ type: 'text', text: 'P' } as ContentBlock], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-P' });
+    cm.presentRows([]);
+    const ids = rows.map((row) => cm.addMessage(row.participant, row.content,
+      row.discordId !== undefined ? { serverId: 'discord', channelId: 'discord:g1:c1', messageId: row.discordId } : undefined));
+    cm.presentRows(ids);
+    cm.close();
+    st.close();
+    return { storePath, ids, p };
+  };
+  const text = (t: string): ContentBlock[] => [{ type: 'text', text: t } as ContentBlock];
+
+  // Finding 2: a range takes every record row between its ends, any agent's,
+  // rows the window never held among them, so it is never offered; each
+  // kept row's Discord id is named for --suppress.
+  it('2: where every kept row has a Discord id, the refusal names each for --suppress and offers no range', async () => {
+    const storePath = await batchStore();
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messages: 2, dryRun: true }),
+      (error: Error) => {
+        assert.ok(error.message.endsWith(`suppress them in the same recovery (--suppress / suppressMessageIds: d-B, d-C). ${OWN_SLOT_ONLY}`), error.message);
+        assert.doesNotMatch(error.message, /--suppress-range/);
+        return true;
+      },
+    );
+  });
+
+  // Finding 72: a kept row that shares the anchor's Discord id (a retried
+  // write's copy) can't be suppressed offline without the anchor: the
+  // suppression takes every copy of the id. It is named by row id for the
+  // live suppression, as a row with no Discord id is.
+  it("72: a kept copy of the anchor's own Discord message is named by row id for the live suppression, not for --suppress", async () => {
+    const { storePath, ids } = await presentedTogether([
+      { participant: 'user', content: text('A'), discordId: 'd-A' },
+      { participant: 'user', content: text('A again'), discordId: 'd-A' },
+    ]);
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', contextId: String(ids[0]), dryRun: true }),
+      (error: Error) => {
+        assert.ok(error.message.endsWith(
+          `suppress it by row id with the live suppressMessages (${String(ids[1])}) once the host runs, since the offline ` +
+          `recovery suppresses only by Discord message id, which takes every copy of a message, the anchor's own too. ${OWN_SLOT_ONLY}`,
+        ), error.message);
+        assert.doesNotMatch(error.message, /--suppress/);
+        return true;
+      },
+    );
+  });
+
 });

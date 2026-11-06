@@ -595,12 +595,16 @@ function windowAfterCut(
  * the live rollback refuses one: the cut at the write that presented the
  * anchor removes no row, and no row the window took after that write
  * becomes an arrival again (windowAfterCut). The rows that write presented
- * after the anchor (`kept`) name the way to take them out: a suppression in
- * the same recovery, which names a row by its Discord message id, and for a
- * row with none (an agent's round, a tool row) the live `suppressMessages`
- * by its row id. Each refusal says the recovery reads the agent's own slot
- * alone: a row of a slot it observes, which the live rollback weighs, isn't
- * weighed here.
+ * after the anchor (`kept`) name the way to take them out: in the same
+ * recovery a row by its Discord message id, each one named, which takes
+ * every copy of that message; and by its row id with the live
+ * `suppressMessages` a row with none (an agent's round, a tool row) or one
+ * sharing the anchor's Discord id (a retried write's copy), which the
+ * offline suppression would take with the anchor. No range is offered: it
+ * takes every record row between its ends, any agent's, rows the window
+ * never held among them. Each refusal says the recovery reads the agent's
+ * own slot alone: a row of a slot it observes, which the live rollback
+ * weighs, isn't weighed here.
  */
 function refuseIneffectiveCut(
   target: StoredWindowMessage,
@@ -615,21 +619,20 @@ function refuseIneffectiveCut(
     const first = kept[0]!;
     const firstDiscordId = discordIdOf(first);
     const named = `${String(first.id)}${firstDiscordId ? `, Discord message ${firstDiscordId}` : ''}`;
-    const unaddressed = kept.filter((row) => discordIdOf(row) === undefined).map((row) => String(row.id));
-    // Every one, so following the advice leaves none of them in place.
-    const rowIds = unaddressed.join(', ');
-    // A range is offered only where every row has a Discord id: beside rows
-    // that have none, a --suppress-range would take them too, between its
-    // ends, and the live suppression advised for them would then fail.
-    const offline = unaddressed.length === 0
-      ? 'in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)'
-      : 'in the same recovery (--suppress / suppressMessageIds)';
-    const live = `by row id with the live suppressMessages (${rowIds}) once the host runs, since the offline recovery ` +
-      'suppresses only by Discord message id';
-    const how = unaddressed.length === 0 ? `suppress ${n === 1 ? 'it' : 'them'} ${offline}`
-      : unaddressed.length === n ? `suppress ${n === 1 ? 'it' : 'them'} ${live} and ${n === 1 ? 'it has none' : 'none of them has one'}`
-      : `suppress the ${n - unaddressed.length} with a Discord message id ${offline}, and the ${unaddressed.length} ` +
-        `without one ${live}`;
+    const copies = kept.filter((row) => anchorDiscordId !== undefined && discordIdOf(row) === anchorDiscordId);
+    // By row id, live: every one, so following the advice leaves none of them in place.
+    const unaddressed = kept.filter((row) => discordIdOf(row) === undefined || copies.includes(row));
+    const addressed = kept.filter((row) => !unaddressed.includes(row));
+    const offline = `in the same recovery (--suppress / suppressMessageIds: ${addressed.map((row) => discordIdOf(row)!).join(', ')})`;
+    const live = `by row id with the live suppressMessages (${unaddressed.map((row) => String(row.id)).join(', ')}) once the host runs, ` +
+      'since the offline recovery suppresses only by Discord message id' +
+      (copies.length > 0 ? `, which takes every copy of a message, the anchor's own too` : '');
+    const them = n === 1 ? 'it' : 'them';
+    const how = unaddressed.length === 0 ? `suppress ${them} ${offline}`
+      : addressed.length === 0 ? `suppress ${them} ${live}` +
+        (copies.length > 0 ? '' : ` and ${n === 1 ? 'it has none' : 'none of them has one'}`)
+      : `suppress the ${addressed.length} with a Discord message id ${offline}, and the ${unaddressed.length} ` +
+        `${copies.length > 0 ? `other${unaddressed.length === 1 ? '' : 's'}` : 'without one'} ${live}`;
     throw new Error(
       `Recovery anchor ${anchor} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
       `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +

@@ -236,7 +236,9 @@ agent-framework-recover \
 
 `--suppress` may be repeated or given a comma-separated list.
 `--suppress-range <first>..<last>` suppresses the inclusive context interval
-between two Discord messages, including intervening agent/tool entries. These
+between two Discord messages, including intervening agent/tool entries: every
+row stored between the two, any agent's, so on a slot residents share, rows
+an agent's window never held too. These
 removals exist only on the recovery branch; the source branch remains intact.
 Suppressed Discord messages follow the same `--marks` choice.
 Selections that split a sharded body group or a tool-use/tool-result exchange
