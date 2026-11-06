@@ -61,6 +61,10 @@ function world(opts: { subconscious?: boolean } = {}) {
     quotedShown: (ref: { channelId: string }) => JSON.stringify(ref.channelId),
     listChannelsRaw: () => [NOISY, OTHER, 'disc:guild:work'].map((id) => ({ serverId: SERVER, descriptor: { id } })),
     getTuneOutState: (serverId: string, channelId: string) => active.get(`${serverId}\0${channelId}`) ?? null,
+    tuneOutsOnRecord: () => [...active].map(([key, { params }]) => {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      return { serverId, channelId, params, source: 'agent-tool' };
+    }),
     cancelTuneOut: (serverId: string, channelId: string) => {
       const key = `${serverId}\0${channelId}`;
       const ended = active.get(key) ?? null;

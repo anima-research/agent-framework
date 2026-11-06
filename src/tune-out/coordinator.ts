@@ -1631,7 +1631,7 @@ export class TuneOutCoordinator {
     if (this.hooks.subconsciousName() == null) return;
     const looks = this.lastLooks();
     if (!looks) return;
-    const active = new Set(this.listActive().map((e) => e.params.epochId));
+    const active = new Set(this.channelRegistry.tuneOutsOnRecord().map((e) => e.params.epochId));
     const scope = this.getAllExcept();
     if (scope) active.add(scope.params.epochId);
     const kept = Object.fromEntries(Object.entries(looks).filter(([epochId]) => active.has(epochId)));
