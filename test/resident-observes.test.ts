@@ -124,6 +124,36 @@ describe('AgentConfig.observes', () => {
     }
   });
 
+  // AF #844 bot review 3, finding 4: a derived agent's registration set no
+  // mode, so it stayed 'raw', and the observed agent's rounds its window
+  // inherits from its parent's went out to it as stored.
+  it("a child derived from an observing resident is sent the observed agent's rounds as its parent is: a transcript", { timeout: 120_000 }, async () => {
+    for (const mode of ['shared', 'copy'] as const) {
+      await withResidents([{ name: 'mira', observes: ['nova'] }, { name: 'nova' }], async (framework, membrane) => {
+        const mira = framework.getAgent('mira')!;
+        const row = storeOwnRow(framework.getAgent('nova')!, 'nova', [
+          { type: 'thinking', thinking: 'mulling', signature: 'sig-nova' } as ContentBlock,
+          text('Looking it up.'),
+          { type: 'tool_use', id: 'c1', name: 'search', input: { q: 'build status' } } as ContentBlock,
+        ]);
+        assert.notEqual(mira.getContextManager().ordinalOf(row), undefined, "premise: nova's round is in mira's window");
+        membrane.identify = (request) =>
+          (JSON.stringify(request.messages).includes('CHILD-FRAMING') ? 'mira-task' : request.assistantParticipant ?? '');
+        const child = await framework.deriveAgent({
+          name: 'mira-task', from: 'mira', mode,
+          framing: [{ participant: 'user', content: [text('CHILD-FRAMING: look')] }],
+        });
+        await framework.runEphemeralToCompletion(child.agent, child.contextManager);
+        const request = membrane.callsFor('mira-task').at(-1);
+        assert.ok(request, `${mode}: premise: the child's request`);
+        const round = request.messages.find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'Looking it up.'));
+        assert.ok(round, `${mode}: nova's round is in the child's request: ${JSON.stringify(request.messages)}`);
+        assert.deepEqual(round.content, [text('Looking it up.'), text('[search called: {"q":"build status"}]')], `${mode}: a transcript`);
+        assert.ok(!JSON.stringify(request.messages).includes('sig-nova'), `${mode}: none of nova's thinking`);
+      });
+    }
+  });
+
   it('create refuses an agent that observes itself, or a name no configured agent has', async () => {
     const refused = (agents: Array<Partial<AgentConfig> & { name: string }>) => AgentFramework.create({
       agents: agents.map((a) => ({ model: 'test-model', systemPrompt: 'x', ...a })),

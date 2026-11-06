@@ -4777,7 +4777,9 @@ export class AgentFramework {
    * The agents whose foreignRounds the framework sets (applyForeignRounds),
    * each with the mode its configuration names: a resident that observes
    * another (AgentConfig.foreignRounds), and the persistent subconscious
-   * (its config's). Recorded at registration.
+   * (its config's); and an agent that takes its context from one of those
+   * (a derived agent, a conversation fork), with that agent's. Recorded at
+   * registration (configureForeignRounds).
    */
   private readonly foreignRoundsConfigured = new WeakMap<Agent, 'transcript' | 'raw'>();
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
@@ -13321,6 +13323,8 @@ export class AgentFramework {
     // its creator seeded into its context (a host's seed rows, a derived
     // agent's framing), which the adoption presents as its own rows.
     this.adoptPresentation(agent);
+    this.configureForeignRounds(agent, candidate.config, registered.inherit?.from);
+    this.applyForeignRounds(agent);
     // Kept while the run is live so the agent can itself be derived from.
     this.agentConfigs.set(agent.name, candidate.config);
     // A spawner that ended after creating it: it registered as that
@@ -17877,10 +17881,7 @@ export class AgentFramework {
     agent.onContextBudgetCompiled((budget, fit) => this.recordCompiledContextBudget(config.name, budget, fit));
     this.agents.set(config.name, agent);
     this.adoptPresentation(agent);
-    // An agent that observes another is sent its rounds as its
-    // configuration's foreignRounds says, a transcript by default, as the
-    // persistent subconscious is (foreign-rounds.ts).
-    if ((config.observes?.length ?? 0) > 0) this.foreignRoundsConfigured.set(agent, config.foreignRounds ?? 'transcript');
+    this.configureForeignRounds(agent, config);
     this.applyForeignRounds(agent);
     this.agentConfigs.set(config.name, config);
 
@@ -19925,6 +19926,8 @@ export class AgentFramework {
       this.managerReleases.set(agent, release);
       this.agents.set(name, agent);
       this.adoptPresentation(agent);
+      this.configureForeignRounds(agent, config, router.templateAgent);
+      this.applyForeignRounds(agent);
       this.agentConfigs.set(name, config);
       return agent;
     } catch (error) {
@@ -23973,6 +23976,25 @@ export class AgentFramework {
    */
   private presents(agent: Agent | undefined): boolean {
     return !!agent && !!this.presentation?.presenting(agent);
+  }
+
+  /**
+   * Record, at an agent's registration, the mode its requests send other
+   * agents' rounds in (foreignRoundsConfigured). An agent that takes its
+   * context from another (`from`: a derived agent's parent, a conversation
+   * fork's template) is sent them as that agent is, its inheritance holding
+   * what that agent's window held of them, a shared derivation's as a
+   * window and a copy's or a fork's seed as its own rows. Otherwise, an
+   * agent that observes another is sent them as its configuration's
+   * foreignRounds says, a transcript by default, as the persistent
+   * subconscious is (foreign-rounds.ts). Any other agent reads no other
+   * agent's rounds, and is left as stored.
+   */
+  private configureForeignRounds(agent: Agent, config: AgentConfig, from?: string): void {
+    const source = from !== undefined ? this.agents.get(from) : undefined;
+    const inherited = source ? this.foreignRoundsConfigured.get(source) : undefined;
+    const mode = inherited ?? ((config.observes?.length ?? 0) > 0 ? config.foreignRounds ?? 'transcript' : undefined);
+    if (mode !== undefined) this.foreignRoundsConfigured.set(agent, mode);
   }
 
   /**
