@@ -53,8 +53,8 @@
   wait is over. A crash before the cancel
   runs leaves the tune-out in force for the next boot, which cancels one whose end time passed. The
   `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
-  for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral
-  queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
+  for a manager refusing its work, but mail, which stays held in the registry for the next boot, where 0.28.0's said
+  writes still queued at exit survive in a persisted deferral queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
   its manager refuses its work (lost) and those a surgery whose operation outlived `stop()`'s wait still holds, it
   logs one `[stop] agent=<name>: …` line and raises an `ops:alert` of kind `store-held-lost` with the counts and
   kinds (`data`: `count`, `keptForRecovery`, `heldBySurgery`, `kinds`, `mail`); mail among them stays held in the
