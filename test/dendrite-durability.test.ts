@@ -380,7 +380,7 @@ describe('round 2: a change is put back when its write fails; a record of what h
     const reopened = await second.inspectAgentContext('nova');
     assert.equal(reopened.getAllMessages().length, 4, 'the premise: its record holds every row of the slot');
     // agentSees reads the view recorded beside an agent's context manager
-    // (storeSees); an inspected context has no agent, so this stands in for one.
+    // (storeViews); an inspected context has no agent, so this stands in for one.
     const agentSees = (metadata: unknown) => (second as unknown as { agentSees(agent: unknown, metadata: unknown): boolean })
       .agentSees({ getContextManager: () => reopened }, metadata);
     assert.deepEqual(

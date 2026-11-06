@@ -20,7 +20,7 @@
  *   is rendered before the first of them that survives. A reply follows the
  *   prompt when what it was sent ends on that `[Continue]`, or on the tool
  *   results of a reply that followed it (`toolLoopPrompt`), stored context
- *   injections after those results aside: a stream start and each round of
+ *   injections and system changes after those results aside: a stream start and each round of
  *   a stream alike. A reply sent anything else after the results (a message
  *   that arrived meanwhile) follows that, and carries no prompt.
  *

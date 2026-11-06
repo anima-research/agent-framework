@@ -81,6 +81,38 @@ An agent that can't use `toolsets--open` and `toolsets--act` gets no host
 toolsets: every tool it may call stays in its tool list, except module
 utilities, which are never in a tool list (it can still call one by name).
 
+**Tool declarations.** By default every request carries the agent's current
+tools and system text, so a change to either rewrites the provider's cache
+from the head, and an agent the framework builds leaves the system changes
+in its context out of its compile (the subconscious, which reads only its
+own, takes those out once its record, if any, is cleared). With `toolDeclarations: 'entries'`, for models that take
+mid-conversation system messages on the native formatter, a request carries
+a recorded head instead, and each later change to the tools, or addition to
+the system text, is stored in the agent's context as a system change where
+it took effect. A replacement of system text, and a consolidation once the
+changes reach a tenth of the input, move the head to what's current, with
+one write. A replacement is a block of system text already declared that's
+dropped or edited (an added block is a change, and order doesn't count), so
+`'entries'` saves writes only while those blocks stay as they are: one whose
+text changes every request moves the head every request. A
+change row a host stores is the host's to remove. A request carrying a
+change that ends with a refusal membrane recognises, or with a 400 it
+doesn't file as context overflow or an account refusal, whatever caused it,
+goes again on the agent's current head, and the agent keeps to its head
+until it's built again, its record and then its own change rows taken out
+(a record the store can't clear keeps them until it can), so an
+unrelated 400, such as one for an
+oversized image, ends its `'entries'` too. A consolidation waits for a compile that
+already rewrites the changes; past a fifth of the input, or when a compile
+is refused over budget, or for dropping messages no summary covers, with
+changes kept, it happens anyway, with an operator line. `thinkingBinding.binds` says whether the model binds its
+thinking to everything before it. Unless it's `false`, such a compile must
+keep no thinking before the first message it renders anew (its
+`firstChanged`), and a forced move sets that thinking aside; with `true`,
+each compile is told the head the request carries, so the context manager
+leaves out the thinking a move of the head sets aside. The host chooses both
+settings from what it knows of the model; neither is a runtime setting.
+
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.
 Framework-created ephemeral and conversation identities fail closed while
@@ -148,7 +180,7 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
-A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins.
+A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark, starting at the first such row that holds more than tool results and isn't a system change, and removes the pin when the turn ends. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins.
 
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
@@ -476,7 +508,8 @@ says so. A server `toolPrefix` of `toolsets` is refused.
 
 With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
-enter it, since every change to the list rebuilds the prompt cache. The
+enter it, since on `'head'`, the default, every change to the list rebuilds
+the prompt cache. The
 framework registers a `toolsets` module with four constant tools at creation,
 for every agent (the host's own toolsets need them too, below), so the tool
 list doesn't change when a server starts to present:

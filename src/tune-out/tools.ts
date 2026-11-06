@@ -166,9 +166,10 @@ export interface PersistentReaderConfig extends SubconsciousConfigBase {
   name?: string;
   /** Model id; defaults to the primary agent's (same-model side-process).
    *  Another id, compared exactly, makes the subconscious leave out the
-   *  fields that describe the primary's model, its window and its thinking
-   *  binding (SUBCONSCIOUS_MODEL_FIELDS); `physicalWindowTokens` and
-   *  `thinkingBinding` set its own. */
+   *  fields that describe the primary's model: its window, its thinking
+   *  binding and its tool declarations (SUBCONSCIOUS_MODEL_FIELDS). It then
+   *  declares its tools and system on its head, and `physicalWindowTokens`
+   *  and `thinkingBinding` set its own window and binding. */
   model?: string;
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the
@@ -186,7 +187,9 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    * Whose weights run the fork. Required, never defaulted: a fork holds the
    * resident's whole prefix, and which model reads it is the one fact the
    * resident's consent names. The resident's own model is the copy; another
-   * model is allowed when stated here. `create` refuses the omission.
+   * model is allowed when stated here. `create` refuses the omission. A fork
+   * on another model declares its tools and system on its head; one on the
+   * resident's own model keeps the resident's `toolDeclarations`.
    */
   model: string;
   /**
