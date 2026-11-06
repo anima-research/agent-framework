@@ -164,9 +164,9 @@ text. Selection never matches notice text.
 Hosts opening the same stores should use the package's
 `residentViewFilter(message, agentName)` or
 `subconsciousViewFilter(message, agentName)` rather than copy the view rules.
-On context-manager 0.24.2 (and current main), hiding an existing summary's first
-or last source can leave it misordered, permanently unmergeable and absent from
-history overview until context-manager #369 or equivalent lands. See the
+On context-manager 0.24.2 (and current main), a hidden first source can place that
+summary after newer messages; a hidden first or last source makes it permanently
+unmergeable and absent from history overview until context-manager #369 or equivalent lands. See the
 [release note](changelog.d/973-reasoning-loss.fixed.md). Addresses #973.
 
 ### Persistence
