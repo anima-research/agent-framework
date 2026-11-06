@@ -1240,6 +1240,46 @@ describe('Dendrite restart', () => {
       'the boot that kept it says so');
   });
 
+  // The held-write path's arm of the same answer (52364a32): a write kept
+  // in memory for an agent that ended goes on to the primary
+  // (passHeldWritesOn), and where the primary's manager keeps that write in
+  // memory too ('held'), it went on: it is counted passed, waits for the
+  // primary's recovery, and isn't told as dropped.
+  it("a kept write for an agent that ended, which the primary's manager keeps in memory in turn, counts as passed on, not dropped", async () => {
+    const framework = await process(new GateModule());
+    const alerts: string[] = [];
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert' && (event as { kind?: string }).kind === 'store-held-lost') alerts.push((event as { message?: string }).message ?? '');
+    });
+    const internals = framework as unknown as {
+      passHeldWritesOn(agentName: string, writes: readonly unknown[]): { passed: number; dropped: number };
+    };
+    // As Kestrel's case above: the primary's manager refuses the write as
+    // context-manager's initialization fence does, so the framework keeps it
+    // for that manager's recovery.
+    const fault = failWritesOf('HELD-FOR-THE-PRIMARY', () => new Error(
+      'ContextManager.addMessage requires successful strategy initialization (selected branch main). ' +
+        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+    ));
+    let outcome: { passed: number; dropped: number };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      outcome = internals.passHeldWritesOn('job', [{
+        participant: 'user', content: [{ type: 'text', text: 'HELD-FOR-THE-PRIMARY' }], metadata: { primaryIfUnread: true },
+        heldAt: Date.now(), heldOrder: 0,
+      }]);
+    } finally {
+      console.error = quiet;
+      fault.restore();
+    }
+    assert.equal(fault.failed(), 1, "setup: the primary's manager refused the write");
+    assert.deepEqual(outcome, { passed: 1, dropped: 0 }, 'kept for the primary: passed on');
+    assert.deepEqual(alerts, [], 'not told as dropped');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1, "it waits for the primary's recovery");
+    assert.equal(told(framework, 'HELD-FOR-THE-PRIMARY'), 0, 'not stored yet');
+  });
+
   it('a notice declined for the primary settles the job, and no later boot tries it again', async () => {
     const declined = 'has ended, and its reply had no channel to reach: no one else is told';
     await jobWithUnreadWrites([{ text: 'A REPLY THAT FAILED', direct: { kind: 'discord-send-failed', channelId: '' } }]);
