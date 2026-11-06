@@ -614,7 +614,12 @@ function refuseIneffectiveCut(
     const unaddressed = kept.filter((row) => discordIdOf(row) === undefined).map((row) => String(row.id));
     // Every one, so following the advice leaves none of them in place.
     const rowIds = unaddressed.join(', ');
-    const offline = 'in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)';
+    // A range is offered only where every row has a Discord id: beside rows
+    // that have none, a --suppress-range would take them too, between its
+    // ends, and the live suppression advised for them would then fail.
+    const offline = unaddressed.length === 0
+      ? 'in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)'
+      : 'in the same recovery (--suppress / suppressMessageIds)';
     const live = `by row id with the live suppressMessages (${rowIds}) once the host runs, since the offline recovery ` +
       'suppresses only by Discord message id';
     const how = unaddressed.length === 0 ? `suppress ${n === 1 ? 'it' : 'them'} ${offline}`
