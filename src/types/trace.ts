@@ -33,6 +33,12 @@ export type TraceEventBase = {
  * For that, use ProcessEvent via the event queue.
  */
 export type TraceEvent =
+  | (TraceEventBase & {
+      type: 'reply:private';
+      serverId: string;
+      /** Fixed fault code; no callback, intent or exception content. */
+      reason: import('../mcpl/reply-routing.js').ReplyPrivateReason;
+    })
   // Process lifecycle
   | (TraceEventBase & { type: 'process:received'; processEvent: ProcessEvent })
   | (TraceEventBase & {

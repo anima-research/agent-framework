@@ -8,7 +8,8 @@ export type ReplyInput = AdmissionInput & { readonly replyIntent?: unknown };
 export interface ReplyAuthorityConfig {
   /** Separate routing deadline; never changes the admission verdict. */
   readonly timeoutMs: number;
-  /** Return one approved registered channel on the original connection, or null. */
+  /** Return one approved registered channel on the original connection, or null.
+   * Callbacks run with the original configured authority as `this`. */
   readonly resolve: (input: ReplyInput) => { readonly channelId: string } | null |
     Promise<{ readonly channelId: string } | null>;
   /** Cheap synchronous policy check, with no I/O. Only literal true authorizes. */
@@ -93,12 +94,16 @@ export function workKey(value: object): unknown[] {
 
 /** Keep persistent fail-closed faults visible without exposing callback details.
  * The live connection object shares the window across epochs and failure paths. */
+export type ReplyPrivateReason = 'authority' | 'consumer' | 'timeout' | 'overload';
 const failureLines = new WeakMap<object, number>();
-export function reportReplyFailure(connection: object, kind: 'authority' | 'consumer' | 'timeout' | 'overload'): void {
+const failureTraces = new WeakMap<object, (reason: ReplyPrivateReason) => void>();
+export function reportReplyFailure(connection: object, kind: ReplyPrivateReason): void {
   const now = performance.now();
   const last = failureLines.get(connection);
   if (last !== undefined && now - last < 60_000) return;
   failureLines.set(connection, now);
+  // Observability cannot change admission or mint authority.
+  try { failureTraces.get(connection)?.(kind); } catch { /* listener failure */ }
   console.error(kind === 'consumer'
     ? '[automatic-reply] post-admission consumer threw; automatic prose stays private'
     : kind === 'timeout' ? '[automatic-reply] reply resolution timeout; automatic prose stays private'
@@ -106,7 +111,8 @@ export function reportReplyFailure(connection: object, kind: 'authority' | 'cons
     : '[automatic-reply] host reply authority threw; automatic prose stays private');
 }
 
-export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: ConnectionKey, target: ReplyDestination) => boolean, diagnosticConnection?: object): PostAdmissionConsumer {
+export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: ConnectionKey, target: ReplyDestination) => boolean, diagnosticConnection?: object, emitPrivate?: (reason: ReplyPrivateReason) => void): PostAdmissionConsumer {
+  if (diagnosticConnection && emitPrivate) failureTraces.set(diagnosticConnection, emitPrivate);
   const { resolve, authorize, timeoutMs } = config;
   let pending = 0;
   return async (input, verdict) => {
@@ -128,7 +134,7 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
         timer = setTimeout(() => { reportReplyFailure(diagnosticConnection ?? input.connection, 'timeout'); done(null); controller.abort(); }, timeoutMs);
         if (controller.signal.aborted) done(null);
       });
-      const operation = Promise.resolve().then(() => controller.signal.aborted ? null : resolve(approvedInput)).catch(() => { reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return null; });
+      const operation = Promise.resolve().then(() => controller.signal.aborted ? null : resolve.call(config, approvedInput)).catch(() => { reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return null; });
       const raw = await Promise.race([operation, cancelled]);
       // Timers cannot preempt synchronous host callbacks. Check elapsed time
       // before accepting a microtask result that overtook the timeout timer.
@@ -144,7 +150,7 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
         typeof channel.value !== 'string' || !channel.value) return privateWork();
       const destination = Object.freeze({ serverId: input.connection.connectionId, channelId: channel.value });
       const current = (): boolean => {
-        try { return valid(input.connection, destination) && authorize(approvedInput, destination) === true; }
+        try { return valid(input.connection, destination) && authorize.call(config, approvedInput, destination) === true; }
         catch { reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return false; }
       };
       return current() ? { routing: mint(input.connection, destination, current) } : privateWork();

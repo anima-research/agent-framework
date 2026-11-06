@@ -32,7 +32,9 @@ Opaque `replyIntent`, metadata, prose and persisted rows cannot mint authority.
 The reply callbacks and deadline are snapshotted once before the initial dial or
 spawn, including for a reconnecting stub. This separate snapshot does not wrap or
 replace the transport configuration: its identity and credential-redaction state
-remain shared with the framework.
+remain shared with the framework. Both callbacks run with the original configured
+`replyAuthority` object as `this` (class instances, including private fields, are
+supported); replacement callback properties do not change the pinned functions.
 
 Required inbound admission completes first, under its unchanged timeout,
 cancellation and pending-slot rules. Only after a fully validated store-and-wake verdict does
@@ -56,7 +58,9 @@ that no unique currently approved destination exists and explicit send tools
 remain available. Private work has no inferred locus or default for `channel_publish`;
 name an explicit destination when using a separately authorized send tool.
 Callback exceptions, timeout and overload produce a fixed, bounded diagnostic at
-most once per 60 seconds per connection while the fault persists. Consumer and
+most once per 60 seconds per connection while the fault persists, alongside a
+`reply:private` trace with a fixed `authority`, `consumer`, `timeout` or `overload`
+reason code. The trace shares the diagnostic bound and never includes callback details. Consumer and
 authority faults, timeout and overload share this monotonic-clock window, including across reconnects. Exception
 content is never included in agent context.
 Cancellation aborts resolution; late results are discarded. The admission layer's

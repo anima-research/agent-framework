@@ -36028,7 +36028,7 @@ export class AgentFramework {
         if (original && original !== descriptor) return false;
         registrations.set(target, descriptor);
         return true;
-      }, connection);
+      }, connection, reason => this.emitTrace({ type: 'reply:private', serverId: connection.id, reason }));
     }
     const recorded = serverTextRedactor(config);
     type Responder = InboundResponder;

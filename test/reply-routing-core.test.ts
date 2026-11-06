@@ -120,7 +120,7 @@ test('core: reconnect retains the snapshotted host authority', async () => {
     assert.equal((connection as any).config, config);
     profile.authorize = () => false; profile.timeoutMs = 1;
     assert.equal(connection.replyAuthority!.timeoutMs, 100);
-    assert.equal(connection.replyAuthority!.authorize, approved);
+    assert.equal(connection.replyAuthority!.authorize({} as any, {} as any), approved());
   } finally { host.handshake = handshake; await connection?.close(); }
 });
 
@@ -295,3 +295,33 @@ test('#13 diagnostic throttling ignores backward wall-clock steps', async t => {
   t.mock.timers.setTime(1); monotonic += 60_000;
   await x.run(); assert.equal(logs.length, 2);
 });
+
+test('R1-5 class authority callbacks retain the configured receiver through snapshotting', async () => {
+  class HostRouter {
+    channel = 'room|one';
+    timeoutMs = 100;
+    resolve() { return { channelId: this.channel }; }
+    authorize(_input: unknown, destination: { channelId: string }) { return destination.channelId === this.channel; }
+  }
+  const host = new HostRouter();
+  const config = (McplServerConnection as any).snapshotReplyAuthority({ replyAuthority: host });
+  const x = fixture(config);
+  const result = await x.run();
+  assert.equal(result.binding.destination?.channelId, host.channel);
+  assert.equal(replyBindingCurrent(result.binding), true);
+  host.channel = 'changed';
+  assert.equal(replyBindingCurrent(result.binding), false);
+});
+
+test('R1-5 private fault trace is bounded with fixed codes and no callback details', async t => {
+  let now = 0; t.mock.method(performance, 'now', () => now);
+  const traces: any[] = [], scope = {}, x = fixture();
+  const consumer = replyConsumer({ timeoutMs: 100, resolve: () => { throw Error('secret'); }, authorize: () => true },
+    () => true, scope, reason => traces.push({ type: 'reply:private', serverId: 'endpoint:a/β', reason }));
+  const run = () => consumer({ connection: x.ingress.key, lane: 'push/event', item: {} as any, signal: x.transport.signal }, { store: true, mayWake: true });
+  await run(); await run();
+  assert.deepEqual(traces, [{ type: 'reply:private', serverId: 'endpoint:a/β', reason: 'authority' }]);
+  now += 60_000; await run(); assert.equal(traces.length, 2);
+  assert(!JSON.stringify(traces).includes('secret'));
+});
+

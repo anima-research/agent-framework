@@ -1418,7 +1418,9 @@ export class McplServerConnection extends EventEmitter {
   private static snapshotReplyAuthority(config: McplServerConfig): ReplyAuthorityConfig | undefined {
     const authority = config.replyAuthority;
     return authority === undefined ? undefined : Object.freeze({
-      timeoutMs: authority.timeoutMs, resolve: authority.resolve, authorize: authority.authorize,
+      timeoutMs: authority.timeoutMs,
+      // Pin callback identity while preserving class/private-field receivers.
+      resolve: authority.resolve.bind(authority), authorize: authority.authorize.bind(authority),
     });
   }
 
