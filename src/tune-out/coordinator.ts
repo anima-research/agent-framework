@@ -366,6 +366,13 @@ interface DeferredCancel {
   noteAuthor?: string;
   /** Its note was delivered, or its loss told (deliverQueuedNote, dropDeferred). */
   noteSettled?: true;
+  /**
+   * Every caller it answered as waiting, by the name each runs under, in
+   * the order asked (deferCancel): its run's release records them all, so
+   * a later caller whose call joined it is credited with it (#844 round 8,
+   * Weft).
+   */
+  askers: string[];
 }
 
 /**
@@ -411,6 +418,8 @@ interface UnstampedStop {
   noteDelivered?: true;
   own?: true;
   ranBy?: string;
+  /** For its own: the others its release credits with it, as the notice names them (other askers', or another cancel's reason). */
+  joined?: string[];
 }
 
 /** How definite each finding is (noteUnstampedStop): a later boot tells a hold again only what says more. */
@@ -524,6 +533,7 @@ function readPersistedLossNotice(value: unknown): PersistedLossNotice | undefine
       ...(drop.noteDelivered === true ? { noteDelivered: true as const } : {}),
       ...(drop.own === true ? { own: true as const } : {}),
       ...(typeof drop.ranBy === 'string' ? { ranBy: drop.ranBy } : {}),
+      ...(Array.isArray(drop.joined) && drop.joined.every((j: unknown) => typeof j === 'string') ? { joined: drop.joined as string[] } : {}),
     };
   } else {
     return undefined;
@@ -1475,10 +1485,13 @@ export class TuneOutCoordinator {
       this.deferredCancels.set(key, {
         for: target, what, run,
         ...(note !== undefined ? { note } : {}), ...(noteAuthor !== undefined ? { noteAuthor } : {}),
+        askers: noteAuthor !== undefined ? [noteAuthor] : [],
       });
       console.error(`[tune-out] the cancel of ${what} waits until the store takes writes again (an operator's change to it is in progress, or a context it writes to refuses writes until it is re-initialized), so that its release is stored before the tune-out's end is recorded`);
       return 'waits';
     }
+    // A later call joins the cancel waiting: its caller is one of its askers.
+    if (noteAuthor !== undefined && !waiting.askers.includes(noteAuthor)) waiting.askers.push(noteAuthor);
     if (note === undefined) return 'waits';
     if (waiting.note === undefined) {
       waiting.note = note;
@@ -1553,9 +1566,12 @@ export class TuneOutCoordinator {
           this.deferredCancels.set(key, entry);
         } else if (waiting.for.epochId !== entry.for.epochId) {
           this.dropDeferred(entry, { reason: 'hold-ended', current: waiting.for.epochId });
-        } else if (waiting.note === undefined && entry.note !== undefined) {
-          waiting.note = entry.note;
-          if (entry.noteAuthor !== undefined) waiting.noteAuthor = entry.noteAuthor;
+        } else {
+          waiting.askers = [...entry.askers.filter((asker) => !waiting.askers.includes(asker)), ...waiting.askers];
+          if (waiting.note === undefined && entry.note !== undefined) {
+            waiting.note = entry.note;
+            if (entry.noteAuthor !== undefined) waiting.noteAuthor = entry.noteAuthor;
+          }
         }
         console.error(`[tune-out] a cancel asked for while writes were held in memory failed when it ran, so it stays waiting, the tune-out in force, and is tried again in ${EXPIRY_RETRY_MS / 1000} s or at the next release:`, err);
       }
@@ -1986,13 +2002,13 @@ export class TuneOutCoordinator {
       // this boot's (`bootHead`), so a release this boot made isn't read as
       // the last run's.
       const notes = new Map<string, number>();
-      const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string; by?: string }>>();
+      const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string; askers: string[] }>>();
       const toldInRelease = new Set<string>();
       try {
         for (const m of this.hooks.getStoredMessages()) {
           if (since !== undefined && typeof m.sequence === 'number' && m.sequence <= since) continue;
           if (bootHead !== undefined && typeof m.sequence === 'number' && m.sequence > bootHead) continue;
-          const meta = m.metadata as { kind?: unknown; epochId?: unknown; lostNote?: unknown; cancel?: { source?: unknown; reason?: unknown; by?: unknown } } | undefined;
+          const meta = m.metadata as { kind?: unknown; epochId?: unknown; lostNote?: unknown; cancel?: { source?: unknown; reason?: unknown; by?: unknown; askers?: unknown } } | undefined;
           if (typeof meta?.epochId !== 'string') continue;
           if (meta.kind === 'subconscious-note') notes.set(meta.epochId, Math.max(notes.get(meta.epochId) ?? -Infinity, m.sequence));
           else if (meta.kind === 'tune-out-cancel') {
@@ -2001,7 +2017,8 @@ export class TuneOutCoordinator {
               sequence: m.sequence,
               ...(typeof meta.cancel?.source === 'string' ? { source: meta.cancel.source } : {}),
               ...(typeof meta.cancel?.reason === 'string' ? { reason: meta.cancel.reason } : {}),
-              ...(typeof meta.cancel?.by === 'string' ? { by: meta.cancel.by } : {}),
+              askers: Array.isArray(meta.cancel?.askers) ? (meta.cancel.askers as unknown[]).filter((a): a is string => typeof a === 'string')
+                : typeof meta.cancel?.by === 'string' ? [meta.cancel.by] : [],
             }]);
           }
         }
@@ -2059,18 +2076,28 @@ export class TuneOutCoordinator {
         // told from none by any store; it is kept for the reading's sake.
         const after = asked ? asked.sequence : Math.max(hold.startedAt ?? -Infinity, since ?? -Infinity);
         const ranAfter = (releases.get(epochId) ?? []).filter((r) => r.sequence > after);
-        // The subconscious's own cancel: one its tool asked for (`subconscious`)
-        // under its own name, or under none; a reader fork's, under the
-        // fork's, is another's, as anyone else's is.
-        const own = ranAfter.some((r) => r.source === 'subconscious' && (r.by === undefined || r.by === author));
+        // The subconscious's own cancel: one whose askers name it (a call of
+        // its joined to another's waiting cancel among them), or one its
+        // tool asked for (`subconscious`) under no name. A release with no
+        // askers recorded is one a build before them wrote (unreleased
+        // builds of #844 only), read as its tool's. A reader fork's, under
+        // the fork's name, is another's, as anyone else's is.
+        const ownRelease = ranAfter.filter((r) => r.askers.includes(author) || (r.source === 'subconscious' && r.askers.length === 0)).at(-1);
+        const own = ownRelease !== undefined;
         // Credited to the latest that ran.
         const by = own ? undefined : ranAfter.at(-1);
+        // Who else its own release credits: the other askers, and the cancel
+        // it joined where that wasn't the subconscious's tool's.
+        const joined = ownRelease
+          ? [...ownRelease.askers.filter((a) => a !== author).map((a) => `${a}'s`),
+            ...(ownRelease.source !== 'subconscious' && ownRelease.reason !== undefined ? [`the cancel for ${ownRelease.reason}`] : [])]
+          : [];
         const noteAt = notes.get(epochId);
         const drop: UnstampedStop = ranAfter.length > 0
           ? {
             reason: 'unstamped-stop', found: 'ran', ...(asked ? { asked: true as const } : {}),
             ...(asked?.note !== undefined ? { note: asked.note } : {}), ...(noteAt !== undefined ? { noteDelivered: true as const } : {}),
-            ...(own ? { own: true as const } : by?.reason !== undefined ? { ranBy: by.reason } : {}),
+            ...(own ? { own: true as const, ...(joined.length > 0 ? { joined } : {}) } : by?.reason !== undefined ? { ranBy: by.reason } : {}),
           }
           : noteAt !== undefined ? { reason: 'unstamped-stop', found: 'delivered' }
           : asked ? { reason: 'unstamped-stop', found: 'asked', ...(asked.note !== undefined ? { note: asked.note } : {}) }
@@ -2350,9 +2377,10 @@ export class TuneOutCoordinator {
         } else if (drop.found === 'ran' && drop.own) {
           // Its own cancel stored the release since it asked, the end not.
           const who = drop.asked ? 'The cancel of it you asked for' : 'Your cancel of it';
+          const joined = drop.joined && drop.joined.length > 0 ? ` (with ${drop.joined.map((j) => suppliedValue(j)).join(' and ')})` : '';
           const note = drop.noteDelivered ? ', with the note you left with it'
             : drop.note !== undefined ? `, but the note you left with it, ${quotedValue(drop.note)}, did not` : '';
-          text = `${unrecorded}${who} ran: its release reached ${to}${note}. ${notRecorded('Its end')}]`;
+          text = `${unrecorded}${who} ran${joined}: its release reached ${to}${note}. ${notRecorded('Its end')}]`;
         } else if (drop.found === 'ran') {
           // Another's cancel stored the release, the end not: the
           // subconscious's own, asked for, had not run. A note of its found
@@ -2666,15 +2694,11 @@ export class TuneOutCoordinator {
     noteAuthor: string | undefined,
     nextState: 'open' | 'closed',
     asQueued?: DeferredCancel,
-    /**
-     * Who asked for the cancel, by the name it runs under, which its release
-     * records: left out, the note's author, as a direct call's is; `null`,
-     * no one named (a queued run of a cancel asked for under no name, whose
-     * entry may carry a later caller's note).
-     */
-    askedBy?: string | null,
   ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
-    const caller = askedBy === undefined ? noteAuthor : askedBy ?? undefined;
+    // Who its release credits, by the names they run under: a queued run's
+    // every asker (deferCancel), else this call's caller, its note's author
+    // (a reader's cancel_tuneout passes its caller so, note or none).
+    const askers = asQueued ? asQueued.askers : noteAuthor !== undefined ? [noteAuthor] : [];
     const ending = this.channelRegistry.getTuneOutState(serverId, channelId);
     if (!ending) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
@@ -2687,7 +2711,7 @@ export class TuneOutCoordinator {
         current: () => this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId,
       };
       const kept = this.deferCancel(this.key(serverId, channelId), target, `${this.shown(serverId, channelId)} (${reason})`,
-        (entry) => { this.endTuneOut(serverId, channelId, source, reason, entry.note, entry.noteAuthor, nextState, entry, caller ?? null); },
+        (entry) => { this.endTuneOut(serverId, channelId, source, reason, entry.note, entry.noteAuthor, nextState, entry); },
         subconsciousNote, noteAuthor);
       return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
@@ -2796,7 +2820,7 @@ export class TuneOutCoordinator {
       this.hooks.addMessage(
         'user',
         [{ type: 'text', text: render(lines, truncated) }],
-        { system: true, kind: 'tune-out-cancel', channelId, epochId, released: record, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, ...(lost ? { lostNote: true } : {}) },
+        { system: true, kind: 'tune-out-cancel', channelId, epochId, released: record, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, ...(lost ? { lostNote: true } : {}) },
       );
       records.push(record);
     } else if (lost) {
@@ -2804,7 +2828,7 @@ export class TuneOutCoordinator {
       // loss alone, and covers none (no `released`). `lostNote` marks a
       // release that tells a queued note's loss, as a boot reads it
       // (noteUnstampedStop).
-      this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, lostNote: true });
+      this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true });
     }
     // Told, in the release written: not delivered or told again, even if
     // the release isn't made durable below and the queued cancel runs later.
@@ -3219,10 +3243,9 @@ export class TuneOutCoordinator {
     note: string | undefined,
     noteAuthor: string | undefined,
     asQueued?: DeferredCancel,
-    /** Who asked for the cancel, as endTuneOut's. */
-    askedBy?: string | null,
   ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
-    const caller = askedBy === undefined ? noteAuthor : askedBy ?? undefined;
+    // Who its release credits, as endTuneOut's.
+    const askers = asQueued ? asQueued.askers : noteAuthor !== undefined ? [noteAuthor] : [];
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
     // As a channel's cancel: while writes are kept in memory, the release
@@ -3233,7 +3256,7 @@ export class TuneOutCoordinator {
         scope: 'all-except', current: () => this.getAllExcept()?.params.epochId,
       };
       const kept = this.deferCancel(TuneOutCoordinator.SCOPE_KEY, target, `the all-except hold (${reason})`,
-        (entry) => { this.endAllExcept(source, reason, entry.note, entry.noteAuthor, entry, caller ?? null); },
+        (entry) => { this.endAllExcept(source, reason, entry.note, entry.noteAuthor, entry); },
         note, noteAuthor);
       return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
@@ -3293,11 +3316,11 @@ export class TuneOutCoordinator {
       this.hooks.addMessage(
         'user',
         [{ type: 'text', text: `${header}\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
-        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, released: record, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, ...(lost ? { lostNote: true } : {}) },
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, released: record, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, ...(lost ? { lostNote: true } : {}) },
       );
     } else if (lost) {
       this.hooks.addMessage('user', [{ type: 'text', text: header }],
-        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, lostNote: true });
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true });
     }
     if (first?.lost) first.entry.noteSettled = true;
     if (this.hooks.commitDeliveries?.() === false) {

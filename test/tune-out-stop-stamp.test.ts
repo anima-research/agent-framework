@@ -1105,7 +1105,7 @@ test("pin: a release carrying a queued note's loss alone, a channel's or the all
   }
 }));
 
-test("pin: a waiting cancel's release records who asked for the cancel, not the author of a note a later call gave it", () => quiet(() => {
+test("pin: a waiting cancel's release records every caller it answered as waiting, a later call that joined it with its note among them (Weft, 0401939e)", () => quiet(() => {
   for (const scope of [false, true]) {
     const h = stampSetup();
     try {
@@ -1122,7 +1122,72 @@ test("pin: a waiting cancel's release records who asked for the cancel, not the 
       h.state.held = false;
       c.runDeferredCancels();
       const release = h.rows.find((m) => m.metadata?.kind === 'tune-out-cancel')!;
-      assert.deepEqual(release.metadata?.cancel, scope ? { source: 'channel-close', reason: 'the excepted channel was closed' } : { source: 'agent-tool', reason: 'agent request' });
+      assert.deepEqual(release.metadata?.cancel, {
+        ...(scope ? { source: 'channel-close', reason: 'the excepted channel was closed' } : { source: 'agent-tool', reason: 'agent request' }),
+        by: SUB, askers: [SUB],
+      });
     } finally { h.stopAll(); }
   }
+}));
+
+// ---------------------------------------------------------------------------
+// Weft's reading of 0401939e.
+// ---------------------------------------------------------------------------
+
+test("1 (Weft, 0401939e): the subconscious's own ask that joined a reader fork's waiting cancel, which ran, is credited to it, in either order", () => quiet(() => {
+  for (const forkFirst of [true, false]) {
+    const h = stampSetup();
+    try {
+      h.hold();
+      const c = h.boot();
+      const e = h.holds[0]!.epochId;
+      h.state.held = true;
+      const fork = () => c.cancel('editor', 'noisy', 'subconscious', 'by reader-fork-7', undefined, 'reader-fork-7');
+      const own = () => { h.ask({ channelId: 'noisy', text: 'SUB NOTE' }); return c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'SUB NOTE', SUB); };
+      if (forkFirst) { fork(); own(); } else { own(); fork(); }
+      h.state.held = false;
+      h.state.endFails = true;
+      c.runDeferredCancels();
+      h.state.endFails = false;
+      assert.equal(h.holds.length, 1, 'premise: its end was not recorded');
+      h.boot();
+      assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}The cancel of it you asked for ran (with reader-fork-7's): its release `
+        + `reached scout, but the note you left with it, "SUB NOTE", did not. ${STILL}]`, forkFirst ? 'fork first' : 'subconscious first');
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("1 (Weft, 0401939e), control: its ask alone, its cancel run, its end unrecorded", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.hold();
+    const c = h.boot();
+    const e = h.holds[0]!.epochId;
+    h.state.held = true;
+    h.ask({ channelId: 'noisy', text: 'SUB NOTE' });
+    c.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'SUB NOTE', SUB);
+    h.state.held = false;
+    h.state.endFails = true;
+    c.runDeferredCancels();
+    h.state.endFails = false;
+    h.boot();
+    assert.equal(textOf(h.unrecorded()[0]!.content), `${opening(e)}The cancel of it you asked for ran: its release reached scout, but the note `
+      + `you left with it, "SUB NOTE", did not. ${STILL}]`);
+  } finally { h.stopAll(); }
+}));
+
+test("pin: a kept notice silences by when its boot decided it: one kept before a later ask doesn't silence that ask", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.state.subRefuses = true;
+    h.boot();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    const c = h.boot();
+    h.state.subRefuses = false;
+    c.runDeferredCancels();
+    assert.equal(h.unrecorded().length, 2);
+  } finally { h.stopAll(); }
 }));

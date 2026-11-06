@@ -804,6 +804,24 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
     }
   });
 
+  it("the guard's archived results are the subconscious's alone: another agent's staged record for the same tool use id is not read (Weft, 0401939e, pin)", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub } = await heldWithPrimer();
+    try {
+      type Appending = { append(record: Record<string, unknown>): void };
+      const guardOf = (name: string) => (f.framework.getAgent(name) as unknown as { toolResultGuard: Appending }).toolResultGuard;
+      const staged = (toolUseId: string, answer: unknown) => ({ type: 'staged', batchId: `b-${toolUseId}`, content: [{ type: 'tool_result', toolUseId, content: JSON.stringify(answer) }] });
+      guardOf(sub).append(staged('x', { waiting: true, serverId: 'editor' }));
+      guardOf('agent').append(staged('x', { cancelled: true }));
+      guardOf('agent').append(staged('y', { waiting: true }));
+      const read = (f.framework as unknown as { subconsciousGuardedResults(): Map<string, unknown> }).subconsciousGuardedResults();
+      assert.deepEqual([...read.entries()], [['x', JSON.stringify({ waiting: true, serverId: 'editor' })]]);
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
   it("control: the same cancel through executeToolCall, which stores no turn's rows, then a crash: the row stays conditional", async () => {
     const errors = mock.method(console, 'error', () => {});
     const { f, sub, epochId } = await heldWithPrimer();
