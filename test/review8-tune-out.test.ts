@@ -2058,3 +2058,16 @@ test("review 3 #14: a stop while the release that told a queued note's loss is k
     }
   }
 });
+
+test("review 3 #45: a window-starts record whose start or start in force is ill-formed logs each one it drops, naming the epoch", () => {
+  const h = anchored({ active: [{ epochId: 'X', sequence: 30 }], state: { starts: { X: 3, Y: 'seven', Z: -1 } as never, inForce: 2.5 as never }, length: 12 });
+  const errors = mock.method(console, 'error', () => {});
+  try {
+    h.internals.anchorSubconscious('enter');
+    const lines = errors.mock.calls.map((c) => String(c.arguments[0]));
+    assert.ok(lines.some((l) => l.includes('Y') && l.includes('"seven"')), `the start of epoch Y is logged as dropped: ${lines.join('\n')}`);
+    assert.ok(lines.some((l) => l.includes('Z') && l.includes('-1')), 'and of Z');
+    assert.ok(lines.some((l) => l.includes('in force') && l.includes('2.5')), 'and the start in force');
+  } finally { errors.mock.restore(); }
+  assert.deepEqual(h.calls, ['setAnchorOrdinal(3)'], "X's well-formed start is read and set, as before");
+});

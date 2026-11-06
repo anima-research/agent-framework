@@ -95,6 +95,17 @@ describe('what a held channel\'s messages are, said to the resident (AF #844 rev
     // The tool's own text names the reader as configured: a new tune_out is refused then anyway.
     assert.deepEqual(tuneOutTool(none), tuneOutTool({ kind: 'persistent', name: 'Muse' }));
   });
+
+  it("says none reads them in tune_out's transport answers too, where none runs (AF #844 review 3, #94)", () => {
+    const reach = (readerWords as unknown as { tuneOutReachWords: (r: unknown, form: string) => string }).tuneOutReachWords;
+    assert.equal(reach({ kind: 'persistent', name: 'Muse' }, 'reach'), 'reach Muse');
+    assert.equal(reach({ kind: 'forks' }, 'may not reach'), 'may not reach the reader');
+    const none = { kind: 'persistent', name: 'Muse', running: false };
+    for (const form of ['reach', 'may not reach', "don't reach"]) {
+      assert.equal(reach(none, form), "are held, with no reader running here to read them, until the tune-out's release, which failed, is tried again",
+        `${form}: no reader is named where none runs`);
+    }
+  });
 });
 
 describe("the reader tools' text", () => {

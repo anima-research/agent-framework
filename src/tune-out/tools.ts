@@ -161,9 +161,16 @@ export function tunedOutTrafficWords(reader: TuneOutReader): string {
  * Whether a tuned-out channel's messages get to its reader, as the words
  * after "its messages" in tune_out's answers about the channel's transport,
  * in the sentence's `form`: they reach `reader`, by the name it runs under
- * or as "the reader" (forks, as tuneOutTool says it).
+ * or as "the reader" (forks, as tuneOutTool says it). Where no reader runs
+ * (`running: false`, a hold left on record by a failed release), none is
+ * named, whatever the form: they are held, with none to read them, as
+ * tuneOutHeldWords says. A new tune_out is refused then, so the answers
+ * that say so are those about the hold already in force.
  */
 export function tuneOutReachWords(reader: TuneOutReader, form: 'reach' | 'may not reach' | "don't reach"): string {
+  if (reader.kind === 'persistent' && reader.running === false) {
+    return "are held, with no reader running here to read them, until the tune-out's release, which failed, is tried again";
+  }
   return `${form} ${reader.kind === 'persistent' ? reader.name : 'the reader'}`;
 }
 

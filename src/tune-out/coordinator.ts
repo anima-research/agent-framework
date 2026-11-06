@@ -1311,9 +1311,15 @@ export class TuneOutCoordinator {
       return { starts: {} };
     }
     const isOrdinal = (o: unknown): o is number => typeof o === 'number' && Number.isInteger(o) && o >= 0;
+    // One ill-formed entry is dropped, logged by its epoch, the rest read:
+    // the next fix writes over it.
     const starts: Record<string, number> = {};
     for (const [epochId, ordinal] of Object.entries(state.starts as Record<string, unknown>)) {
       if (isOrdinal(ordinal)) starts[epochId] = ordinal;
+      else console.error(`[tune-out] the subconscious's window start kept for epoch ${epochId} (${this.windowStartsStateId}) isn't an ordinal (${JSON.stringify(ordinal) ?? String(ordinal)}), so none is kept for it; the next fix writes over it`);
+    }
+    if (state.inForce !== undefined && !isOrdinal(state.inForce)) {
+      console.error(`[tune-out] the subconscious's window start in force (${this.windowStartsStateId}) isn't an ordinal (${JSON.stringify(state.inForce) ?? String(state.inForce)}), so none is read as in force; the next fix writes over it`);
     }
     return { starts, ...(isOrdinal(state.inForce) ? { inForce: state.inForce } : {}) };
   }
