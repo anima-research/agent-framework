@@ -1,8 +1,9 @@
 /**
- * Tools whose call carries the resident's words, by bare name (an MCPL
- * server's `<prefix>--` stripped), each with the arguments that can hold
- * them, as each server names them: the first one present holds the words,
- * when it's a non-blank string. A `silences` tool delivers them where others
+ * Tools whose call carries the resident's words for silencing and the history
+ * module, by bare name (an MCPL server's `<prefix>--` stripped), matched on
+ * any server, each with the arguments that can hold them, as each server
+ * names them: the first one present holds the words, when it's a non-blank
+ * string. A `silences` tool delivers them where others
  * read them: the framework reads a call of one as an explicit send
  * that silences the round's auto-routed prose where it may have posted. The
  * history module's search, extract and semantic index read the words of any
@@ -12,17 +13,21 @@
 const SPEECH_TOOLS: ReadonlyMap<string, { words: readonly string[]; silences: boolean }> = new Map([
   // channel_publish still takes `text` from older callers.
   ['channel_publish', { words: ['content', 'text'], silences: true }],
-  // telegram-mcpl's send_message takes `message`.
-  ['send_message', { words: ['content', 'message'], silences: true }],
-  ['reply_message', { words: ['content'], silences: true }],
-  ['send_dm', { words: ['content'], silences: true }],
+  // telegram-mcpl's send_message takes `message`; other servers, and the
+  // framework's own test servers, send `text`.
+  ['send_message', { words: ['content', 'message', 'text'], silences: true }],
+  ['reply_message', { words: ['content', 'text'], silences: true }],
+  ['send_dm', { words: ['content', 'text'], silences: true }],
   // telegram-mcpl's reply, file send, scheduled send and poll.
   ['reply_to_message', { words: ['text'], silences: true }],
   ['send_file', { words: ['caption'], silences: false }],
   ['send_scheduled_message', { words: ['message'], silences: false }],
   ['create_poll', { words: ['question'], silences: false }],
   // telegram-mcpl's edit_message takes `new_text`.
-  ['edit_message', { words: ['content', 'new_text'], silences: false }],
+  ['edit_message', { words: ['content', 'new_text', 'text'], silences: false }],
+  // slack-mcpl's upload_file posts `comment` with the file; its `content` is
+  // the file.
+  ['upload_file', { words: ['comment'], silences: false }],
   // Eidoverse's say and whisper take `text`.
   ['say', { words: ['text'], silences: true }],
   ['whisper', { words: ['text'], silences: true }],

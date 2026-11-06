@@ -749,6 +749,23 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("a reply_to_message to another channel, whose answer names no channel, holds the prose bound for the woken channel too: it's held for every destination (#524)", async () => {
+    const elsewhere = 'telegram:me:chat:42';
+    const h = await harness({ sendTool: true, sendToolName: 'reply_to_message' });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([
+        createMockResponse([text('Here it is.'), call('s1', 'discord--reply_to_message', { channelId: elsewhere, text: 'the reply elsewhere' })], 'tool_use'),
+        createMockResponse([text('Sent it.')]),
+      ]);
+      assert.deepEqual(h.sends().map((s) => s.channelId), [elsewhere], 'the reply went to the other channel');
+      assert.deepEqual(h.publishes(), [], 'the prose bound for the woken channel was held too');
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]).reverse(), [['Here it is.', 'explicit-send'], ['Sent it.', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
   it("a send through reply_to_message, telegram-mcpl's reply, whose answer names no channel, holds the prose beside it and after it (#524)", async () => {
     const h = await harness({ sendTool: true, sendToolName: 'reply_to_message' });
     await h.sendMode('no-channel');
@@ -765,7 +782,7 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  for (const name of ['edit_message', 'send_file', 'send_scheduled_message', 'create_poll']) {
+  for (const name of ['edit_message', 'send_file', 'send_scheduled_message', 'create_poll', 'upload_file']) {
     it(`a call of ${name} doesn't hold the round's prose: it still goes out (#524)`, async () => {
       const h = await harness({ sendTool: true, sendToolName: name });
       try {

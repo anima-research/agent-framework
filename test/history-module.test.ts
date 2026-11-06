@@ -542,6 +542,61 @@ describe('HistoryModule', () => {
     });
   });
 
+  describe("a speech tool's `text` and Slack's upload_file, after review (#524)", () => {
+    const sent: StoredMessage[] = [
+      msg('t1', 1000, 'Glassy', [{ type: 'tool_use', id: 'a', name: 'fixture--send_message', input: { channelId: 'room', text: 'sent through a text argument' } }], 'c1'),
+      msg('t2', 2000, 'Glassy', [{ type: 'tool_use', id: 'b', name: 'fixture--reply_message', input: { channelId: 'room', messageId: '1', text: 'replied through a text argument' } }], 'c1'),
+      msg('t3', 3000, 'Glassy', [{ type: 'tool_use', id: 'c', name: 'fixture--send_dm', input: { userId: 'u', text: 'a direct word as text' } }], 'c1'),
+      msg('t4', 4000, 'Glassy', [{ type: 'tool_use', id: 'd', name: 'fixture--edit_message', input: { channelId: 'room', messageId: '2', text: 'edited through text' } }], 'c1'),
+      msg('t5', 5000, 'Glassy', [{ type: 'tool_use', id: 'e', name: 'slack--send_message', input: { channelId: 'C1', content: 'what content holds', text: 'what text holds' } }], 'c1'),
+      msg('t6', 6000, 'Glassy', [{ type: 'tool_use', id: 'f', name: 'slack--upload_file', input: { channelId: 'C1', filename: 'positions.csv', content: 'symbol,qty', comment: 'the positions for Friday' } }], 'c1'),
+      msg('t7', 7000, 'Glassy', [{ type: 'tool_result', toolUseId: 'e', toolName: 'slack--send_message', content: 'not_in_channel', isError: true }], 'c1'),
+      msg('t8', 8000, 'Glassy', [{ type: 'tool_result', toolUseId: 'f', toolName: 'slack--upload_file', content: 'uploaded' }], 'c1'),
+    ];
+    const bound = () => {
+      const { cm } = buildStub(sent);
+      const h = new HistoryModule();
+      h.bind(cm);
+      return h;
+    };
+    const ids = async (h: HistoryModule, input: Record<string, unknown>) => {
+      const result = await h.handleToolCall(call('search', input));
+      assert.equal(result.success, true, result.error);
+      return (result.data as { matches: Array<{ id: string }> }).matches.map((m) => m.id);
+    };
+
+    it("search finds a send that carries its words as `text`, and reads the first of a row's arguments that's there", async () => {
+      const h = bound();
+      assert.deepEqual(await ids(h, { query: 'through a text argument' }), ['t1', 't2']);
+      assert.deepEqual(await ids(h, { query: 'direct word as text' }), ['t3']);
+      assert.deepEqual(await ids(h, { query: 'edited through text' }), ['t4']);
+      assert.deepEqual(await ids(h, { query: 'what content holds' }), ['t5']);
+      assert.deepEqual(await ids(h, { query: 'what text holds' }), [], 'content comes first, so text is not read beside it');
+    });
+
+    it("search finds an upload_file by its comment, not by the file it carries", async () => {
+      const h = bound();
+      assert.deepEqual(await ids(h, { query: 'positions for Friday' }), ['t6']);
+      assert.deepEqual(await ids(h, { query: 'symbol,qty' }), [], "the file's contents aren't searched");
+    });
+
+    it('extract shows each by its words, and a failed result as an error', async () => {
+      const result = await bound().handleToolCall(call('extract', { channelId: 'c1', format: 'text' }));
+      assert.equal(result.success, true, result.error);
+      const shown = (result.data as { messages: Array<{ content: string }> }).messages.map((m) => m.content);
+      assert.deepEqual(shown, [
+        '[fixture--send_message] sent through a text argument',
+        '[fixture--reply_message] replied through a text argument',
+        '[fixture--send_dm] a direct word as text',
+        '[fixture--edit_message] edited through text',
+        '[slack--send_message] what content holds',
+        '[slack--upload_file] the positions for Friday',
+        '[tool_result: slack--send_message, error]',
+        '[tool_result: slack--upload_file]',
+      ]);
+    });
+  });
+
   describe('pagination input validation', () => {
     // Math.min(value, max) alone only enforces an UPPER bound —
     // Math.min(-1, 200) is -1, not clamped up to anything — so a negative

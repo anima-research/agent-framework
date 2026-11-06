@@ -158,14 +158,29 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(messageIndexText(said, false), '[say] hello from the plaza\n[whisper] meet me by the fountain');
   });
 
-  it("messageIndexText doesn't read a `text` argument of send_message, reply_message, send_dm or edit_message, which servers send `content` (#524)", () => {
+  it("messageIndexText reads a `text` argument of send_message, reply_message, send_dm or edit_message when the row's other arguments aren't there, and the first one present otherwise (#524)", () => {
     const sent = msg('m12', T0 + 12000, [
-      { type: 'tool_use', id: 'a', name: 'send_message', input: { channelId: 'C1', text: 'not read from text' } },
-      { type: 'tool_use', id: 'b', name: 'reply_message', input: { channelId: 'C1', messageId: '1.2', text: 'not read from text' } },
-      { type: 'tool_use', id: 'c', name: 'send_dm', input: { userId: 'U1', text: 'not read from text' } },
-      { type: 'tool_use', id: 'd', name: 'edit_message', input: { channelId: 'C1', messageId: '1.3', text: 'not read from text' } },
+      { type: 'tool_use', id: 'a', name: 'send_message', input: { channelId: 'C1', text: 'sent as text' } },
+      { type: 'tool_use', id: 'b', name: 'reply_message', input: { channelId: 'C1', messageId: '1.2', text: 'replied as text' } },
+      { type: 'tool_use', id: 'c', name: 'send_dm', input: { userId: 'U1', text: 'a word as text' } },
+      { type: 'tool_use', id: 'd', name: 'edit_message', input: { channelId: 'C1', messageId: '1.3', text: 'edited as text' } },
+      { type: 'tool_use', id: 'e', name: 'send_message', input: { channelId: 'C1', content: 'the content wins', text: 'not this' } },
     ] as ContentBlock[]);
-    assert.equal(messageIndexText(sent, false), '');
+    assert.equal(messageIndexText(sent, false), [
+      '[send_message] sent as text',
+      '[reply_message] replied as text',
+      '[send_dm] a word as text',
+      '[edit_message] edited as text',
+      '[send_message] the content wins',
+    ].join('\n'));
+  });
+
+  it("messageIndexText reads slack-mcpl's upload_file by its comment, not the file it carries (#524)", () => {
+    const sent = msg('m13', T0 + 13000, [
+      { type: 'tool_use', id: 'a', name: 'slack--upload_file', input: { channelId: 'C1', filename: 'positions.csv', content: 'symbol,qty', comment: 'the positions for Friday' } },
+      { type: 'tool_use', id: 'b', name: 'slack--upload_file', input: { channelId: 'C1', filename: 'notes.txt', content: 'only the file' } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(sent, false), '[upload_file] the positions for Friday');
   });
 
   it('syncs messages and summaries incrementally with cursors, then searches with mapped filters', async () => {

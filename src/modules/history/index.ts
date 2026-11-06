@@ -698,7 +698,7 @@ export class HistoryModule implements Module {
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
           'readable string (a call of a tool the framework names for sending, editing or saying a message, such as ' +
           'send_message, as its name and its words when it carries words, such as "[telegram--send_message] …"; ' +
-          'other tool_use/tool_result/thinking/images as bracketed labels); ' +
+          'other tool_use/tool_result/thinking/images as bracketed labels, a failed tool_result\'s ending ", error"); ' +
           'format:"raw" returns the content blocks unmodified. ' +
           'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
           'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
@@ -2471,8 +2471,10 @@ function blockLabel(block: ContentBlock): string {
       const said = speechOf(block.name, block.input);
       return said ? `[${block.name}] ${said.words}` : `[tool_use: ${block.name}]`;
     }
-    case 'tool_result':
-      return block.toolName ? `[tool_result: ${block.toolName}]` : '[tool_result]';
+    case 'tool_result': {
+      const failed = block.isError ? ', error' : '';
+      return block.toolName ? `[tool_result: ${block.toolName}${failed}]` : `[tool_result${failed}]`;
+    }
     case 'thinking':
     case 'redacted_thinking':
       return '[thinking]';
