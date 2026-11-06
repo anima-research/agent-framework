@@ -16,8 +16,8 @@
     identically (e.g. drop an oversized attachment or an unsupported
     setting)." A timed-out turn's note keeps "If a reply is still owed from
     that turn, you can give it now."
-  - The reply judge reads the agent's context, so it no longer sees that a
-    turn which did nothing failed.
+  - The reply judge reads the agent's context, so it no longer sees an
+    `[inference-failed]` note for a turn that did nothing.
   - `SUPPRESS_INFERENCE_FAILED_MARKER=1` now leaves out only that note, since
     no other is written.
   - Notes already in a store stay as they are.
