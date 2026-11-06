@@ -51,7 +51,8 @@ async function lastMillisecond(end: number, before: () => void): Promise<void> {
 }
 
 async function byThisMillisecond(done: () => boolean, what: string): Promise<void> {
-  for (let i = 0; i < 10 && !done(); i++) {
+  const by = performance.now() + 5_000;
+  while (!done() && performance.now() < by) {
     mock.timers.tick(0);
     await settle();
   }
@@ -1845,7 +1846,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.evaluate(chat('and again'));
     await until(() => judge.requests.length === 2, "second's batch to go to the judge while first's is decided");
     assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
-      ['once the judge decides it', 'rule "first"\'s batch of 1 event, with 1 event queued behind it, which the judge is deciding', false],
+      ['once the judge decides it', 'rule "first"\'s batch of 1 event, which the judge is deciding, with 1 event queued behind it, sent to the judge unless the call wakes the agent', false],
     ]);
     judge.answer({ reply: false, reason: 'chatter' });
     judge.answer({ reply: false, reason: 'chatter' });
