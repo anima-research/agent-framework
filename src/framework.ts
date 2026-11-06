@@ -22597,16 +22597,24 @@ export class AgentFramework {
         // Written while its turn is alive, it waits out of the window
         // (present false) for the turn's next point, as the write for the
         // agent it replaces did: the tool boundary whose stream hears it, or
-        // the turn's end. With no turn alive it is presented now, as any own
-        // row written at rest.
-        if (target) storeOwnRow(
-          target,
-          'user',
-          [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
-          { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
-          undefined,
-          !this.logicalTurnAlive(target),
-        );
+        // the turn's end. The other readers of its slot that are idle (an
+        // agent that observes it, the persistent subconscious) are presented
+        // it now, as addMessage presents a write mid-turn to them
+        // (afterStore passes over a reader whose turn is alive, its writer
+        // included). With no turn alive it is presented now, as any own row
+        // written at rest.
+        if (target) {
+          const atRest = !this.logicalTurnAlive(target);
+          const id = storeOwnRow(
+            target,
+            'user',
+            [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
+            { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
+            undefined,
+            atRest,
+          );
+          if (!atRest) this.presentation?.afterStore(target, [id]);
+        }
       } catch (err) {
         console.error('[drafts] held-draft notice failed:', err);
       }

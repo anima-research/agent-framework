@@ -628,7 +628,11 @@ describe('held prose drafts, end to end', () => {
       const readThrough = scout.getConsumedWatermark();
       assert.equal(scout.publishedAfterReading(room, newestCovered(readThrough, cm), cm), true,
         'the resend is noted as a publish into room, made having read what the turn read');
-      assert.equal(scout.publishedAfterReading(room, rowAt(headOf(readThrough) + 1), cm), false, 'and nothing stored since');
+      // A row stored in room after the resend, and presented: a real row in
+      // the window, which the resend's mark doesn't cover.
+      const later = cm.addMessage('someone', [text('said in room after the resend')], { serverId: 'discord', channelId: ROOM });
+      cm.presentRows([later]);
+      assert.equal(scout.publishedAfterReading(room, cm.getMessage(later)!, cm), false, 'and nothing stored since');
       const [list, read, resend] = h.toolResults();
       assert.match(list!, /3 open drafts, newest first/);
       assert.ok(read!.endsWith(`exactly as a resend publishes it):\n${segments[1]}`), `read shows the text in full: ${read}`);
@@ -4733,4 +4737,44 @@ describe('a closed channel\'s invitation offers the reply its agent\'s mode read
       });
     }
   }
+});
+
+// AF #844 bot review 3, finding 108: the held-draft notice written while
+// its agent's turn is alive waits out of that agent's window for the turn's
+// next point, but the other readers of its slot that are idle (a resident
+// that observes it, the persistent subconscious) are presented it at once,
+// as addMessage presents any write mid-turn to them.
+describe('the held-draft notice written mid-turn', () => {
+  it("enters an idle observer's window at its write, and its own agent's at the turn's next point", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-observer-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', observes: ['scout'] },
+      ],
+      modules: [],
+    });
+    try {
+      const internals = framework as unknown as {
+        activeTurnTokens: Map<string, number>;
+        holdProseDrafts(agent: unknown, texts: string[], reason: string, opts: { routing: unknown; notice: 'now' }): unknown[];
+      };
+      const scout = framework.getAgent('scout')!;
+      internals.activeTurnTokens.set('scout', 9999);
+      const held = internals.holdProseDrafts(scout, ['words held back'], 'explicit-send', { routing: { drafts: [], wasIn: [] }, notice: 'now' });
+      assert.equal(held.length, 1, 'setup: one draft held');
+      const notice = scout.getContextManager().getAllMessages()
+        .find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-drafts');
+      assert.ok(notice, 'the notice is stored');
+      assert.equal(scout.getContextManager().ordinalOf(notice.id), undefined, "out of scout's window while its turn is alive");
+      assert.notEqual(framework.getAgent('nova')!.getContextManager().ordinalOf(notice.id), undefined,
+        "in nova's window at once: she observes scout, and is idle");
+      internals.activeTurnTokens.delete('scout');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
