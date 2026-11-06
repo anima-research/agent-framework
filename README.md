@@ -164,10 +164,12 @@ text. Selection never matches notice text.
 Hosts opening the same stores should use the package's
 `residentViewFilter(message, agentName)` or
 `subconsciousViewFilter(message, agentName)` rather than copy the view rules.
-On context-manager 0.24.2 (and current main), a hidden first source can place that
+On context-manager releases up to at least 0.24.2, a hidden first source can place that
 summary after newer messages; a hidden first or last source makes it permanently
-unmergeable and absent from history overview until context-manager #369 or equivalent lands. See the
-[release note](changelog.d/973-reasoning-loss.fixed.md). Addresses #973.
+unmergeable and absent from history overview until anima-research/context-manager#369 or equivalent lands. The release that raises the context-manager dependency floor to a version
+containing that fix should remove this migration limit and the migration test
+`todo`. See the
+[release note](changelog.d/973-reasoning-loss.fixed.md).
 
 ### Persistence
 
