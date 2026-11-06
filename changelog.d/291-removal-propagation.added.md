@@ -4,9 +4,9 @@
   as own rows enter at every point. The others are arrived and not presented, and wait outside it until the agent's
   next turn start, which presents them after what its window holds then: the surgery's release, a resume, a turn's
   end and a row stored for the agent while it is idle don't bring them back, so for them the operator's cut is what
-  the agent's window holds until it speaks again. A turn start that fails keeps them out until one that doesn't. A
-  restart before then presents them at its pass at rest. Both
-  also carry `keptInWindowAfterTarget`: the
+  the agent's window holds until it speaks again. A turn start that fails, or one while the host is quiesced, keeps
+  them out until one that presents them. A restart before then presents them at its pass at rest. Both also carry
+  `keptInWindowAfterTarget`: the
   rows after the target that one write presented together with it (a batch, such as two messages that arrived while
   the agent was busy and entered at its turn's end), which stay in the window after the target, since a branch cut
   can't separate them from it. Neither is removed or marked. `SurgeryMarksPreview.neverPresented` counts the

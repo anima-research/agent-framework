@@ -855,7 +855,8 @@ export class AgentPresentation {
    * per body, for the start to weigh. A fresh start ends a rollback's hold
    * on the arrivals its cut returned (holdUntilStart): they enter with the
    * rest, in record order, and the hold ends once they have, so a start
-   * that fails keeps it; so does an agent the boot's pass at rest left out
+   * that fails keeps it, and so does one while frozen, which presents no
+   * arrival; so does an agent the boot's pass at rest left out
    * (repairAndRest's `restExcept`). A fresh start's presentation that fails (a read
    * of the window or the record that throws, or a write of the window that
    * leaves a row out) is traced, and then throws, so the start fails rather
@@ -868,9 +869,12 @@ export class AgentPresentation {
   presentAtStart(agent: PresentedAgent, occasion: 'turn-start' | 'assembly' | 'compile'): StoredMessage[] {
     if (!this.presenting(agent)) return [];
     const cm = agent.getContextManager();
-    // The sweep below decides the own rows a failed write left (presentOwn).
-    this.failedOwn.delete(cm);
     const fresh = occasion !== 'compile';
+    // The sweep below decides the own rows a failed write left (presentOwn):
+    // the backstop's at once, as its compile goes on whatever it presents; a
+    // fresh start's once it hasn't thrown, so the next own row's write still
+    // puts them first after a start that presented nothing.
+    if (!fresh) this.failedOwn.delete(cm);
     // A fresh start is where rows a write-down took in that aren't the
     // agent's, whose retraction failed, leave before its compile, and a
     // reader fork's framing whose presentation failed enters.
@@ -882,13 +886,16 @@ export class AgentPresentation {
     }
     if (fresh && this.framedPending.has(agent.name)) this.presentFramed(agent);
     // A rollback's returned arrivals enter here (holdUntilStart): the hold
-    // is left out of this presentation, and ends once it hasn't failed.
-    const { arrivals, failure } = this.presentPending(agent, occasion, fresh && !this.host.frozen(), false,
+    // is left out of this presentation, and ends once it hasn't failed, at a
+    // start that could present arrivals (none while frozen).
+    const withArrivals = fresh && !this.host.frozen();
+    const { arrivals, failure } = this.presentPending(agent, occasion, withArrivals, false,
       fresh ? "the start fails, and what it didn't present waits for the next point" : undefined);
     if (fresh && failure !== undefined) {
       throw new Error(`${agent.name}'s turn start could not present what it is owed (at ${occasion}): ${describe(failure)}`, { cause: failure });
     }
-    if (fresh) {
+    if (fresh) this.failedOwn.delete(cm);
+    if (withArrivals) {
       this.heldUntilStart.delete(cm);
       this.restWithheld.delete(agent.name);
     }

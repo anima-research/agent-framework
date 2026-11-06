@@ -15,7 +15,8 @@
   written (a snapshot after the write failing) leaves the window presented rather than the agent in legacy mode.
   A fresh turn start where the rows a write-down took in that aren't the agent's can't be taken out of its window
   (their retraction failed at its registration and fails again there) fails, as a start whose presentation fails
-  does, rather than compile with them.
+  does, rather than compile with them. An own row whose presentation at its write failed still enters ahead of the
+  agent's next own row after such a start.
   An agent whose window couldn't be written down at its registration, left in legacy mode, still has each idle
   reader of its slot presented its own rows as it writes them.
   Two residents of one slot whose turns overlap each keep a window that is what their requests carried, so each
