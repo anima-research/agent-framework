@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
+import { ContextManager } from '@animalabs/context-manager';
 import {
   AgentFramework,
   AgentRegistry,
@@ -1076,5 +1077,132 @@ describe('Dendrite restart', () => {
     assert.equal(told(second), 1, 'passed at the boot whose settle failed');
     const third = await process(new GateModule());
     assert.equal(told(third), 1, 'the next boot finds it passed, and passes it no more');
+  });
+
+  /** A job the crash ends with writes stored for it and out of its window, each a module's write unless given as `direct` with its own metadata. */
+  async function jobWithUnreadWrites(
+    writes: Array<{ text: string; direct?: Record<string, unknown> }>,
+    resultAs: 'tool-result' | 'message' = 'tool-result',
+  ): Promise<void> {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    membrane.script('job', waitCall('job-1'), say('job done'));
+    const { agent, contextManager } = await first.createEphemeralAgent(
+      { name: 'job', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' },
+      workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: resultAs } }),
+    );
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    first.runEphemeralToCompletion(agent, contextManager).catch(() => { /* abandoned */ });
+    await until(() => gates1.entered.has('job-1'), 'the job to block in its call');
+    const internals = first as unknown as {
+      addModuleMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+      addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+    };
+    for (const { text, direct } of writes) {
+      const row = direct
+        ? internals.addMessage('user', [{ type: 'text', text }], direct, { forAgent: 'job' })
+        : internals.addModuleMessage('user', [{ type: 'text', text }], { kind: 'test-note' }, { forAgent: 'job' });
+      assert.equal(contextManager.windowStatusOf(row), 'out', `setup: ${text} is stored and out of the job's window`);
+    }
+  }
+
+  /** Run a boot with console.error kept off the output, returning what it logged. */
+  async function quietBoot(): Promise<{ framework: AgentFramework; logged: string[] }> {
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')); };
+    try {
+      return { framework: await process(new GateModule()), logged };
+    } finally {
+      console.error = quiet;
+    }
+  }
+
+  const told = (framework: AgentFramework, text: string) => textsIn(framework, 'mira').filter((m) => m.text === text).length;
+  const interruptedNotices = (framework: AgentFramework) => textsIn(framework, 'mira')
+    .filter((m) => (m.metadata.dendrite as { event?: unknown } | undefined)?.event === 'interrupted').length;
+
+  /** Fail the primary's write of each notice whose content holds `text`, once each; returns how many failed. */
+  function failWritesOf(text: string): { restore: () => void; failed: () => number } {
+    const add = ContextManager.prototype.addMessage;
+    let failed = 0;
+    ContextManager.prototype.addMessage = function (this: ContextManager, ...args: Parameters<ContextManager['addMessage']>) {
+      if (failed === 0 && JSON.stringify(args[1]).includes(text)) {
+        failed++;
+        throw new Error('EIO: simulated write failure');
+      }
+      return add.apply(this, args);
+    } as ContextManager['addMessage'];
+    return { restore: () => { ContextManager.prototype.addMessage = add; }, failed: () => failed };
+  }
+
+  it("a boot whose write of the primary's passed notice fails leaves the job for the next boot, which passes it once", async () => {
+    await jobWithUnreadWrites([{ text: 'OWED-TO-THE-PRIMARY' }]);
+    const fault = failWritesOf('OWED-TO-THE-PRIMARY');
+    let second: AgentFramework;
+    try {
+      ({ framework: second } = await quietBoot());
+    } finally { fault.restore(); }
+    assert.equal(fault.failed(), 1, 'the boot tried to pass the write and its write failed');
+    assert.equal(told(second, 'OWED-TO-THE-PRIMARY'), 0, 'the primary isn\'t told at that boot');
+    const third = await process(new GateModule());
+    assert.equal(told(third, 'OWED-TO-THE-PRIMARY'), 1, 'the next boot passes it');
+    const fourth = await process(new GateModule());
+    assert.equal(told(fourth, 'OWED-TO-THE-PRIMARY'), 1, 'and once');
+  });
+
+  it("a boot that can't read the interrupted job's context leaves the job for the next boot, which passes its write once", async () => {
+    await jobWithUnreadWrites([{ text: 'OWED-TO-THE-PRIMARY' }]);
+    type Reopen = (record: { name: string }, strategy: unknown) => Promise<ContextManager>;
+    const proto = AgentFramework.prototype as unknown as { reopenAgentContext: Reopen };
+    const reopen = proto.reopenAgentContext;
+    let failed = 0;
+    proto.reopenAgentContext = function (this: AgentFramework, record, strategy) {
+      if (record.name === 'job' && failed === 0) {
+        failed++;
+        return Promise.reject(new Error('EIO: simulated read failure'));
+      }
+      return reopen.call(this, record, strategy);
+    };
+    let second: AgentFramework;
+    try {
+      ({ framework: second } = await quietBoot());
+    } finally { proto.reopenAgentContext = reopen; }
+    assert.equal(failed, 1, 'the boot tried to read the job\'s context and the read failed');
+    assert.equal(told(second, 'OWED-TO-THE-PRIMARY'), 0, 'the primary isn\'t told at that boot');
+    const third = await process(new GateModule());
+    assert.equal(told(third, 'OWED-TO-THE-PRIMARY'), 1, 'the next boot passes it');
+    const fourth = await process(new GateModule());
+    assert.equal(told(fourth, 'OWED-TO-THE-PRIMARY'), 1, 'and once');
+  });
+
+  it('the boot after a failed pass passes only the notices not yet passed, and tells the recipient of the interruption once', async () => {
+    await jobWithUnreadWrites([{ text: 'PASSED-FIRST-TIME' }, { text: 'FAILED-FIRST-TIME' }], 'message');
+    const fault = failWritesOf('FAILED-FIRST-TIME');
+    let second: AgentFramework;
+    try {
+      ({ framework: second } = await quietBoot());
+    } finally { fault.restore(); }
+    assert.equal(fault.failed(), 1, 'the second notice\'s write failed');
+    assert.equal(told(second, 'PASSED-FIRST-TIME'), 1, 'the first notice is passed at that boot');
+    assert.equal(told(second, 'FAILED-FIRST-TIME'), 0, 'the second isn\'t');
+    assert.equal(interruptedNotices(second), 1, 'the recipient is told of the interruption');
+    const third = await process(new GateModule());
+    assert.equal(told(third, 'FAILED-FIRST-TIME'), 1, 'the next boot passes the second');
+    assert.equal(told(third, 'PASSED-FIRST-TIME'), 1, 'and not the first again');
+    assert.equal(interruptedNotices(third), 1, 'nor tells the recipient again');
+    const fourth = await process(new GateModule());
+    assert.equal(told(fourth, 'FAILED-FIRST-TIME'), 1, 'and the boot after passes nothing more');
+  });
+
+  it('a notice declined for the primary settles the job, and no later boot tries it again', async () => {
+    const declined = 'has ended, and its reply had no channel to reach: no one else is told';
+    await jobWithUnreadWrites([{ text: 'A REPLY THAT FAILED', direct: { kind: 'discord-send-failed', channelId: '' } }]);
+    const { framework: second, logged: atSecond } = await quietBoot();
+    assert.equal(atSecond.filter((line) => line.includes(declined)).length, 1, 'the boot declines the notice, logging it');
+    assert.equal(told(second, 'A REPLY THAT FAILED'), 0, 'the primary isn\'t told');
+    const { logged: atThird } = await quietBoot();
+    assert.equal(atThird.filter((line) => line.includes(declined)).length, 0, 'the next boot doesn\'t try it again');
   });
 });
