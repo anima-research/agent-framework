@@ -369,8 +369,6 @@ describe('Turn trigger provenance', () => {
     const timer = setTimeout(() => {}, 60_000);
     try {
       i.providerAccelerationCooldowns.set('scout', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'test hold', failures: 1 });
-      // The silent push's channels stand for those a quiesce's park writes
-      // onto a silent push that absorbed a plain one.
       const push = (channelId: string, silent: boolean) => ({
         agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp: now, addressed: false,
         ...(silent ? { suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } } : {}),
