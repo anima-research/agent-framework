@@ -464,7 +464,9 @@ export interface AgentConfig {
    * (none when left out). Residents share one slot, and each is shown only
    * its own rows and the rows meant for it: another resident's rounds,
    * replies, tool results and notes stay out of its window (#291, decision
-   * 1). A name here is an observe edge in this agent's registry record, on
+   * 1; rows an earlier release stored carry no stamp and stay in the window
+   * written down from the record: 291-presentation-mandatory). A name here
+   * is an observe edge in this agent's registry record, on
    * that agent (`{ agent: name }`, the path the subconscious's edge takes),
    * and the presentation index presents that agent's own rows to this one
    * at its points, as it does any arrival (bearingOf); the history tools

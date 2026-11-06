@@ -457,7 +457,9 @@ export interface ModuleContext {
    * primary's window. The row is stamped (`metadata.audience`, #291) for
    * the agent named, or, with no agent named, for the agents that take
    * untargeted inbound in the slot it lands in: every resident on a
-   * residents' host.
+   * residents' host. A row a suppress rule took is stamped for nobody, and
+   * one carrying a tune-out's hold for nobody but a named agent whose view
+   * keeps held traffic (the persistent subconscious).
    */
   addMessage(
     participant: string,
