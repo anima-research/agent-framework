@@ -12993,14 +12993,24 @@ export class AgentFramework {
           && passesToPrimary(m.metadata)
           && bearingOf(m, reader, 'own') !== 'elsewhere'
           && opened.windowStatusOf(m.id) === 'out');
+        // A notice kept in memory (`held`) isn't stored yet, and a stop or a
+        // crash before its hold's release loses it: its record stays
+        // interrupted as for a failed write, and a later boot passes it
+        // unless the release stored it, which rowsPassedOn then finds.
         let failed = 0;
+        let held = 0;
         for (const { id, metadata, ...written } of notices) {
-          if (this.passNoticeToPrimary(record.name, metadata, written, { from, row: id }) === 'failed') failed++;
+          const outcome = this.passNoticeToPrimary(record.name, metadata, written, { from, row: id });
+          if (outcome === 'failed') failed++;
+          else if (outcome === 'held') held++;
         }
         if (failed > 0) {
-          unpassed.push(record);
           console.error(`[route-failure] ${record.name}: ${failed} of the notices the primary would take couldn't be written; its record stays interrupted, and the next boot passes them again`);
         }
+        if (held > 0) {
+          console.error(`[route-failure] ${record.name}: ${held} of the notices the primary would take ${held === 1 ? 'was' : 'were'} kept in memory, not stored; its record stays interrupted, and the next boot passes ${held === 1 ? 'it' : 'them'} again unless the hold's release stores ${held === 1 ? 'it' : 'them'} first`);
+        }
+        if (failed > 0 || held > 0) unpassed.push(record);
       } catch (err) {
         unpassed.push(record);
         console.error(`[route-failure] ${record.name}: could not read the context the restart interrupted, or pass on the notices the primary would take; its record stays interrupted, and the next boot passes those not yet passed:`, err);
@@ -16510,8 +16520,10 @@ export class AgentFramework {
     let passed = 0;
     const lost: SurgeryHeldWrite[] = [];
     for (const write of writes) {
-      if (passesToPrimary(write.metadata)
-        && this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content }) === 'passed') {
+      const outcome = passesToPrimary(write.metadata)
+        ? this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content })
+        : undefined;
+      if (outcome === 'passed' || outcome === 'held') {
         passed++;
       } else {
         lost.push(write);
@@ -33940,24 +33952,28 @@ export class AgentFramework {
    * which must complete whatever this write meets. Building the notice isn't
    * guarded, so a throw there, as a store read for a channel notice's words
    * can make at boot, reaches the caller. Whether the primary was told:
-   * `declined` when no one is, `failed` when the write failed, each logged.
-   * `passedOn`, the record and row a boot passes on
-   * (passOnInterruptedNotices), is stamped on the notice, so a later boot
-   * finds it passed.
+   * `declined` when no one is, `failed` when the write failed, each logged;
+   * `held` when the write was kept in memory, not stored (a surgery's hold,
+   * or the receiving agent's manager refusing its work), which stores it at
+   * the hold's release, and loses it to a stop or a crash before then: the
+   * empty id addMessage answers for a write it keeps, and, for a write that
+   * names no agent, as this one, for nothing else. `passedOn`, the record
+   * and row a boot passes on (passOnInterruptedNotices), is stamped on the
+   * notice, so a later boot finds it passed.
    */
   private passNoticeToPrimary(
     speaker: string,
     metadata: MessageMetadata | undefined,
     written?: { participant: string; content: ContentBlock[] },
     passedOn?: { from: string; row: MessageId },
-  ): 'passed' | 'declined' | 'failed' {
+  ): 'passed' | 'held' | 'declined' | 'failed' {
     const notice = this.noticeForPrimary(speaker, metadata, written);
     if (!notice) return 'declined';
     try {
-      this.addMessage(notice.participant, notice.content,
+      const id = this.addMessage(notice.participant, notice.content,
         passedOn ? { ...notice.metadata, passedOn } as MessageMetadata : notice.metadata,
         this.primaryAgentName ? { audience: [this.primaryAgentName] } : undefined);
-      return 'passed';
+      return id === '' ? 'held' : 'passed';
     } catch (err) {
       console.error(`[route-failure] failed to tell the primary ${notice.about}:`, err);
       return 'failed';
