@@ -1,7 +1,9 @@
 /**
  * The one-release importer (#291, AF-6): a store a release before #291 left
  * with writes still in its deferred queue boots, stores each of them once,
- * in the order they arrived, and clears the queue's record. A second boot
+ * in the order they arrived (a gone agent's are passed on or dropped,
+ * logged; one whose landing can't be checked is kept, with what follows it
+ * for that agent, for the next boot), and clears the queue's record. A second boot
  * imports nothing. Each case here writes the record by hand, as such a
  * release left it (recovery/deferred-writes.json, or the store's
  * framework/deferred-writes slot), since this release keeps no queue to
@@ -271,7 +273,9 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       queryMessages(...args: unknown[]): unknown;
       getMessageWindow(offset: number, limit: number, opts?: { resolveBlobs?: boolean }): Window;
     };
-    async function bootWithLookupFailing(h: Host, short: boolean): Promise<AgentFramework> {
+    /** `short`: the blob-free scan comes back a row short; `'unreadable'`: it
+     *  finds the row, and the read of that row with its blobs throws. */
+    async function bootWithLookupFailing(h: Host, short: boolean | 'unreadable'): Promise<AgentFramework> {
       const proto = AgentFramework.prototype as unknown as { landedCopiesById(agent: { getContextManager(): unknown }, id: string): unknown };
       const original = proto.landedCopiesById;
       proto.landedCopiesById = function (agent, id) {
@@ -279,7 +283,12 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         const query = cm.queryMessages;
         const read = cm.getMessageWindow;
         cm.queryMessages = () => { throw new Error('Blob not found: 0123'); };
-        if (short) {
+        if (short === 'unreadable') {
+          cm.getMessageWindow = function (this: unknown, offset, limit, opts) {
+            if (opts?.resolveBlobs === false) return read.call(this, offset, limit, opts);
+            throw new Error('Blob not found: 4567');
+          };
+        } else if (short) {
           cm.getMessageWindow = function (this: unknown, offset, limit, opts) {
             const window = read.call(this, offset, limit, opts);
             return opts?.resolveBlobs === false ? { ...window, messages: window.messages.slice(1) } : window;
@@ -343,6 +352,35 @@ describe('the deferred-write importer (#291, AF-6)', () => {
         framework = await h.boot();
         try {
           assert.equal(withText(framework, 'found earlier').length, 1, 'once, when the next boot can search');
+          assert.equal(withText(framework, 'behind it').length, 1);
+          assert.deepEqual(h.readQueue().pending, []);
+        } finally { await framework.stop(); }
+      } finally { h.close(); }
+    });
+
+    it("whose blob-free scan finds it but whose stored copy can't be read, is kept with what follows it for the next boot, and not stored again", async () => {
+      const h = await host();
+      try {
+        const count = await storedEarlier(h);
+        h.writeQueue([
+          entry('u1', 1, 'found earlier', { landing: 'unknown' }),
+          entry('u2', 2, 'behind it'),
+        ], { agent: count });
+        const errors: string[] = [];
+        const quiet = console.error;
+        console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+        let framework: AgentFramework;
+        try { framework = await bootWithLookupFailing(h, 'unreadable'); } finally { console.error = quiet; }
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'not taken as absent and stored again');
+          assert.equal(withText(framework, 'behind it').length, 0, 'held behind it');
+          assert.deepEqual(h.readQueue().pending.map((m) => m.id), ['u1', 'u2'], 'left for the next boot, in order');
+          assert.ok(errors.some((e) => e.includes("found deferred write u1 in agent's store, but could not read its stored copy")
+            && e.includes('Blob not found: 4567')), errors.join('\n'));
+        } finally { await framework.stop(); }
+        framework = await h.boot();
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'once, when the next boot can read it');
           assert.equal(withText(framework, 'behind it').length, 1);
           assert.deepEqual(h.readQueue().pending, []);
         } finally { await framework.stop(); }

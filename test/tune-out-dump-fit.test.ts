@@ -195,10 +195,12 @@ test('a newest message too long to fit alone is shown cut to the room left and m
   assert.ok(notice!.includes('5 of 6 diverted messages, the oldest,'), 'and the report is told of them');
 });
 
-// Every held message is stored as it arrives (#291), so the subconscious's
-// view holds each whole: no row follows the notice for one the dump shows
-// cut or leaves out. (Before #291 one still queued at the cancel did.)
-test("a newest message shown cut is in the subconscious's view, stored, so no row follows the notice for it", () => {
+// Every held message is stored as it arrives (#291), unless a surgery's hold
+// or a refusing manager keeps it in memory, so no row follows the notice for
+// one the dump shows cut or leaves out. (Before #291 one still queued at the
+// cancel did.) The fake builds no view: that the subconscious's window takes
+// the held rows is presentation.test.ts's.
+test("a newest message shown cut, stored, has no row follow the notice for it", () => {
   const longText = `NEWEST ${'y'.repeat(500)}`;
   const room = lengthShowing(1) + 100;
   const storedCut = cancelWith({ room, stored: [...FIVE, row('Bo', longText)] });
@@ -206,13 +208,13 @@ test("a newest message shown cut is in the subconscious's view, stored, so no ro
   assert.deepEqual(storedCut.held, [], 'and no row follows the notice for it');
 });
 
-test("messages the fit leaves out are in the subconscious's view, stored, and none follows the notice as a row", () => {
+test("messages the fit leaves out, stored, have no row follow the notice for them", () => {
   const four = [row('Ann', `S1 ${'x'.repeat(40)}`), row('Ann', `S2 ${'x'.repeat(40)}`), row('Bo', `H1 ${'x'.repeat(40)}`), row('Bo', `H2 ${'x'.repeat(40)}`)];
   const roomForOne = cancelWith({ backlogCap: 1, stored: four }).dump.length;
   const { dump, notice, held: rows } = cancelWith({ room: roomForOne, stored: four });
   assert.ok(dump.includes('Bo: H2 ') && !dump.includes('H1 ') && !dump.includes('S1 ') && !dump.includes('S2 '), 'only the newest fits');
   assert.ok(notice!.includes("3 of 4 diverted messages, the oldest, weren't delivered raw to the resident."), 'the report is told of the three');
-  assert.deepEqual(rows, [], 'no row follows the notice: its view has them');
+  assert.deepEqual(rows, [], 'no row follows the notice for them');
 });
 
 test('without a per-message cap the dump is not fitted', () => {

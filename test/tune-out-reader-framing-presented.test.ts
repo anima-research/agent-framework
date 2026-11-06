@@ -141,6 +141,7 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", (
     assert.equal(rest.at(-1)!.split('\n')[0], `[Tune-out reader — ${CHANNEL}, epoch ${epochId.slice(0, 8)}, wake]`, 'and last the framing');
     const body = JSON.stringify(forkRequest.messages);
     assert.equal(body.split('AMB-1 chatter').length - 1, 1, 'the held message is in the framing alone, not raw beside it');
+    assert.equal(body.split('ADDR-2 hey scout').length - 1, 1, 'and so is the other one it was handed');
 
     // Once the fork ends it holds nothing.
     await waitFor('the fork ended', () => !framework.getAgent(during!.fork));

@@ -2,9 +2,10 @@
  * What a tune-out's cancel makes of the messages it held. The dump and the
  * subconscious's report notice take the ended epoch's messages only, and the
  * notice counts what the dump left out. Every held message is stored as it
- * arrives (#291), so the subconscious's view holds each of them, its media
- * included, and none follows the notice as a row of its own (before #291 the
- * ones still queued at the cancel did). A cancel the subconscious makes
+ * arrives (#291), unless a surgery's hold or a refusing manager keeps it in
+ * memory, so none follows the notice as a row of its own (before #291 the
+ * ones still queued at the cancel did). The fake here builds no view: that
+ * the subconscious's window takes the held rows is presentation.test.ts's. A cancel the subconscious makes
  * itself gets that notice and a report turn when some of the epoch's messages
  * came in after it last looked (unseenBySubconscious), or when it wrote no
  * note and the dump left anything out. Here the cap does it;
@@ -87,7 +88,7 @@ test("a cancel's dump shows only its own epoch's messages, and its notice tells 
   assert.ok(inferences.includes('Subconscious'), 'and a report turn is requested');
 });
 
-test("the notice counts what the cap leaves out, which the subconscious's view holds stored, media and all", () => {
+test("the notice counts what the cap leaves out, media and all, and hands on no row of its own", () => {
   const { dump, notice } = cancelWith({
     backlogCap: 0,
     source: 'agent-tool',
