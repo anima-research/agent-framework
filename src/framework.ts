@@ -15724,7 +15724,17 @@ export class AgentFramework {
   }
 
   /**
-   * The agent's marks (Agent.heldReadMarks) that cover rows of `tail` by
+   * The read marks held for `agent` (heldMarksOf's): its own
+   * (Agent.heldReadMarks), and the marks its running scripts started with
+   * (AgentScripts.readMarksOf), which each script's sends are credited with
+   * having read (publishReadThrough). A redo gives them all again.
+   */
+  private heldMarksOf(agent: Agent): ReadMark[] {
+    return [...new Set([...agent.heldReadMarks(), ...(this.codeExecution?.scripts.readMarksOf(agent.name) ?? [])])];
+  }
+
+  /**
+   * The agent's marks (heldMarksOf: its own and its running scripts') that cover rows of `tail` by
    * their ordinals in its window, read before an undo takes them out, each
    * with the bodies it covers. A mark taken in legacy mode is one of them
    * where it covers such rows: the window is presented (undo refuses one
@@ -15737,7 +15747,7 @@ export class AgentFramework {
   private marksOverTail(agent: Agent, cm: ContextManager, tail: readonly WindowBody[]): RedoEntry['marks'] {
     const marks: RedoEntry['marks'] = [];
     try {
-      for (const mark of agent.heldReadMarks()) {
+      for (const mark of this.heldMarksOf(agent)) {
         const cover = coverTest(mark, cm);
         const covered = new Set(tail.filter((row) => cover(row) === 'covered').map((row) => row.id));
         if (covered.size > 0) marks.push({ mark, covered });
@@ -15871,7 +15881,7 @@ export class AgentFramework {
    */
   private retakeMarks(agent: Agent, cm: ContextManager, entry: RedoEntry, back: readonly MessageId[], below: readonly RedoEntry[]): void {
     try {
-      const held = new Set(agent.heldReadMarks());
+      const held = new Set(this.heldMarksOf(agent));
       const replacements = new Map<ReadMark, ReadMark>();
       for (const { mark, covered } of entry.marks) {
         if (!held.has(mark) || replacements.has(mark)) continue;
@@ -15883,6 +15893,7 @@ export class AgentFramework {
       }
       if (replacements.size === 0) return;
       agent.replaceReadMarks(replacements);
+      this.codeExecution?.scripts.replaceReadMarks(agent.name, replacements);
       for (const older of [...below, entry]) {
         for (const recorded of older.marks) recorded.mark = replacements.get(recorded.mark) ?? recorded.mark;
       }
@@ -23985,25 +23996,30 @@ export class AgentFramework {
    * and the branch as they were and takes the turn's own rows out of the
    * window as undone, so this is where the agent's history no longer holds
    * the write. True for an agent the index doesn't present for, and where
-   * no own row of its came after. Reads the record back from its newest
-   * row, 64 at a time, to that place.
+   * no own row of its came after. A row is its own by the rule an undo
+   * takes it out by (ownWindowRow), so a turn an earlier release stored,
+   * with no stamp, counts by its voice. Reads the record back from its
+   * newest row, 64 at a time, to that place, then weighs the rows after it
+   * in store order.
    */
   private windowHoldsOwnRowsAfter(agentName: string, afterSequence: number): boolean {
     const agent = this.agents.get(agentName);
     if (!agent || !this.presents(agent)) return true;
     const cm = agent.getContextManager();
-    let first: MessageId | undefined;
+    const after: StoredMessage[] = [];
     scan: for (let end = cm.getMessageCount(); end > 0;) {
       const span = Math.min(end, 64);
       const { messages } = cm.getMessageWindow(end - span, span, { resolveBlobs: false });
       for (let i = messages.length - 1; i >= 0; i--) {
         const row = messages[i]!;
         if (row.sequence <= afterSequence) break scan;
-        if (isOwnRowOf(row.metadata, agentName)) first = row.id;
+        after.push(row);
       }
       end -= span;
     }
-    return first === undefined || cm.windowStatusOf(first) !== 'undone';
+    const ownCalls = new Set<string>();
+    const first = after.reverse().find((row) => ownWindowRow(row, agent, ownCalls));
+    return first === undefined || cm.windowStatusOf(first.id) !== 'undone';
   }
 
   /** Let a deregistered agent go from the presentation index (forget), its arrival listener with it. */
