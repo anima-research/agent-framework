@@ -20214,7 +20214,7 @@ export class AgentFramework {
             if (continuesTurn(request)) {
               this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its admitted reply owner ended' });
             }
-            this.emitTrace({ type: 'inference:request_dropped', agentName, reason: 'reply_owner_ended', requestCount: 1 });
+            this.emitTrace({ type: 'inference:request_dropped', agentName, reason: 'reply_owner_ended', requestCount: 1, oldestRequestAge: Math.max(0, Date.now() - request.timestamp) });
           } else runnable.push(request);
         }
         if (this.pendingRequests.some(r => r.agentName === agentName)) {
@@ -24215,7 +24215,7 @@ export class AgentFramework {
         if (trigger && continuesTurn(trigger)) {
           this.endContinuedTurn(agent.name, { kind: 'dropped', why: 'its admitted reply owner ended' });
         }
-        this.emitTrace({ type: 'inference:request_dropped', agentName: agent.name, reason: 'reply_owner_ended', requestCount: 1 });
+        this.emitTrace({ type: 'inference:request_dropped', agentName: agent.name, reason: 'reply_owner_ended', requestCount: 1, oldestRequestAge: Math.max(0, Date.now() - (trigger?.timestamp ?? Date.now())) });
       }
       return;
     }

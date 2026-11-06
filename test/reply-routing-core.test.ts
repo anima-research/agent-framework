@@ -4,7 +4,7 @@ import { RequiredAdmission } from '../src/mcpl/inbound-admission.js';
 import { withReplyConsumer, admissionRoutingFields } from '../src/mcpl/reply-admission.js';
 import { replyConsumer, isReplyBinding, replyBindingCurrent, sameDestination, turnReply, shareReplyTurn, replyWork, type ReplyBinding, type ReplyAuthorityConfig } from '../src/mcpl/reply-routing.js';
 import { serverConfigProblems } from '../src/mcpl/protocol-family.js';
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplServerConnection, frameworkAdmissionConfig } from '../src/mcpl/server-connection.js';
 
 function fixture(overrides: Partial<ReplyAuthorityConfig> = {}, mayWake = true) {
   const admission = new RequiredAdmission({ timeoutMs: 1000, bind: connection => ({ connection, admit: () => ({ store: true, mayWake, replyIntent: 'private' }) }), isReplyIntent: () => true }, 'endpoint:a/β');
@@ -110,9 +110,9 @@ test('core: reconnect retains the snapshotted host authority', async () => {
   let connection: McplServerConnection | undefined;
   try {
     const profile = { timeoutMs: 100, resolve: () => ({ channelId: 'room' }), authorize: () => true };
-    connection = await McplServerConnection.connectWithReconnect({ id: 'endpoint', command: 'peer', reconnect: true,
+    connection = await McplServerConnection.connectWithReconnect(frameworkAdmissionConfig({ id: 'endpoint', command: 'peer', reconnect: true,
       inboundAdmission: { timeoutMs: 1000, bind: connection => ({ connection, admit: () => ({ store: true, mayWake: true }) }), isReplyIntent: () => true }, replyAuthority: profile,
-    }, { version: '0.5' });
+    }), { version: '0.5' });
     profile.authorize = () => false; profile.timeoutMs = 1;
     assert.equal((connection as any).config.replyAuthority.timeoutMs, 100);
     assert.equal((connection as any).config.replyAuthority.authorize(), true);
