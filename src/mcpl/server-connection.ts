@@ -1418,10 +1418,12 @@ export class McplServerConnection extends EventEmitter {
    *  disconnect of its id. */
   private static snapshotReplyConfig(config: McplServerConfig): McplServerConfig {
     if (config.replyAuthority === undefined) return config;
-    return {
+    // Framework-only admission wrappers inherit host fields; keep that chain
+    // while snapshotting own fields and the optional reply authority.
+    return Object.assign(Object.create(config), {
       ...config,
       ...(config.replyAuthority ? { replyAuthority: Object.freeze({ ...config.replyAuthority }) } : {}),
-    };
+    });
   }
 
   private static async connectChecked(
