@@ -10373,9 +10373,11 @@ export class AgentFramework {
    * mail named its recipient counts for an agent its audience names, so a
    * slot's observer isn't woken for a resident's mail. Mail whose sender
    * asked for no wake (sendAgentMessage's `wake: false`, recorded on the row
-   * as `dendrite.wake: false`) asks for none, as main's queued mail asked
-   * none; reconcile's redelivery of held mail doesn't ask, as the registry
-   * doesn't record it.
+   * as `dendrite.wake: false`) asks for none; reconcile's redelivery of held
+   * mail doesn't ask, as the registry doesn't record it. Mail an earlier
+   * release left queued records no such ask (that release didn't queue
+   * it), so it is woken for whatever its sender asked, where main asked no
+   * boot wake for any queued mail.
    * Mail in the window already was presented at rest, or sent in a request
    * of the turn's (at its tool boundary), its wake run or lost as before
    * #291, and asks for none; nor does a wake with the same reason already
