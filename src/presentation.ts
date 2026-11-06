@@ -1285,17 +1285,26 @@ export class AgentPresentation {
     return owed.sort((a, b) => a.sequence - b.sequence).map((row) => row.id);
   }
 
-  /** Keep, of the own rows presentOwn tried, those still out of the window, for its next call; forget the rest. */
+  /**
+   * Keep, of the own rows presentOwn tried, those still out of the window,
+   * for its next call; forget the rest. Rows kept meanwhile that this call
+   * didn't try stay kept: a listener of its presentation, which runs
+   * inside it, may have stored an own row whose presentation failed, kept
+   * by that nested call.
+   */
   private keepFailedOwn(agent: PresentedAgent, tried: readonly MessageId[]): void {
     const cm = agent.getContextManager();
+    const triedHere = new Set(tried);
+    const keptMeanwhile = [...(this.failedOwn.get(cm) ?? [])].filter((id) => !triedHere.has(id));
+    let keep: MessageId[];
     try {
-      const left = tried.filter((id) => cm.ordinalOf(id) === undefined);
-      if (left.length > 0) this.failedOwn.set(cm, new Set(left));
-      else this.failedOwn.delete(cm);
+      keep = [...tried, ...keptMeanwhile].filter((id) => cm.ordinalOf(id) === undefined);
     } catch {
       // A window that can't be read now: keep every row tried.
-      if (tried.length > 0) this.failedOwn.set(cm, new Set(tried));
+      keep = [...tried, ...keptMeanwhile];
     }
+    if (keep.length > 0) this.failedOwn.set(cm, new Set(keep));
+    else this.failedOwn.delete(cm);
   }
 
   /** presentAtEnd under a named occasion; a rollback's held arrivals wait (holdUntilStart), and so do all of an agent's the boot left out (restWithheld). */

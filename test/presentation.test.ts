@@ -1226,6 +1226,29 @@ describe('the presentation module at the point after one that failed', () => {
     assert.deepEqual(ofType(r.traces, 'presentation:failed'), [], 'neither is a failure: the store took both');
   });
 
+  // AF #844 bot review 4, finding 26: a listener of an own row's
+  // presentation that stores an own row of its own, whose presentation
+  // fails, has that row kept; the outer write, back from its listeners,
+  // keeps it too rather than replacing what is kept with what it tried. So
+  // the listener's row enters ahead of the next own row.
+  it("an own row a listener stores, whose presentation fails, stays kept after the write whose listener stored it, and enters ahead of the next own row", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('oren');
+    let nested: MessageId | undefined;
+    r.presentation.onPresented('oren', () => {
+      if (nested !== undefined) return;
+      failNextPresent(r.oren.cm);
+      nested = quietly(() => storeOwnRow(r.oren, 'oren', text('B')));
+    });
+    const first = quietly(() => storeOwnRow(r.oren, 'oren', text('A')));
+    assert.ok(nested, "setup: A's presentation was heard, and its listener stored B");
+    assert.deepEqual([r.oren.has(first), r.oren.has(nested)], [true, false], 'setup: A entered, and B missed its write');
+    const third = storeOwnRow(r.oren, 'oren', text('C'));
+    assert.deepEqual([r.oren.has(nested), r.oren.has(third)], [true, true], 'B enters with C');
+    assert.deepEqual(r.oren.window().slice(-3), ['A', 'B', 'C'], 'B ahead of C, as the record has them');
+  });
+
   // AF #844 bot review 3, finding 46.
   it("an own row kept after a failed write still enters ahead of the next own row when a fresh start throws at its retraction", async () => {
     const r = await rig();
