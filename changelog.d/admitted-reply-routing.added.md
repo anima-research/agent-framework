@@ -19,3 +19,6 @@
   batches preserve their wake/context but prohibit automatic reply as a whole.
 - Reply deadlines check elapsed monotonic time; timeout/overload diagnostics share
   the bounded failure window. Admission setup errors identify their server.
+
+- Pin reply authority separately from the original transport configuration,
+  preserving its identity and dial-token redaction, including reconnecting stubs.

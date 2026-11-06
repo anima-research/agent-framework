@@ -36008,9 +36008,9 @@ export class AgentFramework {
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection, config: McplServerConfig): void {
-    if (config.replyAuthority) {
+    if (connection.replyAuthority) {
       const registrations = new WeakMap<object, object>();
-      connection.postAdmissionConsumer = replyConsumer(config.replyAuthority, (key, target) => {
+      connection.postAdmissionConsumer = replyConsumer(connection.replyAuthority, (key, target) => {
         const descriptor = this.channelRegistry?.getDescriptor(target);
         if (!descriptor || this.mcplServerRegistry?.getServer(connection.id) !== connection ||
           connection.requiredAdmission?.isCurrent(key) !== true || !connection.grant.has('channels.publish')) return false;

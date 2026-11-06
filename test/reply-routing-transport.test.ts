@@ -696,3 +696,59 @@ test('#8 framework setup error names the failing server among configured peers',
   await assert.rejects(wire({ inboundAdmission: { ...base, bind: (key: any) => key.connectionId === 'endpoint-b' ? undefined : base.bind(key) } }),
     error => /admission_missing/.test(String(error)) && /endpoint-b/.test(String(error)));
 });
+
+for (const lane of ['push/event', 'channels/incoming'] as const) test(`replay integration: ${lane} keeps frozen reply authority and acknowledges before modules`, async t => {
+  const order: string[] = [];
+  const bindings: Array<ReturnType<typeof workOf>[number]> = [];
+  let resolves = 0;
+  const approve = () => true;
+  // Inherited readers must survive without wrapping the transport config.
+  const profile = Object.create({ timeoutMs: 1000, authorize: approve,
+    resolve: () => { resolves++; return { channelId: 'chat' }; } });
+  const token = 'synthetic-replay-provider-token';
+  const spy = { name: 'spy', async start() {}, async stop() {}, getTools: () => [],
+    async handleToolCall() { return { success: true, content: [] }; }, async onProcess(e: any) {
+    if (['mcpl:push-event', 'mcpl:channel-incoming'].includes(e.type)) {
+      order.push('module'); bindings.push(...workOf(e));
+    }
+    return {};
+  } };
+  const x = await coalescingFixture({ server: {
+    inboundAdmission: admission(), replyAuthority: profile,
+    accessProvider: () => {
+      profile.authorize = () => false; profile.timeoutMs = 1;
+      return token;
+    },
+  }, framework: { modules: [spy] } });
+  t.after(x.close); await x.register();
+  const f = x.framework as any;
+  const connection = f.mcplServerRegistry.getServer('editor');
+  assert.equal(connection.config, f.mcplServerConfigs.get('editor'));
+  assert(Object.isFrozen(connection.replyAuthority));
+  assert.equal(connection.replyAuthority.authorize, approve);
+  assert.equal(connection.replyAuthority.timeoutMs, 1000);
+  const traces: any[] = []; x.framework.onTrace(e => traces.push(e));
+  connection.emit('orphaned-response', { id: 123, method: 'tools/call', hadState: false, hadCheckpoint: false,
+    error: { code: -32000, message: `quoted ${token}` } });
+  const record = traces.find(e => e.type === 'mcpl:orphaned-response');
+  assert(record?.error.includes('quoted'));
+  assert(!JSON.stringify(record).includes(token));
+  const respond = connection.sendResponse.bind(connection);
+  connection.sendResponse = (...args: any[]) => { const sent = respond(...args); order.push('ack'); return sent; };
+  const item = lane === 'push/event' ? x.params('one', 'body', { initial: true }) : x.channel('one', 'body', { initial: true });
+  const params = lane === 'push/event' ? item : { messages: [item] };
+  const response = await x.send(lane, params);
+  assert.equal((response.result.results?.[0] ?? response.result).accepted, true);
+  await eventually(() => order.includes('module'));
+  assert.deepEqual(order, ['ack', 'module']);
+  assert.equal(bindings.length, 1);
+  assert.deepEqual(bindings[0].destination, { serverId: 'editor', channelId: 'chat' });
+  assert.equal((await f.channelRegistry.routeSpeech('agent', 'answer', bindings[0].destination, bindings[0]))?.delivered, true);
+  assert.equal(x.published.length, 1);
+  assert.equal(x.published[0].channelId, 'chat');
+  await x.send(lane, params);
+  await eventually(() => f.requiredModuleQueues.size === 0);
+  assert.equal(resolves, 1, 'receipt replay neither resolves reply authority nor dispatches modules again');
+  assert.deepEqual(order, ['ack', 'module', 'ack']);
+  assert(!/routing|replyIntent|afterResponse/.test(JSON.stringify(response)));
+});

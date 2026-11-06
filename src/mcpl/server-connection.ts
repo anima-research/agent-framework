@@ -1,3 +1,4 @@
+import type { ReplyAuthorityConfig } from './reply-routing.js';
 import { withReplyConsumer, type PostAdmissionConsumer } from './reply-admission.js';
 import { AdmissionRefusals, RequiredAdmission, AdmissionConnectError, type RequiredIngress, type RefusalCode } from './inbound-admission.js';
 /**
@@ -519,6 +520,8 @@ export class McplServerConnection extends EventEmitter {
   private readonly admissionEpochs = new WeakMap<object, number>();
   /** Installed by the framework before the ready planes open. */
   postAdmissionConsumer?: PostAdmissionConsumer;
+  /** Pinned independently: transport/redaction must retain the caller config identity. */
+  replyAuthority?: ReplyAuthorityConfig;
   requiresReplyBinding = false;
   private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
 
@@ -1409,29 +1412,24 @@ export class McplServerConnection extends EventEmitter {
   ): Promise<McplServerConnection> {
     McplServerConnection.checkConfig(config);
     requireFrameworkAdmission(config, admissionCapability);
-    return McplServerConnection.connectChecked(config, hostCapabilities, signal);
+    return McplServerConnection.connectChecked(config, hostCapabilities, signal, McplServerConnection.snapshotReplyAuthority(config));
   }
 
-  /** {@link connect}, for a configuration its caller has already checked
-   *  (and warned about) once. `signal` ends the connect at once, its launch
-   *  reaped as for any failed handshake: its caller's stop() or a
-   *  disconnect of its id. */
-  private static snapshotReplyConfig(config: McplServerConfig): McplServerConfig {
-    if (config.replyAuthority === undefined) return config;
-    // Framework-only admission wrappers inherit host fields; keep that chain
-    // while snapshotting own fields and the optional reply authority.
-    return Object.assign(Object.create(config), {
-      ...config,
-      ...(config.replyAuthority ? { replyAuthority: Object.freeze({ ...config.replyAuthority }) } : {}),
+  private static snapshotReplyAuthority(config: McplServerConfig): ReplyAuthorityConfig | undefined {
+    const authority = config.replyAuthority;
+    return authority === undefined ? undefined : Object.freeze({
+      timeoutMs: authority.timeoutMs, resolve: authority.resolve, authorize: authority.authorize,
     });
   }
 
+  /** {@link connect}, for a configuration its caller has already checked
+   * (and warned about) once, with reply authority pinned before any I/O. */
   private static async connectChecked(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    replyAuthority: ReplyAuthorityConfig | undefined,
   ): Promise<McplServerConnection> {
-    config = McplServerConnection.snapshotReplyConfig(config);
     const admission = config.inboundAdmission === undefined ? undefined : new RequiredAdmission(config.inboundAdmission, config.id);
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
@@ -1440,14 +1438,15 @@ export class McplServerConnection extends EventEmitter {
       if (!(error instanceof HandshakeCleanupError)) throw error;
       // The launch may still be running. A connection owns it, closed and
       // halted, so the caller can retry the reap by closing it.
-      const owner = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
+      const owner = McplServerConnection.createDisconnectedStub(config, hostCapabilities, replyAuthority);
       owner.holdUnreaped(error.transport, error.cleanup);
       throw new McplUnreapedLaunchError(owner, error.failure, error.cleanup);
     }
     const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
 
     const connection = new McplServerConnection(config.id, capabilities, transport, admission);
-    connection.requiresReplyBinding = config.replyAuthority !== undefined;
+    connection.replyAuthority = replyAuthority;
+    connection.requiresReplyBinding = replyAuthority !== undefined;
     connection.toolsetDeclarations = toolsetDeclarations;
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
@@ -1771,9 +1770,9 @@ export class McplServerConnection extends EventEmitter {
     // Outside the retry path below: a configuration error is never retried.
     McplServerConnection.checkConfig(config);
     requireFrameworkAdmission(config, admissionCapability);
-    config = McplServerConnection.snapshotReplyConfig(config);
+    const replyAuthority = McplServerConnection.snapshotReplyAuthority(config);
     try {
-      return await McplServerConnection.connectChecked(config, hostCapabilities, signal);
+      return await McplServerConnection.connectChecked(config, hostCapabilities, signal, replyAuthority);
     } catch (error) {
       // No common protocol revision is a configuration fact, not an outage:
       // a retry stub would restart the server forever for nothing. A connect
@@ -1788,7 +1787,7 @@ export class McplServerConnection extends EventEmitter {
       // not lost in the window before wireMcplEvents runs.
       // Non-blocking start: create a disconnected stub that will reconnect in background
       console.error(`MCPL server "${config.id}" initial connect failed, will retry: ${redactServerText((error as Error).message, config)}${withStderr(error, (text) => redactServerText(text, config))}`);
-      const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
+      const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities, replyAuthority);
       const stderrTail = stderrTailOf(error);
       stub.emit('connect-failed', { error: (error as Error).message, ...(stderrTail ? { stderrTail } : {}), attempt: 0 });
       stub.scheduleReconnect();
@@ -1805,13 +1804,15 @@ export class McplServerConnection extends EventEmitter {
   private static createDisconnectedStub(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    replyAuthority: ReplyAuthorityConfig | undefined,
   ): McplServerConnection {
     // Null transport — the stub is closed until its first background reconnect.
     const stub = new McplServerConnection(config.id, null, null, config.inboundAdmission === undefined ? undefined : new RequiredAdmission(config.inboundAdmission, config.id));
     stub.closed = true;
     stub.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     stub.config = config;
-    stub.requiresReplyBinding = config.replyAuthority !== undefined;
+    stub.replyAuthority = replyAuthority;
+    stub.requiresReplyBinding = replyAuthority !== undefined;
     stub.hostCapabilities = hostCapabilities;
     stub.reconnectEnabled = config.reconnect === true;
     stub.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;

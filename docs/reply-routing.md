@@ -29,6 +29,10 @@ from the original connection key and freezes the destination. Channels may
 represent registered thread channels; there is no new thread field, transport
 profile, capability negotiation or initialize extension in this feature.
 Opaque `replyIntent`, metadata, prose and persisted rows cannot mint authority.
+The reply callbacks and deadline are snapshotted once before the initial dial or
+spawn, including for a reconnecting stub. This separate snapshot does not wrap or
+replace the transport configuration: its identity and credential-redaction state
+remain shared with the framework.
 
 Required inbound admission completes first, under its unchanged timeout,
 cancellation and pending-slot rules. Only after a fully validated store-and-wake verdict does
