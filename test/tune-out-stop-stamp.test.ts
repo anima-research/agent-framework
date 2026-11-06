@@ -769,6 +769,7 @@ test('pin: told that its cancel ran, a boot that finds less (nothing in its run)
     const e = h.hold();
     h.release(e, 'subconscious', 'by Subconscious');
     h.boot();
+    assert.equal(h.unrecorded().length, 1, 'premise: the second boot told that its cancel ran (review 4 #39)');
     h.boot();
     assert.equal(h.unrecorded().length, 1);
   } finally { h.stopAll(); }
@@ -1595,6 +1596,8 @@ test("review 3 #8: the kept notice a quiesced boot writes, not in the subconscio
       h.refuse.add(STAMP);
       h.boot();
       assert.equal(h.subRows.length, 0, `${refusal.name}: premise: the notice was kept in the store, not written`);
+      assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1,
+        `${refusal.name}: premise: the second boot kept it in the store (review 4 #39)`);
       h.state.frozen = true;
       refusal.off(h);
       h.boot();
@@ -1620,6 +1623,8 @@ test("review 3 #64: a notice written whose record the store then refuses isn't w
       h.state.frozen = frozen;
       h.boot();
       h.refuse.delete(LOSS_RECORD);
+      assert.equal(h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length, 1,
+        'premise: the boot that dies wrote the notice (review 4 #39)');
       assert.equal((h.states.get(LOSS_RECORD) as { pendingLossNotices: unknown[] }).pendingLossNotices.length, 1, 'premise: the record still keeps it');
       h.boot();
       assert.equal(h.subRows.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered').length, 1,
