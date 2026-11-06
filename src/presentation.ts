@@ -6,8 +6,10 @@
  * window is another order over the same rows: the rows presented to it, in
  * the order its requests carry them (context-manager's window index,
  * `presentRows`; a row presented at rest is in the window before a request
- * has carried it). While one agent writes one slot the two orders are the
- * same. Once agents share a slot, or one reads another's, they differ: a row
+ * has carried it). While one agent writes one slot, and nothing else writes
+ * it during that agent's turns, the two orders are the same. Once others
+ * write it during a turn (another agent sharing the slot, a module), or one
+ * agent reads another's, they differ: a row
  * another agent stored during my turn sits inside my turn in the record, but
  * my requests carried it only at my next tool boundary or turn start, so a
  * compile that sent it where the record has it would change my turn's prefix

@@ -4,7 +4,9 @@
  * leaves out. The framework opens its live agents with these, and opens an
  * ended one's context again with the same view (reopenAgentContext). A host
  * that opens one of these contexts itself, to audit a store say, opens it
- * with them too, so what it reads is what the agent's compiles read:
+ * with them too, so what it reads is what the agent's compiles read (the
+ * requests then send other agents' rounds as a transcript, `foreignRounds`,
+ * which `transcribeForeignRounds` applies to what the context reads):
  * `ContextManager.open({ store, ...subconsciousContextOptions({ serves,
  * name, reAnchorFraction, maxMessageTokens }) })`, with `serves` the
  * primary's name, `name` and `reAnchorFraction` the host's

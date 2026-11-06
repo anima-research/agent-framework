@@ -414,8 +414,8 @@ export class DiscordModule implements Module {
   // manager refusing its work, keeps it in memory, which a restart loses,
   // until the release or the branch move that re-initializes the manager
   // stores it. So the next Discord event once it is stored
-  // finds its row, marked held while the agent hasn't been shown it, and
-  // ends its entry. A history sync stores none of these messages, so no message is
+  // finds its row, marked held while the agent's window doesn't hold it
+  // (asModuleRow), and ends its entry. A history sync stores none of these messages, so no message is
   // stored twice. A delete before the create is handled drops it: nothing is
   // stored and nobody is woken. Any message's entry ends when its delete is
   // handled, since a sync running then skips the message (noteLive) and a
@@ -1232,8 +1232,9 @@ export class DiscordModule implements Module {
   /** The stored rows of a Discord message, by its id in the row's metadata,
    *  in store order. Every write is stored (#291), but for one a surgery's
    *  hold or a context manager refusing its work keeps in memory, which a
-   *  restart loses: a row the agent hasn't
-   *  been shown yet reads `held`, in its place, and an edit or a removal
+   *  restart loses: a row the agent's window doesn't hold yet reads `held`
+   *  (one a tune-out holds reads `heldFromResidents`, whatever its window),
+   *  in its place, and an edit or a removal
    *  reaches it as any other, and every window that holds it. The
    *  module context's findMessageByExternalId holds only rows the module
    *  stored through its context, not those a process response added, so it
