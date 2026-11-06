@@ -17133,14 +17133,22 @@ export class AgentFramework {
       if (kept.length > 0) {
         const n = kept.length;
         const first = kept[0]!;
-        const discordId = (first.metadata as { messageId?: unknown } | undefined)?.messageId;
-        const named = `${String(first.id)}${discordId !== undefined && discordId !== null && discordId !== '' ? `, Discord message ${String(discordId)}` : ''}`;
+        const discordIdOf = (m: StoredMessage): string | undefined => {
+          const id = (m.metadata as { messageId?: unknown } | undefined)?.messageId;
+          return id !== undefined && id !== null && id !== '' ? String(id) : undefined;
+        };
+        const discordId = discordIdOf(first);
+        const named = `${String(first.id)}${discordId !== undefined ? `, Discord message ${discordId}` : ''}`;
+        // The host's hide matches a Discord id, so it is named only where
+        // one of them has one (an API or a module's row has none).
+        const hide = kept.some((m) => discordIdOf(m) !== undefined)
+          ? `, or hide ${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`
+          : '';
         throw new OperatorActionError('invalid',
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
           `so a rollback to it would change nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-          `suppress ${n === 1 ? 'it' : 'them'} (${this.suppressionThrough(agentName, cm, kept)}), or hide ` +
-          `${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`);
+          `suppress ${n === 1 ? 'it' : 'them'} (${this.suppressionThrough(agentName, cm, kept)})${hide}`);
       }
       throw new OperatorActionError('invalid', after > 0
         // Rows follow it in the record, but the cut keeps every one of them,

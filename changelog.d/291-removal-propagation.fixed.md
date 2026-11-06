@@ -26,4 +26,5 @@
   are now exactly the rows stored after the cut, and offline recovery checks the tool pairs of those rows only. A
   rollback that would remove nothing and take nothing out of the window is refused as a no-op, saying why: when its
   target was presented in one write with rows after it, the refusal says so, names the first of them, and points to
-  `suppressMessages`, or the host's `hide` for a Discord message, to take them out.
+  `suppressMessages`, or the host's `hide` for a Discord message, to take them out; it names `hide` only where one
+  of them has a Discord message id.
