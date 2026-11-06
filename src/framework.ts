@@ -10161,7 +10161,9 @@ export class AgentFramework {
           error,
         );
         this.opsAlert('deferred-import', 'framework',
-          `the deferred-write record ${where} could not be written with the ids given to its writes that had none: ${thrownText(error)}`,
+          `the deferred-write record ${where} could not be written with the ids given to its writes that had none, so those ` +
+            `writes, and what follows each for its agent, stay queued for the next boot, which imports them once the record ` +
+            `can be written: ${thrownText(error)}`,
           { data: { record: where } });
       }
     }
@@ -21471,11 +21473,12 @@ export class AgentFramework {
     // whose own slot it is in and those that observe that slot (the
     // registry's readersOf), the subconscious among them for the residents'
     // slot, each one whose own view keeps the message (agentSees, main's
-    // #853). A row in an isolated slot, the subconscious's own included, is
-    // its owner's alone. A tune-out-diverted message never enters a
+    // #853). A row in an isolated slot is read by its owner and by the
+    // agents that observe that slot (readersOf), the subconscious's own slot
+    // included. A tune-out-diverted message never enters a
     // resident's compiled view; only the subconscious reads it through its
-    // merged view (or another observer whose edge shows held traffic) — no
-    // subconscious, nobody reads it. Once windows are presented (#291), an
+    // merged view (or another observer whose edge shows held traffic) — with
+    // no such reader, nobody reads it. Once windows are presented (#291), an
     // agent whose window holds the row reads it too (the presentation
     // index's holders, a reader fork's framing among them, which shows the
     // row its view leaves out), whoever the slot's readers are; an agent the
@@ -22804,7 +22807,8 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: ${destination}, confirmDuplicate: true))`),
     ];
-    // Named: residents that share one message slot (#197) share this window.
+    // Named: residents share one message slot (#197), and an agent that
+    // observes the writer's slot is shown the notice too.
     // "Not sent" only when no copied words may already have been posted.
     return (
       `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
@@ -26523,8 +26527,9 @@ export class AgentFramework {
           // is the one gap in which another turn-alive holder can take the
           // agent (puppetToolCall's reservation, #145). Never replace its
           // token — the re-entry would set ours over it, and a short turn
-          // here ends and flushes before the puppeted tool returns, leaving
-          // its pair queued behind a flush that already happened. Give
+          // here ends before the puppeted tool returns, so the pair is
+          // stored under a turn that isn't the puppet's, kept out of its
+          // window only by puppetToolCall's defensive path. Give
           // admission back and hand the wake to the scheduler, which keeps
           // it queued while the agent is turn-alive and starts it normally
           // once the holder releases.
