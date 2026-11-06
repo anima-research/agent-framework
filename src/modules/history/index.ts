@@ -978,7 +978,7 @@ export class HistoryModule implements Module {
     const forCaller = caller === undefined ? undefined : { forAgent: caller };
     const statuses = new Map<string, WindowStatus | null>();
     // Set once a lookup throws: an agent the framework no longer knows. Its
-    // rows carry no mark, and its window is taken as holding nothing.
+    // window is taken as holding nothing, so each row is marked not shown.
     let unknown = false;
     const statusOf = (msg: StoredMessage): WindowStatus | null => {
       if (unknown) return null;
@@ -1040,6 +1040,7 @@ export class HistoryModule implements Module {
     return {
       mark: (msg) => {
         const status = statusOf(msg);
+        if (unknown) return 'not-shown';
         if (status === 'undone') return 'undone';
         if (status === 'out' || status === 'absent') return 'not-shown';
         return status === 'in' && !keeps(msg) ? 'not-shown' : undefined;
