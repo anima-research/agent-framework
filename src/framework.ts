@@ -39241,6 +39241,7 @@ export class AgentFramework {
           this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined),
         unseenBySubconscious: (keep) => this.unseenBySubconscious(keep),
         subconsciousWindow: () => this.subconsciousWindow(),
+        subconsciousStoredMessages: () => (this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName)?.getContextManager().getAllMessages() : undefined) ?? [],
         subconsciousGuardedResults: () => this.subconsciousGuardedResults(),
         isForkBound: (channel) =>
           this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),

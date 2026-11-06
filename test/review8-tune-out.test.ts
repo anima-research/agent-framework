@@ -683,7 +683,8 @@ test("65 follow-up (Isaac-3593, round 3): a loss notice that can't be written is
     const told = h.lossNotices();
     assert.equal(told.length, 1, 'the kept notice is written at the next release');
     assert.equal(told[0]!.forAgent, 'Subconscious');
-    assert.deepEqual(told[0]!.metadata, { system: true, kind: 'tune-out-note-undelivered', channelId: 'disc:guild:a', epochId: a });
+    assert.deepEqual(told[0]!.metadata, { system: true, kind: 'tune-out-note-undelivered', channelId: 'disc:guild:a', epochId: a, lossNoticeId: told[0]!.metadata?.lossNoticeId });
+    assert.equal(typeof told[0]!.metadata?.lossNoticeId, 'string', 'the row names the notice it is (review 3, #64)');
     assert.equal(textOf(told[0]!.content),
       '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. Your cancel ended '
       + 'that tune-out when it ran, and delivering the note then failed: the store refused the row (test).]');
@@ -941,7 +942,8 @@ test("65 follow-up (Isaac-3593): a queued cancel whose hold ended without it tel
     const told = h.lossNotices();
     assert.equal(told.length, 1);
     assert.equal(told[0]!.forAgent, 'Subconscious');
-    assert.deepEqual(told[0]!.metadata, { system: true, kind: 'tune-out-note-undelivered', channelId: 'disc:guild:a', epochId: a });
+    assert.deepEqual(told[0]!.metadata, { system: true, kind: 'tune-out-note-undelivered', channelId: 'disc:guild:a', epochId: a, lossNoticeId: told[0]!.metadata?.lossNoticeId });
+    assert.equal(typeof told[0]!.metadata?.lossNoticeId, 'string', 'the row names the notice it is (review 3, #64)');
     assert.equal(textOf(told[0]!.content),
       '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. That tune-out ended '
       + 'without your cancel while it waited, so your cancel was dropped, and the note with it. A later tune-out of '
@@ -1269,6 +1271,8 @@ for (const ended of [false, true]) test(`65 follow-up (Ivy-3594, round 8): a sto
       id: 'string', author: 'Subconscious', what: 'disc:guild:a (by Subconscious)',
       for: { epochId: a, serverId: 'disc', channelId: 'disc:guild:a' },
       drop: { reason: ended ? 'hold-ended' : 'stopped' }, keptAtMs: 'number',
+      // The stamp's bound this stop wrote, which the notice's row carries (review 3, #65): no boot ran, so none.
+      ...(ended ? {} : { stopBound: {} }),
     }, 'but keeps the loss in the store, naming the author, the hold and why');
     const kept = errors.mock.calls.map((c) => String(c.arguments[0])).filter((l) => l.includes('stopping:'));
     assert.ok(kept.some((l) => l.includes('Subconscious') && l.includes('kept in the store for the next boot')), kept.join('\n'));
