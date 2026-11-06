@@ -321,8 +321,10 @@ export interface AgentConfig {
    * How the agent's PLAIN PROSE (non-tool output) reaches channels.
    * - 'locus' (default): host-inferred — the turn-frozen locus machinery.
    * - 'explicit': the model prefixes prose with a destination
-   *   (`>>#channel` / `>>@person` / `>>skip_reply`); unprefixed prose is never
-   *   delivered — it bounces to a clipboard for a cheap prefixed resend.
+   *   (`>>#channel` / `>>@person` / `>>skip_reply`); unprefixed prose goes to
+   *   the turn's sticky destination, which a `>>` sets, and otherwise bounces
+   *   to a clipboard for a cheap prefixed resend, except in a private turn,
+   *   which keeps it private with no draft.
    *   See docs/explicit-prose-routing.md.
    * - 'hybrid': unprefixed prose keeps locus routing; `>>>destination` routes
    *   that publication envelope through the same authorized resolver.
@@ -331,7 +333,9 @@ export interface AgentConfig {
    *   send externally; prose remains in Chronicle, and a turn that wrote plain
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    * - 'locked': unprefixed prose goes to one destination the agent chose, on
-   *   every turn, and nothing moves it automatically: not the channel that
+   *   every turn that isn't private (a private turn keeps its plain speech
+   *   private, as in every mode, and the choice applies again after it), and
+   *   nothing moves it automatically: not the channel that
    *   woke the turn, not an addressed message, a heartbeat or channel_open.
    *   Only the `prose_locus` tool moves it, to a channel or to drafts (held,
    *   never posted unless the agent resends them). The choice persists
@@ -627,8 +631,10 @@ export interface InferenceRequest {
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events).
    * A heartbeat's turn takes no channel at all, and holds its plain speech as
-   * drafts; any other falls back to the global default channel, except an
-   * ephemeral run's (a subagent's), which takes no global fallback.
+   * drafts unless private input makes it private; a private one's
+   * (nonChannelOrigin) takes no channel at all; any other falls back to the
+   * global default channel, except an ephemeral run's (a subagent's), which
+   * takes no global fallback.
    */
   channelId?: string;
   /**
@@ -725,4 +731,8 @@ export interface InferenceRequest {
    * request-only separator carrying the tick's instruction before the tick's
    * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
+  /** True when this request is a private surface's (a console, a WebUI, an
+   *  API message naming no channel), or a start the framework judged private.
+   *  A start that takes it in is private, and so is its turn from then on. */
+  nonChannelOrigin?: boolean;
 }

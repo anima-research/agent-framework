@@ -23,6 +23,9 @@ function withStoreDir<T>(fn: (path: string) => Promise<T> | T): Promise<T> {
   return Promise.resolve(fn(join(dir, 'store'))).finally(() => rmSync(dir, { recursive: true, force: true }));
 }
 
+/** An event from this source is stored and wakes nothing. */
+const QUIET_SOURCE = 'zz-quiet';
+
 class InputModule implements Module {
   readonly name = 'input';
   async start(_ctx: ModuleContext): Promise<void> {}
@@ -31,7 +34,10 @@ class InputModule implements Module {
   async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, isError: true, error: 'none' }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
-    return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
+    return {
+      addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }],
+      requestInference: event.source !== QUIET_SOURCE,
+    };
   }
 }
 
@@ -1471,3 +1477,53 @@ test("a merged start that took its token read its wakes: when it fails into a ho
     } finally { await fw.stop(); log.restore(); }
   });
 });
+
+for (const privateTurn of [true, false]) {
+  test(`a held turn's retry ${privateTurn ? "speaks in no channel when an operator's message stored during the hold makes the turn private" : 'speaks as the first turn did when nothing private came during the hold, as on main'}`, async (t) => {
+    await withStoreDir(async (path) => {
+      const clock = holdClock(t);
+      const wait = 400;
+      const log = silence();
+      const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+      const { fw, internal } = await framework(path, membrane);
+      const routed: Array<{ text: string; locus: string | null }> = [];
+      const turns = fw as unknown as {
+        channelRegistry: unknown;
+        turnRouting: Map<string, { triggerChannel?: { serverId: string; channelId: string } }>;
+      };
+      turns.channelRegistry = new Proxy({
+        getChannelTools: () => [],
+        resolveLocus: (agentName: string) => turns.turnRouting.get(agentName)?.triggerChannel ?? { serverId: 'zz', channelId: 'zz:lounge' },
+        routeSpeech: async (_agent: string, text: string, locus: { channelId: string } | null) => {
+          routed.push({ text, locus: locus?.channelId ?? null });
+          return { delivered: true, serverId: 'zz', channelId: locus?.channelId };
+        },
+        getDescriptor: () => undefined,
+        channelsNamed: (id: string) => [{ serverId: 'zz', channelId: id }],
+        nameShown: (r: { channelId: string }) => r.channelId,
+      }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
+      try {
+        const inChannel = (content: string) => ({ type: 'external-message', source: 'test', content, metadata: { channelId: 'zz:room' } }) as ProcessEvent;
+        fw.pushEvent(inChannel('zz-first'));
+        await waitFor(fw, () => membrane.primary >= 1, 'the first turn');
+        await fw.runUntilIdle();
+        fw.pushEvent(inChannel('zz-second'));
+        await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the second turn held');
+        if (privateTurn) {
+          fw.pushEvent({ type: 'external-message', source: QUIET_SOURCE, content: 'zz-operator', metadata: {} });
+          const context = fw.getAgent('resident')!.getContextManager();
+          await waitFor(fw, () => JSON.stringify(context.getAllMessages()).includes('zz-operator'), "the operator's message stored during the hold");
+        }
+        await clock.outlast(wait);
+        clock.pass(wait);
+        await waitFor(fw, () => membrane.primary >= 3, 'the retry after the wait');
+        await fw.runUntilIdle();
+        if (privateTurn) assert.match(texts(membrane.calls[2]!), /zz-operator/, "control: the retry read the operator's message");
+        assert.ok(JSON.stringify(fw.getAgent('resident')!.getContextManager().getAllMessages()).includes('zz-answer-3'), 'control: the retry answered');
+        const first = routed.find((r) => r.text === 'zz-answer-1');
+        assert.ok(first?.locus, `control: the first turn spoke in a channel: ${JSON.stringify(routed)}`);
+        assert.deepEqual(routed.filter((r) => r.text === 'zz-answer-3').map((r) => r.locus), privateTurn ? [] : [first!.locus]);
+      } finally { await fw.stop(); log.restore(); }
+    });
+  });
+}

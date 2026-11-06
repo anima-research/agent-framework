@@ -215,7 +215,7 @@ describe('locked prose routing', () => {
     assert.equal(state.locusCalls, 0, 'a locked turn never asks the registry for a locus');
     const primers = windowTexts(framework).filter((t) => t.startsWith('[prose-routing]'));
     assert.deepEqual(primers, [
-      '[prose-routing] Locked routing: your plain speech goes to discord:g:main, on every turn, until you move it with prose_locus. ' +
+      '[prose-routing] Locked routing: your plain speech goes to discord:g:main, on every turn that holds no private input, until you move it with prose_locus. ' +
         'The channel a message comes from no longer moves it; other channels need an explicit send tool.',
     ]);
     assert.ok(!windowTexts(framework).some((t) => t.startsWith('[routing]')), 'no locus announcements');
@@ -958,5 +958,133 @@ describe('locked prose routing', () => {
     assert.equal(result.success, false);
     assert.match(result.error ?? '', /applies only under locked prose routing/);
     await plain.stop();
+  });
+
+  /** A turn woken from a private surface (a TUI message, which names no channel): it holds private input. */
+  function privateTrigger(framework: AgentFramework): void {
+    framework.pushEvent({ type: 'external-message', source: 'tui', content: 'go', metadata: {} } as unknown as ProcessEvent);
+  }
+
+  /** The channels the framework shows typing in, in order. */
+  function watchTyping(framework: AgentFramework): string[] {
+    const typing: string[] = [];
+    (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry.startTyping =
+      (channel: { channelId: string } | string) => { typing.push(typeof channel === 'string' ? channel : channel.channelId); };
+    return typing;
+  }
+
+  it("a private turn isn't locked: its words reach no channel, it shows no typing, no notice names the lock for it, and channel_publish needs a channel", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Just between us.' },
+      { type: 'tool_use', id: 'cp1', name: 'channel_publish', input: { text: 'hello' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Still between us.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    const typing = watchTyping(framework);
+
+    privateTrigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [], 'nothing reached a channel');
+    assert.deepEqual(typing, [], 'no typing in any channel');
+    assert.ok(toolResultTexts().some((t) => t.includes('This private turn has no default channel')), toolResultTexts().join('\n'));
+    const window = windowTexts(framework);
+    assert.ok(!window.some((t) => t.startsWith('[routing]') && t.includes('discord:g:main')), `no [routing] notice names the lock: ${window.join('\n')}`);
+    assert.ok(window.some((t) => t.includes('plain speech → no channel')), 'its receipt says its speech went to no channel');
+    await framework.stop();
+  });
+
+  it('in a private turn, prose_locus says the turn is private and where a turn that holds none speaks, and a move applies from the next such turn', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'pl1', name: 'prose_locus', input: {} }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'pl2', name: 'prose_locus', input: { to: '#ops' } }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Kept to myself.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    const typing = watchTyping(framework);
+
+    privateTrigger(framework);
+    await framework.runUntilIdle();
+
+    const results = toolResultTexts();
+    assert.ok(results.some((t) => t.includes(
+      'Your plain speech stays private on this turn, which holds private input, and on a turn that holds none it goes to discord:g:main.',
+    )), results.join('\n'));
+    assert.ok(results.some((t) => t.includes(
+      'Your plain speech now goes to discord:g:ops from your next turn that holds no private input, until you change it. ' +
+        'This turn holds private input, so its plain speech stays private.',
+    )), results.join('\n'));
+    assert.deepEqual(routed, [], 'the private turn reached no channel');
+    assert.deepEqual(typing, [], 'and showed typing in none, the moved lock included');
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Back in a channel.' }] as ContentBlock[]));
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'Back in a channel.', locus: 'discord:g:ops' }], 'the next turn that holds none speaks at the moved lock');
+    await framework.stop();
+  });
+
+  it('a locked turn made private mid-way is no longer locked: prose_locus says it is private, a move waits for a turn that holds none, and nothing calls its words drafts', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Starting out.' },
+      { type: 'tool_use', id: 'm1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'pl1', name: 'prose_locus', input: {} }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'pl2', name: 'prose_locus', input: { to: '#ops' } }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'For your eyes only.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    module.interjection = { text: 'a private aside', metadata: {} };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const window = windowTexts(framework);
+    assert.ok(window.some((t) => t.startsWith('[routing] Private input came into this turn')), `premise: the aside made the turn private: ${window.join('\n')}`);
+    const results = toolResultTexts();
+    assert.ok(results.some((t) => t.includes('Your plain speech stays private on this turn, which holds private input')), results.join('\n'));
+    assert.ok(results.some((t) => t.includes('Your plain speech now goes to discord:g:ops from your next turn that holds no private input')), results.join('\n'));
+    assert.ok(![...results, ...window].some((t) => t.includes('held as drafts')), 'nothing calls the private words drafts');
+    assert.deepEqual(routed, [{ text: 'Starting out.', locus: 'discord:g:main' }], 'only the words before the aside reached the lock');
+    await framework.stop();
+  });
+
+  it("channel_open in a private turn moves nothing, and says the turn's plain speech stays private", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'co1', name: 'channel_open', input: { channelId: 'discord:g:ops', serverId: 'stub' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Opened ops, quietly.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.handleChannelToolCall = async () => ({ success: true, data: { channelId: 'discord:g:ops', serverId: 'stub' } });
+
+    privateTrigger(framework);
+    await framework.runUntilIdle();
+
+    assert.ok(toolResultTexts().some((t) => t.includes(
+      'Channel opened for incoming traffic. This turn’s plain speech stays private; use an explicit send tool to publish there.',
+    )), toolResultTexts().join('\n'));
+    assert.deepEqual(routed, [], 'nothing reached a channel');
+    await framework.stop();
+  });
+
+  it('a closed-channel invitation made during a private turn defers to the latest word on where speech lands, naming no lock', async () => {
+    const framework = await createFramework({ proseLock: '#main' });
+    stubChannelRegistry(framework);
+    const internals = framework as unknown as {
+      channelRegistry: Record<string, unknown>;
+      openLogical: Map<string, unknown>;
+      buildClosedChannelInvitation(opts: Record<string, unknown>): { block: { text: string } } | null;
+    };
+    internals.channelRegistry.isChannelOpen = () => false;
+    internals.openLogical.set('assistant', { turnId: 1, nonChannelOrigin: true, wasIn: [], engaged: new Set() });
+    const text = internals.buildClosedChannelInvitation({
+      serverId: 'stub', channelId: 'discord:g:main', messageId: 'm1', authorName: 'Ann', tags: ['chat:addressed'],
+    })!.block.text;
+    assert.match(text, /1\. Reply — your plain speech lands where the latest word on where it lands says: a \[routing\] notice, or channel_open's result\./);
+    assert.ok(!text.includes('your plain speech goes to'), text);
+    internals.openLogical.delete('assistant');
+    await framework.stop();
   });
 });

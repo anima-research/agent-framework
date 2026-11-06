@@ -216,7 +216,8 @@ export interface ToolResult {
    * calls and a script's, sets it: the caller may not use the tool
    * (allowedTools), a `skip_reply` wake was refused, the call's MCPL server is
    * absent or still connecting, the host's policy for that server denies the
-   * tool, or a fork reached outside its channel. RFC-007's lifecycle refuses
+   * tool, a fork reached outside its channel, or a private turn's
+   * `channel_publish` named no channel. RFC-007's lifecycle refuses
    * the call from the same place, so observers see no events for it. The
    * framework also sets it on the result it stores for each call in the last
    * round of a response the output limit cut off: such a call was never

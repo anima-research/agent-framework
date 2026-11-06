@@ -52,6 +52,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   const fw = Object.create(FrameworkClass.prototype) as any;
   fw.consecutiveInferenceFailures = new Map<string, number>();
   fw.inferenceFailureEscalationThreshold = 3;
+  fw.getTurnCheckpoints = () => [];
   fw.exhaustionRewinds = new Map<string, number>();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map<string, object>();

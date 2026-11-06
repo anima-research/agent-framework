@@ -164,6 +164,7 @@ export class AgentRegistry {
       readsSharedSlot: spec.readsSharedSlot ?? false,
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
+      ...(spec.privateTurn ? { privateTurn: true as const } : {}),
       createdAt: previous?.createdAt ?? this.now(),
     };
     const spawner = record.relationships.spawnedBy;
@@ -372,6 +373,14 @@ export class AgentRegistry {
   /** Live agents whose completed work returns to `name`. */
   resultSources(name: AgentName): AgentRecord[] {
     return [...this.live.values()].filter((r) => r.relationships.resultTo?.to === name);
+  }
+
+  /** Record that a live agent is a private turn's work (AgentRecord.privateTurn). */
+  markPrivateTurn(name: AgentName): void {
+    const record = this.live.get(name);
+    if (!record || record.privateTurn) return;
+    record.privateTurn = true;
+    this.persistRecord(`${name} as a private turn's work`);
   }
 
   /** Record that `from` used an explicit message path to `to`. */

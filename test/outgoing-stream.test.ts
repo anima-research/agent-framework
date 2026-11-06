@@ -241,7 +241,7 @@ async function harness(
     await (framework as unknown as { proseSpeechChains: Map<string, Promise<void>> }).proseSpeechChains.get('assistant');
   };
   const run = async () => {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } });
     await framework.runUntilIdle();
     await settled();
   };
@@ -474,7 +474,7 @@ test("explicit: a stream's complete waits for the deliveries it queued, so no ch
   let release!: () => void;
   h.holds.set('first', new Promise<void>((resolve) => { release = resolve; }));
   try {
-    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } });
     // The turn has ended and its stream torn down, with 'first' still out.
     await h.framework.runUntilIdle();
     h.log.push({ kind: 'mark', channelId: '', text: 'post released' });
@@ -520,7 +520,7 @@ test('a stream stopped mid-turn still completes what it published', async () => 
   h.module.during = async () => { await held; };
   const unlog = h.framework.onTrace((event) => { if (event.type === 'inference:published') published(); });
   try {
-    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } });
     void h.framework.runUntilIdle().catch(() => {});
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([firstOut, new Promise<never>((_, reject) => {
@@ -564,7 +564,7 @@ for (const late of ['rejects', 'succeeds'] as const) {
       settleSecond();
     };
     try {
-      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } });
       void h.framework.runUntilIdle().catch(() => {});
       for (const end = Date.now() + 10000; !h.log.some((e) => e.kind === 'publish' && e.text === 'second');) {
         assert.ok(Date.now() < end, 'the second publish went out');
@@ -597,7 +597,7 @@ test('a stop() completes a stream the framework no longer tracks, as a disposed 
     rejectSecond();
   };
   try {
-    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } });
     void h.framework.runUntilIdle().catch(() => {});
     for (const end = Date.now() + 10000; !h.log.some((e) => e.kind === 'publish' && e.text === 'second');) {
       assert.ok(Date.now() < end, 'the last publish went out');
@@ -671,7 +671,7 @@ test("with the real channel registry, a stop() with a publish still out sends th
   module.during = async (c) => { if (c.id === 'two') await twoHeld; };
   module.stop = async () => { wire.push('teardown'); rejectSecond(); };
   try {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } });
     void framework.runUntilIdle().catch(() => {});
     for (const end = Date.now() + 10000; !wire.includes('publish:second');) {
       assert.ok(Date.now() < end, 'the second publish went out');
@@ -747,7 +747,7 @@ async function realRegistryTurn(
   });
   module.during = async (c) => { if (c.id === 'one') await during(registry, open); };
   try {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'room' } });
     await framework.runUntilIdle();
     await (framework as unknown as { proseSpeechChains: Map<string, Promise<void>> }).proseSpeechChains.get('assistant');
   } finally {

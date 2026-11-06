@@ -60,6 +60,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.pendingRequests = [];
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
+  fw.getTurnCheckpoints = () => [];
   fw.agents = new Map([['cairn', {
     name: 'cairn',
     refusalHandling: { maxRewinds: opts?.maxRewinds ?? 3 },

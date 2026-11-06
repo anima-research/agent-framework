@@ -5,7 +5,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { AgentFramework } from '../src/index.js';
+import type { AgentFramework, EventResponse, Module, ProcessEvent, ProcessState } from '../src/index.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
@@ -15,7 +15,42 @@ const storedBaselines = (framework: AgentFramework): Record<string, unknown> =>
   ((framework as unknown as { store: { getStateJson(id: string): unknown } }).store.getStateJson('framework/state') as
     { announcedLoci?: Record<string, unknown> } | null)?.announcedLoci ?? {};
 
+class SurfaceModule implements Module {
+  readonly name = 'surface';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools() { return []; }
+  async handleToolCall() { return { success: false, error: 'no tools' }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(event.content) }] }], requestInference: event.triggerInference !== false };
+  }
+}
+
 describe('the routing announcement across a restart', () => {
+  it("a channel turn made private is what the agent was last told, after a restart too", async () => {
+    const f = await fixture({ framework: { modules: [new SurfaceModule()] } as Partial<FrameworkConfig> });
+    const toldWork = () => stored(f).filter((m) => textOf(m).includes('Your plain speech now lands in work')).length;
+    try {
+      await registerOpen(f, 'work');
+      f.alwaysRespond();
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      assert.equal(toldWork(), 1, 'told of the channel');
+      f.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {}, triggerInference: false } as never);
+      await f.framework.runUntilIdle();
+      await incoming(f, 'work', 'w2', 'agent, again?', MENTION);
+      await f.framework.runUntilIdle();
+      assert.ok(has(f, 'Private input came into this turn'), 'premise: the stored operator message made the turn private');
+      await f.framework.stop();
+      await f.create();
+      await registerOpen(f, 'work');
+      await incoming(f, 'work', 'w3', 'agent, and now?', MENTION);
+      await f.framework.runUntilIdle();
+      assert.equal(toldWork(), 2, 'the room turn after the restart is told its channel again, as it would be without the restart');
+    } finally { await f.close(); }
+  });
+
   it('a turn with no locus after a restart is told so, when the agent was last told of a channel', async () => {
     const f = await fixture();
     try {
@@ -27,12 +62,12 @@ describe('the routing announcement across a restart', () => {
       await f.framework.stop();
       await f.create();
       assert.equal(await channellessTurnLocus(f), null);
-      assert.ok(has(f, 'Your plain speech currently has no channel'), 'told it no longer lands there');
+      assert.ok(has(f, 'Your plain speech currently goes to no channel'), 'told it no longer lands there');
       // That announcement is stored too, so the boot after it doesn't tell it again.
       await f.framework.stop();
       await f.create();
       assert.equal(await channellessTurnLocus(f), null);
-      const told = stored(f).filter((m) => textOf(m).includes('Your plain speech currently has no channel')).length;
+      const told = stored(f).filter((m) => textOf(m).includes('Your plain speech currently goes to no channel')).length;
       assert.equal(told, 1, 'told once, across the next boot');
     } finally { await f.close(); }
   });
@@ -54,7 +89,7 @@ describe('the routing announcement across a restart', () => {
       assert.ok(f.framework.getAgent('aide'), 'premise: aide is back at the boot');
       wake();
       await f.turn();
-      assert.ok(told('Your plain speech currently has no channel'), 'told it no longer lands there');
+      assert.ok(told('Your plain speech currently goes to no channel'), 'told it no longer lands there');
     } finally { await f.close(); }
   });
 

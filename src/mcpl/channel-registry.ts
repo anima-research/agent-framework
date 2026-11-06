@@ -567,11 +567,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A turn that has taken in private input, such as a console or WebUI message, must name a channel too, and so must a script such a turn started. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to where your plain speech goes this turn, as the tool's description says; required of a subagent)" },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to where your plain speech goes this turn, as the tool's description says; required of a subagent, of a turn that has taken in private input, and of a script such a turn started)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -1094,8 +1094,9 @@ interface ChannelRegistryOptions {
    * here. For a heartbeat / no-trigger turn it resolves to undefined until the
    * turn's locus is resolved, so that
    * resolution takes the global fallback, which the turn then keeps.
-   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
-   * `defaultPublishChannel`. Null where the turn deliberately has no channel,
+   * Consulted AFTER `homeChannelResolver` (a fork's home always wins, except
+   * in a private turn's channel context, which names neither: `privateTurn`),
+   * BEFORE `defaultPublishChannel`. Null where the turn deliberately has no channel,
    * as one woken for a channel id two servers register, given without its
    * server: that takes no fallback either.
    */
@@ -1109,6 +1110,12 @@ interface ChannelRegistryOptions {
    * with nothing to answer.
    */
   channellessTurn?: (agentName: string) => boolean;
+  /**
+   * Whether the agent's current turn is private: it holds private input, so
+   * it names no channel to anyone. Its channel context names no outgoing
+   * channel, a conversation fork's home included, and no incoming message.
+   */
+  privateTurn?: (agentName: string) => boolean;
   /**
    * Whether a conversation takes the process-global fallback, the channel of
    * the most recent delivered inbound message: as where its plain speech lands
@@ -1208,6 +1215,7 @@ export class ChannelRegistry {
   private homeChannelResolver?: (agentName: string) => ChannelRef | undefined;
   private activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   private channellessTurn?: (agentName: string) => boolean;
+  private privateTurn?: (agentName: string) => boolean;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
   private store?: JsStore;
@@ -1635,6 +1643,7 @@ export class ChannelRegistry {
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.channellessTurn = options?.channellessTurn;
+    this.privateTurn = options?.privateTurn;
     this.takesGlobalFallback = options?.takesGlobalFallback;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
@@ -2533,6 +2542,7 @@ export class ChannelRegistry {
    * its home.
    */
   incomingFor(agentName?: string): { channel: ChannelRef; messageId: string; threadId?: string } | undefined {
+    if (agentName !== undefined && this.privateTurn?.(agentName)) return undefined;
     const channelless = agentName === undefined ? false
       : this.channellessTurn ? this.channellessTurn(agentName) : this.activeChannelResolver?.(agentName) === null;
     if (channelless && !this.homeChannelResolver?.(agentName!)) {
@@ -2575,7 +2585,7 @@ export class ChannelRegistry {
     // its outgoing one, nor that message as the one it is replying to.
     const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback();
     // A turn that deliberately has no channel (null) takes no fallback.
-    const outgoing = home ?? (active !== undefined ? active : fallback);
+    const outgoing = agentName !== undefined && this.privateTurn?.(agentName) ? null : home ?? (active !== undefined ? active : fallback);
 
     const context: ChannelContext = {};
 
@@ -6180,8 +6190,7 @@ export class ChannelRegistry {
         return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
       }
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays in
-      // the archive; honor that.
+      // global inbound ever seen).
       // The locus froze at the turn's start, so this says what the turn had.
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';
