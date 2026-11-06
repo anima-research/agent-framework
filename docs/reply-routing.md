@@ -30,14 +30,15 @@ represent registered thread channels; there is no new thread field, transport
 profile, capability negotiation or initialize extension in this feature.
 Opaque `replyIntent`, metadata, prose and persisted rows cannot mint authority.
 
-A's admission completes first, under its unchanged timeout, cancellation and
-pending-slot rules. Only after a fully validated store-and-wake verdict does
-B resolve a channel/push reply binding. It has its **own** required deadline
+Required inbound admission completes first, under its unchanged timeout,
+cancellation and pending-slot rules. Only after a fully validated store-and-wake verdict does
+this feature resolve a channel/push reply binding. It has its **own** required
+deadline
 (`timeoutMs`, integer 1..60000), AbortController, and cap of 64 pending
 resolutions per connection. No turn can wake or publish with an unresolved
 binding: resolution finishes, or becomes definitively private, before delivery
-to the existing wake path. Admission/storage rules remain A's; B only decides
-the private publish binding. Routing can delay delivery by its bounded wait,
+to the existing wake path. Admission/storage rules remain unchanged; reply
+authority only decides the private publish binding. Routing can delay delivery by its bounded wait,
 but cannot turn route failure into an admission refusal.
 
 Null, malformed output, a throw, timeout, overload, denied approval or an
@@ -46,8 +47,8 @@ Automatic prose remains in context/archive and a readable agent notice explains
 that no unique currently approved destination exists and explicit send tools
 remain available. Callback exceptions produce one fixed, bounded diagnostic per
 configured connection; exception content is never included in agent context.
-Cancellation aborts resolution; late results are discarded. A's existing final
-current/epoch/registration checks still govern stale ingress. Callbacks must
+Cancellation aborts resolution; late results are discarded. The admission layer's
+existing final current/epoch/registration checks still govern stale ingress. Callbacks must
 honor cancellation, avoid reentering ingress, and have no external side effects;
 cancellation cannot undo host callback effects.
 
@@ -89,8 +90,12 @@ example timer, home, or heartbeat prose or an unrelated module wake). Such prose
 a private failure notice, not a guessed destination. Module wakes caused by an
 admitted channel/push event carry only that event's existing private work;
 `mayWake: false` still forbids waking. Check existing unbound-post dependencies
-before opting in. Connections without `replyAuthority` retain slice-A behavior,
-including existing automatic routing.
+before opting in. Wakes carrying private admitted work are also exempt from the
+redundant-wake drop based on deferred/stored-message read and publication
+watermarks: those watermarks cannot discard an admitted cause or its authority,
+even if an unbound wake for the same write would already be satisfied.
+Connections without `replyAuthority` retain existing admission and routing
+behavior, including existing automatic routing.
 
 Silent starts retain the existing owner/latest-routing resume boundary; the
 regression test adds no recovery or simultaneous-start contract. Typing/status

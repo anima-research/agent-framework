@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { RequiredAdmission } from '../src/mcpl/inbound-admission.js';
 import { withReplyConsumer, admissionRoutingFields } from '../src/mcpl/reply-admission.js';
-import { replyConsumer, isReplyBinding, replyBindingCurrent, sameDestination, type ReplyBinding, type ReplyAuthorityConfig } from '../src/mcpl/reply-routing.js';
+import { replyConsumer, isReplyBinding, replyBindingCurrent, sameDestination, turnReply, shareReplyTurn, replyWork, type ReplyBinding, type ReplyAuthorityConfig } from '../src/mcpl/reply-routing.js';
 import { serverConfigProblems } from '../src/mcpl/protocol-family.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 
@@ -64,7 +64,7 @@ for (const mode of ['throw', 'timeout', 'denied'] as const) test(`core: ${mode} 
   if (mode === 'timeout') assert(signal?.aborted);
 });
 
-test('core: routing starts after A completes and frees its pending slot; abort discards a late route', async () => {
+test('core: routing starts after required admission completes and frees its pending slot; abort discards a late route', async () => {
   let entered!: () => void, finish!: (v: any) => void, signal!: AbortSignal;
   const started = new Promise<void>(done => { entered = done; });
   const x = fixture({ timeoutMs: 1000, resolve: input => {
@@ -142,4 +142,58 @@ test('core: authority throws log once with bounded detail and never expose the e
     assert.equal(logs.length, 1); assert(JSON.stringify(logs).length < 200);
     assert(!JSON.stringify(logs).includes('sensitive detail'));
   } finally { console.error = original; }
+});
+
+for (const [label, value] of [['number', 1], ['string', 'true'], ['object', {}], ['undefined', undefined], ['null', null], ['zero', 0]] as const) {
+  test(`core: authorize ${label} is private unless it is literal true`, async () => {
+    const result = await fixture({ authorize: (() => value) as any }).run();
+    assert.equal(result.verdict.store, true);
+    assert(isReplyBinding(result.binding)); assert.equal(result.binding.destination, undefined);
+    assert.equal(replyBindingCurrent(result.binding), false);
+  });
+}
+
+test('core: mixed-destination turnReply has no publication destination', async () => {
+  const x = fixture({ resolve: input => ({ channelId: (input.item as any).channelId ?? 'one' }) });
+  const a = await x.run();
+  const verdict = await x.ingress.admit('channels/incoming', { channelId: 'two' });
+  const b = admissionRoutingFields(verdict).routing as ReplyBinding;
+  assert.notEqual(a.binding.destination?.channelId, b.destination?.channelId);
+  assert.equal(turnReply([a.binding, b])?.destination, undefined);
+  assert.equal(replyBindingCurrent(turnReply([a.binding, b])), false);
+  assert.equal(turnReply([a.binding]), a.binding);
+  assert.equal(turnReply([]), undefined);
+});
+
+test('core: shareReplyTurn checks every destination in both cause sets', async () => {
+  const x = fixture();
+  const a = (await x.run()).binding, same = (await x.run()).binding;
+  const b = (await fixture({ resolve: () => ({ channelId: 'another' }) }).run()).binding;
+  const work = (...bindings: ReplyBinding[]) => ({ [replyWork]: bindings });
+  assert.equal(shareReplyTurn(work(a), work(same)), true);
+  for (const [left, right] of [[work(a, b), work(same)], [work(a), work(same, b)], [work(a), work(b)]]) {
+    assert.equal(shareReplyTurn(left, right), false);
+  }
+});
+
+test('core: a read-only verdict skips the resolver at the consumer boundary', async () => {
+  let resolves = 0;
+  const x = fixture();
+  const consume = replyConsumer({ timeoutMs: 100, resolve: () => { resolves++; return { channelId: 'room' }; }, authorize: () => true }, () => true);
+  assert.deepEqual(await consume({ connection: x.ingress.key, lane: 'channels/incoming', item: {} as any, signal: x.transport.signal }, { store: true, mayWake: false }), {});
+  assert.equal(resolves, 0);
+});
+
+test('core: setup throws release the reply consumer pending slot', async () => {
+  const x = fixture();
+  let resolves = 0;
+  const consume = replyConsumer({ timeoutMs: 100, resolve: () => { resolves++; return { channelId: 'room' }; }, authorize: () => true }, () => true);
+  const signal = new AbortController().signal;
+  Object.defineProperty(signal, 'addEventListener', { value: () => { throw Error('setup failed'); } });
+  for (let i = 0; i < 64; i++) {
+    const result = await consume({ connection: x.ingress.key, lane: 'channels/incoming', item: {} as any, signal }, { store: true, mayWake: true });
+    assert(isReplyBinding(result.routing)); assert.equal(result.routing.destination, undefined);
+  }
+  const live = await consume({ connection: x.ingress.key, lane: 'channels/incoming', item: {} as any, signal: x.transport.signal }, { store: true, mayWake: true });
+  assert.equal(resolves, 1); assert(isReplyBinding(live.routing)); assert.equal(replyBindingCurrent(live.routing), true);
 });
