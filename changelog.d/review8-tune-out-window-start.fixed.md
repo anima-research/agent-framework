@@ -6,5 +6,9 @@
   ordinal: before, a restart once more rows were presented set the old one, and the rows between left the window.
   And a restart that finds no start in force recorded (the oldest tune-out cancelled before its start was kept, a
   later one's start kept beside it) now keeps the window start the subconscious's strategy persisted where that is
-  earlier than the oldest active tune-out's, rather than moving the window to the later start.
+  earlier than the oldest active tune-out's, rather than moving the window to the later start. A restart that finds
+  no start kept for the oldest active tune-out either (its start fixed and set, the write keeping it failed) now keeps
+  the start the strategy persisted, rather than working the start out again from the tune-out's sequence, which, once
+  rows have been presented out of record order, gave another window; that tune-out's own start is fixed beside it,
+  without moving the window to it.
   `tune-out:subconscious-window` with `how: 'clamped'` is raised once the clamped start is set and kept.

@@ -4,8 +4,9 @@
  * The subconscious reads a tune-out's held traffic through a windowed
  * passthrough strategy: everything from the anchor on, the anchor at the
  * oldest active tune-out's start (the coordinator's anchorSubconscious), or
- * at an earlier start kept in force (a cancelled tune-out's, never moved
- * forward while one is active; below).
+ * at an earlier start kept in force: a cancelled tune-out's, kept while
+ * another stays active and across a restart, until the next enter sets the
+ * oldest active one's (below).
  * While its window is the record, a start is a sequence, and the window is
  * every row stored at it or after. Once its window follows the presentation
  * index, the window is the rows in the order it was shown them, and a start
@@ -41,11 +42,14 @@
  * start set in force by its kept ordinal, are dropped at the move. A
  * restart that finds a start in force kept sets that one, and fixes the
  * oldest active tune-out's start, if it isn't kept, without moving the
- * window to it; one that finds none kept, the oldest's start being kept,
- * sets the anchor the strategy persisted where that is earlier (a cancelled
- * tune-out's start that was set but never kept), as the start in force,
- * and where that anchor can't be read, sets nothing, the window left where
- * it was until the next enter or restart.
+ * window to it; one that finds none in force kept sets the anchor the
+ * strategy persisted, as the start in force: where the oldest's start is
+ * kept, if it is earlier (a cancelled tune-out's start that was set but
+ * never kept), and where it isn't (its fix set, its keeping failed),
+ * wherever it is, rather than converting the oldest's sequence again, that
+ * start fixed without moving the window to it; where that anchor can't be
+ * read, it sets nothing, the window left where it was until the next enter
+ * or restart.
  */
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { SubconsciousWindowStart } from './coordinator.js';
@@ -104,8 +108,9 @@ export class SubconsciousWindowAnchor {
    * legacy mode by its sequence, as before the index. In presented mode by
    * its ordinal when one was fixed, clamped to the window's index length
    * and traced when past it, the clamped ordinal kept as the start; the
-   * strategy's persisted anchor where it is earlier, at a resume that asks
-   * for it (keepEarlierAnchor); else by its sequence for now, converted as
+   * strategy's persisted anchor where it is earlier, or, with no ordinal
+   * known, where it has one, at a resume that asks for it
+   * (keepEarlierAnchor); else by its sequence for now, converted as
    * the strategy converts one, and the ordinal is fixed (see the module
    * doc) as soon as no row the subconscious is owed stored before the start
    * is out of its window, now or at a later presentation (presented). An
@@ -132,18 +137,27 @@ export class SubconsciousWindowAnchor {
       this.pending = others.map((other) => carried(other, false));
       let known = start.ordinal;
       let inForceOnly = start.inForceOnly === true;
-      if (known !== undefined && start.keepEarlierAnchor) {
+      if (start.keepEarlierAnchor) {
         const persisted = persistedOrdinal(strategy);
         if (persisted === null) {
           // Whether the strategy holds an earlier start (a cancelled
           // tune-out's, set and never kept) can't be told: the kept one set
           // over it would drop the rows it held from the window, and be kept
           // in force. The window stays where it was, nothing set or kept in
-          // force; the next enter or restart sets it. The others are fixed.
+          // force; the next enter or restart sets it. The others are fixed,
+          // and so is the start itself where no ordinal is kept for it,
+          // without moving the window to it.
+          if (known === undefined) this.pending.push(carried(start, false));
           this.tryFix();
           return;
         }
-        if (persisted !== undefined && persisted < known) {
+        // With no ordinal kept (one fixed and set whose keeping failed), the
+        // persisted anchor is the start this window had, wherever it is: the
+        // sequence converted again could give a later one, leaving out a
+        // row presented out of record order (AF #844 review 5, #47). The
+        // start's own ordinal is fixed beside it, unmoved to.
+        if (persisted !== undefined && (known === undefined || persisted < known)) {
+          if (known === undefined) this.pending.push(carried(start, false));
           known = persisted;
           inForceOnly = true;
         }

@@ -161,7 +161,7 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
         `told what becomes of its note: ${waiting(answer).note}`);
       assert.match(waiting(answer).note ?? '', /The notice is kept in the store as well, unless the store refuses that too: if the host stops before the notice is written, the host writes it when it starts again/,
         `told that a loss notice that can't be written survives a stop (Ivy-3594, round 6): ${waiting(answer).note}`);
-      assert.match(waiting(answer).note ?? '', /The waiting cancel isn't kept in the store: if the host stops before the tune-out ends, the cancel and your note are lost, and you are told so by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told when it starts again that any cancel of the tune-out then waiting was lost, with any note left with it\.$/,
+      assert.match(waiting(answer).note ?? '', /The waiting cancel isn't kept in the store: if the host stops before the tune-out ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told when it starts again that any cancel of the tune-out then waiting was lost, with any note left with it that had not been delivered\.$/,
         `and that a stop before the hold ends loses the cancel and the note, but not the notice of the note's loss (Ivy-3594, round 8): ${waiting(answer).note}`);
       assert.doesNotMatch(waiting(answer).note ?? '', /or the host stops/, `no longer says a stop ends the notice's retries: ${waiting(answer).note}`);
       release();
@@ -1134,6 +1134,40 @@ describe("a kept note whose store couldn't tell whether it landed, its cancel st
   });
 });
 
+// AF #844 bot review 5, #31: the same kept note, the host stopped by a
+// listener of that write's `message:lost`, which the framework traces
+// before it tells the coordinator (heldWriteLost). The stop proper runs only
+// after the stop's wait (hold 2's order), so the coordinator has heard of
+// the lost write by then.
+describe("a kept note whose store couldn't tell whether it landed, the host stopped from a listener of that loss (AF #844 review 5, #31)", () => {
+  it('is told after the start as a note that may be lost, never as one that was not delivered', async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun('unknown');
+    let stopping: Promise<void> | undefined;
+    try {
+      endNotRecorded(h.f);
+      const off = h.f.framework.onTrace((t) => {
+        if (t.type === 'message:lost' && !stopping) stopping = h.f.framework.stop();
+      });
+      h.release();
+      off();
+      assert.ok(stopping, 'premise: a listener of the lost write stopped the host');
+      await stopping;
+      assert.equal(h.attempts(), 1, 'premise: storing the kept note was tried once, and threw');
+      await h.f.create();
+      const told = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.equal(told.length, 1, `told once: ${JSON.stringify(told)}`);
+      assert.match(told[0]!, /^\[Tune-out: the note you left with your cancel of noisy may be lost\./, 'as a note that may be lost');
+      assert.doesNotMatch(told[0]!, /was not delivered/, 'never as one known lost');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // AF #844 (Weft's hold 2, her q4-stop-held probe): the waiting note is
 // written into a second hold (B), and the host stops during B. stop()
@@ -1219,6 +1253,35 @@ describe("a stop while an operator's change keeps the waiting note in memory (AF
     } finally {
       errors.mock.restore();
       h.releaseA();
+      await h.f.close();
+    }
+  });
+});
+
+// Weft's word on 341f99f0 (the item not run): with the stop's new order a
+// waiting cancel can complete inside the stop's wait, after the queue has
+// closed. The release (stored then, or before the stop with the hold
+// ending only then) is presented to the resident at rest, so the boot's
+// wake for rows its window is still owed doesn't count it, and the wake the
+// cancel asked for went with the stop.
+describe("the resident's wake for a release that a cancel completed inside the stop's wait (Weft's not-run on 341f99f0)", () => {
+  for (const mode of ['stop-held', 'stop-nohold'] as const) it(`${mode}: the next start asks the resident's turn once, as it would for a release whose wake a stop lost before it was run`, async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await weftHoldTwo(mode);
+    try {
+      assert.equal(h.inForce, false, 'premise: the cancel ran inside the stop, and the hold ended');
+      const release = stored(h.f).filter((m) => m.metadata?.kind === 'tune-out-cancel');
+      assert.equal(release.length, 1, 'premise: one release row');
+      const resident = h.f.framework.getAgent('agent')!.getContextManager();
+      const releaseId = (release[0] as unknown as { id: string }).id;
+      assert.ok(resident.getPresentedMessages().some((m) => m.id === releaseId), "premise: the release is in the resident's window, not owed");
+      const wakes = (internals(h.f).pendingRequests as Array<{ agentName: string; reason: string; source?: string }>)
+        .filter((r) => r.agentName === 'agent' && r.source === 'tune-out');
+      assert.deepEqual(wakes.map((r) => r.reason), ['tune-out released (restored)'], "the resident's turn is asked for, once");
+    } finally {
+      errors.mock.restore();
+      h.releaseA();
+      h.releaseB?.();
       await h.f.close();
     }
   });

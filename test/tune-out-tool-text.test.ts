@@ -10,7 +10,9 @@
  * what it decides.
  *
  * The reader's own four tools (SUBCONSCIOUS_TOOLS), which every reader is
- * given and every resident is shown under reader forks, say what each does
+ * given and every resident is shown under reader forks, unless its
+ * allowedTools leaves them out (then its forks aren't shown them either),
+ * say what each does
  * and nothing of when to use it (M4): no "use when something needs the
  * resident's full attention", "use sparingly", "staying silent is always
  * allowed", and no real person's name in an example. A host that wants a

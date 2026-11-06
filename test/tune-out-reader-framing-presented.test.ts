@@ -4,7 +4,8 @@
  * it enter its window when its run takes it on, and it holds them while it
  * lives (presentedToAnyone), so no coalescer withdraws a row a reader was
  * handed. Its view, the residents' it inherits, keeps them out of its
- * compile, where the framing shows them: its first request is the
+ * compile, as it keeps out all held traffic, where the default framing
+ * shows them: its first request is the
  * resident's last one, then the resident's reply, then the framing. A fork
  * its run refuses before taking it on (the host quiesced) is let go of its
  * framing, so a row it was handed counts as held by no reader that never

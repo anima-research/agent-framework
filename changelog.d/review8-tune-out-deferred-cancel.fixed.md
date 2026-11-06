@@ -28,7 +28,8 @@
   told so: the persistent subconscious in the release itself, a reader fork in its own context, with the hold, the
   resident and the error's text, where it still exists. A reader fork whose run has ended is written nothing, and the
   loss, reaching no one, is traced as `tune-out:note-loss-untold` (`author-gone`); one still running whose context
-  manager refuses its work has the notice kept for it, written once that ends. The cancel still ends the tune-out. Each notice of a lost note gives
+  manager refuses its work has the notice kept for it, written once that ends; a fork whose own manager works is no
+  longer kept waiting while the primary's or the subconscious's refuses its work, which holds the cancels only. The cancel still ends the tune-out. Each notice of a lost note gives
   the persistent subconscious a turn to read it. No notice is written while writes are held: it waits for their
   release. A notice of a lost note that can't be written was only logged; it is now kept, traced as
   `tune-out:note-loss-untold` (`write-failed`, with the author and the error) at its first failure, and tried again
@@ -43,7 +44,7 @@
   either, the failure is traced and the notice is tried again until it is written. The persistent subconscious is
   told that such a notice is also kept in the store, unless the store refuses that too, so a stop before it is
   written leaves it for the next boot to write; and that the waiting cancel isn't kept in the store, so a stop before
-  the hold ends loses it, and the note with it, told by such a notice kept for the next boot to write. A reader fork is told that its note goes out as its mail even after
+  the hold ends loses it, and the note with it unless the cancel's run delivered the note already, a lost note told by such a notice kept for the next boot to write. A reader fork is told that its note goes out as its mail even after
   its run has ended, but that a loss reaches it only while it runs: after its end the loss reaches no one and is only
-  traced, and a stop before the hold ends loses the note with the cancel, untold. The answer said only that the
+  traced, and a stop before the hold ends loses the note with the cancel, untold, unless it was delivered already. The answer said only that the
   cancel waits.

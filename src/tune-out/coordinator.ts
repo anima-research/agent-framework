@@ -109,10 +109,14 @@ export interface SubconsciousWindowStart {
    */
   inForceOnly?: true;
   /**
-   * At a resume that finds no start in force kept, `ordinal` being the one
-   * kept for `epochIds`: the anchor the subconscious's strategy persisted is
-   * kept where it is earlier (a cancelled tune-out's start that was set but
-   * never kept), as the start in force only.
+   * At a resume that finds no start in force kept: the anchor the
+   * subconscious's strategy persisted is kept, as the start in force only,
+   * where it is earlier than `ordinal`, the one kept for `epochIds` (a
+   * cancelled tune-out's start that was set but never kept), or, with no
+   * `ordinal` (their start fixed and set, its keeping failed), wherever it
+   * is: the sequence converted again could give a later start, once rows
+   * have been presented out of record order. Their own start is then fixed
+   * without moving the window to it.
    */
   keepEarlierAnchor?: true;
 }
@@ -154,7 +158,9 @@ interface WindowStartsState {
  * hold ends loses both, unless the stop's own wait for an operator's
  * operation lets the hold end, which runs the cancel first (the
  * framework's stop calls stop() only after that wait; stopTimers before
- * it), and the subconscious is told of the note's loss
+ * it), or the note went out already (the cancel's run delivered it and
+ * failed before the end: the stop drops the cancel alone, dropQueued; AF
+ * #844 review 5, #26), and the subconscious is told of the note's loss
  * as of any other, by a notice kept in the store for the next boot (stop),
  * or, where the store refuses that or the host crashes, by the next boot's
  * notice that any cancel then waiting was lost (noteUnstampedStop).
@@ -164,7 +170,7 @@ interface WindowStartsState {
  * ended (deliverReaderNote), but a notice of its loss reaches it only while
  * it runs: an ended fork is no agent the framework writes to, and the loss
  * is then traced only (writeLossNotice); a stop drops a fork's notice not
- * yet written.
+ * yet written, and a fork's note not delivered yet is lost with the cancel.
  */
 export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'persistent' | 'fork', unmarked = false): string {
   const hold = what.charAt(0).toLowerCase() + what.slice(1);
@@ -182,9 +188,10 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
         + `the notice is ${retry}written. The notice is kept in the store as well, unless the store refuses that too: `
         + 'if the host stops before the notice is written, the host writes it when it starts again, or keeps trying as '
         + 'above. The waiting cancel isn\'t kept in the store: if the host stops before '
-        + `${hold} ends, the cancel and your note are lost, and you are told so by such a notice, kept in the store `
-        + 'for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told '
-        + `when it starts again that any cancel of ${hold} then waiting was lost, with any note left with it.`
+        + `${hold} ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note `
+        + 'by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or '
+        + `the host crashes, you are told when it starts again that any cancel of ${hold} then waiting was lost, with any `
+        + 'note left with it that had not been delivered.'
         + (unmarked
           ? ' This run\'s start couldn\'t be recorded in the store yet: if the host stops or dies before the cancel runs '
             + 'while the store still refuses it, you may not be told so when it starts again.'
@@ -196,7 +203,7 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
         + 'your run lasts: once it has ended, nothing can be written to you, so the loss reaches no one and is only '
         + 'traced for the host. If writing that notice fails while you still run, the failure is traced for the host, '
         + `and the notice is ${retry}written, your run ends, or the host stops. If the host stops before ${hold} ends, `
-        + 'your note is lost with the cancel, and you are not told.'
+        + 'your note is lost with the cancel, unless it was delivered already, and you are not told.'
       : '');
 }
 
@@ -403,7 +410,9 @@ interface DeferredCancel {
   /**
    * Its note, delivered while writes were held (heldInMemory), was lost
    * when they were stored: the framework's replay of the write threw
-   * (heldWriteLost), so the note isn't settled any more. It is told lost,
+   * (heldWriteLost), so the note isn't settled any more; or the release
+   * kept so that told its loss (lostInRelease) was, which told nothing,
+   * and this is that loss (by another cancel). It is told lost,
    * with that error, by whichever run ends the hold or drops the cancel
    * (noteNow, dropQueued), never written again; `mayBeStored`: the store
    * couldn't tell whether it landed, so it is told as one that may be lost.
@@ -454,6 +463,28 @@ function withUnknownNote(drop: DeferredDrop, lost: DeferredCancel['lostAtRelease
   if (!lost?.mayBeStored) return drop;
   if (drop.reason === 'hold-ended' || drop.reason === 'stopped') return { ...drop, noteUnknown: lost.error };
   return drop;
+}
+
+/**
+ * Whether a queued cancel's note went out already: settled, neither by a
+ * release that told its loss (lostInRelease) nor by a write kept in memory
+ * (heldInMemory). A cancel settled by a loss told is off the queue by then
+ * (dropDeferred's callers), so on the queue settled means delivered. Such a
+ * cancel, waiting on after its run (its end not recorded), carries nothing
+ * more to deliver: a later cancel that joins it gives it its note, which
+ * goes out when the hold ends, rather than being dropped beside one
+ * delivered (deferCancel, requeue; AF #844 review 5, #22).
+ */
+function noteDelivered(entry: DeferredCancel): boolean {
+  return entry.note !== undefined && entry.noteSettled === true && !entry.lostInRelease && !entry.heldInMemory;
+}
+
+/** A later cancel's note (`note`, `noteAuthor`) given to a waiting cancel whose own went out already (noteDelivered), unsettled. */
+function takeLaterNote(entry: DeferredCancel, note: string, noteAuthor: string | undefined): void {
+  entry.note = note;
+  delete entry.noteSettled;
+  if (noteAuthor !== undefined) entry.noteAuthor = noteAuthor;
+  else delete entry.noteAuthor;
 }
 
 /**
@@ -518,7 +549,7 @@ const FOUND_RANK: Record<UnstampedStop['found'], number> = { unknown: 0, asked: 
 
 /**
  * What `tune-out/<primary>/stop-stamp` keeps (`{ v: 1, epochs,
- * runStartedAt?, branch? }`): the holds on record at the last stop (their
+ * runStartedAt?, branch?, wakesOwed? }`): the holds on record at the last stop (their
  * epochs) whose waiting cancels that stop accounted for, a note's loss
  * written or kept in the store (writeStopStamp), and where that run's rows
  * begin: the store's head sequence when it began, or when it moved to the
@@ -533,6 +564,16 @@ interface StopStamp {
   epochs: string[];
   runStartedAt?: number;
   branch?: string;
+  /**
+   * The turns a release asked for while this stop was under way (after
+   * stopTimers: a cancel that its wait for an operator's operation let run),
+   * the resident's and the subconscious's report's: asked in memory after
+   * the host's queue closed, so the stop dropped them, and the release row,
+   * shown at rest, is in the window, where the boot's wake for rows still
+   * owed doesn't count it. The next boot asks them again (noteUnstampedStop;
+   * Weft, #844).
+   */
+  wakesOwed?: { resident?: true; subconscious?: true };
 }
 
 /** A hold on record (holdsOnRecord): its epoch, and its channel, the all-except hold's excepted one with `scope`. */
@@ -848,12 +889,17 @@ export interface TuneOutFrameworkHooks {
   /**
    * Whether a write the coordinator made now would be kept in memory rather
    * than stored: a live surgery's hold, or a context manager of the primary
-   * or the subconscious refusing its work until a branch move re-initializes it,
-   * and with `forAgent`, that agent's too (a reader fork a loss notice is
-   * written for). A cancel then waits (deferCancel), the tune-out still in
+   * or the subconscious refusing its work until a branch move re-initializes it.
+   * A cancel then waits (deferCancel), the tune-out still in
    * force, until the framework says the writes are stored again, or told of
    * where storing one fails (runDeferredCancels), so the release is in the
-   * store before the epoch's end is recorded. Left out, never.
+   * store before the epoch's end is recorded. With `forAgent` (a loss
+   * notice's author, a reader fork's or the subconscious's), whether a write
+   * for that agent would be kept: a surgery's hold or its replay, or that
+   * agent's own manager refusing its work or waiting for its recovery; not
+   * the primary's or the subconscious's, which keep their own agent's writes
+   * alone. The loss notices are written by that answer, even while the
+   * release's is true (AF #844 review 5, #53). Left out, never.
    */
   writesHeld?: (forAgent?: string) => boolean;
   /**
@@ -878,6 +924,15 @@ export interface TuneOutFrameworkHooks {
    * out, none is named, and a stamp's start is read on any branch.
    */
   currentBranch?: () => string;
+  /**
+   * The branch `name` was made from (`parent`, by name) and the sequence it
+   * was made at (`branchPoint`: it holds the parent's rows up to there, at
+   * the same sequences), where the store says; undefined for a branch made
+   * from none, or where the host can't say. A move to a branch made from
+   * this run's at a point past this run's start keeps that start for it
+   * (branchMoved). Left out, a move's destination is read from its head.
+   */
+  branchOrigin?: (name: string) => { parent: string; branchPoint: number } | undefined;
   /**
    * Move the subconscious window anchor to `start`, the oldest active
    * tune-out's (never forward past active epochs): by its sequence while
@@ -1096,6 +1151,14 @@ export class TuneOutCoordinator {
    * so none is written until a try reads those rows (checkLossNoticesWritten).
    */
   private readonly lossNoticesUnchecked = new Set<string>();
+  /** The authors whose loss notice is being written now (writeLossNotices): a loss told for one meanwhile waits behind it. */
+  private readonly lossNoticesWriting = new Set<string>();
+  /** The host's stop has begun (stopTimers): a turn asked for from here on is dropped with the stop's closed queue. */
+  private timersStopped = false;
+  /** The release turns asked for while the stop was under way (StopStamp's `wakesOwed`), for the stop's stamp. */
+  private readonly wakesInStop: { resident?: true; subconscious?: true } = {};
+  /** The release turns this run asked for, by whose: a boot that asks one for its own release asks none again for the last stop's. */
+  private readonly releaseTurnsAsked = new Set<'resident' | 'subconscious'>();
   /**
    * The one retry of the deferred cancels whose run threw (a release that
    * couldn't be made durable, a store operation that threw), and of the
@@ -1182,6 +1245,12 @@ export class TuneOutCoordinator {
     } catch {
       bootHead = undefined;
     }
+    // The all-except hold's record first, uncaught: its first read is the
+    // store's (getAllExcept caches it once read), and one that throws
+    // refuses the start, as the read below would. Caught with the holds
+    // below, it read as no hold, and the last stop's stamp was written over
+    // unchecked, its bound with it (AF #844 review 5, #36).
+    this.getAllExcept();
     let onRecord: HoldOnRecord[] = [];
     try {
       onRecord = this.holdsOnRecord();
@@ -1317,10 +1386,11 @@ export class TuneOutCoordinator {
     // tune-out's, say), and never past the oldest active one's own start
     // where one is kept. With none in force kept, the anchor (window-anchor)
     // keeps the one its strategy persisted where that is earlier than the
-    // oldest active one's own start.
+    // oldest active one's own start, or, where none of that is kept either,
+    // rather than converting its sequence again (AF #844 review 5, #47).
     const inForceOnly = occasion === 'resume' && state.inForce !== undefined && (own === undefined || state.inForce < own);
     if (inForceOnly) ordinal = state.inForce;
-    const keepEarlierAnchor = occasion === 'resume' && kept && state.inForce === undefined && own !== undefined;
+    const keepEarlierAnchor = occasion === 'resume' && kept && state.inForce === undefined;
     // The start in force from now: an ordinal known is kept as in force once
     // it is set (the anchor's fix reports it, subconsciousWindowFixed), not
     // before, so a set that fails leaves the record with the start the
@@ -1676,7 +1746,8 @@ export class TuneOutCoordinator {
    * (`target`). The first one asked for a hold stands, with its reason and
    * source. A later one for the same hold (an end time's retry, a wake past
    * the budget, an agent's cancel) adds nothing, except a note: the waiting
-   * cancel takes it, with its author, when it has none, and otherwise the
+   * cancel takes it, with its author, when it has none or its own went out
+   * already (noteDelivered), and otherwise the
    * later note is dropped, with a log line, and this answers 'note-dropped'
    * so its caller can be told. One waiting for an earlier epoch there,
    * whose hold ended without it, is dropped (dropDeferred), and this one
@@ -1724,6 +1795,12 @@ export class TuneOutCoordinator {
       if (noteAuthor !== undefined) waiting.noteAuthor = noteAuthor;
       return 'waits';
     }
+    // One whose note went out already (its run delivered it, and failed
+    // before the end) takes this one's, which goes out when the hold ends.
+    if (noteDelivered(waiting)) {
+      takeLaterNote(waiting, note, noteAuthor);
+      return 'waits';
+    }
     console.error(`[tune-out] a later cancel of ${what} is dropped with its note: the cancel already waiting carries a note of its own`);
     return 'note-dropped';
   }
@@ -1749,7 +1826,17 @@ export class TuneOutCoordinator {
    */
   runDeferredCancels(): void {
     if (this.stopped) return;
-    if ((this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending) || this.writesHeldNow()) return;
+    if (this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && !this.lossRecordUnread) return;
+    if (this.writesHeldNow()) {
+      // Writes are held for some agent. A loss notice is held only where
+      // its author's are (writeLossNotices asks writesHeld of the author):
+      // a reader fork is told while the primary's or the subconscious's
+      // context manager refuses its work, which holds the cancels' writes
+      // but not the fork's (AF #844 review 5, #53). The cancels, the marker
+      // and the record wait.
+      if (this.lossNotices.size > 0 || this.lossRecordUnread) this.writeLossNotices();
+      return;
+    }
     if (this.deferredRetry !== undefined) {
       clearTimeout(this.deferredRetry);
       this.deferredRetry = undefined;
@@ -1793,10 +1880,10 @@ export class TuneOutCoordinator {
         }
         if (ended) {
           console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory, ended its tune-out (epoch ${entry.for.epochId}) when it ran, but a step after the end failed:`, err);
-          // The run delivers its note after the end, told lost where it
-          // can't be (deliverQueuedNote): a step that failed before then
-          // left it neither. One lost when the writes were stored is told
-          // lost with that error (lostAtRelease).
+          // The run writes its note before the end (noteNow), or, joining
+          // another cancel, after it (deliverQueuedNote); a note the throw
+          // left unsettled is told lost here. One lost when the writes were
+          // stored is told lost with that error (lostAtRelease).
           if (entry.note !== undefined && !entry.noteSettled) {
             this.dropDeferred(entry, entry.lostAtRelease
               ? { ...entry.lostAtRelease, by: 'itself' }
@@ -1818,7 +1905,7 @@ export class TuneOutCoordinator {
         console.error(`[tune-out] a cancel asked for while writes were held in memory failed when it ran, so it stays waiting, the tune-out in force, and is tried again in ${EXPIRY_RETRY_MS / 1000} s or at the next release:`, err);
       }
     }
-    if (!this.stopped && (failed || this.lossNotices.size > 0 || this.markerPending)) this.armDeferredRetry();
+    if (!this.stopped && (failed || this.lossNotices.size > 0 || this.markerPending || this.lossRecordUnread)) this.armDeferredRetry();
   }
 
   /**
@@ -1837,11 +1924,31 @@ export class TuneOutCoordinator {
    * the hold tells it lost then, with this error, as it tells a note it
    * can't write (noteNow, dropDeferred), and a stop before then tells it
    * lost with the cancel (dropQueued). The note is never written again,
-   * since it may be stored after all. Any other write is left to the
-   * operator. Never throws.
+   * since it may be stored after all. A release kept so that told a queued
+   * note's loss (`tune-out-cancel` with `lostNote`, queuedNoteFirst), lost
+   * here, told nothing: the entry it settled (lostInRelease, heldInMemory)
+   * is unsettled, that loss moved to lostAtRelease, so the run that ends
+   * the hold tells it by a notice, and the note isn't written again (AF
+   * #844 review 5, #18). The note's loss is known whether or not that
+   * release may have landed: told twice, where it did, rather than never.
+   * Any other write is left to the operator. Never throws.
    */
   heldWriteLost(metadata: Readonly<Record<string, unknown>> | undefined, error: unknown, mayBeStored = false): void {
     try {
+      if (metadata?.kind === 'tune-out-cancel' && metadata.lostNote === true && typeof metadata.epochId === 'string') {
+        for (const entry of this.deferredCancels.values()) {
+          const told = entry.lostInRelease;
+          if (entry.for.epochId !== metadata.epochId || entry.note === undefined || !entry.noteSettled || !entry.heldInMemory || !told) continue;
+          delete entry.noteSettled;
+          delete entry.heldInMemory;
+          delete entry.lostInRelease;
+          entry.lostAtRelease = told;
+          console.error(`[tune-out] the release that told the loss of the note left with the cancel of ${entry.what}, kept in memory as it was written, `
+            + `${mayBeStored ? 'may be lost' : 'is lost'}: storing it when the writes were stored threw (${thrownReason(error)}), so the note's author is told by a notice once the hold ends`);
+          return;
+        }
+        return;
+      }
       if (metadata?.kind !== 'subconscious-note' || typeof metadata.epochId !== 'string') return;
       for (const entry of this.deferredCancels.values()) {
         if (entry.for.epochId !== metadata.epochId || entry.note === undefined || !entry.noteSettled || !entry.heldInMemory || entry.lostInRelease) continue;
@@ -1912,7 +2019,10 @@ export class TuneOutCoordinator {
    * during the run), joins it, as a later cancel joins one waiting
    * (deferCancel): the run's stands, with its reason and its note, as it
    * was (settled, or told in a release), and takes the later one's askers,
-   * and its note where it has none; a later note beside its own is dropped,
+   * and its note where it has none, or where its own went out already
+   * (noteDelivered: the run delivered it, and failed before the end), the
+   * later note then going out when the hold ends; a later note beside its
+   * own still to go out is dropped,
    * told (dropDeferred, `superseded`), its caller having been answered as
    * waiting. One queued for a later epoch leaves the run nothing to end: it
    * is dropped, told (dropQueued).
@@ -1934,6 +2044,13 @@ export class TuneOutCoordinator {
           ...(lostInRelease ? { lostInRelease } : {}), ...(heldInMemory ? { heldInMemory } : {}),
           ...(lostAtRelease ? { lostAtRelease } : {}),
         });
+        return;
+      }
+      // The run's own note went out (its sync, or a step after, failed
+      // before the end): the later note isn't dropped beside it, and its
+      // author isn't told that one is still to go out.
+      if (noteDelivered(entry) && !waiting.noteSettled) {
+        takeLaterNote(entry, waiting.note, waiting.noteAuthor);
         return;
       }
       this.dropDeferred(waiting, { reason: 'superseded' });
@@ -2008,7 +2125,9 @@ export class TuneOutCoordinator {
    * the author is told so in its own context where it still exists, a
    * reader fork whose run has ended being written nothing (tellNoteLost),
    * unless the release of the cancel that ended the hold tells it already
-   * (`told` release, queuedNoteFirst): no second notice is written then.
+   * (`told` release, queuedNoteFirst): no second notice is written then. A
+   * note that may be stored after all (lostAtRelease, `mayBeStored`) is
+   * traced so (`noteMayBeStored`, with the `error`), as its notice says it.
    */
   private dropDeferred(entry: DeferredCancel, asked: DeferredDrop, told: 'notice' | 'release' = 'notice'): void {
     const { epochId, serverId, channelId, scope } = entry.for;
@@ -2018,7 +2137,8 @@ export class TuneOutCoordinator {
     // `mayBeStored`) may be stored: a stop's drop, or one for a hold that
     // ended without it, says so (`noteUnknown`), never that it was lost.
     const drop = noteLost ? withUnknownNote(asked, entry.lostAtRelease) : asked;
-    const unknown = (drop.reason === 'hold-ended' || drop.reason === 'stopped') && drop.noteUnknown !== undefined;
+    const noteUnknown = drop.reason === 'hold-ended' || drop.reason === 'stopped' ? drop.noteUnknown : undefined;
+    const unknown = noteUnknown !== undefined;
     if (drop.reason === 'hold-ended') {
       const current = drop.current;
       console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, is dropped: `
@@ -2054,7 +2174,11 @@ export class TuneOutCoordinator {
       ...(drop.reason === 'hold-ended' && drop.current !== undefined ? { currentEpochId: drop.current } : {}),
       noteLost,
       ...(author !== undefined ? { noteAuthor: author } : {}),
-      ...(drop.reason === 'note-undelivered' ? { error: drop.error } : {}),
+      // A note that may be stored after all (`mayBeStored`, `noteUnknown`)
+      // is marked so, with what the store couldn't tell, as its author's
+      // notice says it: not delivered, read alone, would be a known loss.
+      ...(drop.reason === 'note-undelivered' ? { error: drop.error } : noteUnknown !== undefined ? { error: noteUnknown } : {}),
+      ...((drop.reason === 'note-undelivered' && drop.mayBeStored) || unknown ? { noteMayBeStored: true as const } : {}),
     });
   }
 
@@ -2143,14 +2267,19 @@ export class TuneOutCoordinator {
    * author's, each author's in the order its losses came: one written, or
    * whose author has ended, leaves the queue; one whose write fails stays
    * for the next try (writeLossNotice), and that author's later ones with
-   * it, behind it. None is written while writes are
-   * held (writesHeld): the framework would keep it in memory and answer an
+   * it, behind it. None is written while its author's writes are
+   * held (writesHeld(author)): the framework would keep it in memory and answer an
    * empty id, which then couldn't tell a kept write from an ended author's
    * dropped one. The release or the retry writes them. Nor is one the boot
    * read from the store's record while whether it was written before the
-   * stop can't be read (checkLossNoticesWritten). Then the store's
+   * stop can't be read (checkLossNoticesWritten). The store's record, where
+   * it wasn't read in yet, is read first, and while it can't be, none of
+   * the persistent subconscious's is written, as one it keeps would come
+   * after it. Then the store's
    * record of the persistent subconscious's kept notices is brought in
-   * line (writeLossRecord). Each leaves its author's list just before it
+   * line (writeLossRecord). A loss told for an author while its notice is
+   * being written (a listener of that write) waits behind it, written next
+   * in this pass. Each leaves its author's list just before it
    * is written, as a deferred cancel leaves its queue, so a stop meanwhile
    * (a listener of the write) keeps those not written yet in the store
    * (stop), and none is written after it; one whose write that stop met and
@@ -2158,23 +2287,40 @@ export class TuneOutCoordinator {
    * throws.
    */
   private writeLossNotices(author?: string): void {
+    // A record not read in yet (a read at boot threw, or a branch move) is
+    // read first: the notices it keeps are older than any kept since, and
+    // are written first (AF #844 review 5, #40).
+    if (this.lossRecordUnread) this.readLossRecord();
     this.checkLossNoticesWritten();
     for (const name of author !== undefined ? [author] : [...this.lossNotices.keys()]) {
-      // One that fails goes back ahead of the rest, which wait behind it
-      // for the next try, so the author is told in the order the losses
-      // came; a loss told meanwhile is kept after them.
-      for (const notice of [...(this.lossNotices.get(name) ?? [])]) {
+      // A loss told for this author from a listener of its notice's write
+      // (that write's trace, or its failure's) only joins the queue, behind
+      // the one in flight: written now, it went ahead of it (AF #844
+      // review 5, #24). This pass writes it next.
+      if (this.lossNoticesWriting.has(name)) continue;
+      // Each from the head: one that fails goes back there, the rest
+      // waiting behind it for the next try, so the author is told in the
+      // order the losses came; a loss told meanwhile is kept after them.
+      for (;;) {
+        const kept = this.lossNotices.get(name);
+        const notice = kept?.[0];
         // One the boot read from the record, which may be written already,
         // waits until that can be read (checkLossNoticesWritten), and those
         // after it with it.
-        if (this.stopped || this.writesHeldNow(name) || this.lossNoticesUnchecked.has(notice.id)) break;
-        const kept = this.lossNotices.get(name);
-        const at = kept?.indexOf(notice) ?? -1;
-        // Written meanwhile, by a write a listener made.
-        if (!kept || at < 0) continue;
-        kept.splice(at, 1);
+        // Nor is the persistent subconscious's while that record can't be
+        // read: one it keeps would be written after it.
+        if (!kept || !notice || this.stopped || this.writesHeldNow(name) || this.lossNoticesUnchecked.has(notice.id)
+          || (notice.persistent && this.lossRecordUnread)) break;
+        kept.shift();
         if (kept.length === 0) this.lossNotices.delete(name);
-        if (this.writeLossNotice(name, notice) !== 'failed') continue;
+        this.lossNoticesWriting.add(name);
+        let written: ReturnType<TuneOutCoordinator['writeLossNotice']>;
+        try {
+          written = this.writeLossNotice(name, notice);
+        } finally {
+          this.lossNoticesWriting.delete(name);
+        }
+        if (written !== 'failed') continue;
         this.lossNotices.set(name, [notice, ...(this.lossNotices.get(name) ?? [])]);
         break;
       }
@@ -2278,13 +2424,16 @@ export class TuneOutCoordinator {
   /**
    * Read the persistent subconscious's kept loss notices from the store
    * (writeLossRecord) into memory (lossNotices), ahead of any kept since for
-   * the same author: at boot (restoreLossNotices), and before the record is
-   * written where it couldn't be read before. Answers whether it was read.
+   * the same author: at boot (restoreLossNotices), and, where it couldn't
+   * be read before (a boot's read threw, or a branch move), before the
+   * notices are written (writeLossNotices) and before the record is
+   * written. Answers whether it was read.
    * One that throws is logged and answers false: nothing is written over it
    * until it is read. A record not in this format (`{ v: 1,
    * pendingLossNotices }`) reads as none kept, logged, and is written over
    * at the next change; an entry this version can't read is logged and left
-   * out, so the next write drops it.
+   * out, so the next write drops it. Those read in wait to be checked
+   * against the subconscious's rows (lossNoticesUnchecked), as a boot's do.
    */
   private readLossRecord(): boolean {
     let raw: unknown;
@@ -2327,7 +2476,13 @@ export class TuneOutCoordinator {
       };
       restored.set(entry.author, [...(restored.get(entry.author) ?? []), notice]);
     }
-    for (const [author, notices] of restored) this.lossNotices.set(author, [...notices, ...(this.lossNotices.get(author) ?? [])]);
+    for (const [author, notices] of restored) {
+      this.lossNotices.set(author, [...notices, ...(this.lossNotices.get(author) ?? [])]);
+      // Written before the record was last read may be (a stop, or a
+      // record the store refused, between the two): each waits until the
+      // subconscious's rows say whether (checkLossNoticesWritten).
+      for (const notice of notices) this.lossNoticesUnchecked.add(notice.id);
+    }
     if (unreadable > 0) {
       console.error(`[tune-out] ${unreadable} of the loss notices kept for the subconscious (${this.lossNoticesStateId}) can't be read by this version, `
         + 'so they are not written, and the next write of the record leaves them out');
@@ -2461,7 +2616,11 @@ export class TuneOutCoordinator {
         }
       }
       const onRecord = this.holdsOnRecord().map((hold) => hold.epochId);
-      const stamp: StopStamp = { v: 1, epochs: onRecord.filter((epochId) => !unaccounted.has(epochId)), ...this.runBound() };
+      const owed = this.wakesInStop;
+      const stamp: StopStamp = {
+        v: 1, epochs: onRecord.filter((epochId) => !unaccounted.has(epochId)), ...this.runBound(),
+        ...(owed.resident || owed.subconscious ? { wakesOwed: { ...owed } } : {}),
+      };
       this.channelRegistry.writeCoordinatorState(this.stopStampStateId, stamp);
       if (!this.stateDurable()) throw new Error('it was written but could not be made durable');
     } catch (err) {
@@ -2534,6 +2693,7 @@ export class TuneOutCoordinator {
         console.error(`[tune-out] no stop stamp is kept (${this.stopStampStateId}): a first start on a version that stamps its stops, `
           + 'so the holds on record count as stopped cleanly');
       }
+      if (stamp && stamp.v === 1 && stamp.wakesOwed && typeof stamp.wakesOwed === 'object') this.askWakesOwed(stamp.wakesOwed);
       // This run begins at the store's head as the boot found it, before
       // the boot's own releases (an end time passed, a wake budget spent):
       // those are this run's, not the last one's. Its marker is written last
@@ -2563,6 +2723,33 @@ export class TuneOutCoordinator {
       }
     } catch (err) {
       console.error(`[tune-out] whether the last stop recorded the holds on record could not be checked at boot: ${thrownReason(err)}`);
+    }
+  }
+
+  /**
+   * At boot, the release turns the last stop's stamp says it dropped
+   * (StopStamp's `wakesOwed`: asked while it was under way), asked again
+   * as the boot's wake for a release row still owed asks them (the
+   * framework's `tune-out released (restored)` and `tune-out (restored)`,
+   * so a row both owed and recorded is asked once), each unless this boot
+   * asked that turn for a release of its own already. Asked once: the
+   * boot's marker is written over that stamp. Never throws.
+   */
+  private askWakesOwed(owed: { resident?: unknown; subconscious?: unknown }): void {
+    const ask = (name: string | null, reason: string, whose: 'resident' | 'subconscious'): void => {
+      if (!name || this.releaseTurnsAsked.has(whose)) return;
+      try {
+        this.hooks.requestInference(name, reason, 'tune-out');
+        console.error(`[tune-out] the last stop dropped the turn a release asked for ${name} while it was under way, so it is asked for again`);
+      } catch (err) {
+        console.error(`[tune-out] the turn the last stop dropped for ${name}'s release could not be asked for again: ${thrownReason(err)}`);
+      }
+    };
+    try {
+      if (owed.resident === true) ask(this.hooks.primaryName(), 'tune-out released (restored)', 'resident');
+      if (owed.subconscious === true) ask(this.hooks.subconsciousName(), 'tune-out (restored)', 'subconscious');
+    } catch (err) {
+      console.error(`[tune-out] the turns the last stop dropped could not be asked for again: ${thrownReason(err)}`);
     }
   }
 
@@ -2601,7 +2788,8 @@ export class TuneOutCoordinator {
     // wrote no release of its own records its askers nowhere else.
     const noteRuns = new Map<string, { sequence: number; askers: string[] }>();
     const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string; askers: string[] }>>();
-    const toldInRelease = new Set<string>();
+    // The newest release of each epoch that told a queued note's loss (`lostNote`).
+    const toldInRelease = new Map<string, number>();
     // Whether that run's rows were read: not where they are another
     // branch's, or the read throws, and then whether a cancel ran isn't known.
     let rowsRead = !elsewhere;
@@ -2617,7 +2805,7 @@ export class TuneOutCoordinator {
             ? (meta.cancel.askers as unknown[]).filter((a): a is string => typeof a === 'string') : undefined;
           if (askers && (noteRuns.get(meta.epochId)?.sequence ?? -Infinity) < m.sequence) noteRuns.set(meta.epochId, { sequence: m.sequence, askers });
         } else if (meta.kind === 'tune-out-cancel') {
-          if (meta.lostNote === true) toldInRelease.add(meta.epochId);
+          if (meta.lostNote === true) toldInRelease.set(meta.epochId, Math.max(toldInRelease.get(meta.epochId) ?? -Infinity, m.sequence));
           releases.set(meta.epochId, [...(releases.get(meta.epochId) ?? []), {
             sequence: m.sequence,
             ...(typeof meta.cancel?.source === 'string' ? { source: meta.cancel.source } : {}),
@@ -2686,10 +2874,6 @@ export class TuneOutCoordinator {
     for (const hold of uncovered) {
       const { epochId, serverId, channelId, scope } = hold;
       const what = scope ? `the all-except hold (epoch ${epochId})` : `the tune-out of ${this.shown(serverId, channelId)} (epoch ${epochId})`;
-      if (toldInRelease.has(epochId)) {
-        console.error(`[tune-out] the last stop did not record the state of ${what}, but a release of it already told ${author} that its waiting note was lost`);
-        continue;
-      }
       if (kept.has(epochId)) {
         console.error(`[tune-out] the last stop's stamp doesn't cover ${what}, but the stop kept the loss of its waiting note in the store, which is told`);
         continue;
@@ -2700,6 +2884,15 @@ export class TuneOutCoordinator {
       // its entry, and the rows are that run's), so this bound can't be
       // told from none by any store; it is kept for the reading's sake.
       const after = asked ? asked.sequence : Math.max(hold.startedAt ?? -Infinity, since ?? -Infinity);
+      // A release that told a queued note's loss, and a note, count for
+      // this ask only where stored after it, as a release that ran does
+      // (ranAfter): one stored before is an earlier cancel's, its end
+      // unrecorded, and says nothing of the note left with a later ask
+      // (AF #844 review 5, #25).
+      if ((toldInRelease.get(epochId) ?? -Infinity) > after) {
+        console.error(`[tune-out] the last stop did not record the state of ${what}, but a release of it already told ${author} that its waiting note was lost`);
+        continue;
+      }
       const ranAfter = (releases.get(epochId) ?? []).filter((r) => r.sequence > after);
       // The subconscious's own cancel: one whose askers name it (a call of
       // its joined to another's waiting cancel among them), or one its
@@ -2726,7 +2919,7 @@ export class TuneOutCoordinator {
         ? [...others.map((a) => `${a}'s`),
           ...(ownRelease.source !== 'subconscious' && ownRelease.reason !== undefined ? [`the cancel for ${ownRelease.reason}`] : [])]
         : [];
-      const noteAt = notes.get(epochId);
+      const noteAt = (notes.get(epochId) ?? -Infinity) > after ? notes.get(epochId) : undefined;
       const drop: UnstampedStop = ranAfter.length > 0
         ? {
           reason: 'unstamped-stop', found: 'ran', ...(asked ? { asked: true as const } : {}),
@@ -2844,7 +3037,8 @@ export class TuneOutCoordinator {
    * there (writePendingMarker, tried again as at boot where it fails),
    * naming the destination and its head now as where this run's rows on it
    * begin (or where they began, on a branch this run was on before: a failed
-   * surgery's restore, say), so that a crash from here on reads only what
+   * surgery's restore, say; or this run's start, on a branch made from this
+   * run's past it, which holds those rows: inheritedStart), so that a crash from here on reads only what
    * this run stored on it. The destination's kept loss notices aren't in memory: the next write
    * of the record reads them in first (lossRecordUnread), and writes this
    * run's kept ones there too; where this run keeps any, that write is
@@ -2858,10 +3052,19 @@ export class TuneOutCoordinator {
       if (branch !== undefined && this.runStarts.has(branch)) {
         this.runStartedAt = this.runStarts.get(branch);
       } else {
-        try {
-          this.runStartedAt = this.hooks.currentSequence();
-        } catch {
-          this.runStartedAt = undefined;
+        // A branch made from this run's past its start (a suppression's
+        // fork, at its head) holds this run's rows since then
+        // at their sequences: this run's start stands there (AF #844
+        // review 5, #74). Any other is read from its head.
+        const inherited = this.inheritedStart(branch);
+        if (inherited !== undefined) {
+          this.runStartedAt = inherited;
+        } else {
+          try {
+            this.runStartedAt = this.hooks.currentSequence();
+          } catch {
+            this.runStartedAt = undefined;
+          }
         }
         if (branch !== undefined) this.runStarts.set(branch, this.runStartedAt);
       }
@@ -2886,6 +3089,27 @@ export class TuneOutCoordinator {
     } catch (err) {
       console.error(`[tune-out] the stop stamp and loss record could not be moved to the store's new branch: ${thrownReason(err)}`);
     }
+  }
+
+  /**
+   * This run's start (runStartedAt), where `branch`, moved to, was made
+   * from the branch this run was on (runBranch) at a point past that start
+   * (branchOrigin): the branch holds this run's rows since then, at their
+   * sequences. Undefined otherwise, or where the store can't say.
+   */
+  private inheritedStart(branch: string | undefined): number | undefined {
+    if (branch === undefined || this.runBranch === undefined || this.runStartedAt === undefined) return undefined;
+    let origin: { parent: string; branchPoint: number } | undefined;
+    try {
+      origin = this.hooks.branchOrigin?.(branch);
+    } catch {
+      return undefined;
+    }
+    // Past the start, not at it: a branch's head only grows, so one made at
+    // a point past this run's start was made during this run; one made at
+    // the start itself may be older, holding another run's rows past it.
+    return origin && origin.parent === this.runBranch && typeof origin.branchPoint === 'number' && origin.branchPoint > this.runStartedAt
+      ? this.runStartedAt : undefined;
   }
 
   /**
@@ -3026,7 +3250,13 @@ export class TuneOutCoordinator {
     // which accounts for them (noteUnstampedStop).
     const stopKept = new Set<string>();
     try {
-      if (!this.readLossRecord() || this.lossNotices.size === 0) return stopKept;
+      // One that can't be read is read again by the retry, which this arms:
+      // nothing else may read it before the stop (AF #844 review 5, #39).
+      if (!this.readLossRecord()) {
+        this.armDeferredRetry();
+        return stopKept;
+      }
+      if (this.lossNotices.size === 0) return stopKept;
       for (const kept of this.lossNotices.values()) {
         for (const notice of kept) if (notice.persistent && notice.drop.reason === 'stopped') stopKept.add(notice.for.epochId);
       }
@@ -3134,7 +3364,7 @@ export class TuneOutCoordinator {
         why = `The host stopped while your cancel waited, so your cancel was lost${withNote}`
           + `${noteUnknown !== undefined ? notKnown(noteUnknown) : ''}${nowInForce()}`;
       } else if (drop.reason === 'superseded') {
-        why = `An earlier cancel of that ${it} was running when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note is to go out when it ends the ${it}; where it can't be delivered, its author is told.`;
+        why = `An earlier cancel of that ${it} was running when you asked for yours, and yours joined it, with a note of its own that stands, so your note was dropped. That cancel's note is to go out when it ends the ${it}; where it can't be delivered, its author is told, if it still runs.`;
       } else if (drop.reason === 'unstamped-stop') {
         // Written whole below.
       } else {
@@ -3290,7 +3520,7 @@ export class TuneOutCoordinator {
     const entry = this.deferredCancels.get(key);
     if (!entry) return undefined;
     this.deferredCancels.delete(key);
-    if (this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && this.deferredRetry !== undefined) {
+    if (this.deferredCancels.size === 0 && this.lossNotices.size === 0 && !this.markerPending && !this.lossRecordUnread && this.deferredRetry !== undefined) {
       clearTimeout(this.deferredRetry);
       this.deferredRetry = undefined;
     }
@@ -3455,6 +3685,19 @@ export class TuneOutCoordinator {
       + `and delivering the note then failed: ${reason}${/[.!?]$/.test(reason) ? '' : '.'}`;
   }
 
+  /**
+   * The turn a release asks for (`whose`: the resident's, or the
+   * subconscious's for its report), as requestInference asks it; one asked
+   * while the host's stop is under way (stopTimers, the stop proper not
+   * yet run) is dropped with the stop's closed queue, so the stop's stamp
+   * records it (`wakesOwed`) and the next boot asks it again.
+   */
+  private askReleaseTurn(agent: string, reason: string, whose: 'resident' | 'subconscious'): void {
+    this.hooks.requestInference(agent, reason, 'tune-out');
+    this.releaseTurnsAsked.add(whose);
+    if (this.timersStopped && !this.stopped) this.wakesInStop[whose] = true;
+  }
+
   /** A turn for the persistent subconscious to read the loss of its note that a release told (queuedNoteFirst), as a notice asks for one (writeLossNotice). */
   private askTurnForLoss(where: string): void {
     let subName: string | null;
@@ -3473,7 +3716,8 @@ export class TuneOutCoordinator {
 
   /**
    * Arm the one retry of the deferred cancels and the loss notices not
-   * written (lossNotices), unless it is armed; it arms itself again while
+   * written (lossNotices), and of the loss record not read yet
+   * (lossRecordUnread), unless it is armed; it arms itself again while
    * one still waits.
    */
   private armDeferredRetry(): void {
@@ -3483,7 +3727,7 @@ export class TuneOutCoordinator {
       this.runDeferredCancels();
       // Writes held again at the retry: the cancels and notices wait on,
       // for the next release or this retry.
-      if (this.deferredCancels.size > 0 || this.lossNotices.size > 0 || this.markerPending) this.armDeferredRetry();
+      if (this.deferredCancels.size > 0 || this.lossNotices.size > 0 || this.markerPending || this.lossRecordUnread) this.armDeferredRetry();
     }, EXPIRY_RETRY_MS);
     timer.unref?.();
     this.deferredRetry = timer;
@@ -3794,7 +4038,7 @@ export class TuneOutCoordinator {
       : !!subconsciousNote && this.deliverReaderNote(subconsciousNote, noteAuthor, noteMetadata);
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.askReleaseTurn(primary, `tune-out cancelled (${reason})`, 'resident');
     }
     // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the dump left
@@ -3821,7 +4065,7 @@ export class TuneOutCoordinator {
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
-      this.hooks.requestInference(subName, `tune-out cancelled: ${name}`, 'tune-out');
+      this.askReleaseTurn(subName, `tune-out cancelled: ${name}`, 'subconscious');
     } else if (!subName && this.forkReader) {
       // Forks are the reader: one last fork for the epoch, handed what no
       // fork has been handed yet, plus the cancel notice; its report follows
@@ -4296,11 +4540,11 @@ export class TuneOutCoordinator {
     this.lossesToldInRelease([first?.entry, queued, asQueued], 'all-except');
     if (!asQueued && note) this.deliverReaderNote(note, noteAuthor, { kind: 'subconscious-note', epochId });
     const primary = this.hooks.primaryName();
-    if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+    if (primary) this.askReleaseTurn(primary, `tune-out cancelled (${reason})`, 'resident');
     const notice = `[${NOTICE_TAG.tuneOutCancelled}: all channels except ${this.shown(except.serverId, except.channelId)} — ${reason}.]`;
     if (source !== 'subconscious' && subName) {
       this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);
-      this.hooks.requestInference(subName, 'tune-out cancelled: all-except', 'tune-out');
+      this.askReleaseTurn(subName, 'tune-out cancelled: all-except', 'subconscious');
     } else if (!subName && this.forkReader) {
       // One last look per channel with messages no fork was handed. That
       // holds for a reader's own release too: the reader that released read one channel's
@@ -5104,8 +5348,8 @@ export class TuneOutCoordinator {
             isError: true,
             error: "Nothing was posted: speak_in_channel is turned off for you in the resident's configuration, and "
               + "calling it again won't change that. The resident can speak there. deliver_summary puts your text in "
-              + "the resident's context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident (its "
-              + 'answer says if the cancel has to wait).',
+              + "the resident's context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident, up "
+              + 'to its backlog cap (its answer says if the cancel has to wait).',
           };
         }
         const channelId = String(input.channelId ?? '');
@@ -5241,6 +5485,7 @@ export class TuneOutCoordinator {
    * tells and keeps what is left (Weft's hold 2, #844). Never throws.
    */
   stopTimers(): void {
+    this.timersStopped = true;
     if (this.releaseRetry) {
       clearTimeout(this.releaseRetry);
       this.releaseRetry = null;
