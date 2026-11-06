@@ -4,7 +4,9 @@
  *
  * A write is stored at once, whatever its agent's turn (unless a surgery's
  * hold or a refusing manager keeps it in memory), and enters the agent's
- * window at the agent's next presentation point. One that arrives
+ * window (a write for it: one a tune-out holds is for no resident, and
+ * enters no resident's window) at the agent's next presentation point.
+ * One that arrives
  * during a round enters at the agent's next tool boundary and is injected
  * into the resumed stream (hear-while-acting), so the next compile's prefix
  * is the request the turn's later replies were minted under. Two kinds of

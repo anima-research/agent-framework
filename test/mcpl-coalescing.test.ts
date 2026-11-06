@@ -3081,7 +3081,7 @@ test("a render cancelled while it runs leaves the recovery wake of a batch opene
   }
 });
 
-test("a render whose store write keeps being refused waits longer before each recovery wake", { timeout: 120_000 }, async (t) => {
+test("a render whose store write keeps being refused waits longer before each recovery wake, up to its cap", { timeout: 120_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number } } }).pushCoalescer;
   coalescer.options.recoveryBackoffMs = 20;

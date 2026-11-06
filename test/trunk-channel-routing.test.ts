@@ -1040,15 +1040,16 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
-  it("a boundary that re-pins supersedes an arrival from another resident's store (latest-inbound)", async () => {
+  it("a boundary that re-pins stands, a message for another resident beside it (latest-inbound)", async () => {
     const { framework, i, routed, release } = await residents('scout', { 2: hereIAm }, [
       [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
       [] as ContentBlock[],
     ], LEGACY);
-    // While scout's tool runs, a message for shade is stored at once, an
-    // arrival for scout's turn. Then one for scout is stored at once too and
-    // kept out of scout's window until its next presentation point, the
-    // boundary, which presents it after, re-pinning the turn there.
+    // While scout's tool runs, a message for shade is stored at once:
+    // stamped for shade since #291, it is no arrival for scout. Then one for
+    // scout is stored at once too and kept out of scout's window until its
+    // next presentation point, the boundary, which presents it, re-pinning
+    // the turn there.
     pause.during = async () => {
       i.addMessage('Antra', [{ type: 'text', text: 'shade, a word' }],
         { channelId: 'discord:dm:xenia', serverId: 'discord', tags: ['chat:addressed'] }, { forAgent: 'shade' });

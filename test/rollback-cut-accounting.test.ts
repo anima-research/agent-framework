@@ -10,7 +10,8 @@
  * (`returnedToArrivals`): the agent's own rows among them enter it again at
  * its next presentation point (the surgery's release), and the rest, arrived
  * and not presented, wait outside the window until the agent's next turn
- * start, so for them the cut holds until it speaks again; the rows
+ * start, so for them the cut holds until it speaks again (the hold is in
+ * memory: a restart presents them at its pass at rest); the rows
  * one write presented together with the target stay after it and are
  * reported too (`keptInWindowAfterTarget`), and a rollback that would
  * change nothing because of them names them and the removals that can take

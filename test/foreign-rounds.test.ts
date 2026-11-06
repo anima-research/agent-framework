@@ -1,9 +1,11 @@
 /**
  * Another agent's rounds as an agent that watches its slot is sent them
  * (#291, answer 13; src/foreign-rounds.ts): a line per call and per result,
- * no thinking, the watcher's own rounds and the results of its own calls as
- * stored. The persistent subconscious's own voice is its name alone, so a
- * round stored under the primary's alias is another agent's to it too.
+ * no thinking (in the default mode, 'transcript'; 'raw' sends them as
+ * stored, thinking included), the watcher's own rounds and the results of
+ * its own calls as stored. The persistent subconscious's own voice is its
+ * name alone, so a round stored under the primary's alias is another
+ * agent's to it too.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';

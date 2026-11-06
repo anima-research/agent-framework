@@ -40,7 +40,9 @@ import type { ContentBlock } from '@animalabs/membrane';
 //   made before a turn where main's undo went before it.
 // - No queue holds a write. A write made while a move holds the store is kept
 //   in memory by the hold (a module's addMessage answers '', a fork's channel
-//   message is placed for the fork with no id) and stored at the release. A
+//   message is placed for the fork with no id) and stored at the release; a
+//   fork the move empties is disposed, the primary taking the writes it takes
+//   in the fork's place, and the rest, its channel messages, dropped. A
 //   write for an agent whose manager then refuses its work waits in memory
 //   too, as does every write for it until a branch move re-initializes it, which
 //   stores them (main kept them in its queue); an agent that ends first passes
@@ -1918,8 +1920,9 @@ describe('conversation forks and a branch move', () => {
   }
 
   // main's redo variant of the test above has none here: a redo is on the
-  // window and moves no branch, so a fork made between an undo and its redo
-  // keeps its history, as the next test but one checks.
+  // window and moves no branch, so a fork spawned after the turn an undo
+  // takes out keeps its history through the undo and its redo, as "an undo
+  // and a redo of the turn before a fork was spawned…" checks.
   it("a clock-keeping fork the move emptied is disposed, though a channel message and a correction arrived for it, re-initialized, while the store was held", { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-dispose-clock-', async (framework, forkInternals) => {
       await forksAroundACheckpoint(framework, forkInternals);
