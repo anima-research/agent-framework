@@ -1045,3 +1045,53 @@ describe("a note kept in memory by its cancel's own run, whose store fails when 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 (nissa's house, the follow-up): the same kept note, stored when
+// the writes are stored. The cancel can still wait after that: its run
+// can't record the end, or writes are held again before it runs. A stop
+// then must not tell the reader its note was lost: the resident has it.
+// ---------------------------------------------------------------------------
+
+describe("a note kept in memory by its cancel's own run and stored when the writes are stored (AF #844, nissa's house)", () => {
+  for (const waits of ['its run can\'t record the end', 'writes are held again before it runs', 'a crash, its run unable to record the end'] as const) it(`counts as delivered: its cancel still waiting (${waits}), ${waits.startsWith('a crash') ? 'the next start reads the note as delivered' : 'a stop tells the subconscious no note lost, and the next start tells nothing of the hold'}`, async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun();
+    try {
+      if (waits === 'writes are held again before it runs') {
+        // Writes are held again as soon as the kept note is stored, so the
+        // release's run of the deferred cancels finds them held.
+        const hooks = (internals(h.f).tuneOutCoordinator as unknown as { hooks: { writesHeld?: () => boolean } }).hooks;
+        const off = h.f.framework.onTrace((t) => {
+          if (t.type === 'message:added' && (t as { source?: string }).source === 'surgery-release' && has(h.f, HELD_NOTE)) hooks.writesHeld = () => true;
+        });
+        h.release();
+        off();
+      } else {
+        endNotRecorded(h.f);
+        h.release();
+      }
+      assert.equal(stored(h.f).filter((m) => textOf(m) === HELD_NOTE).length, 1, 'premise: the kept note was stored at the release, once');
+      assert.equal(h.registry.getTuneOutState('editor', 'noisy')?.params.epochId, h.epochId, 'premise: the cancel still waits, the hold in force');
+      if (waits.startsWith('a crash')) await crashLosingStopWrites(h.f);
+      else await h.f.framework.stop();
+      const lines = errors.mock.calls.map((c) => String(c.arguments[0])).filter((l) => l.includes('stopping:'));
+      assert.ok(!lines.some((l) => l.includes('is not delivered')), `the stop says no note is lost: ${lines.join('\n')}`);
+      await h.f.create();
+      assert.equal(internals(h.f).channelRegistry.getTuneOutState('editor', 'noisy')?.params.epochId, h.epochId, 'the hold is still in force after the restart');
+      const told = presentedTo(h.f, h.sub).filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.deepEqual(told, waits.startsWith('a crash') ? [ranWithNote(h.epochId)] : [],
+        waits.startsWith('a crash')
+          ? "the next start reads that run's rows: its cancel ran, with the note delivered"
+          : 'the subconscious is told nothing: the note was delivered, and the stop accounted for the hold');
+      const record = (h.f.framework as unknown as Restartable).channelRegistry.readCoordinatorState(LOSS_RECORD) as { pendingLossNotices?: unknown[] } | null;
+      assert.deepEqual(record?.pendingLossNotices ?? [], [], 'no loss is kept in the store');
+      assert.equal(stored(h.f).filter((m) => textOf(m) === HELD_NOTE).length, 1, 'the resident has the note once');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+});

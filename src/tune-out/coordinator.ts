@@ -146,7 +146,8 @@ interface WindowStartsState {
  * force; where storing it when they are stored fails, the framework says
  * so (heldWriteLost), and the note is told lost by a notice, as above, once
  * the hold ends, or as one that may be lost where the store can't tell
- * whether it landed; it isn't written again. The waiting
+ * whether it landed; it isn't written again. Stored then, it counts as
+ * delivered (heldWriteStored), even while the cancel still waits. The waiting
  * cancel, and the note with it, is kept in memory only: a stop before the
  * hold ends loses both, and the subconscious is told of the note's loss
  * as of any other, by a notice kept in the store for the next boot (stop),
@@ -384,10 +385,12 @@ interface DeferredCancel {
    * What settled its note, its delivery or the release that told its loss,
    * is a write kept in memory (writes held from it on), stored at their
    * release: a stop before then loses it, so the stop tells the note lost,
-   * as it tells one not settled (dropQueued). Gone once the note's loss is
-   * told (dropDeferred), so nothing tells it again; and, where storing the
-   * note at the release failed, once the framework says so
-   * (heldWriteLost, lostAtRelease).
+   * as it tells one not settled (dropQueued). Gone once the framework
+   * stores that write at their release (heldWriteStored): the note counts as
+   * delivered then, or its loss as told, and a stop while the cancel still
+   * waits tells nothing; once the note's loss is told (dropDeferred), so
+   * nothing tells it again; and, where storing the note at the release
+   * failed, once the framework says so (heldWriteLost, lostAtRelease).
    */
   heldInMemory?: true;
   /**
@@ -1794,6 +1797,37 @@ export class TuneOutCoordinator {
   }
 
   /**
+   * A write the framework kept in memory while writes were held, stored when
+   * it stored them (its replay landed), by its metadata as it was given:
+   * heldWriteLost's sibling, called from the same release. What a queued
+   * cancel kept in memory so (heldInMemory) is in the store now, so a stop
+   * no longer loses it: the queued note written by the cancel's own run or
+   * ahead of another cancel's release (`subconscious-note`, of the cancel's
+   * epoch) counts as delivered, and a release that told its loss
+   * (`tune-out-cancel` with `lostNote`, queuedNoteFirst) as told. The cancel
+   * can still wait after that (writes held again before it runs, or a run
+   * that throws before it records the end): a stop then drops it as one
+   * whose note is settled, telling the author nothing false. Any other write
+   * changes nothing. Never throws.
+   */
+  heldWriteStored(metadata: Readonly<Record<string, unknown>> | undefined): void {
+    try {
+      if (typeof metadata?.epochId !== 'string') return;
+      const note = metadata.kind === 'subconscious-note';
+      if (!note && !(metadata.kind === 'tune-out-cancel' && metadata.lostNote === true)) return;
+      for (const entry of this.deferredCancels.values()) {
+        if (entry.for.epochId !== metadata.epochId || entry.note === undefined || !entry.noteSettled || !entry.heldInMemory) continue;
+        // A note's write settled one whose note went out; a release's, one whose loss it told.
+        if (note === (entry.lostInRelease !== undefined)) continue;
+        delete entry.heldInMemory;
+        return;
+      }
+    } catch (err) {
+      console.error(`[tune-out] a write kept in memory and stored when the writes were stored could not be matched to a waiting cancel: ${thrownReason(err)}`);
+    }
+  }
+
+  /**
    * A queued cancel back on the queue (`key`) after a run that didn't end
    * its hold: one that threw, or met writes held again (waitForWrites). A
    * cancel queued there meanwhile, for the same epoch (a trace listener's,
@@ -1845,8 +1879,9 @@ export class TuneOutCoordinator {
    * (`hold-ended`); one delivered, or told lost already, isn't told lost
    * again: its drop is logged and traced as one with no note, unless the
    * write that settled it is kept in memory at a stop (heldInMemory), which
-   * loses it. One whose write was lost when the writes were stored
-   * (lostAtRelease) isn't settled: it is told lost by this drop, once.
+   * loses it; one stored since (heldWriteStored) is settled. One whose write
+   * was lost when the writes were stored (lostAtRelease) isn't settled: it
+   * is told lost by this drop, once.
    */
   private dropQueued(entry: DeferredCancel, drop: DeferredDrop): void {
     if (entry.lostInRelease && drop.reason === 'hold-ended') {

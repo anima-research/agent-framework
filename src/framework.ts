@@ -24379,7 +24379,9 @@ export class AgentFramework {
    * the tune-out coordinator, by its metadata (heldWriteLost), before the
    * deferred cancels run: a reader's note kept with a waiting cancel is
    * told lost to the reader when that cancel ends the hold, as the cancel's
-   * waiting answer promised.
+   * waiting answer promised. So is each write stored (heldWriteStored),
+   * before its trace: such a note counts as delivered then, and a stop
+   * while its cancel still waits doesn't tell it lost.
    */
   private releaseSurgeryHeldWrites(): void {
     // A release met while this one replays (a recovery with no hold, a
@@ -24432,7 +24434,8 @@ export class AgentFramework {
    * One write of releaseSurgeryHeldWrites's replay, the head of `queue`,
    * stored by the path it was held on; one that fails is noted in `lost`,
    * by agent, and given to the tune-out coordinator (heldWriteLost), which
-   * knows its own writes by their metadata. It is taken off the queue once
+   * knows its own writes by their metadata; one stored is given to it too
+   * (heldWriteStored). It is taken off the queue once
    * it is stored, kept for its agent's recovery, passed on or lost, before
    * its trace; false where a
    * hold begun during its store (a listener of its clock row's trace)
@@ -24473,7 +24476,18 @@ export class AgentFramework {
         return false;
       }
       settle();
-      if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
+      if (id) {
+        // The tune-out coordinator, by the write's metadata, before the
+        // trace (whose listener may stop the host): a write of its own kept
+        // in memory with a waiting cancel (a reader's note) is stored now,
+        // so a stop while that cancel waits doesn't tell it lost.
+        try {
+          this.tuneOutCoordinator?.heldWriteStored(write.metadata);
+        } catch (hookError) {
+          console.error('[surgery] the tune-out coordinator could not be told of a write stored at the release:', hookError);
+        }
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
+      }
       return true;
     } catch (error) {
       settle();
