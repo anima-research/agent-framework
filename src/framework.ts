@@ -25408,7 +25408,6 @@ export class AgentFramework {
           // but the [speech-not-posted] notice; this frame still owns its
           // token, since no retry frame replaced it.
           this.nameUnpostedSpeech(agent, routing);
-          this.abandonSpeechAsks(agent.name, routing);
           this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
@@ -27290,7 +27289,6 @@ export class AgentFramework {
                 // gives. The finally ends its gate entry and its record. As
                 // in abortDroppedTurn, nothing when another turn of this name
                 // holds the token, whose bracket the event would end.
-                this.abandonSpeechAsks(agent.name, streamRouting);
                 const owner = this.activeTurnTokens.get(agent.name);
                 if (owner === undefined || owner === myTurnToken) {
                   if (this.agents.get(agent.name) === agent) this.nameUnpostedSpeech(agent, streamRouting);
