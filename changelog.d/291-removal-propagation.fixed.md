@@ -20,11 +20,11 @@
   that would remove nothing and take nothing out of the window is refused as a no-op, saying why. When its target was
   presented in one write with rows after it, the refusal names the first of them and points to `suppressMessages` with
   every one of their row ids, grouped by the agent each goes through (for a row of a slot the agent observes, the
-  agent whose own slot holds it, or, where that slot holds no other row, that the suppression there is refused), or to
-  the host's `hide` with the Discord message ids of those that have one, each with the agent to run it on. A row
-  holding a result of a call at or before the target isn't advised for suppression, which would leave the call without
-  its result: the refusal says to roll back before the call, naming the message before it, and offers suppression for
-  the rest.
+  agent whose own slot holds it, or, where that slot holds no other row, that the suppression there is refused), or,
+  where any has a Discord message id, to the host's `hide` with the ids of those that have one, each with the agent to
+  run it on. A row holding a result of a call at or before the target isn't advised for suppression, which would leave
+  the call without its result: the refusal says to roll back before the call, naming the message before it, and offers
+  suppression for the rest.
 - Offline recovery on a presented window:
   - refuses a cut that would change nothing, as the live rollback does, a dry run too, and an anchor already at the
     window's tail. Its refusal names the rows with a Discord id for `--suppress` (`suppressMessageIds`) in the same
