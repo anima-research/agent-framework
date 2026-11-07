@@ -1082,6 +1082,7 @@ interface CoalescedChannelEvent {
   /** The coalescer's mark: the agent's first view of the message (see
    *  CoalescedOccurrence.firstView). */
   firstView?: boolean;
+  eventIdAsMessageId?: true;
   /** A batch's recovery after a delivery that may have stored the message
    *  (FrameworkWriteOptions.mayBeStored). */
   mayBeStored?: true;
@@ -1440,6 +1441,7 @@ interface TurnRouting {
    * sent Sol's DM reply to a stale guild channel (2026-07-22).
    */
   triggerChannel?: ChannelRef;
+  answers?: { channel: ChannelRef; messageId?: string };
   /**
    * The turn was woken for a channel that names no one registered channel (a
    * host's id, given without its server, that two servers' channels answer
@@ -4128,6 +4130,11 @@ function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | und
   return byEntry.size > 0 ? [...byEntry.values()] : undefined;
 }
 
+function answersSameMessage(a: InferenceRequest, b: InferenceRequest | undefined): boolean {
+  return a.answersMessageId === b?.answersMessageId
+    && a.channelId === b?.channelId && a.channelServerId === b?.channelServerId;
+}
+
 /** A batched-wake line's identity: its event's stored entry. */
 function wakeLineKey(line: WakeLine): string {
   const { eventType, serverId, channelId, messageId, eventId } = line.entry;
@@ -4533,7 +4540,9 @@ export class AgentFramework {
    * retry the receipt answers, which delivers nothing again, commits the one
    * its first attempt parked. Keyed by server and event id; bounded.
    */
-  private parkedAnchors: Map<string, { channel: ChannelRef; messageId: string; threadId?: string; tags?: string[]; firstView: boolean }> = new Map();
+  private parkedAnchors: Map<string, { channel: ChannelRef; messageId: string; threadId?: string; tags?: string[]; firstView: boolean; seq: number }> = new Map();
+  private deliverySeq = 0;
+  private anchorSeq = 0;
   /** `tuneOut.announce`: the excepted channel hears the all-except scope open and close. */
   private tuneOutAnnounce = true;
   /** `speech.locus`: where prose goes when nothing names a destination (see FrameworkConfig). */
@@ -7105,6 +7114,7 @@ export class AgentFramework {
       held.push(request);
       return;
     }
+    if (!answersSameMessage(same, request)) same.answersMessageId = undefined;
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did.
@@ -14271,27 +14281,24 @@ export class AgentFramework {
     'chat:thread': 'Occurred in a thread',
   };
 
+  private answersOn(event: { messageId?: string; tags?: unknown; firstView?: boolean; eventIdAsMessageId?: true }): Pick<InferenceRequest, 'answersMessageId'> {
+    if (!event.messageId || event.eventIdAsMessageId || isMarkerTagged(event.tags, event.firstView === true)) return {};
+    return { answersMessageId: event.messageId };
+  }
+
   /**
-   * Mark an inference refusal visibly: react on the message that holds the
-   * refused agent's conversational locus (the most recent incoming channel
-   * message that isn't a reaction, reaction removal, edit or deletion
-   * marker or a chat:system notice, apart from an edit the coalescer delivers on acceptance as the
-   * agent's first view; an ephemeral run has none, so a subagent's refusal
-   * marks no message) with a category-specific emoji. Best-effort —
-   * failures are logged, never thrown, and non-Discord loci are silently
-   * skipped.
+   * Mark an inference refusal visibly: react on the message the refused turn
+   * answers with a category-specific emoji. Best-effort — failures are
+   * logged, never thrown, and non-Discord loci are silently skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
-      // The refused agent's own view of the latest inbound message: an
-      // ephemeral run has none (takesGlobalFallback), so a subagent's refusal
-      // marks no one else's channel.
-      const incoming = this.channelRegistry?.incomingFor(agentName);
-      if (!incoming) return;
+      const answers = this.turnRouting.get(agentName)?.answers;
+      if (!answers?.messageId) return;
       // The channel id is the MCPL composite id ("discord:<guild>:<channel>");
       // the reaction tool wants the raw Discord channel (or thread) id — the
       // last segment.
-      const parts = incoming.channel.channelId.split(':');
+      const parts = answers.channel.channelId.split(':');
       if (parts[0] !== 'discord') return;
       const channelId = parts[parts.length - 1];
       // Own names only: an inherited one such as 'constructor' takes the fallback.
@@ -14300,16 +14307,16 @@ export class AgentFramework {
       // channel the message came in on (bare tool name — no prefix games),
       // bypassing the agent event queue so no synthetic tool-result is
       // injected into a turn the agent never took.
-      const server = this.mcplServerRegistry?.getServer(incoming.channel.serverId);
+      const server = this.mcplServerRegistry?.getServer(answers.channel.serverId);
       if (!server) {
         console.error(
-          `[inference-refusal] reaction skipped: no MCPL server for locus ${logValue(incoming.channel.channelId)} on server ${logValue(incoming.channel.serverId)} (agent=${agentName})`,
+          `[inference-refusal] reaction skipped: no MCPL server for locus ${logValue(answers.channel.channelId)} on server ${logValue(answers.channel.serverId)} (agent=${agentName})`,
         );
         return;
       }
       await server.sendToolsCall('add_reaction', {
         channelId,
-        messageId: incoming.messageId,
+        messageId: answers.messageId,
         emoji,
       });
     } catch (err) {
@@ -19625,22 +19632,23 @@ export class AgentFramework {
   /**
    * A delivered inbound message becomes the latest delivered inbound (the
    * channel context's reply anchor; the legacy speech fallback) through the
-   * registry's noteDelivered — at once for a plain channels/incoming, whose
-   * acceptance the registry answers synchronously; parked for a coalesced one
-   * until its acceptance is acknowledged (see parkedAnchors).
+   * registry's noteDelivered — at once for a plain delivery, on either lane,
+   * whose acceptance the registry answers synchronously; parked for a
+   * coalesced one until its acceptance is acknowledged (see parkedAnchors).
    */
   private noteDeliveredOrPark(event: {
     serverId: string; channelId: string; messageId: string; threadId?: string; tags?: string[];
-    eventId?: string; coalescingSubject?: string; firstView?: boolean;
+    eventId?: string; coalescingSubject?: string; firstView?: boolean; assemblingFor?: string; eventIdAsMessageId?: true;
   }): void {
+    if (event.assemblingFor !== undefined || event.eventIdAsMessageId) return;
     // On the server the message came from (noteDelivered).
-    const anchor = { channel: { serverId: event.serverId, channelId: event.channelId }, messageId: event.messageId, threadId: event.threadId, tags: event.tags, firstView: event.firstView === true };
+    const anchor = { channel: { serverId: event.serverId, channelId: event.channelId }, messageId: event.messageId, threadId: event.threadId, tags: event.tags, firstView: event.firstView === true, seq: ++this.deliverySeq };
     if (event.coalescingSubject && typeof event.eventId === 'string') {
-      this.parkedAnchors.set(`${event.serverId}:${event.eventId}`, anchor);
+      this.parkedAnchors.set(JSON.stringify([event.serverId, event.eventId]), anchor);
       if (this.parkedAnchors.size > 1000) this.parkedAnchors.delete(this.parkedAnchors.keys().next().value!);
       return;
     }
-    this.channelRegistry?.noteDelivered(anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView);
+    if (this.channelRegistry?.recordDelivered(anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView)) this.anchorSeq = anchor.seq;
   }
 
   private async handleMcplChannelIncoming(event: {
@@ -19664,6 +19672,7 @@ export class AgentFramework {
     assemblingFor?: string;
     deliverTo?: string;
     firstView?: boolean;
+    eventIdAsMessageId?: true;
     /** FrameworkWriteOptions.mayBeStored, for the message's store. */
     mayBeStored?: true;
     acceptedAt?: number;
@@ -19825,6 +19834,7 @@ export class AgentFramework {
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
             // Stored for the fork, so its wake reads the row, as a resident's does.
             ...this.readsRowFor(placement, target.name),
+            ...this.answersOn(event),
           });
         }
         return placement;
@@ -19911,6 +19921,7 @@ export class AgentFramework {
           ...systemNoticeMark(event.tags),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           ...this.readsRowFor(placement, agentName),
+          ...this.answersOn(event),
         });
       }
     }
@@ -20035,6 +20046,7 @@ export class AgentFramework {
         ...systemNoticeMark(event.tags),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         ...this.readsRowFor(placement, agent.name),
+        ...this.answersOn(event),
       });
     }
     return placement;
@@ -21154,14 +21166,7 @@ export class AgentFramework {
       // answers leaves the anchor where a marker would, as the host already
       // counts what was stored before a restart as shown: every agent's
       // shown watermark starts at the head at boot.
-      const firstView = this.pushCoalescer.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId);
-      // Acknowledged: the anchor the delivery parked is committed now (and a
-      // retry answered from the receipt commits its first attempt's).
-      const parked = this.parkedAnchors.get(`${serverId}:${message.eventId}`);
-      if (parked) {
-        this.parkedAnchors.delete(`${serverId}:${message.eventId}`);
-        this.channelRegistry?.noteDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView === true);
-      }
+      const firstView = this.commitParkedAnchor(serverId, message.eventId);
       return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
     });
   }
@@ -21204,7 +21209,7 @@ export class AgentFramework {
             deferred: !!c.deferred,
           })
         : this.pushSource(event, { deferred: !!c.deferred });
-      return this.pushCoalescer.accept({
+      const result = await this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
         featureSet: params.featureSet,
@@ -21227,7 +21232,22 @@ export class AgentFramework {
         } : {}),
         event: { lane: 'push', event: { ...event, inboundSource } },
       });
+      this.commitParkedAnchor(serverId, params.eventId);
+      return result;
     });
+  }
+
+  private commitParkedAnchor(serverId: string, eventId: string): boolean {
+    const firstView = this.pushCoalescer?.receiptFirstView(serverId, this.coalescingBinding(serverId), eventId) === true;
+    const key = JSON.stringify([serverId, eventId]);
+    const parked = this.parkedAnchors.get(key);
+    if (parked) {
+      this.parkedAnchors.delete(key);
+      if (parked.seq > this.anchorSeq && this.channelRegistry?.recordDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView)) {
+        this.anchorSeq = parked.seq;
+      }
+    }
+    return firstView;
   }
 
   /** §3.2: a channel-scoped push needs what a channels/incoming message needs. */
@@ -21342,6 +21362,7 @@ export class AgentFramework {
         serverId: occ.serverId,
         channelId: occ.scope.id,
         messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
+        ...((identity.messageId ?? str(origin.messageId)) ? {} : { eventIdAsMessageId: true as const }),
         threadId: identity.threadId ?? str(origin.threadId),
         author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
         content: materialized ? convertBlocks(materialized, 'attachment on push event', occ.serverId) : push.content,
@@ -21859,6 +21880,20 @@ export class AgentFramework {
       if (suppressedBy) {
         this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: triggerChannel?.channelId ?? '' });
       }
+      const origin = event.origin ?? {};
+      if (decision.locus && triggerChannel && typeof origin.messageId === 'string' && origin.messageId) {
+        this.noteDeliveredOrPark({
+          serverId: event.serverId,
+          channelId: triggerChannel.channelId,
+          messageId: origin.messageId,
+          threadId: typeof origin.threadId === 'string' && origin.threadId ? origin.threadId : undefined,
+          tags: event.tags,
+          eventId: event.eventId,
+          coalescingSubject: event.coalescingSubject,
+          firstView: event.firstView,
+          assemblingFor: event.assemblingFor,
+        });
+      }
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
@@ -21891,6 +21926,7 @@ export class AgentFramework {
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           ...this.readsRowFor(placement, agentName),
+          ...this.answersOn({ messageId: typeof event.origin?.messageId === 'string' ? event.origin.messageId : undefined, tags: event.tags, firstView: event.firstView }),
         });
       }
     }
@@ -22207,6 +22243,7 @@ export class AgentFramework {
           const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
+          if (prev && !answersSameMessage(prev, request)) kept.answersMessageId = undefined;
           // The wake it absorbs hands on its lines (WakeLine): each event's
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
@@ -22483,6 +22520,8 @@ export class AgentFramework {
         // take no other cause with it.
         readsRow: requests.every((r) => r.readsRow === trigger?.readsRow)
           ? trigger?.readsRow : undefined,
+        answersMessageId: requests.every((r) => answersSameMessage(r, trigger))
+          ? trigger?.answersMessageId : undefined,
         // Every merged wake's handed line, each event's once: the turn's start
         // decides each (beginAgentTurn).
         wakeLines: mergeWakeLines(requests),
@@ -27436,6 +27475,9 @@ export class AgentFramework {
         ? this.channelNamed(trigger.channelId, trigger.channelServerId)
         : undefined;
       noteTurnChannel(routing, routing.triggerChannel);
+      if (routing.triggerChannel && this.usedEphemeralAgentNames.get(agent.name) !== 'run') {
+        routing.answers = { channel: routing.triggerChannel, ...(trigger?.answersMessageId ? { messageId: trigger.answersMessageId } : {}) };
+      }
       const unresolvedTrigger = !!trigger?.channelId && routing.triggerChannel === undefined;
       if (unresolvedTrigger) routing.noChannel = true;
       else delete routing.noChannel;
@@ -29401,12 +29443,7 @@ export class AgentFramework {
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
                 if (forced) forced.removed.push(rec);
-                this.pendingRequests.push({
-                  agentName: agent.name,
-                  reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
-                  source: 'framework',
-                  timestamp: Date.now(),
-                });
+                this.pendingRequests.push(this.rewindRetry(agent.name, forced ? 'unstick-retry' : 'refusal-rewind-retry'));
                 handledByRewind = true;
               };
 
@@ -34947,10 +34984,9 @@ export class AgentFramework {
       kind: 'refusal',
       category,
       streak,
-      // The refused agent's own view: a subagent's refusal names no channel.
       // Named as the agent is shown it, so a shared id names its server.
       locus: ((channel) => (channel ? this.channelRegistry?.nameShown(channel) ?? suppliedValue(channel.channelId) : null))(
-        this.channelRegistry?.incomingFor(agentName)?.channel),
+        this.turnRouting.get(agentName)?.answers?.channel),
       tokens: tokens ?? null,
     });
     if (streak >= 2) {
@@ -35291,12 +35327,22 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    this.pendingRequests.push({
-      agentName: agent.name,
-      reason: 'inference-failure-rewind-retry',
+    this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry'));
+  }
+
+  private rewindRetry(agentName: string, reason: string): InferenceRequest {
+    const answers = this.turnRouting.get(agentName)?.answers;
+    return {
+      agentName,
+      reason,
       source: 'framework',
       timestamp: Date.now(),
-    });
+      ...(answers ? {
+        channelId: answers.channel.channelId,
+        channelServerId: answers.channel.serverId,
+        ...(answers.messageId ? { answersMessageId: answers.messageId } : {}),
+      } : {}),
+    };
   }
 
   // ==========================================================================
