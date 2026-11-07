@@ -4250,13 +4250,15 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
-    it('a failure with no round keeps the marker saying nothing was sent', async () => {
+    it('a failure with no round writes no marker, since the turn did nothing', async () => {
       const h = await harness({ retries: 0 });
       try {
+        const exhausted: unknown[] = [];
+        h.framework.onTrace((event) => { if ((event as { type: string }).type === 'inference:exhausted') exhausted.push(event); });
         breakAfterToolRound(h.membrane, 'error', { fromStart: true });
         await h.turn([]);
-        assert.equal(markers(h).length, 1);
-        assert.match(markers(h)[0]!, /the model call failed( \([^)]*\))? and produced no response, so nothing was sent/);
+        assert.equal(exhausted.length, 1, 'premise: the turn failed');
+        assert.deepEqual(markers(h), []);
       } finally {
         await h.close();
       }

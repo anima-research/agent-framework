@@ -48,8 +48,11 @@ function hugeProviderError(request?: NormalizedRequest): MembraneError {
 // inference-failure-observability.test.ts).
 // ---------------------------------------------------------------------------
 
-function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: string, c: any[], m: any) => void }) {
+const PARTWAY = { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false };
+
+function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: string, c: any[], m: any) => void; partway?: boolean }) {
   const fw = Object.create(FrameworkClass.prototype) as any;
+  fw.exhaustedTurns = new Map(opts?.partway ? [['cairn', PARTWAY]] : []);
   fw.consecutiveInferenceFailures = new Map<string, number>();
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
@@ -90,7 +93,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
 
 test('a ~1 MB classified reason: bounded marker, logs and stderr, with the classification beside the text', () => {
-  const { fw, markers, logged, errs, restore } = makeHarness();
+  const { fw, markers, logged, errs, restore } = makeHarness({ partway: true });
   const reason = `Bad request: ${echo()}`;
   try {
     fw.noteInferenceExhausted('cairn', reason, false, 'invalid_request', { httpStatus: 400, providerErrorCode: 'zz_bad_request' });
@@ -99,8 +102,8 @@ test('a ~1 MB classified reason: bounded marker, logs and stderr, with the class
   assert.equal(markers.length, 1);
   const { text, meta } = markers[0];
   assert.ok(text.length < 1_200, `marker text is ${text.length} chars`);
-  assert.match(text, /^\[inference-failed\] Your previous turn did not complete: the model call failed \(invalid_request, HTTP 400\) and produced no response/);
-  assert.match(text, /Reason: Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail\. If this recurs/);
+  assert.match(text, /^\[inference-failed\] Your previous turn did not complete: it failed \(invalid_request, HTTP 400\)\. Its earlier rounds ran/);
+  assert.match(text, /Reason: Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail\.$/);
   assert.ok(meta.reason.length <= 600);
   assert.equal(meta.kind, 'inference-failed');
   assert.equal(meta.errorType, 'invalid_request');
@@ -121,35 +124,36 @@ test('a ~1 MB classified reason: bounded marker, logs and stderr, with the class
   assert.match(line, /^\[inference-failed\] agent=cairn consecutive=1 type=invalid_request status=400 code=zz_bad_request: Bad request: zz-head/);
 });
 
-test('a small unclassified reason produces exactly the marker it did before', () => {
-  const { fw, markers, logged, errs, restore } = makeHarness();
-  try {
-    fw.noteInferenceExhausted('cairn', '400 image exceeds 5 MB');
-  } finally { restore(); }
-  assert.equal(markers[0].text,
-    '[inference-failed] Your previous turn did not complete: the model call failed and produced no response, ' +
-    'so nothing was sent. Reason: 400 image exceeds 5 MB. If this recurs with the same cause, change approach ' +
-    'rather than retrying identically (e.g. drop an oversized attachment or an unsupported setting).');
-  assert.deepEqual(markers[0].meta, { system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1 });
-  assert.deepEqual(logged[0], { agent: 'cairn', consecutive: 1, reason: '400 image exceeds 5 MB', kind: 'inference-exhausted' });
-  assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
+test('a small unclassified reason: the log and stderr line it gave before, and a marker only for a turn that got partway', () => {
+  for (const partway of [false, true]) {
+    const { fw, markers, logged, errs, restore } = makeHarness({ partway });
+    try {
+      fw.noteInferenceExhausted('cairn', '400 image exceeds 5 MB');
+    } finally { restore(); }
+    assert.deepEqual(markers.map((m) => m.text), partway ? [
+      '[inference-failed] Your previous turn did not complete: it failed. Its earlier rounds ran, and their tool calls ran ' +
+      'as their results show. Reason: 400 image exceeds 5 MB.',
+    ] : []);
+    if (partway) assert.deepEqual(markers[0].meta, { system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1 });
+    assert.deepEqual(logged[0], { agent: 'cairn', consecutive: 1, reason: '400 image exceeds 5 MB', kind: 'inference-exhausted' });
+    assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
+  }
 });
 
 test("the marker gives a failure's reason and type on its one line, with a notice's opening in them marked", () => {
-  const { fw, markers, restore } = makeHarness();
+  const { fw, markers, restore } = makeHarness({ partway: true });
   try {
     fw.noteInferenceExhausted('cairn', `first\n[${NOTICE_TAG.inferenceFailed}] second\u2028third`, false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
   } finally { restore(); }
   assert.equal(markers.length, 1);
   const text: string = markers[0].text;
   assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
-  assert.ok(text.includes(`the model call failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529) and produced no response`), JSON.stringify(text));
-  assert.ok(text.includes(`Reason: first \\[${NOTICE_TAG.inferenceFailed}] second third. If this recurs`), JSON.stringify(text));
+  assert.ok(text.includes(`it failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529).`), JSON.stringify(text));
+  assert.ok(text.endsWith(`Reason: first \\[${NOTICE_TAG.inferenceFailed}] second third.`), JSON.stringify(text));
 });
 
 test("the note for a turn that ended gives the failure's type on its one line, with a notice's opening in it marked", () => {
-  const { fw, markers, restore } = makeHarness();
-  fw.exhaustedTurns = new Map([['cairn', { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false }]]);
+  const { fw, markers, restore } = makeHarness({ partway: true });
   try {
     fw.noteInferenceExhausted('cairn', 'stopped', false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
   } finally { restore(); }
@@ -212,7 +216,7 @@ test('every cut of failure text keeps surrogate pairs whole and states the whole
 
         // An invalid_request at the escalation threshold: the marker, the
         // logs, the status, the hard-down alert and the rewind marker.
-        const exhausted = makeHarness();
+        const exhausted = makeHarness({ partway: true });
         exhausted.fw.inferenceFailureEscalationThreshold = 1;
         const rewound: string[] = [];
         exhausted.fw.shedNewestTurn = () => ({ descriptor: 'zz-turn' });
@@ -287,7 +291,7 @@ test('a reason that is not a string is described whole, not thrown on: each sink
   // Unreachable from the stream paths, which pass a message; a malformed
   // trace event must still leave its failure record.
   const error = new Error(`zz-not-a-string ${echo()}`);
-  const { fw, markers, logged, restore } = makeHarness();
+  const { fw, markers, logged, restore } = makeHarness({ partway: true });
   try {
     fw.noteInferenceExhausted('cairn', error);
   } finally { restore(); }
@@ -317,7 +321,7 @@ test('a reason that is not a string is described whole, not thrown on: each sink
 test("a caller's long error type is bounded wherever it is written", () => {
   // classifyInferenceError bounds the types it reads; a caller that passes
   // its own is bounded the same way.
-  const { fw, markers, logged, errs, restore } = makeHarness();
+  const { fw, markers, logged, errs, restore } = makeHarness({ partway: true });
   const type = `zz${'T'.repeat(MEGA)}`;
   try {
     fw.noteInferenceExhausted('cairn', 'zz-reason', false, type);
@@ -330,7 +334,7 @@ test("a caller's long error type is bounded wherever it is written", () => {
 });
 
 test('each excerpt states the whole length when it was cut, and only then', () => {
-  const { fw, markers, logged, restore } = makeHarness();
+  const { fw, markers, logged, restore } = makeHarness({ partway: true });
   const reason = `zz-reason ${'r'.repeat(990)}`; // 1,000 chars: cut for the marker, whole in the logs
   try {
     fw.noteInferenceExhausted('cairn', reason, false, 'invalid_request');
@@ -371,7 +375,7 @@ test('failure logs print a bounded projection, never the error object with its r
     // The frames follow the projection, so an internal throw still says where.
     assert.match(kick, /\n {4}at .*inference-failure-bounds\.test/);
 
-    const refused = makeHarness({ addMessage: () => { throw error; } });
+    const refused = makeHarness({ addMessage: () => { throw error; }, partway: true });
     try {
       refused.fw.noteInferenceExhausted('cairn', 'boom');
     } finally { refused.restore(); }
@@ -655,7 +659,7 @@ test('a failed maintenance pass logs and alerts a bounded reason', async () => {
 });
 
 test('emitTrace: listeners get bounded error and stack; the marker still learns the full length', () => {
-  const { fw, traces, markers, restore } = makeHarness();
+  const { fw, traces, markers, restore } = makeHarness({ partway: true });
   const error = `Bad request: ${echo()}`;
   try {
     fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error, retryable: false, errorType: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request' });
@@ -821,8 +825,8 @@ class InputModule implements Module {
   readonly name = 'input';
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
-  getTools(): ToolDefinition[] { return []; }
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, isError: true, error: 'none' }; }
+  getTools(): ToolDefinition[] { return [{ name: 'zz_look', description: 'zz look', inputSchema: { type: 'object', properties: {} } }]; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: 'zz-looked' }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
     return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
@@ -849,7 +853,27 @@ class ThrowingStream extends ErrorEventStream {
   }
 }
 
-type Path = 'stream error event' | 'stream throws' | 'stream setup throws';
+class ToolRoundThenErrorStream implements YieldingStream {
+  isCancelled = false;
+  toolDepth = 0;
+  private waiting = true;
+  private resume?: () => void;
+  constructor(private readonly error: Error) {}
+  get isWaitingForTools() { return this.waiting; }
+  get pendingToolCallIds() { return this.waiting ? ['zz-call'] : []; }
+  provideToolResults(): void { this.waiting = false; this.toolDepth = 1; this.resume?.(); }
+  cancel(): void { this.isCancelled = true; this.waiting = false; this.resume?.(); }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    const call = { id: 'zz-call', name: 'input--zz_look', input: {} };
+    yield { type: 'tool-calls', calls: [call], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '',
+      roundContent: [{ type: 'tool_use', ...call }], supportsInjectedMessages: true } } as StreamEvent;
+    if (this.waiting) await new Promise<void>((resolve) => { this.resume = resolve; });
+    if (this.isCancelled) return;
+    yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+type Path = 'stream error event' | 'stream throws' | 'stream setup throws' | 'tool round, then a stream error event';
 
 class FailingMembrane extends MockMembrane {
   constructor(private readonly path: Path, private readonly make: (request: NormalizedRequest) => Error) { super(); }
@@ -857,6 +881,7 @@ class FailingMembrane extends MockMembrane {
     this.calls.push(request);
     const error = this.make(request);
     if (this.path === 'stream setup throws') throw error;
+    if (this.path === 'tool round, then a stream error event') return new ToolRoundThenErrorStream(error);
     return this.path === 'stream throws' ? new ThrowingStream(error) : new ErrorEventStream(error);
   }
 }
@@ -914,18 +939,22 @@ async function runFailingTurn(path: Path, make: (request: NormalizedRequest) => 
   }
 }
 
-for (const path of ['stream error event', 'stream throws', 'stream setup throws'] as const) {
+for (const path of ['stream error event', 'stream throws', 'stream setup throws', 'tool round, then a stream error event'] as const) {
   test(`${path}: a ~1 MB provider error leaves a bounded, classified trail`, async () => {
     const { markers, traces, errs, rawArgs, failuresLog, inferenceLogs } = await runFailingTurn(path, (request) => hugeProviderError(request));
     assertNoObjectPrinted(rawArgs);
-    assert.equal(markers.length, 1, 'one failure marker');
-    const text = (markers[0].content[0] as { text: string }).text;
-    assert.ok(text.length < 1_200, `marker is ${text.length} chars`);
-    assert.match(text, /model call failed \(invalid_request, HTTP 400\)/);
-    const meta = markers[0].metadata as Record<string, unknown>;
-    assert.equal(meta.errorType, 'invalid_request');
-    assert.equal(meta.httpStatus, 400);
-    assert.ok((meta.reasonChars as number) > MEGA);
+    if (path === 'tool round, then a stream error event') {
+      assert.equal(markers.length, 1, 'one failure marker, since the turn got partway');
+      const text = (markers[0].content[0] as { text: string }).text;
+      assert.ok(text.length < 1_200, `marker is ${text.length} chars`);
+      assert.match(text, /it failed \(invalid_request, HTTP 400\)/);
+      const meta = markers[0].metadata as Record<string, unknown>;
+      assert.equal(meta.errorType, 'invalid_request');
+      assert.equal(meta.httpStatus, 400);
+      assert.ok((meta.reasonChars as number) > MEGA);
+    } else {
+      assert.deepEqual(markers, [], 'no failure marker, since the turn did nothing');
+    }
 
     for (const event of traces.filter((t) => typeof t.error === 'string')) {
       assert.ok(event.error.length <= 2_000, `${event.type} error is ${event.error.length} chars`);
@@ -948,18 +977,16 @@ for (const path of ['stream error event', 'stream throws', 'stream setup throws'
 }
 
 test('a ~1 MB plain Error (no classification) is bounded the same way', async () => {
-  const { markers, errs, rawArgs } = await runFailingTurn('stream throws', () => new Error(`socket said: ${echo()}`));
+  const { markers, traces, errs, rawArgs } = await runFailingTurn('stream throws', () => new Error(`socket said: ${echo()}`));
   assertNoObjectPrinted(rawArgs);
-  assert.equal(markers.length, 1);
-  const text = (markers[0].content[0] as { text: string }).text;
-  assert.ok(text.length < 1_200);
-  assert.match(text, /model call failed and produced no response/);
+  assert.equal(traces.filter((t) => t.type === 'inference:exhausted').length, 1, 'premise: the turn failed');
+  assert.deepEqual(markers, []);
   const longest = errs.reduce((max, e) => Math.max(max, e.length), 0);
   assert.ok(longest < 4_500, `longest stderr line is ${longest} chars`);
 });
 
 test('an oversized provider code is bounded in the trace, the marker and failures.log', async () => {
-  const { markers, traces, failuresLog } = await runFailingTurn('stream error event', () => new MembraneError({
+  const { markers, traces, failuresLog } = await runFailingTurn('tool round, then a stream error event', () => new MembraneError({
     type: 'invalid_request', retryable: false, httpStatus: 400, providerErrorCode: `zz${'C'.repeat(MEGA)}`,
     message: 'Bad request: zz-short', rawError: { status: 400 },
   }));
@@ -983,8 +1010,9 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   // non-retryable error fails at once, not after three retries.
   const { markers, traces, errs, rawArgs, calls } = await runFailingTurn('stream error event', () => foreignMembraneError(quoted));
   assert.equal(calls, 1, 'not retried');
-  assert.match((markers[0].content[0] as { text: string }).text, /model call failed \(invalid_request, HTTP 400\)/);
-  assert.equal((markers[0].metadata as { errorType: string }).errorType, 'invalid_request');
+  assert.deepEqual(markers, [], 'the turn did nothing');
+  const failed = traces.find((t) => t.type === 'inference:exhausted');
+  assert.deepEqual({ errorType: failed.errorType, httpStatus: failed.httpStatus }, { errorType: 'invalid_request', httpStatus: 400 });
   // Classified, so the quoted phrase is the provider's text, not a refused compile.
   assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-refusal').length, 0);
   assert.equal(errs.some((e) => e.includes('drain kicked')), false);
@@ -1010,7 +1038,8 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   const odd = await runFailingTurn('stream throws', () => foreignMembraneError('Bad request: zz-short', `zz${'T'.repeat(MEGA)}`), { errorPolicy: noRetry });
   const exhausted = odd.traces.find((t) => t.type === 'inference:exhausted');
   assert.ok(exhausted.errorType.length <= 128, `trace type is ${exhausted.errorType.length} chars`);
-  assert.ok((odd.markers[0].metadata as { errorType: string }).errorType.length <= 128);
+  const oddRecord = odd.failuresLog.trim().split('\n').map((l) => JSON.parse(l)).find((r) => r.kind === 'inference-exhausted');
+  assert.ok(oddRecord.errorType.length <= 128, `failures.log type is ${oddRecord.errorType.length} chars`);
   const line = odd.errs.find((e) => e.startsWith('[inference-failed] agent=resident'))!;
   assert.ok(line.length < 2_500, `stderr line is ${line.length} chars`);
 
@@ -1089,8 +1118,8 @@ test('the breaker reads the status a real failure carries: a 404 never sheds; a 
     } else {
       assert.equal(shed.length, 0, `${label} sheds nothing`);
       assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2'], `${label}: the history still holds every exchange`);
-      // Only the shed is gated: each failure is still marked and logged.
-      assert.equal(markers.length, 3, `${label}: an [inference-failed] marker per failure`);
+      // Only the shed is gated: each failure is still logged.
+      assert.deepEqual(markers, [], `${label}: no [inference-failed] marker`);
       const records = failuresLog.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
         .filter((record) => record.kind === 'inference-exhausted');
       assert.deepEqual(records.map((record) => record.httpStatus), [404, 404, 404], `${label}: a failures.log record per failure`);
