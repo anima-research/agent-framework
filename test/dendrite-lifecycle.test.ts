@@ -1143,14 +1143,14 @@ describe('Dendrite restart', () => {
   const interruptedNotices = (framework: AgentFramework) => textsIn(framework, 'mira')
     .filter((m) => (m.metadata.dendrite as { event?: unknown } | undefined)?.event === 'interrupted').length;
 
-  /** Fail the primary's write of each notice whose content holds `text`, once each; returns how many failed. */
-  function failWritesOf(text: string): { restore: () => void; failed: () => number } {
+  /** Fail the primary's write of each notice whose content holds `text`, once each, with `error`; returns how many failed. */
+  function failWritesOf(text: string, error = (): Error => new Error('EIO: simulated write failure')): { restore: () => void; failed: () => number } {
     const add = ContextManager.prototype.addMessage;
     let failed = 0;
     ContextManager.prototype.addMessage = function (this: ContextManager, ...args: Parameters<ContextManager['addMessage']>) {
       if (failed === 0 && JSON.stringify(args[1]).includes(text)) {
         failed++;
-        throw new Error('EIO: simulated write failure');
+        throw error();
       }
       return add.apply(this, args);
     } as ContextManager['addMessage'];
@@ -1214,6 +1214,70 @@ describe('Dendrite restart', () => {
     assert.equal(interruptedNotices(third), 1, 'nor tells the recipient again');
     const fourth = await process(new GateModule());
     assert.equal(told(fourth, 'FAILED-FIRST-TIME'), 1, 'and the boot after passes nothing more');
+  });
+
+  it("a boot whose notice for the primary is kept in memory, not stored, leaves the job for the next boot, which passes it once", async () => {
+    await jobWithUnreadWrites([{ text: 'KEPT-IN-MEMORY' }]);
+    // The primary's manager refuses the write as context-manager's
+    // initialization fence does, so the framework keeps it in memory for the
+    // manager's recovery, which no move in this boot brings.
+    const fault = failWritesOf('KEPT-IN-MEMORY', () => new Error(
+      'ContextManager.addMessage requires successful strategy initialization (selected branch main). ' +
+        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+    ));
+    let second: AgentFramework;
+    let atSecond: string[];
+    try {
+      ({ framework: second, logged: atSecond } = await quietBoot());
+    } finally { fault.restore(); }
+    assert.equal(fault.failed(), 1, 'the boot passed the notice and the primary\'s manager refused its write');
+    assert.equal(told(second, 'KEPT-IN-MEMORY'), 0, 'the notice is kept in memory, not stored, at that boot');
+    const third = await process(new GateModule());
+    assert.equal(told(third, 'KEPT-IN-MEMORY'), 1, 'the next boot passes it');
+    const fourth = await process(new GateModule());
+    assert.equal(told(fourth, 'KEPT-IN-MEMORY'), 1, 'and once');
+    assert.equal(atSecond.filter((line) => line.includes('kept in memory, not stored; its record stays interrupted')).length, 1,
+      'the boot that kept it says so');
+  });
+
+  // The held-write path's arm of the same answer (52364a32): a write kept
+  // in memory for an agent that ended goes on to the primary
+  // (passHeldWritesOn), and where the primary's manager keeps that write in
+  // memory too ('held'), it went on: it is counted passed, waits for the
+  // primary's recovery, and isn't told as dropped.
+  it("a kept write for an agent that ended, which the primary's manager keeps in memory in turn, counts as passed on, not dropped", async () => {
+    const framework = await process(new GateModule());
+    const alerts: string[] = [];
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert' && (event as { kind?: string }).kind === 'store-held-lost') alerts.push((event as { message?: string }).message ?? '');
+    });
+    const internals = framework as unknown as {
+      passHeldWritesOn(agentName: string, writes: readonly unknown[]): { passed: number; dropped: number };
+    };
+    // As Kestrel's case above: the primary's manager refuses the write as
+    // context-manager's initialization fence does, so the framework keeps it
+    // for that manager's recovery.
+    const fault = failWritesOf('HELD-FOR-THE-PRIMARY', () => new Error(
+      'ContextManager.addMessage requires successful strategy initialization (selected branch main). ' +
+        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+    ));
+    let outcome: { passed: number; dropped: number };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      outcome = internals.passHeldWritesOn('job', [{
+        participant: 'user', content: [{ type: 'text', text: 'HELD-FOR-THE-PRIMARY' }], metadata: { primaryIfUnread: true },
+        heldAt: Date.now(), heldOrder: 0,
+      }]);
+    } finally {
+      console.error = quiet;
+      fault.restore();
+    }
+    assert.equal(fault.failed(), 1, "setup: the primary's manager refused the write");
+    assert.deepEqual(outcome, { passed: 1, dropped: 0 }, 'kept for the primary: passed on');
+    assert.deepEqual(alerts, [], 'not told as dropped');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1, "it waits for the primary's recovery");
+    assert.equal(told(framework, 'HELD-FOR-THE-PRIMARY'), 0, 'not stored yet');
   });
 
   it('a notice declined for the primary settles the job, and no later boot tries it again', async () => {

@@ -73,10 +73,11 @@ export interface CoalescingPlacement {
    *  kept in memory (a surgery's hold, or the wait for its agent's
    *  recovery), which counts as read and can't be removed. */
   messageId?: string;
-  /** Set on a stored placement that wasn't presented to `agent` at its
-   *  write: a turn of the agent's was alive, or its presentation at rest
-   *  failed (#291's presentation index). No request of the agent's reads it
-   *  until it is presented. */
+  /** Set on a placement that wasn't presented to `agent` at its write: a
+   *  write kept in memory (no `messageId` yet), or one stored while a turn
+   *  of the agent's was alive, or with a presentation at rest that failed
+   *  (#291's presentation index). No request of the agent's reads it until
+   *  it is presented. */
   presented?: false;
 }
 
@@ -1229,6 +1230,7 @@ export class PushCoalescer<E = unknown> {
     // update no admission can withdraw or replace what is being published.
     let failed = false;
     let current = false;
+    let recover = false;
     await this.locked(async () => {
       try {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
@@ -1298,7 +1300,11 @@ export class PushCoalescer<E = unknown> {
             this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(saveError) });
           }
           if (!written) this.persist();
-          this.scheduleRecovery(subject, state);
+          // Its recovery is armed once the render has settled (the finally
+          // below): a recovery that fires while a render is under way does
+          // nothing and isn't armed again, and the commit may outlast the
+          // backoff.
+          recover = true;
           if (written) {
             try {
               await this.host.commit?.();
@@ -1310,10 +1316,13 @@ export class PushCoalescer<E = unknown> {
           return;
         }
         if (placement?.presented === false) {
-          // Stored and not presented to its agent: another agent's, whose
-          // turn is alive, or the assembling agent's own after its assembly
-          // ended, as any write during its turn. Still unread there, so it
-          // stays replaceable and withdrawable. The turn being assembled
+          // Not presented to its agent: stored for another agent, whose
+          // turn is alive, or for the assembling agent after its assembly
+          // ended, as any write during its turn; or kept in memory (no id)
+          // until its hold's release stores it, which the host counts as
+          // read and can't remove, so of what follows only the wake applies
+          // to it. A stored one is still unread there, so it stays
+          // replaceable and withdrawable. The turn being assembled
           // doesn't read it, so it isn't materialized for that turn, and no
           // request has consumed it. The freeze withdrew the placement's
           // agent's wake for this batch; give it an ordinary wake, as any
@@ -1348,6 +1357,7 @@ export class PushCoalescer<E = unknown> {
       } finally {
         if (state.rendering === rendering) state.rendering = undefined;
         if (current && !failed) this.clearRecovery(subject);
+        if (recover) this.scheduleRecovery(subject, state);
       }
     });
   }

@@ -1268,6 +1268,68 @@ describe('notices about an agent\'s own action', () => {
       assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
     });
 
+    // AF #844 bot review 5, finding 51: three cases the lifecycle-log
+    // reading pins (the serving boot's, below), on the live registry, as
+    // main's flush-time cases had them: a channel opened and tuned out
+    // since is still told of; a notice of two channels, one closed since,
+    // tells of the other alone; and a channel a failed reply's notice said
+    // was not open, tuned out since, is told of to no one, logged.
+    const tuneOut = (channelId: string, epochId: string) => internals(framework).channelRegistry.enterTuneOut('srv', channelId,
+      { epochId, cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+    const toldOf = (text: string) => framework.getAgent('primary')!.getContextManager().getAllMessages()
+      .filter((m) => JSON.stringify(m.content).includes(text));
+
+    it('tells the primary, by name, of a channel a fork\'s unread notice said opened, tuned out since, on the live registry', async () => {
+      const fork = await spawnFork();
+      decide('missing-channel', 'open');
+      internals(framework).recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
+      tuneOut('missing-channel', 'e-home');
+
+      reap(fork.name);
+
+      assert.equal(framework.getAgent(fork.name), null, 'released');
+      const told = toldOf('Now open: #home');
+      assert.equal(told.length, 1, 'the primary is told once: a tuned-out channel is still open');
+      assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
+    });
+
+    it("tells the primary of the one channel still decided open, of a fork's unread notice that named two, one closed since, on the live registry", async () => {
+      const fork = await spawnFork();
+      decide('missing-channel', 'open');
+      decide('c-12', 'open');
+      // A notice of two channels its reader could act on, stored for the
+      // fork with the inputs a release passes on, as the queue's was.
+      (framework as unknown as { addMessage(participant: string, content: unknown[], metadata: unknown, opts: { forAgent: string }): string }).addMessage('user',
+        [{ type: 'text', text: '[channels] Now open: #home (missing-channel), #twelve (c-12): your own message into the closed channel opened them.' }],
+        { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply',
+          channels: [{ channelId: 'missing-channel', label: '#home' }, { channelId: 'c-12', label: '#twelve' }] } },
+        { forAgent: fork.name });
+      decide('c-12', 'closed', 'agent-tool');
+
+      reap(fork.name);
+
+      assert.equal(framework.getAgent(fork.name), null, 'released');
+      const told = toldOf('Now open: #home');
+      assert.equal(told.length, 1, 'the primary is told once');
+      const words = (told[0]!.content[0] as { text: string }).text;
+      assert.ok(!words.includes('#twelve') && !words.includes('c-12'), `the channel closed since is left out of the notice that named both: ${words}`);
+    });
+
+    it("tells the primary nothing, logged, of a channel a fork's unread notice said was not open, tuned out since, on the live registry", async (t) => {
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+      const { fork } = await forkWithUnreadOpenFailure();
+      tuneOut('missing-channel', 'e-home');
+
+      reap(fork.name);
+
+      assert.equal(framework.getAgent(fork.name), null, 'released');
+      assert.deepEqual(toldOf('Not open: #home').map((m) => m.content), [], 'the primary is told nothing');
+      assert.ok(errors.includes(
+        `[channel] ${fork.name} has ended, and #home (missing-channel), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told`),
+      errors.join('\n'));
+    });
+
     it("passes on no channel notice its reader couldn't act on: the primary was told then, once", async () => {
       const fork = await spawnFork();
       const state = internals(framework);

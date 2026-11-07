@@ -45,8 +45,9 @@
  * its requests never carry. For an agent's call, another agent's own rows
  * (its rounds, its notes, its stored injections) that it isn't shown are
  * left out unless it observes that agent (decision 1), counted as
- * `leftOut`; extract's `offset` counts them, so a caller pages on by
- * `returned + leftOut`. A row stored before the audience stamp, whose owner
+ * `leftOut`; without an author filter extract's `offset` counts them, so a
+ * caller pages on by `returned + leftOut`, and with one it counts only the
+ * rows the filter keeps, which a caller pages on by `resume`. A row stored before the audience stamp, whose owner
  * isn't recorded, is nobody's own and isn't left out: it carries `window`
  * where the caller isn't shown it. The summaries `overview` and `semantic_search` read fold the
  * bound context's agent's window (ModuleContext.agentNameOf says whose), so
@@ -2689,8 +2690,9 @@ const WINDOW_NOTE =
   'to be shown again; another agent\'s own turns and notes that aren\'t in your context are left out unless you ' +
   'observe that agent, and how many were is `leftOut`.';
 
-/** extract's addition to it: its offset counts the rows left out, as its page's place in the window does. */
-const EXTRACT_OFFSET_NOTE = ' `offset` counts the messages left out too: to page on, advance it by returned + leftOut.';
+/** extract's addition to it: without an author filter its offset counts the rows left out, as its page's place in the window does; with one, only the rows the filter keeps. */
+const EXTRACT_OFFSET_NOTE = ' Without an author filter, `offset` counts the messages left out too: to page on, advance it by returned + leftOut. ' +
+  'With one, it counts only the messages the filter keeps: page on by `resume`.';
 
 /** semantic_search's form of it. */
 const WINDOW_NOTE_SEMANTIC =

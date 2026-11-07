@@ -452,7 +452,9 @@ export interface AgentConfig {
    * agent's window after its newest own message and its consumed mark
    * (`pinRange`, named `agent-framework:turn-inputs`; the README says
    * which rows exactly), and removes the pin when the turn ends, so the
-   * strategy doesn't compress the rows the turn opened with while it runs. `false` places no pin:
+   * strategy doesn't compress the rows the turn opened with while it runs,
+   * unless a committing compile refuses as over budget with it held: the
+   * pin is then removed and the compile runs once more (README). `false` places no pin:
    * the turn's opening rows are compressed as any others, and a pin of the
    * name left from before (a crash's) is removed at the next start that opens
    * a turn, as a silent start removes one.

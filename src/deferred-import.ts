@@ -15,7 +15,9 @@
  * keeps for the next boot one it can't store or check, with what follows it
  * for that agent, and rewrites the record with only those. Like that
  * importer, this module is for one release: the release
- * after it deletes both.
+ * after it deletes both. A host boots this release until its record is
+ * empty (the `deferred-import` alert says when writes stay queued), and
+ * doesn't upgrade past it from a release that kept a queue.
  *
  * Nothing here touches a store. It reads the record's value, refuses one
  * that isn't a queue, drops entries its readers can't handle, keeps one entry

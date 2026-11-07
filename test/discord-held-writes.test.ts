@@ -486,6 +486,8 @@ async function withLostRelease(
 ): Promise<{
   framework: AgentFramework; discord: FakeDiscord; module: LostCreateInternals; traces: TraceEvent[];
   processed: (type: string, id: string) => Promise<void>; texts: (id: string) => string[]; cleanup: () => Promise<void>;
+  /** How many store reads `readThrows` refused at the release. */
+  readsRefused: () => number;
 }> {
   const dir = mkdtempSync(join(tmpdir(), 'discord-lost-release-'));
   const discord = new FakeDiscord();
@@ -518,6 +520,7 @@ async function withLostRelease(
   const strategy = framework.getAgent('Sol')!.getContextManager().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
   const initialize = strategy.initialize;
   const quiet = console.error;
+  let readsRefused = 0;
   let open: (() => void) | undefined;
   try {
     framework.start();
@@ -538,7 +541,7 @@ async function withLostRelease(
     fw.addMessage = (participant, content, ...rest) => JSON.stringify(content).includes('zz-kept-create')
       ? atRelease.store(() => addMessage(participant, content, ...rest))
       : addMessage(participant, content, ...rest);
-    if (atRelease.readThrows) internals.storedRow = () => { throw new Error('zz-read-refused (test)'); };
+    if (atRelease.readThrows) internals.storedRow = () => { readsRefused++; throw new Error('zz-read-refused (test)'); };
     console.error = () => {};
     open!();
     await within(move, 'the move');
@@ -552,7 +555,7 @@ async function withLostRelease(
     internals.storedRow = storedRow;
     if (initialize) strategy.initialize = initialize; else delete strategy.initialize;
   }
-  return { framework, discord, module: internals, traces, processed, texts, cleanup };
+  return { framework, discord, module: internals, traces, processed, texts, cleanup, readsRefused: () => readsRefused };
 }
 
 const lostTraces = (traces: TraceEvent[]) =>
@@ -601,6 +604,7 @@ test("a kept create whose release can't say it landed, and whose read then throw
     readThrows: true,
   });
   try {
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
     assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
     assert.deepEqual(s.texts('w1'), ['zz-kept-create'], 'premise: the row landed as created');
     const next = s.processed('discord:message', 'w2');
@@ -626,6 +630,7 @@ test("a kept create whose release can't say it landed, and whose read then throw
     assert.deepEqual(lostTraces(s.traces).map((t) => [t.external, t.mayBeStored]), [[{ source: 'discord', id: 'x1' }, true]],
       'premise: the release traced the write as maybe stored');
     assert.deepEqual(s.texts('x1'), [], 'premise: no row landed');
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
     assert.equal(s.module.creating.has('x1'), true, 'premise: kept, its read having thrown');
     const next = s.processed('discord:message', 'x2');
     await s.discord.onMessageHandler!(live('x2', 'next message'));
@@ -658,6 +663,7 @@ test("a lookup that throws for one kept create at an event's sweep leaves the ot
   });
   const quiet = console.error;
   try {
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
     assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
     // A second answered create whose row is stored, with an edit kept for it.
     s.framework.getAgent('Sol')!.getContextManager().addMessage('User', [{ type: 'text', text: 'k9 as created' }],
@@ -688,6 +694,40 @@ test("a lookup that throws for one kept create at an event's sweep leaves the ot
   }
 });
 
+// AF #844 bot review 5, finding 45: an edit kept for an answered create
+// waits for a sweep that finds the row; one whose lookup throws leaves it
+// for the next event. An edit of the same message that comes meanwhile goes
+// behind the kept ones, so the next sweep applies them in the order they
+// were made and the row ends with the newest text.
+test("an edit that comes while edits kept for its message wait for a sweep goes behind them, so the row ends with the newest text", async () => {
+  const s = await withLostRelease('w1', async () => {}, { store: (add) => add() });
+  const quiet = console.error;
+  try {
+    s.framework.getAgent('Sol')!.getContextManager().addMessage('User', [{ type: 'text', text: 'k9 as created' }],
+      { external: { source: 'discord', id: 'k9' } } as never);
+    (s.module.creating as Map<string, unknown>).set('k9', { phase: 'writing', deleted: false, unapplied: [{ text: 'k9 older edit' }] });
+    const storedRow = s.module.storedRow.bind(s.module);
+    let refuseOnce = true;
+    s.module.storedRow = (id: string) => {
+      if (id === 'k9' && refuseOnce) { refuseOnce = false; throw new Error('zz-read-refused (test)'); }
+      return storedRow(id);
+    };
+    console.error = () => {};
+    const edited = s.processed('discord:edit', 'k9');
+    s.discord.onEditHandler!('k9', 'k9 newer edit');
+    await edited;
+    assert.equal(refuseOnce, false, "setup: the edit's sweep couldn't read k9's row, so the older edit waits");
+    const next = s.processed('discord:message', 'w3');
+    await s.discord.onMessageHandler!(live('w3', 'another message'));
+    await next;
+    assert.deepEqual(s.texts('k9'), ['k9 newer edit'], 'the newer edit is applied after the older one');
+    assert.equal(s.module.creating.has('k9'), false, 'and the entry ended');
+  } finally {
+    console.error = quiet;
+    await s.cleanup();
+  }
+});
+
 test("a kept create lost at its release ends its record with no store read, so a read that throws then doesn't keep it (bot review 2, #12)", async () => {
   const s = await withLostRelease('d1', async () => {}, {
     store: () => { throw new Error('zz-store-refused (test)'); },
@@ -698,6 +738,7 @@ test("a kept create lost at its release ends its record with no store read, so a
       'premise: a definite loss');
     assert.deepEqual(s.texts('d1'), [], 'premise: no row landed');
     assert.equal(s.module.creating.has('d1'), false, 'the record of the create ends');
+    assert.equal(s.readsRefused(), 0, 'with no store read');
     // A history sync now stores the message, which it would pass over while the record stayed.
     s.discord.history = [history('d1', 'from the sync')];
     const synced = await s.module.syncChannelHistory('c1');

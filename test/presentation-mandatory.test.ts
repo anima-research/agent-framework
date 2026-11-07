@@ -6,8 +6,9 @@
  * branch move: review8-presentation). A
  * turn's requests are its window, and a request-only `[Continue]` where the
  * window ends on its own reply. The window is the record when nothing
- * arrives for the agent during a turn and every row in the slot is meant
- * for it, and a write stamped only for agents that can't read its slot is
+ * arrives for the agent during a turn, every row in the slot is meant for
+ * it, and none of its turns is undone, and a write stamped only for agents
+ * that can't read its slot is
  * traced once. A
  * context-manager that keeps no window index is refused, and so is a store
  * handle without chronicle's batched identity append, with which

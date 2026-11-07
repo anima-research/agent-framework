@@ -4,9 +4,13 @@
  * A message that arrives while a turn is alive is stored at once and kept
  * out of the agent's window (#291's presentation index), and its wake waits
  * behind the busy agent. At the turn's next tool boundary the message enters
- * the window and is injected (on a stream that carries injected messages, as
- * this file's does; otherwise, or while the host is quiesced, it waits for
- * the turn's end), so the live turn reads it (hear-while-acting). The
+ * the window and is injected, on a stream that carries injected messages, as
+ * this file's does, so the live turn reads it (hear-while-acting). If an
+ * earlier message can't be injected (one named as the agent, or one that
+ * carries tool blocks), that message and every message behind it wait for
+ * the turn's end. On a stream that doesn't carry injected messages, the
+ * message waits for the turn's end; while the host is quiesced, for the
+ * resume. The
  * wake then starts no turn of its own once nothing is left for the agent to
  * do: a request that carried the write was answered and, for a wake that
  * carries a channel, unless its message's server marked it ambient, the agent

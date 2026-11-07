@@ -498,6 +498,42 @@ describe("the persistent subconscious's window start set while its window is the
   });
 });
 
+describe("the persistent subconscious's window start fixed and set, whose keeping failed, across a restart (AF #844 review 5, #47)", () => {
+  it('(o) is the start the strategy persisted, not the tune-out\'s start converted again', { timeout: 120_000 }, async () => {
+    const dir = place();
+    const first = await boot(dir);
+    const write = first.internals.channelRegistry.writeCoordinatorState.bind(first.internals.channelRegistry);
+    first.internals.channelRegistry.writeCoordinatorState = (id: string, value: unknown) => {
+      if (id === STARTS) throw new Error('injected write failure');
+      write(id, value);
+    };
+    const errors = console.error;
+    console.error = () => {};
+    let epochId: string;
+    let before: number | undefined;
+    try {
+      ({ epochId } = await enterDuringItsTurn(first));
+      before = first.strategy().getAnchorOrdinal();
+      assert.equal(before, first.subCm().ordinalOf(first.rowOf('T1-HELD-1 chatter').id), "premise: T1's start was fixed and set");
+      assert.equal(first.windowStarts()?.[epochId], undefined, 'premise: and keeping it failed');
+      // A row stored before T1 in the window again, past the held rows (see (b)): T1's start worked out again would
+      // be past it, leaving the held rows out.
+      const pre1 = first.rowOf('PRE-1 before the tune-out').id;
+      first.subCm().retractRows([pre1]);
+      first.subCm().presentRows([pre1]);
+      await first.framework.stop();
+    } finally { console.error = errors; }
+    frameworks.splice(frameworks.indexOf(first.framework), 1);
+
+    const second = await boot(dir);
+    await second.framework.runUntilIdle();
+    assert.equal(second.strategy().getAnchorOrdinal(), before, "the start it had, as its strategy persisted it, not T1's start converted again");
+    const kept = second.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number } | null;
+    assert.equal(kept?.inForce, before, 'kept as the start in force');
+    assert.notEqual(kept?.starts?.[epochId], undefined, "T1's own start is fixed and kept beside it");
+  });
+});
+
 describe('SubconsciousWindowAnchor', () => {
   /** A host over a window of `rows` (sequence and ordinal each), with the rows still owed. */
   function host(options: { presents?: boolean; rows?: Array<{ sequence: number; ordinal: number }>; owed?: number[]; length?: number }) {

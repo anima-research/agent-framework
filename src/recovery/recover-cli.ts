@@ -36,6 +36,10 @@ Options:
   --message-id <id|link>      Last Discord message the agent should still see
   --context-id <internal-id>  Exact internal context message to retain as anchor
   --messages <count>          Legacy alternative: remove N context entries
+                              On a presented window the rows one write
+                              presented with the anchor stay after it, a
+                              count is over the agent's window, and a
+                              recovery that would remove nothing is refused
   --suppress <id|link>        Suppress one Discord message; repeat or comma-separate
   --suppress-range <a>..<b>   Suppress an inclusive context range; repeatable
   --remove-suppressed         Remove every row a suppress rule hid, needing no

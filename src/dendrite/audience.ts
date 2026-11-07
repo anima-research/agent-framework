@@ -24,7 +24,9 @@
  *   This is the rule #291's presentation index presents an untargeted row
  *   in the shared slot by, applied when the row is written, so the record
  *   tells an untargeted row from one written for the primary. A message a
- *   tune-out holds is meant for none of them, so its list is empty.
+ *   tune-out holds is meant for none of them, so its list is empty, unless
+ *   the write names an agent whose own view keeps held traffic (the
+ *   persistent subconscious), which it is for.
  *   Observers of a slot (the subconscious watching the residents' slot) are
  *   a relationship in the registry, not part of the list. An inbound
  *   message's target is stamped as named even where it doesn't read the

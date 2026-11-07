@@ -11,11 +11,15 @@
   dropped, logged. A tune-out's release among them wakes its agent, and mail among them is released as it is stored
   and wakes its recipient. The store is synced, and only then is the record cleared; where it doesn't sync, the
   record is left as it was and the next boot skips what landed. A write that can't be stored, or whose agent's store
-  can't be searched, keeps it and that agent's later writes in the record for the next boot, which stores them after
+  can't be searched, keeps it and that agent's later writes in the record for the next boot (one context-manager
+  refuses as malformed is dropped, logged, as the queue's flush dropped it), which stores them after
   the writes made for that agent later in this process (each stored as it was made), so they land after those in
   its store and its window. An unreadable record,
   or one that holds anything but a queue, still fails `create()`. The imported rows enter each agent's window at the
-  boot's pass, or at `resume()` on a quiesced host, apart from an agent's own rows.
+  boot's pass, or at `resume()` on a quiesced host, apart from an agent's own rows. The release after this one
+  deletes the importer, so a host boots this release until its record is empty (the `deferred-import` alert says
+  when writes stay queued, such as those for an agent a move cut), and doesn't upgrade past it from a release that
+  kept a queue.
 - A tune-out's release for the resident, and its notices for the subconscious, are stored at once and made durable
   as before, but the wake each asks for is in memory. At boot, such a row still out of its agent's window (stored
   while a turn of the agent's was alive, the process ending before the turn did) asks its agent's wake again

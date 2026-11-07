@@ -230,7 +230,7 @@ async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; onto
     .flatMap((m) => (m.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text' && b.text?.startsWith('[wake onboarding]')).map((b) => b.text!));
   /** The notices the agent was shown (#291): those in its window. */
   const notices = (agent = 'agent') => noticesIn(f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Row[]);
-  /** The notices stored, whoever they are for: none means none was written. */
+  /** The notices stored in the agent's slot, whoever there they are for (a fork's own copy is in its own slot): none means none was written there. */
   const stored = () => noticesIn(f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Row[]);
   /** The window's texts, in order. */
   const window = (agent = 'agent') => (f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Row[])
@@ -411,7 +411,11 @@ describe('wake onboarding: the host', () => {
     await eventually(() => [...agents.keys()].some((n) => n.startsWith('conversation-')), 'the conversation fork');
     const fork = [...agents.keys()].find((n) => n.startsWith('conversation-'))!;
     assert.equal(h.traces.filter((t) => t.type === 'gate:onboarding-offered').length, 0, 'premise: nothing offered yet');
+    // Traces from the targeted event on, so a turn the fork's spawn started
+    // isn't taken for one the event's wake started.
+    let since = 0;
     const target = async (targetAgents: string[]) => {
+      since = h.traces.length;
       h.f.framework.pushEvent({
         type: 'mcpl:push-event', serverId: 'editor', featureSet: 'games', eventId: 'targeted', timestamp: TS, inferenceId: 'inf-targeted',
         content: [{ type: 'text', text: 'your move.' }], tags: ['surface:turn'], ...(targetAgents.length > 0 ? { targetAgents } : {}),
@@ -423,7 +427,8 @@ describe('wake onboarding: the host', () => {
     /** The offer's rows in an agent's own store. */
     const offerIn = (name: string) => (h.f.framework.getAgent(name)!.getContextManager().getAllMessages() as unknown as Row[])
       .filter((m) => m.content.some((b) => b.text?.startsWith('[wake onboarding]')));
-    const woken = () => [...new Set(h.traces.filter((t) => t.type === 'inference:started' && (t.reason === 'wake-onboarding' || true)).map((t) => t.agentName as string))];
+    /** The agents a turn started for since the targeted event, each once. */
+    const woken = () => [...new Set(h.traces.slice(since).filter((t) => t.type === 'inference:started').map((t) => t.agentName as string))];
     return { ...h, fork, target, offerIn, woken };
   }
 
@@ -435,6 +440,11 @@ describe('wake onboarding: the host', () => {
       assert.deepEqual(h.offerIn(h.fork)[0]!.metadata?.audience, [h.fork], 'stamped for the fork');
       assert.equal(h.notices('agent').length, 0, "not shown to a resident the event wasn't for");
       assert.ok(!h.offerIn('agent').some((m) => (m.metadata?.audience as string[] | undefined)?.includes('agent')), 'nor stamped for one');
+      // AF #844 bot review 5, finding 7: and the fork is woken to decide,
+      // no resident.
+      await eventually(() => h.woken().includes(h.fork), 'the fork woken');
+      await h.f.framework.runUntilIdle();
+      assert.deepEqual(h.woken(), [h.fork], 'the fork alone is woken');
     } finally { await h.f.close(); }
   });
 
@@ -463,6 +473,11 @@ describe('wake onboarding: the host', () => {
       assert.deepEqual(h.offerIn(h.fork)[0]!.metadata?.audience, [h.fork]);
       assert.equal(h.notices('oren').length, 1, "in oren's window");
       assert.equal(h.notices('agent').length, 0, "not in agent's, whom the event wasn't for");
+      // AF #844 bot review 5, finding 7: both recipients are woken, and the
+      // resident the event wasn't for isn't.
+      await eventually(() => h.woken().includes('oren') && h.woken().includes(h.fork), 'oren and the fork woken');
+      await h.f.framework.runUntilIdle();
+      assert.deepEqual([...h.woken()].sort(), ['oren', h.fork].sort(), 'the recipients alone are woken');
     } finally { await h.f.close(); }
   });
 

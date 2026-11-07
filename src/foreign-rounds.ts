@@ -2,11 +2,14 @@
  * Another agent's rounds as an agent that watches its slot is sent them
  * (#291, answer 13).
  *
- * An agent reads another agent's rounds only through an observe edge
- * (decision 1): the persistent subconscious watching the residents' slot.
- * A co-resident's rows stored before audience stamps are the exception: a
- * window written down from the record keeps them, and they go out as
- * stored, as earlier releases sent them.
+ * An agent reads another agent's rounds through an observe edge (decision
+ * 1), as the persistent subconscious watches the residents' slot, and an
+ * agent derived or forked from such a watcher inherits them, sent in its
+ * mode. A co-resident's rows stored before audience stamps, which a window
+ * written down from the record keeps, reach an agent that observes no one
+ * too: they go out as stored there, as earlier releases sent them. An agent
+ * sent others' rounds as a transcript is sent those as one, read by their
+ * participant.
  * Those rounds are stored as the other agent's: its signed thinking, its
  * tool calls and their results. None of that is valid as the watcher's own.
  * A provider takes tool blocks only in their own pairing, in the turns of

@@ -6,8 +6,10 @@
  * window is another order over the same rows: the rows presented to it, in
  * the order its requests carry them (context-manager's window index,
  * `presentRows`; a row presented at rest is in the window before a request
- * has carried it). While one agent writes one slot the two orders are the
- * same. Once agents share a slot, or one reads another's, they differ: a row
+ * has carried it). While one agent writes one slot, and nothing else writes
+ * it during that agent's turns, the two orders are the same. Once others
+ * write it during a turn (another agent sharing the slot, a module), or one
+ * agent reads another's, they differ: a row
  * another agent stored during my turn sits inside my turn in the record, but
  * my requests carried it only at my next tool boundary or turn start, so a
  * compile that sent it where the record has it would change my turn's prefix
@@ -611,7 +613,8 @@ export class AgentPresentation {
    * down: the manager reads its index again after any throw, so a window
    * that reads as presented then is taken as one, and the agent is
    * presented for, with a log line. A write-down at a rebase is traced as
-   * presented, with the bodies the window holds.
+   * presented, with the bodies the window holds; a read for that trace
+   * which throws is logged and the trace skipped, the window presented.
    */
   private writeDown(agent: PresentedAgent, state: Adopted, occasion: 'adopt' | 'rebase'): boolean {
     const cm = agent.getContextManager();
@@ -636,7 +639,14 @@ export class AgentPresentation {
       return false;
     }
     if (wrote && occasion === 'rebase') {
-      const count = bodyHeadCount(cm.getPresentedMessages());
+      // The trace's read is the trace's: a throw there leaves the window
+      // presented, as written down, and skips the trace.
+      let count = 0;
+      try {
+        count = bodyHeadCount(cm.getPresentedMessages());
+      } catch (error) {
+        console.error(`[presentation] ${agent.name}: its window was written down at ${occasion}, and reading it back for the trace failed (${describe(error)}); its window is presented, and the write-down isn't traced`);
+      }
       if (count > 0) this.host.emitTrace({ type: 'presentation:presented', agentName: agent.name, occasion, count });
     }
     return true;
@@ -874,8 +884,11 @@ export class AgentPresentation {
     // The sweep below decides the own rows a failed write left (presentOwn):
     // the backstop's at once, as its compile goes on whatever it presents; a
     // fresh start's once it hasn't thrown, so the next own row's write still
-    // puts them first after a start that presented nothing.
+    // puts them first after a start that presented nothing. Only those kept
+    // before it: a listener of its presentation, which runs inside it, may
+    // store an own row whose presentation fails, kept by that nested write.
     if (!fresh) this.failedOwn.delete(cm);
+    const keptBefore = fresh ? new Set(this.failedOwn.get(cm) ?? []) : undefined;
     // A fresh start is where rows a write-down took in that aren't the
     // agent's, whose retraction failed, leave before its compile, and a
     // reader fork's framing whose presentation failed enters.
@@ -895,7 +908,11 @@ export class AgentPresentation {
     if (fresh && failure !== undefined) {
       throw new Error(`${agent.name}'s turn start could not present what it is owed (at ${occasion}): ${describe(failure)}`, { cause: failure });
     }
-    if (fresh) this.failedOwn.delete(cm);
+    if (keptBefore) {
+      const keptMeanwhile = [...(this.failedOwn.get(cm) ?? [])].filter((id) => !keptBefore.has(id));
+      if (keptMeanwhile.length > 0) this.failedOwn.set(cm, new Set(keptMeanwhile));
+      else this.failedOwn.delete(cm);
+    }
     if (withArrivals) {
       this.heldUntilStart.delete(cm);
       this.restWithheld.delete(agent.name);
@@ -1054,7 +1071,8 @@ export class AgentPresentation {
    * however its window filters held rows, until it is let go (forget). A
    * fork framed before it is taken on has them presented at its adopt. Its
    * window's filter (the residents', which a reader fork inherits) keeps
-   * them out of its compiles, where its framing row shows them; nothing
+   * them out of its compiles, as it keeps all held traffic; its framing row
+   * shows them where the framing puts them (the default's does); nothing
    * else of its window moves. Rows whose presentation fails enter at the
    * fork's next turn start, or after a move of the store's branch (rebase).
    */

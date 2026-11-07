@@ -5,11 +5,14 @@
  * A write is stored at once, whatever its agent's turn (unless a surgery's
  * hold or a refusing manager keeps it in memory), and enters the agent's
  * window (a write for it: one a tune-out holds is for no resident, and
- * enters no resident's window) at the agent's next presentation point.
+ * enters no resident's window) at the agent's next presentation point, or,
+ * while the host is quiesced, at the resume.
  * One that arrives
  * during a round enters at the agent's next tool boundary and is injected
  * into the resumed stream (hear-while-acting), so the next compile's prefix
- * is the request the turn's later replies were minted under. Two kinds of
+ * is the request the turn's later replies were minted under, save where the
+ * render places a message before its window (its images and cap) and a
+ * body stored in parts. Two kinds of
  * message can't be injected: one carrying tool blocks (it would break the
  * tool cycle membrane enforces) and one named as the agent itself (a
  * prefill). Those wait for the turn's end, and so does everything that
@@ -589,8 +592,16 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
           }
           from = at + given.length;
         }
-        if (content.some((b) => b.type === 'image') && !rendered.some((b) => b.type === 'image')) {
+        // Its image, where it was given one, with the source given (AF #844
+        // bot review 5, finding 69); the injection is checked against the
+        // next compile below. Not its place among the text: context-manager's
+        // ingress chunking stores a body's image in its first shard, and its
+        // render sends it ahead of the body's text, wherever it was given.
+        const renderedImage = rendered.find((b) => b.type === 'image');
+        if (content.some((b) => b.type === 'image') && !renderedImage) {
           differ.push(`${name}: the next compile renders the body without its image`);
+        } else if (renderedImage && (renderedImage as { source?: { data?: unknown } }).source?.data !== PNG) {
+          differ.push(`${name}: the next compile renders an image whose source isn't the one given`);
         }
         if (!isDeepStrictEqual(injected[0]!.content, next[0]!.content)) differ.push(`${name}: the injection differs from the next compile`);
       } finally {

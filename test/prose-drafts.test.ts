@@ -537,7 +537,7 @@ async function harness(opts: {
     texts: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text),
     messages: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages(),
-    /** The agent's window, in its order (#291): a row stored mid-round enters it at the round's boundary. */
+    /** The agent's window, in its order (#291): a row stored mid-round enters it at the round's boundary where the stream carries injected messages, else at the turn's end. */
     window: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getPresentedMessages(),
     /** Text of every tool result the last stream received, in call order
      *  within each round (results arrive in completion order). */

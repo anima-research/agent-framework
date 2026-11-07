@@ -3138,11 +3138,12 @@ describe("a re-initialization alert's opening", () => {
 // move to a branch made before that write-down (every branch an earlier
 // release's store holds, or a rollback into rows the write-down presented,
 // which branchAt cuts at their own sequence) would leave the agent in legacy
-// mode for the rest of the process: a write during its turn would enter its
-// window at once, and undo would be refused. Every agent is rebased after the
+// mode for the rest of the process: its window the record, a write during its
+// turn entering it at once, and undo refused. Every agent is rebased after the
 // move instead: its window written down where the new branch has none, its own
-// rows repaired. A manager whose re-initialization fails leaves its agent in
-// legacy mode, traced, until the next move. framework.switchBranch is written
+// rows repaired. A manager whose re-initialization fails leaves its agent
+// unpresented, traced and alerted, until the next move: its window as the new
+// branch holds it, writes for it waiting in memory. framework.switchBranch is written
 // to the operator log as a checkout.
 describe('the window follows a branch move (#291)', () => {
   const blocks = (t: string) => [{ type: 'text', text: t }] as ContentBlock[];
@@ -3397,6 +3398,26 @@ describe('the window follows a branch move (#291)', () => {
       assert.equal(h.framework.getUndoRedoState(name).canRedo, false, `${name}'s entry is dropped`);
       assert.deepEqual(h.framework.redo(name), { redone: false });
     }
+  });
+
+  // AF #844 bot review 5, finding 64: a switch to the branch the store is
+  // on (how a manager left refusing its work is recovered) moves no branch.
+  // An undo is a retraction on that branch's window, so the redo entry is
+  // still good after it, as main kept redo across a switch.
+  it("a switch to the branch the store is on keeps every redo entry, and the redo restores the turn", async () => {
+    const h = await boot();
+    await h.bothServe('a round');
+    const before = h.framework.getAgent('mira')!.getContextManager().getPresentedMessages().length;
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.undoLastTurn(name).undone, true);
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `setup: ${name} can redo`);
+    }
+    await h.framework.switchBranch(h.store.currentBranch().name);
+    for (const name of ['mira', 'oren']) {
+      assert.equal(h.framework.getUndoRedoState(name).canRedo, true, `${name}'s entry is kept`);
+      assert.equal(h.framework.redo(name).redone, true, `${name}'s redo goes ahead`);
+    }
+    assert.equal(h.framework.getAgent('mira')!.getContextManager().getPresentedMessages().length, before, "mira's window holds the turn again");
   });
 
   /** An autobiographical strategy that folds small chunks into L1s and merges four of them into an L2, compressing only when ticked. */

@@ -1249,6 +1249,59 @@ describe('the presentation module at the point after one that failed', () => {
     assert.deepEqual(r.oren.window().slice(-3), ['A', 'B', 'C'], 'B ahead of C, as the record has them');
   });
 
+  // AF #844 bot review 5, finding 42: a fresh start forgets the own rows a
+  // failed write kept once its presentation succeeds, and that presentation
+  // runs its listeners inside it. A listener that stores an own row whose
+  // presentation fails has that row kept; the start forgets only what was
+  // kept before it, so the listener's row enters ahead of the next own row.
+  it("an own row a listener of a turn start's presentation stores, whose presentation fails, stays kept after the start, and enters ahead of the next own row", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('oren');
+    const arrival = r.write(r.mira, 'someone', text('arrived'), ['oren']);
+    let nested: MessageId | undefined;
+    r.presentation.onPresented('oren', () => {
+      if (nested !== undefined) return;
+      failNextPresent(r.oren.cm);
+      nested = quietly(() => storeOwnRow(r.oren, 'oren', text('B')));
+    });
+    r.presentation.presentAtStart(r.oren, 'turn-start');
+    assert.ok(nested, "setup: the start's presentation was heard, and its listener stored B");
+    assert.deepEqual([r.oren.has(arrival), r.oren.has(nested)], [true, false], 'setup: the arrival entered, and B missed its write');
+    const third = storeOwnRow(r.oren, 'oren', text('C'));
+    assert.deepEqual([r.oren.has(nested), r.oren.has(third)], [true, true], 'B enters with C');
+    assert.deepEqual(r.oren.window().slice(-3), ['arrived', 'B', 'C'], 'B ahead of C, as the record has them');
+  });
+
+  // AF #844 bot review 5, finding 20: a rebase's write-down that succeeded
+  // is traced with the bodies the window holds, read after it. A throw from
+  // that read is the trace's, not the write-down's: the window is
+  // presented, and the agent isn't pinned in legacy mode.
+  it("a rebase whose write-down succeeded leaves the agent presented when the read for its trace throws", async () => {
+    const r = await rig();
+    r.adoptAll();
+    // A window back in legacy mode, as a branch with no index leaves it.
+    const cm = r.oren.cm as unknown as { windowMode: () => string; getPresentedMessages: () => unknown };
+    const mode = cm.windowMode.bind(r.oren.cm);
+    let legacy = true;
+    cm.windowMode = () => (legacy ? 'legacy' : mode());
+    const present = r.oren.cm.presentRows.bind(r.oren.cm);
+    r.oren.cm.presentRows = (ids) => { legacy = false; return present(ids); };
+    const read = cm.getPresentedMessages.bind(r.oren.cm);
+    let fail = true;
+    cm.getPresentedMessages = () => {
+      if (fail) { fail = false; throw new Error('a transient read failure'); }
+      return read();
+    };
+    quietly(() => r.presentation.rebase(r.oren));
+    assert.equal(legacy, false, 'setup: the write-down ran');
+    assert.equal(fail, false, "setup: the trace's read threw");
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').filter((t) => t.agentName === 'oren'), [], 'no failure: the write-down succeeded');
+    r.alive.add('oren');
+    const own = storeOwnRow(r.oren, 'oren', text('after the rebase'));
+    assert.equal(r.oren.has(own), true, 'presented for: its own row enters its window');
+  });
+
   // AF #844 bot review 3, finding 46.
   it("an own row kept after a failed write still enters ahead of the next own row when a fresh start throws at its retraction", async () => {
     const r = await rig();

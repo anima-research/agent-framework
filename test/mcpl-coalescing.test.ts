@@ -20,6 +20,21 @@ import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
 import { coverTest, readMarkForTest, type ReadMark } from '../src/read-marks.js';
 
+/**
+ * Drain the framework (`drain`, named for its failure) until `settled`,
+ * polling every 20 ms on a time budget read from the monotonic clock
+ * rather than a count of passes, so a slow machine isn't failed by a pass
+ * count that fits a fast one (AF #844 bot review 5, #29).
+ */
+async function drainUntil(settled: () => boolean, drain: (what: string) => Promise<unknown>, what: string, budgetMs = 10_000): Promise<void> {
+  const deadline = performance.now() + budgetMs;
+  for (let pass = 1; !settled(); pass++) {
+    assert(performance.now() < deadline, `${what} was settled within ${budgetMs / 1000} s`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await drain(`${what}, the drain after pass ${pass}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
 // ---------------------------------------------------------------------------
@@ -2729,11 +2744,8 @@ for (const when of ['after', 'before'] as const) {
     try {
       await f.send('push/event', f.params('1', 'throwing_fallback', { deferred: true, initial: true }));
       await settles(f.framework.runUntilIdle(), 'the first drain');
-      for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
-        assert(pass < 100, 'the batch was settled within 100 passes');
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        await settles(f.framework.runUntilIdle(), `the drain after pass ${pass + 1}`);
-      }
+      await drainUntil(() => coalescer.pendingBatches() === 0 && internals.pendingRequests.length === 0,
+        (what) => settles(f.framework.runUntilIdle(), what), 'the batch');
     } finally {
       console.error = error;
     }
@@ -2843,11 +2855,8 @@ for (const atRecovery of ['readable', 'unreadable'] as const) {
     try {
       await f.send('push/event', f.params('1', 'unknown_fallback', { deferred: true, initial: true }));
       await settles(f.framework.runUntilIdle(), 'the first drain');
-      for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
-        assert(pass < 100, 'the batch was settled within 100 passes');
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        await settles(f.framework.runUntilIdle(), `the drain after pass ${pass + 1}`);
-      }
+      await drainUntil(() => coalescer.pendingBatches() === 0 && internals.pendingRequests.length === 0,
+        (what) => settles(f.framework.runUntilIdle(), what), 'the batch');
     } finally {
       console.error = error;
       own.handleMessageStoreEvent = handle;
@@ -2905,11 +2914,8 @@ test("a render whose store can't tell whether its row landed, where none did, ha
   f.renderer(async (params) => ({ content: [{ type: 'text', text: `subject_render_${String(params.eventId)}` }] }));
   const settle = async (what: string) => {
     await settles(f.framework.runUntilIdle(), what);
-    for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
-      assert(pass < 100, `${what}: the batch was settled within 100 passes`);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      await settles(f.framework.runUntilIdle(), `${what}, the drain after pass ${pass + 1}`);
-    }
+    await drainUntil(() => coalescer.pendingBatches() === 0 && internals.pendingRequests.length === 0,
+      (drained) => settles(f.framework.runUntilIdle(), drained), what);
   };
   const cm = f.framework.getAgent('agent')!.getContextManager();
   const rowsWith = (text: string) => cm.getAllMessages().filter((m) => JSON.stringify(m.content).includes(text));
@@ -3033,6 +3039,49 @@ test("a render's delivery that may have stored it is redelivered at its recovery
       `${String(thrown)}${joins ? ', a notice joining since' : ''}: ${flagged ? 'says it may be stored' : 'says nothing'}`);
     assert.equal(coalescer.pendingBatches(), 0);
   }
+});
+
+// AF #844 bot review 5, finding 43: a render whose delivery throws arms
+// its batch's recovery, saves the batch at once and awaits the save's
+// commit, all while the render is still the subject's. A recovery timer
+// that fires while a render is under way does nothing and isn't re-armed,
+// so a commit slower than the backoff would leave the batch waiting for
+// unrelated traffic. The recovery is armed once the render has settled.
+test("a render whose delivery throws is re-woken by its recovery though the save's commit outlasts the backoff", async () => {
+  const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];
+  const wakes: string[] = [];
+  let commits = 0;
+  let releaseCommit!: () => void;
+  const held = new Promise<void>((resolve) => { releaseCommit = resolve; });
+  const host: CoalescerHost<null> = {
+    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    deliver: async () => { throw new Error('the store refused it'); },
+    wakeForBatch: async (occ) => { wakes.push(occ.eventId); }, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent'],
+    render: async () => ({ content: [{ type: 'text', text: 'rendered' }] }),
+    audit: (record) => { audits.push(record); },
+    save: () => {},
+    saveNow: () => {},
+    // The render-start boundary's commit returns at once; the failed
+    // delivery's is held past the backoff.
+    commit: async () => { if (++commits === 2) await held; },
+  };
+  const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 20 });
+  await coalescer.accept({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId: 'e1', timestamp: TS,
+    retract: false, deferred: true, initial: false, content: [{ type: 'text', text: 'fallback e1' }], event: null,
+  });
+  wakes.length = 0;
+  commits = 0;
+  const assembled = coalescer.assemble('agent');
+  await eventually(() => commits === 2, "the failed delivery's commit");
+  assert.ok(audits.some((a) => a.kind === 'deliver-failed'), 'setup: the delivery threw, and its commit is held');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  releaseCommit();
+  await assembled;
+  await eventually(() => audits.some((a) => a.kind === 'recovery-wake'), 'the recovery wake');
+  assert.deepEqual(wakes, ['e1'], 'the batch is woken again by its recovery');
+  coalescer.suspend();
 });
 
 test("a render cancelled while it runs leaves the recovery wake of a batch opened after it", async () => {

@@ -3,7 +3,9 @@
  * with writes still in its deferred queue boots, stores each of them once,
  * in the order they arrived (a gone agent's are passed on or dropped,
  * logged; one whose landing can't be checked, or whose store write throws,
- * is kept, with what follows it for that agent, for the next boot), and
+ * is kept, with what follows it for that agent, for the next boot; one
+ * context-manager refuses as malformed is dropped, logged, as the queue's
+ * flush dropped it), and
  * rewrites the record with what it kept. A second boot imports only that.
  * Each case here writes the record by hand, as such a
  * release left it (recovery/deferred-writes.json, or the store's
@@ -597,7 +599,12 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     }
   });
 
-  it('releases the mail an imported write carries as it is stored, so the boot delivers it no second time', async () => {
+  // AF #844 bot review 5, finding 48: main's mail stamp names no recipient
+  // (`to`), so the queue an earlier release left holds it that way; the
+  // importer finds the mail's copy by the write's agent (isMailCopyFor) and
+  // the boot's wake by the stamp's fallback. A stamp with `to` is checked
+  // too.
+  for (const withTo of [false, true]) it(`releases the mail an imported write carries as it is stored, so the boot delivers it no second time${withTo ? ' (a stamp that names its recipient)' : " (main's stamp, no recipient named)"}`, async () => {
     const h = await host();
     try {
       let framework = await h.boot();
@@ -609,7 +616,7 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       } finally { await framework.stop(); }
       h.writeQueue([entry('mail-1', 1, 'queued mail', {
         participant: 'helper', forAgent: 'agent',
-        metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent' } },
+        metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, ...(withTo ? { to: 'agent' } : {}) } },
       })]);
       framework = await h.boot();
       const traces: TraceEvent[] = [];
@@ -953,6 +960,19 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       writeFileSync(join(recovery, 'deferred-writes.json'), JSON.stringify({ version: 2, pending: [entry('q1', 1, 'queued-1')] }));
       const child = await runChild(storePath, 'before-rewrite', t.signal);
       assert.equal(child.status, 0, `the child exited where it was told (stderr: ${child.stderr.slice(-800)})`);
+      // AF #844 bot review 5, finding 5: the crashed boot imported the write
+      // and synced it (the child exits 5 where nothing was imported, 4 where
+      // no sync followed), so it is on disk before the next boot: read there,
+      // past any framework, as the crash cases below read theirs.
+      {
+        const store = JsStore.openOrCreate({ path: storePath });
+        try {
+          const cm = await StoreWindow.open({ store, ...residentContextOptions('agent'), strategy: new PassthroughStrategy() });
+          try {
+            assert.deepEqual(cm.getAllMessages().map(textOf).filter((x) => x === 'queued-1'), ['queued-1'], 'the write is on disk before the next boot');
+          } finally { cm.close(); }
+        } finally { store.close(); }
+      }
       const boot = () => AgentFramework.create({
         storePath, membrane: new MockMembrane().asMembrane(), modules: [], syncIntervalMs: 0,
         agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'You are agent.' }],

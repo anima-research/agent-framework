@@ -7,8 +7,9 @@
  * guard evaluated against THAT agent's state. Since #291 a write is stored
  * at once (unless a surgery's hold or a refusing manager keeps it in
  * memory), and the guard decides only when it enters the target's window:
- * at once while the target is at rest, at the target's own next point while
- * its turn is alive. These tests once read the deferral queue; they read the
+ * at once while the target is at rest and the host isn't quiesced
+ * (otherwise at the resume), and at the target's own next point while its
+ * turn is alive. These tests once read the deferral queue; they read the
  * target's window now.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';

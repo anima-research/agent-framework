@@ -332,6 +332,9 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    * reader that a disposition it records is shown to the reader each time
    * it runs, and a fork is shown them only as its framing puts them
    * (`dispositions`), so a framing that leaves them out makes that untrue.
+   * Likewise the held traffic reaches the fork only as its framing puts it
+   * (`backlog`): the fork's view, the residents', leaves the raw rows out,
+   * as it leaves out all held traffic (the default framing shows them).
    */
   framing?: (context: ReaderFramingContext) => ContentBlock[];
   /**

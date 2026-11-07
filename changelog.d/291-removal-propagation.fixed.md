@@ -28,8 +28,12 @@
   target was presented in one write with rows after it, the refusal says so, names the first of them, and points to
   `suppressMessages` with every one of their row ids, grouped by the agent the suppression goes through (for a row of
   a slot the agent observes, the agent whose own slot holds it, and where that slot holds no other row, that the
-  suppression there is refused), or the host's `hide` with their Discord message ids, to take them out; it names
-  `hide` only where one of them has a Discord message id, and, where only some have one, for those alone.
+  suppression there is refused), or the host's `hide` with their Discord message ids, each with the agent to run it
+  on (the hide reads that agent's own slot: for a row of a slot the agent observes, the agent whose own slot holds
+  it), to take them out; it names `hide` only where one of them has a Discord message id, and, where only some have
+  one, for those alone. A row holding a result of a call at or before the target (a tool boundary presents a round's
+  reply and its results in one write) isn't advised for suppression, which would leave the call without its result:
+  the refusal says to roll back before the call, naming the message before it, and offers suppression for the rest.
 - Offline recovery with `removeSuppressed` alone (`--remove-suppressed`, no anchor) on a presented window threw a TypeError before it made anything. It now takes the newest row as on a legacy window, branching at the head with the suppressed rows removed, and a run with nothing left to suppress makes its branch, removing 0, instead of being refused as an anchor "already the tail" of the window.
 - Offline recovery's refusal of a no-op cut on a presented window told the operator to suppress the rows presented with the anchor in the same recovery, which names a row only by its Discord message id, so an agent's round or a tool row could not be taken out that way. A row with no Discord id is now named by its row id for the live `suppressMessages` once the host runs, the offline suppression advised for the rest.
 - Offline recovery on a presented window reports the rows its cut returns to the arrivals as `returnedToArrivals`, a dry run too, as the live rollback does (a row the same recovery suppresses is counted as suppressed instead): a cut that only returned rows answered `messagesRemoved: 0` and `messagesSuppressed: 0`, as if it changed nothing. `0` for a run with no anchor; absent on a window that is still the record.

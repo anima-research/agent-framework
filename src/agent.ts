@@ -586,9 +586,11 @@ export class Agent {
    * per call and per result and no thinking, the same in every compile and
    * in what a tool boundary injects. The framework sets it, once the
    * agent's window follows the presentation index, for the persistent
-   * subconscious and for a resident that observes another
+   * subconscious, for a resident that observes another
    * (AgentConfig.observes), as their configurations' `foreignRounds` say
-   * (`'transcript'` by default); every other agent reads no other agent's
+   * (`'transcript'` by default), and for an agent derived or forked from
+   * one of them, in that agent's mode (its inheritance holds them); every
+   * other agent reads no other agent's
    * rounds, but for a co-resident's rows stored before audience stamps,
    * which a window written down from the record keeps and which go out as
    * stored ('raw'), as earlier releases sent them.

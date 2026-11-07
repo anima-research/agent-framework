@@ -1149,7 +1149,10 @@ export type TraceEvent =
    * which the next boot resumes without running it. `superseded`: it was
    * asked for while an earlier cancel of the same hold ran, and joined that
    * one when it was queued again, whose note stands.
-   * `noteLost`: it carried a reader's note, which is not delivered; its
+   * `noteLost`: it carried a reader's note, which is not delivered, or,
+   * with `noteMayBeStored`, may be stored after all: the store couldn't tell
+   * whether its write landed (`error` says what it couldn't read), as the
+   * author's notice then says it may be lost. Its
    * author is told so in its own context where the author still exists,
    * and a reader fork that has ended is not, the loss reaching no one
    * (`tune-out:note-loss-untold`, `author-gone`). The persistent
@@ -1169,6 +1172,7 @@ export type TraceEvent =
       reason: 'hold-ended' | 'note-undelivered' | 'stopped' | 'superseded';
       currentEpochId?: string;
       noteLost: boolean;
+      noteMayBeStored?: true;
       noteAuthor?: string;
       error?: string;
     })
@@ -1490,9 +1494,11 @@ export type TraceEvent =
       /** A presentation failed; the rows it didn't present stay out of the
        *  agent's window for its next presentation point. At a fresh turn's
        *  start (`turn-start`, `assembly`), the start fails too. With
-       *  `legacy`, the agent was left in legacy mode, its window the whole
-       *  record as before the index, until a later move of the store's
-       *  branch writes its window down: at `adopt`, its window couldn't be
+       *  `legacy`, the agent was left unpresented (legacy mode) until a
+       *  later move of the store's branch: its window the whole record as
+       *  before the index, or, where its strategy couldn't follow a move to
+       *  a branch that holds a window, that window, writes for it waiting in
+       *  memory: at `adopt`, its window couldn't be
        *  written down (another version's index format, or a failed write);
        *  at `rebase`, after the store's branch moved, its window couldn't be
        *  written down on the new branch, or its context's strategy couldn't

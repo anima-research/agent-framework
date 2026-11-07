@@ -247,8 +247,9 @@ describe("the history tools' window marks (#291, AF-7)", () => {
     assert.equal(ctx.agentNameOf?.(h.cm('Subconscious')), 'Subconscious');
     assert.equal(ctx.agentNameOf?.({} as ContextManager), undefined, 'a context that is no live agent\'s');
 
-    // What each agent's view keeps: a resident's leaves out held traffic and
-    // the other agents' stored injections, the subconscious's the injections only.
+    // What each agent's view keeps: a resident's leaves out held traffic, the
+    // other agents' stored injections and what a suppress rule hid, the
+    // subconscious's those injections and suppressed rows.
     const row = (metadata: Record<string, unknown>) => ({ id: 'r', participant: 'x', content: [], metadata }) as unknown as StoredMessage;
     const injection = row({ contextInjection: { agent: 'mira', namespace: 'notes', contentHash: 'h', part: 0, parts: 1 } });
     const held = row({ tuneOut: { epochId: 'e1' } });

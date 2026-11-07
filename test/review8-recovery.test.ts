@@ -72,7 +72,7 @@ describe('AF #844 review 8 — offline recovery at a presented cut', () => {
     for (const dryRun of [true, false]) {
       await assert.rejects(
         createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messages: 1, dryRun, branchName: 'recovery/cairn/one' }),
-        /presented to cairn in one write with the 1 message after it in its window \(the first: .*Discord message d-C\).*remove nothing.*suppress it in the same recovery/,
+        /presented to cairn in one write with the 1 message after it in its window \(the first: .*Discord message d-C\).*remove nothing.*suppress it in the same recovery \(--suppress \/ suppressMessageIds: d-C\)/,
       );
     }
     await assert.rejects(
@@ -249,20 +249,22 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
         return true;
       },
     );
-    // Mixed: C by its Discord id here, the agent's note by row id live.
-    const mixed = await store(['B', 'C', 'agent:note']);
+    // Mixed: C and D by their Discord ids here, the agent's note, between
+    // them, by row id live.
+    const mixed = await store(['B', 'C', 'agent:note', 'D']);
     await assert.rejects(
       createOfflineRecoveryBranch({ storePath: mixed.storePath, agentName: 'cairn', messageId: 'd-B', dryRun: true }),
       (error: Error) => {
-        assert.match(error.message, /in one write with the 2 messages after it .*Discord message d-C\)/);
+        assert.match(error.message, /in one write with the 3 messages after it .*Discord message d-C\)/);
         // AF #844 bot review 4, finding 64: no --suppress-range here, which
-        // would take the agent's note between its ends too, and the live
-        // suppression of the note advised beside it would then fail.
+        // would take the agent's note between its ends (C..D) too, and the
+        // live suppression of the note advised beside it would then fail.
         assert.ok(error.message.endsWith(
-          'suppress the 1 with a Discord message id in the same recovery (--suppress / suppressMessageIds), ' +
+          'suppress the 2 with a Discord message id in the same recovery (--suppress / suppressMessageIds: d-C, d-D), ' +
           `and the 1 without one by row id with the live suppressMessages (${String(mixed.ids.get('agent:note'))}) ` +
           `once the host runs, since the offline recovery suppresses only by Discord message id. ${OWN_SLOT_ONLY}`,
         ), error.message);
+        assert.doesNotMatch(error.message, /--suppress-range/);
         return true;
       },
     );
@@ -341,5 +343,85 @@ describe('AF #844 bot review 2 — offline recovery on a presented window', () =
     const dry = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'd-A', dryRun: true });
     assert.equal(dry.messagesRemoved, 1);
     assert.equal(dry.returnedToArrivals, undefined);
+  });
+});
+
+describe('AF #844 bot review 5 — the offline no-op refusal', () => {
+  /** P presented by the write-down, then each of `rows` stored and all presented in one write, with their ids. */
+  const presentedTogether = async (rows: Array<{ participant: string; content: ContentBlock[]; discordId?: string }>): Promise<{ storePath: string; ids: MessageId[]; p: MessageId }> => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-review8-recovery-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'agent.chronicle');
+    const st = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store: st, namespace: 'agents/cairn' });
+    const p = cm.addMessage('user', [{ type: 'text', text: 'P' } as ContentBlock], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-P' });
+    cm.presentRows([]);
+    const ids = rows.map((row) => cm.addMessage(row.participant, row.content,
+      row.discordId !== undefined ? { serverId: 'discord', channelId: 'discord:g1:c1', messageId: row.discordId } : undefined));
+    cm.presentRows(ids);
+    cm.close();
+    st.close();
+    return { storePath, ids, p };
+  };
+  const text = (t: string): ContentBlock[] => [{ type: 'text', text: t } as ContentBlock];
+
+  // Finding 2: a range takes every record row between its ends, any agent's,
+  // rows the window never held among them, so it is never offered; each
+  // kept row's Discord id is named for --suppress.
+  it('2: where every kept row has a Discord id, the refusal names each for --suppress and offers no range', async () => {
+    const storePath = await batchStore();
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messages: 2, dryRun: true }),
+      (error: Error) => {
+        assert.ok(error.message.endsWith(`suppress them in the same recovery (--suppress / suppressMessageIds: d-B, d-C). ${OWN_SLOT_ONLY}`), error.message);
+        assert.doesNotMatch(error.message, /--suppress-range/);
+        return true;
+      },
+    );
+  });
+
+  // Finding 72: a kept row that shares the anchor's Discord id (a retried
+  // write's copy) can't be suppressed offline without the anchor: the
+  // suppression takes every copy of the id. It is named by row id for the
+  // live suppression, as a row with no Discord id is.
+  it("72: a kept copy of the anchor's own Discord message is named by row id for the live suppression, not for --suppress", async () => {
+    const { storePath, ids } = await presentedTogether([
+      { participant: 'user', content: text('A'), discordId: 'd-A' },
+      { participant: 'user', content: text('A again'), discordId: 'd-A' },
+    ]);
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', contextId: String(ids[0]), dryRun: true }),
+      (error: Error) => {
+        assert.ok(error.message.endsWith(
+          `suppress it by row id with the live suppressMessages (${String(ids[1])}) once the host runs, since the offline ` +
+          `recovery suppresses only by Discord message id, which takes every copy of a message, the anchor's own too. ${OWN_SLOT_ONLY}`,
+        ), error.message);
+        assert.doesNotMatch(error.message, /--suppress/);
+        return true;
+      },
+    );
+  });
+
+  // Finding 9: a tool boundary presents a round's reply and its results in
+  // one write, so an anchor at the call keeps its result. Suppressing the
+  // result would leave the call without it (the recovery itself refuses
+  // that split): the advice is to anchor before the call.
+  it("9: a kept result of the anchor's own call is not advised for suppression: the refusal says to anchor before the call", async () => {
+    const { storePath, ids, p } = await presentedTogether([
+      { participant: 'agent', content: [{ type: 'text', text: 'Fetching.' } as ContentBlock, { type: 'tool_use', id: 'call-1', name: 'test--fetch', input: {} } as ContentBlock] },
+      { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock] },
+    ]);
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', contextId: String(ids[0]), dryRun: true }),
+      (error: Error) => {
+        assert.ok(error.message.endsWith(
+          `to take that message out, anchor the recovery before ${String(ids[0])}, which holds the call it answers, instead ` +
+          `(at ${String(p)}, the message before it in the window): ${String(ids[1])} holds a result of a call at or before ` +
+          `the anchor, and suppressing it would leave that call without its result. ${OWN_SLOT_ONLY}`,
+        ), error.message);
+        assert.doesNotMatch(error.message, /suppressMessages|--suppress/);
+        return true;
+      },
+    );
   });
 });

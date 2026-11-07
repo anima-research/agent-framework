@@ -476,6 +476,42 @@ describe('live operator surgery', () => {
 
   // Ported for #291: what the hold keeps is in memory, so there is no
   // recovery queue to acknowledge, which this test once checked.
+  // AF #844 bot review 5, finding 19: the writes kept for an agent that
+  // ended are taken off their queues before each goes on to the primary,
+  // and building a channel notice's words can throw (a store read). That
+  // throw costs only its own write, counted as lost: the others still go
+  // on, or are counted and alerted.
+  it("writes kept for an agent that ended go on to the primary each on its own: one whose notice can't be built is counted lost, the rest go on", async () => {
+    const internals = framework as unknown as {
+      passHeldWritesOn(agentName: string, writes: readonly unknown[]): { passed: number; dropped: number };
+      noticeForPrimary: (...args: unknown[]) => unknown;
+    };
+    const build = internals.noticeForPrimary;
+    let calls = 0;
+    internals.noticeForPrimary = function (this: unknown, ...args: unknown[]) {
+      if (calls++ === 0) throw new Error('injected: the channel notice could not be built');
+      return build.apply(this, args);
+    };
+    const kept = (text: string) => ({
+      participant: 'Antra', content: [{ type: 'text', text }], metadata: { primaryIfUnread: true },
+      heldAt: Date.now(), heldOrder: 0,
+    });
+    const error = console.error;
+    console.error = () => {};
+    let outcome: { passed: number; dropped: number };
+    try {
+      outcome = internals.passHeldWritesOn('gone-fork', [kept('first, whose notice throws'), kept('second, for the primary')]);
+    } finally {
+      console.error = error;
+      internals.noticeForPrimary = build;
+    }
+    assert.deepEqual(outcome, { passed: 1, dropped: 1 });
+    assert.ok(remainingTexts().includes('second, for the primary'), 'the second went on to the primary');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.equal(lost.length, 1, 'the lost write is alerted');
+    assert.equal((lost[0]!.data as { count?: number } | undefined)?.count, 1);
+  });
+
   it("the hold's release stores what waited behind it while another agent's tool cycle is pending", { timeout: 60_000 }, async () => {
     const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
     const originalSwitch = c.switchBranch;

@@ -302,7 +302,8 @@ export interface AgentSpec {
    * and the framework fills it for the agents it derives or creates from
    * how it opens their context. Absent, the registry reads it as an older
    * spec meant it: a shared derivation's slot; the shared slot when
-   * `readsSharedSlot` is set and no observe edge on that slot explains it;
+   * `readsSharedSlot` is set and no observe edge without a `slot` explains
+   * it (one naming an agent reads as on the shared slot here);
    * else the isolated slot of `namespace`. A slot it reads without owning
    * it is an observe edge (`observes`).
    */

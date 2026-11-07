@@ -696,6 +696,8 @@ describe('stop() with work still in flight', () => {
       fw.tuneOutCoordinator = {
         handleSubconsciousTool: () => new Promise<ToolResult>((resolve, reject) => { settle = { resolve, reject }; }),
         stop: () => {},
+        // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+        stopTimers: () => {},
       };
       fw.subconsciousAgentName = 'assistant';
       const pushed: ProcessEvent[] = [];

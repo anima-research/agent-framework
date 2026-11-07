@@ -185,7 +185,7 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
         assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
         assert.match(e.message, new RegExp(`Message ${a} was presented to scout in one write with the 1 message after it in its window \\(the first: ${b}, Discord message d-B\\)`));
         assert.match(e.message, /a branch cut can't separate the rows one write presented/);
-        assert.ok(e.message.endsWith(`suppress it (suppressMessages for ${b}), or hide it by Discord message id (the host's hide command: d-B)`), e.message);
+        assert.ok(e.message.endsWith(`suppress it (suppressMessages for ${b}), or hide it by Discord message id (the host's hide command: on scout for d-B)`), e.message);
         assert.doesNotMatch(e.message, /already the tail/);
         return true;
       });
@@ -226,7 +226,7 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
       assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
       assert.match(e.message, /the 2 messages after it/, e.message);
       assert.ok(e.message.endsWith(
-        `suppress them (suppressMessages for ${y}, ${z}), or hide them by Discord message id (the host's hide command: d-y, d-z)`,
+        `suppress them (suppressMessages for ${y}, ${z}), or hide them by Discord message id (the host's hide command: on scout for d-y, d-z)`,
       ), e.message);
       return true;
     });
@@ -247,9 +247,41 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
       assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
       assert.match(e.message, /the 2 messages after it/, e.message);
-      assert.ok(e.message.endsWith(", or hide those with a Discord message id by it (the host's hide command: d-y)"), e.message);
+      assert.ok(e.message.endsWith(", or hide those with a Discord message id by it (the host's hide command: on scout for d-y)"), e.message);
       return true;
     });
+  });
+
+  // AF #844 bot review 5, finding 9: a tool boundary presents a round's
+  // reply and its results in one write, so a rollback to the call keeps
+  // its result. Suppressing the result would leave the call without it:
+  // the refusal says to roll back before the call, and offers suppression
+  // for the rest only, which keeps the call and its result.
+  it("the refusal of a rollback to a call kept with its result says to roll back before the call, not to suppress the result", async () => {
+    const h = await boot();
+    const p = h.store('p');
+    h.cm().presentRows([p]);
+    const call = h.cm().addMessage('scout', [
+      { type: 'text', text: 'Fetching.' } as ContentBlock,
+      { type: 'tool_use', id: 'call-1', name: 'surface--fetch', input: {} } as ContentBlock,
+    ]);
+    const result = h.cm().addMessage('user', [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock]);
+    const after = h.store('after');
+    h.cm().presentRows([call, result, after]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: call }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.ok(e.message.endsWith(
+        `to take those messages out, roll back before ${call}, which holds the call it answers, instead (to ${p}, the message ` +
+        `before it in the window): ${result} holds a result of a call at or before the anchor, and suppressing it would leave ` +
+        `that call without its result; or, to keep that call and its results, suppress the rest (suppressMessages for ${after}), ` +
+        `or hide the rest by Discord message id (the host's hide command: on scout for d-after)`,
+      ), e.message);
+      return true;
+    });
+    // As it says: the rollback to p takes the call and its result out together.
+    const back = await h.framework.rollbackToMessage('scout', { messageId: p });
+    assert.equal(back.messagesRemoved, 3);
+    assert.deepEqual(h.windowTexts(), ['p']);
   });
 
   it('a rollback to a row presented together with every row after it changes nothing, and is refused saying so', async () => {
@@ -444,6 +476,42 @@ describe("a host's message-granular undo on a window that merges an observed slo
     // subconscious its note goes.
     await assert.rejects(h.framework.suppressMessages('mira', { messageIds: [residents] }), /at least one must remain/);
     assert.equal((await h.framework.suppressMessages(SUB, { messageIds: [note] })).messagesRemoved, 1);
+  });
+
+  // AF #844 bot review 5, finding 73: the host's hide reads the own slot of
+  // the agent it is run on, so the refusal names, for each Discord id, the
+  // agent to hide it on: the residents' row is hidden on mira, whose own
+  // slot holds it, as its suppression goes through her.
+  it("a no-op rollback's refusal names, for each Discord id, the agent the host's hide is run on", async () => {
+    const h = await bootWithSubconscious();
+    const SUB = 'Subconscious';
+    const text = (t: string) => [{ type: 'text', text: t } as ContentBlock];
+    const mcm = h.framework.getAgent('mira')!.getContextManager();
+    const discord = (id: string) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId: id });
+    const target = h.scm().addMessage(SUB, text('its target'), asOwnRow(undefined, SUB));
+    const note = h.scm().addMessage('someone', text('a message in its own slot'), discord('d-own'));
+    const residents = mcm.addMessage('someone', text("a residents' row"), discord('d-res'));
+    mcm.addMessage('someone', text('another residents\' row'), {});
+    h.scm().presentRows([target, note, residents]);
+    await assert.rejects(h.framework.rollbackToMessage(SUB, { messageId: target }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.ok(e.message.endsWith(
+        `, or hide them by Discord message id (the host's hide command: on ${SUB} for d-own; on mira for d-res, whose own slot holds it)`,
+      ), e.message);
+      return true;
+    });
+    // As it says: the hide run on the subconscious doesn't find the
+    // residents' row; run on mira, it does.
+    const internals = h.framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    const hide = (agentName: string) => internals.handleHostCommand('discord', { command: 'hide', agentName, fromMessageId: 'd-res', requesterName: 'antra' });
+    const onSub = await hide(SUB);
+    assert.equal(onSub.ok, false);
+    assert.match(String(onSub.error), /is not an addressable message in context/);
+    const onMira = await hide('mira');
+    assert.equal(onMira.ok, true, String(onMira.error));
+    assert.equal(mcm.getMessage(residents), null);
   });
 
   it("a rollback to a residents' row in its window is refused as not its own, not as off the branch", async () => {

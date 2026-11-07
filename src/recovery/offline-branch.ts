@@ -273,7 +273,7 @@ export async function createOfflineRecoveryBranch(
     const afterCut = presented && anchorCount > 0 ? windowAfterCut(contextManager, target) : undefined;
     const returnedToArrivals = afterCut?.returned.filter((id) => !suppression.ids.has(String(id))).length;
     if (afterCut && removedCount === 0 && suppression.intervals.length === 0 && afterCut.returned.length === 0) {
-      refuseIneffectiveCut(target, afterCut.kept, options.agentName);
+      refuseIneffectiveCut(target, afterCut.kept, options.agentName, contextManager.getPresentedMessages() as StoredWindowMessage[]);
     }
     validateRemovalIntegrity(
       contextManager,
@@ -595,17 +595,26 @@ function windowAfterCut(
  * the live rollback refuses one: the cut at the write that presented the
  * anchor removes no row, and no row the window took after that write
  * becomes an arrival again (windowAfterCut). The rows that write presented
- * after the anchor (`kept`) name the way to take them out: a suppression in
- * the same recovery, which names a row by its Discord message id, and for a
- * row with none (an agent's round, a tool row) the live `suppressMessages`
- * by its row id. Each refusal says the recovery reads the agent's own slot
- * alone: a row of a slot it observes, which the live rollback weighs, isn't
- * weighed here.
+ * after the anchor (`kept`) name the way to take them out. A row holding a
+ * result of a call at or before the anchor (`window`, the agent's window:
+ * a tool boundary presents a round's reply and its results in one write)
+ * isn't to be suppressed, which would leave that call without its result:
+ * the advice is to anchor before the call. The others are suppressed: in
+ * the same recovery a row by its Discord message id, each one named, which
+ * takes every copy of that message; and by its row id with the live
+ * `suppressMessages` a row with none (an agent's round, a tool row) or one
+ * sharing the anchor's Discord id (a retried write's copy), which the
+ * offline suppression would take with the anchor. No range is offered: it
+ * takes every record row between its ends, any agent's, rows the window
+ * never held among them. Each refusal says the recovery reads the agent's
+ * own slot alone: a row of a slot it observes, which the live rollback
+ * weighs, isn't weighed here.
  */
 function refuseIneffectiveCut(
   target: StoredWindowMessage,
   kept: readonly StoredWindowMessage[],
   agentName: string,
+  window: readonly StoredWindowMessage[],
 ): never {
   const anchorDiscordId = discordIdOf(target);
   const anchor = `${String(target.id)}${anchorDiscordId ? ` (Discord message ${anchorDiscordId})` : ''}`;
@@ -615,26 +624,30 @@ function refuseIneffectiveCut(
     const first = kept[0]!;
     const firstDiscordId = discordIdOf(first);
     const named = `${String(first.id)}${firstDiscordId ? `, Discord message ${firstDiscordId}` : ''}`;
-    const unaddressed = kept.filter((row) => discordIdOf(row) === undefined).map((row) => String(row.id));
-    // Every one, so following the advice leaves none of them in place.
-    const rowIds = unaddressed.join(', ');
-    // A range is offered only where every row has a Discord id: beside rows
-    // that have none, a --suppress-range would take them too, between its
-    // ends, and the live suppression advised for them would then fail.
-    const offline = unaddressed.length === 0
-      ? 'in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)'
-      : 'in the same recovery (--suppress / suppressMessageIds)';
-    const live = `by row id with the live suppressMessages (${rowIds}) once the host runs, since the offline recovery ` +
-      'suppresses only by Discord message id';
-    const how = unaddressed.length === 0 ? `suppress ${n === 1 ? 'it' : 'them'} ${offline}`
-      : unaddressed.length === n ? `suppress ${n === 1 ? 'it' : 'them'} ${live} and ${n === 1 ? 'it has none' : 'none of them has one'}`
-      : `suppress the ${n - unaddressed.length} with a Discord message id ${offline}, and the ${unaddressed.length} ` +
-        `without one ${live}`;
+    const split = resultsOfAnchoredCalls(window, target.id, kept);
+    const suppressible = split ? kept.filter((row) => !split.rows.includes(row)) : kept;
+    const copies = suppressible.filter((row) => anchorDiscordId !== undefined && discordIdOf(row) === anchorDiscordId);
+    // By row id, live: every one, so following the advice leaves none of them in place.
+    const unaddressed = suppressible.filter((row) => discordIdOf(row) === undefined || copies.includes(row));
+    const addressed = suppressible.filter((row) => !unaddressed.includes(row));
+    const offline = `in the same recovery (--suppress / suppressMessageIds: ${addressed.map((row) => discordIdOf(row)!).join(', ')})`;
+    const live = `by row id with the live suppressMessages (${unaddressed.map((row) => String(row.id)).join(', ')}) once the host runs, ` +
+      'since the offline recovery suppresses only by Discord message id' +
+      (copies.length > 0 ? `, which takes every copy of a message, the anchor's own too` : '');
+    const m = suppressible.length;
+    const them = m === n ? (n === 1 ? 'it' : 'them') : 'the rest';
+    const how = m === 0 ? ''
+      : unaddressed.length === 0 ? `suppress ${them} ${offline}`
+      : addressed.length === 0 ? `suppress ${them} ${live}` +
+        (copies.length > 0 ? '' : ` and ${m === 1 ? 'it has none' : 'none of them has one'}`)
+      : `suppress the ${addressed.length} with a Discord message id ${offline}, and the ${unaddressed.length} ` +
+        `${copies.length > 0 ? `other${unaddressed.length === 1 ? '' : 's'}` : 'without one'} ${live}`;
+    const before = split ? anchorBefore(split, 'anchor the recovery', 'at') : '';
     throw new Error(
       `Recovery anchor ${anchor} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
       `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
       `so a recovery anchored there would remove nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-      how + ownSlotOnly,
+      (before && how ? `${before}; or, to keep that call and its results, ${how}` : before || how) + ownSlotOnly,
     );
   }
   throw new Error(
@@ -642,6 +655,64 @@ function refuseIneffectiveCut(
     'stored before the write that presented it, where the branch is cut, and none entered the window after it, so ' +
     'a recovery anchored there would change nothing' + ownSlotOnly,
   );
+}
+
+/**
+ * Of the rows a no-op cut keeps after its anchor (`kept`), those holding a
+ * result of a call in a row of the agent's window at or before the anchor,
+ * which a suppression would leave without its result: a tool boundary
+ * presents a round's reply and its results in one write, and so does a
+ * write-down for rows stored together. With them, the earliest such call's
+ * row and the window row before it, where a cut keeps the call and its
+ * results together. Undefined where no kept row answers such a call, or the
+ * anchor isn't in `window`. The live rollback's refusal reads it too.
+ */
+export function resultsOfAnchoredCalls<R extends { id: unknown; content: readonly unknown[] }>(
+  window: readonly R[],
+  anchorId: unknown,
+  kept: readonly R[],
+): { rows: R[]; call: R; before?: R } | undefined {
+  const anchorAt = window.findIndex((row) => row.id === anchorId);
+  if (anchorAt < 0) return undefined;
+  const callAt = new Map<string, number>();
+  for (let i = 0; i <= anchorAt; i++) {
+    for (const raw of window[i]!.content) {
+      const block = raw as { type?: unknown; id?: unknown };
+      if (block.type === 'tool_use' && typeof block.id === 'string') callAt.set(block.id, i);
+    }
+  }
+  let earliest: number | undefined;
+  const rows = kept.filter((row) => {
+    let answers = false;
+    for (const raw of row.content) {
+      const block = raw as { type?: unknown; toolUseId?: unknown };
+      const at = block.type === 'tool_result' && typeof block.toolUseId === 'string' ? callAt.get(block.toolUseId) : undefined;
+      if (at === undefined) continue;
+      answers = true;
+      earliest = earliest === undefined ? at : Math.min(earliest, at);
+    }
+    return answers;
+  });
+  if (rows.length === 0 || earliest === undefined) return undefined;
+  return { rows, call: window[earliest]!, ...(earliest > 0 ? { before: window[earliest - 1]! } : {}) };
+}
+
+/**
+ * A refusal's advice for the kept rows that answer a call at or before the
+ * anchor (resultsOfAnchoredCalls): `verb` (anchor the recovery, roll back)
+ * before the call's row, naming the row before it (`to`: at, to), and why
+ * they aren't to be suppressed.
+ */
+export function anchorBefore(
+  split: { rows: ReadonlyArray<{ id: unknown }>; call: { id: unknown }; before?: { id: unknown } },
+  verb: string,
+  to: string,
+): string {
+  const ids = split.rows.map((row) => String(row.id)).join(', ');
+  const one = split.rows.length === 1;
+  return `${verb} before ${String(split.call.id)}, which holds the call ${one ? 'it answers' : 'they answer'}, instead` +
+    `${split.before ? ` (${to} ${String(split.before.id)}, the message before it in the window)` : ''}: ${ids} ${one ? 'holds a result' : 'hold results'} ` +
+    `of a call at or before the anchor, and suppressing ${one ? 'it' : 'them'} would leave that call without its result`;
 }
 
 function discordIdOf(message: { metadata?: Record<string, unknown> }): string | undefined {
