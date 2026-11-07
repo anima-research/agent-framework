@@ -35,6 +35,15 @@ export function carriedBlock(block: ContentBlock): boolean {
 }
 
 /**
+ * Whether content holds a turn: a block a request carries besides a provider-native item's carrier. A message holding
+ * only carriers is carried, so the Responses API gets its items, but every other wire leaves it out, so the framework's
+ * own bookkeeping (the request's last turn, its count of stored injections, a shed) doesn't count it as a turn.
+ */
+export function holdsTurn(content: readonly ContentBlock[]): boolean {
+  return content.some((block) => carriedBlock(block) && !carriesRawItem(block));
+}
+
+/**
  * A stored body's content as the agent's next request carries it: what the sanitize pass leaves of it, without
  * the framework's pricing stamp. Null when the pass leaves nothing, so the request carries no message there.
  */

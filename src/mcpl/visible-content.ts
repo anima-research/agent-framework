@@ -18,8 +18,10 @@ import { classifyBlock, NON_STRING_TEXT_PLACEHOLDER } from './references.js';
 
 /**
  * True when `content` holds nothing the model would see: no non-text block,
- * and no text block whose text has a non-whitespace character. Mirrors the
- * request sanitizer, which drops text that is not a string or trims to ''.
+ * and no text block whose text has a non-whitespace character. A provider-
+ * native item's carrier, an empty text block the request sanitizer keeps for
+ * its item, holds nothing to see either; otherwise this is the sanitizer's
+ * rule, which drops text that is not a string or trims to ''.
  * Accepts MCPL wire blocks and converted membrane blocks alike. A wire
  * block is judged as the block the converter makes of it where that's text:
  * MCP's embedded resource shows as the block its contents make

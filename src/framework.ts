@@ -224,7 +224,7 @@ import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } 
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
-import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
+import { holdsTurn, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, suppressedRow, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -14328,8 +14328,9 @@ export class AgentFramework {
    * With `carried` (the stored bodies a refused request's compile carried,
    * by each body's first message id), only a message that request carried
    * counts, or the stored result of a call it carried, which goes with that
-   * call as one exchange; a row that carries nothing a request sends
-   * (asNextRequestCarries) is passed over and left in place. It adds no
+   * call as one exchange; a row that holds no turn (holdsTurn: nothing a
+   * request sends, or only provider items' carriers, which every wire but
+   * the Responses API leaves out) is passed over and left in place. It adds no
    * marker; the caller keeps one consolidated marker for the episode
    * (updateRewindMarker). The returned record's descriptor says what was
    * set aside and its size, never the content. Returns null when nothing
@@ -14391,7 +14392,7 @@ export class AgentFramework {
       // A row the agent is never sent is passed over, unless it is the
       // stored result of a call the request carried: the exchange goes whole.
       if (passedOver(all[i]!) && !resultOfCarriedCall) continue;
-      if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
+      if (!body.every((m) => !Array.isArray(m.content) || !holdsTurn(m.content))
         && (wasCarried(start, i) || resultOfCarriedCall)) {
         idx = i; break;
       }

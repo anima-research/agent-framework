@@ -120,6 +120,23 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
 });
 
+test('at the threshold, a row holding only a provider item\'s carrier is passed over, uncounted, and the newest turn shed', () => {
+  const { fw, messages, added, restore } = makeHarness({ messages: [
+    { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },
+    { id: 'a0', participant: 'agent', content: [{ type: 'text', text: 'an answer' }] },
+    { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+    // On a wire that leaves the item out, nothing of this row reaches the provider, so shedding it changes nothing.
+    { id: 'a1', participant: 'agent', content: [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } }] },
+  ] });
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
+    'the newest message is gone, and the carrier-only row after it stays with what came before');
+  const marker = added.find(isRewindMarker);
+  assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
+});
+
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {

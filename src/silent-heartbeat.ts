@@ -52,6 +52,7 @@
  */
 import { NOTICE_TAG } from './notice-tags.js';
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
+import { carriesRawItem } from './sent-rows.js';
 
 /** Request-only separator a silent tick's request ends on. It carries the
  * tick's instruction, so the tick's own request reads it as its prompt, and
@@ -149,15 +150,21 @@ function requestOnlyTurn(text: string): NormalizedMessage {
 
 /**
  * Structural identity of one stored response wherever a compile renders it:
- * tool_use ids and thinking signatures, which the provider made unique and
- * strategies keep verbatim (the same identity the tool-result guard relies
- * on). Text is never read, so request-build sanitizing (blank text blocks
- * stripped) cannot make a stored row and its compiled copy disagree.
+ * tool_use ids, thinking signatures, and a provider-native item's own id on
+ * its carrier (a server-tool result's `tool_use_id` where it has no id),
+ * which the provider made unique and strategies keep verbatim (tool_use ids
+ * and signatures are the identity the tool-result guard relies on). Text is
+ * never read, so request-build sanitizing (blank text blocks stripped)
+ * cannot make a stored row and its compiled copy disagree.
  */
 function identityKeys(content: ContentBlock[]): string[] {
   const keys: string[] = [];
   for (const block of content) {
-    if (block.type === 'tool_use' && typeof block.id === 'string' && block.id) keys.push(toolUseKey(block.id));
+    if (carriesRawItem(block)) {
+      const item = (block as { rawItem: { type?: unknown; id?: unknown; tool_use_id?: unknown } }).rawItem;
+      const id = typeof item.id === 'string' && item.id ? item.id : typeof item.tool_use_id === 'string' && item.tool_use_id ? item.tool_use_id : undefined;
+      if (id !== undefined) keys.push(`item:${String(item.type)}:${id}`);
+    } else if (block.type === 'tool_use' && typeof block.id === 'string' && block.id) keys.push(toolUseKey(block.id));
     else if (block.type === 'thinking' && typeof block.signature === 'string' && block.signature) {
       keys.push(`thinking:${block.signature}`);
     } else if (block.type === 'redacted_thinking' && typeof block.data === 'string' && block.data) {

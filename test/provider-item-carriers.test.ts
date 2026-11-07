@@ -33,10 +33,11 @@ const MOVE: ToolDefinition = { name: 'move', description: 'Move the robot', inpu
 
 class Robot implements Module {
   readonly name = 'robot';
+  moves = 0;
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] { return [MOVE]; }
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: { ok: true } }; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { this.moves++; return { success: true, data: { ok: true } }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
     const text = String((event as { content?: unknown }).content);
@@ -81,14 +82,15 @@ function responsesWire(messages: readonly NormalizedMessage[], assistant: string
 }
 
 /** Turn 1's reply, then turn 2's first request as the framework hands it to membrane. */
-async function secondTurnRequest(arm: 'final-round' | 'tool-round'): Promise<{ request: { messages: NormalizedMessage[]; assistantParticipant?: string }; reply: ContentBlock[] }> {
+async function secondTurnRequest(arm: 'final-round' | 'tool-round'): Promise<{ request: { messages: NormalizedMessage[]; assistantParticipant?: string }; reply: ContentBlock[]; moves: number }> {
   const dir = mkdtempSync(join(tmpdir(), 'af-carriers-'));
   const membrane = new MockMembrane();
+  const robot = new Robot();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'),
     membrane: membrane.asMembrane(),
     agents: [{ name: AGENT, model: 'test-model', systemPrompt: 'You are a test agent.' }],
-    modules: [new Robot()],
+    modules: [robot],
   });
   try {
     let reply: ContentBlock[];
@@ -114,7 +116,7 @@ async function secondTurnRequest(arm: 'final-round' | 'tool-round'): Promise<{ r
     await framework.runUntilIdle();
     const request = membrane.calls[turn1Calls];
     assert.ok(request, `turn 2 made a request after turn 1's ${turn1Calls}`);
-    return { request: request as never, reply };
+    return { request: request as never, reply, moves: robot.moves };
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -124,7 +126,8 @@ async function secondTurnRequest(arm: 'final-round' | 'tool-round'): Promise<{ r
 describe('a turn\'s first request carries the provider items of the turns before it', () => {
   for (const [arm, next] of [['final-round', 'message:msg_1'], ['tool-round', 'function_call:fc_1']] as const) {
     it(`carries turn 1's compaction item in turn 2's first request, after a ${arm}`, async () => {
-      const { request, reply } = await secondTurnRequest(arm);
+      const { request, reply, moves } = await secondTurnRequest(arm);
+      assert.equal(moves, arm === 'tool-round' ? 1 : 0, 'the tool round\'s call ran');
       const carrier = reply.find((block) => itemOf(block)?.type === 'compaction');
       assert.ok(carrier, 'membrane carried the compaction item on a block of the reply');
       assert.deepEqual({ type: carrier.type, text: (carrier as { text?: unknown }).text }, { type: 'text', text: '' });

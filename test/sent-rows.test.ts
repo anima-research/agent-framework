@@ -70,7 +70,7 @@ describe('asNextRequestCarries', () => {
   it('keeps a provider-native item\'s carrier, an exactly empty text block whose rawItem is an object, as membrane marks one', () => {
     const carrier = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } } as ContentBlock;
     assert.deepEqual(asNextRequestCarries([carrier, text('Hi.')]), [carrier, text('Hi.')]);
-    // A row holding only a carrier carries something, so a rewind counts it and a shed can take it.
+    // A row holding only a carrier is carried: the request sends it where its provider takes the item.
     assert.deepEqual(asNextRequestCarries([carrier]), [carrier]);
   });
 });

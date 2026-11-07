@@ -662,6 +662,28 @@ describe('replies to a [Continue] turn', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
+  it('a reply holding only provider items\' carriers gets the prompt it followed, by each item\'s own id', () => {
+    const prompt = { turn: 'p-1', text: '[Continue]' };
+    const carrier = (item: Record<string, unknown>) => ({ type: 'text', text: '', rawItem: item }) as ContentBlock;
+    const compaction = carrier({ type: 'compaction', id: 'cmp_9', encrypted_content: 'x' });
+    const result = carrier({ type: 'web_search_tool_result', tool_use_id: 'srvtoolu_9', content: [] });
+    const anonymous = carrier({ type: 'compaction', encrypted_content: 'y' });
+    for (const [content, expected] of [
+      [[compaction], ['earlier reply', '[Continue]', '']],
+      [[result], ['earlier reply', '[Continue]', '']],
+      // An item with neither id has no identity, as before: its prompt isn't rendered.
+      [[anonymous], ['earlier reply', '']],
+    ] as const) {
+      const stored = [
+        { participant: 'assistant', content: signed('sig-a', 'earlier reply') },
+        { participant: 'assistant', content: [...content], metadata: { promptedBy: prompt } },
+      ];
+      const index = indexRequestOnlyRows(stored, 'assistant');
+      const bare = stored.map(({ participant, content }) => ({ participant, content }));
+      assert.deepEqual(renderRequestOnlyRows(bare, index, 'assistant').messages.map(textOf), expected, JSON.stringify(content));
+    }
+  });
+
   it('a row that is both a tick row and a reply to [Continue] gets both turns, separator first', () => {
     const tick = { eventId: 'hb-x', serverId: 'heartbeat', agentName: 'assistant', separator: SILENT_HEARTBEAT_SEPARATOR };
     const prompt = { turn: 'p-1', text: '[Continue]' };

@@ -118,24 +118,50 @@ describe('buildActivationRequest empty-text sanitize', () => {
     assert.deepEqual(request.messages[0]!.content, [{ type: 'text', text: 'kept' }]);
   });
 
-  it('agrees with the stored-injection check (hasRenderedContent) on what a message keeps', async () => {
-    const blocks = [
-      { type: 'text', text: '' },
-      { type: 'text', text: ' \n' },
-      { type: 'text', text: null },
-      { type: 'text', text: 'said' },
-      { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } },
-      { type: 'text', text: ' ', rawItem: { type: 'compaction', id: 'cmp_1' } },
-      { type: 'text', text: '', rawItem: 'compaction' },
-      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } },
+  it('agrees with the stored-injection check (hasRenderedContent) on what a message keeps, but for a carrier, which it carries and doesn\'t count as a turn', async () => {
+    const blocks: Array<[unknown, boolean, boolean]> = [
+      // [block, the request keeps a message holding it alone, the message holds a turn]
+      [{ type: 'text', text: '' }, false, false],
+      [{ type: 'text', text: ' \n' }, false, false],
+      [{ type: 'text', text: null }, false, false],
+      [{ type: 'text', text: 'said' }, true, true],
+      [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } }, true, false],
+      [{ type: 'text', text: ' ', rawItem: { type: 'compaction', id: 'cmp_1' } }, false, false],
+      [{ type: 'text', text: '', rawItem: 'compaction' }, false, false],
+      [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } }, true, true],
     ];
-    for (const block of blocks) {
+    for (const [block, kept, turn] of blocks) {
       const request = await agentCompiling([
         { participant: 'human', content: [block] },
         { participant: 'human', content: [{ type: 'text', text: 'last' }] },
       ]).buildActivationRequest([]);
-      assert.equal(request.messages.length === 2, hasRenderedContent([block] as never), JSON.stringify(block));
+      assert.equal(request.messages.length === 2, kept, `kept: ${JSON.stringify(block)}`);
+      assert.equal(hasRenderedContent([block] as never), turn, `a turn: ${JSON.stringify(block)}`);
     }
+  });
+
+  it('puts [Continue] after the agent\'s own last turn when another participant\'s carrier-only message follows it', async () => {
+    const carrier = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } };
+    const request = await agentCompiling([
+      { participant: 'human', content: [{ type: 'text', text: 'hi' }] },
+      { participant: 'tester', content: [{ type: 'text', text: 'ok' }] },
+      { participant: 'Bob', content: [carrier] },
+    ]).buildActivationRequest([]);
+    // A wire that leaves the item out would otherwise end on the agent's own turn.
+    assert.deepEqual(request.messages.map((m) => m.participant), ['human', 'tester', 'Bob', 'user']);
+    assert.deepEqual(request.messages.at(-1)!.content, [{ type: 'text', text: '[Continue]' }]);
+  });
+
+  it('adds no [Continue] when the agent\'s own carrier-only message follows another participant\'s turn', async () => {
+    const carrier = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } };
+    const request = await agentCompiling([
+      { participant: 'human', content: [{ type: 'text', text: 'hi' }] },
+      { participant: 'tester', content: [{ type: 'text', text: 'ok' }] },
+      { participant: 'human', content: [{ type: 'text', text: 'and?' }] },
+      { participant: 'tester', content: [carrier] },
+    ]).buildActivationRequest([]);
+    assert.deepEqual(request.messages.map((m) => m.participant), ['human', 'tester', 'human', 'tester']);
+    assert.deepEqual(request.messages.at(-1)!.content, [carrier]);
   });
 
   it('runs BEFORE the trailing-assistant check: a sanitize-exposed trailing assistant still gets [Continue]', async () => {

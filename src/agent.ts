@@ -8,7 +8,7 @@ import { ToolResultGuard } from './tool-result-guard.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
-import { carriedBlock, type SentRow } from './sent-rows.js';
+import { carriedBlock, holdsTurn, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
@@ -150,14 +150,34 @@ import type {
 
 
 /**
+ * The turn a request's messages, as sanitized, end on apart from
+ * `injectionTail` stored context injections after it, and whether those are
+ * all context injections. Both count only messages that hold a turn
+ * (holdsTurn), as the injection tail is counted: a message holding only
+ * provider items' carriers is passed over, since every wire but the
+ * Responses API leaves it out.
+ */
+function turnBeforeInjections(messages: NormalizedMessage[], injectionTail: number): { turn: NormalizedMessage | undefined; injectionsOnly: boolean } {
+  let counted = 0;
+  let injectionsOnly = true;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (!holdsTurn(message.content)) continue;
+    if (counted === injectionTail) return { turn: message, injectionsOnly };
+    if (!message.participant.startsWith('system_context:')) injectionsOnly = false;
+    counted++;
+  }
+  return { turn: undefined, injectionsOnly };
+}
+
+/**
  * Whether a request's messages, as sanitized, end on `agentName`'s own
- * message, apart from `injectionTail` stored context injections after it
- * (counted over the messages the sanitizer keeps).
+ * turn, apart from `injectionTail` stored context injections after it
+ * (turnBeforeInjections).
  */
 function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, injectionTail: number): boolean {
-  const own = messages[messages.length - 1 - injectionTail];
-  return own !== undefined && own.participant === agentName
-    && messages.slice(messages.length - injectionTail).every((m) => m.participant.startsWith('system_context:'));
+  const { turn, injectionsOnly } = turnBeforeInjections(messages, injectionTail);
+  return turn !== undefined && turn.participant === agentName && injectionsOnly;
 }
 
 /** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
@@ -2135,8 +2155,9 @@ export class Agent {
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
     }
     // The stored context injections the request ends on, counted over the
-    // messages the sanitizer below keeps (hasRenderedContent), since it drops
-    // a message it leaves empty, a placed blank injection among them.
+    // messages that hold a turn (hasRenderedContent): the sanitizer below
+    // drops a message it leaves empty, a placed blank injection among them,
+    // and a message holding only provider items' carriers isn't a turn.
     // [Continue] goes after them, and a tool loop's prompt is read from
     // before them: they're context, not what woke the agent. An injection
     // compile() places ends the tail, as on main, where every one was placed.
@@ -2218,7 +2239,7 @@ export class Agent {
     } else {
       // What the request ends on apart from the stored injections after it,
       // which aren't something the reply answers.
-      continuePrompt = toolLoopPrompt(messages.at(-1 - injectionTail), index);
+      continuePrompt = toolLoopPrompt(turnBeforeInjections(messages, injectionTail).turn, index);
     }
 
     const request: NormalizedRequest = {
