@@ -4,4 +4,7 @@
   one with requester `{ via: 'api' }`. Before, a branch switch was the one branch move the operator log didn't
   record.
 - `PresentationOccasion` gains `'rebase'`: the store's branch moved under a live agent, and its window was written
-  down on the new branch, or couldn't be (`presentation:presented` and `presentation:failed`).
+  down on the new branch, or couldn't be (`presentation:presented` and `presentation:failed`). A move of the store's
+  branch carries every live agent's window to the new branch: it is written down where that branch has none, and the
+  agent's own rows not in its window are presented. An agent whose window can't be written down there stays in legacy
+  mode until the next move, and the move itself stands. Every agent's redo entries are dropped at a move.
