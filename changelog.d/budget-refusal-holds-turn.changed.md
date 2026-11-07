@@ -72,10 +72,10 @@
   room for the note, the request goes past its budget by up to the note's
   price, out of the reply's reserve; a placed injection can't refuse the
   compile. Before its compile, a released start can also add to the window
-  deferred batches and a module's changed context injection, and, where it
-  is the turn's first start rather than a retry or a resume, the messages
-  written for the agent while the turn waited and a clock row that has come
-  due, none of which the check sees. Where those tip the compile into a refusal while compression is
+  a module's changed context injection, and, where it is the turn's first
+  start rather than a retry or a resume, the messages written for the agent
+  while the turn waited, a clock row that has come due and deferred batches,
+  none of which the check sees. Where those tip the compile into a refusal while compression is
   pending, the turn is held again; where compression has nothing left to do,
   the refusal takes the error policy's path, its reason saying that the
   context fit at the check that released it and the compile its start then
