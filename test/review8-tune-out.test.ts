@@ -2943,6 +2943,40 @@ test("Oscar on #844: a cancel that ends a hold the boot told the resident still 
   }
 });
 
+test("Oscar on #844: where the cancel can't read the resident's rows to tell whether the boot's \"still stands\" row is its last word, it writes the short release all the same, and says so once", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    let next: TuneOutCoordinator | undefined;
+    try {
+      ({ next } = toldStillStands(h, scope));
+      // The cancel's own read of the backlog lands; the read that tells whether the boot's row is the last word throws.
+      const hooks = (next as unknown as { hooks: { getStoredMessages: () => unknown } }).hooks;
+      const read = hooks.getStoredMessages;
+      let calls = 0;
+      hooks.getStoredMessages = () => {
+        if (++calls === 2) throw new Error("the resident's rows can't be read (test)");
+        return read();
+      };
+      const before = h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel').length;
+      errors.mock.resetCalls();
+      const answer = scope ? next.cancelAllExcept('subconscious', 'by Subconscious') : next.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious');
+      hooks.getStoredMessages = read;
+      const where = scope ? 'all-except' : 'channel';
+      assert.equal(answer.ok, true, `${where}: the cancel ends the hold`);
+      const rows = h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel').slice(before);
+      assert.equal(rows.length, 1, `${where}: the short release is written, one redundant line being the cheaper error against a false "still stands"`);
+      assert.match(textOf(rows[0]!.content), /this release records the end/, `${where}: as the short release`);
+      const said = errors.mock.calls.map((c) => String(c.arguments[0])).filter((l) => l.includes("rows can't be read to tell whether"));
+      assert.equal(said.length, 1, `${where}: said once: ${JSON.stringify(errors.mock.calls.map((c) => String(c.arguments[0])))}`);
+    } finally {
+      next?.stop();
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
 test("Oscar on #844, control: a cancel whose earlier release the resident wasn't told still stands (a run's retry) writes no second row; one with no earlier release writes its release as before", () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup({ stored: true });

@@ -297,8 +297,8 @@ function releaseRecordsOf(rows: readonly HeldRow[], epochId: string): ReleaseRec
  * more writes a release all the same, saying the end is recorded now
  * (AF #844, Oscar).
  */
-function toldStillStands(rows: readonly HeldRow[], epochId: string): boolean {
-  // In store order, as residentMessages lists them.
+function toldStillStands(rows: readonly Pick<StoredMessage, 'metadata'>[], epochId: string): boolean {
+  // In store order.
   let release = -1;
   let told = -1;
   rows.forEach((m, at) => {
@@ -1842,6 +1842,25 @@ export class TuneOutCoordinator {
    */
   private writeKept(id: string | void): boolean {
     return id === '' && this.writesHeldNow();
+  }
+
+  /**
+   * Whether the resident's last word on a hold (`what`, as the log names
+   * it) is the boot's row that it still stands (toldStillStands), read from
+   * the residents' stored rows for the cancel that ends it with nothing
+   * more to deliver. A read that throws, or rows that can't be read, count
+   * as yes, said once: one redundant release line is the cheaper error
+   * against a "still stands" left as the last word on a tune-out that has
+   * ended (AF #844, Oscar). Never throws.
+   */
+  private residentToldStillStands(epochId: string, what: string): boolean {
+    try {
+      return toldStillStands(this.hooks.getStoredMessages(), epochId);
+    } catch (err) {
+      console.error(`[tune-out] the resident's rows can't be read to tell whether its last word on ${what} is that it still stands, `
+        + `so the cancel that ends it writes it a short release all the same: ${thrownReason(err)}`);
+      return true;
+    }
   }
 
   /** Whether the framework keeps writes in memory now (writesHeld), with `forAgent`'s among them; a hook that throws counts as not. */
@@ -4083,7 +4102,7 @@ export class TuneOutCoordinator {
       // release that tells a queued note's loss, as a boot reads it
       // (noteUnstampedStop).
       releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
-    } else if (toldStillStands(rows, epochId)) {
+    } else if (this.residentToldStillStands(epochId, name)) {
       // The boot told the resident this tune-out still stands, after its
       // last release (tellResidentUnended): this cancel delivers nothing
       // more, and says it has ended, so that row isn't the resident's last
@@ -4631,7 +4650,7 @@ export class TuneOutCoordinator {
     } else if (lost) {
       releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: header }],
         { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
-    } else if (toldStillStands(rows, epochId)) {
+    } else if (this.residentToldStillStands(epochId, 'the all-except hold')) {
       // As a channel's: the boot told the resident the hold still stands.
       releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: `${header}\n\n${endedNow('hold')}` }],
         { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) } }));
