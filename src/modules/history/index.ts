@@ -697,8 +697,8 @@ export class HistoryModule implements Module {
           'Fetch raw, uncompressed messages for a time range and/or channel, paginated oldest-first. ' +
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
           'readable string (a call of a tool the framework names for sending, editing or saying a message, such as ' +
-          'send_message, as its name and its words when it carries words, such as "[telegram--send_message] …", its name ending ", error" when its result, stored after it, failed; ' +
-          'other tool_use/tool_result/thinking/images as bracketed labels, a failed tool_result\'s ending ", error"); ' +
+          'send_message, as its name and its words when it carries words, such as "[telegram--send_message] …", its name ending ", error" when its result, stored after it, is flagged as an error; ' +
+          'other tool_use/tool_result/thinking/images as bracketed labels, a tool_result flagged as an error ending ", error"); ' +
           'format:"raw" returns the content blocks unmodified. ' +
           'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
           'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
@@ -1539,7 +1539,7 @@ export class HistoryModule implements Module {
       if (block.type !== 'tool_use') continue;
       const said = speechOf(block.name, block.input);
       const wordsAt = at + label.length - (said?.words.length ?? 0);
-      if (said && index >= wordsAt && index + length <= at + label.length) {
+      if (said && index >= wordsAt && index < at + label.length && index + length <= at + label.length) {
         return `[${block.name}${failed.has(block.id) ? ERROR_MARK : ''}] ${snippetAround(said.words, index - wordsAt, length)}`;
       }
     }

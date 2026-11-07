@@ -634,6 +634,25 @@ describe('HistoryModule', () => {
       assert.deepEqual(await snippets({ query: 'pin at the end' }), [['l3', `[fixture--send_message] ${'…'}${'a'.repeat(79)} pin at the end`]]);
     });
 
+    it("a zero-length regex match at the end of a send's words takes the message's window, and a match ending there keeps the send's label", async () => {
+      const store: StoredMessage[] = [
+        msg('z1', 1000, 'Glassy', [
+          { type: 'tool_use', id: 'z', name: 'fixture--send_message', input: { channelId: 'room', text: 'hello there' } },
+          { type: 'tool_result', toolUseId: 'z', toolName: 'fixture--send_message', content: 'sent' },
+        ], 'c1'),
+      ];
+      const { cm } = buildStub(store);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const snippets = async (query: string) => {
+        const result = await h.handleToolCall(call('search', { query, regex: true }));
+        assert.equal(result.success, true, result.error);
+        return (result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]);
+      };
+      assert.deepEqual(await snippets('(?= \\[tool_result)'), [['z1', '[fixture--send_message] hello there [tool_result: fixture--send_message]']]);
+      assert.deepEqual(await snippets('there(?= \\[tool_result)'), [['z1', '[fixture--send_message] hello there']]);
+    });
+
     it("reads a send's result across its own body's shards and the results after it, and stops at a message of any other kind", async () => {
       const shard = (m: StoredMessage, group: string, index: number): StoredMessage => ({ ...m, bodyGroupId: group, shardIndex: index, shardCount: 2 }) as StoredMessage;
       const store: StoredMessage[] = [

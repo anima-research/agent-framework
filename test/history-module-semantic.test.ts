@@ -13,7 +13,6 @@ class FakeService {
   upserts: Item[][] = [];
   searches: Record<string, unknown>[] = [];
   failNext = 0;
-  /** Called with the search's count as each search arrives, before it's answered. */
   onSearch?: (n: number) => void;
   /** Answer hits without text, as a service that keeps only vectors and ids does. */
   omitText = false;
