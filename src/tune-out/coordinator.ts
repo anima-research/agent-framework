@@ -177,7 +177,7 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
   const hold = what.charAt(0).toLowerCase() + what.slice(1);
   return 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
     + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
-    + 'fails; cancelling again won\'t make it sooner. '
+    + 'fails; cancelling again won\'t make it sooner while that lasts. '
     + `${what} stays in force; when it ends, what it still holds is delivered, up to its backlog cap and what `
     + 'fits in one message. '
     + 'If the host stops first, the cancel is lost, and the restart doesn\'t run it.'

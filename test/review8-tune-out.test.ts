@@ -956,7 +956,7 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
     h.state.held = true;
     const waits = 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
       + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
-      + 'fails; cancelling again won\'t make it sooner. ';
+      + 'fails; cancelling again won\'t make it sooner while that lasts. ';
     const holds = 'stays in force; when it ends, what it still holds is delivered, up to its backlog cap and what fits in one message. ';
     const stop = 'If the host stops first, the cancel is lost, and the restart doesn\'t run it.';
     const kept = (hold: string) => ` Unless the host stops first, your note goes to the resident when a cancel ends ${hold}, or tries to. `
@@ -1264,8 +1264,8 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
     assert.deepEqual(answer, { success: true, data: { waiting: true, serverId: 'disc', note:
       'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
       + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
-      + 'fails; cancelling again won\'t make it sooner. The tune-out stays in force; when it ends, what it still holds '
-      + 'is delivered, up to its backlog cap and what fits in one message. If the host stops first, the cancel is lost, '
+      + 'fails; cancelling again won\'t make it sooner while that lasts. The tune-out stays in force; when it ends, what it '
+      + 'still holds is delivered, up to its backlog cap and what fits in one message. If the host stops first, the cancel is lost, '
       + 'and the restart doesn\'t run it. Your note goes to the resident as your mail when a cancel ends the tune-out, '
       + 'or tries to, even if your run has ended by then. If it can\'t be delivered, you are told so while your run '
       + 'lasts; after that, no one is. If the host stops before the tune-out ends, your note is lost with the cancel, '
