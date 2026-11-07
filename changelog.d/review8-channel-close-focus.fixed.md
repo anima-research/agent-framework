@@ -1,8 +1,6 @@
 - `channel_close` of the channel an all-except hold excepts says what holds of the focus when its answer
-  arrives. A close whose hold's release waited for held writes, and ran while the close's transport
-  round-trip was awaited, answered `status: 'closed'` with "The close cancels the all-except hold that
-  excepts it. Not cancelled yet: …" though the focus had ended. The answer's sentence is now read as the
-  answer is built: "The focus on it ended, and what the other channels held was delivered, up to its backlog cap." where the hold
+  arrives, so a close whose hold's release waited for held writes, and ran while the close's transport
+  round-trip was awaited, says the focus ended. The answer's sentence is read as the answer is built: "The focus on it ended, and what the other channels held was delivered, up to its backlog cap." where the hold
   has ended by then, and the wait's note where it is still in force.
 - A `channel_close` of the excepted channel whose hold's release failed after it had ended the focus (a step
   after the end, such as the resident's wake, threw) answered "The close wasn't recorded: <reason>" and said
@@ -15,7 +13,8 @@
   with it before.
 - A `channel_close` naming the channel an all-except hold excepts, after its server stopped registering it
   (removed by `channels/changed`, or the server removed), answered "No channel has the id "work", so nothing
-  ran. channel_list shows the channel ids." and left the focus in force. An agent's close given that
+  ran. channel_list shows the channel ids." (or a like refusal for another form of its name) and left the focus
+  in force. An agent's close given that
   channel's id, its server-qualified name, its id with its `serverId`, or, inside the turn whose channel it
   was, its id, now ends the focus as a close of the registered channel ends it, its backlog released, and
   answers, as a failure since no close ran: "Server "editor" no longer registers channel "work", so no close

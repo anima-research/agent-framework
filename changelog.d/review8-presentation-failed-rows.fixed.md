@@ -2,4 +2,4 @@
   its log line counts and names them (#291).
 - A presentation whose write the store accepted counts its rows as presented even when a read of the window throws
   right after: it is traced (`presentation:presented`), its listeners hear the rows, and no `presentation:failed` is
-  traced for it. Before, that read's throw left the rows in the window untold (#291).
+  traced for it, so the rows aren't left in the window untold (#291).

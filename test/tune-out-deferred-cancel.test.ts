@@ -1640,3 +1640,123 @@ describe("a stop whose wait for the kept hold runs out, and a start on the same 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 (Oscar, nissa's house, at 412877b3): a cancel's release reaches
+// the resident, but its end isn't recorded, so the tune-out stays in force.
+// After the next start the resident had "[Tune-out: noisy cancelled — …]"
+// and nothing after it saying the tune-out still stands. Two doors: (a) a
+// budgeted stop whose wait ran out, the hold released after it; (b) a throw
+// between the release and the end, as a store fault would give. The boot
+// tells the resident once, in the pass that tells the subconscious.
+// ---------------------------------------------------------------------------
+
+const STILL_IN_FORCE = /^\[Tune-out: noisy is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\)\.\]$/;
+
+/** The resident's window after the start: the release's first line and every row after it that says the tune-out still stands. */
+function residentAfterStart(f: Fixture): { releases: number; stillInForce: string[]; releaseFirst: boolean } {
+  const window = presentedTo(f, 'agent');
+  const at = window.findIndex((t) => t.startsWith('[Tune-out: noisy cancelled'));
+  const still = window.filter((t) => STILL_IN_FORCE.test(t));
+  return {
+    releases: window.filter((t) => t.startsWith('[Tune-out: noisy cancelled')).length,
+    stillInForce: still,
+    releaseFirst: at >= 0 && still.length > 0 && window.indexOf(still[0]!) > at,
+  };
+}
+
+/** What a check and a second enter say of noisy now, once its server registers it again after the start: held count, and the refusal. */
+async function whatTheChannelSays(f: Fixture): Promise<{ held: number | undefined; refusal: string }> {
+  await f.send('channels/register', {
+    channels: ['work', 'noisy'].map((id) => ({ id, type: 'discord', label: id, initiallyOpen: true, metadata: { channelType: 'guild_text' } })),
+  });
+  await eventually(() => internals(f).tuneOutCoordinator!.check().channels.some((c) => c.channelId === 'noisy'), 'noisy listed by a check');
+  const held = internals(f).tuneOutCoordinator!.check().channels.find((c) => c.channelId === 'noisy')?.held;
+  const answer = await internals(f).handleTuneOutTool('agent', { channelId: 'noisy' });
+  return { held, refusal: answer.success ? `(entered: ${JSON.stringify(answer.data)})` : answer.error ?? '' };
+}
+
+describe("a release that reached the resident, its end not recorded (AF #844, Oscar)", () => {
+  it("(a) a budgeted stop whose wait ran out, the hold released after it: after the start the resident is told, once, after the release, that the tune-out is still in force; a check and a second enter agree", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun();
+    try {
+      const first = await h.f.framework.stop(500).then(() => 'resolved', (error: unknown) => error);
+      assert.ok(first instanceof ShutdownTimeoutError, `premise: the stop's wait ran out: ${String(first)}`);
+      h.release();
+      await h.f.framework.stop();
+      await h.f.create();
+      assert.ok(internals(h.f).channelRegistry.getTuneOutState('editor', 'noisy'), 'premise: the tune-out is still in force');
+      const seen = residentAfterStart(h.f);
+      assert.equal(seen.releases, 1, "premise: the release is in the resident's window");
+      assert.equal(seen.stillInForce.length, 1, `the resident is told once that it still stands: ${JSON.stringify(presentedTo(h.f, 'agent'))}`);
+      assert.ok(seen.releaseFirst, 'after the release');
+      const request = await subconsciousRequest(h.f, 'agent');
+      assert.ok(request.some((t) => STILL_IN_FORCE.test(t)), "the resident's first request carries it");
+      const says = await whatTheChannelSays(h.f);
+      assert.equal(says.held, 0, 'a check counts nothing held: what was held went with the release');
+      assert.match(says.refusal, /is already tuned out/, 'a second enter is refused as one already tuned out');
+      await h.f.framework.stop();
+      await h.f.create();
+      assert.equal(residentAfterStart(h.f).stillInForce.length, 1, 'a later start tells it no second time');
+    } finally {
+      errors.mock.restore();
+      h.release();
+      h.off();
+      await h.f.close();
+    }
+  });
+
+  it("(b) a throw between the release and the end, then a stop and a start: the resident is told, once, after the release, that the tune-out is still in force; a check and a second enter agree", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const registry = internals(f).channelRegistry;
+      const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      (f.framework as unknown as Framework).addMessage('antra', [{ type: 'text', text: 'held 1f2e' }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      endNotRecorded(f);
+      assert.throws(() => internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'agent request'), /before the end was recorded/,
+        'premise: the cancel stored its release and threw at its end');
+      assert.match(textOf(find(f, '<tuned-out-backlog')), /held 1f2e/, 'premise: the release, with the held message, is stored');
+      assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the tune-out is still in force');
+      await f.framework.stop();
+      await f.create();
+      assert.ok(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), 'premise: still in force after the start');
+      const seen = residentAfterStart(f);
+      assert.equal(seen.releases, 1, "premise: the release is in the resident's window");
+      assert.equal(seen.stillInForce.length, 1, `the resident is told once that it still stands: ${JSON.stringify(presentedTo(f, 'agent'))}`);
+      assert.ok(seen.releaseFirst, 'after the release');
+      const request = await subconsciousRequest(f, 'agent');
+      assert.ok(request.some((t) => STILL_IN_FORCE.test(t)), "the resident's first request carries it");
+      const says = await whatTheChannelSays(f);
+      assert.equal(says.held, 0, 'a check counts nothing held: what was held went with the release');
+      assert.match(says.refusal, /is already tuned out/, 'a second enter is refused as one already tuned out');
+      await f.framework.stop();
+      await f.create();
+      assert.equal(residentAfterStart(f).stillInForce.length, 1, 'a later start tells it no second time');
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
+  it('control: a cancel that recorded its end tells the resident nothing of the kind after a start', async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      assert.deepEqual(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'agent request'), { ok: true }, 'premise: the cancel ended it');
+      await f.framework.stop();
+      await f.create();
+      assert.deepEqual(residentAfterStart(f).stillInForce, [], 'nothing says it still stands');
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+});

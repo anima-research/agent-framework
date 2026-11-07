@@ -8,4 +8,4 @@
   presentation traces synchronously), ends the turn the same way, at an ordinary tool boundary and after a stream that
   completed with its tools still running: the stream isn't resumed, and the turn ends with the stop's one
   `inference:aborted`. What is stored by then stays, the calls with their results, so the record holds no call
-  without one. Before, the round went on: its stream was resumed after the stop.
+  without one.

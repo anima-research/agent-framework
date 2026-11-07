@@ -2,9 +2,11 @@
   window once it is presented (#291, decision 4): the agent's newest exchange in its window leaves it as an undone
   turn's rows do, and the record keeps it, as the marker has always said. A co-resident's round the agent doesn't
   observe, a row the agent was never shown, a system change, a row a tune-out holds from residents and another
-  agent's stored injection are no longer shed (an observed co-resident's round, which is in the observer's view, can
-  be its newest exchange, and leaves the observer's window only), and no other agent's window, cache prefix or
-  signed thinking changes. An undone row is in no list a
+  agent's stored injection aren't shed (an observed co-resident's round, which is in the observer's view, can be its
+  newest exchange, and leaves the observer's window only), and no other agent's window, cache prefix or signed
+  thinking changes. In 0.32.0 the shed took the newest exchange from the record, a co-resident's round included, and
+  the quarantine's also a row the agent was never shown or one a tune-out held; neither took a row marked `system`,
+  such as another agent's stored injection. An undone row is in no list a
   presentation point presents from, so a later start, a restart or a redo of another turn doesn't bring it back; it
   reads `'undone'` (`windowStatusOf`) and is marked so in the history tools. On a window that is still the record
   the shed removes the rows from it, as before.

@@ -15,10 +15,10 @@
   `mail`, `agentEnded: true`); a release that still meets a write for an agent gone, or for a name another agent is
   registered under since, does the same, so a new agent of that name never gets an ended one's writes. A
   crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's queue
-  on disk, and a surgery's deferred writes with it. So does a release whose store throws for one, none of its rows
+  on disk, and with it the writes a surgery deferred while the host was quiesced or its queue already on disk. So does a release whose store throws for one, none of its rows
   landing: the writes after it go on, and the release logs the loss and raises an `ops:alert` of kind
-  `store-held-lost` for the agent, with the counts and kinds as at a stop, where earlier releases kept such a write
-  queued for the next drain. A write whose store throws after its rows landed counts as stored, here and on the
+  `store-held-lost` for the agent, with the counts and kinds as at a stop, where earlier releases kept such a write,
+  and its agent's writes after it, queued for the next drain. A write whose store throws after its rows landed counts as stored, here and on the
   write path the release replays (an inbound channel message or push, a fork's channel message, a module's write):
   context-manager names those rows (`WriteLandedError`), and the write is placed, presented and answered by them as
   if its store hadn't thrown, the throw logged. So a coalesced occurrence stored that way isn't stored again as its
@@ -34,8 +34,9 @@
   Rows found are placed as the delivery, and no fallback is stored; with none found, the fallback is stored; and
   where the store still can't be read, the fallback is stored and a line logged names the occurrence the agent may
   then see twice. Any other throw means none of the write landed. A write whose store refuses it as it is made, on
-  the ordinary write path, is lost, logged, where the queue used to keep it, so a refused failure notice for a fork
-  is no longer passed to the primary at the fork's release.
+  the ordinary write path, is lost, logged. In earlier releases such a write made during its agent's turn (or while
+  quiesced, or during a surgery) was queued, and the queue kept it when its flush was refused, so a refused failure
+  notice for a fork was passed to the primary at the fork's release; it no longer is.
   A tune-out's cancel asked for meanwhile (its end time passing, a wake past its budget, a tool's or a host's
   cancel), or while the primary's or the subconscious's context manager refuses its work before anything is kept for
   it, waits, the tune-out in force, until the release has stored the writes, or told of those it couldn't, then runs,
@@ -56,8 +57,8 @@
   wait is over. A crash before the cancel
   runs leaves the tune-out in force for the next boot, which cancels one whose end time passed. The
   `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
-  for a manager refusing its work, but mail, which stays held in the registry for the next boot, where 0.28.0's said
-  writes still queued at exit survive in a persisted deferral queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
+  for a manager refusing its work, but mail, which stays held in the registry for the next boot, where 0.32.0's (0.28.0's
+  text) said writes still queued at exit survive only in a persisted deferral queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
   its manager refuses its work (lost) and those a surgery whose operation outlived `stop()`'s wait still holds, it
   logs one `[stop] agent=<name>: …` line and raises an `ops:alert` of kind `store-held-lost` with the counts and
   kinds (`data`: `count`, `keptForRecovery`, `heldBySurgery`, `kinds`, `mail`); mail among them stays held in the
@@ -95,7 +96,7 @@
     only where its write throws or the store's sync fails (`commitDeliveries` answers false); a release, or a
     queued run's note, kept in memory as it is written (a hold that begins with that write) makes the cancel wait,
     as above, so no queue over its cap keeps a tune-out in force
-    (the tune-out-cancel-order entry); a dump's record of what it covered (`released`) names a held message by its
+    (0.31.0's entry on the order of a cancel's dump and its end); a dump's record of what it covered (`released`) names a held message by its
     id, and one an earlier release queued, which the boot's import stores, by its queued write's id, as that
     release's records name it.
   - **Hosts:** `WritePlacement.deferredId` and `CoalescingPlacement.deferredId` are removed (a placement names its
@@ -108,8 +109,8 @@
     surgery holds it, or its recipient's context manager refuses its work); `message:added` no longer comes with the
     `deferred-flush:*` sources (an imported write's is `deferred-import`). A write kept in memory is traced once, as a
     release stores it: `message:added` with its stored id and source `surgery-release`. Its arrival is never traced,
-    where a module's process response, a resident's channel message, a push event and a script's wake traced it with
-    the id `''` (or `'deferred'`) and a fork's channel message didn't, so a consumer keyed on the id or counting a
+    where a module's process response, a resident's or a fork's channel message, a push event and a script's wake
+    traced it with the id `''` (or `'deferred'`), so a consumer keyed on the id or counting a
     source sees a held write once, under `surgery-release`.
   - **Rollback:** going back to a release before this one needs a copy of the store taken before the upgrade: the
     first window write-down that holds rows, or any presentation of more than one row, moves the store's MANIFEST to

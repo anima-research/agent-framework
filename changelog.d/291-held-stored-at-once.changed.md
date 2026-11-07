@@ -19,7 +19,9 @@
   messages are ones it hadn't been shown when it wrote the note (those its window doesn't hold); the notice says how
   many.
 - `inspectAgentContext` on an ended agent reopens its context with the view its live one had: a resident's leaves
-  out the other residents' stored context injections as well as held traffic, and the subconscious's leaves out
-  the residents' stored injections. Before, they compiled them.
+  out the other residents' stored context injections as well as held traffic, as in 0.32.0, and the subconscious's
+  leaves out the residents' stored injections and keeps the held traffic it reads. 0.32.0 reopened an ended
+  subconscious through the residents' view, which left out held traffic as well (and on the residents' slot: the
+  291-audience-stamp fixed entry).
 - The subconscious's window anchor counts an active all-except hold when a channel's tune-out is entered during it,
   so the anchor stays at the hold's start rather than moving forward past it.

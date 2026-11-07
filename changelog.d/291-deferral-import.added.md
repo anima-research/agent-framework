@@ -20,11 +20,12 @@
   deletes the importer, so a host boots this release until its record is empty (the `deferred-import` alert says
   when writes stay queued, such as those for an agent a move cut), and doesn't upgrade past it from a release that
   kept a queue.
-- A tune-out's release for the resident, and its notices for the subconscious, are stored at once and made durable
-  as before, but the wake each asks for is in memory. At boot, such a row still out of its agent's window (stored
+- A tune-out's release for the resident, and its notices for the subconscious, are stored at once and made durable,
+  where 0.32.0 queued them behind a live turn of their agent and made the release durable in the persisted queue,
+  but the wake each asks for is in memory. At boot, such a row still out of its agent's window (stored
   while a turn of the agent's was alive, the process ending before the turn did) asks its agent's wake again
-  (`tune-out released (restored)` for the resident, `tune-out (restored)` for the subconscious), as the restored
-  queue did in earlier releases (#232 gap 6).
+  (`tune-out released (restored)` for the resident, `tune-out (restored)` for the subconscious), as 0.32.0's
+  restored queue did for the resident's release (#232 gap 6).
 - Mail (a job's result, an agent's message) is stored for its recipient as it is delivered, whatever the recipient's
   turn, and its hold is released once the store has synced the row; the wake the delivery asks for is in memory. At
   boot, mail stored for an agent and still out of its window (it arrived during a turn the process ended before
@@ -32,9 +33,10 @@
   source `dendrite`), before the boot's pass presents it. Earlier releases kept such mail held while its write
   waited, and the boot's redelivery woke the recipient. Mail sent with `wake: false` asks for no wake at the boot
   either: its row records it (`dendrite.wake: false`). Mail an earlier release left queued records no such ask (that
-  release didn't queue it), so the boot wakes its recipient for it whatever its sender asked; main asked no boot wake
-  for any queued mail. An interrupted job whose
-  result is stored this way still
-  tells its recipient nothing about ending without a result.
+  release didn't record `wake: false` with a queued write), so the boot wakes its recipient for it whatever its
+  sender asked; 0.32.0's boot asked no wake for any queued mail. An interrupted job whose
+  result is stored this way tells its recipient nothing about ending without a result, as 0.32.0 told nothing
+  while the result was held; 0.32.0 told the recipient of a result already stored and released before the restart
+  that the job ended without one (the review8-writes-interrupted-notice entry).
   Where the boot can't read what an agent is owed to ask those wakes, the agent's arrivals stay out of its window
   until its next turn start, at the boot's pass and at every point at rest after it, so a later boot asks them.

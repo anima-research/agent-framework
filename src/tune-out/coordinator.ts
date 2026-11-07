@@ -353,7 +353,12 @@ export interface AllExceptState {
   wakeCount: number;
 }
 
-/** `check`: what is held right now, without releasing anything. */
+/**
+ * `check`: what is held right now, without releasing anything. A hold's
+ * messages an earlier release of it delivered (its end not recorded, the
+ * hold still in force) are delivered, not held, and are counted and peeked
+ * no more: what is held is what its next release delivers (AF #844, Oscar).
+ */
 export interface TuneOutCheck {
   allExcept: { epochId: string; except: { serverId: string; channelId: string }; expiresAtMs: number; wakeCount: number; held: Record<string, number> } | null;
   channels: Array<{ serverId: string; channelId: string; epochId: string; held: number; expiresAtMs?: number }>;
@@ -1362,6 +1367,70 @@ export class TuneOutCoordinator {
     // reads; then those for the holds the last stop didn't stamp.
     this.askTurnsForUnreadLosses();
     this.noteUnstampedStop(onRecord, this.restoreLossNotices(), bootHead);
+    // And the resident, of a hold still in force whose release reached it
+    // before the last stop, its end not recorded (tellResidentUnended).
+    this.tellResidentUnended(onRecord, bootHead);
+  }
+
+  /**
+   * At boot (resumeActiveEpochs), after this boot's own releases (an end
+   * time passed, a wake budget spent): each hold on record then still in
+   * force whose release the resident has, stored before this boot (a
+   * `tune-out-cancel` row of its epoch), its end never recorded. The
+   * resident read "[Tune-out: … cancelled …]", and nothing said the
+   * tune-out still stood: a stop whose wait for an operator's operation ran
+   * out, the hold's release after it storing the release, or a throw
+   * between a cancel's release and its end (a store fault). It is told,
+   * once, by a row in the residents' slot (`tune-out-end-unrecorded`) that
+   * the release reached it but the end wasn't recorded, so the tune-out is
+   * still in force, what arrives there held for its next release, and how
+   * it ends; the release row stays as the record of the release. A row of
+   * that kind for the epoch after its latest release silences a later boot;
+   * a release after it (another cancel that failed at its end) is told
+   * again. The subconscious, whose window holds the residents' rows, reads
+   * it too. A write that throws is logged, and tried at the next boot
+   * (AF #844, Oscar). Never throws.
+   */
+  private tellResidentUnended(onRecord: readonly HoldOnRecord[], bootHead: number | undefined): void {
+    try {
+      if (onRecord.length === 0) return;
+      const rows = this.hooks.getStoredMessages();
+      for (const { epochId, serverId, channelId, scope } of onRecord) {
+        const params = scope
+          ? this.getAllExcept()?.params
+          : this.channelRegistry.getTuneOutState(serverId, channelId)?.params;
+        if (!params || params.epochId !== epochId) continue;
+        let release = -Infinity;
+        let told = -Infinity;
+        for (const m of rows) {
+          const meta = m.metadata as { kind?: unknown; epochId?: unknown } | undefined;
+          if (meta?.epochId !== epochId || typeof m.sequence !== 'number') continue;
+          if (bootHead !== undefined && m.sequence > bootHead) continue;
+          if (meta.kind === 'tune-out-cancel') release = Math.max(release, m.sequence);
+          else if (meta.kind === 'tune-out-end-unrecorded') told = Math.max(told, m.sequence);
+        }
+        if (release === -Infinity || told > release) continue;
+        const shown = this.shown(serverId, channelId);
+        const expires = params.expiresAtMs !== undefined ? new Date(params.expiresAtMs) : undefined;
+        const until = expires && Number.isFinite(expires.getTime())
+          ? `, or at its end time, ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
+          : '';
+        const text = scope
+          ? `[${NOTICE_TAG.tuneOut}: the all-except hold (all channels except ${shown}) is still in force. Its release above reached you, but its `
+            + 'end wasn\'t recorded before the host stopped, so the hold is still in force: what arrives in those channels is held, and comes '
+            + `with its next release. It ends when it is cancelled (tune_out mode "cancel" with scope "all-except")${until}.]`
+          : `[${NOTICE_TAG.tuneOut}: ${shown} is still tuned out. Its release above reached you, but its end wasn't recorded before the `
+            + 'host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release. It ends when it '
+            + `is cancelled (tune_out mode "cancel")${until}.]`;
+        this.hooks.addMessage('user', [{ type: 'text', text }], {
+          system: true, kind: 'tune-out-end-unrecorded', channelId, serverId, epochId, ...(scope ? { scope } : {}),
+        });
+        console.error(`[tune-out] the release of ${scope ? 'the all-except hold' : shown} (epoch ${epochId}) reached the resident before the last stop, `
+          + 'but its end was not recorded, so the resident is told the hold is still in force');
+      }
+    } catch (err) {
+      console.error(`[tune-out] the resident could not be told, at boot, of a hold whose release reached it with its end not recorded: ${thrownReason(err)}`);
+    }
   }
 
   /** The epochs of the tune-outs active now, a channel's and the all-except hold (the anchor's branchMoved reads them). */
@@ -4423,11 +4492,11 @@ export class TuneOutCoordinator {
   }
 
   /** Channels held by the scope (not by their own epoch) with the count held under it. */
-  private scopeHeldCounts(epochId: string): Map<string, { serverId: string; channelId: string; count: number }> {
+  private scopeHeldCounts(epochId: string, held?: (m: HeldRow) => boolean): Map<string, { serverId: string; channelId: string; count: number }> {
     const counts = new Map<string, { serverId: string; channelId: string; count: number }>();
     for (const m of this.residentMessages()) {
       const meta = m.metadata as { tuneOut?: { epochId?: string }; channelId?: string; serverId?: string } | undefined;
-      if (meta?.tuneOut?.epochId !== epochId) continue;
+      if (meta?.tuneOut?.epochId !== epochId || (held && !held(m))) continue;
       const channelId = typeof meta.channelId === 'string' ? meta.channelId : '(unknown channel)';
       const serverId = typeof meta.serverId === 'string' ? meta.serverId : '';
       const k = this.key(serverId, channelId);
@@ -4634,9 +4703,14 @@ export class TuneOutCoordinator {
   check(opts: { peek?: { serverId?: string; channelId: string }; peekLimit?: number } = {}): TuneOutCheck {
     // Stored, and kept by a surgery's hold until its release (residentMessages).
     const stored = this.residentMessages();
-    const countOf = (epochId: string) => stored.filter(
-      (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
-    ).length;
+    // Held now: an epoch's messages no earlier release of it covered, which
+    // its next release delivers (a release whose end wasn't recorded leaves
+    // the hold in force, and delivered what it covered).
+    const heldOf = (epochId: string): ((m: HeldRow) => boolean) => {
+      const delivered = keyedBy(releaseRecordsOf(stored, epochId));
+      return (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId && !delivered(m);
+    };
+    const countOf = (epochId: string) => stored.filter(heldOf(epochId)).length;
     const channels = this.listActive().map(({ serverId, channelId, params }) => ({
       serverId, channelId, epochId: params.epochId, held: countOf(params.epochId),
       ...(params.expiresAtMs !== undefined ? { expiresAtMs: params.expiresAtMs } : {}),
@@ -4645,7 +4719,8 @@ export class TuneOutCoordinator {
     let allExcept: TuneOutCheck['allExcept'] = null;
     if (scope) {
       const held: Record<string, number> = {};
-      for (const { serverId, channelId, count } of this.scopeHeldCounts(scope.params.epochId).values()) held[this.shown(serverId, channelId)] = count;
+      const isHeld = heldOf(scope.params.epochId);
+      for (const { serverId, channelId, count } of this.scopeHeldCounts(scope.params.epochId, isHeld).values()) held[this.shown(serverId, channelId)] = count;
       allExcept = { epochId: scope.params.epochId, except: scope.params.except, expiresAtMs: scope.params.expiresAtMs, wakeCount: scope.wakeCount, held };
     }
     const result: TuneOutCheck = { allExcept, channels };
@@ -4659,10 +4734,12 @@ export class TuneOutCoordinator {
         if (e.channelId === opts.peek.channelId && (!opts.peek.serverId || e.serverId === opts.peek.serverId)) active.add(e.epochId);
       }
       if (scope) active.add(scope.params.epochId);
+      // Nor what an earlier release of the epoch delivered, its end not recorded.
+      const heldIn = new Map([...active].map((epochId) => [epochId, heldOf(epochId)]));
       const lines = stored
         .filter((m) => {
           const meta = m.metadata as { tuneOut?: { epochId?: string }; channelId?: string; serverId?: string } | undefined;
-          return typeof meta?.tuneOut?.epochId === 'string' && active.has(meta.tuneOut.epochId)
+          return typeof meta?.tuneOut?.epochId === 'string' && active.has(meta.tuneOut.epochId) && heldIn.get(meta.tuneOut.epochId)!(m)
             && meta.channelId === opts.peek!.channelId
             && (!opts.peek!.serverId || meta.serverId === opts.peek!.serverId);
         })

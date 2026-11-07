@@ -11,5 +11,6 @@
   - A row stored for an agent is in its context's record at once: a host that reads `getAllMessages()` sees rows
     its agent's window doesn't hold yet (`getPresentedMessages()` is the window).
   - A turn's continuation (a budget restart, a tool-result guard's retry) presents no arrival: a message stored
-    while it was on its way enters the window as the turn ends, and its wake starts a turn of its own, where before
-    it rode in the continuation's request.
+    while it was on its way enters the window as the turn ends, and its wake starts a turn of its own, where in
+    0.32.0 a message stored while the continuation waited (its agent holding no turn token then) rode in the
+    continuation's request.
