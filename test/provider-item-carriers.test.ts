@@ -150,15 +150,40 @@ const carrierOf = (item: Record<string, unknown>) => ({ type: 'text', text: '', 
 const SEARCH_CALL = { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'tides' } };
 const SEARCH_RESULT = { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_1', content: [] };
 const STRAY_RESULT = { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_user', content: [] };
+const LATER_COMPACTION = { type: 'compaction', id: 'cmp_2', encrypted_content: 'compacted-again' };
 
-/** A window holding carriers in an assistant turn and in a user turn, as the agent's request carries it. */
+const QUESTION = { participant: 'human', content: [carrierOf(STRAY_RESULT), { type: 'text', text: 'When is high tide?' }] };
+const ANSWER = { participant: 'tester', content: [carrierOf(SEARCH_CALL), carrierOf(SEARCH_RESULT), carrierOf(COMPACTION), { type: 'text', text: 'At six.' }] };
+const ONLY_CARRIER = { participant: 'tester', content: [carrierOf(LATER_COMPACTION)] };
+
+/**
+ * A window holding carriers in an assistant turn and in a user turn, and a message holding only a carrier, as the
+ * agent's request carries it.
+ */
 async function requestWithCarriers() {
-  const request = await agentCompiling([
-    { participant: 'human', content: [carrierOf(STRAY_RESULT), { type: 'text', text: 'When is high tide?' }] },
-    { participant: 'tester', content: [carrierOf(SEARCH_CALL), carrierOf(SEARCH_RESULT), carrierOf(COMPACTION), { type: 'text', text: 'At six.' }] },
-    { participant: 'human', content: [{ type: 'text', text: 'Thanks.' }] },
-  ]).buildActivationRequest([]);
+  const request = await agentCompiling([QUESTION, ANSWER, ONLY_CARRIER, { participant: 'human', content: [{ type: 'text', text: 'Thanks.' }] }])
+    .buildActivationRequest([]);
   return { messages: request.messages as NormalizedMessage[], assistant: request.assistantParticipant ?? 'tester' };
+}
+
+/**
+ * Messages a formatter may be handed with a carrier-only message in each place: mid-request; last in the window, as
+ * the agent's request carries it (its trailing-assistant check puts [Continue] after it); and last in the messages
+ * themselves, the agent's own and another participant's, as a direct caller could hand membrane them.
+ */
+async function windowsWithCarrierOnlyMessages(): Promise<Array<[string, NormalizedMessage[], string]>> {
+  const mid = await requestWithCarriers();
+  const last = await agentCompiling([QUESTION, ANSWER, ONLY_CARRIER]).buildActivationRequest([]);
+  const lastMessages = last.messages as NormalizedMessage[];
+  assert.deepEqual(lastMessages.at(-2)!.content, ONLY_CARRIER.content, 'the agent sends the carrier-only message');
+  assert.deepEqual(lastMessages.at(-1)!.content, [{ type: 'text', text: '[Continue]' }], 'and [Continue] after it');
+  const direct = (tail: unknown) => [...mid.messages.slice(0, 2), tail] as NormalizedMessage[];
+  return [
+    ['mid-request', mid.messages, mid.assistant],
+    ['last in the window', lastMessages, last.assistantParticipant ?? 'tester'],
+    ['last, the agent\'s own', direct(ONLY_CARRIER), mid.assistant],
+    ['last, another participant\'s', direct({ participant: 'human', content: [carrierOf(STRAY_RESULT)] }), mid.assistant],
+  ];
 }
 
 /** Every content block of what a formatter built, where its messages hold blocks rather than a string. */
@@ -170,20 +195,23 @@ describe('membrane decides per provider what a carried item becomes', () => {
   const options = (assistant: string, extra: Record<string, unknown> = {}) =>
     ({ participantMode: 'multiuser', assistantParticipant: assistant, humanParticipant: 'user', systemPrompt: 'sys', ...extra }) as never;
 
-  it('sends no empty text block on any wire', async () => {
-    const { messages, assistant } = await requestWithCarriers();
-    for (const [name, built] of [
-      ['native', new NativeFormatter().buildMessages([...messages], options(assistant)).messages],
-      ['native with server blocks', new NativeFormatter().buildMessages([...messages], options(assistant, { anthropicServerBlocks: true })).messages],
-      ['anthropic-xml', new AnthropicXmlFormatter().buildMessages([...messages], options(assistant)).messages],
-      ['completions', new CompletionsFormatter().buildMessages([...messages], options(assistant)).messages],
-    ] as const) {
-      for (const m of built as Array<{ content?: unknown }>) {
-        if (typeof m.content === 'string') assert.notEqual(m.content.trim(), '', `${name}: an empty message`);
+  it('sends no empty text block, and no message a carrier leaves empty, on any wire but Responses', async () => {
+    for (const [where, messages, assistant] of await windowsWithCarrierOnlyMessages()) {
+      for (const [name, built] of [
+        ['native', new NativeFormatter().buildMessages([...messages], options(assistant)).messages],
+        ['native with server blocks', new NativeFormatter().buildMessages([...messages], options(assistant, { anthropicServerBlocks: true })).messages],
+        ['anthropic-xml', new AnthropicXmlFormatter().buildMessages([...messages], options(assistant)).messages],
+        ['completions', new CompletionsFormatter().buildMessages([...messages], options(assistant)).messages],
+      ] as const) {
+        const at = `${name}, carrier-only message ${where}`;
+        for (const m of built as Array<{ content?: unknown }>) {
+          if (typeof m.content === 'string') assert.notEqual(m.content.trim(), '', `${at}: an empty message`);
+          if (Array.isArray(m.content)) assert.notEqual(m.content.length, 0, `${at}: a message with no content`);
+        }
+        assert.deepEqual(builtBlocks(built).filter((b) => b.type === 'text' && typeof b.text === 'string' && b.text.trim() === ''), [], at);
+        assert.ok(!JSON.stringify(built).includes('cmp_'), `${at}: leaves out the compaction items`);
+        assert.ok(!JSON.stringify(built).includes('srvtoolu_user'), `${at}: leaves out a user turn's server block`);
       }
-      assert.deepEqual(builtBlocks(built).filter((b) => b.type === 'text' && typeof b.text === 'string' && b.text.trim() === ''), [], name);
-      assert.ok(!JSON.stringify(built).includes('cmp_1'), `${name} leaves out the compaction item`);
-      assert.ok(!JSON.stringify(built).includes('srvtoolu_user'), `${name} leaves out a user turn's server block`);
     }
   });
 
@@ -195,10 +223,10 @@ describe('membrane decides per provider what a carried item becomes', () => {
     assert.deepEqual(off.filter((b) => b.type === 'server_tool_use' || b.type === 'web_search_tool_result'), []);
   });
 
-  it('sends the compaction item on the Responses wire, and no server-tool block', async () => {
+  it('sends the item of a message holding only a carrier on the Responses wire, and no server-tool block', async () => {
     const { messages, assistant } = await requestWithCarriers();
     const wire = responsesWire(messages, assistant);
-    assert.ok(wire.includes('compaction:cmp_1'), wire.join(', '));
+    assert.ok(wire.includes('compaction:cmp_2'), wire.join(', '));
     assert.ok(!wire.some((item) => item.startsWith('server_tool_use') || item.startsWith('web_search_tool_result')), wire.join(', '));
   });
 });

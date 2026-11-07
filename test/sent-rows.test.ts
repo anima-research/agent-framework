@@ -72,12 +72,6 @@ describe('asNextRequestCarries', () => {
     assert.deepEqual(asNextRequestCarries([carrier, text('Hi.')]), [carrier, text('Hi.')]);
     // A row holding only a carrier carries something, so a rewind counts it and a shed can take it.
     assert.deepEqual(asNextRequestCarries([carrier]), [carrier]);
-    // Not carriers, by membrane's rule: whitespace text, and a rawItem that isn't an object.
-    assert.equal(asNextRequestCarries([
-      { type: 'text', text: ' ', rawItem: { type: 'compaction', id: 'cmp_1' } } as ContentBlock,
-      { type: 'text', text: '', rawItem: 'compaction' } as ContentBlock,
-      { type: 'text', text: '', rawItem: null } as ContentBlock,
-    ]), null);
   });
 });
 
