@@ -150,9 +150,9 @@ import type {
 
 
 /**
- * Whether a request's messages, as sanitized, end on `agentName`'s own
- * message, apart from `injectionTail` stored context injections after it
- * (counted over the messages the sanitizer keeps).
+ * Whether the request's turns end on `agentName`'s own message, apart from
+ * `injectionTail` stored context injections after it (counted over the
+ * messages it's given: the request's turns).
  */
 function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, injectionTail: number): boolean {
   const own = messages[messages.length - 1 - injectionTail];
