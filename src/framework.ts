@@ -758,6 +758,17 @@ function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled', hel
   );
 }
 
+/**
+ * Locked mode's one-time primer. Event-shaped and short, as the others are
+ * (proseModePrimer): it says where the agent's speech goes and what moves
+ * it, and teaches no grammar. `where` reads after "your plain speech".
+ */
+function lockedModePrimer(where: string, canMove: boolean): string {
+  return `[${NOTICE_TAG.proseRouting}] Locked routing: your plain speech ${where}, on every turn` +
+    (canMove ? ', until you move it with prose_locus. ' : '. ') +
+    'The channel a message comes from no longer moves it; other channels need an explicit send tool.';
+}
+
 /** Full `>>` routing reference, served as the prose_help TOOL RESULT (never
  *  injected ambiently — see proseModePrimer note). */
 const PROSE_ROUTING_HELP =
@@ -791,6 +802,44 @@ const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
   description: 'Show the plain-text output routing syntax (destination prefixes, resend token, skip).',
   inputSchema: { type: 'object' as const, properties: {} },
 };
+
+/**
+ * Locked prose routing's one mover (AgentConfig.proseRouting 'locked'): where
+ * the agent's plain speech goes, which nothing else moves. Offered only to an
+ * agent whose turns route locked (proseRoutingOf).
+ */
+const PROSE_LOCUS_TOOL: import('./types/index.js').ToolDefinition = {
+  name: 'prose_locus',
+  description:
+    'Where your plain speech (text you write without a send tool) goes. It stays there, on this turn and later ones, ' +
+    'until you change it here: the channel a message comes from, a heartbeat and channel_open never move it. ' +
+    'Leave `to` out (or null) to see where it goes now. `to`: "#channel", "@person" or a channel id posts your ' +
+    'plain speech there; "drafts" holds it as drafts instead, posted nowhere unless you resend them with the drafts ' +
+    'tool. A change applies from your next round; what you wrote beside the call goes where your speech went before. ' +
+    'Where a turn\'s words are sent only when it ends, a change applies from your next turn and holds this turn\'s ' +
+    'plain speech as drafts; the result says which. Send tools are unaffected.',
+  inputSchema: {
+    type: 'object' as const,
+    properties: {
+      to: {
+        type: ['string', 'null'],
+        description: '"#channel", "@person", a channel id, or "drafts". Leave out or null to see where your plain speech goes now.',
+      },
+    },
+  },
+};
+
+/** The word that points locked prose routing at drafts (prose_locus, AgentConfig.proseLock). */
+const PROSE_LOCK_DRAFTS = 'drafts';
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** What a damaged stored value is, for a diagnostic that doesn't repeat its contents (other agents' choices). */
+function shapeOf(value: unknown): string {
+  return value === null ? 'null' : Array.isArray(value) ? `an array of ${value.length}` : typeof value;
+}
 
 /** What a call of the removed `utils` tool is answered: where its utilities went. */
 const UTILS_REMOVED = `utils was removed: module utilities are in the host's built-in toolset now. ` +
@@ -843,6 +892,7 @@ type ToolRoute =
   | { kind: 'code-execution' }
   | { kind: 'drafts' }
   | { kind: 'prose-help' }
+  | { kind: 'prose-locus' }
   | { kind: 'module' };
 
 function agentsOwnVerbRefusal(toolName: string): ToolResult {
@@ -1425,7 +1475,26 @@ interface TurnRouting {
    */
   heartbeat?: true;
   /**
-   * Locus and hybrid mode: where the turn's unpinned plain prose lands.
+   * Locked mode (AgentConfig.proseRouting 'locked'): the turn's locus is the
+   * agent's prose lock, taken when the turn opens, and only prose_locus moves
+   * it. No incoming message, re-pin, heartbeat or channel_open does. A turn
+   * locked to drafts has no locus, takes no fallback (activeChannelResolver's
+   * null), and holds its plain speech as drafts.
+   */
+  locked?: true;
+  /** Locked mode: a stream of the turn routes its prose only at its end (no verbatim round content, membrane's XML tool path). */
+  endRouted?: true;
+  /**
+   * Locked mode: prose_locus moved the lock during a turn whose prose is
+   * routed only at its end (endRouted), so which words came before the move
+   * can't be told. The rest of the turn's plain speech, every later stream's
+   * included, is held as drafts, as the move's result says.
+   */
+  heldForMove?: true;
+  /**
+   * Locus, hybrid and locked mode: where the turn's unpinned plain prose
+   * lands. Locked mode's is the agent's lock (TurnRouting.locked); the rest
+   * of this describes locus and hybrid mode.
    * Frozen when the turn opens (home channel for a fork, else the trigger
    * channel, else the global default), so ambient chatter, reactions and
    * system markers can't move it (2026-07-21 Cairn lounge misroute). Since
@@ -1528,8 +1597,9 @@ interface TurnRouting {
    */
   arrivals: Arrival[];
   /**
-   * Under `speech.locus: 'delivery'`, the channels the turn has already told
-   * the agent it was addressed from while busy, by destinationKey (one
+   * Under `speech.locus: 'delivery'`, or in a locked turn, the channels the
+   * turn has already told the agent it was addressed from while busy, by
+   * destinationKey (one
    * notice per channel per turn; a retry or restart continues the turn and
    * doesn't repeat it).
    */
@@ -1923,6 +1993,13 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * `thinkingBinding` left unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
+  if ((config.tuneOut as { enabled?: unknown } | null | undefined)?.enabled === true) {
+    throw new Error(
+      'tuneOut.enabled was removed in agent-framework 0.33.0: residents are offered tune_out only with a reader ' +
+        '(subconscious), since a hold nothing summarizes hands the resident an undated backlog all at once. ' +
+        'Remove tuneOut.enabled; to keep tune-out, configure a subconscious as well.',
+    );
+  }
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
     assertBooleanSetting(
       'subconscious.enabled',
@@ -2492,6 +2569,9 @@ export class DefaultErrorPolicy implements ErrorPolicy {
     return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
   }
 }
+
+/** How many upcoming wakes healthSnapshot lists per agent: an agent can hold any number of reminders. */
+const HEALTH_UPCOMING_WAKES = 8;
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
@@ -4000,7 +4080,7 @@ export class AgentFramework {
   private subconsciousConfig: SubconsciousConfig | null = null;
   /** Tune-out coordinator (issue #77); non-null iff a reader is configured + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
-  /** Residents are offered `tune_out` (a reader is configured, or `tuneOut.enabled`). */
+  /** Residents are offered `tune_out` (a reader is configured). */
   private tuneOutOffered = false;
   /**
    * The reply anchor a coalesced delivery would set, parked until the
@@ -4364,6 +4444,7 @@ export class AgentFramework {
   private mcplToolServers: Map<string, string> = new Map();
   /** Servers whose tools/list answered in the latest refresh. */
   private mcplListedServers: Set<string> = new Set();
+  private mcplPublishedConnections: Map<string, McplServerConnection> = new Map();
   /** refreshMcplTools' starts, and the start whose result was published
    *  last: a refresh that a later-started one has overtaken publishes
    *  nothing, since that one listed every server after it. */
@@ -4768,7 +4849,7 @@ export class AgentFramework {
     framework.beforeDerive = config.dendrite?.beforeDerive;
     framework.derivationNoticeHook = config.dendrite?.derivationNotice;
     framework.speechLocus = config.speech?.locus ?? 'delivery';
-    framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
+    framework.tuneOutOffered = !!config.subconscious?.enabled;
     framework.tuneOutAnnounce = config.tuneOut?.announce !== false;
 
     // What the previous process left in the agent registry. Read before any
@@ -5210,85 +5291,18 @@ export class AgentFramework {
       await framework.ensureToolsetsModule();
     }
 
-    // Tune-out coordinator (issue #77, #232 §3.3): the hold machinery exists
-    // wherever tune_out is offered — with a reader (persistent subconscious
-    // or reader forks) it summarizes and wakes; with `tuneOut.enabled` alone
-    // it is a silent hold, and a persisted epoch is resumed and released
-    // (#232 gap 10). Where neither is configured nothing could ever cancel a
-    // tune-out on record, so each one ends at the start instead
-    // (endTuneOutsWithoutCoordinator), as main has it.
+    // Tune-out coordinator (issue #77): the hold machinery exists wherever
+    // tune_out is offered, which is only with a reader (persistent
+    // subconscious or reader forks): it summarizes and wakes, and a persisted
+    // epoch is resumed and released (#232 gap 10). Without a reader each
+    // tune-out on record is released at the start instead, backlog delivered
+    // (releaseTuneOutsWithoutReader), a hold that 0.32's `tuneOut.enabled`
+    // left included.
     if (framework.channelRegistry && framework.tuneOutOffered) {
-      framework.tuneOutCoordinator = new TuneOutCoordinator(
-        framework.channelRegistry,
-        framework.mcplServerRegistry!,
-        {
-          addMessage: (participant, content, metadata, forAgent) =>
-            framework.addMessage(participant, content, metadata as MessageMetadata,
-              forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
-          },
-          subconsciousName: () => framework.subconsciousAgentName,
-          ...(framework.readerForks
-            ? {
-                invokeReader: (invocation: ReaderInvocation) => framework.invokeReaderFork(invocation),
-                deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
-                  framework.deliverFromReader(reader, content, metadata),
-              }
-            : {}),
-          primaryName: () => framework.primaryAgentName,
-          getStoredMessages: () => {
-            const primary = framework.primaryAgentName
-              ? framework.agents.get(framework.primaryAgentName) : undefined;
-            return primary ? primary.getContextManager().getAllMessages() : [];
-          },
-          commitDeliveries: () => framework.commitDeliveries(),
-          historyTool: () => framework.residentHistoryTool(),
-          getDeferredMessages: () => {
-            const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName;
-            // Settled first, so a write that landed is in the stored rows
-            // alone (settleUnknownLandings).
-            framework.settleUnknownLandings(forPrimary);
-            return framework.deferredMessages.filter(forPrimary)
-              .sort(bySeq)
-              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
-          },
-          // Every reader of the shared slot compiles the dump with its own
-          // strategy, so the dump fits the smallest of their bounds.
-          residentMessageChars: () => {
-            let chars: number | undefined;
-            for (const reader of framework.sharedSlotAgents) {
-              const bound = framework.strategyDerivedToolResultChars(reader);
-              if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
-            }
-            return chars;
-          },
-          currentSequence: () => framework.store.currentSequence(),
-          setSubconsciousAnchor: (sequence) =>
-            framework.subconsciousStrategy?.setAnchor(sequence),
-          isForkBound: (channel) =>
-            framework.registry.list().some((record) => sameChannel(framework.homeOf(record.name), channel)),
-          isPrivilegedAuthor: (authorId) =>
-            framework.eventGate?.isPrivilegedUser(authorId) ?? false,
-          allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
-          holdWithoutReader: () => framework.tuneOutOffered,
-          ...(framework.tuneOutAnnounce
-            ? {
-                // The excepted channel on its server: a bare id two servers
-                // register is refused (publishForAgent).
-                announce: async (serverId: string, channelId: string, text: string) => {
-                  const r = await framework.channelRegistry!.publishForAgent(
-                    { serverId, channelId }, text, framework.primaryAgentName ?? 'resident');
-                  return { success: r.success, ...(r.error ? { error: r.error } : {}) };
-                },
-              }
-            : {}),
-          emitTrace: (e) => framework.emitTrace(e),
-        },
-      );
+      framework.tuneOutCoordinator = framework.makeTuneOutCoordinator();
       framework.tuneOutCoordinator.resumeActiveEpochs();
     } else {
-      framework.endTuneOutsWithoutCoordinator();
+      framework.releaseTuneOutsWithoutReader();
     }
 
     // Modules, agents, MCPL servers and the tune-out tool are all in place:
@@ -6239,17 +6253,50 @@ export class AgentFramework {
       const reason = queued[0]!.reason;
       wakes.push({
         certain: queued.some((r) => !this.mayDropAnswered(r)),
+        kind: 'queued',
         what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})`,
       });
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
-      wakes.push({ at: cooldown.until, certain: cooldown.heldRequests.some((r) => !this.mayDropAnswered(r)), what: cooldown.rearm
+      wakes.push({ at: cooldown.until, certain: cooldown.heldRequests.some((r) => !this.mayDropAnswered(r)), kind: 'provider-hold', what: cooldown.rearm
         ? `a turn whose retries ran out, sent again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
         : 'a turn held by a provider cooldown, when it ends' });
     }
     wakes.push(...this.heartbeatWakesFor(agentName));
     return wakes;
+  }
+
+  /**
+   * What will wake `agentName` with no new event, as healthSnapshot reports
+   * it: soonest first, the first HEALTH_UPCOMING_WAKES of them, each with its
+   * time, kind and whether it will wake the agent (`UpcomingWake.certain`).
+   * It only may where the rule table would hold it back (a probe: gate.js
+   * isn't asked) or hands it to the judge, or where it starts no turn once
+   * the agent has answered every message it names. A wake's `what` stays out:
+   * it can quote a reminder or a queue reason, and health goes to observers
+   * granted nothing else.
+   *
+   * The field is left out when this can't say, so that it isn't taken for an
+   * agent with nothing due: when a read throws, and when the heartbeat is
+   * heartbeat-mcpl, whose next tick only its own process knows.
+   */
+  private upcomingWakesHealth(agentName: string): {
+    upcomingWakes?: Array<{ at?: number; kind?: import('./gate/types.js').UpcomingWakeKind; certain: boolean }>;
+  } {
+    try {
+      if (!this.heartbeat && [...this.mcplServerConfigs.values()].some(isHeartbeatMcplServer)) return {};
+      const wakes = [...this.upcomingWakesFor(agentName), ...(this.eventGate?.upcomingWakes([agentName]) ?? [])];
+      return {
+        upcomingWakes: wakes
+          .sort((a, b) => (a.at ?? 0) - (b.at ?? 0))
+          .slice(0, HEALTH_UPCOMING_WAKES)
+          .map(({ at, kind, certain }) => ({ ...(at !== undefined ? { at } : {}), kind, certain })),
+      };
+    } catch (err) {
+      console.error(`[health] could not read upcoming wakes for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+      return {};
+    }
   }
 
   /**
@@ -7951,7 +7998,10 @@ export class AgentFramework {
     if (this.channelRegistry) {
       channelTools.push(AgentFramework.DRAFTS_TOOL);
     }
-    if (this.tuneOutCoordinator && this.tuneOutOffered) {
+    // Offered while a reader is there to watch a hold, or a hold is still on
+    // record for the resident to check or cancel: not once the persistent
+    // reader has ended and its holds are released (enter would refuse).
+    if (this.tuneOutCoordinator && this.tuneOutOffered && (this.subconsciousAgentName !== null || this.readerForks || this.tuneOutOnRecord())) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
     }
     const gateTools = this.eventGate
@@ -8650,6 +8700,7 @@ export class AgentFramework {
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const tools = this.getToolsForAgent(agentName, snapshot).filter(t => agent.canUseTool(t.name));
     if (agent.proseRouting === 'explicit' && agent.canUseTool(PROSE_HELP_TOOL.name)) tools.push(PROSE_HELP_TOOL);
+    if (this.proseRoutingOf(agent) === 'locked' && agent.canUseTool(PROSE_LOCUS_TOOL.name)) tools.push(PROSE_LOCUS_TOOL);
     return tools;
   }
 
@@ -12139,6 +12190,9 @@ export class AgentFramework {
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stopReader();
       this.subconsciousAgentName = null;
+      // No reader is left, and a hold nothing summarizes isn't kept: each
+      // ends now, its backlog to the resident.
+      if (!this.readerForks) this.tuneOutCoordinator?.releaseAll('reader-ended', 'its reader ended', { retry: true });
     }
   }
 
@@ -12964,9 +13018,7 @@ export class AgentFramework {
       'its messages will reach your subconscious where that\'s known. ' +
       'Calling tune_out again for a channel already tuned out keeps its ' +
       'settings, and, where this host can open the channel, tries the open ' +
-      'again if it isn\'t open. Without a subconscious it is a silent hold: ' +
-      'nothing summarizes or wakes you; the backlog is delivered when you ' +
-      'cancel. scope "all-except" holds EVERY channel (DMs and new channels ' +
+      'again if it isn\'t open. scope "all-except" holds EVERY channel (DMs and new channels ' +
       'included) except channelId, for durationSeconds (required); your plain ' +
       'speech lands in that channel meanwhile; the reader pauses rather than ' +
       'cancels when its wake budget is spent. mode "check" reports what is ' +
@@ -16996,9 +17048,13 @@ export class AgentFramework {
           // agent's mode, so its boundary neither notices nor re-pins. The
           // trigger is this stream's: its start holds the agent's turn token
           // while the agent waits on this round's tools.
-          const routesLocus = (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid')
-            && !this.activeTurnTriggers.get(agent.name)?.suppressProse;
-          if (this.speechLocus === 'delivery' && routesLocus && !shouldEndTurn && !overBudget && currentState.stream) {
+          // A locked turn is told the same, whichever locus rule the host
+          // runs: nothing incoming moves its lock either.
+          const silentTurn = !!this.activeTurnTriggers.get(agent.name)?.suppressProse;
+          const boundaryMode = this.proseRoutingOf(agent);
+          const routesLocus = (boundaryMode === 'locus' || boundaryMode === 'hybrid') && !silentTurn;
+          const noticesElsewhere = (this.speechLocus === 'delivery' && routesLocus) || (boundaryMode === 'locked' && !silentTurn);
+          if (noticesElsewhere && !shouldEndTurn && !overBudget && currentState.stream) {
             const routing = this.routingOf(agent.name);
             for (const inj of [...midTurnInjections]) {
               const m = inj.metadata as Record<string, unknown> | undefined;
@@ -17074,11 +17130,12 @@ export class AgentFramework {
               const notice = this.repinTurnLocus(agent, routing, newLocus, 'mid-turn addressed');
               if (notice) midTurnInjections.push(notice);
             }
-          } else if (routesLocus && !shouldEndTurn) {
+          } else if ((routesLocus || (boundaryMode === 'locked' && !silentTurn)) && !shouldEndTurn) {
             // A boundary that can't re-pin now (over budget, or no live
             // stream to tell) leaves what it stored for the agent to the
             // turn's next start, as arrivals: a budget restart, or a
-            // re-inference on these tool results.
+            // re-inference on these tool results. A locked turn's next start
+            // only tells of them (noticeAddressedArrivals).
             for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
           }
 
@@ -18480,7 +18537,8 @@ export class AgentFramework {
       : " To reply without opening it, decline it first (option 3): a channel you've declined stays closed when you speak there.";
     const named = [...new Set(opts.targetAgents ?? [])].filter((name) => this.agents.has(name));
     const woken = named.length === 1 ? this.agents.get(named[0]!) : undefined;
-    const mode = (woken ?? this.deliveryAgent())?.proseRouting ?? 'locus';
+    const reader = woken ?? this.deliveryAgent();
+    const mode = reader ? this.proseRoutingOf(reader) : 'locus';
     const prefix = mode === 'hybrid' ? '>>>' : '>>';
     const delivered = replyOpens
       ? `it will be delivered there, which opens the channel.${withoutOpening}`
@@ -18494,6 +18552,20 @@ export class AgentFramework {
         `you write is posted into it. To speak there, use ${inboundOnlyServer}'s own tools.\n`
       : mode === 'disabled'
         ? `1. Replying in plain text isn't available: your plain text is never published. To speak there, ${sendTool}.\n`
+        : mode === 'locked'
+          ? (() => {
+            // Where the lock points, as the reader's open turn has it (a
+            // move from outside the turn leaves the turn where it was): no
+            // open or reply moves it.
+            const open = this.openLogical.get(reader!.name);
+            const lock = open?.locked ? this.turnSpeaksAt(open) : this.proseLockLocus(reader!);
+            // A move made while a turn is held reaches only the next turn, so
+            // it's no way to reply here now.
+            const canMove = this.mayCallTool(reader!.name, PROSE_LOCUS_TOOL.name) && !(open?.locked && open.heldForMove);
+            return sameChannel(lock, channel)
+              ? `1. Reply — your plain speech goes to this channel: write your reply with no prefix; ${tunedOut ? 'it will be delivered there.' : delivered}\n`
+              : `1. Reply — your plain speech ${this.proseLockShown(lock, reader!.name)}, not here. To reply here, ${sendTool}${canMove ? ', or point prose_locus here' : ''}.\n`;
+          })()
         : mode === 'locus' && tunedOut
           ? `1. Reply — ${plainSpeechRule} it will be delivered there. If that is another channel, or you see none, to reply here, ` +
             `${sendTool}.\n`
@@ -20333,8 +20405,12 @@ export class AgentFramework {
   private publishInputWithTurnLocus(input: unknown, agentName: string, callingTurn: TurnRouting | undefined): unknown {
     const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
     if (typeof given === 'string') return input;
+    // A locked turn's default is its lock, or none: never what the registry
+    // resolves now, which reads the agent's latest routing (a silent start's).
     const locus = callingTurn
-      ? callingTurn.locus ?? this.channelRegistry?.resolveLocus(agentName) ?? null
+      ? callingTurn.locked
+        ? this.turnSpeaksAt(callingTurn)
+        : callingTurn.locus ?? this.channelRegistry?.resolveLocus(agentName) ?? null
       : this.homeOf(agentName) ?? null;
     if (!locus) return input;
     // The pair: a serverId beside a channelId names that server's channel.
@@ -21311,6 +21387,18 @@ export class AgentFramework {
     text: string,
     locus: ChannelRef | null,
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
+    if (round.routing.heldForMove) {
+      // The lock moved during a turn whose words wait for its end: which came
+      // before the move can't be told, so the rest of the turn's plain speech,
+      // on any stream or path of it, is held (TurnRouting.heldForMove).
+      console.error(`[prose] ${agent.name}: plain speech held as a draft (the lock moved during a turn routed at its end)`);
+      this.holdProseDrafts(agent, [text], 'no-destination', { routing: round.routing, notice: 'later' });
+      return null;
+    }
+    if (locus === null && round.routing.locked) {
+      this.holdLockedProse(agent, [text], round);
+      return null;
+    }
     if (locus === null && round.routing.heartbeat) {
       this.holdHeartbeatProse(agent, [text], round);
       return null;
@@ -21318,11 +21406,26 @@ export class AgentFramework {
     return this.channelRegistry!.routeSpeech(agent.name, text, locus);
   }
 
+  /**
+   * Hold a locked turn's plain speech as drafts ('no-destination'): the agent
+   * pointed its speech at drafts, or has no lock yet. Named in the turn's
+   * receipt rather than a notice per round, since holding is what the agent
+   * asked for.
+   */
+  private holdLockedProse(agent: Agent, texts: string[], round: ProseRound): Draft[] {
+    console.error(`[prose] ${agent.name}: locked to drafts — ${texts.length} plain-speech segment(s) held as drafts`);
+    return this.holdProseDrafts(agent, texts, 'no-destination', {
+      routing: round.routing,
+      notice: 'later',
+    });
+  }
+
   /** The mark a framework wake takes from a heartbeat's turn with no locus
    *  of its own (InferenceRequest.heartbeatTurn), so the turn it opens is a
    *  heartbeat's too; nothing for any other turn. */
   private heartbeatTurnMark(routing: TurnRouting): { heartbeatTurn?: true } {
-    return routing.heartbeat && !routing.locus ? { heartbeatTurn: true } : {};
+    // A locked turn's locus is its lock, not a channel the heartbeat answered.
+    return routing.heartbeat && (!routing.locus || routing.locked) ? { heartbeatTurn: true } : {};
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
@@ -21442,7 +21545,7 @@ export class AgentFramework {
     }
     if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`);
     if (suppressed > 0) {
-      notes.push(agent.proseRouting === 'disabled'
+      notes.push(this.proseRoutingOf(agent) === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
         : `${suppressed} plain-speech segment(s) suppressed`);
     }
@@ -21466,7 +21569,7 @@ export class AgentFramework {
     const text =
       shown.length > 0
         ? `[${NOTICE_TAG.delivered}] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}${closedNote}`
-        : agent.proseRouting === 'disabled'
+        : this.proseRoutingOf(agent) === 'disabled'
           ? `[${NOTICE_TAG.delivered}] plain speech → no channel — ${suppressedNote}`
           : `[${NOTICE_TAG.delivered}] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
@@ -21583,7 +21686,13 @@ export class AgentFramework {
   private writeAnnouncedLocus(agentName: string, locus: ChannelRef | null | undefined): void {
     try {
       const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      // A damaged slot is left as it is: replacing it would drop the prose
+      // locks it holds, which keep locked speech held until it's repaired.
+      if (data !== null && data !== undefined && !isPlainRecord(data)) {
+        console.error(`[routing] ${agentName}: ${FRAMEWORK_STATE_ID} isn't a record (${shapeOf(data)}); the announced locus wasn't written`);
+        return;
+      }
+      const state = (data ?? {}) as Record<string, unknown>;
       const loci = { ...((state.announcedLoci as Record<string, ChannelRef | null> | undefined) ?? {}) };
       if (locus === undefined) {
         if (!Object.hasOwn(loci, agentName)) return;
@@ -21599,6 +21708,261 @@ export class AgentFramework {
   }
 
   /**
+   * Whether the agent's current turn has no channel of its own, so it is
+   * answering no incoming message (ChannelRegistry.incomingFor): a
+   * heartbeat's, or one woken for a channel that names none, which no re-pin
+   * or channel_open has given a channel since. A locked turn's locus is where
+   * it speaks, not a message it answers, so it never counts as one.
+   */
+  private channellessTurn(agentName: string): boolean {
+    const routing = this.turnRouting.get(agentName);
+    if (!routing || routing.triggerChannel || !(routing.noChannel || routing.heartbeat)) return false;
+    return routing.locked === true || !routing.locus;
+  }
+
+  /**
+   * The prose routing an agent's turns run under: its configured mode, except
+   * for a locked agent's conversation fork and ephemeral run, which have no
+   * lock of their own. A fork is bound to its home channel, so it routes as
+   * locus mode does. A run's plain speech is its caller's result, and it
+   * publishes none: run as locus mode, its narration between tool calls would
+   * post to the channel inferred for its turn, which the lock exists to
+   * prevent, so it runs disabled, as a disabled resident's run does.
+   */
+  private proseRoutingOf(agent: Agent): NonNullable<AgentConfig['proseRouting']> {
+    // An agent's mode is always set (Agent defaults it); a stand-in for one
+    // may leave it out, which reads as the default, as `?? 'locus'` did here.
+    const mode = agent.proseRouting ?? 'locus';
+    if (mode !== 'locked') return mode;
+    if (this.usedEphemeralAgentNames.get(agent.name) === 'run') return 'disabled';
+    return this.homeOf(agent.name) ? 'locus' : mode;
+  }
+
+  /**
+   * A locked agent's own choice of destination (prose_locus), as
+   * framework/state keeps it: a channel, 'drafts', or undefined when it
+   * hasn't chosen. Throws when the state can't be read.
+   */
+  private readProseLock(agentName: string): ChannelRef | 'drafts' | undefined {
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as unknown;
+    if (data !== null && data !== undefined && !isPlainRecord(data)) {
+      throw new Error(`${FRAMEWORK_STATE_ID} isn't a record (${shapeOf(data)})`);
+    }
+    const locks = (data as { proseLocks?: unknown } | null | undefined)?.proseLocks;
+    if (locks === undefined) return undefined;
+    // A container that isn't a record holds choices that can't be read; it
+    // isn't taken as none, which would fall back to the recipe's destination.
+    if (!isPlainRecord(locks)) throw new Error(`its prose-lock record isn't a record (${shapeOf(locks)})`);
+    // Own keys only: an agent named after an Object.prototype member has no inherited choice.
+    if (!Object.hasOwn(locks, agentName)) return undefined;
+    const value = (locks as Record<string, unknown>)[agentName];
+    if (value === PROSE_LOCK_DRAFTS) return 'drafts';
+    if (value && typeof value === 'object') {
+      const { serverId, channelId } = value as { serverId?: unknown; channelId?: unknown };
+      if (typeof serverId === 'string' && serverId && typeof channelId === 'string' && channelId) return { serverId, channelId };
+    }
+    // A stored entry is a choice, even one that can't be read: it isn't
+    // taken as no choice, which would fall back to the recipe's destination.
+    throw new Error(`its stored entry names no destination (${shapeOf(value)})`);
+  }
+
+  /** Record a locked agent's choice of destination. Throws when it isn't recorded. */
+  private writeProseLock(agentName: string, lock: ChannelRef | 'drafts'): void {
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    // Damaged state keeps every agent's speech held as drafts
+    // (readProseLock); replacing it would drop the others' choices back to
+    // their recipes' destinations, so it's left for the host's operator.
+    const repair = 'the host\'s operator has to repair it, and until then no move can be recorded';
+    if (data !== null && data !== undefined && !isPlainRecord(data)) {
+      throw new Error(`the framework's stored state is damaged, so ${repair}`);
+    }
+    const state = (data ?? {}) as Record<string, unknown>;
+    const stored = state.proseLocks;
+    if (stored !== undefined && !isPlainRecord(stored)) {
+      throw new Error(`the stored prose-lock record is damaged, so ${repair}`);
+    }
+    const locks: Record<string, unknown> = { ...((stored as Record<string, unknown> | undefined) ?? {}) };
+    Object.defineProperty(locks, agentName, {
+      value: lock === 'drafts' ? PROSE_LOCK_DRAFTS : { serverId: lock.serverId, channelId: lock.channelId },
+      enumerable: true, writable: true, configurable: true,
+    });
+    state.proseLocks = locks;
+    this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    // A move away from a channel must survive a crash right after it's
+    // answered, or the old lock comes back. The write is in the store either
+    // way, so a sync that fails only widens that window, and is logged.
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error(`[prose] ${agentName}: the store didn't sync after the prose lock was written:`, err);
+    }
+  }
+
+  /**
+   * Where a locked agent's plain speech goes now: its own choice
+   * (prose_locus), else its recipe's proseLock, resolved as a `>>` target
+   * is, else nowhere (null: held as drafts). A stored choice that can't be
+   * read holds the speech as drafts rather than fall back to the recipe's,
+   * which the agent may have moved it away from.
+   */
+  private proseLockLocus(agent: Agent): ChannelRef | null {
+    let stored: ChannelRef | 'drafts' | undefined;
+    try {
+      stored = this.readProseLock(agent.name);
+    } catch (err) {
+      console.error(`[prose] ${agent.name}: the prose lock (${FRAMEWORK_STATE_ID}) couldn't be read — plain speech is held as drafts:`, err);
+      return null;
+    }
+    if (stored !== undefined) return stored === 'drafts' ? null : stored;
+    const spec = agent.proseLock;
+    if (!spec || spec.toLowerCase() === PROSE_LOCK_DRAFTS) return null;
+    const resolved = this.channelRegistry?.resolveProseTarget(spec, { forSpeech: true });
+    if (!resolved || 'error' in resolved) {
+      console.error(
+        `[prose] ${agent.name}: proseLock ${JSON.stringify(spec)} doesn't resolve${resolved ? ` (${resolved.error})` : ' (no channels)'} — plain speech is held as drafts`,
+      );
+      return null;
+    }
+    return { serverId: resolved.serverId, channelId: resolved.channelId };
+  }
+
+  /** Where a locked turn's plain speech goes now: its locus, or nowhere (drafts) while a move holds the rest of the turn (heldForMove). */
+  private turnSpeaksAt(turn: TurnRouting): ChannelRef | null {
+    return turn.heldForMove ? null : turn.locus ?? null;
+  }
+
+  /** " prose_locus moves it." where the agent may call prose_locus, else nothing: a notice names only a tool the agent has. */
+  private proseLocusMoves(agentName: string, turn?: TurnRouting): string {
+    if (!this.mayCallTool(agentName, PROSE_LOCUS_TOOL.name)) return '';
+    return turn?.heldForMove ? ' prose_locus moves it from your next turn.' : ' prose_locus moves it.';
+  }
+
+  /** Where a locked agent's plain speech goes, as the agent is told it: a verb phrase after "your plain speech". */
+  private proseLockShown(lock: ChannelRef | null, agentName: string, now = false): string {
+    if (lock) return `${now ? 'now ' : ''}goes to ${this.channelShown(lock)}`;
+    // The drafts tool is named only to an agent that may call it.
+    return `is ${now ? 'now ' : ''}held as drafts, posted nowhere` +
+      (this.mayCallTool(agentName, 'drafts') ? ' unless you resend them with the drafts tool' : '');
+  }
+
+  /**
+   * prose_locus: read or move a locked agent's prose lock. A move is
+   * recorded before it applies, so a failed write moves nothing. It applies
+   * to the calling turn's later rounds while that turn is open (what the
+   * calling round wrote was routed with the locus it had), and to every
+   * later turn.
+   */
+  private proseLocusToolResult(agentName: string, rawInput: unknown, callingTurn: TurnRouting | undefined): ToolResult {
+    const refuse = (error: string): ToolResult => ({ success: false, error, isError: true });
+    const agent = this.agents.get(agentName);
+    if (!agent) return refuse(`Unknown agent: ${agentName}`);
+    if (this.proseRoutingOf(agent) !== 'locked') {
+      return refuse('prose_locus applies only under locked prose routing. Nothing was changed.');
+    }
+    const input = (rawInput && typeof rawInput === 'object' ? rawInput : {}) as { to?: unknown };
+    const inTurn = !!callingTurn?.locked && this.openLogical.get(agentName) === callingTurn;
+    const current = (): ChannelRef | null => (inTurn ? callingTurn!.locus ?? null : this.proseLockLocus(agent));
+    // Where the agent's plain speech goes as of this call, a verb phrase
+    // after "your plain speech": under heldForMove, nowhere for the rest of
+    // the turn, and the lock from the next.
+    const nowShown = (): string => (inTurn && callingTurn!.heldForMove
+      ? `is held as drafts for the rest of this turn, since the lock moved while its words waited for its end, and from your next turn it ${this.proseLockShown(this.proseLockLocus(agent), agentName)}`
+      : this.proseLockShown(current(), agentName));
+    if (input.to === undefined || input.to === null) {
+      return { success: true, data: { proseLocus: `Your plain speech ${nowShown()}.` } };
+    }
+    if (typeof input.to !== 'string' || !input.to.trim()) {
+      return refuse('to must be "#channel", "@person", a channel id or "drafts". Nothing was changed.');
+    }
+    const spec = input.to.trim();
+    let lock: ChannelRef | 'drafts';
+    if (spec.toLowerCase() === PROSE_LOCK_DRAFTS) {
+      lock = 'drafts';
+    } else {
+      const registry = this.channelRegistry;
+      if (!registry) return refuse(`No channels are configured, so there is no channel to point your plain speech at. It still ${nowShown()}.`);
+      // Resolved as a `>>` target is: inside its turn, a name the turn's own
+      // channel answers to means that channel.
+      const resolved = registry.resolveProseTarget(spec, { forSpeech: true, own: callingTurn ? this.ownChannels(callingTurn) : [] });
+      if ('error' in resolved) {
+        const cand = resolved.candidates?.length
+          ? ` It could mean: ${resolved.candidates.join(', ')}.${registry.publishRouteFor(resolved.candidates) ?? ''}`
+          : '';
+        return refuse(`"${spec}" did not resolve: ${suppliedValue(resolved.error)}.${cand} Your plain speech still ${nowShown()}.`);
+      }
+      lock = { serverId: resolved.serverId, channelId: resolved.channelId };
+    }
+    const locus = lock === 'drafts' ? null : lock;
+    // Pointed where the turn already speaks and the stored choice already
+    // is: nothing to move, write or hold.
+    let chosen: ChannelRef | 'drafts' | undefined;
+    try {
+      chosen = this.readProseLock(agentName);
+    } catch {
+      chosen = undefined;
+    }
+    const alreadyChosen = chosen !== undefined && sameChannel(chosen === 'drafts' ? null : chosen, locus);
+    if (inTurn && sameChannel(callingTurn!.locus ?? null, locus) && alreadyChosen) {
+      return {
+        success: true,
+        data: {
+          proseLocus: callingTurn!.heldForMove
+            ? `Your plain speech already ${this.proseLockShown(locus, agentName)} from your next turn. The rest of this turn's is held as drafts.`
+            : `Your plain speech already ${this.proseLockShown(locus, agentName)}.`,
+        },
+      };
+    }
+    try {
+      this.writeProseLock(agentName, lock);
+    } catch (err) {
+      return refuse(`The change wasn't recorded (${thrownText(err)}), so your plain speech still ${nowShown()}.`);
+    }
+    const movesTurn = inTurn;
+    console.error(`[routing] ${agentName}: prose_locus -> ${locus ? qualifiedChannelName(locus) : 'drafts'}${movesTurn ? '' : ' (from its next turn)'}`);
+    if (!movesTurn) {
+      // A call from outside the agent's turn (a host's, or one answered
+      // after its turn settled) moves only the turns after it. The agent may
+      // never read this result, so the announce baseline stays where it was
+      // and the next turn's announce-on-change tells it where it speaks.
+      return {
+        success: true,
+        data: { proseLocus: `Your plain speech ${this.proseLockShown(locus, agentName, true)} from your next turn, until you change it. A turn under way keeps where it was.` },
+      };
+    }
+    const turn = callingTurn!;
+    // The stored choice moved back to where this turn already speaks (a
+    // move from outside had moved it on): the turn goes on as it was.
+    const turnMoves = !sameChannel(turn.locus ?? null, locus);
+    if (turnMoves && turn.endRouted) turn.heldForMove = true;
+    if (locus) {
+      turn.locus = locus;
+      noteTurnChannel(turn, locus);
+    } else {
+      delete turn.locus;
+    }
+    // Nothing more this turn writes is posted where it showed typing when it
+    // now speaks nowhere (drafts, or held after the move).
+    if (!this.turnSpeaksAt(turn) && turn.typing) {
+      this.channelRegistry?.stopTyping(turn.typing);
+      delete turn.typing;
+    }
+    // The announce baseline stays where it was: the next turn's
+    // announce-on-change confirms where its speech lands, which also holds
+    // when a rewind or a branch move takes this exchange out of the window.
+    return {
+      success: true,
+      data: {
+        proseLocus: turn.heldForMove
+          // A turn whose words are routed together at its end can't tell
+          // which came before this move (heldForMove).
+          ? `Your plain speech ${this.proseLockShown(locus, agentName, true)} from your next turn, until you change it. ` +
+            "This turn's plain speech is routed when it ends, all of it together, so it is held as drafts instead."
+          : `Your plain speech ${this.proseLockShown(locus, agentName, true)}, on this turn's later rounds and on later turns, until you change it.`,
+      },
+    };
+  }
+
+  /**
    * Announce-on-change locus notice (turn-frozen routing). Appends a durable
    * `[routing]` window message when the turn's effective outbound locus
    * differs from the last one announced — the agent must never have to guess
@@ -21609,7 +21973,7 @@ export class AgentFramework {
    * Never triggers
    * inference; never locus-eligible itself (system + no channel metadata).
    */
-  private announceLocusIfChanged(agentName: string, locus: ChannelRef | null): void {
+  private announceLocusIfChanged(agentName: string, locus: ChannelRef | null, locked = false): void {
     if (!this.lastAnnouncedLocus.has(agentName)) {
       try {
         const stored = (this.store.getStateJson(FRAMEWORK_STATE_ID) as { announcedLoci?: Record<string, ChannelRef | null> } | null)?.announcedLoci;
@@ -21630,9 +21994,10 @@ export class AgentFramework {
 
     let text: string;
     if (locus === null) {
-      text =
-        `[${NOTICE_TAG.routing}] Your plain speech currently has no channel — it stays in ` +
-        'your archive. Use an explicit send tool to reach a channel.';
+      text = locked
+        ? `[${NOTICE_TAG.routing}] Your plain speech ${this.proseLockShown(null, agentName)}. Use an explicit send tool to reach a channel.`
+        : `[${NOTICE_TAG.routing}] Your plain speech currently has no channel — it stays in ` +
+          'your archive. Use an explicit send tool to reach a channel.';
     } else {
       const shown = this.channelShown(locus);
       const inboundOnlyServer = this.channelRegistry?.inboundOnlyServer(locus);
@@ -22067,10 +22432,11 @@ export class AgentFramework {
   }
 
   /**
-   * Under `speech.locus: 'delivery'`: tell the agent that someone addressed
-   * it from another channel while its turn was busy, since incoming traffic
-   * never moves the locus and a neutral message carries nothing that names
-   * its channel (first live run, 2026-10-12, finding C). Once per channel
+   * Under `speech.locus: 'delivery'`, and in a locked turn under either rule:
+   * tell the agent that someone addressed it from another channel while its
+   * turn was busy, since incoming traffic never moves the locus and a neutral
+   * message carries nothing that names its channel (first live run,
+   * 2026-10-12, finding C). Once per channel
    * per turn (TurnRouting.addressedElsewhere); nothing for the turn's own
    * locus. Stored durably; returned as stored for a live stream to inject
    * with its boundary's other messages. Undefined when nothing was stored.
@@ -22082,10 +22448,14 @@ export class AgentFramework {
     who: string,
     when = 'while you were busy',
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
-    const pin = routing.locus ?? null;
+    const pin = routing.locked ? this.turnSpeaksAt(routing) : routing.locus ?? null;
     const key = destinationKey(channel);
     if (sameChannel(channel, pin) || routing.addressedElsewhere.has(key)) return undefined;
-    const where = pin ? `still lands in ${this.channelShown(pin)}` : 'stays in your archive (no channel)';
+    // A locked turn's speech stays where it is past this turn too, so the
+    // notice doesn't say "this turn" of it.
+    const where = pin
+      ? `still lands in ${this.channelShown(pin)}`
+      : routing.locked ? 'is held as drafts' : 'stays in your archive (no channel)';
     const content: ContentBlock[] = [{
       type: 'text',
       text:
@@ -22093,7 +22463,7 @@ export class AgentFramework {
         // line, its notice openings marked); the channel is shown as
         // channelShown gives it.
         `[${NOTICE_TAG.routing}] ${suppliedValue(who)} addressed you from ${this.channelShown(channel)} ${when}. ` +
-        `Your plain speech ${where} this turn; reaching them takes an explicit send.`,
+        `Your plain speech ${where}${routing.locked ? '' : ' this turn'}; reaching them takes an explicit send.`,
     }];
     const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
     const before = this.storedCountOf(agent);
@@ -22123,7 +22493,7 @@ export class AgentFramework {
 
   /**
    * The arrivals a start of the turn consumes under `speech.locus:
-   * 'delivery'`: each one that addressed the agent, whose message is still
+   * 'delivery'`, or in a locked turn: each one that addressed the agent, whose message is still
    * in the store, gets the addressed-elsewhere notice, oldest first. A
    * follow-up in an engaged channel addressed nobody and is not announced.
    */
@@ -22635,8 +23005,12 @@ export class AgentFramework {
     // turn that had no channel (noChannel: its wake named one that resolves
     // to none) passes its wake's channel on, so the next has none either,
     // rather than taking the global fallback this one refused.
-    const channel = routing.locus
-      ? { channelId: routing.locus.channelId, channelServerId: routing.locus.serverId }
+    // A locked turn's next takes the lock when it opens, so the wake names
+    // the channel this one came from (none for a heartbeat's), never the lock,
+    // which would read as the channel the next turn answers.
+    const named = routing.locked ? routing.triggerChannel : routing.locus;
+    const channel = named
+      ? { channelId: named.channelId, channelServerId: named.serverId }
       : routing.noChannel && trigger?.channelId
         ? { channelId: trigger.channelId, ...(trigger.channelServerId ? { channelServerId: trigger.channelServerId } : {}) }
         : {};
@@ -23509,10 +23883,16 @@ export class AgentFramework {
    * in default locus mode is recorded silently — no primer for the status quo.
    */
   private maybePrimeProseMode(agent: Agent): void {
-    const mode = agent.proseRouting;
+    const mode = this.proseRoutingOf(agent);
     try {
       const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      // A damaged slot is left as it is (writeAnnouncedLocus): no primer is
+      // recorded or appended until it's repaired.
+      if (data !== null && data !== undefined && !isPlainRecord(data)) {
+        console.error(`[prose] ${agent.name}: ${FRAMEWORK_STATE_ID} isn't a record (${shapeOf(data)}); the mode primer waits until it's repaired`);
+        return;
+      }
+      const state = (data ?? {}) as Record<string, unknown>;
       const primed = { ...((state.proseRoutingPrimed as Record<string, string> | undefined) ?? {}) };
       const stored = primed[agent.name];
       if (stored === mode) return;
@@ -23535,12 +23915,19 @@ export class AgentFramework {
       console.error(`[prose] ${agent.name}: disabled mode recorded (no primer injected)`);
       return;
     }
+    const lock = mode === 'locked' ? this.proseLockLocus(agent) : undefined;
+    const text = lock !== undefined
+      ? lockedModePrimer(this.proseLockShown(lock, agent.name), this.mayCallTool(agent.name, PROSE_LOCUS_TOOL.name))
+      : proseModePrimer(mode as Exclude<typeof mode, 'locked'>, this.canAgentUseTool(agent.name, 'prose_help'));
     try {
       const id = agent.getContextManager().addMessage(
         'user',
-        [{ type: 'text', text: proseModePrimer(mode, this.canAgentUseTool(agent.name, 'prose_help')) }],
+        [{ type: 'text', text }],
         { system: true, kind: 'prose-routing-primer' },
       );
+      // The primer names where locked speech goes: the turn's announce-on-change
+      // doesn't say it again.
+      if (lock !== undefined) this.rememberAnnouncedLocus(agent.name, lock);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-routing-primer' });
       console.error(`[prose] ${agent.name}: mode primer appended (${mode})`);
     } catch (err) {
@@ -24093,7 +24480,7 @@ export class AgentFramework {
   ): Promise<boolean> {
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
-    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
+    const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
     // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
@@ -24394,7 +24781,28 @@ export class AgentFramework {
       // this turn compiles, so the agent always knows where its voice goes
       // (announce-on-change only — no per-turn chatter, append-only for KV
       // stability).
-      if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
+      if (trigger?.suppressProse && this.proseRoutingOf(agent) === 'locked') {
+        // A silent start of a locked agent publishes no prose, but what it
+        // tells servers and gives a send with no channel is its lock or
+        // nothing, never the channel that woke it or a fallback.
+        routing.locked = true;
+        const locus = this.proseLockLocus(agent);
+        if (locus !== null) routing.locus = locus;
+      } else if (turnProseRouting === 'locked') {
+        // Locked mode: the agent's lock, whatever woke the turn, a heartbeat
+        // included; none (drafts) until it has one. Announce-on-change speaks
+        // when the lock differs from what the agent was last told: after any
+        // prose_locus move (its result told the turn that made it; this
+        // confirms it, even where a rewind dropped that exchange), and after
+        // a recipe proseLock's channel registers. The primer counts as told.
+        routing.locked = true;
+        const locus = this.proseLockLocus(agent);
+        if (locus !== null) {
+          routing.locus = locus;
+          noteTurnChannel(routing, locus);
+        }
+        if (attempt === 0) this.announceLocusIfChanged(agent.name, locus, true);
+      } else if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
         // None for a turn with no channel (noChannel), unless it's a fork's.
         const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) {
@@ -24429,7 +24837,7 @@ export class AgentFramework {
         : undefined;
       routing.arrivals = [];
       if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
-      else if (routesLocus && this.speechLocus === 'delivery') {
+      else if ((routesLocus && this.speechLocus === 'delivery') || turnProseRouting === 'locked') {
         // Which start this is, since from inside they look alike and the
         // reason says whether the earlier prose landed (Linn, 2026-10-14).
         const when = attempt > 0
@@ -24444,7 +24852,9 @@ export class AgentFramework {
     }
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.
-    const turnLocus = turnProseRouting === 'disabled' ? undefined : routing.locus;
+    const turnLocus = turnProseRouting === 'disabled' ? undefined
+      : turnProseRouting === 'locked' ? this.turnSpeaksAt(routing) ?? undefined
+        : routing.locus;
 
     this.touchEphemeralRun(agent.name, true);
     const turnStartedAt = Date.now();
@@ -24894,7 +25304,7 @@ export class AgentFramework {
     thinkingDrops?: StreamThinkingDrops,
     carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
   ): Promise<void> {
-    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
+    const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
@@ -25239,15 +25649,24 @@ export class AgentFramework {
     let typingChannel =
       turnProseRouting === 'explicit' || turnProseRouting === 'disabled'
         ? streamRouting.typing ?? null
-        : resolveTurnLocus();
+        : turnProseRouting === 'locked'
+          ? this.turnSpeaksAt(streamRouting)
+          : resolveTurnLocus();
     if (typingChannel) this.showTurnTyping(streamRouting, typingChannel);
-    // Locus and hybrid mode: move the indicator to the turn's locus when it
-    // has moved since the indicator last showed. Once a turn has a locus it
-    // always has one.
+    // Locus, hybrid and locked mode: move the indicator to the turn's locus
+    // when it has moved since the indicator last showed (locked: by
+    // prose_locus). Once a locus or hybrid turn has a locus it always has one.
     const followTurnLocus = (): void => {
-      if (turnProseRouting !== 'locus' && turnProseRouting !== 'hybrid') return;
-      const locus = resolveTurnLocus();
-      if (!locus || sameChannel(locus, typingChannel)) return;
+      if (turnProseRouting !== 'locus' && turnProseRouting !== 'hybrid' && turnProseRouting !== 'locked') return;
+      const locus = turnProseRouting === 'locked' ? this.turnSpeaksAt(streamRouting) : resolveTurnLocus();
+      // A locked turn moved to speak nowhere (drafts, or held after a move)
+      // shows and traces no channel: prose_locus stopped its indicator.
+      if (!locus && turnProseRouting === 'locked') {
+        typingChannel = null;
+        return;
+      }
+      // Against the turn's own record, which a locked move to drafts clears.
+      if (!locus || sameChannel(locus, streamRouting.typing ?? null)) return;
       this.showTurnTyping(streamRouting, locus);
       typingChannel = locus;
     };
@@ -25583,6 +26002,9 @@ export class AgentFramework {
             const roundCalls = calls.map((c) => this.roundCallOf(agent.name, c));
             const liveRound = !!this.channelRegistry && !!roundContent && roundContent.length > 0;
             if (liveRound) liveProseRouting = true;
+            // Set before the round's calls dispatch, so a prose_locus among
+            // them knows this turn's words wait for its end (heldForMove).
+            else if (turnProseRouting === 'locked' && this.channelRegistry) streamRouting.endRouted = true;
             // Whether this round's tool-result batch (and anything queued
             // with it) will be presented to the model before it speaks
             // again: the stream declares it (true on membrane's native path).
@@ -25699,8 +26121,8 @@ export class AgentFramework {
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
                 );
               } else {
-                console.error(roundLocus === null && streamRouting.heartbeat
-                  ? `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) held as drafts (a heartbeat turn)`
+                console.error(roundLocus === null && (streamRouting.heartbeat || streamRouting.locked)
+                  ? `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) held as drafts (${streamRouting.locked ? 'locked to drafts' : 'a heartbeat turn'})`
                   : `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${roundLocus ?? '(default)'}`);
                 for (const seg of roundSegments) {
                   enqueueSpeech(seg, roundLocus, roundPublished, roundOpts);
@@ -25719,7 +26141,7 @@ export class AgentFramework {
               .filter((c) => c.name === CODE_EXECUTION_TOOL_NAME
                 && this.scriptMayRoute(agent.name, c, turnProseRouting, requestSnapshot.sameRoundThinkTextPolicy === 'private'))
               .map((c) => c.id);
-            const sendCallIds = this.channelRegistry && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')
+            const sendCallIds = this.channelRegistry && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid' || turnProseRouting === 'locked')
               ? calls.filter((_, i) => roundCalls[i]!.cause === 'send').map((c) => c.id)
               : [];
             if (scriptCallIds.length > 0 || sendCallIds.length > 0) {
@@ -27664,6 +28086,15 @@ export class AgentFramework {
         return this.draftsToolResult(origin.agentName, call.input);
       case 'prose-help':
         return { success: true, data: PROSE_ROUTING_HELP };
+      // prose_locus: the calling agent's own lock. Like prose_help it's a
+      // direct verb, outside a script's tool surface (scriptTools). A call
+      // that carries a turn of the agent's still moves that turn's later
+      // rounds (callingTurnOf); one made outside it (a puppet's, a host's
+      // executeToolCall) moves the lock its later turns start from, and
+      // leaves a turn under way where it is.
+      case 'prose-locus':
+        if (origin.kind === 'module') return failed(agentsOwnVerbRefusal(call.name));
+        return this.proseLocusToolResult(origin.agentName, call.input, this.callingTurnOf(origin.agentName, call));
       case 'module':
         // Module tools. The caller uses the result in process, so it gets the
         // module's own result, as the module returned it, less a refusal it
@@ -29544,6 +29975,7 @@ export class AgentFramework {
     if (name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) return { kind: 'code-execution' };
     if (name === 'drafts' && this.channelRegistry) return { kind: 'drafts' };
     if (name === PROSE_HELP_TOOL.name) return { kind: 'prose-help' };
+    if (name === PROSE_LOCUS_TOOL.name) return { kind: 'prose-locus' };
     return { kind: 'module' };
   }
 
@@ -29818,6 +30250,23 @@ export class AgentFramework {
           agentName,
           moduleName: 'framework',
           result: { success: true, data: PROSE_ROUTING_HELP },
+        });
+        return;
+      }
+
+      // prose_locus: locked prose routing's mover. Answered inline; the move
+      // applies to the calling turn's later rounds and to later turns.
+      case 'prose-locus': {
+        const result = this.proseLocusToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall));
+        if (result.success) this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'prose_locus', callId: enrichedCall.id, durationMs: 0 });
+        else this.emitTrace({ type: 'tool:failed', module: 'framework', tool: 'prose_locus', callId: enrichedCall.id, error: result.error ?? '' });
+        this.pushEvent({
+          type: 'tool-result',
+          callId: enrichedCall.id,
+          toolName: enrichedCall.name,
+          agentName,
+          moduleName: 'framework',
+          result,
         });
         return;
       }
@@ -31876,6 +32325,7 @@ export class AgentFramework {
         })(),
         lastInference: this.lastInferenceAt.get(name) ?? null,
         refusalStats: this.refusalStats.get(name) ?? null,
+        ...this.upcomingWakesHealth(name),
       })),
     };
   }
@@ -32597,8 +33047,15 @@ export class AgentFramework {
         // global fallback (none for an ephemeral run), and the turn then keeps
         // that channel; null for a heartbeat's turn, which takes none
         // (TurnRouting.heartbeat).
+        // A turn with no channel of its own (a heartbeat's, or a wake for a
+        // channel that names none) is replying to no message. A locked
+        // turn's null locus (drafts) is where it speaks, not what it answers.
+        channellessTurn: (agentName) => this.channellessTurn(agentName),
         activeChannelResolver: (agentName) => {
           const routing = this.turnRouting.get(agentName);
+          // A locked turn's channel is its lock, or none: the channel that
+          // woke it isn't where its speech goes.
+          if (routing?.locked) return this.turnSpeaksAt(routing);
           return routing?.locus ?? routing?.triggerChannel ?? (routing?.noChannel || routing?.heartbeat ? null : undefined);
         },
         // An ephemeral run (a subagent) never takes the process-global
@@ -34514,8 +34971,11 @@ export class AgentFramework {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
       // The lifecycle log's replay restored any tune-out on record, and no
-      // coordinator is made here to carry one.
-      this.endTuneOutsWithoutCoordinator();
+      // coordinator is made here to carry one. With no reader configured,
+      // each ends with its backlog; with one, it ends as before (its backlog
+      // isn't delivered: a coordinator made at this connect would carry it).
+      if (this.tuneOutOffered) this.endTuneOutsWithoutCoordinator();
+      else this.releaseTuneOutsWithoutReader();
     }
 
     const collision = this.mcplPrefixCollision(config, undefined, claim);
@@ -35825,6 +36285,8 @@ export class AgentFramework {
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
+    const results: Array<{ serverId: string; connection: McplServerConnection; staged: { tools: import('./types/index.js').ToolDefinition[]; featureSets: Map<string, string>; classes: Map<string, ToolClass[]>; servers: Map<string, string> }; error?: string }> = [];
+    const modernTools: import('./types/index.js').ToolDefinition[] = [];
     const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
@@ -35835,9 +36297,15 @@ export class AgentFramework {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       closesAtListing.set(server.id, closesOf(server.id));
+      const stage = () => ({
+        tools: [] as import('./types/index.js').ToolDefinition[],
+        featureSets: new Map<string, string>(),
+        classes: new Map<string, ToolClass[]>(),
+        servers: new Map<string, string>(),
+      });
+      const staged = stage();
       try {
         const result = await server.sendToolsList();
-        listedServers.add(server.id);
         const listed = new Set<string>();
         const repeated: string[] = [];
         // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
@@ -35851,10 +36319,10 @@ export class AgentFramework {
         // reach the tool list here (§4.2). The agent is told where each tool
         // went once this refresh publishes a list that shows it there: a move
         // to static once the list offers the tool, a move to dynamic once it
-        // doesn't (a listing that breaks off publishes what it read). The
-        // rest stay pending for a refresh that does.
+        // doesn't. The rest stay pending for a refresh that does, as do all
+        // of a listing that breaks off, which publishes none of what it read.
         const presence = this.toolsetHub?.get(server.id);
-        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, prefix, moves: presence.presence.moves() });
+        const moves = presence?.presence.active ? { controller: presence, prefix, moves: presence.presence.moves() } : undefined;
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -35865,7 +36333,7 @@ export class AgentFramework {
             continue;
           }
           listed.add(namespacedName);
-          toolServers.set(namespacedName, server.id);
+          staged.servers.set(namespacedName, server.id);
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
             _meta?: { featureSet?: unknown; [key: string]: unknown };
@@ -35873,7 +36341,7 @@ export class AgentFramework {
           // RFC-008: the server's class hint for this tool. Never shown to
           // the model (the definition below is unchanged by it).
           const declaredClasses = parseDeclaredClasses(attributedTool._meta, namespacedName);
-          if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
+          if (declaredClasses) staged.classes.set(namespacedName, declaredClasses);
           const featureSet = typeof attributedTool.featureSet === 'string'
             ? attributedTool.featureSet
             : typeof attributedTool._meta?.featureSet === 'string'
@@ -35882,25 +36350,33 @@ export class AgentFramework {
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
           if (offered) {
-            tools.push({
+            staged.tools.push({
               name: namespacedName,
               description: tool.description ?? '',
               inputSchema: schema,
             });
           }
           if (featureSet !== undefined) {
-            toolFeatureSets.set(namespacedName, featureSet);
+            staged.featureSets.set(namespacedName, featureSet);
           }
         }
+        listedServers.add(server.id);
+        if (moves) movesListed.set(server.id, moves);
         if (repeated.length > 0) repeats.push({ serverId: server.id, tools: repeated });
-      } catch {
-        // Server may not support tools/list — skip silently. A live server
-        // whose handshake advertised no MCP `tools` has, in effect, listed
-        // nothing; count it as listed so tool-pattern checks do not wait on
-        // it forever. (A server that advertised tools but failed to list
-        // them stays unknown.)
-        if (server.isConnected && !server.mcpToolsAdvertised) listedServers.add(server.id);
+      } catch (error) {
+        // A live server whose handshake advertised no MCP `tools` has, in
+        // effect, listed nothing; count it as listed so tool-pattern checks do
+        // not wait on it forever. (A server that advertised tools but failed
+        // to list them stays unknown.)
+        if (!server.mcpToolsAdvertised) {
+          if (server.isConnected) listedServers.add(server.id);
+          results.push({ serverId: server.id, connection: server, staged: stage() });
+        } else {
+          results.push({ serverId: server.id, connection: server, staged: stage(), error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}) });
+        }
+        continue;
       }
+      results.push({ serverId: server.id, connection: server, staged });
     }
 
     // Modern servers: the same namespacing, tool policy and RFC-008 class
@@ -35922,7 +36398,7 @@ export class AgentFramework {
           toolServers.set(namespacedName, server.id);
           const declaredClasses = parseDeclaredClasses(tool._meta, namespacedName);
           if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
-          tools.push({
+          modernTools.push({
             name: namespacedName,
             description: tool.description ?? '',
             inputSchema: tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'],
@@ -35950,15 +36426,22 @@ export class AgentFramework {
     // for good. Nor does one whose connection closed after its listing
     // began, even if it has reconnected since: the close forgot its class
     // hints as stale (RFC-008), and its reconnect lists the new session.
-    const connections = new Map<string, McplServerConnection | ModernMcpConnection>([
-      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const),
-      ...this.modernServers(),
-    ]);
+    // An MCPL server whose listing doesn't count for that reason, or whose
+    // listing failed, keeps what's published while its connection serves,
+    // advertises tools, and is still the one whose tools were published.
+    const mcplConnections = new Map<string, McplServerConnection>((this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const));
+    const connections = new Map<string, McplServerConnection | ModernMcpConnection>([...mcplConnections, ...this.modernServers()]);
     const serving = (serverId: string): boolean => {
       const connection = connections.get(serverId);
       return !!connection && AgentFramework.mcpConnectionServes(connection);
     };
     const over = new Set([...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
+    const keeps = new Set(results
+      .filter(({ serverId, error }) => serving(serverId)
+        && mcplConnections.get(serverId)?.mcpToolsAdvertised === true
+        && this.mcplPublishedConnections?.get(serverId) === mcplConnections.get(serverId)
+        && (error !== undefined || over.has(serverId)))
+      .map(({ serverId }) => serverId));
     if (over.size > 0) {
       for (const [name, serverId] of [...toolServers]) {
         if (!over.has(serverId)) continue;
@@ -35979,8 +36462,43 @@ export class AgentFramework {
       if (unlisted !== undefined) this.handleToolsListChanged(unlisted);
       return;
     }
+    const kept = new Map<string, number>();
+    const publishedConnections = new Map<string, McplServerConnection>();
+    for (const { serverId, connection, staged } of results) {
+      const publisher = keeps.has(serverId) ? this.mcplPublishedConnections?.get(serverId) : listedServers.has(serverId) ? connection : undefined;
+      if (publisher) publishedConnections.set(serverId, publisher);
+      if (keeps.has(serverId)) {
+        const names = [...(this.mcplToolServers ?? [])]
+          .filter(([, owner]) => owner === serverId)
+          .map(([name]) => name);
+        const known = new Set(names);
+        tools.push(...(this.mcplTools ?? []).filter((tool) => known.has(tool.name)));
+        for (const name of names) {
+          toolServers.set(name, serverId);
+          const featureSet = this.mcplToolFeatureSets?.get(name);
+          if (featureSet !== undefined) toolFeatureSets.set(name, featureSet);
+          const classes = this.mcplToolClasses?.get(name);
+          if (classes !== undefined) toolClasses.set(name, classes);
+        }
+        kept.set(serverId, names.length);
+      } else if (listedServers.has(serverId)) {
+        tools.push(...staged.tools);
+        for (const [name, featureSet] of staged.featureSets) toolFeatureSets.set(name, featureSet);
+        for (const [name, classes] of staged.classes) toolClasses.set(name, classes);
+        for (const [name, owner] of staged.servers) toolServers.set(name, owner);
+      }
+    }
+    if (!this.stopHasBegun()) {
+      for (const { serverId, error } of results) {
+        if (error === undefined) continue;
+        const count = kept.get(serverId) ?? 0;
+        console.error(`[mcpl] server "${serverId}": tools/list failed (${error}); ${count > 0 ? `keeping its ${count} known tool(s)` : 'none of its tools are offered'}`);
+      }
+    }
+    tools.push(...(over.size > 0 ? modernTools.filter((tool) => toolServers.has(tool.name)) : modernTools));
     this.mcplToolsRefreshPublished = generation;
-    this.mcplTools = over.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
+    this.mcplTools = tools;
+    this.mcplPublishedConnections = publishedConnections;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
@@ -36692,6 +37210,107 @@ export class AgentFramework {
     };
   }
 
+  /** Whether any tune-out is on record: a channel's, or the all-except scope. */
+  private tuneOutOnRecord(): boolean {
+    try {
+      return (this.channelRegistry?.tuneOutsOnRecord().length ?? 0) > 0 || this.tuneOutCoordinator?.getAllExcept() != null;
+    } catch {
+      return true;
+    }
+  }
+
+  /** The tune-out coordinator over this framework's channels, with the hooks it acts through. */
+  private makeTuneOutCoordinator(options: { announce?: boolean } = {}): TuneOutCoordinator {
+    const channelRegistry = this.channelRegistry;
+    if (!channelRegistry) throw new Error('a tune-out coordinator needs the channel registry');
+    return new TuneOutCoordinator(
+      channelRegistry,
+      this.mcplServerRegistry!,
+      {
+        addMessage: (participant, content, metadata, forAgent) =>
+          this.addMessage(participant, content, metadata as MessageMetadata,
+            forAgent ? { forAgent } : undefined),
+        requestInference: (agentName, reason, source) => {
+          this.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+        },
+        subconsciousName: () => this.subconsciousAgentName,
+        ...(this.readerForks
+          ? {
+              invokeReader: (invocation: ReaderInvocation) => this.invokeReaderFork(invocation),
+              deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
+                this.deliverFromReader(reader, content, metadata),
+            }
+          : {}),
+        primaryName: () => this.primaryAgentName,
+        getStoredMessages: () => {
+          const primary = this.primaryAgentName
+            ? this.agents.get(this.primaryAgentName) : undefined;
+          return primary ? primary.getContextManager().getAllMessages() : [];
+        },
+        commitDeliveries: () => this.commitDeliveries(),
+        historyTool: () => this.residentHistoryTool(),
+        getDeferredMessages: () => {
+          const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? this.primaryAgentName) === this.primaryAgentName;
+          // Settled first, so a write that landed is in the stored rows
+          // alone (settleUnknownLandings).
+          this.settleUnknownLandings(forPrimary);
+          return this.deferredMessages.filter(forPrimary)
+            .sort(bySeq)
+            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
+        },
+        // Every reader of the shared slot compiles the dump with its own
+        // strategy, so the dump fits the smallest of their bounds.
+        residentMessageChars: () => {
+          let chars: number | undefined;
+          for (const reader of this.sharedSlotAgents) {
+            const bound = this.strategyDerivedToolResultChars(reader);
+            if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
+          }
+          return chars;
+        },
+        currentSequence: () => this.store.currentSequence(),
+        setSubconsciousAnchor: (sequence) =>
+          this.subconsciousStrategy?.setAnchor(sequence),
+        isForkBound: (channel) =>
+          this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
+        isPrivilegedAuthor: (authorId) =>
+          this.eventGate?.isPrivilegedUser(authorId) ?? false,
+        allowChannelSpeech: () => this.subconsciousConfig?.allowChannelSpeech === true,
+        ...(this.tuneOutAnnounce && options.announce !== false
+          ? {
+              // The excepted channel on its server: a bare id two servers
+              // register is refused (publishForAgent).
+              announce: async (serverId: string, channelId: string, text: string) => {
+                const r = await this.channelRegistry!.publishForAgent(
+                  { serverId, channelId }, text, this.primaryAgentName ?? 'resident');
+                return { success: r.success, ...(r.error ? { error: r.error } : {}) };
+              },
+            }
+          : {}),
+        emitTrace: (e) => this.emitTrace(e),
+      },
+    );
+  }
+
+  /**
+   * No reader is configured, so nothing can watch or end a hold: each hold
+   * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
+   * recipe no longer has) ends now, and its backlog goes to the resident,
+   * the per-channel holds and the all-except scope alike, through a
+   * coordinator made for that alone: at a start, or, where no MCPL server
+   * was configured, when the first one connects. One whose release fails
+   * stays on record for the next start.
+   */
+  private releaseTuneOutsWithoutReader(): void {
+    if (!this.channelRegistry || this.tuneOutCoordinator) return;
+    // Nothing is posted in an excepted channel: this is the host's own
+    // housekeeping, at a start or when the channel subsystem comes up after
+    // one. A hold whose release fails stays on record (releaseAll logs it),
+    // so the next start releases it, backlog and all, rather than ending it
+    // with none.
+    this.makeTuneOutCoordinator({ announce: false }).releaseAll('start', 'no reader is configured');
+  }
+
   /**
    * A tune-out on record where this host has no tune-out coordinator: a
    * start with no subconscious makes none, and neither does a channel
@@ -36704,7 +37323,10 @@ export class AgentFramework {
    * agent's tune-out keeps the agent's provenance (the housekeeping guard
    * reads it). A log line names the channel and says how many of the
    * messages it diverted are held here, stored or still queued to be
-   * written, which nothing will now deliver as its backlog.
+   * written, which nothing will now deliver as its backlog. Where no reader
+   * is configured, releaseTuneOutsWithoutReader ends them instead, backlog
+   * delivered; this is only the late-connect path of a host that has a
+   * reader.
    */
   private endTuneOutsWithoutCoordinator(): void {
     const registry = this.channelRegistry;
@@ -36892,8 +37514,21 @@ export class AgentFramework {
             // turn's locus stays where the agent was last told, for a resume
             // that opens the turn again, and so does the announce baseline,
             // which is the agent's across turns.
-            if (openerAgent
-              && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
+            const openerMode = openerAgent ? this.proseRoutingOf(openerAgent) : undefined;
+            if (openerMode === 'locked' && callingTurn.locked && this.openLogical.get(agentName) === callingTurn) {
+              // Locked mode: the open moves nothing. Said here, since an open
+              // moves the speech of every other mode that has a locus.
+              result = {
+                ...result,
+                data: {
+                  routing: sameChannel(callingTurn.locus, opened) && !callingTurn.heldForMove
+                    ? 'Your plain speech lands in this channel.'
+                    : `Your plain speech still ${this.proseLockShown(this.turnSpeaksAt(callingTurn), agentName)}${callingTurn.heldForMove ? ' for the rest of this turn' : ''}.${this.proseLocusMoves(agentName, callingTurn)} Other channels need an explicit send tool.`,
+                  ...(result.data as Record<string, unknown> | undefined),
+                },
+              };
+            } else if (openerAgent
+              && (openerMode === 'locus' || openerMode === 'hybrid')
               && this.openLogical.get(agentName) === callingTurn) {
               callingTurn.locus = opened;
               noteTurnChannel(callingTurn, opened);
@@ -37490,14 +38125,17 @@ export class AgentFramework {
       const speaker = this.agents.get(agentName);
       const home = this.homeOf(agentName);
       const open = turn && this.openLogical.get(agentName) === turn ? turn : undefined;
+      const speakerMode = speaker ? this.proseRoutingOf(speaker) : undefined;
       if (open && open.locus == null && !open.noChannel && !open.heartbeat && !home
-        && (speaker?.proseRouting === 'locus' || speaker?.proseRouting === 'hybrid')) {
+        && (speakerMode === 'locus' || speakerMode === 'hybrid')) {
         open.locus = resolved;
         noteTurnChannel(open, resolved);
         this.rememberAnnouncedLocus(agentName, resolved);
       }
       const speech = home
         ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
+        : speaker && this.proseRoutingOf(speaker) === 'locked'
+          ? `Your plain speech still ${this.proseLockShown(open?.locked ? this.turnSpeaksAt(open) : this.proseLockLocus(speaker), agentName)}.${this.proseLocusMoves(agentName, open?.locked ? open : undefined)}`
         : open?.locus && !sameChannel(open.locus, resolved)
           ? `This turn's plain speech still lands in ${this.channelShown(open.locus)}; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's.`
           : open && (open.noChannel || open.heartbeat)
@@ -37513,9 +38151,7 @@ export class AgentFramework {
           cadenceSeconds: r.params.cadenceSeconds,
           backlogCap: r.params.backlogCap,
           maxWakes: r.params.maxWakes,
-          note: coordinator.hasReader()
-            ? `${speech} Reader wakes pause, not cancel, when the budget is spent.`
-            : `No subconscious is configured: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
+          note: `${speech} Reader wakes pause, not cancel, when the budget is spent.`,
         },
       };
     }
@@ -37563,9 +38199,6 @@ export class AgentFramework {
         backlogCap: r.params.backlogCap,
         maxWakes: r.params.maxWakes,
         ...(openError ? { openError } : {}),
-        ...(coordinator.hasReader()
-          ? {}
-          : { note: 'No subconscious is configured: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
       },
     };
   }
@@ -38001,9 +38634,9 @@ export class AgentFramework {
         console.error(`[sleep] ${agentName}: the call was made outside the agent's current turn — sleep announcement not posted`);
       } else if (silentTurn) {
         console.error(`[sleep] ${agentName}: the turn was started silent — sleep announcement not posted`);
-      } else if (agent?.proseRouting === 'disabled') {
+      } else if (agent && this.proseRoutingOf(agent) === 'disabled') {
         console.error(`[sleep] ${agentName}: proseRouting=disabled — sleep announcement not posted`);
-      } else if (agent?.proseRouting === 'explicit') {
+      } else if (agent && this.proseRoutingOf(agent) === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
         const target = callingTurn.pin;
@@ -38014,6 +38647,8 @@ export class AgentFramework {
         } else {
           console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
         }
+      } else if (callingTurn.locked && !this.turnSpeaksAt(callingTurn)) {
+        console.error(`[sleep] ${agentName}: locked turn speaks nowhere now (drafts, or held after a move) — sleep announcement not posted`);
       } else if (!callingTurn.locus && callingTurn.heartbeat) {
         console.error(`[sleep] ${agentName}: a heartbeat turn has no channel — sleep announcement not posted`);
       } else {

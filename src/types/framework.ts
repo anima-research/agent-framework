@@ -169,16 +169,14 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * Tune-out without a reader (issue #232 §3.3). The hold machinery always
-   * runs when MCPL channels exist, so a persisted epoch is resumed and
-   * released whatever the configuration; this switch only decides whether
-   * residents are offered `tune_out` when no reader is configured. Without
-   * a reader a tune-out is a silent hold: no cadence, no wake budget,
-   * mentions are acknowledged, the backlog is released on cancel.
+   * Tune-out settings. Residents are offered `tune_out` only with a reader
+   * (`subconscious`), or while a hold a failed release left is still on
+   * record to check or cancel: a hold nothing summarizes would hand the resident an
+   * undated backlog all at once when it ends. `enabled`, which offered one
+   * without a reader, was removed in 0.33.0: `enabled: true` is refused at
+   * `create` (`false` is still accepted, from JavaScript, and does nothing).
    */
   tuneOut?: {
-    /** Offer `tune_out` without a subconscious. Default: only with one. */
-    enabled?: boolean;
     /**
      * Announce the all-except scope in the excepted channel: one bracketed
      * line under the resident's name when it opens (who, for how long) and
@@ -202,7 +200,9 @@ export interface FrameworkConfig {
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
    *
-   * Held traffic never moves the locus under either rule.
+   * Held traffic never moves the locus under either rule. Neither rule
+   * applies to an agent under locked prose routing (AgentConfig.proseRouting
+   * 'locked'): its turns speak at its lock, whatever arrives.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';

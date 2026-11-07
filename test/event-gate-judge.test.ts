@@ -838,6 +838,22 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
+  it("gives an agent the gate doesn't wake its own self-wake and targeted sleep, not a batch or an untargeted sleep", () => {
+    const { gate } = makeGate(writeConfig('upcoming-roles.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+    }));
+    gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
+    gate.setSleep(300);
+    const kinds = (name: string) => gate.upcomingWakes([name]).map((w) => w.kind).sort();
+    assert.deepStrictEqual(kinds('agent'), ['debounce', 'sleep-end']);
+    assert.deepStrictEqual(kinds('a-worker'), []);
+    gate.armSelfWake('a-worker', 60);
+    gate.clearSleep();
+    gate.setSleep(300, undefined, 'a-worker');
+    assert.deepStrictEqual(kinds('a-worker'), ['self-wake', 'sleep-end']);
+    gate.dispose();
+  });
+
   it("lists a sleep's end, and nothing once a self-wake has been cancelled by a turn", () => {
     const { gate } = makeGate(writeConfig('upcoming-sleep.json', JUDGED));
     gate.armSelfWake('agent', 60);
