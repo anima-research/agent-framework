@@ -301,7 +301,10 @@ test('an exchange the refused request carried only by its call is shed whole', a
     assert.ok(refusedRequest.includes('look-9') && !refusedRequest.includes('what the tool saw'), 'the premise: the refused request carried the call and not its stored result');
     const retry = rig.requests[3]!;
     assert.ok(!JSON.stringify(retry.messages).includes('look-9'), 'the call is gone');
-    assert.ok(!rig.stored().some((m) => JSON.stringify(m.content).includes('what the tool saw')), 'and so is its result');
+    // Read onto #291: a shed is the window's (the record keeps what it sets
+    // aside), so the result goes with its call out of the agent's window.
+    const result = rig.stored().find((m) => JSON.stringify(m.content).includes('what the tool saw'))!;
+    assert.notEqual(cm.windowStatusOf(result.id), 'in', 'and so is its result, from the window');
     assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
   } finally { await rig.close(); }
 });
@@ -337,7 +340,12 @@ test('a message stored after the refused request was sent is neither removed nor
     assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
     assert.ok(rig.texts(retry).some((t) => t.includes('while it streams')), 'the message stored meanwhile stays');
     assert.ok(rig.texts(retry).some((t) => t.includes('reply 1')), 'and so does what came before');
-    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+    // Read onto #291: the message stored while the refused request streamed
+    // enters the window as that turn ends, after the marker the rewind
+    // stored, so the marker is the retry's last message but one.
+    const markerAt = rig.texts(retry).findIndex((t) => t.includes('[refusal-rewind]'));
+    assert.match(rig.texts(retry)[markerAt] ?? '', /The 1 most recent turn\(s\) were set aside/);
+    assert.ok(rig.texts(retry).slice(markerAt + 1).some((t) => t.includes('while it streams')), 'the message stored meanwhile follows the marker');
   } finally { await rig.close(); }
 });
 

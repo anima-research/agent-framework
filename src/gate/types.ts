@@ -404,6 +404,17 @@ export interface JudgeEventSummary {
   at: number;
 }
 
+/** The kinds of UpcomingWake. */
+export type UpcomingWakeKind =
+  | 'heartbeat'
+  | 'reminder'
+  | 'self-wake'
+  | 'sleep-end'
+  | 'debounce'
+  | 'judge-batch'
+  | 'queued'
+  | 'provider-hold';
+
 /**
  * The agent's last turn, when it failed (its retries spent, or by a throw
  * before its stream) and no turn has started since, as the reply judge is told it: when it failed, and whether
@@ -444,6 +455,9 @@ export interface UpcomingWake {
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
+  /** What it is, in a word that quotes nothing, for healthSnapshot: `what` can
+   *  quote a reminder or a queue reason. The judge isn't told it. */
+  kind?: UpcomingWakeKind;
 }
 
 /** What the gate asks the reply judge for one batch. */
@@ -562,6 +576,12 @@ export interface GateEventInfo {
   paths?: string[];
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
+  /** The agents admission delivered a targeted event to (its targetAgents).
+   *  A debounced batch wakes each agent with the events it may see, those
+   *  naming it and those naming no agent, and agents that may see the same
+   *  events share one line. Absent for an untargeted event, whose batch wakes
+   *  every agent getAgentNames lists. */
+  recipients?: readonly string[];
   /**
    * Set when the framework asked whether the event is suppressed before it
    * asked about its wake (decideSuppression), so a suppress rule that
@@ -588,13 +608,13 @@ export interface GateEntryRef {
  *  than wrote: its batch was one event whose entry was still the newest in
  *  the window when the batch fired (EventGate's `isNewestEntry`). A fresh
  *  start of the wake's turn decides it (the framework's placeWakeLines): the
- *  delivery agent's own start leaves it out while that entry is still the
- *  newest, and writes it once something follows; a co-resident's start
- *  places none; two or more such lines are each written;
- *  and none is written while the host is quiesced or another reader of the
- *  residents' shared slot has a turn alive. A line left out stays for a
- *  later fresh start of the same wake. Its text is rendered when it's
- *  written (wakeLineText), so its age is true then.
+ *  delivery agent's start, and on a presented window each resident's own
+ *  start, decides its own line, leaving it out while that entry is still
+ *  the newest in its window and writing it once something follows; a
+ *  co-resident whose window isn't presented places none; two or more such
+ *  lines are each written; and none is written while the host is quiesced.
+ *  A line left out stays for a later fresh start of the same wake. Its text
+ *  is rendered when it's written (wakeLineText), so its age is true then.
  *
  *  Every request for one wake carries the same object: the framework writes
  *  each line once by its identity, across the wake's retries and holds. A

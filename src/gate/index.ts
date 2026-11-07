@@ -17,6 +17,7 @@ export type {
   JudgeVerdict,
   ReplyJudgeOptions,
   UpcomingWake,
+  UpcomingWakeKind,
   FailedLastTurn,
   SuppressConfig,
   SuppressionReviewOptions,
