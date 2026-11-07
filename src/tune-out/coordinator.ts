@@ -298,6 +298,31 @@ function releaseRecordsOf(rows: readonly HeldRow[], epochId: string): ReleaseRec
   return records;
 }
 
+/**
+ * Whether the resident's last word on this hold is the boot's row that it
+ * still stands (`tune-out-end-unrecorded`, tellResidentUnended): one of
+ * that epoch after its latest release. A cancel that then delivers nothing
+ * more writes a release all the same, saying the end is recorded now
+ * (AF #844, Oscar).
+ */
+function toldStillStands(rows: readonly HeldRow[], epochId: string): boolean {
+  // In store order, as residentMessages lists them.
+  let release = -1;
+  let told = -1;
+  rows.forEach((m, at) => {
+    const meta = m.metadata as { kind?: unknown; epochId?: unknown } | undefined;
+    if (meta?.epochId !== epochId) return;
+    if (meta.kind === 'tune-out-cancel') release = at;
+    else if (meta.kind === 'tune-out-end-unrecorded') told = at;
+  });
+  return told > release;
+}
+
+/** What that release adds (toldStillStands), agreeing with the boot's row: the earlier release, nothing held since, the end recorded now. */
+function endedNow(it: 'tune-out' | 'hold'): string {
+  return `Its earlier release reached you before its end was recorded, and nothing has been held since; this release records the end, so the ${it} has ended.`;
+}
+
 function truncationNote(records: readonly ReleaseRecord[]): string {
   const truncated = records.reduce((n, r) => n + r.truncated, 0);
   if (truncated === 0) return '';
@@ -4066,6 +4091,13 @@ export class TuneOutCoordinator {
       // release that tells a queued note's loss, as a boot reads it
       // (noteUnstampedStop).
       releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
+    } else if (toldStillStands(rows, epochId)) {
+      // The boot told the resident this tune-out still stands, after its
+      // last release (tellResidentUnended): this cancel delivers nothing
+      // more, and says it has ended, so that row isn't the resident's last
+      // word on it. It covers none (no `released`).
+      releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: `${lifecycle}\n\n${endedNow('tune-out')}` }],
+        { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) } }));
     }
     // Told, in the release written: not delivered or told again, even if
     // the release isn't made durable below and the queued cancel runs later,
@@ -4607,6 +4639,10 @@ export class TuneOutCoordinator {
     } else if (lost) {
       releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: header }],
         { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
+    } else if (toldStillStands(rows, epochId)) {
+      // As a channel's: the boot told the resident the hold still stands.
+      releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: `${header}\n\n${endedNow('hold')}` }],
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) } }));
     }
     if (first?.lost) {
       first.entry.noteSettled = true;

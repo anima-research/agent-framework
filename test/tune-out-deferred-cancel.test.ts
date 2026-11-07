@@ -1760,3 +1760,52 @@ describe("a release that reached the resident, its end not recorded (AF #844, Os
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// AF #844 (Oscar, nissa's house, at a1195f24): after the boot's row tells
+// the resident "noisy is still tuned out", a later cancel with nothing new
+// held ended the hold but wrote the resident no row (the earlier release
+// covered the held rows), so "still tuned out" stayed its last word. That
+// cancel now writes one short release row, no backlog again.
+// ---------------------------------------------------------------------------
+
+describe("a cancel after the boot told the resident a tune-out still stands (AF #844, Oscar)", () => {
+  it("the subconscious's cancel_tuneout with nothing new held ends the hold and writes the resident one short release row after the boot's row, with no backlog again", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun();
+    try {
+      const first = await h.f.framework.stop(500).then(() => 'resolved', (error: unknown) => error);
+      assert.ok(first instanceof ShutdownTimeoutError, `premise: the stop's wait ran out: ${String(first)}`);
+      h.release();
+      await h.f.framework.stop();
+      await h.f.create();
+      assert.equal(residentAfterStart(h.f).stillInForce.length, 1, 'premise: the boot told the resident the tune-out still stands');
+      const sub = (h.f.framework as unknown as Held).subconsciousAgentName!;
+      // Its server registers the channel again after the start.
+      await h.f.send('channels/register', {
+        channels: ['work', 'noisy'].map((id) => ({ id, type: 'discord', label: id, initiallyOpen: true, metadata: { channelType: 'guild_text' } })),
+      });
+      await eventually(() => internals(h.f).tuneOutCoordinator!.check().channels.some((c) => c.channelId === 'noisy'), 'noisy registered again');
+      const answer = await internals(h.f).tuneOutCoordinator!.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy' }, [], sub);
+      assert.equal(answer.success, true, answer.error);
+      assert.equal((answer.data as { cancelled?: unknown } | undefined)?.cancelled, true, `premise: answered cancelled: ${JSON.stringify(answer.data)}`);
+      assert.equal(internals(h.f).channelRegistry.getTuneOutState('editor', 'noisy'), null, 'the registry has no tune-out on noisy');
+      const window = presentedTo(h.f, 'agent');
+      const request = await subconsciousRequest(h.f, 'agent');
+      const boot = request.findIndex((t) => STILL_IN_FORCE.test(t));
+      const cancelled = request.findIndex((t, i) => i > boot && t.startsWith('[Tune-out: noisy cancelled'));
+      assert.ok(boot >= 0, `premise: the boot's row is in the resident's request: ${JSON.stringify(window)}`);
+      assert.ok(cancelled > boot, `the resident's request shows the cancel's row after the boot's: ${JSON.stringify(request)}`);
+      assert.equal(request[cancelled],
+        '[Tune-out: noisy cancelled — by Subconscious, 0 wakes]\n\nIts earlier release reached you before its end was recorded, and nothing has '
+        + 'been held since; this release records the end, so the tune-out has ended.',
+        'saying the earlier release reached it, and the end is recorded now');
+      assert.equal(stored(h.f).filter((m) => textOf(m).includes('<tuned-out-backlog')).length, 1, 'the held messages are not delivered again');
+    } finally {
+      errors.mock.restore();
+      h.release();
+      h.off();
+      await h.f.close();
+    }
+  });
+});
