@@ -1,0 +1,1 @@
+- When the thinking binding's note at a stream's end can't read an agent's presented window for a row injected at its tool boundary, it logs a `[thinking-binding]` line that names the agent and the row, so an operator can tell it from a row that was absent. The note records that row as not stored.

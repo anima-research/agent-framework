@@ -150,15 +150,20 @@ interface PendingEvent {
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
   eventId?: string;
+  /** GateEventInfo.recipients. */
+  recipients?: readonly string[];
 }
 
 /** Where the host put a message the gate wrote: the agent whose window it
- *  went to and, when it was held for that agent's live turn, the id it waits
- *  under in the host's queue, or else the id it was stored under. */
+ *  went to; its stored id, once stored (absent while a surgery's hold, or
+ *  its agent's recovery, keeps the write in memory); and `presented: false`
+ *  when it wasn't presented to the agent: kept in memory, or stored while a
+ *  turn of the agent's was alive, or with a presentation at rest that
+ *  failed (#291's presentation index). The host marks the wake that goes with it from these. */
 export interface WritePlacement {
   agent?: string;
-  deferredId?: string;
   messageId?: string;
+  presented?: false;
 }
 
 /**
@@ -2130,6 +2135,33 @@ function errorText(err: unknown): string {
   }
 }
 
+class PartialDelivery extends Error {
+  constructor(readonly woke: readonly string[], readonly notWoken: readonly string[], cause: unknown) {
+    super(errorText(cause), { cause });
+  }
+}
+
+/**
+ * Runs a batch's delivery to `woken`, which pushes each agent it wakes to
+ * `woke`: a throw once any is woken is a PartialDelivery naming them and the
+ * rest; one before any wake is thrown as it is.
+ */
+function deliveredTracking(woke: string[], woken: readonly string[], deliver: () => void): void {
+  try {
+    deliver();
+  } catch (err) {
+    if (woke.length === 0) throw err;
+    throw new PartialDelivery(woke, woken.filter((name) => !woke.includes(name)), err);
+  }
+}
+
+function deliveredInPart(err: unknown): string | undefined {
+  if (!(err instanceof PartialDelivery)) return undefined;
+  const one = err.notWoken.length === 1;
+  return `woke ${joinedList(err.woke)}, and delivering it threw (${err.message}), `
+    + `so it's dropped for ${joinedList(err.notWoken)}, who ${one ? "isn't" : "aren't"} woken`;
+}
+
 /**
  * Run a caller's callback once the change it's told of is made and traced. A
  * throw from it is logged, not thrown, so the call answers as the change it
@@ -2309,6 +2341,10 @@ export class EventGate {
     forAgent?: string,
     /** Out-param: where the message landed, for the wake that goes with it. */
     placement?: WritePlacement,
+    /** The agents the row is for; absent: the host's default for the write.
+     *  The host stamps those of them that read where it stores the row, and
+     *  its default when none does. */
+    audience?: readonly string[],
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
@@ -2316,7 +2352,7 @@ export class EventGate {
   private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
-  private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
+  private isNewestEntryFn?: (entry: GateEntryRef, recipients?: readonly string[]) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2332,6 +2368,7 @@ export class EventGate {
       metadata?: Record<string, unknown>,
       forAgent?: string,
       placement?: WritePlacement,
+      audience?: readonly string[],
     ) => unknown;
     /** `after`: the placement of the message the wake is for, when it has
      *  one, so the host can drop the wake once a request that carried the
@@ -2381,8 +2418,10 @@ export class EventGate {
      *  waiting to be written there. A batched wake for that one message
      *  doesn't write its line when it fires: it hands the line to the wake
      *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
-     *  (WakeLine). Absent: every batched wake writes its line, as before. */
-    isNewestEntry?: (entry: GateEntryRef) => boolean;
+     *  (WakeLine). With `recipients`, the windows are those agents', each of
+     *  which the event must be newest in. Absent: every batched wake writes
+     *  its line, as before. */
+    isNewestEntry?: (entry: GateEntryRef, recipients?: readonly string[]) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
@@ -3987,6 +4026,7 @@ export class EventGate {
       routeChannelId: this.routeChannelFor(info),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
+      ...(info.recipients !== undefined ? { recipients: [...info.recipients] } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -4046,8 +4086,8 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
+        `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} `
+        + (deliveredInPart(err) ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
       return;
     }
@@ -4080,7 +4120,31 @@ export class EventGate {
       });
     }
     if (events.length === 0) return;
+    // Who each delivery woke, so that a throw after a wake is told as a
+    // delivery in part (PartialDelivery), the batch dropped only for those
+    // it didn't wake.
+    const woke: string[] = [];
+    if (events.every((e) => e.recipients === undefined)) {
+      const names = this.getAgentNamesFn();
+      deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
+      return;
+    }
+    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
+    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
+    const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
+    for (const agentName of woken) {
+      const seen = events.filter((e) => e.recipients === undefined || e.recipients.includes(agentName));
+      const key = seen.map((e) => events.indexOf(e)).join(',');
+      const group = groups.get(key) ?? { agents: [], events: seen };
+      group.agents.push(agentName);
+      groups.set(key, group);
+    }
+    deliveredTracking(woke, [...woken], () => {
+      for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents, woke);
+    });
+  }
 
+  private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {
     const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL
@@ -4139,7 +4203,12 @@ export class EventGate {
     const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
-    if (only && this.newestEntry(only)) {
+    // Where a line stored now landed, for the delivery agent's wake, as the
+    // self-wake's notice places its own (readsRowFor): a live turn that
+    // carried and answered the line drops the wake. Other agents' wakes stay
+    // plain by readsRowFor's rule.
+    const placement: WritePlacement = {};
+    if (only && this.newestEntry(only, audience)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
       line = {
         entry: entryRef(only),
@@ -4152,7 +4221,7 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
-      });
+      }, undefined, placement, audience);
     }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
@@ -4163,19 +4232,20 @@ export class EventGate {
     // back to whoever addressed the agent, not to whichever channel last saw
     // any traffic. Ambient-only batches set no locus. A batch whose line the
     // gate left to the turn's start carries it too (`line`), one object
-    // shared by every agent the batch wakes, so it is written once.
+    // shared by every agent woken with these messages, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
-    for (const agentName of this.getAgentNamesFn()) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+    for (const agentName of woken) {
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance, line ? undefined : placement);
+      woke?.push(agentName);
     }
   }
 
   /** isNewestEntry for one event; a callback fault keeps the line. */
-  private newestEntry(event: PendingEvent): boolean {
+  private newestEntry(event: PendingEvent, recipients?: readonly string[]): boolean {
     if (!this.isNewestEntryFn) return false;
     try {
-      return this.isNewestEntryFn(entryRef(event)) === true;
+      return this.isNewestEntryFn(entryRef(event), recipients) === true;
     } catch {
       return false;
     }
@@ -4438,8 +4508,8 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
+        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} `
+        + (deliveredInPart(err) ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
     }
   }
@@ -4513,8 +4583,8 @@ export class EventGate {
    * buffer through the same path a turn's end uses. Self-wake and sleep-expiry
    * timers deliberately do NOT route through this — their inference requests
    * are per-agent targeted pushes that the framework's quiesce wake gate parks
-   * and releases at resume, whereas the buffer's deliverEvents broadcasts a
-   * wake to every agent.
+   * and releases at resume, whereas the buffer's deliverEvents wakes every
+   * agent a batch is for.
    */
   setQuiesced(quiesced: boolean): void {
     if (this.quiesced === quiesced) return;
@@ -4542,10 +4612,12 @@ export class EventGate {
           this.deliverEvents(events);
         } catch (err) {
           const one = events.length === 1;
-          console.error(
-            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
-            + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
-          );
+          const held = `${events.length} ${one ? 'event' : 'events'}`;
+          const partly = deliveredInPart(err);
+          console.error(partly
+            ? `[gate] a batch of ${held}, held for an agent's turn or the host's quiesce, ${partly}`
+            : `[gate] ${held} held for an agent's turn or the host's quiesce couldn't be delivered (${errorText(err)}), `
+              + `so ${one ? "it's" : "they're"} dropped`);
         }
       });
     }
@@ -4690,8 +4762,9 @@ export class EventGate {
       // Compact in-window notice: without it the wake turn contains nothing
       // new, so the agent can't tell WHAT woke it (its own timer vs. a
       // heartbeat) or WHEN. One line, timestamped to the second. Added
-      // before the inference request so it rides the wake turn (addMessage's
-      // turn-alive guard defers it to that turn's start if needed).
+      // before the inference request so it rides the wake turn: it is stored
+      // at once, and while a turn of the agent's is alive it is kept out of
+      // the window until the agent's next presentation point.
       const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
       // Deliver the notice into the WAKING agent's window — a self-wake
       // armed by a non-primary agent (e.g. a subconscious cadence) must not
