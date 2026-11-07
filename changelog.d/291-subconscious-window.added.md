@@ -16,9 +16,7 @@
     what its tool boundary injects (`Agent.setForeignRounds`, `Agent.injectedAsSent`). Its own rounds go as
     stored, and it keeps their signed thinking across a row heard from the residents' slot. That is the default of
     a new setting, `subconscious.foreignRounds`: `'raw'` sends a resident's rounds as stored, its thinking and
-    tool blocks included, as 0.32.0 and earlier releases did, and any other value is refused at `create()`. A thinking block's
-    signature rules out sending the block as part of another agent's prefix, not its text; leaving the text out is
-    the transcript's choice. A result is told by the nearest call before it with its id, so a resident's result
+    tool blocks included, as 0.32.0 and earlier releases did, and any other value is refused at `create()`. A result is told by the nearest call before it with its id, so a resident's result
     whose id a call of the subconscious's also has (calls numbered per response, `c1`, `call_0`) is transcribed. A call answers one result: another agent's result whose id a call of the watcher's had, and which comes after that call's own result, is sent as a line ("a tool returned: …"), not as a second result of the watcher's call.
   - A reader fork's framing hand-off presents the held rows it is handed into the fork's window when its run takes
     it on: the fork holds them while it lives (`presentedToAnyone`), so a coalescer doesn't withdraw a row a reader

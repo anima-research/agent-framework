@@ -41,8 +41,7 @@
   channel registry takes the reader from the new `tuneOutReader` option, which the framework gives it; a registry
   made without one names the persistent reader by its default name, "Subconscious".
 - **Hosts: `create()`'s refusal of reader forks with no `model` no longer calls the resident's model a copy of the
-  resident.** It said, after saying that a reader fork holds the resident's whole prefix, to give the resident's
-  model "for a copy of the resident"; it now says `model` is the model the resident runs or another by name.
+  resident.** It said to give the resident's model "for a copy of the resident"; it now says `model` is the model the resident runs or another by name.
 - **Residents and readers: where no reader runs, the text says so, and a cancel that can wait says it can.** After
   the persistent reader ended, or at a start with none configured, for a hold whose release failed, a held channel's
   messages, in a channel tool's refusal and the `[tuned out]` send note, are held "with no reader running here to
