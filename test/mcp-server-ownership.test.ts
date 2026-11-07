@@ -759,6 +759,7 @@ for (const engine of ['legacy', 'modern'] as const) {
         const real = server.listTools.bind(server);
         server.listTools = async () => { const tools = classed(await real()); held = true; await gate; return tools; };
       }
+      const before = framework.getAllTools().filter((tool) => tool.name.startsWith('mcpl--s--')).map((tool) => tool.name);
       const refreshing = internals.refreshMcplTools();
       await until(() => held, 'the refresh holds its listing');
       let closed = false;
@@ -769,7 +770,13 @@ for (const engine of ['legacy', 'modern'] as const) {
       await refreshing;
       const kept = framework.listToolClasses().filter((tool) => tool.serverId === 's' && tool.class.includes('files'));
       assert.deepEqual(kept, [], "no tool keeps the closed session's class");
-      assert.deepEqual(framework.getAllTools().filter((tool) => tool.name.startsWith('mcpl--s--')), [], "nor are the closed session's tools published");
+      const published = framework.getAllTools().filter((tool) => tool.name.startsWith('mcpl--s--')).map((tool) => tool.name);
+      if (engine === 'legacy') {
+        assert.ok(before.length > 0, 'the server had published tools');
+        assert.deepEqual(published, before, 'a reconnecting MCPL server keeps the tools published before the listing');
+      } else {
+        assert.deepEqual(published, [], "nor are the closed session's tools published");
+      }
     });
   });
 }

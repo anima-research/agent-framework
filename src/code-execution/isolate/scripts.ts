@@ -29,6 +29,7 @@
 import { NOTICE_TAG } from '../../notice-tags.js';
 import { ChildCapacity, ScriptRun, type CallAnswer, type Ending, type ScriptRunOptions, type ToolAnswer } from './runner.js';
 import type { CallSummary } from './calls.js';
+import type { ReadMark } from '../../read-marks.js';
 import type { OutputBounds, OutputWindow } from './output.js';
 import type { PreludeTool } from './prelude.js';
 import { glimpse } from './render.js';
@@ -51,7 +52,7 @@ export interface ScriptCallContext {
   /** The turn the script's run call was made in, when one was: the turn its words were written in, which a later turn's wait doesn't change. */
   startTurnId?: number;
   /** What its agent had read when the run call started the script (the host's consumed watermark), given at run: what the script's words were written having read, which a later round's wait doesn't change. */
-  startReadThrough?: { branch: string; sequence: number } | null;
+  startReadThrough?: ReadMark | null;
 }
 
 export interface ScriptsHost {
@@ -119,7 +120,7 @@ interface Script {
   /** The code it runs. */
   code: string;
   run: ScriptRun;
-  context: { origin?: unknown; startReadThrough?: { branch: string; sequence: number } | null };
+  context: { origin?: unknown; startReadThrough?: ReadMark | null };
   /** The turn its run call was made in, when one was: its agent's turns end it by that. */
   turnId: number | undefined;
   startedAt: number;
@@ -182,7 +183,7 @@ export class AgentScripts {
     agentName: string,
     code: string,
     askedMs?: number,
-    options: { origin?: unknown; watch?: ScriptWatch; startReadThrough?: { branch: string; sequence: number } | null } = {},
+    options: { origin?: unknown; watch?: ScriptWatch; startReadThrough?: ReadMark | null } = {},
   ): Promise<ScriptReturn> {
     // Listed first, so a module whose tool list throws refuses the run with nothing taken.
     let tools: readonly PreludeTool[];
@@ -359,6 +360,30 @@ export class AgentScripts {
   /** Running scripts of this agent, yielded ones included; not those of an earlier agent of its name that has gone, which the host's count still holds. */
   running(agentName: string): number {
     return [...this.scripts.values()].filter((s) => s.agentName === agentName && !s.gone && !s.run.ended).length;
+  }
+
+  /**
+   * The marks this agent's running scripts started with (their
+   * `startReadThrough`), which each one's sends are credited with having
+   * read: a redo on the agent's window gives them again, as it gives the
+   * agent's own (Agent.heldReadMarks), over the rows it puts back.
+   */
+  readMarksOf(agentName: string): ReadMark[] {
+    const marks: ReadMark[] = [];
+    for (const s of this.scripts.values()) {
+      const mark = s.context.startReadThrough;
+      if (mark && s.agentName === agentName && !s.gone && !s.run.ended) marks.push(mark);
+    }
+    return marks;
+  }
+
+  /** Put each mark `replacements` maps in place of the start mark of this agent's scripts that hold it (readMarksOf), as Agent.replaceReadMarks does the agent's own: their later calls carry it. */
+  replaceReadMarks(agentName: string, replacements: ReadonlyMap<ReadMark, ReadMark>): void {
+    for (const s of this.scripts.values()) {
+      const mark = s.context.startReadThrough;
+      const next = mark && s.agentName === agentName ? replacements.get(mark) : undefined;
+      if (next) s.context.startReadThrough = next;
+    }
   }
 
   /** Running scripts that no call is watching: those acting outside any turn. */

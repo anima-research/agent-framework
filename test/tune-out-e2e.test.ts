@@ -146,11 +146,6 @@ describe('tune-out end to end', () => {
       'diverted messages never enter the resident\'s compiled view',
     );
     const sub = i.agents.get('Subconscious')!.getContextManager();
-    const subCompiled = await sub.compile();
-    assert.ok(
-      subCompiled.messages.some((m) => textOf(m).includes('release chatter one')),
-      'the subconscious\'s merged view includes the diverted backlog',
-    );
 
     // ---- addressed message: ack + coalesced subconscious wake ------------
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Noted — nothing urgent yet.' }]));
@@ -161,6 +156,14 @@ describe('tune-out end to end', () => {
       'deterministic suppressed-mention acknowledge',
     );
     await waitFor(() => membrane.calls.length >= 1, 'subconscious wake turn (coalesced)', 20_000);
+    // Checked at the wake's request, what the subconscious is sent, rather
+    // than at a bare compile: with the presentation index (#291) its window
+    // takes the backlog at its points, and the wake's request carries it
+    // either way.
+    const wakeRequest = JSON.stringify(membrane.calls[0]!.messages);
+    for (const chatter of ['release chatter one', 'release chatter two', 'release chatter three']) {
+      assert.ok(wakeRequest.includes(chatter), `the subconscious's wake request carries the diverted backlog: ${chatter}`);
+    }
     await waitFor(
       () => (i.channelRegistry!.getTuneOutState('disc', CHANNEL)?.wakeCount ?? -1) === 1,
       'durable wake count = 1',

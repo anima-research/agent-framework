@@ -5,7 +5,7 @@
  *
  * P describes disk, and disk does not rewind with a branch switch, so P lives
  * in global chronicle records (RecordJournal) rather than branch state: after
- * an undo selects an older tree, P still says what disk holds, and a
+ * a rollback selects an older tree, P still says what disk holds, and a
  * difference reads as a store-side change, never as a disk edit. Branch-local
  * intent — tombstones, store origin, conflicts — lives in BranchIntents and
  * rewinds with the tree.

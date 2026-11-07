@@ -54,6 +54,12 @@ describe('live operator surgery', () => {
         channelId: 'discord:g1:c1',
         messageId: `d${i}`,
       }));
+      // Each enters scout's window as it is stored, as a write for an idle
+      // agent does (#291): a rollback cuts at the write that presented its
+      // target (AF-7), so one to m3 removes m4 and m5, stored after it. Rows
+      // stored and never presented would all enter at the next boot in one
+      // presentation, and a rollback to any of them would remove nothing.
+      cm().presentRows([ids[ids.length - 1] as never]);
     }
   });
 
@@ -229,7 +235,10 @@ describe('live operator surgery', () => {
     }
   });
 
-  it('a write deferred behind the surgery lands with its durable id, as every flush from the queue does', async () => {
+  // Ported for #291: the surgery's hold keeps a write in memory, and its
+  // release stores it; the deferral queue, whose durable id this test once
+  // checked on the landed row, is gone, and so is the id.
+  it('a write held behind the surgery is kept in memory and stored when the hold releases, with no deferred-write id', async () => {
     const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
     const originalSwitch = c.switchBranch;
     let releaseSwitch!: () => void;
@@ -237,28 +246,273 @@ describe('live operator surgery', () => {
     c.switchBranch = async (name: string) => { await gate; return originalSwitch.call(c, name); };
     const internals = framework as unknown as {
       surgeryHold: unknown;
-      deferredMessages: Array<{ id: string }>;
+      surgeryHeldWrites: unknown[];
       addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
     };
     try {
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
       await new Promise((resolve) => setImmediate(resolve));
       assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
-      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'arrived mid-surgery' }]), '', 'deferred');
-      const queuedId = internals.deferredMessages.at(-1)!.id;
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'arrived mid-surgery' }]), '', 'held');
+      assert.equal(internals.surgeryHeldWrites.length, 1, 'kept in memory');
       releaseSwitch();
       await rollback;
       const landed = cm().getAllMessages().find((m) => (m.content[0] as { text?: string }).text === 'arrived mid-surgery');
-      assert.ok(landed, 'flushed when the hold released');
-      // The id makes a queued pair's tool_result re-defer with its tool_use
-      // rather than land alone, and lets boot recovery skip a replay.
-      assert.equal((landed!.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId, queuedId);
+      assert.ok(landed, 'stored when the hold released');
+      assert.equal(internals.surgeryHeldWrites.length, 0, 'nothing left held');
+      assert.equal((landed!.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId, undefined, 'no deferred-write id');
     } finally {
       c.switchBranch = originalSwitch;
     }
   });
 
-  it("the post-surgery flush lands what waited behind the hold while another agent's tool cycle is pending, and acknowledges it", { timeout: 60_000 }, async () => {
+  // AF #844 bot review 2, finding 20.
+  it("a write whose clock row's trace starts a surgery is held behind it and stored at its release", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-surgery-clock-'));
+    const clocked = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', clock: { intervalMinutes: 10 } }],
+      modules: [],
+      operatorLogPath: false,
+    });
+    const internals = clocked as unknown as {
+      surgeryHeldWrites: unknown[];
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    let switching: Promise<void> | undefined;
+    clocked.onTrace((event) => {
+      if (event.type === 'message:added' && event.source === 'clock:event' && !switching) {
+        switching = clocked.switchBranch(clocked.getStore().currentBranch().name);
+      }
+    });
+    try {
+      const id = internals.addMessage('user', [{ type: 'text', text: 'arrived as the clock struck' }]);
+      assert.ok(switching, "setup: the clock row was traced, and its listener started a switch");
+      assert.equal(id, '', 'held behind the surgery its clock row started');
+      assert.equal(internals.surgeryHeldWrites.length, 1, 'kept in memory');
+      await switching;
+      const rows = clocked.getAgent('scout')!.getContextManager().getAllMessages()
+        .filter((m) => (m.content[0] as { text?: string }).text === 'arrived as the clock struck');
+      assert.equal(rows.length, 1, 'stored once, at the release');
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      await clocked.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // AF #844 bot review 3, finding 20: a write that takes no clock, whose
+  // audience check's trace starts a surgery, waits for its release too.
+  it("a write whose audience check's trace starts a surgery is held behind it and stored at its release", async () => {
+    const internals = framework as unknown as {
+      surgeryHeldWrites: unknown[];
+      addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { audience?: readonly string[] }): string;
+    };
+    let switching: Promise<void> | undefined;
+    framework.onTrace((event) => {
+      if (event.type === 'presentation:unreadable-audience' && !switching) {
+        switching = framework.switchBranch(framework.getStore().currentBranch().name);
+      }
+    });
+    const id = internals.addMessage('someone', [{ type: 'text', text: 'for a worker' }], undefined, { audience: ['worker-9'] });
+    assert.ok(switching, "setup: the stamp's fault was traced, and its listener started a switch");
+    assert.equal(id, '', 'held behind the surgery its trace started');
+    assert.equal(internals.surgeryHeldWrites.length, 1, 'kept in memory');
+    await switching;
+    assert.equal(remainingTexts().filter((t) => t === 'for a worker').length, 1, 'stored once, at the release');
+    assert.equal(internals.surgeryHeldWrites.length, 0);
+  });
+
+  // AF #844 bot review 4, finding 17: an audience-fault listener that starts
+  // a surgery runs before the write's clock row is due. The clock is then
+  // not written under the switch's reservation, which takes every agent's
+  // turn token, so the write reads a turn alive and takes no clock; it waits
+  // for the release, and the release's replay takes the clock due, ahead of
+  // it.
+  it("a write whose audience check's trace starts a surgery writes no clock row under it; the release stores the clock, then the write", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-surgery-audience-clock-'));
+    const clocked = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', clock: { intervalMinutes: 10 } }],
+      modules: [],
+      operatorLogPath: false,
+    });
+    const internals = clocked as unknown as {
+      surgeryHeldWrites: unknown[];
+      addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { audience?: readonly string[] }): string;
+    };
+    const scoutCm = clocked.getAgent('scout')!.getContextManager();
+    const kinds = () => scoutCm.getAllMessages()
+      .map((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'clock' ? 'clock' : (m.content[0] as { text?: string }).text);
+    let switching: Promise<void> | undefined;
+    let clocksAtTheSwitch: number | undefined;
+    clocked.onTrace((event) => {
+      if (event.type === 'presentation:unreadable-audience' && !switching) {
+        clocksAtTheSwitch = kinds().filter((k) => k === 'clock').length;
+        switching = clocked.switchBranch(clocked.getStore().currentBranch().name);
+      }
+    });
+    try {
+      const id = internals.addMessage('someone', [{ type: 'text', text: 'for a worker' }], undefined, { audience: ['worker-9'] });
+      assert.ok(switching, "setup: the stamp's fault was traced, and its listener started a switch");
+      assert.equal(id, '', 'held behind the surgery its trace started');
+      assert.equal(kinds().filter((k) => k === 'clock').length, clocksAtTheSwitch, 'no clock row written under the reservation');
+      await switching;
+      const after = kinds();
+      assert.deepEqual(after.slice(-2), ['clock', 'for a worker'], "the release stores the clock due, then the write");
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      await clocked.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // AF #844 bot review 3, findings 24 and 63: the write a release replays is
+  // taken off the queue only once it is stored, so a listener of its clock
+  // row's trace still finds it listed, and a hold that listener begins keeps
+  // it at the head, ahead of the writes that came after it.
+  it("a replayed write whose clock row's listener begins a hold stays listed, and ahead of the writes behind it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-surgery-replay-'));
+    const clocked = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', clock: { intervalMinutes: 10 } }],
+      modules: [],
+      operatorLogPath: false,
+    });
+    const internals = clocked as unknown as {
+      surgeryHeldWrites: Array<{ content: Array<{ text?: string }> }>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    const scoutCm = clocked.getAgent('scout')!.getContextManager();
+    // The first switch's re-initialization waits on a gate, so its hold is
+    // up while the writes arrive.
+    const c = scoutCm as unknown as { setStrategy: (strategy: unknown) => Promise<void> };
+    const originalSetStrategy = c.setStrategy;
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let armed = true;
+    c.setStrategy = async function (this: unknown, strategy: unknown) {
+      if (armed) { armed = false; await gate; }
+      return originalSetStrategy.call(this, strategy);
+    };
+    const branch = clocked.getStore().currentBranch().name;
+    let second: Promise<void> | undefined;
+    let listedAtTheClock: Array<string | undefined> | undefined;
+    clocked.onTrace((event) => {
+      if (event.type === 'message:added' && event.source === 'clock:event' && !second) {
+        listedAtTheClock = internals.surgeryHeldWrites.map((w) => w.content[0]?.text);
+        second = clocked.switchBranch(branch);
+      }
+    });
+    const texts = () => scoutCm.getAllMessages()
+      .map((m) => (m.content[0] as { text?: string }).text)
+      .filter((t) => t === 'M' || t === 'N' || t === 'O');
+    try {
+      const first = clocked.switchBranch(branch);
+      await new Promise((resolve) => setImmediate(resolve));
+      for (const text of ['M', 'N', 'O']) {
+        assert.equal(internals.addMessage('user', [{ type: 'text', text }]), '', `${text} held`);
+      }
+      releaseFirst();
+      await first;
+      assert.ok(second, "setup: M's clock row was traced at its replay, and its listener began a hold");
+      assert.deepEqual(listedAtTheClock, ['M', 'N', 'O'], 'the write being replayed is still listed as its clock row is traced');
+      assert.deepEqual(texts(), [], 'none stored under the new hold');
+      assert.deepEqual(internals.surgeryHeldWrites.map((w) => w.content[0]?.text), ['M', 'N', 'O'], 'M stays at the head, for the new hold');
+      await second;
+      assert.deepEqual(texts(), ['M', 'N', 'O'], 'stored in the order they arrived');
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      c.setStrategy = originalSetStrategy;
+      await clocked.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // AF #844 bot review 4, finding 107: the write a release replays is taken
+  // off the queue as soon as its store returns, before it is presented, so a
+  // listener of its presentation (an idle reader's, which may count the
+  // stored rows and the held ones, as a tune-out's check does) finds it
+  // stored and not listed as held too. It was listed both ways from the
+  // store until addMessage returned.
+  it("a replayed write is no longer listed as held once it is stored, when its presentation is traced", async () => {
+    const internals = framework as unknown as {
+      surgeryHeldWrites: Array<{ content: Array<{ text?: string }> }>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    const c = cm() as unknown as { setStrategy: (strategy: unknown) => Promise<void> };
+    const originalSetStrategy = c.setStrategy;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let armed = true;
+    c.setStrategy = async function (this: unknown, strategy: unknown) {
+      if (armed) { armed = false; await gate; }
+      return originalSetStrategy.call(this, strategy);
+    };
+    const seen: Array<{ stored: number; held: number }> = [];
+    framework.onTrace((event) => {
+      if (event.type !== 'presentation:presented' || event.agentName !== 'scout') return;
+      const stored = remainingTexts().filter((t) => t === 'R').length;
+      if (stored === 0) return;
+      seen.push({ stored, held: internals.surgeryHeldWrites.filter((w) => w.content[0]?.text === 'R').length });
+    });
+    try {
+      const switching = framework.switchBranch(framework.getStore().currentBranch().name);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'R' }]), '', 'held while the switch holds the store');
+      assert.equal(internals.surgeryHeldWrites.length, 1);
+      release();
+      await switching;
+      assert.ok(seen.length > 0, 'setup: the replayed write was presented to scout, at rest, as its release stored it');
+      assert.deepEqual(seen, seen.map(() => ({ stored: 1, held: 0 })), 'stored once and listed as held nowhere as it is presented');
+      assert.equal(internals.surgeryHeldWrites.length, 0);
+    } finally {
+      c.setStrategy = originalSetStrategy;
+    }
+  });
+
+  // Ported for #291: what the hold keeps is in memory, so there is no
+  // recovery queue to acknowledge, which this test once checked.
+  // AF #844 bot review 5, finding 19: the writes kept for an agent that
+  // ended are taken off their queues before each goes on to the primary,
+  // and building a channel notice's words can throw (a store read). That
+  // throw costs only its own write, counted as lost: the others still go
+  // on, or are counted and alerted.
+  it("writes kept for an agent that ended go on to the primary each on its own: one whose notice can't be built is counted lost, the rest go on", async () => {
+    const internals = framework as unknown as {
+      passHeldWritesOn(agentName: string, writes: readonly unknown[]): { passed: number; dropped: number };
+      noticeForPrimary: (...args: unknown[]) => unknown;
+    };
+    const build = internals.noticeForPrimary;
+    let calls = 0;
+    internals.noticeForPrimary = function (this: unknown, ...args: unknown[]) {
+      if (calls++ === 0) throw new Error('injected: the channel notice could not be built');
+      return build.apply(this, args);
+    };
+    const kept = (text: string) => ({
+      participant: 'Antra', content: [{ type: 'text', text }], metadata: { primaryIfUnread: true },
+      heldAt: Date.now(), heldOrder: 0,
+    });
+    const error = console.error;
+    console.error = () => {};
+    let outcome: { passed: number; dropped: number };
+    try {
+      outcome = internals.passHeldWritesOn('gone-fork', [kept('first, whose notice throws'), kept('second, for the primary')]);
+    } finally {
+      console.error = error;
+      internals.noticeForPrimary = build;
+    }
+    assert.deepEqual(outcome, { passed: 1, dropped: 1 });
+    assert.ok(remainingTexts().includes('second, for the primary'), 'the second went on to the primary');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.equal(lost.length, 1, 'the lost write is alerted');
+    assert.equal((lost[0]!.data as { count?: number } | undefined)?.count, 1);
+  });
+
+  it("the hold's release stores what waited behind it while another agent's tool cycle is pending", { timeout: 60_000 }, async () => {
     const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
     const originalSwitch = c.switchBranch;
     let releaseSwitch!: () => void;
@@ -268,32 +522,31 @@ describe('live operator surgery', () => {
     c.switchBranch = async (name: string) => { entered(); await gate; return originalSwitch.call(c, name); };
     const internals = framework as unknown as {
       surgeryHold: unknown;
-      deferredWritesPersisted: boolean;
-      unackedDeferredWrites: unknown[];
+      surgeryHeldWrites: unknown[];
       pendingAssistantBlocks: Map<string, unknown[]>;
       addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
     };
-    internals.deferredWritesPersisted = true;
     try {
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
       await inSwitch;
       assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
-      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'waited for the hold' }]), '', 'deferred');
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'waited for the hold' }]), '', 'held');
       // Another agent's tool cycle says nothing about scout's window.
       internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'x', input: {} }]);
       releaseSwitch();
       await rollback;
-      assert.ok(remainingTexts().includes('waited for the hold'), 'flushed when the hold released');
-      assert.equal(internals.unackedDeferredWrites.length, 0, 'and acknowledged, so the recovery queue no longer holds it');
+      assert.ok(remainingTexts().includes('waited for the hold'), 'stored when the hold released');
+      assert.equal(internals.surgeryHeldWrites.length, 0, 'nothing left held');
     } finally {
       internals.pendingAssistantBlocks.delete('builder');
       c.switchBranch = originalSwitch;
     }
   });
 
-  it("the post-surgery flush stores several agents' writes in the order they arrived", { timeout: 60_000 }, async () => {
-    // Residents share one message slot, so the order writes arrived in is the
-    // order every resident reads.
+  it("the hold's release stores several agents' writes in the order they arrived", { timeout: 60_000 }, async () => {
+    // Residents share one message slot, so the writes are stored in it in the
+    // order they arrived, whoever each is stamped for ('two' is builder's
+    // alone, out of scout's window).
     await framework.stop();
     framework = await AgentFramework.create({
       storePath,
@@ -317,9 +570,9 @@ describe('live operator surgery', () => {
     try {
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
       await inSwitch;
-      assert.equal(add('user', [{ type: 'text', text: 'one' }]), '', 'deferred');
-      assert.equal(add('user', [{ type: 'text', text: 'two' }], undefined, { forAgent: 'builder' }), '', 'deferred');
-      assert.equal(add('user', [{ type: 'text', text: 'three' }]), '', 'deferred');
+      assert.equal(add('user', [{ type: 'text', text: 'one' }]), '', 'held');
+      assert.equal(add('user', [{ type: 'text', text: 'two' }], undefined, { forAgent: 'builder' }), '', 'held');
+      assert.equal(add('user', [{ type: 'text', text: 'three' }]), '', 'held');
       releaseSwitch();
       await rollback;
       assert.deepEqual(remainingTexts().filter((t) => ['one', 'two', 'three'].includes(t)), ['one', 'two', 'three']);
@@ -675,18 +928,24 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
+  // Ported for #291 (AF-7): scout's window is presented, so a shed takes the
+  // body out of the window, as an undone turn's, and the record keeps it.
+  // The shed of a window that is still the record (refusal-rewind.test.ts's
+  // stubs) removes it from the record, as these tests once checked here.
   it('a rewind whose newest message is the last shard of a body takes the whole body', async () => {
     const [s0, s1, s2] = appendShards('g-doc', ['d0', 'd1', 'd2']);
+    cm().presentRows([s0 as never]);
     const internals = framework as unknown as {
       shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
     };
     const record = internals.shedNewestTurn(framework.getAgent('scout'));
     assert.ok(record);
     assert.deepEqual(record.removedIds, [s2, s1, s0]);
-    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+    for (const id of [s0, s1, s2]) assert.equal(cm().windowStatusOf(id as never), 'undone', `${id} left the window whole`);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'd0', 'd1', 'd2'], 'the record keeps the body');
   });
 
-  it('a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one removal', async () => {
+  it('a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one retract', async () => {
     // As context-manager's chunker stores them: the tool_use block on the
     // turn's first shard, text after it; then the result, also a body.
     const store = (cm() as unknown as ShardStore).messageStore;
@@ -698,10 +957,18 @@ describe('live operator surgery', () => {
       store.append('user', [{ type: 'tool_result', toolUseId: 't9', content: 'r0' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 0 }).id,
       store.append('user', [{ type: 'text', text: 'r1' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 1 }).id,
     ];
-    const c = cm() as unknown as { removeMessages: (a: string, b: string) => void };
+    cm().presentRows([turn[0] as never]);
+    cm().presentRows([result[0] as never]);
+    const c = cm() as unknown as {
+      removeMessages: (a: string, b: string) => void;
+      retractRows: (ids: string[], options?: { undone?: boolean }) => void;
+    };
     const ranges: Array<[string, string]> = [];
+    const retracts: Array<[string[], { undone?: boolean } | undefined]> = [];
     const original = c.removeMessages.bind(c);
+    const originalRetract = c.retractRows.bind(c);
     c.removeMessages = (a: string, b: string) => { ranges.push([a, b]); original(a, b); };
+    c.retractRows = (ids: string[], options?: { undone?: boolean }) => { retracts.push([[...ids], options]); originalRetract(ids, options); };
     try {
       const internals = framework as unknown as {
         shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
@@ -710,11 +977,17 @@ describe('live operator surgery', () => {
       assert.ok(record);
       assert.equal(record.descriptor, 'a tool exchange (~1KB)');
       assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
-      assert.deepEqual(ranges, [[turn[0], result[1]]], "one removal, from the turn's first shard to the result's last");
+      // Ported for #291 (AF-7): on a presented window the exchange leaves
+      // the window in one call, each body by its first shard, as an undone
+      // turn's; the record keeps it.
+      assert.deepEqual(retracts, [[[turn[0], result[0]], { undone: true }]], "one retract, the turn's body and the result's");
+      assert.deepEqual(ranges, [], 'nothing removed from the record');
     } finally {
       c.removeMessages = original;
+      c.retractRows = originalRetract;
     }
-    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+    for (const id of [...turn, ...result]) assert.equal(cm().windowStatusOf(id as never), 'undone');
+    assert.equal(cm().getMessageCount(), 9, 'the record keeps the exchange');
   });
 
   // --- failure path ----------------------------------------------------------
