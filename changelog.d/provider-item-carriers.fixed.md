@@ -6,6 +6,12 @@
   turn without the compaction the server had given it. membrane's formatters
   decide per provider whether such an item goes out, and none sends it as an
   empty text block.
+  - Hosts: by anima-research/context-manager#462's account,
+    context-manager 0.25.0, which this release allows, prices these items at
+    nothing, so its estimate of a window holding them misses what the request
+    now sends, and calibration's multiplier rises to cover them.
+    anima-research/context-manager#462 prices them as the items they're sent
+    as.
   - On Anthropic's API, which takes server-tool blocks back in an assistant
     turn, a resident whose turns used server tools now sends those stored
     blocks, such as web-search results, in each later turn's first request,
