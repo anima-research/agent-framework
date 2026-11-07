@@ -57,6 +57,7 @@ const count = (n: number): string => n.toLocaleString('en-US');
 
 /** A text's length in code points, so a character outside the Basic Multilingual Plane, such as 😀, counts once where UTF-16 counts it twice. */
 const characters = (text: string): number => [...text].length;
+const holdsSetting = (entry: ToolOverride): boolean => entry.visible !== undefined || entry.description !== undefined;
 
 /** A text's first `n` characters, never splitting a code point. */
 const firstCharacters = (text: string, n: number): string => [...text].slice(0, n).join('');
@@ -234,7 +235,7 @@ export class ToolPresentation {
       } catch (error) { diagnostics.push(`The description defaults for ${JSON.stringify(profile.source)} can't be used (${problemText(error)}), so its tools show their installed descriptions, or yours where you set one. Ask whoever runs this host to fix that defaults file.`); }
     }
     const names = new Set(tools.map(t => t.name));
-    for (const name of Object.keys(doc.tools)) if (!names.has(name)) diagnostics.push(`Not currently available: ${quoted(name)}`);
+    for (const name of Object.keys(doc.tools)) if (!names.has(name) && holdsSetting(doc.tools[name])) diagnostics.push(`Not currently available: ${quoted(name)}`);
     const entries = tools.map(tool => {
       const override = Object.hasOwn(doc.tools, tool.name) ? doc.tools[tool.name] : undefined;
       // Always retain a usable discovery signpost, even when its wording is overridden.
@@ -336,8 +337,15 @@ export class ToolPresentation {
     const name = args.name as string;
     if (!available.some((t) => t.name === name)) {
       const near = closestNames(name, available.map((t) => t.name));
-      throw new PresentationRefusal(`Nothing was changed: no tool named ${quoted(name)} is available to you.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
-        + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`);
+      let held = false;
+      try {
+        const tools = parsePresentation(this.read()).tools;
+        held = Object.hasOwn(tools, name) && holdsSetting(tools[name]);
+      } catch { held = false; }
+      throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
+        + (held
+          ? ' Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.'
+          : ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`));
     }
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
       throw new PresentationRefusal(`Nothing was changed: the description is ${count(characters(args.description))} characters, over the ${count(MAX_DESCRIPTION_CHARS)} allowed. Shorten it and call set_tool_description again.`);
@@ -360,12 +368,20 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
     'Visible = not hidden by you: in your tool list, unless the host keeps it in its "settings" toolset or a server\'s tab (toolsets--look shows those). Hidden = moved into the "settings" toolset, or its MCPL server\'s tab: toolsets--look shows it, toolsets--act calls it once that toolset is open.',
     'These are your visibility choices, not fixed primary/secondary rankings.',
     'Copy exact names from the index; similar-sounding names may not exist.',
+    'Index by source: line N.',
     'Show a hidden tool: set_tool_visibility {"name":"EXACT_NAME","visible":true}.',
     `Read details: workspace--read {"path":${JSON.stringify(snapshot.cataloguePath)},"offset":LINE,"limit":LINES}.`,
     'Line references below belong to this revision; reread the index after changes.', '',
   ];
+  const indexLineAt = lines.indexOf('Index by source: line N.');
   // One line each: a quoted parse error can hold the file's own line breaks.
   for (const diagnostic of snapshot.diagnostics) lines.push('Diagnostic: '+diagnostic.replace(/\r\n|\r|\n/g, '\\n'));
+  const hidden = snapshot.entries.filter(e => !e.visible);
+  if (hidden.length) {
+    lines.push(`## Hidden (${hidden.length})`, '');
+    for (const entry of hidden) lines.push(`### ${entry.name} (${entry.source})`, '', ...entry.description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).map(line => line ? `> ${line}` : '>'), '');
+  }
+  lines[indexLineAt] = `Index by source: line ${lines.length + 1}.`;
   lines.push('## Index by source', '');
   const index = new Map<string, number>();
   for (const [source, entries] of groups) {

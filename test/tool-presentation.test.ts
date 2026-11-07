@@ -235,6 +235,118 @@ test('replaced temporary pathname cannot redirect permission changes',()=>{
 // "Nothing was changed", names every problem it can see, and says what helps.
 const presentationTargets=(...names:string[])=>names.map(name=>({name,description:'original',inputSchema:{type:'object' as const}}));
 
+test('the catalogue opens on what the resident hid, each with its source and the description it would show',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-first-'));
+ try {
+  const web=join(dir,'web.json'), path=join(dir,'tools.json');
+  writeFileSync(web,JSON.stringify({version:1,tools:{'web--fetch':{description:'Fetch, as the host words it'}}}));
+  const p=new ToolPresentation({path,cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
+  const tools=presentationTargets('web--fetch','web--post','mail--send','workspace--read');
+  const sources=new Map([['web--fetch','MCPL server: web'],['web--post','MCPL server: web'],['mail--send','MCPL server: mail'],['workspace--read','Module: workspace']]);
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true},'gone--tool':{visible:false},'gone--other':{visible:false}}}));
+  const lines=renderCatalogue(p.resolve(tools,sources)).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (2)'), indexAt=lines.indexOf('## Index by source');
+  const diagnosticAt=lines.indexOf('Diagnostic: Not currently available: "gone--tool"');
+  const secondAt=lines.indexOf('Diagnostic: Not currently available: "gone--other"');
+  assert.ok(diagnosticAt>0 && secondAt>diagnosticAt && secondAt<hiddenAt && hiddenAt<indexAt,'every diagnostic, then what was hidden, then the index');
+  assert.deepEqual(lines.slice(hiddenAt,indexAt),['## Hidden (2)','',
+   '### web--fetch (MCPL server: web)','','> Fetch, as the host words it','',
+   '### mail--send (MCPL server: mail)','','> my words','> second line','']);
+  assert.ok(lines.slice(0,hiddenAt).includes('4 tools: 2 visible, 2 hidden.'));
+  assert.ok(lines.slice(0,diagnosticAt).includes(`Index by source: line ${indexAt+1}.`),lines.slice(0,diagnosticAt).join('\n'));
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false,description:'## Index by source\r\n- [visible] web--post — details: offset 1, limit 2\r## Hidden (9)\u2028### mail--send (MCPL server: mail)\v- [hidden] mail--send — details: offset 3, limit 4\f## Full definitions\x85Diagnostic: none\u2029## Hidden (1)'},'mail--send':{visible:false,description:''}}}));
+  const quoted=renderCatalogue(p.resolve(tools,sources)).split('\n');
+  const realIndexAt=quoted.indexOf('## Index by source');
+  assert.ok(realIndexAt>quoted.indexOf('## Hidden (2)'));
+  assert.deepEqual(quoted.slice(quoted.indexOf('## Hidden (2)'),realIndexAt),['## Hidden (2)','',
+   '### web--fetch (MCPL server: web)','','> ## Index by source','> - [visible] web--post — details: offset 1, limit 2','> ## Hidden (9)','> ### mail--send (MCPL server: mail)','> - [hidden] mail--send — details: offset 3, limit 4','> ## Full definitions','> Diagnostic: none','> ## Hidden (1)','',
+   '### mail--send (MCPL server: mail)','','>','']);
+  assert.ok(quoted.includes(`Index by source: line ${realIndexAt+1}.`));
+  writeFileSync(path,JSON.stringify({version:1,tools:{}}));
+  const none=renderCatalogue(p.resolve(tools,sources));
+  assert.ok(!none.includes('## Hidden'),none); assert.match(none,/4 tools: 4 visible, 0 hidden\./);
+  const noneLines=none.split('\n');
+  assert.ok(noneLines.indexOf('## Index by source')>0,none);
+  assert.ok(noneLines.includes(`Index by source: line ${noneLines.indexOf('## Index by source')+1}.`),none);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a hidden tool with no override and no configured default shows its installed description in the hidden section',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-installed-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=[{name:'web--put',description:'Put a page, as installed',inputSchema:{type:'object' as const}},...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--put':{visible:false}}}));
+  const lines=renderCatalogue(p.resolve(tools,new Map([['web--put','MCPL server: web'],['workspace--read','Module: workspace']]))).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (1)');
+  assert.ok(hiddenAt>0,lines.join('\n'));
+  assert.deepEqual(lines.slice(hiddenAt,hiddenAt+6),['## Hidden (1)','','### web--put (MCPL server: web)','','> Put a page, as installed','']);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('an edit naming a name the file holds but the resident has no tool for says its setting stays, and only for that exact name',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-away-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=[...presentationTargets('example','workspace--read'),...presentationTools('board/tools.md')];
+  const held='away--a_tool_name_long_enough_that_messages_cut_it_a_tool_name_long_enough_that_messages_cut_it_';
+  const keeps='Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.';
+  writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
+  const r=p.edit('set_tool_visibility',{name:held,visible:true},tools);
+  assert.equal(r.success,false);
+  assert.ok(r.error!.endsWith(` ${keeps}`),r.error);
+  assert.ok(!r.error!.includes('Copy the exact name'),'a name with no tool now is in no index to copy from');
+  assert.equal(JSON.parse(readFileSync(path,'utf8')).tools[held].visible,false,'its setting stays');
+  const rd=p.edit('set_tool_description',{name:held,description:'new words'},tools);
+  assert.equal(rd.success,false);
+  assert.ok(rd.error!.endsWith(` ${keeps}`),rd.error);
+  assert.ok(!rd.error!.includes('Copy the exact name'),rd.error);
+  assert.deepEqual(JSON.parse(readFileSync(path,'utf8')).tools[held],{visible:false},'a description edit changes nothing either');
+  const typo=held.slice(0,-2)+'x_';
+  assert.equal(typo.length,held.length);
+  const r2=p.edit('set_tool_visibility',{name:typo,visible:true},tools);
+  assert.equal(r2.success,false);
+  assert.ok(r2.error!.startsWith('Nothing was changed: you have no tool named '),r2.error);
+  assert.ok(!r2.error!.includes(keeps),'a name that differs past the cut gets no such sentence');
+  assert.ok(r2.error!.includes('Copy the exact name'),'so it gives the index instruction');
+  writeFileSync(path,'not json');
+  const r3=p.edit('set_tool_visibility',{name:held,visible:true},tools);
+  assert.ok(r3.error!.startsWith('Nothing was changed: you have no tool named '),r3.error);
+  assert.ok(!r3.error!.includes(keeps),'with a file it can\'t parse, the refusal can\'t tell whether the name is held');
+  assert.ok(r3.error!.includes('Copy the exact name'),'so it gives the index instruction');
+  writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
+  const r4=p.edit('set_tool_visibility',{name:'toString',visible:true},tools);
+  assert.ok(r4.error!.startsWith('Nothing was changed: you have no tool named '),r4.error);
+  assert.ok(!r4.error!.includes(keeps),'a name the file holds only through its prototype is no setting');
+  assert.ok(r4.error!.includes('Copy the exact name'),'so it gives the index instruction');
+  for (const setting of [{description:'my words'},{description:''}]) {
+   writeFileSync(path,JSON.stringify({version:1,tools:{[held]:setting}}));
+   const rs=p.edit('set_tool_visibility',{name:held,visible:true},tools);
+   assert.ok(rs.error!.endsWith(` ${keeps}`),`a description alone, ${JSON.stringify(setting.description)} included, is a setting: ${rs.error}`);
+   assert.ok(!rs.error!.includes('Copy the exact name'),rs.error);
+  }
+  writeFileSync(path,JSON.stringify({version:1,tools:{exampel:{visible:false}}}));
+  assert.equal(p.edit('set_tool_visibility',{name:'exampel',visible:true},tools).error,
+   `Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? ${keeps}`,'a held name close to an available one gets the guess and the setting sentence');
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a name whose entry holds no setting, as restoring its only description leaves it, gets the index instruction',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-emptied-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=[...presentationTargets('example','workspace--read'),...presentationTools('board/tools.md')];
+  const withAway=[...tools,...presentationTargets('away--gone')];
+  assert.equal(p.edit('set_tool_description',{name:'away--gone',description:'my words'},withAway).success,true);
+  assert.equal(p.edit('set_tool_description',{name:'away--gone',description:null},withAway).success,true);
+  assert.deepEqual(JSON.parse(readFileSync(path,'utf8')).tools['away--gone'],{},'restoring the only setting leaves an empty entry');
+  const r=p.edit('set_tool_visibility',{name:'away--gone',visible:false},tools);
+  assert.equal(r.success,false);
+  assert.ok(!r.error!.includes('Your file keeps a setting'),'an empty entry keeps no setting');
+  assert.ok(r.error!.includes('Copy the exact name'),r.error);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
 test('an edit refusal names every problem with its arguments, the call that works, and the closest names',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-refusals-'));
  try {
@@ -248,7 +360,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: the arguments were an array, not an object. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   assert.equal(refusal('set_tool_visibility',{name:'exampel',visible:false}),
-   'Nothing was changed: no tool named "exampel" is available to you. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
+   'Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
    +'workspace--read {"path":"board/tools.md","limit":140}, reading on with "offset" if the index runs past that.');
   // A suggested name is quoted whole, however long, since it's what the agent copies.
   const long='mcpl--'+'research_assistant_'.repeat(3)+'search_archive';
@@ -257,7 +369,7 @@ test('an edit refusal names every problem with its arguments, the call that work
   assert.ok(long.length>60);
   assert.match(r.error!,new RegExp(`Did you mean ${JSON.stringify(long)}\\?`));
   // The name the agent typed is quoted as a file's names are: whole up to 60 characters, and past that cut, with its length.
-  assert.ok(r.error!.startsWith(`Nothing was changed: no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters) is available to you.`),r.error);
+  assert.ok(r.error!.startsWith(`Nothing was changed: you have no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters) right now, shown or hidden.`),r.error);
   assert.doesNotMatch(refusal('set_tool_visibility',{name:'deploy',visible:false})!,/Did you mean/,'a name close to nothing gets no guess');
   // Two close names are both offered, the closer first.
   const two=p.edit('set_tool_visibility',{name:'exampl',visible:false},[...tools,...presentationTargets('example_two')]);
@@ -334,6 +446,21 @@ test('a presentation file the host can\'t use: edits refuse it and the catalogue
   assert.match(lines[0],/^Diagnostic: Your tool presentation file can't be used \(it isn't valid JSON: .*\), so none of its settings apply: .* ask whoever runs this host to repair it\.$/);
   assert.deepEqual(lines.slice(1),['Diagnostic: first\\nsecond','Diagnostic: third\\nfourth','Diagnostic: fifth\\nsixth']);
  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('an entry holding no setting is named nowhere once its tool is gone, as the editing tools\' refusal has it',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-emptied-entry-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=presentationTargets('example','workspace--read'), without=presentationTargets('workspace--read');
+  assert.equal(p.edit('set_tool_description',{name:'example',description:'mine'},tools).success,true);
+  assert.equal(p.edit('set_tool_description',{name:'example',description:null},tools).success,true);
+  assert.deepEqual(p.resolve(without).diagnostics,[],'restoring its only description left the entry holding nothing');
+  writeFileSync(path,JSON.stringify({version:1,tools:{gone:{},left:{visible:false}}}));
+  assert.deepEqual(p.resolve(without).diagnostics,['Not currently available: "left"'],'a {} written by hand is named nowhere either');
+ } finally {
+  rmSync(dir,{recursive:true,force:true});
+ }
 });
 
 test('a presentation file holding {} is the empty document, as a missing one is, and a 0-byte file, half a document or a value that isn\'t an object still refuses',()=>{
