@@ -1,4 +1,0 @@
-- **Modules and MCPL servers that write `metadata.suppressed`:** the key is now the framework's, the stamp a suppress rule leaves on a row.
-  - **Who needs to act:** only code that stores a value of its own under that key. Nothing in this repository does.
-  - **Migration:** rename the key. A value written from this release on is dropped. A row already stored whose value is an object with a string `rule` reads as suppressed: it leaves residents' views, and `--remove-suppressed` removes it.
-  - **Unchanged:** every other metadata key. A row a module reads through its context is new only in being marked `heldFromResidents` when a suppress rule hid it, as a tuned-out row is.
