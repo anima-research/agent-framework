@@ -52,7 +52,7 @@
   that holds a row, as at the first boot on a store with history, or a
   presentation of more than one row): the store's MANIFEST is then at version 2, which
   no earlier release opens, and only a copy of the store taken before the
-  upgrade goes back (the 291-presentation-mandatory entry). It cleans the agent's own
+  upgrade goes back (see Breaking: every agent's context follows its own presentation index). It cleans the agent's own
   branch, not a derived context's (`dendrite/…`), so finish any such context
   first. With an anchor it starts at that message, where a row an earlier run
   removed is back, so run it last with no anchor. Suppress rules load as `defer`

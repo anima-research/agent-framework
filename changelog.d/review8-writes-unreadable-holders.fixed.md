@@ -1,1 +1,0 @@
-- A row whose holding windows can't be read counts as read for the MCPL coalescer, so the coalescer doesn't remove or replace it. One window that can't be read fails the lookup for every window, so the failed lookup isn't read as no window holding the row, which would let a later occurrence of its subject take back a row that an agent outside its slot's readers held and had read.
