@@ -13,6 +13,7 @@ class FakeService {
   upserts: Item[][] = [];
   searches: Record<string, unknown>[] = [];
   failNext = 0;
+  onSearch?: (n: number) => void;
   /** Answer hits without text, as a service that keeps only vectors and ids does. */
   omitText = false;
   server!: Server; url = '';
@@ -42,7 +43,7 @@ class FakeService {
           for (const it of items) { if (this.items.has(it.id) && this.items.get(it.id)!.text === it.text) unchanged++; else inserted++; this.items.set(it.id, it); }
           return json(200, { namespace: 'test/ns', inserted, updated: 0, unchanged, count: this.items.size });
         }
-        const q = JSON.parse(body) as Record<string, unknown>; this.searches.push(q);
+        const q = JSON.parse(body) as Record<string, unknown>; this.searches.push(q); this.onSearch?.(this.searches.length);
         const hits = [...this.items.values()].filter((it) => !q.kinds || (q.kinds as string[]).includes(it.kind))
           .filter((it) => !q.channel || it.channel === q.channel)
           .map((it) => ({ id: it.id, score: it.text.includes(q.query as string) ? 0.9 : 0.1, ts: it.ts ?? null, channel: it.channel ?? null, kind: it.kind, level: it.level ?? null, meta: it.meta ?? {}, ...(this.omitText ? {} : { text: it.text.slice(0, 40), chars: it.text.length }) }))
@@ -72,10 +73,11 @@ function stubCm(messages: StoredMessage[], summaries: Array<Record<string, unkno
       // listing gives as `createdMs`.
       return s ? { ...s, created: s.createdMs } : null;
     },
-    queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number }) {
+    queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number; offset?: number }) {
       const all = messages.filter((m) => (o.fromMs === undefined || m.timestamp.getTime() >= o.fromMs) && (o.toMs === undefined || m.timestamp.getTime() <= o.toMs))
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
-      return { messages: all.slice(0, o.limit ?? all.length), totalCount: all.length };
+      const offset = o.offset ?? 0;
+      return { messages: all.slice(offset, offset + (o.limit ?? all.length)), totalCount: all.length };
     },
     getSummariesInRange() { return summaries; },
   } as unknown as ContextManager;
@@ -129,6 +131,58 @@ describe('HistoryModule semantic_search', () => {
     // What it wrote to someone isn't a private note, so it is indexed with
     // private tools left out.
     assert.equal(messageIndexText(sent, false), expected);
+  });
+
+  it("messageIndexText keeps what the resident sent through telegram-mcpl's tools, under their own argument names (#524)", () => {
+    const sent = msg('m10', T0 + 10000, [
+      { type: 'tool_use', id: 'a', name: 'telegram--send_message', input: { chat_id: 42, message: 'the meeting moved to Thursday' } },
+      { type: 'tool_use', id: 'b', name: 'telegram--reply_to_message', input: { chat_id: 42, message_id: 7, text: 'yes, Thursday at noon' } },
+      { type: 'tool_use', id: 'c', name: 'telegram--send_file', input: { chat_id: 42, file_path: '/tmp/minutes-0612.pdf', caption: 'the minutes from today' } },
+      { type: 'tool_use', id: 'd', name: 'telegram--edit_message', input: { chat_id: 42, message_id: 8, new_text: 'Thursday at one, not noon' } },
+      { type: 'tool_use', id: 'e', name: 'telegram--send_scheduled_message', input: { chat_id: 42, message: 'a reminder that the report is due', schedule_date: '2026-11-02T09:00:00Z' } },
+      { type: 'tool_use', id: 'f', name: 'telegram--create_poll', input: { chat_id: 42, question: 'which room suits everyone?', options: ['the library', 'the hall'] } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(sent, false), [
+      '[send_message] the meeting moved to Thursday',
+      '[reply_to_message] yes, Thursday at noon',
+      '[send_file] the minutes from today',
+      '[edit_message] Thursday at one, not noon',
+      '[send_scheduled_message] a reminder that the report is due',
+      '[create_poll] which room suits everyone?',
+    ].join('\n'));
+  });
+
+  it("messageIndexText keeps what the resident said in a world through Eidoverse's say and whisper (#524)", () => {
+    const said = msg('m11', T0 + 11000, [
+      { type: 'tool_use', id: 'a', name: 'world--say', input: { text: 'hello from the plaza', spoken: false } },
+      { type: 'tool_use', id: 'b', name: 'world--whisper', input: { to: 'p-7', text: 'meet me by the fountain' } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(said, false), '[say] hello from the plaza\n[whisper] meet me by the fountain');
+  });
+
+  it("messageIndexText reads a `text` argument of send_message, reply_message, send_dm or edit_message when the row's other arguments aren't there, and the first one present otherwise (#524)", () => {
+    const sent = msg('m12', T0 + 12000, [
+      { type: 'tool_use', id: 'a', name: 'send_message', input: { channelId: 'C1', text: 'sent as text' } },
+      { type: 'tool_use', id: 'b', name: 'reply_message', input: { channelId: 'C1', messageId: '1.2', text: 'replied as text' } },
+      { type: 'tool_use', id: 'c', name: 'send_dm', input: { userId: 'U1', text: 'a word as text' } },
+      { type: 'tool_use', id: 'd', name: 'edit_message', input: { channelId: 'C1', messageId: '1.3', text: 'edited as text' } },
+      { type: 'tool_use', id: 'e', name: 'send_message', input: { channelId: 'C1', content: 'the content wins', text: 'not this' } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(sent, false), [
+      '[send_message] sent as text',
+      '[reply_message] replied as text',
+      '[send_dm] a word as text',
+      '[edit_message] edited as text',
+      '[send_message] the content wins',
+    ].join('\n'));
+  });
+
+  it("messageIndexText reads slack-mcpl's upload_file by its comment, not the file it carries (#524)", () => {
+    const sent = msg('m13', T0 + 13000, [
+      { type: 'tool_use', id: 'a', name: 'slack--upload_file', input: { channelId: 'C1', filename: 'positions.csv', content: 'symbol,qty', comment: 'the positions for Friday' } },
+      { type: 'tool_use', id: 'b', name: 'slack--upload_file', input: { channelId: 'C1', filename: 'notes.txt', content: 'only the file' } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(sent, false), '[upload_file] the positions for Friday');
   });
 
   it('syncs messages and summaries incrementally with cursors, then searches with mapped filters', async () => {
@@ -188,6 +242,57 @@ describe('HistoryModule semantic_search', () => {
       const sdata = sum.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number } };
       assert.ok(!sdata.hits.some((h) => h.id === 'sum:s1'), JSON.stringify(sdata.hits));
       assert.equal(sdata.index.droppedOffBranch, 1);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it("a message hit for a send whose result, stored after it, failed is marked as an error on the send's label, and its chars are the indexed text's", async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const sends = [
+        msg('m11', T0 + 11_000, [{ type: 'tool_use', id: 'u', name: 'discord--send_message', input: { channelId: 'C1', content: 'the dinner is at eight' } }], 'chan-A'),
+        msg('m12', T0 + 12_000, [{ type: 'tool_result', toolUseId: 'u', toolName: 'discord--send_message', content: 'Missing Access', isError: true }], 'chan-A'),
+        msg('m13', T0 + 13_000, [{ type: 'text', text: 'after the send and its result' }], 'chan-B'),
+        msg('m14', T0 + 14_000, [{ type: 'tool_use', id: 'v', name: 'discord--send_message', input: { channelId: 'C1', content: 'the lunch is at noon' } }], 'chan-A'),
+        msg('m15', T0 + 15_000, [{ type: 'tool_result', toolUseId: 'v', toolName: 'discord--send_message', content: 'sent' }], 'chan-A'),
+      ];
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+      mod.bind(stubCm(sends));
+      await mod.syncSemanticIndex()!;
+      const hitFor = async (query: string, id: string) => {
+        const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query, kinds: 'messages' } });
+        assert.equal(res.success, true, JSON.stringify(res));
+        const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number }> }).hits.find((h) => h.id === id);
+        assert.ok(hit, JSON.stringify(res.data));
+        return { snippet: hit.snippet, chars: hit.chars };
+      };
+      assert.deepEqual(await hitFor('dinner is at eight', 'msg:m11'), { snippet: '[send_message, error] the dinner is at eight', chars: '[send_message] the dinner is at eight'.length });
+      assert.deepEqual(await hitFor('lunch is at noon', 'msg:m14'), { snippet: '[send_message] the lunch is at noon', chars: '[send_message] the lunch is at noon'.length });
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it("a hit checked again after a search that waited shows its send's account as it is then, not a failure since answered otherwise", async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const store = [
+        msg('m31', T0 + 31_000, [{ type: 'text', text: 'dinner plans elsewhere' }], 'chan-A'),
+        msg('m32', T0 + 32_000, [{ type: 'tool_use', id: 'w', name: 'discord--send_message', input: { channelId: 'C1', content: 'dinner plans at eight' } }], 'chan-A'),
+        msg('m33', T0 + 33_000, [{ type: 'tool_result', toolUseId: 'w', toolName: 'discord--send_message', content: 'Missing Access', isError: true }], 'chan-A'),
+      ];
+      const offBranch = new Set<string>();
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+      mod.bind(stubCm(store, [], offBranch));
+      await mod.syncSemanticIndex()!;
+      offBranch.add('m31');
+      svc2.onSearch = (n) => {
+        if (n === 2) store[2] = msg('m33', T0 + 33_000, [{ type: 'tool_result', toolUseId: 'w', toolName: 'discord--send_message', content: 'sent' }], 'chan-A');
+      };
+      const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query: 'dinner plans', kinds: 'messages', limit: 2 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      assert.equal(svc2.searches.length, 2, 'the first answer held one hit on this branch, so it searched again');
+      const hits = (res.data as { hits: Array<{ id: string; snippet: string }> }).hits;
+      assert.deepEqual(hits.map((h) => [h.id, h.snippet]), [['msg:m32', '[send_message] dinner plans at eight']]);
       await mod.stop();
     } finally { await svc2.stop(); }
   });
