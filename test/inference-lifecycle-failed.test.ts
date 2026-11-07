@@ -312,3 +312,37 @@ test('a stream that ends with no event, and nobody cancelled, ends failed, and a
     await teardown();
   }
 });
+
+test('a silent stream log write failure still releases its turn without retrying', { timeout: 60_000 }, async () => {
+  const { framework, membrane, phases, teardown } = await frameworkOver([silentEnd], retryOnce);
+  const internal = framework as unknown as {
+    logInference: (entry: { error?: string }) => void;
+    activeTurnTokens: Map<string, unknown>;
+    activeStreams: Map<string, unknown>;
+  };
+  const write = internal.logInference;
+  internal.logInference = (entry) => {
+    if (entry.error === 'Stream ended without a final response') throw new Error('synthetic log write failure');
+    write.call(framework, entry);
+  };
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    framework.start();
+    framework.nudgeAgent('resident', 'operator');
+    assert.ok(await settles(() => warnings.some((line) => line.startsWith('[usage] agent=resident could not record'))
+      && phases().length === 1 && phases()[0].length === 2
+      && !internal.activeTurnTokens.has('resident') && !internal.activeStreams.has('resident')),
+    'the warning is emitted and teardown completes');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(phases(), [['started', 'failed']]);
+    assert.equal(membrane.calls.length, 1, 'the logging error starts no retry');
+    assert.equal(framework.getAgent('resident')?.state.status, 'idle');
+    assert.equal(framework.getHostModeStatus().activeTurns, 0);
+  } finally {
+    console.error = originalError;
+    internal.logInference = write;
+    await teardown();
+  }
+});

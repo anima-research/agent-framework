@@ -25657,6 +25657,7 @@ export class AgentFramework {
     // Set by the complete / aborted / error cases: the stream SAID how it
     // ended. An iterator that just closes says nothing (see after the loop).
     let streamTerminal = false;
+    let silentExhaustion = false;
     let preserveEventGateForSuccessor = false;
     this.hookOrchestrator?.emitLifecycle({
       inferenceId: outgoingInferenceId,
@@ -27399,13 +27400,8 @@ export class AgentFramework {
             agentName: agent.name,
             error: terminal,
           });
-          logStream({
-            success: false,
-            error: terminal,
-            request: compiledRequest ?? { note: 'streaming request ended without a terminal event' },
-            durationMs: Date.now() - startTime,
-          });
           if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+          silentExhaustion = true;
         }
       }
     } catch (error) {
@@ -27523,9 +27519,9 @@ export class AgentFramework {
         // newer one, a disposed agent's stream) writes one now, as a failure
         // naming what ended it, so the log carries what the totals count. A
         // stop that reaches its terminal writes its own, through logStream.
-        // With no finished round there is nothing to carry, and no entry is
-        // written, as before.
-        if (countedUsage && !usageLogged) {
+        // A silent uncancelled end also logs its failure when no round
+        // finished. Other ends without usage keep their prior no-entry behavior.
+        if (!usageLogged && (countedUsage !== undefined || silentExhaustion)) {
           const replaced = this.agents.get(agent.name) !== agent;
           const superseded = generationLost || agent.streamId !== myStreamId;
           logStream({
