@@ -1,11 +1,16 @@
-- A `channel_close` of the channel an all-except hold excepts, whose release of the focus fails, answers the
-  failure with what holds of the focus: "The close wasn't recorded: <reason>. The focus on it ended before that
-  failure, and what the other channels held was delivered, up to its backlog cap." where a step after the end
-  (such as the resident's wake) threw, and otherwise "The close wasn't recorded: <reason>. The focus on it is still
-  in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode:
-  'cancel', scope: 'all-except' }, or asks this close again." In 0.32.0 such a failure rejected `executeToolCall`
-  with "The close wasn't recorded: <reason>" and said nothing of the focus; it is now the close's answer, as the
-  registry's other failures are.
+- A `channel_close` of the channel an all-except hold excepts answers, once its focus has ended, "The focus on it
+  ended, and what the other channels held was delivered, up to its backlog cap." (0.32.0: "The focus on it ended
+  all the same, and what the other channels held was delivered."). Where the focus's release fails, it answers
+  the failure with what holds of the focus: "The close wasn't recorded: <reason>. The focus on it ended before
+  that failure, and what the other channels held was delivered, up to its backlog cap." where a step after the
+  end (such as the resident's wake) threw; otherwise "The close wasn't recorded: <reason>. The focus on it is
+  still in force: what the other channels hold stays held until it ends.", or, where the release couldn't be
+  made durable after its notice was stored, "… The focus on it is still in force, but its release notice, with
+  what the other channels held up to its backlog cap, was stored before that failure: what they hold from now on
+  stays held until it ends.", each followed by "A resident ends it with tune_out { mode: 'cancel', scope:
+  'all-except' }, or asks this close again." In 0.32.0 such a failure rejected `executeToolCall` with "The close
+  wasn't recorded: <reason>" and said nothing of the focus; it is now the close's answer, as the registry's other
+  failures are.
 - An agent's close of the excepted channel after its server stopped registering it (removed by
   `channels/changed`, or the server removed), by the channel's id, its server-qualified name, its id with its
   `serverId`, or, inside the turn whose channel it was, its id, now ends the focus as a close of the registered
