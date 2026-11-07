@@ -13,6 +13,5 @@
   upgrade (rows stored before it carry no stamp, and stay in the window written down from the record).
   `create()` refuses a name that is the
   agent's own or no configured agent's, and anything but a list of names. The rounds an agent observes go out in its
-  requests as `AgentConfig.foreignRounds` says, as the persistent subconscious's do: `'transcript'` (the default) or
-  `'raw'`. `AgentRegistry.register` takes `declaredWith`, the names declared with the agent, so an edge may name a
+  requests as `AgentConfig.foreignRounds` says, as the persistent subconscious's do: `'transcript'` (the default) or `'raw'`. An agent whose window is still the record (its write-down failed) is sent them `'raw'` until a branch move presents its window; an agent derived from one sent transcripts (`deriveAgent`, shared or copy), and a conversation fork of such a template, are sent them as it is. `AgentRegistry.register` takes `declaredWith`, the names declared with the agent, so an edge may name a
   resident registered after it, and two may observe each other; `residentSpec` takes `observes`.

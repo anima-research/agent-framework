@@ -13,7 +13,7 @@
   release stored, which a window written down from the record holds, its view leaving it out. A cancel's dump reads it
   from the record. While a surgery holds the store, a `check` counts and peeks the held messages the hold keeps in
   memory too (#232 gap 7); a cancel asked for then waits for the release, which stores them before the cancel runs
-  (the deferral-queue entry), so a dump reads the hold's writes in memory only where the coordinator's `writesHeld`
+  (see Breaking: the deferral queue is gone), so a dump reads the hold's writes in memory only where the coordinator's `writesHeld`
   hook throws and the cancel goes on during the hold.
 - A cancel the subconscious makes itself, with its note, gets it a report turn when some of its tune-out's stored
   messages are ones it hadn't been shown when it wrote the note (those its window doesn't hold); the notice says how
@@ -21,7 +21,6 @@
 - `inspectAgentContext` on an ended agent reopens its context with the view its live one had: a resident's leaves
   out the other residents' stored context injections as well as held traffic, as in 0.32.0, and the subconscious's
   leaves out the residents' stored injections and keeps the held traffic it reads. 0.32.0 reopened an ended
-  subconscious through the residents' view, which left out held traffic as well (and on the residents' slot: the
-  291-audience-stamp fixed entry).
+  subconscious through the residents' view, which left out held traffic as well (and on the residents' slot: see Fixed: an ended subconscious that `inspectAgentContext` reopens).
 - The subconscious's window anchor counts an active all-except hold when a channel's tune-out is entered during it,
   so the anchor stays at the hold's start rather than moving forward past it.

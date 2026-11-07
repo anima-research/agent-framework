@@ -11,7 +11,7 @@
   the agent was busy and entered at its turn's end), which stay in the window after the target, since a branch cut
   can't separate them from it. Neither is removed or marked. `SurgeryMarksPreview.neverPresented` counts the
   messages a rollback or suppression would remove that no live agent is shown: no window holds them, or only
-  windows whose view leaves them out (a row a tune-out holds); a message that may be in a window that couldn't be
+  windows whose view leaves them out (a row a tune-out holds, another agent's stored context injection); a message that may be in a window that couldn't be
   read isn't counted, and is logged. All three are set only on a
   presented window, and the operator log records the first two; the host command's message-granular undo answers
   `returnedToArrivals` and `keptInWindowAfterTarget` too.

@@ -31,8 +31,7 @@
   - `InferenceRequest.readsStoredMessage` (0.28.0, #814) is folded into
     `readsRow` as well: a wake for a message stored for its agent as it
     arrived carries `readsRow`, the row's stored id, as a wake for a row
-    stored during the agent's turn does, and is judged as one (the
-    291-reads-row changed entry).
+    stored during the agent's turn does, and is judged as one (see Changed: what an agent has read is what its window held).
   - `WritePlacement.messageId` names the stored row of every write stored at
     once, and `WritePlacement` gains `presented?: false` (a row stored and not
     presented to its agent: its turn was alive, or, at rest, its presentation

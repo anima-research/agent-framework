@@ -37,6 +37,6 @@
   sender asked; 0.32.0's boot asked no wake for any queued mail. An interrupted job whose
   result is stored this way tells its recipient nothing about ending without a result, as 0.32.0 told nothing
   while the result was held; 0.32.0 told the recipient of a result already stored and released before the restart
-  that the job ended without one (the review8-writes-interrupted-notice entry).
+  that the job ended without one (see Fixed: at boot, an interrupted job's end is told from what its recipient's store holds).
   Where the boot can't read what an agent is owed to ask those wakes, the agent's arrivals stay out of its window
   until its next turn start, at the boot's pass and at every point at rest after it, so a later boot asks them.

@@ -3,8 +3,7 @@
   `ContextManager.presentRows` (one before 0.25.0), and a store handle without chronicle's
   `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.1 or earlier), each naming the range this package
   declares (see Breaking: the chronicle `^0.6.0` dependency). An agent whose window
-  can't be written down at its registration (another version's index format, a failed write) stays in legacy mode,
-  its window the whole record, as before, until a branch move writes its window down on the new branch. A
+  can't be written down at its registration (another version's index format, a failed write) stays in legacy mode (logged, and raised as an ops alert of kind `presentation-legacy` beside the `presentation:failed` trace, which carries `legacy: true`), its window the whole record, as before, until a branch move writes its window down on the new branch. A
   conversation fork is seeded with its template's window, so a row a host writes into the template's context
   manager directly, past the framework, reaches a fork only once the template's next point has presented it.
   - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
@@ -19,8 +18,7 @@
     wants them marked rolls back instead, with `rollbackToMessage`'s `marks` or a `host/command` undo by messages
     with `marks`. The result's `fromBranch` and `toBranch`
     are both the store's branch and its `window` says how many rows left or entered; the `undo:completed` and
-    `redo:completed` traces are removed in favour of `window:undone` (the one exception to the 899-trace-union
-    entry's unchanged trace names), and the API server broadcasts `window:undone` in place of `branch:switched` for
+    `redo:completed` traces are removed in favour of `window:undone` (the one exception to every trace's name staying unchanged, as Breaking's entry on the trace callback's type says), and the API server broadcasts `window:undone` in place of `branch:switched` for
     them. Both are refused while a turn of the agent's is alive, and for an agent
     whose window isn't presented; a redo also on another branch than its undo's, which the base redo switched back
     to. Moving no branch, an undo or redo reserves nothing and re-initializes no context manager, as a branch move

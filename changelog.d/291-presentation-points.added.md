@@ -18,7 +18,7 @@
   does, rather than compile with them. An own row whose presentation at its write failed still enters ahead of the
   agent's next own row after such a start.
   An agent whose window couldn't be written down at its registration, left in legacy mode, still has each idle
-  reader of its slot presented its own rows as it writes them.
+  reader of its slot presented its own rows as it writes them. The held-draft notice written during an agent's turn is presented at once to an idle agent that observes it, or to the persistent subconscious, and to its own agent at the turn's next point.
   Two residents of one slot whose turns overlap each keep a window that is what their requests carried, so each
   request starts with the one before it and their rounds' signed thinking is sent again. A wake for a row stored where it would have been queued reads
   that row (`WritePlacement.presented` false); a write stored during a turn, the gap before a budget restart's
