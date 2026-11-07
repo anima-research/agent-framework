@@ -1,6 +1,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import { authorLine } from '../author-presentation.js';
 import type { StoredMessage } from '@animalabs/context-manager';
+import { appendAll } from '../append-all.js';
 /**
  * The subconscious's tool surface (issue #77).
  *
@@ -277,7 +278,7 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     const media = message.content.filter((b) => b.type !== 'text');
     if (media.length > 0) {
       flush();
-      content.push(...media);
+      appendAll(content, media);
     }
   }
   flush();

@@ -1189,7 +1189,7 @@ export class DiscordModule implements Module {
       // boundary whose tied millisecond must be preserved.
       const fetchedCompleteHistory = discordMessages.length < scrollback;
       const oldestFetchedTimestamp = discordMessages.length > 0
-        ? Math.min(...discordMessages.map((msg) => msg.timestamp.getTime()))
+        ? discordMessages.reduce((min, msg) => Math.min(min, msg.timestamp.getTime()), Infinity)
         : undefined;
       for (const [externalId, rows] of storedMessageMap) {
         const stored = rows[0]!;

@@ -431,6 +431,39 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
+  // About twice the most a spread can pass as call arguments on Node 24.22.1
+  // (between 124,887 and 125,498 elements).
+  const PAST_A_SPREAD = 250_000;
+  for (const route of ['held while a turn runs', 'queued while the judge decides'] as const) {
+    it(`a quiet period's batch longer than a spread can pass, ${route}, keeps its newest`, async () => {
+      const judge = scriptedJudge();
+      const { gate } = makeGate(writeConfig(`spread-${route.split(' ')[0]}.json`, {
+        policies: [{ name: 'busy', match: {}, behavior: { judge: { debounceMs: 100 } } }],
+      }), { judge: judge.fn });
+      const original = console.error;
+      console.error = () => {};
+      try {
+        const state = () => gate.getStatus().policies[0]!.judgeState!;
+        if (route === 'held while a turn runs') gate.onInferenceStarted('agent');
+        gate.evaluate(chat('first'));
+        if (route === 'queued while the judge decides') await until(() => judge.requests.length === 1, 'the judge to decide the first batch');
+        else await until(() => state().heldCount === 1, 'the first batch to be held');
+        for (let i = 0; i < PAST_A_SPREAD; i++) gate.evaluate(chat(`b${i}`));
+        await until(() => state().pendingCount === 0, 'the flood to end its quiet period');
+        if (route === 'queued while the judge decides') assert.ok(state().judging && judge.requests.length === 1, 'premise: the flood waits for the judge');
+        else assert.strictEqual(state().heldCount, 100, 'premise: the flood is held with the first batch');
+      } finally {
+        console.error = original;
+      }
+      if (route === 'held while a turn runs') gate.onInferenceEnded('agent');
+      else judge.answer({ reply: false, reason: 'not yet' });
+      await until(() => judge.requests.length === (route === 'held while a turn runs' ? 1 : 2), 'the newest events to be judged');
+      assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content),
+        Array.from({ length: 100 }, (_, i) => `b${PAST_A_SPREAD - 100 + i}`));
+      gate.dispose();
+    });
+  }
+
   it('gate_status names a judge that keeps failing', async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('streak.json', JUDGED), { judge: judge.fn });
