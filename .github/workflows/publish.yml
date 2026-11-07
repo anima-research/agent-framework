@@ -40,8 +40,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # --engine-strict, as in ci.yml: a dependency range with no release
+      # that admits the floor fails here, before anything is published.
       - name: Install dependencies
-        run: npm install
+        run: npm install --engine-strict
 
       - name: Build
         run: npm run build
