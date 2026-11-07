@@ -248,6 +248,29 @@ export type TraceEvent =
       budget: number;
     })
   | (TraceEventBase & {
+      /**
+       * A tool boundary past `maxStreamTokens` at which the restart was declined, so the stream goes on: emitted
+       * at each such boundary. `reason` is why: the restart's compile won't fit by context-manager's preview
+       * (`wont_fit`, with the preview's `finalTokens`, `budgetTokens` and `clearedBy`), the preview threw an
+       * `UncoveredDropError` (`uncovered_drop`), or it failed otherwise (`preview_error`, also logged).
+       * `previewed` is false where the boundary took an earlier boundary's `wont_fit` on the same stream, one a
+       * newer message couldn't clear, with none of these changed since: the budget, the compression holds, the
+       * live context settings, the strategy's compression state, the pins and document marks other than the
+       * turn's own, or a stored row edited or removed. It ran no preview, and its figures are that earlier
+       * preview's. Rows added to the store, the stream's own among them, and context-manager's calibration
+       * multiplier aren't in that list, so such a decline isn't previewed again when only those change.
+       */
+      type: 'inference:restart_declined';
+      agentName: string;
+      reason: 'wont_fit' | 'uncovered_drop' | 'preview_error';
+      previewed: boolean;
+      inputTokens: number;
+      maxStreamTokens: number;
+      finalTokens?: number;
+      budgetTokens?: number;
+      clearedBy?: string[];
+    })
+  | (TraceEventBase & {
       type: 'inference:turn_ended';
       agentName: string;
     })
