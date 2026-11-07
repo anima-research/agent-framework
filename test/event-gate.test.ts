@@ -1277,7 +1277,7 @@ describe('a batched wake writes no line for events with a message of their own',
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false]);
     assert.deepStrictEqual(gate.upcomingWakes(['other']).map((w) => w.certain), [true], 'a write placed for another agent drops no wake of this one');
     gate.evaluate(event({ eventType: 'workspace:file-changed', content: 'notes.md changed' }));
-    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [true], 'a quoted event\'s line is written when the batch is delivered, so no answer covers it');
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [true], 'a quoted event\'s line is written when the batch is delivered, so no answer before its delivery covers it');
   });
 
   it('what the judge is told: a write with no stored id drops no wake', () => {
