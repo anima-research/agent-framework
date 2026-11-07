@@ -42,11 +42,12 @@
  *
  * Known limit: compiled messages carry no store provenance, so a stored row
  * is recognised only by structural identity the provider made unique
- * (tool_use ids, thinking signatures, and a provider-native item's own id on
- * its carrier, or a server-tool result's tool_use_id). A reply with none of
- * them — unsigned, tool-free and carrying no such item — gets no row and
- * still merges as before. Without signed thinking
- * that merge carries no provider-rejection risk; it is only a misreading.
+ * (tool_use ids, thinking signatures, a redacted_thinking block's data, and
+ * a provider-native item's own id on its carrier, or a server-tool result's
+ * tool_use_id). A reply with none of them — unsigned, tool-free and
+ * carrying no such item — gets no row and still merges as before. Without
+ * signed thinking that merge carries no provider-rejection risk; it is only
+ * a misreading.
  * Reply text is deliberately never used as identity: identical replies ("all
  * quiet") would collide, and an ordinary reply with the same text could take
  * another reply's row and rewrite cached history. Exact matching for every
