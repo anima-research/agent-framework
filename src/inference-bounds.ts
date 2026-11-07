@@ -72,11 +72,11 @@ export function wholeCallMs(bounds: InferenceBounds, maxTokens: number | undefin
   return setupMs(bounds.progressBounds) + allowanceMs(bounds.progressBounds, maxTokens);
 }
 
-// membrane 0.8.0 marks a deadline it reports as run out with this registered
-// symbol (on a sent request, or the Anthropic SDK's timeout, which covers its
-// connect timeout too) and exports no reader or marker for it. The one reader:
-// the deadline class here and the transient-failure check of an exhausted
-// turn's re-arm both use it.
+// membrane 0.8.0 and 0.9.0 mark a deadline they report as run out with this
+// registered symbol (on a sent request, or the Anthropic SDK's timeout, which
+// covers its connect timeout too) and export no reader or marker for it. The
+// one reader: the deadline class here and the transient-failure check of an
+// exhausted turn's re-arm both use it.
 const DEADLINE_EXPIRY = Symbol.for('membrane.deadlineExpiry');
 
 export function isDeadlineExpiry(error: unknown): boolean {
@@ -85,7 +85,7 @@ export function isDeadlineExpiry(error: unknown): boolean {
 
 /**
  * Names the host setting for the bound a stream cut hit, read from the opening
- * of membrane 0.8.0's message for it (its progress-bounds.ts and
+ * of membrane 0.8.0's and 0.9.0's message for it (their progress-bounds.ts and
  * providers/utils.ts), so the reason an operator and the agent see names the
  * host's setting for that bound, as the README's table maps them. A message it
  * doesn't know is left as it is.
