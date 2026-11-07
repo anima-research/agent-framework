@@ -13,6 +13,8 @@ class FakeService {
   upserts: Item[][] = [];
   searches: Record<string, unknown>[] = [];
   failNext = 0;
+  /** Called with the search's count as each search arrives, before it's answered. */
+  onSearch?: (n: number) => void;
   /** Answer hits without text, as a service that keeps only vectors and ids does. */
   omitText = false;
   server!: Server; url = '';
@@ -42,7 +44,7 @@ class FakeService {
           for (const it of items) { if (this.items.has(it.id) && this.items.get(it.id)!.text === it.text) unchanged++; else inserted++; this.items.set(it.id, it); }
           return json(200, { namespace: 'test/ns', inserted, updated: 0, unchanged, count: this.items.size });
         }
-        const q = JSON.parse(body) as Record<string, unknown>; this.searches.push(q);
+        const q = JSON.parse(body) as Record<string, unknown>; this.searches.push(q); this.onSearch?.(this.searches.length);
         const hits = [...this.items.values()].filter((it) => !q.kinds || (q.kinds as string[]).includes(it.kind))
           .filter((it) => !q.channel || it.channel === q.channel)
           .map((it) => ({ id: it.id, score: it.text.includes(q.query as string) ? 0.9 : 0.1, ts: it.ts ?? null, channel: it.channel ?? null, kind: it.kind, level: it.level ?? null, meta: it.meta ?? {}, ...(this.omitText ? {} : { text: it.text.slice(0, 40), chars: it.text.length }) }))
@@ -268,6 +270,31 @@ describe('HistoryModule semantic_search', () => {
       };
       assert.deepEqual(await hitFor('dinner is at eight', 'msg:m11'), { snippet: '[send_message, error] the dinner is at eight', chars: '[send_message] the dinner is at eight'.length });
       assert.deepEqual(await hitFor('lunch is at noon', 'msg:m14'), { snippet: '[send_message] the lunch is at noon', chars: '[send_message] the lunch is at noon'.length });
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it("a hit checked again after a search that waited shows its send's account as it is then, not a failure since answered otherwise", async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const store = [
+        msg('m31', T0 + 31_000, [{ type: 'text', text: 'dinner plans elsewhere' }], 'chan-A'),
+        msg('m32', T0 + 32_000, [{ type: 'tool_use', id: 'w', name: 'discord--send_message', input: { channelId: 'C1', content: 'dinner plans at eight' } }], 'chan-A'),
+        msg('m33', T0 + 33_000, [{ type: 'tool_result', toolUseId: 'w', toolName: 'discord--send_message', content: 'Missing Access', isError: true }], 'chan-A'),
+      ];
+      const offBranch = new Set<string>();
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+      mod.bind(stubCm(store, [], offBranch));
+      await mod.syncSemanticIndex()!;
+      offBranch.add('m31');
+      svc2.onSearch = (n) => {
+        if (n === 2) store[2] = msg('m33', T0 + 33_000, [{ type: 'tool_result', toolUseId: 'w', toolName: 'discord--send_message', content: 'sent' }], 'chan-A');
+      };
+      const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query: 'dinner plans', kinds: 'messages', limit: 2 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      assert.equal(svc2.searches.length, 2, 'the first answer held one hit on this branch, so it searched again');
+      const hits = (res.data as { hits: Array<{ id: string; snippet: string }> }).hits;
+      assert.deepEqual(hits.map((h) => [h.id, h.snippet]), [['msg:m32', '[send_message] dinner plans at eight']]);
       await mod.stop();
     } finally { await svc2.stop(); }
   });

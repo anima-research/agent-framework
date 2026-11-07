@@ -1532,11 +1532,21 @@ export class HistoryModule implements Module {
   }
 
   private hitSnippet(msg: StoredMessage, text: string, index: number, length: number): string {
+    const content = msg.content as ContentBlock[];
     const failed = this.failedSpeech(msg);
+    const spans = blockSpans(content);
+    for (const { block, at, label } of spans) {
+      if (block.type !== 'tool_use') continue;
+      const said = speechOf(block.name, block.input);
+      const wordsAt = at + label.length - (said?.words.length ?? 0);
+      if (said && index >= wordsAt && index + length <= at + label.length) {
+        return `[${block.name}${failed.has(block.id) ? ERROR_MARK : ''}] ${snippetAround(said.words, index - wordsAt, length)}`;
+      }
+    }
     if (!failed.size) return snippetAround(text, index, length);
-    const marks = errorMarksIn(msg.content as ContentBlock[], failed);
+    const marks = spans.flatMap(({ block, at }) => (block.type === 'tool_use' && failed.has(block.id) ? [at + 1 + block.name.length] : []));
     const moved = (i: number) => i + ERROR_MARK.length * marks.filter((mark) => mark <= i).length;
-    return snippetAround(flattenContent(msg.content as ContentBlock[], failed), moved(index), moved(index + length) - moved(index));
+    return snippetAround(flattenContent(content, failed), moved(index), moved(index + length) - moved(index));
   }
 
   /**
@@ -1758,8 +1768,7 @@ export class HistoryModule implements Module {
     // must not leak a passage the edit removed. Only the ranking can be stale.
     // A summary hit's snippet is rebuilt from the local summary too, so a
     // service that keeps only vectors and ids (no text) still yields one.
-    const currentText = new Map<string, string>();
-    const shownText = new Map<string, string>();
+    const currentText = new Map<string, { text: string; shown: string }>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
       const sum = parseSummaryKey(h.id);
@@ -1768,9 +1777,8 @@ export class HistoryModule implements Module {
         if (!m) return 'offBranch';
         const text = safeSlice(messageIndexText(m, includePrivate), 0, this.semanticCfg!.maxChars ?? 32_000);
         if (!text) return 'stale';
-        currentText.set(h.id, text);
         const failed = this.failedSpeech(m);
-        if (failed.size) shownText.set(h.id, safeSlice(messageIndexText(m, includePrivate, failed), 0, this.semanticCfg!.maxChars ?? 32_000));
+        currentText.set(h.id, { text, shown: failed.size ? safeSlice(messageIndexText(m, includePrivate, failed), 0, this.semanticCfg!.maxChars ?? 32_000) : text });
         return 'ok';
       }
       if (sum !== null) {
@@ -1792,7 +1800,7 @@ export class HistoryModule implements Module {
         // nothing gives one. The hit is dropped rather than show the index's
         // text.
         if (!text) return 'stale';
-        currentText.set(h.id, text);
+        currentText.set(h.id, { text, shown: text });
         return 'ok';
       }
       return 'ok';
@@ -1868,8 +1876,8 @@ export class HistoryModule implements Module {
         channelId: h.channel,
         participant: meta?.participant ?? null,
         author: meta?.author ?? null,
-        snippet: currentText.has(h.id) ? snippetOf(shownText.get(h.id) ?? currentText.get(h.id)!) : (h.text ?? ''),
-        chars: currentText.has(h.id) ? currentText.get(h.id)!.length : h.chars,
+        snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!.shown) : (h.text ?? ''),
+        chars: currentText.has(h.id) ? currentText.get(h.id)!.text.length : h.chars,
       };
     });
     if (unread.length > 0) {
@@ -2509,16 +2517,15 @@ function flattenContent(content: ContentBlock[], failed: ReadonlySet<string> = N
   return content.map((block) => blockLabel(block, failed)).join(' ').trim();
 }
 
-function errorMarksIn(content: ContentBlock[], failed: ReadonlySet<string>): number[] {
+function blockSpans(content: ContentBlock[]): Array<{ block: ContentBlock; at: number; label: string }> {
   const labels = content.map((block) => blockLabel(block));
   const joined = labels.join(' ');
   let at = joined.trimStart().length - joined.length;
-  const marks: number[] = [];
-  content.forEach((block, k) => {
-    if (block.type === 'tool_use' && failed.has(block.id) && speechOf(block.name, block.input)) marks.push(at + 1 + block.name.length);
-    at += labels[k]!.length + 1;
+  return content.map((block, k) => {
+    const span = { block, at, label: labels[k]! };
+    at += span.label.length + 1;
+    return span;
   });
-  return marks;
 }
 
 function blockLabel(block: ContentBlock, failed: ReadonlySet<string> = NO_FAILURES): string {

@@ -612,6 +612,28 @@ describe('HistoryModule', () => {
       ]);
     });
 
+    it("a match deep in a send's words shows the send's label first, marked when its result failed, then the words around the match", async () => {
+      const long = (lead: string) => `${'a'.repeat(100)} ${lead} at the end`;
+      const store: StoredMessage[] = [
+        msg('l1', 1000, 'Glassy', [{ type: 'tool_use', id: 'x', name: 'fixture--send_message', input: { channelId: 'room', text: long('needle') } }], 'c1'),
+        msg('l2', 1001, 'Glassy', [{ type: 'tool_result', toolUseId: 'x', toolName: 'fixture--send_message', content: 'Missing Access', isError: true }], 'c1'),
+        msg('l3', 2000, 'Glassy', [{ type: 'tool_use', id: 'y', name: 'fixture--send_message', input: { channelId: 'room', text: long('pin') } }], 'c1'),
+        msg('l4', 2001, 'Glassy', [{ type: 'tool_result', toolUseId: 'y', toolName: 'fixture--send_message', content: 'sent' }], 'c1'),
+      ];
+      const { cm } = buildStub(store);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const snippets = async (input: Record<string, unknown>) => {
+        const result = await h.handleToolCall(call('search', input));
+        assert.equal(result.success, true, result.error);
+        return (result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]);
+      };
+      const cut = `…${'a'.repeat(79)}`;
+      assert.deepEqual(await snippets({ query: 'needle at the end' }), [['l1', `[fixture--send_message, error] ${cut} needle at the end`]]);
+      assert.deepEqual(await snippets({ query: 'needle a[t]', regex: true }), [['l1', `[fixture--send_message, error] ${cut} needle at the end`]]);
+      assert.deepEqual(await snippets({ query: 'pin at the end' }), [['l3', `[fixture--send_message] ${'…'}${'a'.repeat(79)} pin at the end`]]);
+    });
+
     it("reads a send's result across its own body's shards and the results after it, and stops at a message of any other kind", async () => {
       const shard = (m: StoredMessage, group: string, index: number): StoredMessage => ({ ...m, bodyGroupId: group, shardIndex: index, shardCount: 2 }) as StoredMessage;
       const store: StoredMessage[] = [
