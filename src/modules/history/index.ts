@@ -49,8 +49,9 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
+import { ERROR_MARK, EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
+import { speechOf } from '../../send-tools.js';
 import { safeSlice } from '../../safe-slice.js';
 
 // ============================================================================
@@ -695,7 +696,9 @@ export class HistoryModule implements Module {
         description:
           'Fetch raw, uncompressed messages for a time range and/or channel, paginated oldest-first. ' +
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
-          'readable string (tool_use/tool_result/thinking/images rendered as bracketed labels); ' +
+          'readable string (a call of a tool the framework names for sending, editing or saying a message, such as ' +
+          'send_message, as its name and its words when it carries words, such as "[telegram--send_message] …", its name ending ", error" when its result, stored after it, is flagged as an error; ' +
+          'other tool_use/tool_result/thinking/images as bracketed labels, a tool_result flagged as an error ending ", error"); ' +
           'format:"raw" returns the content blocks unmodified. ' +
           'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
           'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
@@ -1157,7 +1160,7 @@ export class HistoryModule implements Module {
                 };
               })()
             : {}),
-          messages: page.map((msg) => projectMessage(msg, format)),
+          messages: page.map((msg) => projectMessage(msg, format, (m) => this.failedSpeech(m))),
         },
       };
     }
@@ -1181,7 +1184,7 @@ export class HistoryModule implements Module {
         ...(channelId !== undefined ? { matchedCount: result.matchedCount } : {}),
         returned: page.length,
         hasMore: result.messages.length > limit,
-        messages: page.map((msg) => projectMessage(msg, format)),
+        messages: page.map((msg) => projectMessage(msg, format, (m) => this.failedSpeech(m))),
       },
     };
   }
@@ -1283,7 +1286,7 @@ export class HistoryModule implements Module {
         channelId: channelId ?? null,
         returned: window.length,
         messages: window.map((m) => ({
-          ...projectMessage(m, format),
+          ...projectMessage(m, format, (n) => this.failedSpeech(n)),
           ...(String(m.id) === anchorId ? { anchor: true } : {}),
         })),
       },
@@ -1485,7 +1488,7 @@ export class HistoryModule implements Module {
         participant: msg.participant,
         author: authorName(msg),
         channelId: getChannelId(msg) ?? null,
-        snippet: snippetAround(text, hit.index, hit.length),
+        snippet: this.hitSnippet(msg, text, hit.index, hit.length),
       });
     }
 
@@ -1493,6 +1496,57 @@ export class HistoryModule implements Module {
       success: true,
       data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches },
     };
+  }
+
+  private failedSpeech(msg: StoredMessage): ReadonlySet<string> {
+    const pending = new Set<string>();
+    for (const block of msg.content as ContentBlock[]) if (block.type === 'tool_use' && speechOf(block.name, block.input)) pending.add(block.id);
+    if (!pending.size) return NO_FAILURES;
+    const cm = this.cm as ContextManager;
+    const fromMs = msg.timestamp.getTime();
+    const failed = new Set<string>();
+    const answer = (blocks: ContentBlock[]) => {
+      for (const block of blocks) {
+        if (block.type === 'tool_result' && pending.delete(block.toolUseId) && block.isError) failed.add(block.toolUseId);
+      }
+    };
+    answer(msg.content as ContentBlock[]);
+    let past = false;
+    let body = msg.bodyGroupId;
+    for (let offset = 0; pending.size > 0; offset++) {
+      const later = cm.queryMessagesByTime({ fromMs, limit: 1, offset }).messages[0];
+      if (!later) break;
+      if (!past) {
+        if (later.timestamp.getTime() > fromMs) break;
+        past = String(later.id) === String(msg.id);
+        continue;
+      }
+      const blocks = later.content as ContentBlock[];
+      if (later.bodyGroupId === undefined || later.bodyGroupId !== body) {
+        if (blocks.some((block) => block.type === 'tool_use') || !blocks.some((block) => block.type === 'tool_result')) break;
+        body = later.bodyGroupId;
+      }
+      answer(blocks);
+    }
+    return failed;
+  }
+
+  private hitSnippet(msg: StoredMessage, text: string, index: number, length: number): string {
+    const content = msg.content as ContentBlock[];
+    const failed = this.failedSpeech(msg);
+    const spans = blockSpans(content);
+    for (const { block, at, label } of spans) {
+      if (block.type !== 'tool_use') continue;
+      const said = speechOf(block.name, block.input);
+      const wordsAt = at + label.length - (said?.words.length ?? 0);
+      if (said && index >= wordsAt && index < at + label.length && index + length <= at + label.length) {
+        return `[${block.name}${failed.has(block.id) ? ERROR_MARK : ''}] ${snippetAround(said.words, index - wordsAt, length)}`;
+      }
+    }
+    if (!failed.size) return snippetAround(text, index, length);
+    const marks = spans.flatMap(({ block, at }) => (block.type === 'tool_use' && failed.has(block.id) ? [at + 1 + block.name.length] : []));
+    const moved = (i: number) => i + ERROR_MARK.length * marks.filter((mark) => mark <= i).length;
+    return snippetAround(flattenContent(content, failed), moved(index), moved(index + length) - moved(index));
   }
 
   /**
@@ -1563,7 +1617,7 @@ export class HistoryModule implements Module {
           participant: msg.participant,
           author: authorName(msg),
           channelId: getChannelId(msg) ?? null,
-          snippet: snippetAround(text, matchIndex, matchLength),
+          snippet: this.hitSnippet(msg, text, matchIndex, matchLength),
         };
       });
       return { matches, scanned };
@@ -1714,7 +1768,7 @@ export class HistoryModule implements Module {
     // must not leak a passage the edit removed. Only the ranking can be stale.
     // A summary hit's snippet is rebuilt from the local summary too, so a
     // service that keeps only vectors and ids (no text) still yields one.
-    const currentText = new Map<string, string>();
+    const currentText = new Map<string, { text: string; shown: string }>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
       const sum = parseSummaryKey(h.id);
@@ -1723,7 +1777,8 @@ export class HistoryModule implements Module {
         if (!m) return 'offBranch';
         const text = safeSlice(messageIndexText(m, includePrivate), 0, this.semanticCfg!.maxChars ?? 32_000);
         if (!text) return 'stale';
-        currentText.set(h.id, text);
+        const failed = this.failedSpeech(m);
+        currentText.set(h.id, { text, shown: failed.size ? safeSlice(messageIndexText(m, includePrivate, failed), 0, this.semanticCfg!.maxChars ?? 32_000) : text });
         return 'ok';
       }
       if (sum !== null) {
@@ -1745,7 +1800,7 @@ export class HistoryModule implements Module {
         // nothing gives one. The hit is dropped rather than show the index's
         // text.
         if (!text) return 'stale';
-        currentText.set(h.id, text);
+        currentText.set(h.id, { text, shown: text });
         return 'ok';
       }
       return 'ok';
@@ -1821,8 +1876,8 @@ export class HistoryModule implements Module {
         channelId: h.channel,
         participant: meta?.participant ?? null,
         author: meta?.author ?? null,
-        snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!) : (h.text ?? ''),
-        chars: currentText.has(h.id) ? currentText.get(h.id)!.length : h.chars,
+        snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!.shown) : (h.text ?? ''),
+        chars: currentText.has(h.id) ? currentText.get(h.id)!.text.length : h.chars,
       };
     });
     if (unread.length > 0) {
@@ -2440,33 +2495,51 @@ function mergeForeignIntoGap(
   }
 }
 
-function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<string, unknown> {
+function projectMessage(msg: StoredMessage, format: 'text' | 'raw', failedOf: (msg: StoredMessage) => ReadonlySet<string>): Record<string, unknown> {
   return {
     id: String(msg.id),
     timestamp: msg.timestamp.toISOString(),
     participant: msg.participant,
     author: authorName(msg),
     channelId: getChannelId(msg) ?? null,
-    content: format === 'raw' ? msg.content : flattenContent(msg.content),
+    content: format === 'raw' ? msg.content : flattenContent(msg.content, failedOf(msg)),
   };
 }
 
+const NO_FAILURES: ReadonlySet<string> = new Set();
+
 /** Flatten a message's content blocks to one short, readable string. Text
- *  blocks verbatim; everything else (tool_use/tool_result/thinking/media) as
- *  a short bracketed label — this is for agent readability and search
- *  matching, not byte-faithful reconstruction. */
-function flattenContent(content: ContentBlock[]): string {
-  return content.map(blockLabel).join(' ').trim();
+ *  blocks verbatim; a speech tool's call (send-tools.ts) as its name and
+ *  words; everything else (tool_use/tool_result/thinking/media) as a short
+ *  bracketed label — this is for agent readability and search matching, not
+ *  byte-faithful reconstruction. */
+function flattenContent(content: ContentBlock[], failed: ReadonlySet<string> = NO_FAILURES): string {
+  return content.map((block) => blockLabel(block, failed)).join(' ').trim();
 }
 
-function blockLabel(block: ContentBlock): string {
+function blockSpans(content: ContentBlock[]): Array<{ block: ContentBlock; at: number; label: string }> {
+  const labels = content.map((block) => blockLabel(block));
+  const joined = labels.join(' ');
+  let at = joined.trimStart().length - joined.length;
+  return content.map((block, k) => {
+    const span = { block, at, label: labels[k]! };
+    at += span.label.length + 1;
+    return span;
+  });
+}
+
+function blockLabel(block: ContentBlock, failed: ReadonlySet<string> = NO_FAILURES): string {
   switch (block.type) {
     case 'text':
       return block.text;
-    case 'tool_use':
-      return `[tool_use: ${block.name}]`;
-    case 'tool_result':
-      return block.toolName ? `[tool_result: ${block.toolName}]` : '[tool_result]';
+    case 'tool_use': {
+      const said = speechOf(block.name, block.input);
+      return said ? `[${block.name}${failed.has(block.id) ? ERROR_MARK : ''}] ${said.words}` : `[tool_use: ${block.name}]`;
+    }
+    case 'tool_result': {
+      const mark = block.isError ? ERROR_MARK : '';
+      return block.toolName ? `[tool_result: ${block.toolName}${mark}]` : `[tool_result${mark}]`;
+    }
     case 'thinking':
     case 'redacted_thinking':
       return '[thinking]';
