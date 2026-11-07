@@ -61,6 +61,13 @@ function stored(framework: AgentFramework): Array<{ text: string; metadata: Reco
 const storedText = (framework: AgentFramework): string => stored(framework).map((m) => m.text).join('\n');
 const noteCount = (text: string): number => text.split('[budget-hold]').length - 1;
 const turnCalls = (membrane: MockMembrane): NormalizedRequest[] => (membrane.calls as NormalizedRequest[]).filter((c) => c.messages.length > 0);
+const presented = (framework: AgentFramework): Array<{ content?: Array<{ type: string; text?: string }> }> =>
+  (framework.getAgent('prime')!.getContextManager() as unknown as { getPresentedMessages(): Array<{ content?: Array<{ type: string; text?: string }> }> })
+    .getPresentedMessages();
+const windowText = (framework: AgentFramework): string =>
+  presented(framework).map((m) => (m.content ?? []).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')).join('\n');
+const windowToolBlocks = (framework: AgentFramework): number =>
+  presented(framework).flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
 const toolBlocks = (framework: AgentFramework): number => {
   const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content?: Array<{ type: string }> }>;
   return msgs.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
@@ -2372,7 +2379,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('refuses an undo while a turn is held, naming the hold', async () => {
+  it('refuses an undo while a turn is held, as a turn alive', async () => {
     await withBacklog({ fit: true }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       try {
@@ -2383,7 +2390,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
         assert.throws(() => t.framework.undoLastTurn('prime'), (e: Error) => {
           assert.equal((e as Error & { code?: string }).code, 'agent-busy');
-          assert.match(e.message, /Cannot undo while prime is idle\+turn-alive \(a budget hold/);
+          assert.match(e.message, /Cannot undo: a turn of prime's is alive/);
           return true;
         });
         assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 2, 'the earlier turn and the held one are there to undo once it ends');
@@ -2407,9 +2414,10 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(storedText(t.framework).includes('Answered once it fit'));
         assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the refused start left no undo step of its own');
         assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        const text = storedText(t.framework);
-        assert.ok(!text.includes('Answered once it fit'), 'the undo takes the reply');
-        assert.ok(text.includes('First message') && text.includes('Second message, while held'), 'and keeps both inputs');
+        const text = windowText(t.framework);
+        assert.ok(!text.includes('Answered once it fit'), 'the undo takes the reply out of the window');
+        assert.ok(text.includes('First message') && text.includes('Second message, while held'),
+          'and leaves both inputs in it: the released start recorded the checkpoint again after presenting them');
       } finally {
         await t.close();
       }
@@ -2429,9 +2437,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(storedText(t.framework).includes('Answered once it fit'));
         assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
         assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        const text = storedText(t.framework);
-        assert.ok(text.includes('First message') && !text.includes('Answered once it fit'), 'which takes the reply and leaves the input');
-        assert.ok(!text.includes('Second message, while held'), 'and takes the message that arrived while the retry waited');
+        const text = windowText(t.framework);
+        assert.ok(!text.includes('Answered once it fit'), 'which takes the reply out of the window');
+        assert.ok(text.includes('First message'), 'and leaves the input its first start presented before its checkpoint');
       } finally {
         await t.close();
       }
@@ -2464,16 +2472,15 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     try {
       assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the retry after the failed stream is refused and held');
       assert.ok(toolBlocks(t.framework) >= 2, 'the turn\'s tool round is in its history');
-      t.framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'Added while held' }]);
       t.fit();
       assert.ok(await turnOver(t));
       assert.ok(storedText(t.framework).includes('Answered once it fit'));
       assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
       assert.equal(t.framework.undoLastTurn('prime').undone, true);
-      assert.equal(toolBlocks(t.framework), 0, 'the undo takes the rounds the turn ran before its hold');
-      const text = storedText(t.framework);
-      assert.ok(text.includes('fetch it') && !text.includes('Answered once it fit') && !text.includes('Added while held'),
-        'and the reply and what arrived while the retry waited');
+      assert.equal(windowToolBlocks(t.framework), 0, 'the undo takes the rounds the turn ran before its hold out of the window');
+      const text = windowText(t.framework);
+      assert.ok(!text.includes('Answered once it fit'), 'and the reply');
+      assert.ok(text.includes('fetch it'), 'and leaves the input its first start presented before its checkpoint');
     } finally {
       await t.close();
     }
@@ -2489,7 +2496,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       assert.ok(storedText(t.framework).includes('Answered once it fit'));
       assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the turn\'s first start recorded its one undo step, and the hold gave none of it back');
       assert.equal(t.framework.undoLastTurn('prime').undone, true);
-      assert.equal(toolBlocks(t.framework), 0, 'the undo takes the tool round the guard\'s retry followed');
+      assert.equal(windowToolBlocks(t.framework), 0, 'the undo takes the tool round the guard\'s retry followed out of the window');
     } finally {
       await t.close();
     }
@@ -3747,9 +3754,11 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     const traces: TraceEvent[] = [];
     framework.onTrace((e) => traces.push(e));
     const cm = framework.getAgent('prime')!.getContextManager();
+    const seeded: string[] = [];
     for (let i = 0; i < (given ? 0 : 16); i++) {
-      cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]);
+      seeded.push(cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]));
     }
+    (cm as unknown as { presentRows(ids: string[]): void }).presentRows(seeded);
     const budget = (maxTokens: number) => ({ maxTokens, reserveForResponse: 1_000 });
     return {
       framework,
@@ -3794,7 +3803,9 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     const inputs: string[] = [];
     for (let i = 0; i < 8; i++) inputs.push(cm.addMessage('User', [{ type: 'text', text: `Input ${i}. ` + 'word '.repeat(80) }]));
     strategy.seedL1('The user gave eight inputs.', inputs);
-    for (let i = 0; i < 10; i++) cm.addMessage('prime', [{ type: 'text', text: `Round ${i}. ` + 'step '.repeat(30) }]);
+    const rounds: string[] = [];
+    for (let i = 0; i < 10; i++) rounds.push(cm.addMessage('prime', [{ type: 'text', text: `Round ${i}. ` + 'step '.repeat(30) }]));
+    (cm as unknown as { presentRows(ids: string[]): void }).presentRows([...inputs, ...rounds]);
     const pinId = kind === 'pin' ? cm.pinRange(inputs[0]!, inputs[inputs.length - 1]!, { name: 'zz-inputs' }) : cm.markDocument(inputs[3]!, { name: 'zz-brief' });
     const fits = (maxTokens: number, excludePins?: string[]) => (cm as unknown as {
       previewContext: (b: object, o?: undefined, opts?: object) => { fits: boolean } | null;
@@ -3811,7 +3822,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     return { t, cm, pinId, pinned: lowest(), free: lowest([pinId]) };
   }
 
-  it("keeps compressionChangedAt where compression left it while traffic adds chunks, and moves it when compression makes a summary", async () => {
+  it("keeps compressionChangedAt where compression left it while traffic is written, which no held window is presented, and moves it when compression makes a summary", async () => {
     class SeededStrategy extends AutobiographicalStrategy {
       seedL1(content: string, sourceIds: string[]): void {
         this.pushSummary({
@@ -3830,21 +3841,25 @@ describe('the release check takes context-manager\'s verdict on the real strateg
       for (let i = 0; i < 16; i++) {
         ids.push(cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]));
       }
+      (cm as unknown as { presentRows(ids: string[]): void }).presentRows(ids);
       t.setBudget(3_000);
       t.framework.start();
       t.wake();
       assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'held, with compression pending');
       await new Promise((resolve) => setTimeout(resolve, 200));
       const before = strategy.getProgressSnapshot();
-      const looks = t.previews();
+      const write = (text: string): string => (t.framework as unknown as {
+        addMessage(participant: string, content: Array<{ type: 'text'; text: string }>): string;
+      }).addMessage('User', [{ type: 'text', text }]);
+      const traffic: string[] = [];
       for (let round = 0; round < 3; round++) {
-        for (let i = 0; i < 6; i++) t.addMessage(`zz traffic ${round}.${i} ` + 'lorem ipsum dolor sit amet '.repeat(60));
+        for (let i = 0; i < 6; i++) traffic.push(write(`zz traffic ${round}.${i} ` + 'lorem ipsum dolor sit amet '.repeat(60)));
         await new Promise((resolve) => setTimeout(resolve, 150));
       }
       const after = strategy.getProgressSnapshot();
-      assert.ok(after.totalChunks > before.totalChunks, `premise: traffic added chunks (${before.totalChunks} to ${after.totalChunks})`);
-      assert.equal(after.chunksCompressed, before.chunksCompressed, 'premise: and nothing compressed them');
-      assert.ok(t.previews() > looks, 'premise: the hold looked again for the traffic');
+      assert.deepEqual([...new Set(traffic.map((id) => cm.windowStatusOf(id as never)))], ['out'], 'the traffic is stored, and not presented to the held window');
+      assert.equal(after.totalChunks, before.totalChunks, 'so it adds no chunk there');
+      assert.equal(after.chunksCompressed, before.chunksCompressed, 'premise: and nothing compressed anything');
       assert.equal(hold()!.compressionChangedAt, hold()!.since, 'traffic moves nothing compression did');
       const changed = Date.now();
       strategy.seedL1('zz a summary compression made', ids.slice(0, 2));
