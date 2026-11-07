@@ -22282,13 +22282,14 @@ export class AgentFramework {
         continue;
       }
 
-      // A wake whose sole cause was a stored row (readsRow): one not
-      // presented to this agent at its write, stored during its turn, or one
-      // stored for it as it arrived, has nothing left to do once a request
-      // that carried that row was answered and, if the wake carries a
-      // channel and isn't marked ambient, the agent has published there
-      // since, or once the row is gone from the store's current branch: it
-      // starts no turn (rowDone). A wake is marked ambient when its
+      // A wake whose sole cause was a stored row (readsRow), or a batch's
+      // rows (readsRows, every one of them): one not presented to this agent
+      // at its write, stored during its turn, or one stored for it as it
+      // arrived, has nothing left to do once a request that carried that row
+      // was answered and, if the wake carries a channel and isn't marked
+      // ambient (for readsRows, if the row's replyTo names one), the agent
+      // has published there since, or once the row is gone from the store's
+      // current branch: it starts no turn (rowDone). A wake is marked ambient when its
       // message's server tagged it chat:ambient, or for a render, every
       // notice the render stands for: such a message asked nothing of the
       // agent, so reading it was all its wake was for, as for a chat:system

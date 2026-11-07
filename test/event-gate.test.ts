@@ -30,7 +30,6 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: {
   initialConfig?: GateConfig;
   resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
-  channelShown?: (channel: { serverId: string; channelId: string }) => string;
   privilegedUsersPath?: string;
   isAnswered?: (after: WritePlacement) => boolean;
   agentNames?: string[];
@@ -43,7 +42,6 @@ function makeGate(configPath: string, opts?: {
     configPath,
     initialConfig: opts?.initialConfig,
     ...(opts?.resolveRouteChannel ? { resolveRouteChannel: opts.resolveRouteChannel } : {}),
-    ...(opts?.channelShown ? { channelShown: opts.channelShown } : {}),
     ...(opts?.privilegedUsersPath ? { privilegedUsersPath: opts.privilegedUsersPath } : {}),
     ...(opts?.isAnswered ? { isAnswered: opts.isAnswered } : {}),
     emitTrace: (e) => traces.push(e as TraceEntry),

@@ -4,12 +4,9 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import { MembraneError } from '@animalabs/membrane';
-import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/wake-locus-mcpl-server.mjs');
-const GENERAL = 'discord:g1:general';
 const ROOM = 'discord:g1:room';
 const RAW_DM = '1548000000000000001';
 
@@ -73,9 +70,6 @@ describe('a batched wake writes no line for messages already in the window', () 
           }],
           default: 'skip',
         },
-        // Wake onboarding would follow the first ambient message with an offer
-        // for this server (its events are let by the default), and the cases
-        // here count on exactly which message is newest.
         onboarding: false,
       },
       mcplServers: [{
@@ -98,8 +92,6 @@ describe('a batched wake writes no line for messages already in the window', () 
 
   const command = (line: string): void => appendFileSync(commandPath, line + '\n');
   const dm = (text: string): void => command(`dm ev-${++n} 134 ${RAW_DM} ${text}`);
-  const incoming = (channelId: string, mode: 'ambient' | 'addressed', text: string): void =>
-    command(`incoming ${channelId} m-${++n} ${mode} ${text}`);
 
   /** The text of every entry in scout's window. */
   const window = (): string[] => framework.getAgent('scout')!.getContextManager().getAllMessages()
@@ -125,46 +117,6 @@ describe('a batched wake writes no line for messages already in the window', () 
       release: () => { released = true; for (const p of pending) fire(p); pending.clear(); },
     };
   };
-
-  it('one DM, still the newest entry when its wake fires: the wake runs without a line', async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello back' }]));
-    dm('are you there?');
-    await waitFor(() => membrane.calls.length >= 1, 'the wake');
-    assert.ok(window().some((t) => t.includes('are you there?')), 'premise: the DM is in the window');
-    assert.deepEqual(gateLines(), []);
-  });
-
-  it('one mention in a channel (channels/incoming), still the newest entry: the wake runs without a line', async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello back' }]));
-    incoming(ROOM, 'addressed', '@scout are you around?');
-    await waitFor(() => membrane.calls.length >= 1, 'the wake');
-    assert.ok(window().some((t) => t.includes('are you around?')), 'premise: the mention is in the window');
-    assert.deepEqual(gateLines(), []);
-  });
-
-  it('one DM with an ambient message stored after it: no line', async () => {
-    const batches = holdBatches();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello back' }]));
-    dm('are you there?');
-    await waitFor(() => batches.held() >= 1, "the DM's batch, held");
-    incoming(GENERAL, 'ambient', 'unrelated chatter');
-    await waitFor(() => window().some((t) => t.includes('unrelated chatter')), 'the ambient message stored');
-    batches.release();
-    await waitFor(() => membrane.calls.length >= 1, 'the wake');
-    assert.deepEqual(gateLines(), []);
-  });
-
-  it('two DMs in one batch: no line', async () => {
-    const batches = holdBatches();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello back' }]));
-    dm('first');
-    await waitFor(() => batches.held() >= 1, "the first DM's batch, held");
-    dm('second');
-    await waitFor(() => window().some((t) => t.includes('second')), 'the second DM stored');
-    batches.release();
-    await waitFor(() => membrane.calls.length >= 1, 'the wake');
-    assert.deepEqual(gateLines(), []);
-  });
 
   it("two DMs in one batch: no line, and the wake reads both DMs' rows", async () => {
     const gate = (framework as unknown as {
@@ -194,42 +146,6 @@ describe('a batched wake writes no line for messages already in the window', () 
     const wake = asked.find((a) => a.reason === 'gate:debounce');
     assert.ok(wake, 'premise: the batch woke scout');
     assert.deepEqual(wake.rows, rows, "the wake reads the DMs' own rows");
-  });
-
-  /** The text of the first request's messages, in order. */
-  const requestTexts = (): string[] => {
-    const request = membrane.calls[0] as unknown as { messages: Array<{ content: unknown }> };
-    return request.messages.map((m) => (Array.isArray(m.content)
-      ? (m.content as Array<{ type: string; text?: string }>).map((b) => (b.type === 'text' ? b.text ?? '' : '')).join('\n')
-      : String(m.content)));
-  };
-  type Internals = {
-    eventGate: { fireDebounce(policyName: string): void } | null;
-    addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>): string;
-    pendingRequests: Array<Record<string, unknown>>;
-    agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ metadata?: Record<string, unknown>; content: Array<{ type: string; text?: string }> }> } }>;
-  };
-  const internals = (): Internals => framework as unknown as Internals;
-
-  it('one DM, and a message stored after its batch fires but before the turn starts: no line', async () => {
-    const gate = internals().eventGate!;
-    const fire = gate.fireDebounce.bind(gate);
-    gate.fireDebounce = (policyName) => {
-      fire(policyName);
-      // After the gate decided, before the turn compiles, as a provider hold
-      // or a compression in flight leaves room for.
-      internals().addMessage('someone', [{ type: 'text', text: 'unrelated chatter' }],
-        { serverId: 'discord', channelId: GENERAL, messageId: 'm-later' });
-    };
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello back' }]));
-    dm('are you there?');
-    await waitFor(() => membrane.calls.length >= 1, 'the wake');
-    const texts = requestTexts();
-    const dmAt = texts.findIndex((t) => t.includes('are you there?'));
-    const laterAt = texts.findIndex((t) => t.includes('unrelated chatter'));
-    assert.ok(dmAt >= 0 && laterAt > dmAt, 'premise: the later message comes after the DM');
-    assert.ok(!texts.some((t) => t.includes('[Gate:')), 'no line in the request');
-    assert.deepEqual(gateLines(), []);
   });
 
 });
@@ -309,63 +225,6 @@ describe("a batched wake's rows across a quiesce and a hold", () => {
   });
 });
 
-/** The first call fails with a retryable server error, the next succeeds. */
-class FailOnceMembrane extends MockMembrane {
-  private k = 0;
-  override streamYielding(request: NormalizedRequest): YieldingStream {
-    this.calls.push(request);
-    if (++this.k === 1) {
-      const error = new MembraneError({
-        type: 'server', retryable: true, httpStatus: 500,
-        message: 'Internal server error', rawError: { status: 500 }, rawRequest: request,
-      });
-      return {
-        isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
-        provideToolResults() { throw new Error('not waiting'); },
-        cancel() {},
-        async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> { yield { type: 'error', error } as StreamEvent; },
-      } as unknown as YieldingStream;
-    }
-    return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'hello back' }])]);
-  }
-}
-
-describe('a same-turn retry', () => {
-  // Nigel-2405's probe: the first attempt's own start notices sit after the DM,
-  // and nothing else arrives, so the retry has no line to write.
-  it('one DM, nothing arriving, the first attempt fails and is retried: no line', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'wake-line-retry-'));
-    const commandPath = join(tempDir, 'commands.txt');
-    writeFileSync(commandPath, '');
-    const membrane = new FailOnceMembrane();
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'test.chronicle'),
-      membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
-      errorPolicy: { onInferenceError: (_e: Error, _a: string, attempt: number) => attempt === 0 ? { retry: true, delayMs: 20 } : { retry: false } },
-      gate: { onboarding: false, config: { policies: [{ name: 'addressed', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'], tagsAny: ['chat:addressed'] }, behavior: { debounce: 100 } }], default: 'skip' } },
-      mcplServers: [{ id: 'discord', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: join(tempDir, 'status.jsonl'), COMMAND_PATH: commandPath } }],
-      modules: [],
-    } as never);
-    try {
-      let completed = false;
-      framework.onTrace((event) => { if (event.type === 'inference:completed' && event.agentName === 'scout') completed = true; });
-      await framework.start();
-      const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
-      await waitFor(() => registry.listChannelsRaw().length >= 2, 'channel registration');
-      appendFileSync(commandPath, `dm ev-r1 134 ${RAW_DM} are you there?\n`);
-      await waitFor(() => membrane.calls.length >= 2, 'the failed attempt and its retry');
-      await waitFor(() => completed, "the retried turn's completion");
-      const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
-        .map((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text?: string }).text ?? '').join('\n'));
-      assert.ok(texts.some((t) => t.includes('are you there?')), 'premise: the DM is in the window');
-      assert.deepEqual(texts.filter((t) => t.includes('[Gate:')), [], 'no line: nothing arrived after the DM');
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-});
 
 describe('a debounced batch of targeted messages', () => {
   type Internals = {

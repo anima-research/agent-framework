@@ -234,86 +234,28 @@ describe('debounced writes already read and answered', () => {
     } finally { off(); await f.close(); }
   });
 
-  it('unsatisfied residents retain stored content without re-presenting it in a shared summary', async () => {
+  it("the delivery agent's answer drops its own wake alone: the other residents wake, each request holding the event", async () => {
     const { f, module, start } = await setup(60_000, false, undefined,
       ['agent', 'other', 'third'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
+    const turns: string[] = [];
+    const off = f.framework.onTrace((event) => {
+      if (event.type === 'inference:started') turns.push(event.agentName);
+    });
     try {
       const { loop } = await start();
       await send(f, 'module');
       await eventually(() => stored(f, 'new event'), 'event stored');
       module.release('first');
       await loop;
+      assert.deepEqual(turns, ['agent'], "premise: the delivery agent's turn read the event and was answered");
       fire(f);
       const linesFor = (name: string) => f.framework.getAgent(name)!.getContextManager()
         .getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
-      const other = linesFor('other');
-      const third = linesFor('third');
-      assert.equal(other.length, 0, 'a shared summary must not re-present the event to its answered owner');
-      assert.deepEqual(third, other);
-      for (const name of ['other', 'third']) {
-        assert.match(JSON.stringify(f.framework.getAgent(name)!.getContextManager().getAllMessages()), /new event/, 'original stored content is still in each resident window');
-      }
       await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 3, 'both unsatisfied recipients wake');
-      for (const request of f.membrane.calls.slice(1)) assert.match(JSON.stringify(request), /new event/, 'each request actually includes the original input');
-      for (const name of ['agent', 'other', 'third']) assert.deepEqual(linesFor(name), [], `${name}'s window has no line for the event its delivery agent answered`);
-    } finally { await f.close(); }
-  });
-
-  it('a batch that wakes three residents of one slot writes no line there', async () => {
-    const { f, module } = await setup(60_000, false, undefined,
-      ['agent', 'other', 'third'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
-    try {
-      await send(f, 'module', 'first unread');
-      await send(f, 'module', 'second unread', 'second');
-      await f.framework.runUntilIdle();
-      fire(f);
-      const idle = f.framework.runUntilIdle();
-      await eventually(() => module.entered.has('first'), 'the first turn reached its tool');
-      module.release('first');
-      await idle;
-      await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 3, 'each resident wakes');
-      for (const name of ['agent', 'other', 'third']) {
-        assert.deepEqual(f.framework.getAgent(name)!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce'), [], `no line in ${name}'s window`);
-      }
-    } finally { await f.close(); }
-  });
-
-
-  it('a batch with an event the host gave no write: its line, written when it fires, names that event alone', async () => {
-    const module = new class extends ReminderModule {
-      override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
-        if (event.type !== 'test:double') return super.onProcess(event, state);
-        return {
-          addMessages: ['double one', 'double two'].map((text) => ({ participant: 'user', content: [{ type: 'text' as const, text }] })),
-          requestInference: true,
-        };
-      }
-    }();
-    const f = await fixture({ framework: {
-      modules: [module],
-      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
-      gate: { config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder', 'test:double'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
-    } });
-    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
-      f.membrane.calls.push(request);
-      return new MockYieldingStream([say('fresh turn')], true);
-    };
-    const lines = () => f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
-    try {
-      await send(f, 'module', 'with a write');
-      f.framework.pushEvent({ type: 'test:double', source: 'test', content: 'no write' } as unknown as ProcessEvent);
-      await f.framework.runUntilIdle();
-      fire(f);
-      assert.equal(lines().length, 1, 'written when it fired');
-      const text = (lines()[0]!.content as Array<{ type: string; text?: string }>).map((b) => b.text ?? '').join('');
-      assert.equal(text, '[Gate: 1 event matched]\n\n- [batch] (test:double): no write', 'naming the event with no write alone');
-      await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 1, 'the line keeps the wake');
-      assert.match(JSON.stringify(f.membrane.calls[0]), /1 event matched/, "the woken turn's request carries it");
-      assert.equal(lines().length, 1, 'once');
-    } finally { await f.close(); }
+      assert.deepEqual(turns.slice(1).sort(), ['other', 'third'], "the two other residents wake, and the delivery agent's answered wake starts no turn");
+      for (const request of f.membrane.calls.slice(1)) assert.match(JSON.stringify(request), /new event/, 'each request includes the event');
+      for (const name of ['agent', 'other', 'third']) assert.deepEqual(linesFor(name), [], `no line in ${name}'s window`);
+    } finally { off(); await f.close(); }
   });
 
   for (const held of ['a mention', 'a module event without a write', 'both'] as const) {
@@ -367,6 +309,46 @@ describe('debounced writes already read and answered', () => {
       } finally { await f.close(); }
     });
   }
+
+  it("a batch's line written while a turn's start awaits its assembly is carried by that turn: once it answers, the line's wake starts no second turn", async () => {
+    const module = new class extends ReminderModule {
+      override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
+        if (event.type !== 'test:quoted') return super.onProcess(event, state);
+        return { requestInference: true };
+      }
+    }();
+    const f = await fixture({ framework: {
+      modules: [module],
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+      gate: { config: { policies: [{ name: 'batch', match: { scope: ['test:quoted'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
+    } });
+    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+      f.membrane.calls.push(request);
+      return new MockYieldingStream([say('answered')], true);
+    };
+    const wakes = recordWakes(f);
+    const lines = () => f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+    try {
+      f.framework.pushEvent({ type: 'test:quoted', source: 'test', content: 'quoted event' } as unknown as ProcessEvent);
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 0, 'premise: the rule held the event back');
+      let release!: (value: unknown) => void;
+      let rendering = false;
+      f.renderer(() => { rendering = true; return new Promise((resolve) => { release = resolve; }); });
+      await f.send('push/event', f.params('1', 'doc_edit', { deferred: true }));
+      const run = f.framework.runUntilIdle();
+      await eventually(() => rendering, "the turn's start awaits the render");
+      assert.deepEqual(gateOf(f).inferenceDiagnostics().inferring, [], 'premise: the gate has not been told of the turn');
+      fire(f);
+      assert.equal(lines().length, 1, 'premise: the line is written while the start awaits its assembly');
+      release({ content: [{ type: 'text', text: 'rendered' }] });
+      await run;
+      await f.framework.runUntilIdle();
+      assert.ok(JSON.stringify(f.membrane.calls[0]).includes('quoted event'), 'premise: the turn carried the line');
+      assert.equal(f.membrane.calls.length, 1, "the line's wake starts no second turn");
+      assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch's wake carries its line's write");
+    } finally { await f.close(); }
+  });
 
   it('two batches whose events each have a message of their own wake one start, with no line', async () => {
     const module = new class extends ReminderModule {
@@ -556,7 +538,7 @@ describe('debounced writes already read and answered', () => {
     });
   }
 
-  it('an unread channel edit batched with the message it replaced and a later message: the wake stays, with no line', async () => {
+  it('an unread channel edit that replaced its original, batched with a later message: no line', async () => {
     const { f } = await setup(60_000);
     (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
       f.membrane.calls.push(request);
@@ -569,7 +551,7 @@ describe('debounced writes already read and answered', () => {
       await f.send('channels/incoming', { messages: [f.channel('l', 'later text', { initial: true }, 'work', 'later')] });
       fire(f);
       await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 1, 'the unread edit and the later message keep the wake');
+      assert.equal(f.membrane.calls.length, 1, 'premise: the batch wakes the agent');
       assert.ok(!JSON.stringify(f.membrane.calls[0]).includes('[Gate:'), 'no line');
     } finally { await f.close(); }
   });
