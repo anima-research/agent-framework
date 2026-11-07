@@ -2,7 +2,7 @@
   to turn it on or off (see the presentation index's entries). `create()` refuses a context-manager without
   `ContextManager.presentRows` (one before 0.25.0), and a store handle without chronicle's
   `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.1 or earlier), each naming the range this package
-  declares (the 291-chronicle-0.6 entry). An agent whose window
+  declares (see Breaking: the chronicle `^0.6.0` dependency). An agent whose window
   can't be written down at its registration (another version's index format, a failed write) stays in legacy mode,
   its window the whole record, as before, until a branch move writes its window down on the new branch. A
   conversation fork is seeded with its template's window, so a row a host writes into the template's context
@@ -29,8 +29,8 @@
     the store is busy or a conversation agent is being created, a coalesced update or retraction made meanwhile
     isn't held back, and neither judges a conversation agent for disposal, as a move does.
   - **A resident is shown another resident's rows only through `observes`** (decision 1): its window takes its own
-    rows, the rows meant for it (their audience stamp, the 291-audience-stamp entry) and the own rows of each agent
-    it observes (`AgentConfig.observes`, none by default, the 291-resident-observes entry). In 0.32.0 a resident's
+    rows, the rows meant for it (their audience stamp, see Added: every row says who it is for) and the own rows of each agent
+    it observes (`AgentConfig.observes`, none by default; see Added). In 0.32.0 a resident's
     view was the whole shared slot but held traffic and the other residents' stored context injections, so it was
     shown each co-resident's rounds, replies, tool results and notes, and the mail and messages meant for them. Rows
     stored before the upgrade carry no stamp and stay in the window its write-down takes from the record; a row
@@ -38,8 +38,8 @@
     only for another resident (its mail, a message addressed to it) enters none of the others'.
   - **Context-manager's MANIFEST:** the first window write-down that holds rows, or any presentation of more than
     one row, moves the store's MANIFEST to version 2, which chronicle 0.5.1 and earlier refuse, and so does a release
-    whose chronicle range resolves one, such as agent-framework 0.30.0 or context-manager 0.24.0 (context-manager's
-    291-window-batches entry). Going back to an earlier release after that needs a copy of the store taken before
+    whose chronicle range resolves one, such as agent-framework 0.30.0 or context-manager 0.24.0 (context-manager
+    0.25.0's release notes). Going back to an earlier release after that needs a copy of the store taken before
     the upgrade.
 
   **Migration:** a host that listened for `undo:completed`, `redo:completed`, or `branch:switched` with reason

@@ -110,7 +110,7 @@
     source sees a held write once, under `surgery-release`.
   - **Rollback:** going back to a release before this one needs a copy of the store taken before the upgrade: the
     first window write-down that holds rows, or any presentation of more than one row, moves the store's MANIFEST to
-    version 2, which those releases refuse (the 291-presentation-mandatory entry), and what this release stored
+    version 2, which those releases refuse (see Breaking: every agent's context follows its own presentation index), and what this release stored
     after the copy was taken isn't in the copy. The queue's record this release leaves (empty once its writes are
     imported) is itself harmless to an earlier release, which reads it as a queue with nothing in it. A store that
     hasn't moved to version 2 still opens there, and is read as an earlier release reads any store, interleaved:
