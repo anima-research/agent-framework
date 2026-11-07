@@ -143,28 +143,6 @@ describe('a turn\'s first request carries the provider items of the turns before
   }
 });
 
-describe('a reply that continues the agent\'s own carrier-only reply', () => {
-  it('follows the prompt that reply followed, so a later compile can render it before both', async () => {
-    const prompt = { turn: 'p-1', text: '[Continue]' };
-    const stored = [
-      { id: 'm1', participant: 'human', content: [{ type: 'text', text: 'Search the tides.' }] },
-      { id: 'm2', participant: 'tester', content: [{ type: 'text', text: 'Searching.' }] },
-      { id: 'm3', participant: 'tester', content: [carrierOf(SEARCH_CALL)], metadata: { promptedBy: prompt } },
-    ];
-    const cm = {
-      compile: async () => ({ messages: stored.map(({ participant, content }) => ({ participant, content })), systemInjections: [] }),
-      getAllMessages: () => stored,
-    } as unknown as ContextManager;
-    const agent = new Agent({ name: 'tester', model: 'test-model', systemPrompt: 'sys' }, cm, {} as Membrane) as unknown as {
-      assembleActivationRequest(tools: unknown[]): Promise<{ request: { messages: NormalizedMessage[] }; continuePrompt?: unknown }>;
-    };
-    const built = await agent.assembleActivationRequest([]);
-    assert.deepEqual(built.request.messages.map((m) => m.participant), ['human', 'tester', 'user', 'tester'],
-      'the premise: the request renders the prompt before the carrier-only reply, and ends on that reply');
-    assert.deepEqual(built.continuePrompt, prompt);
-  });
-});
-
 /** buildActivationRequest only needs compile(); membrane is never touched. */
 function agentCompiling(messages: unknown[]): Agent {
   const cm = { compile: async () => ({ messages, systemInjections: [] }) } as unknown as ContextManager;

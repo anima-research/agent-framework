@@ -10,16 +10,11 @@
     turn, a resident whose turns used server tools now sends those stored
     blocks, such as web-search results, in each later turn's first request,
     so those requests are larger.
-  - For a resident whose stored history holds items its wire now sends,
+  - For a resident whose compiled window holds items its wire now sends,
     compaction items on the Responses API or server-tool blocks on Anthropic's
     API, the first request after a host takes this release differs from the
-    one before it from the first such item on. It differs too, on every wire,
-    for a resident whose history holds a reply carrying such an item, alone or
-    beside its text, with no tool call, thinking signature or encrypted
-    reasoning, after a silent tick or a `[Continue]`: the item's id now
-    identifies the reply, so that prompt is rendered before it, and the
-    request differs from there on. The provider's prompt cache matches such a
-    request only up to the first difference.
+    one before it from the first such item on, and the provider's prompt cache
+    matches it only up to there.
   - An agent whose `foreignRounds` is `'raw'`, and a co-resident's rows
     stored before audience stamps, now send another agent's stored items as
     stored, as the rest of its rows already go. Whether OpenAI accepts a
@@ -29,12 +24,14 @@
     stored injections pass over it, as before. The Responses API gets its
     items, except an Anthropic server-tool block; Anthropic's API gets an
     assistant turn's paired server-tool blocks, and a lone call in the
-    request's last message; the other wires get none. A refusal rewind and the
-    shed after inference exhaustion take such a message, where the request
-    carried it, with the turn before it, in the same step and counted as that
-    one turn, since its items may be what the provider refuses. A reply that
-    continues the agent's own such message follows the `[Continue]` that
-    message followed, so later requests render it before both.
+    request's last message; the other wires get none. So where the agent's own
+    such message is newest after another participant's turn, no `[Continue]`
+    follows it, and a request can now end on it, such as on a compaction item
+    on the Responses API. A refusal rewind and the shed after inference
+    exhaustion take such a message, where the request carried it, with the
+    turn before it, in the same step and counted as that one turn, since its
+    items may be what the provider refuses. One with no turn before it that
+    the request carried is never shed.
   - The framework doesn't resume a paused Anthropic turn (`pause_turn`)
     itself. But a round stored as server-tool blocks alone no longer counts as
     the agent's turn: a `[Continue]` follows it only where the turn before it

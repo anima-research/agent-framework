@@ -14476,7 +14476,8 @@ export class AgentFramework {
     // Rows the shed leaves can sit between the turn and a carrier body after
     // it, so each contiguous run is one removal. Runs go newest first, so a
     // removal that throws leaves carriers removed and the turn in place,
-    // never the other way round.
+    // never the other way round, and other agents' windows aren't told of
+    // what was removed before the throw.
     const runs: Array<{ from: number; to: number }> = [{ from, to: idx }];
     for (const b of carrierBodies) {
       const last = runs[runs.length - 1]!;

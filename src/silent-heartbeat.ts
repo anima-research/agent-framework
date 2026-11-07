@@ -42,12 +42,9 @@
  *
  * Known limit: compiled messages carry no store provenance, so a stored row
  * is recognised only by structural identity the provider made unique
- * (tool_use ids, thinking signatures, a redacted_thinking block's data, and
- * a provider-native item's own id on its carrier, or a server-tool result's
- * tool_use_id). A reply with none of them — unsigned, tool-free and
- * carrying no such item — gets no row and still merges as before. Without
- * signed thinking that merge carries no provider-rejection risk; it is only
- * a misreading.
+ * (tool_use ids, thinking signatures). A reply with neither — unsigned and
+ * tool-free — gets no row and still merges as before. Without signed thinking
+ * that merge carries no provider-rejection risk; it is only a misreading.
  * Reply text is deliberately never used as identity: identical replies ("all
  * quiet") would collide, and an ordinary reply with the same text could take
  * another reply's row and rewrite cached history. Exact matching for every
@@ -55,7 +52,6 @@
  */
 import { NOTICE_TAG } from './notice-tags.js';
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import { carriesRawItem, holdsTurn } from './sent-rows.js';
 
 /** Request-only separator a silent tick's request ends on. It carries the
  * tick's instruction, so the tick's own request reads it as its prompt, and
@@ -153,21 +149,15 @@ function requestOnlyTurn(text: string): NormalizedMessage {
 
 /**
  * Structural identity of one stored response wherever a compile renders it:
- * tool_use ids, thinking signatures, and a provider-native item's own id on
- * its carrier (a server-tool result's `tool_use_id` where it has no id),
- * which the provider made unique and strategies keep verbatim (tool_use ids
- * and signatures are the identity the tool-result guard relies on). Text is
- * never read, so request-build sanitizing (blank text blocks stripped)
- * cannot make a stored row and its compiled copy disagree.
+ * tool_use ids and thinking signatures, which the provider made unique and
+ * strategies keep verbatim (the same identity the tool-result guard relies
+ * on). Text is never read, so request-build sanitizing (blank text blocks
+ * stripped) cannot make a stored row and its compiled copy disagree.
  */
 function identityKeys(content: ContentBlock[]): string[] {
   const keys: string[] = [];
   for (const block of content) {
-    if (carriesRawItem(block)) {
-      const item = (block as { rawItem: { type?: unknown; id?: unknown; tool_use_id?: unknown } }).rawItem;
-      const id = typeof item.id === 'string' && item.id ? item.id : typeof item.tool_use_id === 'string' && item.tool_use_id ? item.tool_use_id : undefined;
-      if (id !== undefined) keys.push(`item:${String(item.type)}:${id}`);
-    } else if (block.type === 'tool_use' && typeof block.id === 'string' && block.id) keys.push(toolUseKey(block.id));
+    if (block.type === 'tool_use' && typeof block.id === 'string' && block.id) keys.push(toolUseKey(block.id));
     else if (block.type === 'thinking' && typeof block.signature === 'string' && block.signature) {
       keys.push(`thinking:${block.signature}`);
     } else if (block.type === 'redacted_thinking' && typeof block.data === 'string' && block.data) {
@@ -239,28 +229,6 @@ export function toolLoopPrompt(
     if (block.type !== 'tool_result') continue;
     const prompt = index.prompts.get(toolUseKey(block.toolUseId));
     if (prompt) return prompt;
-  }
-  return undefined;
-}
-
-/**
- * The prompt of the agent's own reply holding only provider items' carriers
- * that a request ends on, apart from stored context injections: a reply that
- * continues it, such as one resuming a paused round, follows that prompt too.
- */
-export function carrierReplyPrompt(
-  messages: readonly NormalizedMessage[],
-  agentName: string,
-  index: RequestOnlyRowIndex,
-): RequestOnlyPrompt | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]!;
-    if (message.participant.startsWith('system_context:')) continue;
-    if (message.participant !== agentName || holdsTurn(message.content)) return undefined;
-    for (const key of identityKeys(message.content)) {
-      const prompt = index.prompts.get(key);
-      if (prompt) return prompt;
-    }
   }
   return undefined;
 }

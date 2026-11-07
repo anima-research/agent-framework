@@ -155,8 +155,8 @@ export function roundRows(
     const body = carried(row.id);
     const content = body ? asNextRequestCarries(body.content) : null;
     if (!body || !content) return UNSTORED;
-    // What the stream sent, as membrane's native formatter sends it (sentBlock): an exactly empty text block is in
-    // neither request.
+    // What the stream sent, as membrane's native formatter sends it (sentBlock): an exactly empty text block that
+    // carries no provider-native item is in neither request.
     const sent = row.kind === 'results' ? submittedBlocks(row.sent) : row.sent.filter(sentBlock);
     const sameParticipant = row.kind !== 'injected' || body.participant === row.participant;
     const sameContent = row.kind === 'results'

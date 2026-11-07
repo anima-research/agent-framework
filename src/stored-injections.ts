@@ -113,9 +113,7 @@ export function isStoredKind(injection: ContextInjection): boolean {
  * Responses API gets its items, except an Anthropic server-tool block;
  * Anthropic's API gets an assistant turn's paired server-tool blocks, and
  * a lone call in the request's last message; the other wires get none. An
- * injection with no turn isn't stored: its row would vanish from a
- * request, and the count of stored rows the request ends on, which keeps
- * [Continue] last, would then be wrong. compile() places it, as before.
+ * injection with no turn isn't stored, as before: compile() places it.
  */
 export function hasRenderedContent(content: ContextInjection['content']): boolean {
   return Array.isArray(content) && holdsTurn(content as ContentBlock[]);
