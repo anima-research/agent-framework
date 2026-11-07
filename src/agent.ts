@@ -156,8 +156,8 @@ import type {
  * (holdsTurn), as the injection tail is counted: a message holding only
  * provider items' carriers isn't a turn, and is passed over. So a paused
  * Anthropic round stored as server-tool blocks alone, newest, gets no
- * [Continue] after it (a silent tick's opening request still ends on the
- * tick's separator).
+ * [Continue] after it, though a request can still put something else after
+ * it, as a silent tick's opening request puts the tick's separator.
  */
 function turnBeforeInjections(messages: NormalizedMessage[], injectionTail: number): { turn: NormalizedMessage | undefined; injectionsOnly: boolean } {
   let counted = 0;

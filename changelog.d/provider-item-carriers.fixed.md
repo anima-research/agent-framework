@@ -32,11 +32,12 @@
     server-tool blocks, and a lone call in the request's last message; the
     other wires get none.
   - The framework doesn't resume a paused Anthropic turn (`pause_turn`)
-    itself. But while a round stored as server-tool blocks alone is newest, a
-    request now ends on that round, with no `[Continue]` after it, which is
-    the shape Anthropic asks for to resume one; a silent tick's opening
-    request still ends on the tick's separator, so its lone call is left
-    out. Before, every request left the round out.
+    itself. But a round stored as server-tool blocks alone, newest, is no
+    longer followed by a `[Continue]`, so a request whose last message it is
+    sends its lone call last, the shape Anthropic asks for to resume one. A
+    request can still put something after it: a silent tick's opening request,
+    for one, ends on the tick's separator, and then the lone call is left out.
+    Before, every request left the round out.
   - A tool boundary's note to a context manager that keeps a thinking-binding
     record now names a row holding such an item where the next request
     carries it as the stream sent it, rather than marking it as a difference.
