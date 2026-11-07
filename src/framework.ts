@@ -6545,8 +6545,10 @@ export class AgentFramework {
     // above): the cancels still waiting are those whose writes no operation
     // stored, each told and kept, and the stop's stamp names the holds as
     // they are now, before the registry forgets its channels below. A wait
-    // whose budget ran out leaves its hold's writes in memory: a note among
-    // them is told lost here, as before.
+    // whose budget ran out leaves its hold's writes in memory, which its
+    // release may still store in this process: a note among them isn't told
+    // lost, but left for the next boot to tell what the store holds of it
+    // then (AF #844, the stop's budget).
     step(() => this.tuneOutCoordinator?.stop());
 
     // A stream's `complete` waits for the deliveries it queued, and the

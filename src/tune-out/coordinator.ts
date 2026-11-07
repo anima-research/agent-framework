@@ -405,8 +405,12 @@ interface DeferredCancel {
    * is a write kept in memory, as that write answered (an empty id; never
    * judged by whether writes are held after it, which a write that landed
    * and a hold begun only then would misread), stored at their
-   * release: a stop before then loses it, so the stop tells the note lost,
-   * as it tells one not settled (dropQueued). Gone once the framework
+   * release: a stop before then may lose it, or a release after the stop,
+   * in the same process, may store it yet (the stop's wait for it ran out
+   * of budget), so the stop doesn't tell the note lost but leaves its hold
+   * out of the stamp, naming the note kept, for the next boot to tell what
+   * the store holds then (stop, StopStamp's `notesKept`; the stop's budget,
+   * #844). Gone once the framework
    * stores that write at their release (heldWriteStored): the note counts as
    * delivered then, or its loss as told, and a stop while the cancel still
    * waits tells nothing; once the note's loss is told (dropDeferred), so
@@ -549,6 +553,15 @@ interface UnstampedStop {
    * known, a release being perhaps stored.
    */
   rowsUnread?: true;
+  /**
+   * The stop's stamp names a note of this hold's waiting cancel as kept in
+   * memory then (StopStamp's `notesKept`: a hold the stop's wait didn't see
+   * end), and that run's rows don't hold it: a release after the stop may
+   * store it yet (a host's store handle given to a new instance while the
+   * old one's hold is pending), or none did, so it may be lost, never told
+   * lost outright (AF #844, the stop's budget).
+   */
+  noteKept?: true;
 }
 
 /** How definite each finding is (noteUnstampedStop): a later boot tells a hold again only what says more. */
@@ -581,6 +594,15 @@ interface StopStamp {
    * Weft, #844).
    */
   wakesOwed?: { resident?: true; subconscious?: true };
+  /**
+   * The holds left out of `epochs` whose waiting cancel's note, or the
+   * release telling its loss, was still kept in memory at the stop (a hold
+   * its wait for an operator's operation didn't see end, its budget run
+   * out, or a manager refusing its work): not told lost, since a release
+   * after the stop may store it, the next boot reading what that run's rows
+   * show then (noteUnstampedStop; AF #844, the stop's budget).
+   */
+  notesKept?: string[];
 }
 
 /** A hold on record (holdsOnRecord): its epoch, and its channel, the all-except hold's excepted one with `scope`. */
@@ -693,6 +715,7 @@ function readPersistedLossNotice(value: unknown): PersistedLossNotice | undefine
       ...(drop.own === true ? { own: true as const } : {}),
       ...(typeof drop.ranBy === 'string' ? { ranBy: drop.ranBy } : {}),
       ...(drop.rowsUnread === true ? { rowsUnread: true as const } : {}),
+      ...(drop.noteKept === true ? { noteKept: true as const } : {}),
       ...(Array.isArray(drop.joined) && drop.joined.every((j: unknown) => typeof j === 'string') ? { joined: drop.joined as string[] } : {}),
     };
   } else {
@@ -1026,6 +1049,8 @@ export class TuneOutCoordinator {
   private stopDone = false;
   /** The holds the stop's stamp left out (writeStopStamp), which a stamp written again after it leaves out too. */
   private stopUnaccounted = new Set<string>();
+  /** The holds the stop left out of its stamp because a waiting cancel's note was still kept in memory (StopStamp's `notesKept`). */
+  private stopNotesKept = new Set<string>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
   /**
@@ -2608,8 +2633,10 @@ export class TuneOutCoordinator {
    * and made durable (stateDurable), as the loss record before it is. Left
    * out are the epochs of a note whose loss couldn't be kept (`unaccounted`;
    * every persistent notice's where the store refused the record,
-   * `recorded` false), so the next boot tells the subconscious of them
-   * (noteUnstampedStop). A stamp the store refuses too is logged: nothing
+   * `recorded` false), and of one still kept in memory at the stop, which
+   * the stamp names (`notesKept`, stopNotesKept), so the next boot tells
+   * the subconscious of them (noteUnstampedStop), that a kept note may be
+   * lost where that run's rows don't hold it. A stamp the store refuses too is logged: nothing
    * more can be done at the stop. The next boot then finds this run's own
    * stamp, covering no hold, where it landed, and tells the subconscious of
    * each hold; where the store refused that too, it finds none, which it
@@ -2624,9 +2651,11 @@ export class TuneOutCoordinator {
       }
       const onRecord = this.holdsOnRecord().map((hold) => hold.epochId);
       const owed = this.wakesInStop;
+      const kept = onRecord.filter((epochId) => this.stopNotesKept.has(epochId) && unaccounted.has(epochId));
       const stamp: StopStamp = {
         v: 1, epochs: onRecord.filter((epochId) => !unaccounted.has(epochId)), ...this.runBound(),
         ...(owed.resident || owed.subconscious ? { wakesOwed: { ...owed } } : {}),
+        ...(kept.length > 0 ? { notesKept: kept } : {}),
       };
       this.channelRegistry.writeCoordinatorState(this.stopStampStateId, stamp);
       if (!this.stateDurable()) throw new Error('it was written but could not be made durable');
@@ -2686,11 +2715,13 @@ export class TuneOutCoordinator {
       }
       const stamp = raw as Partial<StopStamp> | null | undefined;
       const covered = new Set<string>();
+      const notesKept = new Set<string>();
       let since: number | undefined;
       let stampBranch: string | undefined;
       const firstBoot = readable && raw == null;
       if (stamp && stamp.v === 1 && Array.isArray(stamp.epochs)) {
         for (const epochId of stamp.epochs) if (typeof epochId === 'string') covered.add(epochId);
+        if (Array.isArray(stamp.notesKept)) for (const epochId of stamp.notesKept) if (typeof epochId === 'string') notesKept.add(epochId);
         if (typeof stamp.runStartedAt === 'number') since = stamp.runStartedAt;
         if (typeof stamp.branch === 'string') stampBranch = stamp.branch;
       } else if (raw != null) {
@@ -2719,7 +2750,7 @@ export class TuneOutCoordinator {
       const elsewhere = stampBranch !== undefined && this.runBranch !== undefined && stampBranch !== this.runBranch;
       let told = false;
       try {
-        this.tellUnstampedHolds(onRecord, stopKept, bootHead, { covered, since, firstBoot, elsewhere, stampBranch });
+        this.tellUnstampedHolds(onRecord, stopKept, bootHead, { covered, notesKept, since, firstBoot, elsewhere, stampBranch });
         told = true;
       } finally {
         this.carriedUntold = !told;
@@ -2770,7 +2801,7 @@ export class TuneOutCoordinator {
     onRecord: readonly HoldOnRecord[],
     stopKept: ReadonlySet<string>,
     bootHead: number | undefined,
-    last: { covered: ReadonlySet<string>; since: number | undefined; firstBoot: boolean; elsewhere: boolean; stampBranch: string | undefined },
+    last: { covered: ReadonlySet<string>; notesKept?: ReadonlySet<string>; since: number | undefined; firstBoot: boolean; elsewhere: boolean; stampBranch: string | undefined },
   ): void {
     const { covered, since, firstBoot, elsewhere } = last;
     let author: string | null;
@@ -2936,6 +2967,10 @@ export class TuneOutCoordinator {
         : noteAt !== undefined ? { reason: 'unstamped-stop', found: 'delivered' }
         : asked ? { reason: 'unstamped-stop', found: 'asked', ...(asked.note !== undefined ? { note: asked.note } : {}), ...(rowsRead ? {} : { rowsUnread: true as const }) }
         : { reason: 'unstamped-stop', found: 'unknown', ...(rowsRead ? {} : { rowsUnread: true as const }) };
+      // A note the stop found still kept in memory (notesKept) that these
+      // rows don't hold: a release after the stop may store it yet, or none
+      // did, so it may be lost.
+      if (last.notesKept?.has(epochId) && noteAt === undefined) drop.noteKept = true;
       const found = drop.found;
       // What it was told silences this only where it was told at or after
       // what this reads (the newest ask of the hold, the release, the note):
@@ -3398,6 +3433,12 @@ export class TuneOutCoordinator {
         }
         const notRecorded = (whose: string): string => `${whose} was not recorded`
           + (still === true ? `, so that ${it} is still in force.` : still === false ? `, and that ${it} has ended since.` : '.');
+        // A note the stop found kept in memory, not in that run's rows
+        // (noteKept): it may be lost, and nothing below says it was.
+        const kept = drop.noteKept && !drop.noteDelivered
+          ? ` The note you left with your cancel of it was kept in memory when the host stopped, to be stored when an operator's change to the store `
+            + "ended, and the store didn't hold it when this was written: it may be lost."
+          : '';
         if (drop.found === 'delivered') {
           // The note's row is stored, no release since, the end of its cancel's hold not.
           text = `${unrecorded}The note you left with your cancel of it was delivered to ${to} before the stop. ${notRecorded("The cancel's end")}]`;
@@ -3406,8 +3447,8 @@ export class TuneOutCoordinator {
           const who = drop.asked ? 'The cancel of it you asked for' : 'Your cancel of it';
           const joined = drop.joined && drop.joined.length > 0 ? ` (with ${drop.joined.map((j) => suppliedValue(j)).join(' and ')})` : '';
           const note = drop.noteDelivered ? ', with the note you left with it'
-            : drop.note !== undefined ? `, but the note you left with it, ${quotedValue(drop.note)}, did not` : '';
-          text = `${unrecorded}${who} ran${joined}: its release reached ${to}${note}. ${notRecorded('Its end')}]`;
+            : drop.note !== undefined && !drop.noteKept ? `, but the note you left with it, ${quotedValue(drop.note)}, did not` : '';
+          text = `${unrecorded}${who} ran${joined}: its release reached ${to}${note}. ${notRecorded('Its end')}${kept}]`;
         } else if (drop.found === 'ran') {
           // Another's cancel stored the release, the end not: the
           // subconscious's own, asked for, had not run. A note of its found
@@ -3417,8 +3458,9 @@ export class TuneOutCoordinator {
             + `${drop.noteDelivered ? ', with the note you left with your cancel of it' : ''}. ${notRecorded('Its end')}`
             + (drop.asked
               ? ` The cancel of it you asked for had not run when the host stopped: it was lost`
-                + `${!drop.noteDelivered && drop.note !== undefined ? `, and the note you left with it, ${quotedValue(drop.note)}` : ''}.]`
-              : ']');
+                + `${!drop.noteDelivered && !drop.noteKept && drop.note !== undefined ? `, and the note you left with it, ${quotedValue(drop.note)}` : ''}.`
+              : '')
+            + `${kept}]`;
         } else if (drop.found === 'asked' && drop.rowsUnread) {
           // Its own call, answered as waiting, and no rows of that run to say whether it ran.
           text = `${unrecorded}The cancel of it you asked for ${drop.note !== undefined ? `with your note ${quotedValue(drop.note)}` : 'with no note'} `
@@ -3427,13 +3469,13 @@ export class TuneOutCoordinator {
         } else if (drop.found === 'asked') {
           // Its own call, answered as waiting, read from its window.
           text = `${unrecorded}The cancel of it you asked for ${drop.note !== undefined ? `with your note ${quotedValue(drop.note)}` : 'with no note'} `
-            + `had not run when the host stopped: it was lost${drop.note !== undefined ? ', and the note you left with it' : ''}.${nowInForce()}]`;
+            + `had not run when the host stopped: it was lost${drop.note !== undefined && !drop.noteKept ? ', and the note you left with it' : ''}.${nowInForce()}${kept}]`;
         } else if (drop.rowsUnread) {
           text = `${unrecorded}If you asked for a cancel of it before the stop, whether it ran isn't known here, as what that run stored can't be read here: `
             + `its end was not recorded, and any note you left with it may be lost.${nowInForce()}]`;
         } else {
-          text = `${unrecorded}If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and any `
-            + `note you left with it.${nowInForce()}]`;
+          text = `${unrecorded}If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost`
+            + `${drop.noteKept ? '' : ', and any note you left with it'}.${nowInForce()}${kept}]`;
         }
       } else if ((drop.reason === 'note-undelivered' && drop.mayBeStored) || noteUnknown !== undefined) {
         text = `[${NOTICE_TAG.tuneOut}: the note you left with your cancel of ${hold} may be lost. ${why}]`;
@@ -5510,7 +5552,9 @@ export class TuneOutCoordinator {
 
   /**
    * Stop all timers (framework shutdown), tell each waiting cancel's note
-   * lost, keep the persistent subconscious's notices in the store, and
+   * lost (one still kept in memory left for the next boot instead, its hold
+   * out of the stamp: a release after the stop may store it), keep the
+   * persistent subconscious's notices in the store, and
    * stamp the stop (writeStopStamp). A second stop stamps nothing: the
    * first one's notices are no longer in memory to say what it kept. The
    * framework calls it once its stop has waited for an operator's
@@ -5538,9 +5582,26 @@ export class TuneOutCoordinator {
     // logged, naming its author.
     // Every one is logged and traced, one with no note, or one whose note
     // was delivered or told lost already, as one that loses no note.
+    // One whose note, or the release telling its loss, is still kept in
+    // memory (heldInMemory: a hold this stop's wait for an operator's
+    // operation didn't see end, its budget run out, or a manager refusing
+    // its work) isn't told lost: a release after the stop, in this process,
+    // may store it yet. For the persistent subconscious, its hold, still in
+    // force, is left out of the stamp as one whose note was kept
+    // (notesKept), and the next boot tells it what that run's rows show
+    // then, that the note may be lost where they don't hold it
+    // (noteUnstampedStop; AF #844, the stop's budget, nissa's house). A
+    // reader fork's is dropped as before: no fork outlives the stop.
     const waiting = [...this.deferredCancels.values()];
     this.deferredCancels.clear();
     const unaccounted = new Set<string>();
+    const notesKept = new Set<string>();
+    let persistent: boolean;
+    try {
+      persistent = !!this.hooks.subconsciousName();
+    } catch {
+      persistent = false;
+    }
     for (const entry of waiting) {
       try {
         let now: string | undefined;
@@ -5549,6 +5610,15 @@ export class TuneOutCoordinator {
           now = entry.for.current();
         } catch {
           read = false;
+        }
+        if (persistent && entry.note !== undefined && entry.heldInMemory && (!read || now === entry.for.epochId)) {
+          const { note: _kept, ...cancel } = entry;
+          this.dropDeferred(cancel, { reason: 'stopped' });
+          unaccounted.add(entry.for.epochId);
+          notesKept.add(entry.for.epochId);
+          console.error(`[tune-out] stopping: the note left with the cancel of ${entry.what} is still kept in memory, to be stored when that hold ends, `
+            + "so it isn't told lost: the stop's stamp leaves its hold out, and the next boot tells what the store holds of it then");
+          continue;
         }
         this.dropQueued(entry, read && now !== entry.for.epochId
           ? { reason: 'hold-ended', ...(now !== undefined ? { current: now } : {}) }
@@ -5559,7 +5629,10 @@ export class TuneOutCoordinator {
         console.error(`[tune-out] stopping: ${noteLost ? 'the note left with ' : ''}the cancel of ${entry.what} is lost, and ${noteLost ? 'its loss' : 'that'} could not be kept: ${thrownReason(err)}`);
       }
     }
-    if (!again) this.stopUnaccounted = unaccounted;
+    if (!again) {
+      this.stopUnaccounted = unaccounted;
+      this.stopNotesKept = notesKept;
+    }
     this.keepAtStop(again ? 'none' : 'stop', unaccounted);
     this.stopDone = true;
     if (this.deferredRetry !== undefined) clearTimeout(this.deferredRetry);

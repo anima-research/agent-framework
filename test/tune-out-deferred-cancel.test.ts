@@ -6,6 +6,7 @@ import { AgentFramework } from '../src/framework.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { SUB, internals, textOf, stored, has, find, registerOpen, enter, type Fixture, type Stored } from './helpers/admission.js';
 import { WriteOutcomeUnknownError } from '../src/context-manager-errors.js';
+import { ShutdownTimeoutError } from '../src/shutdown.js';
 
 type Answer = { success: boolean; data?: unknown; error?: string };
 type Framework = {
@@ -1527,6 +1528,115 @@ describe("a release that tells a queued note's loss, kept in memory, then a stop
       release();
       again?.();
       await f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844, the stop's budget: written by nissa's house (Paloma-2644 wrote and
+// ran it, Crispin-2406 ran it at 52364a32; comment of 2026-11-07T00:23Z on
+// #844), added unchanged. A stop() whose wait for the operator's operations
+// runs out while a hold still keeps the waiting note in memory; the hold
+// then releases in the same process and stores the note.
+// ---------------------------------------------------------------------------
+
+/** What else a stop called now could await before the operator's operations: streams, the event loop, a maintenance pass. */
+function stopAwaits(f: Fixture): string {
+  const fw = f.framework as unknown as { activeStreams: Map<string, unknown>; loopPromise: unknown; maintenanceRunning(): boolean };
+  return `at the stop call: activeStreams.size ${fw.activeStreams.size}, loopPromise ${fw.loopPromise ? 'set' : 'null'}, maintenanceRunning ${fw.maintenanceRunning()}`;
+}
+
+describe("a stop whose wait for the kept hold runs out, the hold released after it (AF #844, the stop's budget)", () => {
+  it("budget run out, then the hold released: the subconscious isn't told the note was not delivered, nor owed a turn for that, where the resident has it", async (t) => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun();
+    try {
+      const kept = () => h.fw.surgeryHeldWrites.filter((w) => w.metadata?.kind === 'subconscious-note').length;
+      t.diagnostic(stopAwaits(h.f));
+      let firstError: unknown;
+      const first = await h.f.framework.stop(2000).then(() => 'resolved', (error: unknown) => {
+        firstError = error;
+        return `rejected: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`;
+      });
+      // The rejection is the operator wait's timeout itself, or an aggregate of the stop's errors; either way, only that timeout.
+      const stopErrors = firstError instanceof ShutdownTimeoutError ? [firstError]
+        : firstError instanceof AggregateError ? [...firstError.errors] : [firstError];
+      t.diagnostic(`the first stop, a 2 s budget: ${first}; its errors: ${JSON.stringify(stopErrors.map((e) => e instanceof ShutdownTimeoutError
+        ? { timeout: e.pending } : e instanceof Error ? `${e.name}: ${e.message}` : String(e)))}`);
+      assert.match(first, /^rejected: /, 'premise: the first stop failed');
+      assert.ok(stopErrors.length === 1 && stopErrors[0] instanceof ShutdownTimeoutError && stopErrors[0].pending.includes('surgery:roll back'),
+        "premise: its one error is the operator wait's timeout, the second hold (surgery:roll back) still pending");
+      assert.equal(kept(), 1, 'premise: the note still kept in memory by the hold when it failed');
+      let released = 'released';
+      try { h.release(); } catch (error) { released = `the release threw: ${error instanceof Error ? error.message : String(error)}`; }
+      t.diagnostic(`the hold: ${released}; kept in memory after: ${kept()}`);
+      const second = await h.f.framework.stop().then(() => 'resolved', (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`);
+      t.diagnostic(`the second stop: ${second}`);
+      await h.f.create();
+      const residentRows = stored(h.f).filter((m) => textOf(m).includes(HELD_NOTE)).length;
+      const notices = presentedTo(h.f, h.sub).filter((text) => text.includes('not delivered') || text.includes('may be lost') || text.includes('without recording'));
+      const turns = internals(h.f).pendingRequests.filter((r) => r.agentName === h.sub).map((r) => r.reason);
+      t.diagnostic(`the note's rows in the resident's record: ${residentRows}`);
+      for (const notice of notices) t.diagnostic(notice);
+      t.diagnostic(`the subconscious's pending turns: ${JSON.stringify(turns)}`);
+      assert.ok(!(residentRows > 0 && notices.some((notice) => notice.includes('was not delivered'))),
+        "where the resident has the note, the subconscious isn't told it was not delivered");
+      assert.ok(!(residentRows > 0 && turns.some((reason) => reason.startsWith('tune-out note not delivered'))),
+        'nor owed a turn to read that');
+    } finally {
+      h.off();
+      errors.mock.restore();
+      h.release();
+      await h.f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AF #844, the stop's budget, the one case the house left open: a host
+// that passes its own store handle to a new create() in the same process
+// while the old instance's hold still keeps the note. The new boot can read
+// the record before the release stores the note; "may be lost" is the only
+// true word there. Once the release stores it, a start after says it went.
+// ---------------------------------------------------------------------------
+
+describe("a stop whose wait for the kept hold runs out, and a start on the same store handle before the hold releases (AF #844, the stop's budget)", () => {
+  it("the start tells the subconscious that the note may be lost, never that it was not delivered; after the release, the note is stored once", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const h = await noteKeptByItsOwnRun();
+    const handle = h.f.framework.getStore();
+    let next: AgentFramework | undefined;
+    try {
+      const first = await h.f.framework.stop(500).then(() => 'resolved', (error: unknown) => error);
+      assert.ok(first instanceof ShutdownTimeoutError && first.pending.includes('surgery:roll back'), `premise: the stop's wait ran out: ${String(first)}`);
+      assert.equal(h.fw.surgeryHeldWrites.filter((w) => w.metadata?.kind === 'subconscious-note').length, 1, 'premise: the note is still kept in memory');
+      assert.equal(stored(h.f).filter((m) => textOf(m) === HELD_NOTE).length, 0, 'premise: the store holds no note yet');
+      // A new instance on the same handle, as a host that passes its own store does.
+      next = await AgentFramework.create({
+        store: handle, membrane: h.f.membrane.asMembrane(),
+        agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [], subconscious: SUB,
+        mcplServers: [{ id: 'editor', url: `ws://127.0.0.1:${h.f.port}`, enabledFeatureSets: ['doc'] }],
+      } as unknown as FrameworkConfig);
+      const sub = (next as unknown as { subconsciousAgentName: string }).subconsciousAgentName;
+      const told = (next.getAgent(sub)!.getContextManager().getPresentedMessages() as unknown as Stored[]).map(textOf)
+        .filter((t) => t.includes('not delivered') || t.includes('may be lost') || t.includes('without recording'));
+      assert.equal(told.length, 1, `told once: ${JSON.stringify(told)}`);
+      assert.match(told[0]!, /Your cancel of it ran: its release reached agent\. Its end was not recorded, so that tune-out is still in force\. The note you left with your cancel of it was kept in memory when the host stopped, to be stored when an operator's change to the store ended, and the store didn't hold it when this was written: it may be lost\.\]$/,
+        'that the note may be lost, and why that is all that is known');
+      assert.doesNotMatch(told[0]!, /was not delivered|did not/, 'never that it was not delivered');
+      const turns = (next as unknown as { pendingRequests: Array<{ agentName: string; reason: string }> }).pendingRequests
+        .filter((r) => r.agentName === sub).map((r) => r.reason);
+      assert.ok(!turns.some((reason) => reason.startsWith('tune-out note not delivered')), `no turn for a loss: ${JSON.stringify(turns)}`);
+      // The old instance's hold releases now, and stores the note on the same handle.
+      h.release();
+      assert.equal((next.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Stored[]).filter((m) => textOf(m) === HELD_NOTE).length, 1,
+        'the note is stored once by the release');
+    } finally {
+      errors.mock.restore();
+      h.release();
+      await next?.stop().catch(() => {});
+      h.off();
+      await h.f.close();
     }
   });
 });
