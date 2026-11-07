@@ -8,6 +8,7 @@ import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import { incoming, registerOpen, MENTION } from './helpers/admission.js';
 import { GateModule, waitCall, say } from './helpers/dendrite.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { readMarkForTest } from '../src/read-marks.js';
 
 class ReminderModule extends GateModule {
   override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -52,16 +53,6 @@ class BeforeCompletionStream extends MockYieldingStream {
       if (event.type === 'complete') await this.beforeComplete?.();
       yield event;
     }
-  }
-}
-
-class HeldStream extends MockYieldingStream {
-  entered = false;
-  release: () => void = () => {};
-  override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-    this.entered = true;
-    await new Promise<void>((resolve) => { this.release = resolve; });
-    yield* { [Symbol.asyncIterator]: () => super[Symbol.asyncIterator]() };
   }
 }
 
@@ -131,17 +122,17 @@ async function send(f: Fixture, lane: 'module' | 'channel' | 'push' | 'heartbeat
     await f.send('push/event', { featureSet: 'doc', eventId: id, timestamp: new Date().toISOString(), payload: { content: [{ type: 'text', text: body }] } });
   }
 }
-function deferred(f: Fixture, body: string) {
-  return (f.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.some((m) => JSON.stringify(m).includes(body));
+function stored(f: Fixture, body: string) {
+  return f.context().includes(body);
 }
 function heard(stream: MockYieldingStream) { return JSON.stringify(stream.receivedToolResultOptions); }
-function recordWakes(f: Fixture): Array<{ agentName: string; lines?: number }> {
+function recordWakes(f: Fixture): Array<{ agentName: string; writes?: number }> {
   const gate = gateOf(f) as unknown as { requestInferenceFn: (agentName: string, ...rest: unknown[]) => void };
-  const wakes: Array<{ agentName: string; lines?: number }> = [];
+  const wakes: Array<{ agentName: string; writes?: number }> = [];
   const original = gate.requestInferenceFn;
   gate.requestInferenceFn = (agentName, ...rest) => {
-    const provenance = rest[2] as { lines?: unknown[] } | undefined;
-    wakes.push({ agentName, ...(provenance?.lines ? { lines: provenance.lines.length } : {}) });
+    const provenance = rest[2] as { writes?: unknown[] } | undefined;
+    wakes.push({ agentName, ...(provenance?.writes ? { writes: provenance.writes.length } : {}) });
     original(agentName, ...rest);
   };
   return wakes;
@@ -156,7 +147,7 @@ describe('debounced writes already read and answered', () => {
         try {
           const { loop } = await start();
           await send(f, lane);
-          await eventually(() => deferred(f, 'new event'), 'event deferred');
+          await eventually(() => stored(f, 'new event'), 'event stored');
           if (held) await eventually(() => gateOf(f).inferenceDiagnostics().bufferedEvents === 1, 'batch held');
           module.release('first');
           await loop;
@@ -165,7 +156,7 @@ describe('debounced writes already read and answered', () => {
             fire(f);
           }
           await eventually(() => gateOf(f).debounceTimers.size === 0, 'debounce fired');
-          assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+          assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
           await f.framework.runUntilIdle();
           assert.ok(heard(streams[0]!).includes('new event'), 'the tool boundary carried the event');
           if (lane === 'channel') assert.ok(f.published.some((p) => p.channelId === 'work'), 'the answer reached the channel');
@@ -180,12 +171,12 @@ describe('debounced writes already read and answered', () => {
   it('a partial batch keeps the event arriving mid-turn after the request was built', async () => {
     const { f, module, streams, start } = await setup(60_000, false, async (f) => {
       await send(f, 'module', 'still unread', 'second');
-      await eventually(() => deferred(f, 'still unread'), 'late event deferred after the boundary');
+      await eventually(() => stored(f, 'still unread'), 'late event stored after the boundary');
     });
     try {
       const { loop } = await start();
       await send(f, 'module', 'already answered');
-      await eventually(() => deferred(f, 'already answered'), 'first event deferred');
+      await eventually(() => stored(f, 'already answered'), 'first event stored');
       module.release('first');
       await loop;
       assert.ok(heard(streams[0]!).includes('already answered'));
@@ -193,13 +184,9 @@ describe('debounced writes already read and answered', () => {
       assert.equal(gateOf(f).debounceTimers.get('batch')!.events.length, 2);
       fire(f);
       await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 2);
-      const rows = f.framework.getAgent('agent')!.getContextManager().getAllMessages();
-      const lines = rows.filter((r) => r.metadata?.source === 'gate:debounce');
-      assert.equal(lines.length, 1);
-      assert.ok(JSON.stringify(lines[0]).includes('still unread'));
-      assert.ok(!JSON.stringify(lines[0]).includes('already answered'));
-      assert.ok(JSON.stringify(lines[0]).includes('1 event matched'));
+      assert.equal(f.membrane.calls.length, 2, 'the unread event keeps the wake');
+      assert.ok(JSON.stringify(f.membrane.calls[1]).includes('still unread'), "the second turn's request holds it");
+      assert.ok(!f.context().includes('[Gate:'), 'and no line names either event');
     } finally { await f.close(); }
   });
 
@@ -213,7 +200,7 @@ describe('debounced writes already read and answered', () => {
     try {
       const { loop } = await start();
       await send(f, 'module');
-      await eventually(() => deferred(f, 'new event'), 'event deferred');
+      await eventually(() => stored(f, 'new event'), 'event stored');
       module.release('first');
       await loop;
       fire(f);
@@ -253,7 +240,7 @@ describe('debounced writes already read and answered', () => {
     try {
       const { loop } = await start();
       await send(f, 'module');
-      await eventually(() => deferred(f, 'new event'), 'event deferred');
+      await eventually(() => stored(f, 'new event'), 'event stored');
       module.release('first');
       await loop;
       fire(f);
@@ -273,7 +260,7 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
-  it('a batch that wakes three residents of one slot writes one line there', async () => {
+  it('a batch that wakes three residents of one slot writes no line there', async () => {
     const { f, module } = await setup(60_000, false, undefined,
       ['agent', 'other', 'third'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
     try {
@@ -287,50 +274,14 @@ describe('debounced writes already read and answered', () => {
       await idle;
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 3, 'each resident wakes');
-      const slot = f.framework.getAgent('other')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
-      assert.equal(slot.length, 1, 'one line in the shared slot');
-      assert.ok(JSON.stringify(slot[0]).includes('2 events matched'));
-      assert.deepEqual(f.framework.getAgent('third')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce'), slot);
+      for (const name of ['agent', 'other', 'third']) {
+        assert.deepEqual(f.framework.getAgent(name)!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce'), [], `no line in ${name}'s window`);
+      }
     } finally { await f.close(); }
   });
 
 
-  it("a reader of the slot the batch didn't wake writes the batch's line at its own start, before the woken turn's", async () => {
-    const f = await fixture({ framework: {
-      modules: [new ReminderModule()],
-      subconscious: { enabled: true, systemPrompt: 'notice' },
-      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
-      gate: { config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
-    } });
-    const starts: string[] = [];
-    f.framework.onTrace((event) => { if (event.type === 'inference:started') starts.push(event.agentName); });
-    let held: HeldStream | undefined;
-    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
-      f.membrane.calls.push(request);
-      if (!held) return (held = new HeldStream([say('noted')], true));
-      return new MockYieldingStream([say('fresh turn')], true);
-    };
-    try {
-      await send(f, 'module', 'first unread');
-      await send(f, 'module', 'second unread', 'second');
-      await f.framework.runUntilIdle();
-      fire(f);
-      const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
-      assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], 'premise: the batch wakes the resident, not the subconscious');
-      internals.pendingRequests.unshift({ agentName: 'Subconscious', reason: 'test', source: 'test', timestamp: Date.now() } as never);
-      const idle = f.framework.runUntilIdle();
-      await eventually(() => held?.entered === true, "the subconscious's turn is alive");
-      await eventually(() => starts.length === 2, "the resident's woken turn starts while the subconscious's is alive");
-      held!.release();
-      await idle;
-      assert.deepEqual(starts.slice(0, 2), ['Subconscious', 'agent']);
-      for (const i of [0, 1]) assert.match(JSON.stringify(f.membrane.calls[i]), /2 events matched/, `request ${i} carries the batch's line`);
-      const lines = f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
-      assert.equal(lines.length, 1, 'one line in the slot');
-    } finally { await f.close(); }
-  });
-
-  it("a batch with an event the host gave no write is written when it fires, naming every event, though the woken start finds the slot held", async () => {
+  it('a batch with an event the host gave no write: its line, written when it fires, names that event alone', async () => {
     const module = new class extends ReminderModule {
       override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
         if (event.type !== 'test:double') return super.onProcess(event, state);
@@ -342,16 +293,11 @@ describe('debounced writes already read and answered', () => {
     }();
     const f = await fixture({ framework: {
       modules: [module],
-      subconscious: { enabled: true, systemPrompt: 'notice' },
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
       gate: { config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder', 'test:double'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
     } });
-    const starts: string[] = [];
-    f.framework.onTrace((event) => { if (event.type === 'inference:started') starts.push(event.agentName); });
-    let held: HeldStream | undefined;
     (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
       f.membrane.calls.push(request);
-      if (!held) return (held = new HeldStream([say('noted')], true));
       return new MockYieldingStream([say('fresh turn')], true);
     };
     const lines = () => f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
@@ -361,22 +307,17 @@ describe('debounced writes already read and answered', () => {
       await f.framework.runUntilIdle();
       fire(f);
       assert.equal(lines().length, 1, 'written when it fired');
-      assert.match(JSON.stringify(lines()[0]!.content), /2 events matched/, 'naming every event');
-      const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
-      internals.pendingRequests.unshift({ agentName: 'Subconscious', reason: 'test', source: 'test', timestamp: Date.now() } as never);
-      const idle = f.framework.runUntilIdle();
-      await eventually(() => held?.entered === true, "the subconscious's turn is alive");
-      await eventually(() => starts.length === 2, "the resident's woken turn starts while the subconscious's is alive");
-      held!.release();
-      await idle;
-      assert.deepEqual(starts.slice(0, 2), ['Subconscious', 'agent']);
-      assert.match(JSON.stringify(f.membrane.calls[1]), /2 events matched/, "the woken turn's request carries it");
+      const text = (lines()[0]!.content as Array<{ type: string; text?: string }>).map((b) => b.text ?? '').join('');
+      assert.equal(text, '[Gate: 1 event matched]\n\n- [batch] (test:double): no write', 'naming the event with no write alone');
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 1, 'the line keeps the wake');
+      assert.match(JSON.stringify(f.membrane.calls[0]), /1 event matched/, "the woken turn's request carries it");
       assert.equal(lines().length, 1, 'once');
     } finally { await f.close(); }
   });
 
   for (const held of ['a mention', 'a module event without a write', 'both'] as const) {
-    it(`batches held for one turn are delivered apart by whether every event has a write: ${held}`, async () => {
+    it(`batches held for one turn: an event with no write keeps its line and the wake, an answered mention neither: ${held}`, async () => {
       const module = new class extends ReminderModule {
         override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
           if (event.type !== 'test:double') return super.onProcess(event, state);
@@ -415,10 +356,11 @@ describe('debounced writes already read and answered', () => {
         const lines = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
           .filter((row) => row.metadata?.source === 'gate:debounce').map((row) => JSON.stringify(row.content));
         assert.equal(f.membrane.calls.length, held === 'a mention' ? 1 : 2, 'a second turn only where the module event was held');
-        assert.equal(f.published.filter((p) => p.channelId === 'work').length, 1, "only the first turn's answer reached the mention's channel");
+        assert.equal(f.published.filter((p) => p.channelId === 'work').length, held === 'both' ? 2 : 1,
+          held === 'both' ? "the batches held for one turn are delivered as one, routed by its mention, so the second turn speaks there too" : "only the first turn's answer reached the mention's channel");
         if (held === 'a mention') assert.deepEqual(lines, [], 'no line for the answered mention');
         else {
-          assert.equal(lines.length, 1, 'one line, written when the batches were delivered');
+          assert.equal(lines.length, 1, 'one line, written when the batch was delivered');
           assert.match(lines[0]!, /1 event matched/);
           assert.doesNotMatch(lines[0]!, /in work/, 'naming the module event, not the answered mention');
         }
@@ -426,7 +368,7 @@ describe('debounced writes already read and answered', () => {
     });
   }
 
-  it('two batches owed to one start are written as one line, in the order they fired', async () => {
+  it('two batches whose events each have a message of their own wake one start, with no line', async () => {
     const module = new class extends ReminderModule {
       override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
         if (event.type !== 'test:second') return super.onProcess(event, state);
@@ -461,30 +403,7 @@ describe('debounced writes already read and answered', () => {
       }
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 1, 'one start');
-      const lines = f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
-      assert.equal(lines.length, 1);
-      assert.match(JSON.stringify(lines[0]!.content), /2 events matched\]\\n\\n- \[seconds\] \(test:second\): fired first\\n- \[reminders\] \(clock:reminder\): fired second/);
-    } finally { await f.close(); }
-  });
-
-  it('an owed line whose event was answered before any start leaves the set unwritten at the next start', async () => {
-    const { f, module, start } = await setup(200);
-    const owed = () => (f.framework as unknown as { owedWakeLines: Set<unknown> }).owedWakeLines.size;
-    try {
-      const { loop } = await start();
-      await send(f, 'module');
-      await eventually(() => deferred(f, 'new event'), 'event deferred');
-      await eventually(() => gateOf(f).inferenceDiagnostics().bufferedEvents === 1, 'batch held');
-      module.release('first');
-      await loop;
-      await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 1, 'premise: the answered batch started no turn');
-      assert.equal(owed(), 1, 'premise: no start has decided its line');
-      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
-      await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 2, 'premise: a later start');
-      assert.equal(owed(), 0, 'that start found it answered');
-      assert.ok(!f.context().includes('[Gate:'), 'and wrote no line');
+      assert.ok(!f.context().includes('[Gate:'), 'no line');
     } finally { await f.close(); }
   });
 
@@ -496,13 +415,13 @@ describe('debounced writes already read and answered', () => {
         await registerOpen(f, 'elsewhere');
         const { loop } = await start('elsewhere');
         await incoming(f, 'work', 'mid', 'new event', kind === 'ambient' ? ['chat:ambient'] : kind === 'system' ? ['chat:system'] : MENTION);
-        await eventually(() => deferred(f, 'new event'), 'event deferred');
+        await eventually(() => stored(f, 'new event'), 'event stored');
         module.release('first');
         await loop;
         assert.ok(heard(streams[0]!).includes('new event'), 'premise: the first turn read the event');
         assert.ok(!f.published.some((p) => p.channelId === 'work'), 'the first turn did not reply there');
         fire(f);
-        assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+        assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
         await f.framework.runUntilIdle();
         assert.equal(f.membrane.calls.length, kind === 'addressed' ? 2 : 1);
       } finally { await f.close(); }
@@ -521,7 +440,7 @@ describe('debounced writes already read and answered', () => {
       await loop;
       assert.ok(JSON.stringify(f.membrane.calls[0]).includes('new event'));
       fire(f);
-      assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+      assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 1);
     } finally { await f.close(); }
@@ -567,7 +486,7 @@ describe('debounced writes already read and answered', () => {
       try {
         const { loop } = await start();
         await send(f, 'channel');
-        await eventually(() => deferred(f, 'new event'), 'event deferred');
+        await eventually(() => stored(f, 'new event'), 'event stored');
         fire(f);
         assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 1, 'premise: the batch fired during the turn is held for it');
         module.release('first');
@@ -582,7 +501,7 @@ describe('debounced writes already read and answered', () => {
         await stopping;
         if (outcome === 'publishes') {
           await f.framework.runUntilIdle();
-          assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+          assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
           assert.ok(f.published.some((p) => p.channelId === 'work'), 'premise: the held publication reached the channel');
           assert.equal(f.membrane.calls.length, 1, 'judged after the publication, the wake is dropped');
         } else if (outcome === 'throws' || outcome === 'refuses') {
@@ -622,7 +541,7 @@ describe('debounced writes already read and answered', () => {
       try {
         const { loop } = await start();
         await send(f, 'channel');
-        await eventually(() => deferred(f, 'new event'), 'event deferred');
+        await eventually(() => stored(f, 'new event'), 'event stored');
         fire(f);
         assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 1, 'premise: the batch fired during the turn is held for it');
         module.release('first');
@@ -630,14 +549,14 @@ describe('debounced writes already read and answered', () => {
         release();
         await loop;
         await f.framework.runUntilIdle();
-        assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+        assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
         assert.ok(f.published.some((p) => p.channelId === 'work'), 'premise: the held publication reached the channel');
         assert.equal(f.membrane.calls.length, 1, 'judged after the publication, the wake is dropped');
       } finally { release(); await f.close(); }
     });
   }
 
-  it("an unread channel edit batched with the message it replaced and a later message: the turn's line counts the edit and the later message", async () => {
+  it('an unread channel edit batched with the message it replaced and a later message: the wake stays, with no line', async () => {
     const { f } = await setup(60_000);
     (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
       f.membrane.calls.push(request);
@@ -651,8 +570,7 @@ describe('debounced writes already read and answered', () => {
       fire(f);
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 1, 'the unread edit and the later message keep the wake');
-      assert.deepEqual(JSON.stringify(f.membrane.calls[0]).match(/\[Gate: \d+ events? matched\]/g), ['[Gate: 2 events matched]'],
-        'one line, for the edit and the later message, not the removed original');
+      assert.ok(!JSON.stringify(f.membrane.calls[0]).includes('[Gate:'), 'no line');
     } finally { await f.close(); }
   });
 
@@ -672,18 +590,18 @@ describe('debounced writes already read and answered', () => {
       await send(f, 'module');
       await f.framework.runUntilIdle();
       fire(f);
-      const queued = (f.framework as unknown as { pendingRequests: Array<{ readsWakeLines?: boolean; wakeLines?: unknown[] }> }).pendingRequests;
-      assert.deepEqual(queued.map((r) => [r.readsWakeLines, r.wakeLines?.length]), [[true, 1]], "premise: the batch's wake, with its line");
-      const line = queued[0]!.wakeLines![0];
+      const queued = (f.framework as unknown as { pendingRequests: Array<{ readsRows?: Array<{ row: string; replyTo?: { serverId: string; channelId: string } }> }> }).pendingRequests;
+      assert.deepEqual(queued.map((r) => r.readsRows?.length), [1], "premise: the batch's wake, reading its event's row");
+      const read = queued[0]!.readsRows![0]!;
       const idle = f.framework.runUntilIdle();
       await eventually(() => module.entered.has('first'), "the batch's turn reached its tool");
       module.release('first');
       await idle;
-      const holds = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, { heldRequests: Array<{ readsWakeLines?: boolean }> }> }).providerAccelerationCooldowns;
+      const holds = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, { heldRequests: Array<{ readsRows?: unknown[] }> }> }).providerAccelerationCooldowns;
       assert.equal(holds.get('agent')?.heldRequests.length, 1, "premise: the provider's stated wait holds the turn's retry");
-      const done = (f.framework as unknown as { wakeLineDone(agent: unknown, line: unknown): boolean }).wakeLineDone(f.framework.getAgent('agent'), line);
-      assert.equal(done, true, "premise: the failed attempt's tool round answered the line's write");
-      assert.ok(!holds.get('agent')!.heldRequests[0]!.readsWakeLines, 'the held retry no longer reads its lines, so the answer can\'t drop it');
+      const done = (f.framework as unknown as { rowDone(agent: unknown, row: string, to: unknown): boolean }).rowDone(f.framework.getAgent('agent'), read.row, read.replyTo);
+      assert.equal(done, true, "premise: the failed attempt's tool round answered the event's row");
+      assert.equal(holds.get('agent')!.heldRequests[0]!.readsRows, undefined, "the held retry no longer reads its rows, so the answer can't drop it");
       f.framework.releaseProviderWait('agent');
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 2, 'the retry ran');
@@ -696,7 +614,7 @@ describe('debounced writes already read and answered', () => {
       try {
         const { loop } = await start();
         await send(f, 'module');
-        await eventually(() => deferred(f, 'new event'), 'event deferred');
+        await eventually(() => stored(f, 'new event'), 'event stored');
         fire(f);
         assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 1);
         if (outcome === 'aborted') assert.equal(f.framework.abortInference('agent', 'test abort'), true);
@@ -747,7 +665,7 @@ async function judged(wired: boolean, opts: { tool?: boolean } = {}) {
     const loop = wake();
     await eventually(() => module.entered.has('first'), 'turn reached tool');
     await send(f, 'module');
-    await eventually(() => deferred(f, 'new event'), 'event deferred');
+    await eventually(() => stored(f, 'new event'), 'event stored');
     module.release('first');
     await loop;
     assert.ok(heard(streams[0]!).includes('new event'), 'premise: the tool boundary carried the event');
@@ -773,10 +691,10 @@ describe('judge rules and the answered-batch drop', () => {
     try {
       await answeredMidTurn();
       fire(f);
-      assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+      assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
-      assert.ok(!f.context().includes('[Gate:'), 'no gate line for the answered event');
+      assert.ok(!f.context().includes('[Gate:'), 'no gate line');
     } finally { await f.close(); }
   });
 
@@ -794,7 +712,7 @@ describe('judge rules and the answered-batch drop', () => {
         asked.shift()!.reject(error);
         await eventually(() => (gateOf(f) as unknown as { judging: Map<string, unknown> }).judging.size === 0, "the judge's outcome is settled");
         assert.deepEqual(verdicts, traced);
-        assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+        assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
         await f.framework.runUntilIdle();
         assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
       } finally { await f.close(); }
@@ -821,7 +739,7 @@ describe('judge rules and the answered-batch drop', () => {
       const loop = wake();
       await eventually(() => module.entered.has('first'), 'turn reached tool');
       await send(f, 'channel');
-      await eventually(() => deferred(f, 'new event'), 'event deferred');
+      await eventually(() => stored(f, 'new event'), 'event stored');
       fire(f);
       assert.equal(asked.length, 0, 'premise: the judge waits for the turn');
       module.release('first');
@@ -870,7 +788,7 @@ describe('judge rules and the answered-batch drop', () => {
       await run;
       await f.framework.runUntilIdle();
       assert.ok(JSON.stringify(f.membrane.calls[0]).includes('new event'), 'premise: the turn read the event');
-      assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+      assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
       assert.equal(f.membrane.calls.length, 1, "the reply's wake starts no second turn");
     } finally { await f.close(); }
   });
@@ -896,7 +814,7 @@ describe('judge rules and the answered-batch drop', () => {
       await eventually(() => f.membrane.calls.length >= 1, 'the parked turn runs');
       await f.framework.runUntilIdle();
       assert.ok(JSON.stringify(f.membrane.calls[0]).includes('new event'), 'premise: the turn read the event');
-      assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+      assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
       assert.equal(f.membrane.calls.length, 1, "the reply's wake starts no second turn");
     } finally { await f.close(); }
   });
@@ -918,72 +836,43 @@ describe('judge rules and the answered-batch drop', () => {
       gateOf(f).onInferenceEnded('reader');
       await eventually(() => gateOf(f).inferenceDiagnostics().bufferedEvents === 0, 'the batch is delivered');
       await f.framework.runUntilIdle();
-      assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+      assert.deepEqual(wakes, [{ agentName: 'agent', writes: 1 }], "the batch requested its wake, carrying its event's write");
       assert.equal(f.membrane.calls.length, 1, "the reply's wake starts no second turn");
     } finally { await f.close(); }
   });
 });
 
 describe("the framework's answer to the gate's isAnswered", () => {
-  type Row = { id: string; sequence: number; metadata?: { deferredWriteId?: string } };
-  type AgentView = {
-    getContextManager(): { getAllMessages(): Row[]; currentBranch(): { name: string } };
-    answeredWatermark: { branch: string; sequence: number } | null;
-  };
-  type Ctx = {
-    after: Record<string, string>; agent: AgentView; row: Row;
-    internal: { deferredMessages: unknown[]; unackedDeferredWrites: unknown[]; landedCopiesById: () => unknown };
-  };
-  const write = (id: string) => ({ id, seq: 1, participant: 'editor', content: [{ type: 'text', text: id }], heldAt: Date.now() });
+  type Placement = { agent?: string; messageId?: string };
+  type AgentView = { getContextManager(): { addMessage(participant: string, content: unknown[]): string } };
+  type Ctx = { after: Placement; agent: AgentView & { answeredWatermark: unknown } };
   const unreadable = (c: Ctx) => { c.agent.getContextManager = () => { throw new Error('store unreadable'); }; };
-  const rows: Array<[string, boolean, (c: Ctx) => Record<string, string>]> = [
-    ['a write that a request the agent answered carried: answered', true, (c) => c.after],
-    ['the same write asked for as a stored message: answered', true, (c) => ({ agent: 'agent', messageId: c.row.id })],
+  const rows: Array<[string, boolean, (c: Ctx) => Placement]> = [
+    ['a stored message a request the agent answered carried: answered', true, (c) => c.after],
     ['a stored message no longer in the store: answered', true, () => ({ agent: 'agent', messageId: 'no-such-row' })],
-    ["a write above the answered watermark on the agent's branch: not answered", false, (c) => {
-      c.agent.answeredWatermark = { branch: c.agent.getContextManager().currentBranch().name, sequence: c.row.sequence - 1 };
+    ['a message stored after the answer, which no answered request carried: not answered', false,
+      (c) => ({ agent: 'agent', messageId: c.agent.getContextManager().addMessage('user', [{ type: 'text', text: 'later' }]) })],
+    ['with no answered mark yet: not answered', false, (c) => { c.agent.answeredWatermark = null; return c.after; }],
+    ['with the answered mark on another branch: in doubt, so answered', true, (c) => {
+      c.agent.answeredWatermark = readMarkForTest('elsewhere', 1_000_000, null);
       return c.after;
     }],
-    ['a write still queued for the agent: not answered', false, (c) => {
-      c.internal.deferredMessages.push(write('queued-1'));
-      return { agent: 'agent', deferredId: 'queued-1' };
-    }],
-    ['with no answered watermark yet: not answered', false, (c) => { c.agent.answeredWatermark = null; return c.after; }],
-    ['with the watermark on another branch: in doubt, so answered', true, (c) => {
-      c.agent.answeredWatermark = { branch: 'elsewhere', sequence: c.row.sequence };
-      return c.after;
-    }],
-    ['a write drained but not yet stored: in doubt, so answered', true, (c) => {
-      c.internal.unackedDeferredWrites.push(write('drained-1'));
-      return { agent: 'agent', deferredId: 'drained-1' };
-    }],
-    ['a store that throws reading the write: in doubt, so answered', true, (c) => { unreadable(c); return c.after; }],
-    ['a store that throws reading a stored message: in doubt, so answered', true, (c) => {
-      const messageId = c.row.id;
-      unreadable(c);
-      return { agent: 'agent', messageId };
-    }],
+    ['a store that throws reading the message: in doubt, so answered', true, (c) => { const after = c.after; unreadable(c); return after; }],
     ['a write whose agent is gone: in doubt, so answered', true, (c) => ({ ...c.after, agent: 'gone' })],
     ['a write placement that names no message: in doubt, so answered', true, () => ({ agent: 'agent' })],
-    ['a queued write whose landing the store can\'t settle: in doubt, so answered', true, (c) => {
-      c.internal.deferredMessages.push({ ...write('unsettled-1'), landing: 'unknown' });
-      c.internal.landedCopiesById = () => undefined;
-      return { agent: 'agent', deferredId: 'unsettled-1' };
-    }],
   ];
   for (const [what, answered, ask] of rows) {
     it(what, async () => {
       const { f, answeredMidTurn } = await judged(true, { tool: true });
-      const agent = f.framework.getAgent('agent') as unknown as AgentView;
+      const agent = f.framework.getAgent('agent') as unknown as Ctx['agent'];
       const getContextManager = agent.getContextManager;
       try {
         await answeredMidTurn();
-        const after = (gateOf(f).debounceTimers.get('batch')!.events[0] as { after: Record<string, string> }).after;
-        const row = agent.getContextManager().getAllMessages().find((m) => m.metadata?.deferredWriteId === after.deferredId);
-        assert.ok(row && after.agent === 'agent', "premise: the event was written to the agent's queue and has landed");
-        const internal = f.framework as unknown as Ctx['internal'];
-        const isAnswered = (gateOf(f) as unknown as { isAnsweredFn: (after: Record<string, string>) => boolean }).isAnsweredFn;
-        assert.equal(isAnswered(ask({ after, agent, row, internal })), answered);
+        const after = (gateOf(f).debounceTimers.get('batch')!.events[0] as { after: Placement }).after;
+        assert.equal(after.agent, 'agent', "premise: the event's write went to the agent");
+        assert.ok(f.framework.getAgent('agent')!.getContextManager().getMessage(after.messageId as never), 'premise: and is stored');
+        const isAnswered = (gateOf(f) as unknown as { isAnsweredFn: (after: Placement) => boolean }).isAnsweredFn;
+        assert.equal(isAnswered(ask({ after, agent })), answered);
       } finally {
         agent.getContextManager = getContextManager;
         await f.close();
@@ -997,7 +886,6 @@ describe("what the judge is told of the framework's queued wakes", () => {
     pendingRequests: Array<Record<string, unknown>>;
     upcomingWakesFor(name: string): Array<{ certain: boolean; what: string }>;
   };
-  const line = (after?: Record<string, string>) => ({ policyNames: ['batch'], at: 0, ...(after ? { after } : {}) });
   const told = (internal: Internal, queued: Array<Record<string, unknown>>) => {
     internal.pendingRequests.length = 0;
     for (const reads of queued) internal.pendingRequests.push({ agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), ...reads });
@@ -1011,10 +899,9 @@ describe("what the judge is told of the framework's queued wakes", () => {
     try {
       const internal = f.framework as unknown as Internal;
       for (const reads of [
-        { readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' })] },
-        { readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' }), line({ agent: 'agent', deferredId: 'deferred-1' })] },
-        { readsStoredMessage: 'row-1' },
-        { readsDeferredWrite: 'deferred-1' },
+        { readsRows: [{ row: 'row-1' }] },
+        { readsRows: [{ row: 'row-1' }, { row: 'row-2', replyTo: { serverId: 'editor', channelId: 'work' } }] },
+        { readsRow: 'row-1' },
       ]) assert.deepEqual(told(internal, [reads]), [false], JSON.stringify(reads));
     } finally { await f.close(); }
   });
@@ -1023,11 +910,8 @@ describe("what the judge is told of the framework's queued wakes", () => {
     const { f } = await judged(true);
     try {
       const internal = f.framework as unknown as Internal;
-      const maybe = { readsStoredMessage: 'row-1' };
+      const maybe = { readsRow: 'row-1' };
       for (const queued of [
-        [{ readsWakeLines: true, wakeLines: [] }],
-        [{ readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' }), line()] }],
-        [{ readsWakeLines: true, wakeLines: [line({ agent: 'other', messageId: 'row-1' })] }],
         [{}],
         [maybe, {}],
       ]) assert.deepEqual(told(internal, queued), [true], JSON.stringify(queued));
@@ -1046,7 +930,7 @@ describe("what the judge is told of the framework's queued wakes", () => {
       const wait = internal.recordProviderWait('agent', 'test-model', new MembraneError({
         type: 'rate_limit', retryable: true, retryAfterMs: 60_000, message: 'slow down', rawError: { status: 429 },
       }));
-      const droppable = { agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' })] };
+      const droppable = { agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsRows: [{ row: 'row-1' }] };
       assert.ok(internal.holdForProviderWait(internal.getAgent('agent'), wait, [droppable]), 'premise: the cooldown holds the wake');
       const cooldownTold = () => internal.upcomingWakesFor('agent').filter((w) => w.what.includes('provider cooldown')).map((w) => w.certain);
       assert.deepEqual(cooldownTold(), [false], 'a held wake the scheduler could drop on release');

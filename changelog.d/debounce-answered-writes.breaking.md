@@ -1,20 +1,9 @@
-- **Hosts that build their own `EventGate` and handle `requestInference`, and
-  hosts and modules that read an `InferenceRequest`'s `wakeLines`:**
-  `WakeProvenance.line` is now `lines`, a `WakeLine` per event of the batch;
-  `WakeLine.shown` is absent for a quoted event; and `wakeLineText` takes the
-  lines (`wakeLineText(lines, now)`). Migration: pass `provenance.lines` on as
-  the request's `wakeLines`, and render with `wakeLineText(lines, now)`. The
-  gate hands lines only to a host with `isNewestEntry`, and only for a batch
-  whose every event has a write, each line carrying the write the host passed
-  to `evaluate` (`after`, in `.added`), or, as before, for a single event
-  still the newest entry, whose line carries its write where it has one. On a
-  reply verdict, an event `isAnswered` counts as answered loses its write
-  first. Dropping the wake once the agent has answered them is the
-  scheduler's: AgentFramework's drops a request with `readsWakeLines: true`,
-  and a host that runs its own judges the drop itself from each line's
-  `after`.
-  Unchanged: a host that gives the gate no `isNewestEntry` still has every
-  batched wake's line written when the batch is delivered: when it fires,
-  when a judge rule's judging ends in a wake, or, if a turn or the host's
-  quiesce holds it, once no agent's turn is running and the host isn't
-  quiesced.
+- **Hosts that build their own `EventGate`, and hosts and modules that read an
+  `InferenceRequest`'s `wakeLines`:** a batched wake has no `[Gate: …]` line
+  for an event with a message of its own in the window, so nothing is handed
+  to the wake for its turn's start to write. Removed: `EventGate`'s
+  `isNewestEntry` option, `WakeProvenance.line`, `InferenceRequest.wakeLines`,
+  the `WakeLine` and `wakeLineText` exports, and the
+  `gate:wake-line-omitted` trace. Migration: drop them. A host that handles
+  `requestInference` itself and wants a wake dropped once the agent has
+  answered it reads `provenance.writes` (in `.added`).

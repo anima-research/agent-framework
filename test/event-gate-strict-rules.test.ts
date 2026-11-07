@@ -2305,8 +2305,8 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
   const gate = new EventGate({
     configPath, getAgentNames: () => ['agent'],
     emitTrace: (e) => { if (e.type === 'gate:debounce-delivered') delivered.push(String(e.policyName)); },
-    addMessage: () => { attempts++; if (fails) throw new Error('no agent to deliver to'); return ''; },
-    requestInference: (agent) => { wakes.push(agent); },
+    addMessage: () => '',
+    requestInference: (agent) => { attempts++; if (fails) throw new Error('no agent to deliver to'); wakes.push(agent); },
   });
   t.after(() => gate.dispose());
 
@@ -2462,11 +2462,11 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   // Whether limited's bucket is still there as each batch is sent.
   const bucketAtDelivery: boolean[] = [];
   const gate: EventGate = new EventGate({
-    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: (agent) => { wakes.push(agent); },
-    addMessage: () => {
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], addMessage: () => '',
+    requestInference: (agent) => {
       bucketAtDelivery.push((gate as unknown as { rateLimitBuckets: Map<string, unknown> }).rateLimitBuckets.has('limited'));
       if (++deliveries === 1) throw new Error('no agent to deliver to');
-      return '';
+      wakes.push(agent);
     },
   });
   t.after(() => gate.dispose());
@@ -2500,8 +2500,8 @@ test("a reload whose pending batch can't be delivered still puts the new rules i
   const quiet = { name: 'quiet', match: { tagsAny: ['chat:mention'] }, behavior: { debounce: 60000 } };
   writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [quiet] }));
   const gate = new EventGate({
-    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: () => {},
-    addMessage: () => { throw new Error('no agent to deliver to'); },
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], addMessage: () => '',
+    requestInference: () => { throw new Error('no agent to deliver to'); },
   });
   t.after(() => gate.dispose());
   assert.equal(gate.evaluate(MENTION).trigger, false, "the mention waits in quiet's batch");
