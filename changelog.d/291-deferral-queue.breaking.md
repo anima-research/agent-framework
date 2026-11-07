@@ -41,20 +41,16 @@
   cancel), or while the primary's or the subconscious's context manager refuses its work before anything is kept for
   it, waits, the tune-out in force, until the release has stored the writes, or told of those it couldn't, then runs,
   so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()` answer
-  `{ ok: true, deferred: true }` then. A later cancel while one waits adds its note to the waiting cancel when that
-  has none; otherwise its note is dropped, logged, and the answer adds `noteDropped: true`. The tools say so to the
+  `{ ok: true, deferred: true }` then. A later cancel while one waits adds its note to the waiting cancel if the waiting cancel has no note, or if its own note has already gone out. Otherwise the later note is dropped and logged, and the answer adds `noteDropped: true`. The tools say so to the
   agent, where they answered `cancelled`: the resident's `tune_out` cancel answers `waiting` (the channel's name, or
   `'all-except'`) and the subconscious's `cancel_tuneout` `waiting: true` (with `scope: 'all-except'` for that
   hold), each with a `note`: not cancelled yet, since an operator's change to the store is in progress or a context
   the cancel writes to refuses writes until the host re-initializes it; cancelling again doesn't end the wait
   sooner while that lasts (once writes are stored, a cancel whose run failed is retried, and another can end the
-  hold first: review8-operator-close-wait); the tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap; and a host that stops
-  first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed, or the
-  host starts again with no reader, which ends every hold on record.
+  hold first: review8-operator-close-wait); the tune-out stays in force, and when it ends what it still holds is delivered, up to its backlog cap and what fits in one message; and a host that stops first loses the cancel, which the restart doesn't run. After such a restart the tune-out is still in force, even where its release reached the resident, until it is cancelled: the restart cancels it itself if its end time has passed or, for a channel's tune-out, its wakes have gone past their budget, and cancels every hold if the host starts again with no reader.
   `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A `channel_close` of the
   channel an all-except hold excepts carries what became of the focus, whatever became of the close (`note` on a
-  success, where it said nothing, and after the error on a failure): that the focus ended, or that it ends once the
-  wait is over. A crash before the cancel
+  success, where it said nothing, and after the error on a failure): that the focus ended, or that the focus is still in force while its release waits for held writes. A crash before the cancel
   runs leaves the tune-out in force for the next boot, which cancels one whose end time passed. The
   `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
   for a manager refusing its work, but mail, which stays held in the registry for the next boot, where 0.32.0's (0.28.0's

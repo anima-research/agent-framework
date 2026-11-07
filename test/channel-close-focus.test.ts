@@ -28,7 +28,7 @@ type Framework = {
 };
 
 const ENDED = 'The focus on it ended, and what the other channels held was delivered, up to its backlog cap.';
-const WAITS = /^The close cancels the all-except hold that excepts it\. Not cancelled yet: /;
+const WAITS = /^The close asks to cancel the all-except hold that excepts this channel\. Not cancelled yet: /;
 
 const framework = (f: Fixture) => f.framework as unknown as Framework;
 const coordinatorOf = (f: Fixture) => internals(f).tuneOutCoordinator!;
@@ -265,7 +265,7 @@ describe('a close naming the excepted channel after its server no longer registe
       assert.equal(result.success, false);
       assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus is in force');
       assert.match(result.error ?? '',
-        /^Server "editor" no longer registers channel "work", so no close was recorded or sent\. This call cancels the all-except hold that excepts it\. Not cancelled yet: /,
+        /^Server "editor" no longer registers channel "work", so no close was recorded or sent\. This call asks to cancel the all-except hold that excepts this channel\. Not cancelled yet: /,
         result.error);
       release();
       assert.equal(coordinatorOf(f).getAllExcept(), null, 'ended at the release');

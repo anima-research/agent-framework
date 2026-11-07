@@ -20,7 +20,7 @@
   answers, as a failure since no close ran: "Server "editor" no longer registers channel "work", so no close
   was recorded or sent. The focus on it ended, and what the other channels held was delivered, up to its backlog cap." The release
   notice gives its reason as "a close of the excepted channel, which its server no longer registers". While
-  the store's writes are held the answer says "This call cancels the all-except hold that excepts it." and
+  the store's writes are held the answer says "This call asks to cancel the all-except hold that excepts this channel." and
   the wait's note; a release that fails before the end adds "The focus on it wasn't ended: <reason>. The focus on it is
   still in force: …" (the same sentence as above), and
   one that fails after it "A step of the focus's release failed: <reason>. The focus on it ended before

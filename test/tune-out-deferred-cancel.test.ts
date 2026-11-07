@@ -22,9 +22,9 @@ function saysWhatItWaitsFor(note: string): void {
   assert.match(note, /an operator's change to the store/, `names a surgery's hold: ${note}`);
   assert.match(note, /refuses writes until the host re-initializes it/, `names a refusing context: ${note}`);
   assert.doesNotMatch(note, /writes (are |kept |held )?(in memory|stored)/, `doesn't say it waits for writes: ${note}`);
-  assert.match(note, /Cancelling again doesn't end the wait sooner while that lasts, and how long it lasts isn't known here/, `says asking again won't end it: ${note}`);
+  assert.match(note, /The host runs the cancel when that ends and retries it if it fails; cancelling again won't make it sooner\./, `says asking again won't end it: ${note}`);
   assert.doesNotMatch(note, /Nothing you can do/, `claims nothing of the host's other tools: ${note}`);
-  assert.match(note, /If the host stops before then, the cancel is lost/, `says a stop loses it: ${note}`);
+  assert.match(note, /If the host stops first, the cancel is lost/, `says a stop loses it: ${note}`);
 }
 
 async function heldDuringSurgery() {
@@ -113,7 +113,7 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.equal(result.success, false);
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
       assert.doesNotMatch(result.error ?? '', /ended all the same|was delivered/, result.error);
-      assert.match(result.error ?? '', /The close cancels the all-except hold that excepts it\. Not cancelled yet: /, result.error);
+      assert.match(result.error ?? '', /The close asks to cancel the all-except hold that excepts this channel\. Not cancelled yet: /, result.error);
       saysWhatItWaitsFor(result.error ?? '');
       assert.doesNotMatch(result.error ?? '', /Nothing you can do/, result.error);
       again();
@@ -140,7 +140,7 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       const data = (result.data ?? {}) as { status?: string; note?: string };
       assert.equal(data.status, already ? 'already closed' : 'closed');
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
-      assert.match(data.note ?? '', /^The close cancels the all-except hold that excepts it\. Not cancelled yet: /,
+      assert.match(data.note ?? '', /^The close asks to cancel the all-except hold that excepts this channel\. Not cancelled yet: /,
         `the answer says the hold's end waits, not only that the channel is closed: ${JSON.stringify(data)}`);
       saysWhatItWaitsFor(data.note ?? '');
       assert.doesNotMatch(data.note ?? '', /ended|was delivered/, data.note);
@@ -158,13 +158,11 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
       const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'Someone asked for you.' });
       assert.equal(answer.success, true, answer.error);
       assert.equal(waiting(answer).waiting, true);
-      assert.match(waiting(answer).note ?? '', /Your note waits with the cancel and is delivered when the tune-out ends\./,
+      assert.match(waiting(answer).note ?? '', /Unless the host stops first, your note goes to the resident when a cancel ends the tune-out, or tries to\./,
         `told what becomes of its note: ${waiting(answer).note}`);
-      assert.match(waiting(answer).note ?? '', /The notice is kept in the store as well, unless the store refuses that too: if the host stops before the notice is written, the host writes it when it starts again/,
-        `told that a loss notice that can't be written survives a stop (Ivy-3594, round 6): ${waiting(answer).note}`);
-      assert.match(waiting(answer).note ?? '', /The waiting cancel isn't kept in the store: if the host stops before the tune-out ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told when it starts again that any cancel of the tune-out then waiting was lost, with any note left with it that had not been delivered\.$/,
-        `and that a stop before the hold ends loses the cancel and the note, but not the notice of the note's loss (Ivy-3594, round 8): ${waiting(answer).note}`);
-      assert.doesNotMatch(waiting(answer).note ?? '', /or the host stops/, `no longer says a stop ends the notice's retries: ${waiting(answer).note}`);
+      assert.match(waiting(answer).note ?? '', /If it can't be delivered, or the host stops first, you are told what is known of it once the host can write to you, or when it starts again with you as its reader\.$/,
+        `told that a loss, or a stop before the hold ends, is told, now or after the restart (Ivy-3594, rounds 6 and 8): ${waiting(answer).note}`);
+      assert.doesNotMatch(waiting(answer).note ?? '', /while your run lasts/, `not told that a loss reaches it only while its run lasts, as a fork is: ${waiting(answer).note}`);
       release();
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
       assert.ok(has(f, 'Someone asked for you.'), "the subconscious's note is delivered with the release");
@@ -176,13 +174,13 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
     try {
       const first = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'The first note.' });
       assert.equal(first.success, true, first.error);
-      assert.match(waiting(first).note ?? '', /Your note waits with the cancel and is delivered when the tune-out ends\./,
+      assert.match(waiting(first).note ?? '', /Unless the host stops first, your note goes to the resident when a cancel ends the tune-out, or tries to\./,
         'the first caller is told its note waits with the cancel');
       const second = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'The second note.' });
       assert.equal(second.success, true, second.error);
       assert.equal(waiting(second).waiting, true);
       assert.match(waiting(second).note ?? '', /Your note isn't delivered/, `the second caller is told: ${waiting(second).note}`);
-      assert.doesNotMatch(waiting(second).note ?? '', /Your note waits/, 'and not that it waits');
+      assert.doesNotMatch(waiting(second).note ?? '', /your note goes to the resident/, 'and not that it waits');
       release();
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
       assert.ok(has(f, 'The first note.'), "the waiting cancel's note is delivered");
@@ -201,13 +199,13 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
       const first = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except', text: 'The first note.' });
       assert.equal(first.success, true, first.error);
       assert.equal(waiting(first).waiting, true);
-      assert.match(waiting(first).note ?? '', /Your note waits with the cancel and is delivered when the all-except hold ends\./,
+      assert.match(waiting(first).note ?? '', /Unless the host stops first, your note goes to the resident when a cancel ends the all-except hold, or tries to\./,
         'the first caller is told its note waits with the cancel');
       const second = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except', text: 'The second note.' });
       assert.equal(second.success, true, second.error);
       assert.equal(waiting(second).waiting, true);
       assert.match(waiting(second).note ?? '', /Your note isn't delivered/, `the second caller is told: ${waiting(second).note}`);
-      assert.doesNotMatch(waiting(second).note ?? '', /Your note waits/, 'and not that it waits');
+      assert.doesNotMatch(waiting(second).note ?? '', /your note goes to the resident/, 'and not that it waits');
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
       assert.ok(has(f, 'The first note.'), "the waiting cancel's note is delivered");
@@ -903,7 +901,7 @@ async function noteKeptByItsOwnRun(fault?: 'lost' | 'unknown') {
   const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: HELD_NOTE }, [], sub);
   assert.equal(answer.success, true, answer.error);
   assert.equal(waiting(answer).waiting, true, 'premise: accepted as waiting');
-  assert.match(waiting(answer).note ?? '', /If it can't be delivered then, you are told so in your context, and why/,
+  assert.match(waiting(answer).note ?? '', /If it can't be delivered, or the host stops first, you are told what is known of it/,
     'premise: the waiting answer promises the reader is told of a loss');
   // Every write of the note the coordinator makes; the release's replay of a kept one isn't another.
   let noteWrites = 0;

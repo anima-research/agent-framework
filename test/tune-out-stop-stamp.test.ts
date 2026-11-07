@@ -412,7 +412,7 @@ test("4 (Weft): while the boot's stamp isn't written, a waiting cancel's answer 
     const c = h.boot();
     h.state.held = true;
     const answer = await c.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', serverId: 'editor', text: 'Look.' }, [], SUB) as { data?: { note?: string } };
-    assert.match(answer.data?.note ?? '', /This run's start couldn't be recorded in the store yet: if the host stops or dies before the cancel runs while the store still refuses it, you may not be told so when it starts again\.$/);
+    assert.match(answer.data?.note ?? '', /This run's start isn't recorded in the store yet: if the host stops or dies before the cancel runs while the store still refuses it, you may not be told\.$/);
     h.refuse.delete(STAMP);
     h.state.held = false;
     c.runDeferredCancels();
@@ -968,7 +968,7 @@ test("pin: the all-except hold's waiting answer says so too while the boot's sta
     const c = h.boot();
     h.state.held = true;
     const answer = await c.handleSubconsciousTool('cancel_tuneout', { channelId: 'all-except', scope: 'all-except', text: 'Back.' }, [], SUB) as { data?: { note?: string } };
-    assert.match(answer.data?.note ?? '', /This run's start couldn't be recorded in the store yet/);
+    assert.match(answer.data?.note ?? '', /This run's start isn't recorded in the store yet/);
   } finally { h.stopAll(); errors.mock.restore(); }
 });
 
