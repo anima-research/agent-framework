@@ -1065,12 +1065,13 @@ test("a wait released by a listener of the inference:failed a conversation agent
 /** A held turn with a wake beside its retry, released so the two merge into
  *  one start, which parks behind an auxiliary call or is held again at the
  *  last admission boundary by a wait recorded meanwhile. */
-async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membrane: ScriptedMembrane, clock: { advance(ms: number): void; pass(ms: number): void }, wait: number, how: 'parked' | 'held again') {
+async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membrane: ScriptedMembrane, clock: { advance(ms: number): void; pass(ms: number): void }, wait: number, how: 'parked' | 'held again', leads: 'retry' | 'wake' = 'retry') {
   await heldTurn(fw, internal, membrane);
   clock.advance(1);
   fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the hold', metadata: {} });
   await fw.runUntilIdle();
   assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the hold keeps the retry and the wake');
+  if (leads === 'wake') internal.providerAccelerationCooldowns.get('resident')!.heldRequests.reverse();
   const gate = internal.providerGate('resident');
   gate.auxiliaryInFlight = 1;
   clock.pass(wait);
@@ -1114,6 +1115,314 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
       await waitFor(fw, () => membrane.primary >= 3, 'the wake, as a turn of its own');
       assert.match(texts(membrane.calls[2]), /zz-during the hold/);
       assert.deepEqual(aborted, ['zz-operator stop']);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
+  'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
+
+function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<string | symbol, unknown>): symbol {
+  const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+  const before = held.length;
+  (internal as unknown as { rearmExhaustedTurn(...args: unknown[]): void })
+    .rearmExhaustedTurn(fw.getAgent('resident'), new Error('zz-probe'), { ...trigger, reason: 'zz-rearm-probe' }, true, undefined, true);
+  const rearm = held.splice(before)[0] as unknown as Record<string | symbol, unknown> | undefined;
+  const mark = rearm && Object.getOwnPropertySymbols(rearm).find((key) => key.description === 'rearmed' && rearm[key] === true);
+  assert.ok(mark, 'premise: the probe was re-armed into the hold');
+  return mark;
+}
+
+test("a held turn's retry the hold folds into an equal held wake gives that wake the turn's carry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      const wake: Record<string, unknown> = {};
+      for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
+      assert.equal(held.length, 1, 'premise: the hold folds the retry into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.deepEqual((held[0] as unknown as Record<symbol, unknown>)[carry!], retry[carry!]);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held turn's retry the hold folds into an equal held wake gives it the turn's carry, over one the wake kept from an exhausted retry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      const kept = { silence: null, sends: null };
+      const wake: Record<string | symbol, unknown> = { [carry!]: kept, [rearmedMark(fw, internal, retry)]: true };
+      for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
+      assert.equal(held.length, 1, 'premise: the hold folds the retry into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.equal((held[0] as unknown as Record<symbol, unknown>)[carry!], retry[carry!]);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held turn's retry the hold folds an equal retry with another carry into keeps its own carry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      const own = retry[carry!];
+      held.push(retry as unknown as Request);
+      const other: Record<string | symbol, unknown> = { ...retry, [carry!]: { silence: null, sends: null } };
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, other);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal retry into the held one');
+      assert.equal(held[0], retry, 'premise: the held retry is the one kept');
+      assert.equal((held[0] as unknown as Record<symbol, unknown>)[carry!], own);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held turn's retry with no carry the hold folds into an equal held wake leaves it none, though the wake kept one from an exhausted retry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      delete retry[carry!];
+      const wake: Record<string | symbol, unknown> = { [carry!]: { silence: null, sends: null }, [rearmedMark(fw, internal, retry)]: true };
+      for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
+      assert.equal(held.length, 1, 'premise: the hold folds the retry into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.equal((held[0] as unknown as Record<symbol, unknown>)[carry!], undefined);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a wake the hold folds into a held merged start keeps its opening messages when the start is released", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { openingMessages: ['zz-folded'] };
+      for (const key of ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
+        'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines']) {
+        if (start[key] !== undefined) wake[key] = start[key];
+      }
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      const routing = (internal as unknown as { turnRouting: Map<string, { openingMessages?: string[] }> }).turnRouting.get('resident');
+      assert.ok(routing?.openingMessages?.includes('zz-folded'), `the folded wake's opening message: ${JSON.stringify(routing?.openingMessages)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held wake that an equal merged start folds into keeps its opening messages when the start is released", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { openingMessages: ['zz-held-first'] };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
+      assert.equal(held.length, 1, 'premise: the hold folds the merged start into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      const routing = (internal as unknown as { turnRouting: Map<string, { openingMessages?: string[] }> }).turnRouting.get('resident');
+      assert.ok(routing?.openingMessages?.includes('zz-held-first'), `the held wake's opening message: ${JSON.stringify(routing?.openingMessages)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a start merged from an autoContinue wake carrying its turn's opening message and a heartbeat names that message, since the heartbeat brought none", async (t) => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    const triggers: Array<Record<string, unknown> | undefined> = [];
+    const start = internal.startAgentStream.bind(internal);
+    t.mock.method(internal, 'startAgentStream', (agent: unknown, trigger: Record<string, unknown> | undefined, ...rest: unknown[]) => {
+      triggers.push(trigger);
+      return (start as (...args: unknown[]) => Promise<void>)(agent, trigger, ...rest);
+    });
+    try {
+      const at = Date.now();
+      internal.pendingRequests.push(
+        { agentName: 'resident', reason: 'auto-continue', source: 'framework', timestamp: at, openingMessages: ['zz-console message'] } as unknown as Request,
+        { agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: at + 1 },
+      );
+      await fw.runUntilIdle();
+      assert.equal(triggers.length, 1, `premise: one merged start: ${log.lines.join('\n')}`);
+      assert.deepEqual(triggers[0]?.openingMessages, ['zz-console message']);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a heartbeat that continues an open turn before any of its rounds reached its tool calls keeps the turn's opening messages, since it brought none", async (t) => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const turns = internal as unknown as { routingOf(name: string): { openingMessages?: string[] }; openLogical: Map<string, unknown> };
+      const routing = turns.routingOf('resident');
+      routing.openingMessages = ['zz-console message'];
+      turns.openLogical.set('resident', routing);
+      const seen: Array<string[] | undefined> = [];
+      const stream = membrane.streamYielding.bind(membrane);
+      t.mock.method(membrane, 'streamYielding', (request: NormalizedRequest) => {
+        seen.push(routing.openingMessages && [...routing.openingMessages]);
+        return stream(request);
+      });
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now() });
+      await fw.runUntilIdle();
+      assert.equal(seen.length, 1, `premise: the heartbeat's start made one call: ${log.lines.join('\n')}`);
+      assert.deepEqual(seen[0], ['zz-console message']);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held merged start's release gives its first member none of the other members' opening messages, so a member the read check drops leaves its message off the turn", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const start = internal.providerAccelerationCooldowns.get('resident')!.heldRequests[0] as unknown as Record<string | symbol, unknown>;
+      const symbols = Object.getOwnPropertySymbols(start);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const members = start[batchKey] as Array<Record<string | symbol, unknown>>;
+      const first = members[0]!;
+      const other = members.find((member) => member !== first)!;
+      assert.equal(first[retryKey], true, "premise: the batch's first member is the turn's retry");
+      first.openingMessages = ['zz-kept'];
+      other.openingMessages = ['zz-dropped'];
+      other.readsStoredMessage = 'zz-no-such-message';
+      start.openingMessages = ['zz-kept', 'zz-dropped'];
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      assert.ok(log.lines.some((line) => line.startsWith('[wake] resident: dropped 1 wake(s)')), `premise: the read check dropped the other member: ${log.lines.join('\n')}`);
+      const routing = (internal as unknown as { turnRouting: Map<string, { openingMessages?: string[] }> }).turnRouting.get('resident');
+      assert.ok(routing?.openingMessages?.includes('zz-kept'), `premise: the first member's message: ${JSON.stringify(routing?.openingMessages)}`);
+      assert.ok(!routing?.openingMessages?.includes('zz-dropped'), `the dropped member's message: ${JSON.stringify(routing?.openingMessages)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("an equal merged start the hold folds into a held one keeps its members beside the held start's, as at main: gatedRequests counts each wake, and abortInference() puts back each once", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again', 'wake');
+      const before = fw.getHostModeStatus().gatedRequests;
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held[0] as unknown as Record<string | symbol, unknown>;
+      const symbols = Object.getOwnPropertySymbols(start);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const members = start[batchKey] as Array<Record<string | symbol, unknown>>;
+      assert.equal(members.length, 2, 'premise: the merged start stands for the retry and the wake');
+      const own = members.find((member) => member[retryKey] !== true)!;
+      own.zzOwn = true;
+      const again: Record<string | symbol, unknown> = { ...start, [batchKey]: members.map((member) => ({ ...member, zzOwn: false, zzAgain: member[retryKey] !== true })) };
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, again);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal merged start into the held one');
+      assert.equal((start[batchKey] as unknown[]).length, 4, "each start's members are kept");
+      assert.equal(fw.getHostModeStatus().gatedRequests, before + 1, "the incoming start's wake counts too");
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzOwn === true).length, 1, "the held start's wake comes back, once");
+      assert.equal(back.filter((r) => r.zzAgain === true).length, 1, "the incoming start's equal wake comes back too, once");
+      go();
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a wake held on its own, that an equal start led by the turn's retry folds into, is that retry's event, as at main: abortInference() puts back only the start's other wake", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests as unknown as Array<Record<string | symbol, unknown>>;
+      const symbols = Object.getOwnPropertySymbols(held[0]!);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const batchWake = (held[0]![batchKey] as Array<Record<string | symbol, unknown>>).find((member) => member[retryKey] !== true)!;
+      const wake: Record<string | symbol, unknown> = { zzHeld: true };
+      const retry: Record<string | symbol, unknown> = { [retryKey]: true };
+      for (const key of identityKeys) if (batchWake[key] !== undefined) wake[key] = retry[key] = batchWake[key];
+      const other = { ...wake, timestamp: (wake.timestamp as number) + 7, zzHeld: false, zzOther: true };
+      held.length = 0;
+      held.push(wake);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, { ...retry, [batchKey]: [retry, other] });
+      assert.equal(held.length, 1, 'premise: the start folds into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.equal(wake[retryKey], true, "premise: the held wake is marked the turn's retry, as at main");
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+      assert.equal(back.filter((r) => r.zzHeld === true).length, 0, "the held wake's event is the retry's, which the abort ends");
+      assert.equal(back.filter((r) => r.zzOther === true).length, 1, "the start's other wake comes back, once");
+      go();
     } finally { await fw.stop(); log.restore(); }
   });
 });

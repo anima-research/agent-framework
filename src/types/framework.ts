@@ -194,8 +194,9 @@ export interface FrameworkConfig {
    * - `'delivery'` (default): the locus comes only from the delivery that
    *   woke the turn, a conversation fork's home channel, or a channel the
    *   agent opened during the turn. Incoming traffic never moves it — not
-   *   between turns, not mid-turn. A turn with no such locus keeps its
-   *   prose private, and says so in a `[routing]` notice.
+   *   between turns, not mid-turn. A turn with no such locus has routing
+   *   post its prose to no channel, and a `[routing]` notice says so when the
+   *   locus the agent was last told of was a channel.
    * - `'latest-inbound'`: the previous rule. The most recent delivered
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.

@@ -196,6 +196,56 @@ export interface Module {
   ): Promise<void>;
 
   /**
+   * Asked as a turn routes a piece of the agent's plain speech, `text`,
+   * as it goes to the turn's channel, or, when the turn has no channel,
+   * before the turn is told it had nowhere to go. There are two answers:
+   * - a `SpeechSent` naming a place, `{ sentTo }`, when this module showed
+   *   that text to someone, such as the person whose message opened the
+   *   turn: the turn's `[delivered]` receipt names the place, and a turn
+   *   with no channel writes no `[send-undeliverable]` notice for it;
+   * - `{}` otherwise: it can't say the text reached someone, as for a turn
+   *   none of its surfaces opened. A turn with no channel's notice then
+   *   still says another surface may have shown it. A piece held as a draft
+   *   gets no such notice, since it's named as a draft.
+   *
+   * Asked as the turn routes each piece of its plain speech, in the order it
+   * routes them, or holds one as a draft, which can be after later pieces
+   * have routed, under prose routing by locus, hybrid or locked on a host
+   * with a channel registry. Never asked
+   * about private envelopes or words kept private, explicit sends (prefixed
+   * envelopes included) or their own words held as drafts, a turn under
+   * explicit routing, which writes no receipt, or an ephemeral run's unheld
+   * speech with no channel, which is its caller's result. A module that throws, or
+   * hasn't answered within `SPEECH_RECEIPT_WAIT_MS` of its call, names no
+   * place, as `{}` does, and so does a module removed or replaced before it
+   * answers. A module still answering earlier asks past that bound isn't
+   * asked again until each of those answers comes, and names no place meanwhile, as a
+   * wedged `onToolBatchComplete` isn't called again. A hook that blocks
+   * synchronously past that bound
+   * and returns its answer still has it taken, since no timer runs while it
+   * blocks. For a turn that ends with its reply or a tool, the turn's receipt
+   * and the agent's next turn wait for every answer, each piece's up to that
+   * bound, and a routed piece with no channel waits for its answers before
+   * the next piece routes, so a turn of several such pieces can wait that
+   * long for each; only the turn's receipt waits for a held piece's answers. Answer from what the module already holds rather than after a
+   * round trip. A turn that fails or is stopped writes no receipt and
+   * doesn't wait. A turn that had finished when `stop()` began still routes
+   * its speech, and `stop()` waits for those answers in the same way, within
+   * its own timeout: once that runs out it stops the modules, and an answer
+   * that comes after its module has stopped names no place. That holds except for
+   * an ephemeral run's, whose stream its run's end leaves to finish on its
+   * own: when its reply ends the run, its receipt can come after the run
+   * returns, and a `stop()` before it comes loses it; when a tool ends it, it
+   * writes no receipt, as before, and a place a module names for its speech
+   * is logged.
+   */
+  onSpeechRouted?(
+    agentName: string,
+    text: string,
+    context: SpeechRoutedContext
+  ): Promise<SpeechSent>;
+
+  /**
    * Gather context injections before agent inference.
    * Called before each inference to collect data (e.g., HUD overlays, game state)
    * that should be injected into the compiled context.
@@ -743,6 +793,68 @@ export interface SpeechContext {
    * of the process.
    */
   turnId?: number;
+}
+
+/**
+ * What a module is told with plain speech a turn is routing
+ * (`Module.onSpeechRouted`).
+ */
+export interface SpeechRoutedContext {
+  /**
+   * Whether the text is the turn's final speech: the speech after its last
+   * tool call, which a relay that starts a new speech at each
+   * `inference:tool_calls_yielded` writes as the turn's reply. A refused XML
+   * tool attempt traces no `inference:tool_calls_yielded`, and neither does a
+   * call a round cut off at the output limit left unrun, so neither ends a
+   * speech: the speech on both sides of one is final when no later tool call
+   * follows it.
+   */
+  final: boolean;
+
+  /** The turn, as `SpeechContext.turnId` names it. */
+  turnId?: number;
+
+  /**
+   * The request that opened the turn, kept across its streams: after a
+   * context-budget restart the turn's current request is the framework's
+   * continuation, and this is still the one that started it. `messages`
+   * are the messages added by the module answers whose wakes the turn took,
+   * and, for a turn the framework queued to carry another on (a `!`
+   * continuation, an autoContinue run, a bounce's wake, or a retry on a
+   * history rewound after a refusal, an unstick or an inference failure),
+   * the messages that opened that turn, each as its stored id or a held
+   * write's handle, either of which a module context's `getMessage` takes.
+   * A turn that took a cause of its own that brought messages beside such a
+   * continuation, such as a module answer's wake, before any of its rounds
+   * reached its tool calls names that cause's messages, not those the
+   * continuation carried;
+   * a cause that joins a turn already under way is named beside the turn's
+   * own. A message a rewind
+   * removed is still named, and `getMessage` returns `null` for it. A wake
+   * an event gate debounced carries none, so the messages of the module
+   * answers it stands for aren't named.
+   */
+  openedBy?: {
+    reason: string;
+    source: string;
+    timestamp: number;
+    messages: readonly string[];
+  };
+}
+
+/**
+ * What a module did with plain speech it was asked about
+ * (`Module.onSpeechRouted`).
+ */
+export interface SpeechSent {
+  /**
+   * Where it showed the text, as the agent reads it in its `[delivered]`
+   * receipt: "sent to <sentTo>", such as "the terminal that sent this turn".
+   * Whitespace runs read as one space, with none at either end, and a long
+   * place reads whole. Left out
+   * (`{}`) when the module can't say the text reached someone.
+   */
+  sentTo?: string;
 }
 
 /**

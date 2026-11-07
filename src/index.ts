@@ -9,7 +9,7 @@ export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
-export { ModuleRegistry } from './module-registry.js';
+export { ModuleRegistry, SPEECH_RECEIPT_WAIT_MS } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
 export { CLOCK_ROW_KIND, resolveClockConfig } from './clock-rows.js';

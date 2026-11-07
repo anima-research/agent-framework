@@ -576,7 +576,7 @@ describe('Conversation routing', () => {
       }], { system: true, kind: 'channel-notice' });
       // The trunk's own failed reply, which onRouteFailure stores in this shape.
       trunk.addMessage('user', [{
-        type: 'text', text: '[discord-send-failed] Your previous reply (10 chars) could not be delivered to slack:C1 (rate limited). Nothing was posted; it is saved in your archive.',
+        type: 'text', text: '[discord-send-failed] Your previous reply (10 chars) could not be delivered to slack:C1 (rate limited). The framework posted nothing there; it is saved in your archive.',
       }], { system: true, kind: 'discord-send-failed', channelId: 'slack:C1', reason: 'rate limited', textLen: 10 });
     } finally {
       quiet.mock.restore();

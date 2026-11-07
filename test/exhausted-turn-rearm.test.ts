@@ -962,6 +962,17 @@ test("a re-armed turn opens where its turn's plain speech was going after a re-p
   }
 });
 
+test("a re-armed continuation keeps the messages that opened the turn it continues", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n >= 2 && n <= 4 ? serverError : undefined));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100] });
+  queue(r, { reason: 'zz-console-message', openingMessages: ['zz-opening'] });
+  await waitFor(() => r.count('inference:completed') === 1, 'the turn to answer');
+  queue(r, { reason: 'context_budget_restart', source: 'framework' });
+  await waitFor(() => r.count('inference:completed') === 2, 'the re-armed restart to answer');
+  assert.equal(membrane.sends.length, 5, "premise: the turn, the restart's window, then the re-armed send");
+  assert.deepEqual((routingOf(r) as { openingMessages?: string[] } | undefined)?.openingMessages, ['zz-opening']);
+});
+
 test('a continuation of a turn that found a channel after it had none is re-armed there', async (t) => {
   const membrane = new ScriptedMembrane((n) => (n >= 2 && n <= 4 ? serverError : undefined));
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100] });
@@ -1426,4 +1437,40 @@ test("a job's turn aborted from outside ends its run without clearing its failur
   await ran(third, "the third run to fail");
   const failed = stderr.filter((line) => line.startsWith('[inference-failed] agent=job consecutive='));
   assert.deepEqual(failed.map((line) => line.match(/consecutive=(\d+)/)![1]), ['1', '2'], 'the abort is neither an end from outside nor a failure');
+});
+
+test("a provider hold that folds a wake into an equal re-arm keeps it re-armed only if both were, as the scheduler's merge does", async (t) => {
+  const membrane = new ScriptedMembrane(() => serverError, 'event');
+  const r = await resident(t, membrane);
+  const internal = r.fw as unknown as {
+    providerAccelerationCooldowns: Map<string, { heldRequests: Array<Record<string | symbol, unknown>> }>;
+    holdRequest(held: unknown[], request: unknown): void;
+  };
+  const rearmedKey = (request: Record<string | symbol, unknown>) =>
+    Object.getOwnPropertySymbols(request).find((key) => key.description === 'rearmed' && request[key] === true);
+  const held = () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests ?? [];
+  r.say('zz-question');
+  await waitFor(() => held().some((request) => rearmedKey(request) !== undefined), 'a re-arm to be held');
+  const rearm = held().find((request) => rearmedKey(request) !== undefined)!;
+  const key = rearmedKey(rearm)!;
+  const wake: Record<string | symbol, unknown> = { ...rearm };
+  delete wake[key];
+  const marked = (): Record<string | symbol, unknown> => ({ ...rearm, [key]: true });
+  const unmarked = (): Record<string | symbol, unknown> => ({ ...wake });
+  const before = held().length;
+  internal.holdRequest(held(), wake);
+  assert.equal(held().length, before, 'premise: the hold folds the equal wake into the re-arm');
+  assert.equal(rearm[key], undefined, "not re-armed, since the wake folded into it wasn't");
+  const both = [marked()];
+  internal.holdRequest(both, marked());
+  assert.equal(both.length, 1, 'premise: the hold folds the equal re-arm into the re-arm');
+  assert.equal(both[0]![key], true, 'still re-armed, since both were');
+  const second = [unmarked()];
+  internal.holdRequest(second, marked());
+  assert.equal(second.length, 1, 'premise: the hold folds the equal re-arm into the wake');
+  assert.equal(second[0]![key], undefined, "not re-armed, since the wake it folded into wasn't");
+  const neither = [unmarked()];
+  internal.holdRequest(neither, unmarked());
+  assert.equal(neither.length, 1, 'premise: the hold folds the equal wake into the wake');
+  assert.equal(neither[0]![key], undefined, 'not re-armed, since neither was');
 });

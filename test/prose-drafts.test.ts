@@ -601,7 +601,7 @@ describe('held prose drafts, end to end', () => {
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
-      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
+      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (the framework didn't send them — drafts can resend them unchanged, or dismiss them)`);
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
@@ -670,7 +670,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
       assert.equal(
         h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (the framework didn't send them — drafts can resend them unchanged, or dismiss them)`,
       );
     } finally {
       await h.close();
@@ -755,7 +755,7 @@ describe('held prose drafts, end to end', () => {
       const held = h.drafts();
       assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (the framework didn't send them — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
@@ -933,7 +933,7 @@ describe('held prose drafts, end to end', () => {
       assert.equal(h.publishes().filter((p) => p.text === 'scout words').length, 0);
       // Residents of one framework share a message slot (#197), so the
       // notice is visible there too; it names whose drafts it means.
-      const held = h.texts('scout').find((t) => t.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${mine.id}`));
+      const held = h.texts('scout').find((t) => t.startsWith(`[drafts] scout: not sent by the framework — a plain-speech segment held as draft ${mine.id}`));
       assert.ok(held);
       assert.ok(!held!.includes('scout words'), `the held-draft notice quotes none of the draft's words: ${held}`);
     } finally {
@@ -1019,7 +1019,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([text('words a refusing connector drops')])]);
       await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
       const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
-      assert.match(marker, /could not be delivered to .* Nothing was posted/);
+      assert.match(marker, /could not be delivered to .* The framework posted nothing there/);
       assert.deepEqual(h.drafts(), [], 'locus speech is not held');
     } finally {
       await h.close();
@@ -2119,7 +2119,7 @@ describe('draft notices and turn-end settlement', () => {
       const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
         .filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
         .find((text) => text.startsWith('[delivered]'))!;
-      const held = receipt.match(/held as drafts? ([^(]+)\(not sent/)?.[1] ?? '';
+      const held = receipt.match(/held as drafts? ([^(]+)\(the framework didn't send/)?.[1] ?? '';
       assert.ok(held.includes(newer.id), `the draft still held is reported as held: ${receipt}`);
       assert.ok(!held.includes(old.id), `the let-go draft is not offered as held: ${receipt}`);
       assert.ok(receipt.includes(`draft ${old.id} held this turn and since let go by retention (no longer held, so not resendable)`), receipt);
@@ -2855,7 +2855,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       await h.turn(rounds([text(`>>>${ROOM} {{unsent}}`), explicitSend('s2')]));
       assert.equal(h.drafts().length, count, 'a bare {{unsent}} mints no copy');
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (not sent — drafts can resend them unchanged, or dismiss them)`);
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (the framework didn't send them — drafts can resend them unchanged, or dismiss them)`);
 
       // Once the bounce may have been posted, held words copied from it carry its risk.
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -2890,6 +2890,28 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
+  it("hybrid: a draft a bare {{unsent}} delivers in its own turn is named in the log when its receipt can't be recorded", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      fixIds(h, ['d-unsent1']);
+      const cm = h.framework.getAgent('scout')!.getContextManager();
+      const add = cm.addMessage.bind(cm);
+      t.mock.method(cm, 'addMessage', (...args: Parameters<typeof cm.addMessage>) => {
+        if ((args[2] as { kind?: string } | undefined)?.kind === 'delivery-receipt') throw new Error('zz-receipt refused');
+        return add(...args);
+      });
+      await h.turn(rounds([text('>>>#nowhere lost words'), call('l1', 'channel_list', {})], [text(`>>>${ROOM} {{unsent}}`), call('l2', 'channel_list', {})]));
+      assert.deepEqual(h.publishes().map((p) => p.text), ['lost words'], 'premise: the {{unsent}} delivered the draft');
+      const line = errors.find((e) => e.startsWith("[delivered] scout: its receipt couldn't be recorded; it named "));
+      assert.ok(line, `premise: the receipt couldn't be recorded: ${errors.join('\n')}`);
+      assert.ok(line.includes('d-unsent1'), line);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('the turn-end receipt reports each draft as it stands: resent, dismissed, unconfirmed or still held', async () => {
     const h = await harness();
     try {
@@ -2904,7 +2926,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'resend me']);
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
         `[delivered] plain speech → #room (Guild One) (${ROOM}) (draft ${ids[0]}, by your resend) · ` +
-        `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged, or dismiss them) · ` +
+        `1 plain-speech segment(s) held as draft ${ids[2]} (the framework didn't send them — drafts can resend them unchanged, or dismiss them) · ` +
         `draft ${ids[1]} dismissed by you`);
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -3562,7 +3584,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           assert.equal(published(h, SPEECH).length, 0);
           assert.equal(published(h, PARTIAL).length, 0);
           assert.equal(h.drafts().length, 0);
-          assert.deepEqual(notices(h), ['[speech-not-posted] Nothing you wrote before your tool calls in the rounds just above was posted. If any of it should go out, send it again.']);
+          assert.deepEqual(notices(h), ['[speech-not-posted] The framework didn\'t post what you wrote before your tool calls in one or more of the rounds just above. If any of it should go out, send it again.']);
           assert.equal(markers(h).length, 1);
           assert.match(markers(h)[0]!, AFTER_ROUNDS);
           assert.ok(!markers(h)[0]!.includes(CUT_OFF), markers(h)[0]);
@@ -4012,7 +4034,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
   });
 
   describe('native tool mode: the failure and stop notes', () => {
-    const HANDED_ON = 'Plain speech its rounds routed live was handed on for delivery as written, and no [delivered] line was written for it.';
+    const HANDED_ON = 'Some plain speech of its rounds was handed on for delivery or shown as written, and no [delivered] line was written for it.';
     const STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
     for (const [how, shown] of [['error', 'an error'], ['throw', 'a throw'], ['abort', "an abort that isn't a stop"]] as const) {
       it(`a failure after a live-routed round, reported as ${shown}, says the rounds ran and the speech was handed on, and writes no receipt`, async () => {

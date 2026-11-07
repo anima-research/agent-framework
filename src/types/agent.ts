@@ -615,6 +615,8 @@ export interface InferenceRequest {
    *  published into that channel having read it, or once the message isn't
    *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
+  /** @internal For the framework's speech receipts; not a host API. */
+  openingMessages?: string[];
   agentName: string;
   reason: string;
   source: string;

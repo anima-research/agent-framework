@@ -40,7 +40,7 @@ export function autoContinueNotice(opts: {
 }): string {
   return `[${NOTICE_TAG.continue}] ${opts.agentName}, another turn starts now.` +
     (opts.heldAfterSend
-      ? ' Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going.'
+      ? ' Some or all of your closing words last turn were held, and the framework didn\'t send them: a send that turn may already have posted where they were going.'
       : '') +
     (opts.heartbeat
       ? ` If you're done, ${opts.stop}; plain words you write without it and with no destination are held as drafts, as on the heartbeat's turn, and an explicit send reaches a channel.`

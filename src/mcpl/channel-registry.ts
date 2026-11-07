@@ -1044,6 +1044,9 @@ interface ChannelRegistryOptions {
     serverId?: string;
     reason: string;
     textLen: number;
+    /** The words routed, whichever the outcome; the registry sets it on
+     *  every failure it reports. */
+    text?: string;
     /** `failed`: nothing was posted; `unknown`: the request was dispatched
      *  and no valid receipt came back, so it may or may not have been. */
     outcome?: 'failed' | 'unknown';
@@ -5803,8 +5806,8 @@ export class ChannelRegistry {
    * What every conversation that takes the global fallback falls back to when
    * neither a home channel nor its own delivery names one: the all-except
    * hold's channel while one is open, else the latest delivered inbound
-   * channel under the legacy locus rule, else none — the prose stays private
-   * (architecture channel §3 carve-out, 2026-10-06).
+   * channel under the legacy locus rule, else none, and routing posts the
+   * prose to no channel (architecture channel §3 carve-out, 2026-10-06).
    */
   private sharedFallback(): ChannelRef | null {
     return this.focusChannelResolver?.() ?? this.fallbackLocus();
@@ -6105,7 +6108,8 @@ export class ChannelRegistry {
    * Plain speech for one turn segment: publish `text` to the turn's frozen
    * locus and report the PublishOutcome. A failure (or an uncertain outcome)
    * is surfaced as a trace and through onRouteFailure, so the agent learns
-   * its words did not (or may not have) reached anyone. A `failed` one whose
+   * that this route didn't deliver its words, or didn't confirm it.
+   * A `failed` one whose
    * caller holds its words with a notice of its own (`heldOnFailure`) gets
    * the trace but not onRouteFailure. An ephemeral run's speech with no locus
    * (null) is its caller's result: it returns as not delivered and surfaces
@@ -6118,10 +6122,8 @@ export class ChannelRegistry {
     text: string,
     /** The turn's FROZEN locus, with its server, snapshotted once by the caller (resolveLocus
      *  at turn start) and passed to every segment of the turn. Mandatory:
-     *  there is deliberately no live-resolution fallback here — a late
-     *  dispatch resolving live can read the NEXT turn's trigger state or a
-     *  stale global default and land the reply in the wrong channel (item-3,
-     *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
+     *  there is deliberately no live-resolution fallback here (item-3,
+     *  PR #32). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess,
      *  except for an ephemeral run, whose speech is then its caller's
      *  result. */
@@ -6152,7 +6154,7 @@ export class ChannelRegistry {
       if (status === 'unknown' || !opts?.heldOnFailure) {
         this.onRouteFailure?.({
           conversationId, channelId, ...(channel ? { serverId: channel.serverId } : {}),
-          reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}),
+          reason, textLen: text.length, text, outcome: status, ...(detail !== undefined ? { detail } : {}),
         });
       }
       return outcome;
@@ -6180,8 +6182,8 @@ export class ChannelRegistry {
         return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
       }
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays in
-      // the archive; honor that.
+      // global inbound ever seen) — the agent was told routing posts its
+      // prose to no channel; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';
