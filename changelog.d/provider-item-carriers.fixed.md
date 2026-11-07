@@ -10,9 +10,11 @@
     turn, a resident whose turns used server tools now sends those stored
     blocks, such as web-search results, in each later turn's first request,
     so those requests are larger.
-  - The first request after a host takes this release differs from the one
-    before it for each resident whose stored history holds such items, so
-    that request writes the prompt cache afresh, once.
+  - For a resident whose stored history holds items its wire now sends,
+    compaction items on the Responses API or server-tool blocks on
+    Anthropic's API, the first request after a host takes this release
+    differs from the one before it from the first such item on, so the
+    provider's prompt cache matches it only up to there.
   - An agent whose `foreignRounds` is `'raw'`, and a co-resident's rows
     stored before audience stamps, now send another agent's stored items as
     stored, as the rest of its rows already go. Whether OpenAI accepts a
@@ -25,10 +27,11 @@
     server-tool blocks, and a lone call in the request's last message; the
     other wires get none.
   - The framework doesn't resume a paused Anthropic turn (`pause_turn`)
-    itself. But a request made while a round stored as server-tool blocks
-    alone is newest now ends on that round, with no `[Continue]` after it,
-    which is the shape Anthropic asks for to resume one. Before, the request
-    left the round out.
+    itself. But while a round stored as server-tool blocks alone is newest, a
+    request now ends on that round, with no `[Continue]` after it, which is
+    the shape Anthropic asks for to resume one; a silent tick's opening
+    request still ends on the tick's separator, so its lone call is left
+    out. Before, every request left the round out.
   - A tool boundary's note to a context manager that keeps a thinking-binding
     record now names a row holding such an item where the next request
     carries it as the stream sent it, rather than marking it as a difference.

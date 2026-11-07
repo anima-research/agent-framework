@@ -155,8 +155,9 @@ import type {
  * all context injections. Both count only messages that hold a turn
  * (holdsTurn), as the injection tail is counted: a message holding only
  * provider items' carriers isn't a turn, and is passed over. So a paused
- * Anthropic round stored as server-tool blocks alone, newest, ends the
- * request with no [Continue] after it.
+ * Anthropic round stored as server-tool blocks alone, newest, gets no
+ * [Continue] after it (a silent tick's opening request still ends on the
+ * tick's separator).
  */
 function turnBeforeInjections(messages: NormalizedMessage[], injectionTail: number): { turn: NormalizedMessage | undefined; injectionsOnly: boolean } {
   let counted = 0;
