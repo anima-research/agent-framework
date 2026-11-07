@@ -20,4 +20,4 @@
     context, with the reason. A reader fork's is dropped at a stop.
   - A stop before the retry succeeds loses the queued cancel, and the hold
     is still in force after the restart unless its end time has passed, or
-    the host starts again with no reader, which ends every hold on record.
+    the host starts again with no reader, which cancels every hold on record.
