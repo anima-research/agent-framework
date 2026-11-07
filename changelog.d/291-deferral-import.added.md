@@ -2,19 +2,13 @@
   for one release). `create()` reads the queue's record (`recovery/deferred-writes.json`, or the store's
   `framework/deferred-writes` slot), after the quiesced flags and before the boot's pass over the windows and the
   agent registry's reconcile, and stores its writes in the order they arrived, each under its queued id
-  (`metadata.deferredWriteId`), with a `message:added` trace whose source is `deferred-import`. A write that already
-  landed is skipped by that id, and one whose landing was unknown is looked up across its agent's whole branch
-  first. A write keeps the audience stamp it was queued with; one queued before the stamp is stamped as any write,
+  (`metadata.deferredWriteId`), with a `message:added` trace whose source is `deferred-import`. A write keeps the audience stamp it was queued with; one queued before the stamp is stamped as any write,
   and a puppeted tool-call pair as its agent's own round. A write for an agent no longer registered goes to the
   primary as its by-name notice, stamped for the primary alone whatever stamp it was queued with, when it is a
   failed reply, a channel notice its reader could act on, or a module's write for a run or a fork; anything else is
   dropped, logged. A tune-out's release among them wakes its agent, and mail among them is released as it is stored
   and wakes its recipient. The store is synced, and only then is the record cleared; where it doesn't sync, the
-  record is left as it was and the next boot skips what landed. A write that can't be stored, or whose agent's store
-  can't be searched, keeps it and that agent's later writes in the record for the next boot (one context-manager
-  refuses as malformed is dropped, logged, as the queue's flush dropped it), which stores them after
-  the writes made for that agent later in this process (each stored as it was made), so they land after those in
-  its store and its window. An unreadable record,
+  record is left as it was and the next boot skips what landed. A write that can't be stored stays in the record for the next boot, with that agent's later writes. An unreadable record,
   or one that holds anything but a queue, still fails `create()`. The imported rows enter each agent's window at the
   boot's pass, or at `resume()` on a quiesced host, apart from an agent's own rows. The release after this one
   deletes the importer, so a host boots this release until its record is empty (the `deferred-import` alert says
@@ -38,5 +32,3 @@
   result is stored this way tells its recipient nothing about ending without a result, as 0.32.0 told nothing
   while the result was held; 0.32.0 told the recipient of a result already stored and released before the restart
   that the job ended without one (see Fixed: at boot, an interrupted job's end is told from what its recipient's store holds).
-  Where the boot can't read what an agent is owed to ask those wakes, the agent's arrivals stay out of its window
-  until its next turn start, at the boot's pass and at every point at rest after it, so a later boot asks them.
