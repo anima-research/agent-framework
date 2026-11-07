@@ -9,6 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent } from '../src/agent.js';
+import { hasRenderedContent } from '../src/stored-injections.js';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Membrane } from '@animalabs/membrane';
 
@@ -81,6 +82,60 @@ describe('buildActivationRequest empty-text sanitize', () => {
     assert.equal(request.messages.length, 4);
     assert.deepEqual(request.messages[1]!.content, [toolUse]);
     assert.deepEqual(request.messages[2]!.content, [toolResult]);
+  });
+
+  it('keeps a provider-native item\'s carrier, which membrane sends as its item or leaves out, per provider', async () => {
+    // membrane carries an item it has no block type for, such as OpenAI's compaction item or Anthropic's
+    // web-search results, as an exactly empty text block whose rawItem is an object.
+    const compaction = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'x' } };
+    const search = { type: 'text', text: '', rawItem: { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_1', content: [] } };
+    const agent = agentCompiling([
+      { participant: 'human', content: [{ type: 'text', text: 'hi' }] },
+      { participant: 'tester', content: [compaction, { type: 'text', text: 'ok' }] },
+      // A message holding only a carrier stays too.
+      { participant: 'tester', content: [search] },
+      { participant: 'human', content: [{ type: 'text', text: 'and?' }] },
+    ]);
+    const request = await agent.buildActivationRequest([]);
+    assert.equal(request.messages.length, 4);
+    assert.deepEqual(request.messages[1]!.content, [compaction, { type: 'text', text: 'ok' }]);
+    assert.deepEqual(request.messages[2]!.content, [search]);
+  });
+
+  it('strips what only looks like a carrier: whitespace text with an item, or an item that isn\'t an object', async () => {
+    const agent = agentCompiling([
+      {
+        participant: 'human',
+        content: [
+          { type: 'text', text: ' ', rawItem: { type: 'compaction', id: 'cmp_1' } },
+          { type: 'text', text: '', rawItem: 'compaction' },
+          { type: 'text', text: '', rawItem: null },
+          { type: 'text', text: 'kept' },
+        ],
+      },
+    ]);
+    const request = await agent.buildActivationRequest([]);
+    assert.deepEqual(request.messages[0]!.content, [{ type: 'text', text: 'kept' }]);
+  });
+
+  it('agrees with the stored-injection check (hasRenderedContent) on what a message keeps', async () => {
+    const blocks = [
+      { type: 'text', text: '' },
+      { type: 'text', text: ' \n' },
+      { type: 'text', text: null },
+      { type: 'text', text: 'said' },
+      { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } },
+      { type: 'text', text: ' ', rawItem: { type: 'compaction', id: 'cmp_1' } },
+      { type: 'text', text: '', rawItem: 'compaction' },
+      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } },
+    ];
+    for (const block of blocks) {
+      const request = await agentCompiling([
+        { participant: 'human', content: [block] },
+        { participant: 'human', content: [{ type: 'text', text: 'last' }] },
+      ]).buildActivationRequest([]);
+      assert.equal(request.messages.length === 2, hasRenderedContent([block] as never), JSON.stringify(block));
+    }
   });
 
   it('runs BEFORE the trailing-assistant check: a sanitize-exposed trailing assistant still gets [Continue]', async () => {

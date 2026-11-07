@@ -14,12 +14,24 @@ export type SentRow = MessageId | { unstored: true };
 const UNSTORED: SentRow = Object.freeze({ unstored: true as const });
 
 /**
+ * Whether a block is membrane's carrier for a provider-native item it has no block type for, such as OpenAI's
+ * compaction item or Anthropic's server-tool blocks: an exactly empty text block whose `rawItem` is an object, as
+ * membrane's own `isRawItemCarrier` judges one.
+ */
+export function carriesRawItem(block: ContentBlock): boolean {
+  if (block.type !== 'text' || block.text !== '') return false;
+  const raw = (block as { rawItem?: unknown }).rawItem;
+  return raw !== null && typeof raw === 'object';
+}
+
+/**
  * Whether a request carries a block: the sanitize pass leaves out an empty or whitespace text block, which the
- * Anthropic API refuses (assembleActivationRequest). The `typeof` guard is runtime defense: history loaded from
- * disk can carry a non-string `text` despite what the types claim.
+ * Anthropic API refuses (assembleActivationRequest), and keeps a provider-native item's carrier (carriesRawItem),
+ * which membrane's formatters send as its item or leave out, per provider. The `typeof` guard is runtime defense:
+ * history loaded from disk can carry a non-string `text` despite what the types claim.
  */
 export function carriedBlock(block: ContentBlock): boolean {
-  return !(block.type === 'text' && (typeof block.text !== 'string' || block.text.trim() === ''));
+  return carriesRawItem(block) || !(block.type === 'text' && (typeof block.text !== 'string' || block.text.trim() === ''));
 }
 
 /**
@@ -37,14 +49,12 @@ export function asNextRequestCarries(content: readonly ContentBlock[]): ContentB
  * empty text block, which the API refuses. An empty text block carrying a provider-native item (`rawItem`) it sends
  * as that item where it's a server-tool block it knows, in an assistant turn, and leaves out otherwise; whitespace
  * text it sends, behind the participant's name where a multiuser conversation shows names. The next request's
- * sanitize pass leaves both out, so both count as differences. Where membrane, or the adapter's cleanup (whitespace in
- * an assistant turn), leaves one out of both requests, that's a needless strip rather than a row named for bytes the
- * provider didn't see.
+ * sanitize pass keeps the carrier, which membrane treats there as it did in the stream, and leaves the whitespace out,
+ * so whitespace counts as a difference. Where membrane, or the adapter's cleanup (whitespace in an assistant turn),
+ * leaves it out of both requests, that's a needless strip rather than a row named for bytes the provider didn't see.
  */
 function sentBlock(block: ContentBlock): boolean {
-  if (block.type !== 'text' || block.text !== '') return true;
-  const raw = (block as { rawItem?: unknown }).rawItem;
-  return raw !== null && typeof raw === 'object';
+  return block.type !== 'text' || block.text !== '' || carriesRawItem(block);
 }
 
 /** A block's own cache marker left out: the provider's thinking binding doesn't count it, nor does the context

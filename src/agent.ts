@@ -2158,7 +2158,11 @@ export class Agent {
     // through unchanged, so tool pairing is unaffected. (Field-observed
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
     // path entirely; twin of context-manager's stripEmptyTextBlocks on the
-    // compression path.)
+    // compression path.) An exactly empty text block that carries a
+    // provider-native item (`rawItem`), as membrane carries OpenAI's
+    // compaction item and Anthropic's server-tool blocks, stays: membrane's
+    // formatters send it as its item or leave it out, per provider, and none
+    // sends it as an empty text block.
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
     // Another agent's rounds go out as this agent is sent them (setForeignRounds).

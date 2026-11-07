@@ -28,6 +28,8 @@
  */
 
 import type { ContextInjection } from '@animalabs/context-manager';
+import type { ContentBlock } from '@animalabs/membrane';
+import { carriedBlock } from './sent-rows.js';
 import { stableHash } from './stable-hash.js';
 import { injectionsAsStored } from './text-as-stored.js';
 
@@ -104,18 +106,16 @@ export function isStoredKind(injection: ContextInjection): boolean {
 }
 
 /**
- * Whether content leaves anything in a request: a block that isn't a text
- * block, or a text block with non-blank text, as the request's sanitizer
- * keeps (Agent's assembleActivationRequest drops blank text blocks, and a
- * message left with none). An injection with none isn't stored: its row
- * would vanish from every request, and the count of stored rows the
- * request ends on, which keeps [Continue] last, would then be wrong.
- * compile() places it, and the sanitizer drops it, as before.
+ * Whether content leaves anything in a request: a block the request's
+ * sanitizer keeps (carriedBlock: Agent's assembleActivationRequest drops
+ * blank text blocks but for a provider-native item's carrier, and a message
+ * left with none). An injection with none isn't stored: its row would
+ * vanish from every request, and the count of stored rows the request ends
+ * on, which keeps [Continue] last, would then be wrong. compile() places
+ * it, and the sanitizer drops it, as before.
  */
 export function hasRenderedContent(content: ContextInjection['content']): boolean {
-  return Array.isArray(content) && content.some((block) =>
-    !((block as { type?: unknown }).type === 'text'
-      && (typeof (block as { text?: unknown }).text !== 'string' || ((block as { text: string }).text).trim() === '')));
+  return Array.isArray(content) && content.some((block) => carriedBlock(block as ContentBlock));
 }
 
 /** One injection as its row would store it: its namespace as text (as
