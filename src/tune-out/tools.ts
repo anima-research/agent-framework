@@ -1,6 +1,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
-import { authorLine } from '../author-presentation.js';
+import { ANONYMOUS_PARTICIPANT, authorLine } from '../author-presentation.js';
 import type { StoredMessage } from '@animalabs/context-manager';
+import { NOTHING_SAID, foreignRowAsSent } from '../foreign-rounds.js';
 /**
  * The subconscious's tool surface (issue #77).
  *
@@ -126,8 +127,13 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
  */
 export type TuneOutReader =
   | { readonly kind: 'persistent'; readonly name: string; readonly running?: false }
-  | { readonly kind: 'forks' };
-
+  | {
+      readonly kind: 'forks';
+      /** `subconscious.persist`, when it persists the reader; left out for a fork per look. */
+      readonly persist?: 'epoch' | 'resident';
+      /** `subconscious.resync`, read with `persist`. */
+      readonly resync?: 'window' | 'none';
+    };
 /**
  * What a tuned-out channel's messages are, as the words after "its
  * messages" in a refusal a resident reads (a channel tool's on a tuned-out
@@ -196,8 +202,10 @@ export function tuneOutNoReaderAnswer(reader: TuneOutReader): string | undefined
  *   the resident's head — the resident's whole prefix, its refusals
  *   included, ending with it — hands it the traffic held since the last
  *   look as the first message after the fork point, and lets it report
- *   back as attributed mail. No agent persists between invocations;
- *   dispositions do, in the coordinator's state. Its `voice` is framing,
+ *   back as attributed mail. By default no agent persists between
+ *   invocations; dispositions do, in the coordinator's state. With
+ *   `persist` `'epoch'` or `'resident'`, the first look derives one
+ *   identity and later looks resume it (ForkReaderConfig.persist). Its `voice` is framing,
  *   not a system prompt, and residents are shown the reader's four tools
  *   in their tool block (refused at dispatch), so the fork's request is
  *   the resident's up to the fork point.
@@ -315,7 +323,8 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
   forkIdleTimeoutMs?: number;
   /**
    * How a reader fork is prompted: the content of the one message it
-   * receives after the fork point. Default `defaultReaderFraming`. The
+   * receives after the fork point (a resumed persisted reader, after its
+   * own last round). Default `defaultReaderFraming`. The
    * framework stores whatever this returns as a user message with
    * `metadata.kind = 'tune-out-reader-framing'`; the notice, voice,
    * dispositions and held traffic are in the context, and nothing else
@@ -328,13 +337,94 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    * as it leaves out all held traffic (the default framing shows them).
    */
   framing?: (context: ReaderFramingContext) => ContentBlock[];
+  /**
+   * Whether the reader is one derived identity across looks, and over what
+   * scope.
+   *
+   * - `'look'` (the default): each look derives a fork of its own,
+   *   `reader/<resident>/<epoch8>/<n>`, which runs once; nothing reads it
+   *   again.
+   * - `'epoch'`: the first look in a tune-out derives
+   *   `reader/<resident>/<epoch8>/g<k>` as `'look'` derives a fork, and each
+   *   later look in that tune-out resumes it (`resumeAgent`): a new
+   *   incarnation on the same branch, which continues from its own last
+   *   round, rather than a new fork.
+   * - `'resident'`: the same, one identity across tune-outs,
+   *   `reader/<resident>/g<k>`.
+   *
+   * The framework derives the identity again, under the next `g<k>`, when
+   * it has no ended record of it in scope (with `'epoch'`, of that
+   * tune-out), when the derivation's checkpoint
+   * is no longer on the host's branch, when (with `resync: 'window'`) its
+   * last look was framed on another branch than the resident's window reads
+   * now, or (with `'epoch'`) when the tune-out had ended before the look was
+   * asked for. Each such derivation is traced (`tune-out:reader-rederived`,
+   * with its reason). One look runs at a time for one identity: a look asked
+   * for while another runs waits for it. `dendrite.beforeDerive` is asked at
+   * every derivation and every resumption; a resumption it refuses is a
+   * failed look, and its held rows go back as any failed look's do.
+   */
+  persist?: 'look' | 'epoch' | 'resident';
+  /**
+   * What a resumed reader is handed besides the held traffic. Read with
+   * `persist` `'epoch'` or `'resident'` only.
+   *
+   * - `'window'` (the default): the rows the resident's window took since
+   *   the reader's last look (ReaderFramingContext.residentRows), read from
+   *   the resident's window index from the place recorded on the reader's
+   *   previous framing row (`metadata.residentThrough`).
+   * - `'none'`: nothing more.
+   */
+  resync?: 'window' | 'none';
+  /**
+   * How much of the resident's window a resumed reader is handed with
+   * `resync: 'window'`: the newest rows it took since the reader's last
+   * look, as many as fit both bounds, and a count of the older ones left out
+   * (ReaderFramingContext.residentRowsOmitted). The framing row's mark is
+   * the window's end either way, so a row left out is never handed at a
+   * later look.
+   *
+   * - `rows`: the most rows handed. Left out, no count bound.
+   * - `chars`: the most characters the rows take as the default framing
+   *   writes them (defaultReaderFraming), their count line included. Left
+   *   out, the room the reader's strategy gives one message
+   *   (`maxMessageTokens`, at four characters a token, as the tune-out
+   *   dump's bound is read) less what the default framing's other parts
+   *   take at that look (header, voice, dispositions, held traffic), so the
+   *   framing fits that room whole: such a strategy keeps a message's first
+   *   characters up to its room and cuts the rest, and the held traffic
+   *   comes last. A strategy with no per-message cap gives no bound.
+   *
+   * A row's media blocks are kept as they are, and count as no characters,
+   * as the strategy's cut counts them; how many images a compile keeps is
+   * the reader's strategy's image limits'.
+   */
+  resyncLimit?: { rows?: number; chars?: number };
+  /**
+   * The resident's tool round in flight when a reader is derived, as
+   * `DeriveAgentOptions.pendingRound` takes it, or a function of the look's
+   * framing context that returns it. Left out, or returning undefined, the
+   * framework's default holds: the round is reproduced on the reader's
+   * branch, its only open call answered with the framework's note of what
+   * the reader is. A resumption reproduces no round.
+   */
+  pendingRound?: ReaderPendingRound | ((context: ReaderFramingContext) => ReaderPendingRound | undefined);
+}
+
+/** The resident's tool round in flight at a reader's derivation, as `DeriveAgentOptions.pendingRound` takes it. */
+export interface ReaderPendingRound {
+  include?: boolean;
+  /** The result for the call the reader is told made it; `toolUseId` left out, the only open call. */
+  madeBy?: { toolUseId?: string; result: string };
+  /** Results for other calls still open, by tool-use id. */
+  results?: Record<string, string>;
 }
 
 /** What a reader fork's framing is built from. */
 export interface ReaderFramingContext {
   /** The resident the fork was derived from. */
   resident: string;
-  /** The fork's own name. */
+  /** The fork's own name: with `persist` `'epoch'` or `'resident'`, the identity's, the same at each look it is resumed for. */
   fork: string;
   /** `ForkReaderConfig.voice`. */
   voice: string;
@@ -361,13 +451,64 @@ export interface ReaderFramingContext {
    * @deprecated Never set since #291; removed in a later release.
    */
   queuedCount?: number;
+  /**
+   * With `persist` `'epoch'` or `'resident'`: whether this look resumes the
+   * reader (true) or derives it (false). Left out with `'look'`.
+   */
+  resumed?: boolean;
+  /**
+   * With `persist` `'epoch'` or `'resident'`: the reader's incarnation for
+   * this look, 1 at a derivation. Left out with `'look'`.
+   */
+  incarnation?: number;
+  /**
+   * With `persist` `'epoch'` or `'resident'`, on a derivation that follows
+   * an earlier one of the identity: why it was derived again. Left out
+   * otherwise.
+   */
+  rederived?: ReaderRederivedReason;
+  /**
+   * With `persist` `'epoch'` or `'resident'` and `resync: 'window'`, on a
+   * resumed look: the rows the resident's window took since this reader's
+   * last look, in window order (the resident's own rounds as stored, what it
+   * was shown, the mail it was sent). Left out are the reader's own mail and
+   * rows under its name, the resident's stored context injections, and held
+   * traffic, which the resident's window doesn't take and which comes as
+   * `backlog`. With `resyncLimit`, the newest of them (residentRowsOmitted).
+   * Left out on any other look, and when they can't be read
+   * (residentRowsUnavailable).
+   */
+  residentRows?: StoredMessage[];
+  /**
+   * With `residentRows`: how many older rows the resident's window took
+   * since the reader's last look `resyncLimit` leaves out of them. Left out
+   * when it leaves out none.
+   */
+  residentRowsOmitted?: number;
+  /**
+   * With `persist` `'epoch'` or `'resident'` and `resync: 'window'`, on a
+   * resumed look whose rows can't be read, why: `'not-presented'`, the
+   * resident's window isn't presented, so there is no index to read it
+   * from; `'no-mark'`, no framing row on the reader's branch records where
+   * the resident's window stood on the branch it reads now. `residentRows`
+   * is left out then.
+   */
+  residentRowsUnavailable?: 'not-presented' | 'no-mark';
 }
+
+/** Why a persisted reader was derived again rather than resumed (ForkReaderConfig.persist). */
+export type ReaderRederivedReason = 'no-record' | 'branch-moved' | 'scope-ended';
 
 /**
  * The default reader-fork framing: a header naming the channel, epoch and
- * trigger; the notice; the voice block; standing dispositions if any; then
- * the held traffic as `author: text` lines with non-text blocks (images,
- * documents) preserved in order as the source supplied them.
+ * trigger; the notice; the voice block; standing dispositions if any; with
+ * `residentRows` (a resumed persisted reader's), the rows the resident's
+ * context took since the last look, under a count line that says how many
+ * older ones `residentRowsOmitted` leaves out, each as a line
+ * (residentRowLines), or with `residentRowsUnavailable`, a line saying they
+ * could not be read; then the held traffic as `author: text` lines with
+ * non-text blocks (images, documents) preserved in order as the source
+ * supplied them.
  */
 export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] {
   const header =
@@ -375,6 +516,10 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     `${ctx.notice}\n\n${ctx.voice}` +
     (ctx.dispositions ? `\n\n[Standing dispositions]\n${ctx.dispositions}` : '');
   const content: ContentBlock[] = [{ type: 'text', text: header }];
+  if (ctx.residentRows !== undefined) content.push(...residentRowLines(ctx.resident, ctx.residentRows, ctx.residentRowsOmitted ?? 0));
+  else if (ctx.residentRowsUnavailable !== undefined) {
+    content.push({ type: 'text', text: `\n[What entered ${ctx.resident}'s context since your last look could not be read; none of it is shown here.]` });
+  }
   if (ctx.backlog.length === 0) {
     content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
     return content;
@@ -386,17 +531,85 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
   };
   for (const message of ctx.backlog) {
     const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
-    const text = message.content
-      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n');
-    lines.push(authorLine(author, text));
-    const media = message.content.filter((b) => b.type !== 'text');
-    if (media.length > 0) {
-      flush();
-      content.push(...media);
-    }
+    writeRowInOrder(message.content, author, '', lines, content);
   }
   flush();
   return content;
+}
+
+/**
+ * The rows a resident's context took since a persisted reader's last look,
+ * as the default framing writes them: a count line, of `rows` and the
+ * `omitted` older ones, which it says are not shown, then a line per row,
+ * `author: text`, its tool calls and results as the transcript the
+ * persistent subconscious is sent a resident's rounds in (foreignRowAsSent:
+ * the tool's name and its input or outcome in brief, no thinking), and its
+ * non-text blocks as they are, each where it stands in the row
+ * (writeRowInOrder, as the held traffic is written). A row's author is its
+ * participant, or for a row under the anonymous participant, the author its
+ * metadata names; one that names none, a tool result's or a notice's, goes
+ * with no author. Each row counted has its line: a row that opens with media
+ * has `author: ` before it (with no author to name, its media alone), and a
+ * row with nothing to send reads `[no text]`.
+ */
+function residentRowLines(resident: string, rows: readonly StoredMessage[], omitted = 0): ContentBlock[] {
+  if (rows.length === 0 && omitted === 0) return [{ type: 'text', text: `\n[Nothing has entered ${resident}'s context since your last look.]` }];
+  const n = rows.length + omitted;
+  const cut = omitted === 0 ? '' : omitted === n ? '; none is shown here' : `; the oldest ${omitted === 1 ? 'is' : `${omitted} are`} not shown here`;
+  const content: ContentBlock[] = [];
+  const lines: string[] = [`\n[In ${resident}'s context since your last look: ${n} message${n === 1 ? '' : 's'}${cut}]`];
+  const flush = () => {
+    if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
+  };
+  // Each result is named by the call it answers, as the transcript names it.
+  const callNames = new Map<string, string>();
+  for (const row of rows) for (const b of row.content) if (b.type === 'tool_use') callNames.set(b.id, b.name);
+  for (const row of rows) {
+    const author = row.participant === ANONYMOUS_PARTICIPANT
+      ? (row.metadata as { author?: { name?: string } } | undefined)?.author?.name
+      : row.participant;
+    writeRowInOrder(foreignRowAsSent(row.content, { callNames }), author, NOTHING_SAID, lines, content);
+  }
+  flush();
+  return content;
+}
+
+/**
+ * One row of a reader framing, written onto `lines` (the text block being
+ * built) and `content` in the order of its blocks. The row's text runs into
+ * a line, and its first line is `author: text` when it has an author to name
+ * (authorLine). At a non-text block (an image, a document) the line ends,
+ * `lines` goes into `content` as a text block, the block follows it, and the
+ * text after it runs into a new line, with no author. A row that opens with
+ * a non-text block has `author: ` before it (nothing, with no author to
+ * name), and a row with neither text nor other blocks reads `empty`, under
+ * its author when it has one.
+ */
+function writeRowInOrder(
+  blocks: readonly ContentBlock[],
+  author: string | undefined,
+  empty: string,
+  lines: string[],
+  content: ContentBlock[],
+): void {
+  let run: string[] = [];
+  let opened = false;
+  const endLine = () => {
+    const said = run.join('\n');
+    run = [];
+    if (!opened && author !== undefined) lines.push(authorLine(author, said));
+    else if (said.length > 0) lines.push(said);
+    opened = true;
+  };
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      run.push(block.text);
+      continue;
+    }
+    endLine();
+    if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
+    content.push(block);
+  }
+  if (!opened && run.join('\n').length === 0) run = [empty];
+  endLine();
 }
