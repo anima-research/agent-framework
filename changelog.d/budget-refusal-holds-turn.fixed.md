@@ -1,0 +1,119 @@
+- A turn whose compile is refused for budget waits for compression and then
+  runs, instead of ending (#304). The refusal comes before any provider call,
+  for example after an immediate budget decrease. Before, the error policy
+  retried it into the same refusal within seconds and ended the turn, and once
+  compression had made the context fit, nothing ran it again, so the agent
+  stayed silent until its next wake. Now a resident's or a conversation
+  agent's turn is held while its context manager has compression pending, and
+  later wakes join it. The hold leaves the provider gate open and drives
+  compression itself: from its start it ticks the agent's context manager
+  while a call of that manager's starts during each tick, so it doesn't wait
+  for a maintenance pass, and it drives it again after each pass (with the
+  maintenance timer off, every 5 seconds) and when a call of that manager's
+  lands while the turn is held, unless a drive of the hold's own or a drain it
+  joined is under way, whose end looks again; for a call that lands during a
+  drain it hasn't joined, such as the OverBudget drain breaker's, the hold
+  looks at once and, still short, joins that drain, whose end looks again.
+  A tick that starts no call, as while
+  compression is paused after a failure, ends that drive. An ephemeral run, a
+  turn in a framework that `start()` hasn't started (only `runUntilIdle()`
+  runs its turns, so nothing would run a released one), and a refusal with
+  nothing pending fail as before. What a held turn changes for hosts is under
+  Changed.
+  - **When it runs:** as one fresh compile, once context-manager's preview of
+    that compile, at its budget and with its thinking binding, says it fits. A
+    dry compile can't say so, since it can resolve a plan the turn's compile
+    refuses. A refusal the preview rethrows, such as a context refusal, counts
+    as a refusal. A strategy with no preview gets the dry compile. The
+    hierarchical strategy's preview reports a context that doesn't fit, and
+    for one that does, the dry compile decides. The hold looks after each tick
+    it drives that starts a compression call, so a call that makes the context
+    fit releases the turn at once, and looks again when each drive, or drain
+    it joined, ends, when a call of that manager's lands outside them, and
+    after each maintenance pass. After a compression call returns, its
+    chunk's quarantine clean-up can still run under the compression-state
+    lock; a hold that looked during that clean-up, with more compression
+    still needed, is looked at again at the next maintenance pass, at the
+    hold's recheck with the
+    maintenance timer off, or when another call of that manager's lands. With
+    the maintenance timer on, once the hold's own drive has ended, the hold
+    drives compression again at a pass's end or when a later call of that
+    manager's lands, so a pass that never ends, with no other call of that
+    manager's landing, keeps the turn held until the turn is ended, as by an
+    abandoning quiesce, `abortInference()` or a stop; with the timer off, so
+    does a tick of the hold's own that never ends. It takes a fresh verdict
+    only once something that could make the context fit has changed:
+    compression's progress or whether it still has compression pending, a
+    message added, edited or removed (other than the arrival of a stored
+    context injection, the hold's own note among them, or of a clock row, and
+    the arrival or edit of a row a suppress rule kept out of the context), the
+    agent's runtime settings, the budget its next compile plans at, or its
+    context manager's pins and document marks, since removing one can let
+    messages it kept raw fold to summaries they already have. Those are the
+    changes known to move the verdict; a chunk's lock (the autobiographical
+    strategy's `lockChunk`, which this framework doesn't call) isn't among
+    them, so a turn held until an unlock lets it fit waits for the next of
+    those changes. A turn
+    released and refused again is held again, as of the refusal that first
+    held it, and isn't released again until one of those changes.
+  - **When it ends without a fit:** once compression has nothing pending and
+    the context still doesn't fit. The turn then compiles once more: it runs
+    if that compile fits, and otherwise its refusal takes the error policy's
+    path, as a refused compile did, its reason saying when it was first held.
+    A check that fails for a reason other than the budget ends the hold too,
+    and the turn compiles again; a refusal of that compile while compression
+    is pending holds the turn again. The hold has no time limit, since the
+    turn can't run before its context fits. Compression can stay pending
+    without moving, and the turn stays held through that, and runs once a
+    check finds its context fits:
+    - **Calls that keep failing:** with context-manager 0.24.1, when every
+      compression call fails for a reason that says nothing about the
+      request, as in an outage of its model's provider or with bad
+      credentials, it waits between tries from 5 seconds doubling up to 10
+      minutes and tries again on later ticks. A failure raises
+      `context-maintenance-failed` under maintenance's rule for repeats: the
+      same failure again is alerted only once the alert's cooldown has passed
+      or after a pass or drive without one. The hold ends by itself once a
+      call succeeds and the context fits.
+    - **A wait with no end:** after a call whose provider states a wait that
+      can't be held as an instant, the framework records it as a wait until
+      released, which raises one `provider-wait` ops alert and holds the
+      agent's calls on that model, compression's included, and the lane
+      makes no call. `releaseProviderWait()` lifts that wait and offers the
+      lane its release: context-manager's autobiographical lane then drops the
+      stated wait, and its own backoff, 5 seconds doubling to 10 minutes with
+      its failure count kept, still paces its next call. The wait is
+      recorded in the store, so a restart doesn't lift it, and a restart
+      drops the held turn.
+    - **Work nothing bounds:** compression whose pending work isn't a call,
+      such as a quarantine clean-up under the compression-state lock that
+      never ends, keeps the turn held with no signal beyond the hold's own
+      `context-hold` alert (under Added), and so does
+      a compression call that doesn't return where the host sets
+      `inferenceBounds: false`. Otherwise the framework gives each
+      compression call a time limit (`progressTimeoutMs`) from its inference
+      bounds, so one that doesn't return fails and is reported as above. A
+      chunk or a
+      merge blocked by a message held from compression waits too; this
+      framework holds a message only as it stores it, which blocks no chunk
+      or merge already made, so only a host's own later hold meets that.
+    - **Outside the framework's alerts:** a strategy that drains compression
+      on new messages by itself (`autoTickOnNewMessage`, which this framework
+      doesn't set) reports that drain's failures in context-manager's own
+      log only.
+    The hold lives in memory: a restart drops it, and the agent's next wake
+    compiles afresh.
+  - **Undo:** a hold adds no undo step: the held turn is one step, whether
+    its first start or a retry, an error policy's or a tool-result guard's,
+    was refused, and its undo works on the window as any turn's does. When
+    the refused start recorded a checkpoint, as a turn's first start does,
+    the start the hold releases records it again after the inputs that start
+    presents, the messages that arrived while the turn waited among them, so
+    the undo leaves them in the window, as it leaves the context injections
+    the refused start stored; a hold that's stopped leaves the checkpoint
+    where it was. When a retry is refused, the turn keeps the checkpoint its
+    first start recorded, and the undo takes what came after it out of the
+    window: the turn's own rows, the rounds it ran before its hold among
+    them, and the others' rows, which the agent's next presentation point
+    presents again. The redo its new work invalidated stays invalidated, as
+    at any turn's first start.

@@ -156,6 +156,62 @@ export type TraceEvent =
       /** The provider's own error code, when it sent one (at most 128 characters). */
       providerErrorCode?: string;
     })
+  | (TraceEventBase & {
+      /**
+       * A turn whose compile was refused for budget is held while compression
+       * makes its context fit, instead of failing (#304). It follows the
+       * refused attempt's `inference:failed`, as a provider hold does. Its
+       * logical turn stays open, unless a listener of the hold's
+       * `context-hold` alert ended it, whose `inference:aborted` then comes
+       * first; `inference:hold_ended` follows, and then, unless the turn was
+       * stopped while held, its fresh compile. After a hold that ended
+       * because compression had nothing left to do, a refusal of that compile
+       * takes the error policy's path; after one whose check failed, a
+       * refusal while compression is pending holds the turn again.
+       */
+      type: 'inference:held';
+      agentName: string;
+      /** 'over_budget', or 'context_refusal' when no summary covers a span the compile would drop. */
+      errorType: 'over_budget' | 'context_refusal';
+      /** The refusal's message, bounded as a trace event's `error` is (2,000 characters). */
+      error: string;
+      /** The refused compile's budget and size in tokens, when context-manager gave them. */
+      budget?: number;
+      actual?: number;
+      /** When the hold started (epoch ms): this refusal, or for a released
+       *  turn refused again, the refusal that first held it. */
+      since: number;
+      /** Requests the hold holds as it starts: the refused start's own. Later
+       *  joins are counted in `inference:hold_ended`. */
+      heldRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'inference:hold_ended';
+      agentName: string;
+      /**
+       * 'fit': context-manager's preview, of the stored context at the turn's
+       * next compile budget, says it fits (a dry compile does, for a strategy
+       * with no preview), and the held requests are queued for one fresh
+       * compile. The preview doesn't see what that start adds before it
+       * compiles. 'check_failed': that
+       * check failed for a reason other than the budget, and the requests are
+       * queued for the turn's own compile to meet it. 'nothing_pending':
+       * compression has nothing pending and the context still doesn't fit;
+       * the requests are queued too, for one fresh compile, and a refusal of
+       * it takes the error policy's path, as a refused compile did before the
+       * hold. A hold has no time limit: while compression stays pending, it
+       * holds until one of these. 'stopped':
+       * the turn ended while it was held (an abandon, a stop of the turn or of
+       * the framework, or the agent's leaving), reported after its
+       * `inference:aborted`, once the wakes that joined it are back in the
+       * queue (after an abandon or a stop of the turn) or gone with it
+       * (otherwise).
+       */
+      outcome: 'fit' | 'check_failed' | 'nothing_pending' | 'stopped';
+      /** Since the hold started (`inference:held`'s `since`). */
+      waitedMs: number;
+      heldRequests: number;
+    })
 
   // Streaming inference lifecycle
   | (TraceEventBase & {
@@ -1043,13 +1099,17 @@ export type TraceEvent =
   // this stream, not a separate system. See connectome docs/observability.md.
   | (TraceEventBase & {
       type: 'ops:alert';
-      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | … */
+      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' |
+       *  'context-hold' | … A kind ending in `-clear` ends the alert of the
+       *  kind before it: 'context-hold-clear' is raised at every end of a
+       *  budget hold, each start of which raised 'context-hold'. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
       /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record),
+      /** Kind-specific structured payload (mirrors the failures.log record,
+       *  where the alert has one: `context-hold` and its clear have none),
        *  bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
