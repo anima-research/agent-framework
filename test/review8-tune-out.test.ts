@@ -2051,7 +2051,7 @@ test("review 3 #10: a queued cancel's own note kept in memory as it is written l
   }
 });
 
-test("review 3 #10: a stop while the queued cancel's own note is kept in memory tells the note lost, kept in the store", () => {
+test("review 3 #10, as the stop's budget on #844 has it: a stop while the queued cancel's own note is kept in memory doesn't tell it lost, but leaves its hold out of the stamp, the note kept, for the next boot", () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup({ stored: true });
   try {
@@ -2070,8 +2070,12 @@ test("review 3 #10: a stop while the queued cancel's own note is kept in memory 
     assert.ok(noteWritten, 'premise: the run wrote its note, which began the hold (review 4 #41)');
     assert.equal(h.inForce(), held, 'premise: the note was kept in memory, the hold in force');
     h.coordinator.stop();
-    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', true]], 'the stop loses the kept note with the cancel, and tells it');
-    assert.equal(h.lossRecord()?.pendingLossNotices.length, 1, 'kept in the store for the next boot');
+    // A release after the stop may store the note yet (nissa's house, the stop's budget): the stop tells nothing of it.
+    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], 'the stop drops the cancel, telling no note lost');
+    assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], 'and keeps no notice');
+    const stamp = h.states.get(STAMP_UNIT) as { epochs: string[]; notesKept?: string[] };
+    assert.ok(!stamp.epochs.includes(held), 'the stamp leaves the hold out, for the next boot to read what the store holds');
+    assert.deepEqual(stamp.notesKept, [held], 'naming its note as kept in memory');
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -2150,12 +2154,12 @@ test("pin (H3, Weft at 1f96d1f7): a cancel another caller asks for while an earl
   }
 });
 
-test("review 3 #14: a stop while the release that told a queued note's loss is kept in memory tells that loss, kept in the store", () => {
+test("review 3 #14, as the stop's budget on #844 has it: a stop while the release that told a queued note's loss is kept in memory doesn't tell it again, but leaves its hold out of the stamp, for the next boot", () => {
   for (const scope of [false, true]) {
     const errors = mock.method(console, 'error', () => {});
     const h = epochSetup();
     try {
-      if (scope) h.enterScope(); else h.enter();
+      const epochId = scope ? h.enterScope() : h.enter();
       h.state.held = true;
       if (scope) h.coordinator.cancelAllExcept('subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
       else h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
@@ -2167,9 +2171,12 @@ test("review 3 #14: a stop while the release that told a queued note's loss is k
       const ending = scope ? h.coordinator.cancelAllExcept('agent-tool', 'agent request') : h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request');
       assert.deepEqual(ending, { ok: true, deferred: true }, 'premise: that release was kept in memory, so the cancel waits');
       h.coordinator.stop();
-      assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', true]],
-        `${scope ? 'all-except' : 'channel'}: the stop loses the release that told the loss, so it tells the note lost`);
-      assert.equal(h.lossRecord()?.pendingLossNotices.length, 1, 'kept in the store for the next boot');
+      // A release after the stop may store that release yet (nissa's house, the stop's budget): the stop tells nothing of it.
+      const where = scope ? 'all-except' : 'channel';
+      assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], `${where}: the stop tells the loss no second time`);
+      assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], `${where}: and keeps no notice`);
+      const stamp = h.states.get(STAMP_UNIT) as { epochs: string[]; notesKept?: string[] };
+      assert.ok(!stamp.epochs.includes(epochId), `${where}: the stamp leaves the hold out, for the next boot to read what the store holds`);
     } finally {
       h.coordinator.stop();
       errors.mock.restore();
@@ -2509,7 +2516,7 @@ test("nissa's house on #844: a release that told a queued note's loss, kept in m
   }
 });
 
-test("nissa's house on #844, control: a stored write of another epoch, of another kind, or a release that told no loss leaves the kept note kept: a stop tells it lost", () => {
+test("nissa's house on #844, control: a stored write of another epoch, of another kind, or a release that told no loss leaves the kept note kept: a stop names it so in its stamp", () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup({ stored: true });
   try {
@@ -2519,8 +2526,10 @@ test("nissa's house on #844, control: a stored write of another epoch, of anothe
     h.coordinator.heldWriteStored({ kind: 'tune-out-cancel', epochId });
     h.coordinator.heldWriteStored(undefined);
     h.coordinator.stop();
-    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', true]], 'the stop tells the kept note lost');
-    assert.equal(h.lossRecord()?.pendingLossNotices.length, 1, 'kept in the store');
+    // Still kept in memory at the stop: the stamp names it so, for the next boot (the stop's budget, #844).
+    const stamp = h.states.get(STAMP_UNIT) as { epochs: string[]; notesKept?: string[] };
+    assert.deepEqual(stamp.notesKept, [epochId], 'the stop finds the note still kept in memory');
+    assert.ok(!stamp.epochs.includes(epochId), 'and leaves its hold out of the stamp');
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -2719,6 +2728,87 @@ test("Weft's sibling A on #844: a release telling a queued note's loss that land
       h.coordinator.stop();
       errors.mock.restore();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AF #844, the stop's budget (nissa's house, 2026-11-07): a stop that finds
+// a waiting cancel whose note, or the release telling its loss, is still
+// kept in memory (the stop's wait for an operator's operation ran out, or a
+// manager refusing its work keeps it) doesn't tell it lost: a release after
+// the stop, in the same process, may store it. The stamp leaves the hold
+// out, naming its note as kept (`notesKept`), and the next boot tells the
+// subconscious what that run's rows show then.
+// ---------------------------------------------------------------------------
+
+const STAMP_UNIT = 'tune-out/scout/stop-stamp';
+
+test("the stop's budget on #844: a stop while the queued cancel's note is still kept in memory tells no loss; the stamp leaves its hold out, the note kept; the next boot says what the rows show", () => {
+  for (const stored of [true, false]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    try {
+      const { epochId } = ownNoteKeptInMemory(h, false);
+      h.coordinator.stop();
+      const what = stored ? 'stored after the stop' : 'never stored';
+      assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], `${what}: the stop drops the cancel, telling no note lost`);
+      assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], `${what}: and keeps no notice`);
+      const stamp = h.states.get(STAMP_UNIT) as { epochs: string[]; notesKept?: string[] };
+      assert.ok(!stamp.epochs.includes(epochId), `${what}: the stamp leaves the hold out`);
+      assert.deepEqual(stamp.notesKept, [epochId], `${what}: naming its note as kept in memory`);
+      // The hold's release after the stop, in the same process, stores the note (or nothing does).
+      if (stored) h.storeHeld();
+      h.state.held = false;
+      const next = h.reboot();
+      try {
+        next.resumeActiveEpochs();
+        assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [
+          `[Tune-out: the host stopped without recording the state of the tune-out of disc:guild:a (epoch ${epochId}). Your cancel of it ran: `
+          + `its release reached scout${stored ? ', with the note you left with it' : ''}. Its end was not recorded, so that tune-out is still in force.`
+          + (stored ? ']' : " The note you left with your cancel of it was kept in memory when the host stopped, to be stored when an operator's "
+            + "change to the store ended, and the store didn't hold it when this was written: it may be lost.]"),
+        ], `${what}: the next boot says ${stored ? 'it went out with the release' : 'that it may be lost'}`);
+      } finally {
+        next.stop();
+      }
+    } finally {
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("the stop's budget on #844: a stop while the release telling a queued note's loss is still kept in memory doesn't tell the loss again; once that release is stored, the next boot needs nothing more", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  try {
+    const epochId = h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'Someone asked for you.', 'Subconscious');
+    failFirstRelease(h);
+    h.state.noteFails = true;
+    h.state.keepWhenHeld = true;
+    h.listenWrites((metadata) => { if (metadata?.kind === 'tune-out-cancel') h.state.held = true; });
+    assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), { ok: true, deferred: true },
+      'premise: the release telling the loss was kept in memory, so the cancel waits');
+    h.listenWrites(() => {});
+    h.coordinator.stop();
+    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteLost]), [['stopped', false]], 'the stop tells the loss no second time');
+    assert.deepEqual(h.lossRecord()?.pendingLossNotices ?? [], [], 'and keeps no notice');
+    const stamp = h.states.get(STAMP_UNIT) as { epochs: string[]; notesKept?: string[] };
+    assert.ok(!stamp.epochs.includes(epochId), 'the stamp leaves the hold out');
+    h.storeHeld();
+    h.state.noteFails = false;
+    const next = h.reboot();
+    try {
+      next.resumeActiveEpochs();
+      assert.deepEqual(h.lossNotices(), [], 'the stored release told the loss: the next boot writes nothing more');
+    } finally {
+      next.stop();
+    }
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
   }
 });
 
