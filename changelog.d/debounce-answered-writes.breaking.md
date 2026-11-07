@@ -9,5 +9,9 @@
   where 0.33.0 passed the placement of the line it wrote, and its
   `InferenceRequest` no longer carries `readsRow`: the writes it is for, its
   line's among them, are `provenance.writes`, and its rows are `readsRows` (in
-  `.added`). A host that handles `requestInference` itself and wants a batched
-  wake dropped once the agent has answered it reads `provenance.writes`.
+  `.added`). A batch with an event in the window that was given no write of
+  its own (`evaluate` without `after`) has no writes, so its wake is plain and
+  starts its turn even once the agent has answered, where 0.33.0 marked it by
+  the line it wrote, so it could drop once that line was answered. A host that
+  handles `requestInference` itself and wants a batched wake dropped once the
+  agent has answered it reads `provenance.writes`.
