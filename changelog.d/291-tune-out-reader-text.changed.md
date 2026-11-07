@@ -40,16 +40,16 @@
   agent's name, a reader fork's structural one included, reaches the channel. The
   channel registry takes the reader from the new `tuneOutReader` option, which the framework gives it; a registry
   made without one names the persistent reader by its default name, "Subconscious".
-- **Hosts: `create()`'s refusal of reader forks with no `model` says what a reader fork is.** It said to give the
-  resident's model "for a copy of the resident"; it now says a reader fork of the resident holds its whole prefix,
-  and `model` is the model the resident runs or another by name.
-- **Residents and readers: where no reader runs, the text says so, and a cancel that can wait says it can.** A
-  held channel's messages, in a channel tool's refusal and the `[tuned out]` send note, were "read by <name>" after
-  the persistent reader ended, or at a start with none configured, for a hold whose release failed; they are now
-  held "with no reader running here to read them, until the tune-out's release, which failed, is tried again"
-  (`TuneOutReader`'s `running: false`), and so are they in tune_out's answers about the channel's transport, which
-  said they "reach <name>". `tune_out`'s refusal with no reader says none "is running here", a reader
+- **Hosts: `create()`'s refusal of reader forks with no `model` no longer calls the resident's model a copy of the
+  resident.** It said, after saying that a reader fork holds the resident's whole prefix, to give the resident's
+  model "for a copy of the resident"; it now says `model` is the model the resident runs or another by name.
+- **Residents and readers: where no reader runs, the text says so, and a cancel that can wait says it can.** After
+  the persistent reader ended, or at a start with none configured, for a hold whose release failed, a held channel's
+  messages, in a channel tool's refusal and the `[tuned out]` send note, are held "with no reader running here to
+  read them, until the tune-out's release, which failed, is tried again" (`TuneOutReader`'s `running: false`), and
+  so are they in tune_out's answers about the channel's transport. `tune_out`'s refusal with no reader says none "is running here", a reader
   that ended included. `cancel_tuneout`'s description no longer says it ends the tune-out "now": its answer says
   when the cancel has to wait, and whether the note waits with it, and the channel's traffic reaches the resident
   again unless the all-except hold holds it too; `speak_in_channel`'s refusal where speech is off, and `tune_out`'s
-  refusal of a channel already tuned out, say a cancel's answer tells if it waits, where they said it delivers now.
+  refusal of a channel already tuned out, say a cancel's answer tells if it waits, where tune_out's said a cancel
+  delivers the backlog now and speak_in_channel's said to end the tune-out if the channel needs the resident now.

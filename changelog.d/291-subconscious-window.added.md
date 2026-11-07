@@ -24,7 +24,7 @@
     what its tool boundary injects (`Agent.setForeignRounds`, `Agent.injectedAsSent`). Its own rounds go as
     stored, and it keeps their signed thinking across a row heard from the residents' slot. That is the default of
     a new setting, `subconscious.foreignRounds`: `'raw'` sends a resident's rounds as stored, its thinking and
-    tool blocks included, as 0.30.0 did, and any other value is refused at `create()`. A thinking block's
+    tool blocks included, as 0.32.0 and earlier releases did, and any other value is refused at `create()`. A thinking block's
     signature rules out sending the block as part of another agent's prefix, not its text; leaving the text out is
     the transcript's choice. A result is told by the nearest call before it with its id, so a resident's result
     whose id a call of the subconscious's also has (calls numbered per response, `c1`, `call_0`) is transcribed.

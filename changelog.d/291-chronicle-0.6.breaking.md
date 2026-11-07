@@ -14,8 +14,7 @@
   context-manager without `ContextManager.presentRows`, each with an error that names the range this package declares. chronicle 0.6.0 and
   context-manager 0.25.0 carry 0.5.0's and 0.24.0's changes, so what 0.30.0's entry says of derived agents and
   branch views holds under them too. The framework reads those two errors from context-manager's exports as it loads,
-  not by a named import, so on 0.24.0, which has neither, the package loads and `create()` gives that error, where
-  the import failed before with a missing-export `SyntaxError`.
+  not by a named import, so on 0.24.0, which has neither, the package loads and `create()` gives that error.
   **Who needs to act:** a host that depends on chronicle or context-manager itself, such as connectome-host, which
   takes the same ranges alongside this release so that npm installs one copy of each; and a host that opens its own
   `JsStore` and passes it as `FrameworkConfig.store`, whose handle must come from chronicle 0.6.0 or later.

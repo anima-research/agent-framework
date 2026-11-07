@@ -1,6 +1,6 @@
 - `channel_close` of the channel an all-except hold excepts, while that
   hold's cancel waits for held writes (an operator's change to the store,
-  or a context that refuses writes), now answers as the tune-out tools
+  or a context that refuses writes), answers as the tune-out tools
   answer a cancel that waits. The answer describes the wait while the
   writes are held: what the cancel waits for, that how long it lasts isn't
   known, that cancelling again doesn't end it sooner, and that a stop
