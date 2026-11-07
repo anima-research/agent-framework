@@ -103,12 +103,17 @@
       log only.
     The hold lives in memory: a restart drops it, and the agent's next wake
     compiles afresh.
-  - **Undo:** a hold adds no undo step. When the refused start recorded a
-    checkpoint, as a turn's first start does, the start the hold releases
-    moves it to after the messages that arrived while the turn waited, so the
-    undo keeps them, as it keeps the context injections the refused start
-    stored, and a hold that's stopped leaves it where it was. When a retry is
-    refused, an error policy's or a tool-result guard's, the turn keeps the
-    checkpoint its first start recorded, before what it had done, and the undo
-    takes the messages that arrived while it waited too. The redo its new work
-    invalidated stays invalidated, as at any turn's first start.
+  - **Undo:** a hold adds no undo step: the held turn is one step, whether
+    its first start or a retry, an error policy's or a tool-result guard's,
+    was refused, and its undo works on the window as any turn's does. When
+    the refused start recorded a checkpoint, as a turn's first start does,
+    the start the hold releases records it again after the inputs that start
+    presents, the messages that arrived while the turn waited among them, so
+    the undo leaves them in the window, as it leaves the context injections
+    the refused start stored; a hold that's stopped leaves the checkpoint
+    where it was. When a retry is refused, the turn keeps the checkpoint its
+    first start recorded, and the undo takes what came after it out of the
+    window: the turn's own rows, the rounds it ran before its hold among
+    them, and the others' rows, which the agent's next presentation point
+    presents again. The redo its new work invalidated stays invalidated, as
+    at any turn's first start.

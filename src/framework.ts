@@ -7642,8 +7642,9 @@ export class AgentFramework {
   /** Compression's own work, from its progress snapshot: the summaries it
    *  has made (`chunksCompressed`, `summaryCounts`) and whether a call is in
    *  flight (`pending`), as context-manager's AutobiographicalProgressSnapshot
-   *  documents them. Its other fields, and readiness, move with traffic: a
-   *  stored message can close or queue a chunk. A snapshot without those
+   *  documents them. Its other fields, and readiness, move with what the
+   *  window is presented: a presented message can close or queue a chunk.
+   *  A snapshot without those
    *  three fields is taken whole. */
   private budgetHoldProgressKey(agent: Agent): string | undefined {
     try {
