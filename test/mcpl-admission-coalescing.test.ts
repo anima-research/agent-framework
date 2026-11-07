@@ -1,0 +1,352 @@
+/** Required admission over the same real WebSocket transport as the RFC-006 matrix. */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { admissionOf, type AdmissionVerdict } from '../src/mcpl/inbound-admission.js';
+
+const allow = { store: true, mayWake: false } as const;
+const deny = { store: false, mayWake: false, reason: 'admission_denied' } as const;
+const config = (admit: (input: any) => unknown) => ({
+  timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit }), isReplyIntent: () => true,
+});
+type Lane = 'channels/incoming' | 'push/event';
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+const lanes: Lane[] = ['channels/incoming', 'push/event'];
+function item(f: Fixture, lane: Lane, id: string, text: string, flags = {}) {
+  return lane === 'channels/incoming' ? f.channel(id, text, flags)
+    : f.params(id, text, { key: 'message:m', channelId: 'chat', ...flags });
+}
+async function send(f: Fixture, lane: Lane, id: string, text: string, flags = {}) {
+  const value = item(f, lane, id, text, flags);
+  const response = await f.send(lane, lane === 'channels/incoming' ? { messages: [value] } : value);
+  assert.equal(response.error, undefined);
+  return lane === 'channels/incoming' ? response.result.results[0] : response.result;
+}
+
+for (const createLane of lanes) for (const updateLane of lanes) {
+  test(`required coalesce ${createLane} -> ${updateLane}: admitted replacement, refused update, withdrawal`, async t => {
+    const seen: any[] = [];
+    const envelopes: unknown[] = [];
+    const observer: any = { name: 'observer', start: async () => {}, stop: async () => {}, getTools: () => [], handleToolCall: async () => ({ success: true }), onProcess: async (event: any) => {
+      if (event.type.startsWith('mcpl:')) envelopes.push(admissionOf(event));
+      return {};
+    } };
+    const f = await fixture({ framework: { modules: [observer] }, server: { inboundAdmission: config(input => {
+      seen.push(input); return input.item.eventId.startsWith('refused') ? deny : allow;
+    }) } }); t.after(f.close); await f.register();
+    assert.equal((await send(f, createLane, 'create', 'original_body', { initial: true })).coalesce.outcome, 'first');
+    assert(f.context().includes('original_body'));
+    assert.deepEqual((await send(f, updateLane, 'edit', 'edited_body')).coalesce, { outcome: 'replaced', priorEventId: 'create' });
+    assert(!f.context().includes('original_body')); assert(f.context().includes('edited_body'));
+    assert.equal((await send(f, updateLane, 'refused', 'refused_body')).reason, 'admission_denied');
+    assert(f.context().includes('edited_body')); assert(!f.context().includes('refused_body'));
+    assert.equal((await send(f, updateLane, 'refused-delete', '', { retract: true })).reason, 'admission_denied');
+    assert(f.context().includes('edited_body'));
+    assert.equal((await send(f, updateLane, 'delete', '', { retract: true })).coalesce.outcome, 'retracted');
+    assert(!f.context().includes('edited_body'));
+    assert.deepEqual(seen.map(input => input.item.eventId), ['create', 'edit', 'refused', 'refused-delete', 'delete']);
+    assert(seen.every(input => input.item.coalesce.key === 'message:m' && Object.isFrozen(input.item.coalesce)));
+    assert(envelopes.length >= 2); assert(envelopes.every(value => value && (value as any).mayWake === false));
+    await f.framework.runUntilIdle(); assert.equal(f.membrane.calls.length, 0);
+  });
+}
+
+for (const lane of lanes) for (const replacement of ['edit', 'delete'] as const) {
+  test(`required ${lane}: refused create cannot be revived by approved ${replacement}`, async t => {
+    const seen: string[] = [];
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      seen.push(input.item.eventId); return input.item.eventId === 'create' ? deny : allow;
+    }) } }); t.after(f.close); await f.register();
+    const before = f.context();
+    assert.equal((await send(f, lane, 'create', 'never_revive_this', { initial: true })).reason, 'admission_denied');
+    assert.equal(f.context(), before);
+    const result = await send(f, lane, replacement, replacement === 'edit' ? 'independently_admitted_edit' : '', replacement === 'delete' ? { retract: true } : {});
+    assert.equal(result.accepted, true);
+    assert.equal(result.coalesce.priorEventId, undefined, 'a refusal created no RFC-006 target or receipt');
+    if (replacement === 'edit') assert(f.context().includes('independently_admitted_edit'));
+    else assert.equal(f.context(), before, 'pure withdrawal with no target appends nothing');
+    assert(!f.context().includes('never_revive_this'));
+    assert.deepEqual(seen, ['create', replacement]);
+    await f.framework.runUntilIdle(); assert.equal(f.membrane.calls.length, 0);
+  });
+}
+
+for (const lane of lanes) for (const timing of ['callback', 'coalescer-lock'] as const) for (const change of ['epoch', 'registration'] as const) {
+  test(`required ${lane}: replacement rechecks ${change} after ${timing}`, async t => {
+    let release!: (value: AdmissionVerdict) => void;
+    let entered = false;
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      if (input.item.eventId !== 'edit') return allow;
+      entered = true;
+      return timing === 'callback' ? new Promise<AdmissionVerdict>(resolve => { release = resolve; }) : allow;
+    }) } }); t.after(f.close); await f.register();
+    assert.equal((await send(f, lane, 'create', 'retained_original', { initial: true })).accepted, true);
+    const inner = f.framework as any;
+    let unlock!: () => void;
+    let queued = false;
+    let locked: Promise<unknown> | undefined;
+    if (timing === 'coalescer-lock') {
+      // Hold the real coalescer mutex, not admission, to expose the final effect boundary.
+      locked = inner.pushCoalescer.locked(() => new Promise<void>(resolve => { unlock = resolve; }));
+      await eventually(() => !!unlock);
+      const accept = inner.pushCoalescer.accept.bind(inner.pushCoalescer);
+      inner.pushCoalescer.accept = (...args: any[]) => { queued = true; return accept(...args); };
+    }
+    const pending = send(f, lane, 'edit', 'must_not_replace');
+    await eventually(() => entered);
+    if (timing === 'coalescer-lock') {
+      await eventually(() => queued, 'the admitted replacement waiting for the coalescer mutex');
+    }
+    if (change === 'epoch') inner.mcplServerRegistry.getServer('editor').requiredAdmission.bind(999);
+    else {
+      const entries: Map<string, any> = inner.channelRegistry.channels;
+      const [key, entry] = [...entries].find(([, entry]) => entry.descriptor.id === 'chat')!;
+      entries.set(key, { ...entry, descriptor: { ...entry.descriptor } });
+    }
+    if (timing === 'callback') release(allow); else unlock();
+    const result = await pending;
+    await locked;
+    assert.equal(result.accepted, false); assert.equal(result.reason, 'admission_stale');
+    assert(f.context().includes('retained_original')); assert(!f.context().includes('must_not_replace'));
+  });
+}
+
+test('required channel batch admits each coalesced item independently and keeps replacement keys', async t => {
+  const seen: string[] = [];
+  const f = await fixture({ server: { inboundAdmission: config(input => {
+    seen.push(input.item.eventId); return input.item.eventId === 'deny' ? deny : allow;
+  }) } }); t.after(f.close); await f.register();
+  const response = await f.send('channels/incoming', { messages: [
+    f.channel('create', 'batch_original', { initial: true }), f.channel('deny', 'batch_denied'), f.channel('edit', 'batch_latest'),
+  ] });
+  assert.deepEqual(response.result.results.map((result: any) => result.accepted), [true, false, true]);
+  assert.deepEqual(response.result.results[2].coalesce, { outcome: 'replaced', priorEventId: 'create' });
+  assert.deepEqual(seen, ['create', 'deny', 'edit']);
+  assert(f.context().includes('batch_latest')); assert(!f.context().includes('batch_original')); assert(!f.context().includes('batch_denied'));
+});
+
+for (const lane of lanes) {
+  test(`required ${lane}: acknowledged retry replays its receipt without a second verdict`, async t => {
+    let calls = 0;
+    const f = await fixture({ server: { inboundAdmission: config(() => ++calls === 1 ? allow : deny) } });
+    t.after(f.close); await f.register();
+    const first = await send(f, lane, 'acknowledged', 'already_visible', { initial: true });
+    assert.equal(first.accepted, true); assert(f.context().includes('already_visible'));
+    const before = f.context();
+    const retry = await send(f, lane, 'acknowledged', 'retry_must_not_store', { initial: true });
+    assert.deepEqual(retry, first);
+    assert.equal(calls, 1, 'a live receipt is not re-decided, even if the callback would refuse');
+    assert.equal(f.context(), before);
+    assert.equal((await send(f, lane, 'refused', 'not_admitted')).reason, 'admission_denied');
+    assert.equal((await send(f, lane, 'refused', 'not_admitted')).reason, 'admission_denied');
+    assert.equal(calls, 3, 'refused work never acquires a replayable receipt');
+    assert.equal(f.context(), before);
+  });
+
+  test(`required ${lane}: receipt created by another subject during a concurrent callback beats its refusal`, async t => {
+    let calls = 0;
+    let release!: (verdict: AdmissionVerdict) => void;
+    const f = await fixture({ server: { inboundAdmission: config(() => {
+      if (++calls === 1) return new Promise<AdmissionVerdict>(resolve => { release = resolve; });
+      return allow;
+    }) } }); t.after(f.close); await f.register();
+    // Receipts are keyed by eventId across subjects. Same-subject effects
+    // now wait for the first callback; a different subject remains concurrent.
+    const pending = send(f, lane, 'same-event', 'pending_must_not_store', { initial: true, key: 'other-subject' });
+    await eventually(() => !!release);
+    const accepted = await send(f, lane, 'same-event', 'concurrent_admitted', { initial: true });
+    assert.equal(accepted.accepted, true); assert(f.context().includes('concurrent_admitted'));
+    const before = f.context();
+    release(deny);
+    assert.deepEqual(await pending, accepted);
+    assert.equal(calls, 2); assert.equal(f.context(), before);
+  });
+
+  test(`required ${lane}: receipt wins over a fresh-work check without repeating effects`, async t => {
+    const f = await fixture({ server: { inboundAdmission: config(() => allow) } });
+    t.after(f.close); await f.register();
+    const coalescer = (f.framework as any).pushCoalescer;
+    let occurrence: any;
+    const accepted = coalescer.host.accepted;
+    coalescer.host.accepted = (value: any) => { occurrence = value; accepted?.(value); };
+    const first = await send(f, lane, 'mutex-retry', 'visible_before_recheck', { initial: true });
+    assert(occurrence);
+    const before = f.context();
+    const retry = await coalescer.accept(occurrence, () => 'admission_denied');
+    assert.equal(retry.accepted, true); assert.deepEqual(retry.coalesce, first.coalesce);
+    assert.equal(f.context(), before);
+  });
+
+  test(`required ${lane}: receipt replay preserves a failed acknowledgement's durability barrier`, async t => {
+    let calls = 0;
+    const f = await fixture({ server: { inboundAdmission: config(() => ++calls === 1 ? allow : deny) } });
+    t.after(f.close); await f.register();
+    const host = (f.framework as any).pushCoalescer.host;
+    const commit = host.commit;
+    host.commit = () => { throw new Error('commit unavailable'); };
+    const raw = () => {
+      const value = item(f, lane, 'needs-commit', 'admitted_before_ack', { initial: true });
+      return f.send(lane, lane === 'channels/incoming' ? { messages: [value] } : value);
+    };
+    assert.equal((await raw()).error?.code, -32000);
+    assert(f.context().includes('admitted_before_ack'));
+    const before = f.context();
+    assert.equal((await raw()).error?.code, -32000, 'an uncommitted receipt cannot answer success');
+    assert.equal(calls, 1, 'admitted work cannot be re-decided even while acknowledgement fails');
+    host.commit = commit;
+    const result = await raw();
+    assert.equal(result.error, undefined);
+    assert.equal((lane === 'channels/incoming' ? result.result.results[0] : result.result).accepted, true);
+    assert.equal(calls, 1); assert.equal(f.context(), before);
+  });
+}
+
+for (const lane of lanes) {
+  test(`R3-1 required ${lane}: live receipt replays while all admission tickets are occupied`, async t => {
+    let release!: (v: AdmissionVerdict) => void;
+    let calls = 0;
+    const held = new Promise<AdmissionVerdict>(r => { release = r; });
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      calls++;
+      return input.item.eventId.startsWith('held-') ? held : allow;
+    }) } });
+    const pending: Promise<unknown>[] = [];
+    t.after(async () => { release(deny); await Promise.all(pending); await f.close(); });
+    await f.register();
+    const first = await send(f, lane, 'receipt', 'stored_receipt', { initial: true });
+    for (let i = 0; i < 64; i++) pending.push(send(f, lane, `held-${i}`, 'held_body', { initial: true, key: `held-${i}` }));
+    await eventually(() => calls === 65);
+    assert.equal((f.framework as any).coalescingTicketCounts.get('editor'), 64);
+    assert.deepEqual(await send(f, lane, 'receipt', 'never_store_retry', { initial: true }), first);
+    assert.equal(calls, 65, 'replay does not invoke policy');
+    const traces: any[] = []; f.framework.onTrace(e => traces.push(e));
+    assert.equal((await send(f, lane, 'overflow', 'never_store_overflow', { initial: true, key: 'overflow' })).reason, 'admission_denied');
+    assert(traces.some(e => e.reason === 'admission_ticket_capacity'));
+    assert(f.context().includes('stored_receipt')); assert(!f.context().includes('never_store'));
+  });
+
+  for (const authority of (lane === 'push/event' ? ['registration', 'grant', 'readiness', 'featureSet'] : ['registration', 'grant', 'readiness']))
+  test(`R3-4 required ${lane}: waiting receipt rechecks revoked ${authority} under the mutex`, async t => {
+    const f = await fixture({ server: { inboundAdmission: config(() => allow) } }); t.after(f.close); await f.register();
+    await send(f, lane, 'receipt', 'stored_once', { initial: true });
+    const inner = f.framework as any;
+    let unlock!: () => void; let waiting = false;
+    const lock = inner.pushCoalescer.locked(() => new Promise<void>(r => { unlock = r; }));
+    await eventually(() => !!unlock);
+    const replay = inner.pushCoalescer.replayReceipt.bind(inner.pushCoalescer);
+    inner.pushCoalescer.replayReceipt = (...args: any[]) => { waiting = true; return replay(...args); };
+    const pending = send(f, lane, 'receipt', 'must_not_store', { initial: true });
+    await eventually(() => waiting);
+    const entries: Map<string, any> = inner.channelRegistry.channels;
+    const [key, entry] = [...entries].find(([, e]) => e.descriptor.id === 'chat')!;
+    const connection = inner.mcplServerRegistry.getServer('editor');
+    if (authority === 'registration') entries.set(key, { ...entry, descriptor: { ...entry.descriptor } });
+    else if (authority === 'grant') connection.grant = CapabilityGrant.empty();
+    else if (authority === 'readiness') connection.pauseDataPlane();
+    else inner.featureSetManager.disable('editor', ['doc']);
+    unlock(); await lock;
+    assert.equal((await pending).reason, authority === 'readiness' ? 'admission_not_ready' : 'admission_stale');
+    assert(f.context().includes('stored_once')); assert(!f.context().includes('must_not_store'));
+  });
+}
+
+test('R3-4 duplicate accept rechecks authority, not fresh-work capacity', async t => {
+  const f = await fixture({ server: { inboundAdmission: config(() => allow) } }); t.after(f.close);
+  const coalescer = (f.framework as any).pushCoalescer;
+  let occurrence: any;
+  const accepted = coalescer.host.accepted;
+  coalescer.host.accepted = (value: any) => { occurrence = value; accepted?.(value); };
+  await f.send('push/event', f.params('receipt', 'stored_once', { initial: true }));
+  assert(occurrence);
+  const retry = await coalescer.accept(occurrence, () => 'admission_denied', () => 'admission_stale');
+  assert.deepEqual(retry, { accepted: false, reason: 'admission_stale' });
+});
+
+for (const lane of lanes) for (const saturation of ['callbacks', 'busy-chain'] as const) {
+  test(`R4-1 required ${lane}: delete at ticket cap with ${saturation} keeps removal and subject order`, async t => {
+    let release!: (v: AdmissionVerdict) => void;
+    const held = new Promise<AdmissionVerdict>(r => { release = r; });
+    let calls = 0;
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      calls++;
+      return saturation === 'callbacks' && input.item.eventId.startsWith('held-') ? held : allow;
+    }) } });
+    const inner = f.framework as any;
+    const pending: Promise<any>[] = [];
+    let unlock!: () => void;
+    t.after(async () => { release(allow); unlock?.(); await Promise.all(pending); await f.close(); });
+    await f.register();
+    // Unknown birth: the non-empty delete notice is delivered as well as removing the occupant.
+    assert.equal((await send(f, lane, 'create', 'deleted_occupant')).accepted, true);
+    if (saturation === 'busy-chain') {
+      inner.coalescingAdmission = new Promise<void>(r => { unlock = r; });
+    }
+    // Include a pending create without an occupant, to exercise that allowance too.
+    if (saturation === 'callbacks') {
+      // One slow batch callback holds 64 arrival tickets, leaving admission
+      // budget for the deletes (which must not bypass that separate budget).
+      pending.push(f.send('channels/incoming', { messages: Array.from({ length: 64 }, (_, i) =>
+        f.channel(`held-${i}`, `body_${i}_end`, { key: `held-${i}` }, 'chat', `held-${i}`)) }));
+    } else {
+      for (let i = 0; i < 64; i++) pending.push(send(f, lane, `held-${i}`, `body_${i}_end`, { key: `held-${i}` }));
+    }
+    const saturatedCalls = saturation === 'callbacks' ? 2 : 65;
+    await eventually(() => calls === saturatedCalls);
+    assert.equal(inner.coalescingTicketCounts.get('editor'), 64);
+    const unknown = await send(f, lane, 'unknown-delete', '[unknown deleted]', { key: 'unknown', retract: true });
+    assert.equal(unknown.reason, 'admission_denied');
+    assert.equal(calls, saturatedCalls, 'unknown-subject withdrawals do not bypass the cap');
+    const deletion = send(f, lane, 'delete', '[message deleted]', { retract: true });
+    const pendingDeletion = send(f, lane, 'pending-delete', '[pending deleted]', { key: 'held-0', retract: true });
+    pending.push(deletion, pendingDeletion);
+    // The baseline refuses both before policy. Yield through a later refused request rather than timing a wait.
+    await send(f, lane, 'overflow', 'never_store', { key: 'overflow' });
+    assert.equal(calls, saturatedCalls + 2, 'known and pending subjects still pass through policy at the ticket cap');
+    assert.equal((await send(f, lane, 'duplicate-delete', '[duplicate]', { key: 'held-0', retract: true })).reason, 'admission_denied', 'one over-cap withdrawal per subject');
+    release(allow); unlock?.();
+    assert.equal((await deletion).accepted, true);
+    assert.equal((await pendingDeletion).accepted, true);
+    await Promise.all(pending);
+    assert(!f.context().includes('deleted_occupant'));
+    assert(!f.context().includes('body_0_end'), 'withdrawal waits behind its pending create');
+    assert(f.context().includes('[message deleted]'));
+    assert(f.context().includes('[pending deleted]'));
+    await eventually(() => inner.coalescingTicketCounts.size === 0);
+  });
+}
+
+for (const lane of lanes) for (const change of ['grant', 'receipt-expiry'] as const) {
+  test(`R4-4 required ${lane}: pinned receipt waits for subject ticket before ${change} recheck`, async t => {
+    let release!: (v: AdmissionVerdict) => void;
+    let waiting = false; let calls = 0;
+    const held = new Promise<AdmissionVerdict>(r => { release = r; });
+    const f = await fixture({ server: { inboundAdmission: config(input => {
+      calls++;
+      return input.item.eventId === 'slow-edit' ? held : allow;
+    }) } });
+    const pending: Promise<any>[] = [];
+    t.after(async () => { release(deny); await Promise.all(pending); await f.close(); });
+    await f.register();
+    const first = await send(f, lane, 'receipt', 'stored_once');
+    const inner = f.framework as any;
+    const slowItem = item(f, lane, 'slow-edit', 'never_store_slow');
+    const slow = f.send(lane, lane === 'channels/incoming' ? { messages: [slowItem] } : slowItem); pending.push(slow);
+    await eventually(() => calls === 2);
+    const replay = inner.pushCoalescer.replayReceipt.bind(inner.pushCoalescer);
+    inner.pushCoalescer.replayReceipt = (...args: any[]) => { waiting = true; return replay(...args); };
+    const retry = send(f, lane, 'receipt', 'never_store_retry'); pending.push(retry);
+    await eventually(() => waiting);
+    // Let the old implementation finish its too-early mutex check.
+    await inner.pushCoalescer.locked(async () => {});
+    const connection = inner.mcplServerRegistry.getServer('editor');
+    if (change === 'grant') connection.grant = CapabilityGrant.empty();
+    else inner.pushCoalescer.host.now = () => Date.now() + 1_000_000_000;
+    release(deny); await slow;
+    const result = await retry;
+    if (change === 'grant') assert.equal(result.reason, 'admission_stale');
+    else assert.deepEqual(result, first, 'receipt pinned before ticket wait cannot expire into fresh admission');
+    assert.equal(calls, 2);
+    assert(f.context().includes('stored_once')); assert(!f.context().includes('never_store'));
+  });
+}

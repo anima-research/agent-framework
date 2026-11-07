@@ -574,6 +574,13 @@ export class PushCoalescer<E = unknown> {
     return this.subjects.get(subject)?.identity;
   }
 
+  /** A withdrawal can remove an occupant or cancel pending/rendering work.
+   * Historical subject records alone do not justify an over-cap ticket. */
+  hasLiveSubject(subject: string): boolean {
+    const state = this.subjects.get(subject);
+    return !!(state?.occupant || state?.batch || state?.rendering);
+  }
+
   pendingBatches(): number {
     let n = 0;
     for (const s of this.subjects.values()) if (s.batch) n++;
@@ -596,6 +603,23 @@ export class PushCoalescer<E = unknown> {
   receipt(serverId: string, binding: string, eventId: string): PushEventResult | undefined {
     const entry = this.receiptEntry(coalescingReceiptKey(serverId, binding, eventId));
     return entry && structuredClone(entry.result);
+  }
+
+  /** Replay only work already admitted. Pin a live receipt before waiting
+   * for subject order, then queue the authority check and ordinary durability
+   * barrier under the mutex without repeating effects. */
+  replayReceipt(occurrence: Pick<CoalescedOccurrence<E>, 'serverId' | 'binding' | 'eventId' | 'scope' | 'key'>, authority?: () => string | undefined, ready?: Promise<void>): Promise<PushEventResult> | undefined {
+    const key = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
+    const entry = this.receiptEntry(key);
+    if (!entry) return undefined;
+    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
+    const replay = () => this.locked(() => {
+      if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000, { admitted: true });
+      const reason = authority?.();
+      if (reason) return Promise.resolve({ accepted: false, reason });
+      return this.acknowledge(key, entry, subject, occurrence.eventId);
+    });
+    return ready ? ready.then(replay) : replay();
   }
 
   /** Whether the admission this receipt records delivered its occurrence as
@@ -646,10 +670,26 @@ export class PushCoalescer<E = unknown> {
    * Admit an occurrence that has already passed the lane's ordinary checks and
    * the coalesce-member validation. Returns the wire result, performing the
    * host effects (replace / remove / deliver) synchronously so a create, edit
-   * and delete cannot overtake one another.
+   * and delete cannot overtake one another. `check` gates fresh effects
+   * (including capacity); `authority` alone gates duplicate receipts.
    */
-  accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
-    return this.locked(() => this.admit(occurrence));
+  accept(occurrence: CoalescedOccurrence<E>, check?: () => string | undefined, authority?: () => string | undefined): Promise<PushEventResult> {
+    if (!check) return this.locked(() => this.admit(occurrence));
+    return this.locked(() => {
+      // A concurrent acceptance may have created the receipt since the
+      // lane's lookup. Already-admitted work must not be refused as fresh.
+      if (this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId))) {
+        const reason = authority?.();
+        if (reason) return Promise.resolve({ accepted: false, reason });
+        return this.admit(occurrence);
+      }
+      // Required admission may have waited behind a render or another
+      // acceptance. Recheck at the first effect, under the mutex, before
+      // receipts, subject state or an unread occupant can be touched.
+      const reason = check();
+      if (reason) return Promise.resolve({ accepted: false, reason });
+      return this.admit(occurrence);
+    });
   }
 
   private async admit(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {

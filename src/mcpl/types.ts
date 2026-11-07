@@ -11,6 +11,7 @@
  *   - All other types use plain names — they live in the mcpl/ module and are
  *     unambiguous when imported from here.
  */
+import type { InboundAdmissionConfig } from './inbound-admission.js';
 
 // ============================================================================
 // JSON-RPC 2.0 (Transport Layer)
@@ -196,7 +197,7 @@ export interface McplHostCapabilities {
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
   /** RFC-014 §6.3: this host presents tool hints. Sent to every server
-   *  with hints (McplServerConfig.toolHints: on unless false). */
+   *  with hints (McplServerConfig.toolHints: on unless false or inboundAdmission is configured). */
   toolHints?: boolean;
 }
 
@@ -227,6 +228,18 @@ export interface McplChannelCapabilities {
  * a restart with the new configuration).
  */
 export interface McplServerConfig {
+  /** AgentFramework-only opt-in, fail-closed admission for inbound data lanes.
+   * Direct McplServerConnection factories reject this option. Required coalesced
+   * module dispatch starts after acceptance and after the lane's response is written or abandoned,
+   * per channel in acceptance order (callback-completion order across subjects).
+   * Released queued+running work and unreleased reservations have separate
+   * 64-slot admission limits (batch release can temporarily exceed 64 released).
+   * New deliveries refuse before acceptance at either limit; withdrawals stand (only notice module work may
+   * be dropped at capacity). Stop/disconnect drop queued work with diagnostics;
+   * close/reconnect preserve it. Required and unconfigured coalescing servers
+   * share one host-wide chain/mutex: an unconfigured server's hung coalesced
+   * module delivery can stall required coalesced effects. */
+  inboundAdmission?: InboundAdmissionConfig;
   /** Unique server identifier */
   id: string;
 
@@ -528,7 +541,8 @@ export interface McplServerConfig {
 
   /**
    * MCPL RFC-014 (tool presence, toolsets and surfaces). On unless set to
-   * `false`: the host advertises `experimental.mcpl.toolHints` and honours
+   * `false` or inboundAdmission is configured (which always disables hints).
+   * When enabled, the host advertises `experimental.mcpl.toolHints` and honours
    * hints (through the `toolsets` meta-tools) only from a server that
    * advertised `toolHints` too. Such a server's static tools stay in the tool
    * list as before, and its dynamic tools (toolset tools, `mcpl/presence:

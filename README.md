@@ -1039,3 +1039,18 @@ npm run typecheck  # Type-check without emitting
 ```
 
 Requires Node.js >= 22.12. Chronicle requires a Rust toolchain for native module compilation (`npm run build` in the chronicle directory).
+
+Required inbound admission is supported only through `AgentFramework`; direct
+`McplServerConnection` factories reject `inboundAdmission`. Required coalesced
+content is stored and acknowledged without awaiting module `onProcess`; module
+dispatch runs per channel in acceptance order (callback-completion order across subjects)
+after acceptance and after the lane's response is written or abandoned. Released
+queued+running work and unreleased reservations each have a 64-slot admission
+limit (batch release can temporarily take released work over 64). New deliveries
+refuse before storage/acceptance at either limit, but withdrawals stand: at
+capacity only a delivered withdrawal notice's module work is dropped, with
+diagnostics. Stop/disconnect discard queued work; close/reconnect preserve it.
+Required and unconfigured coalescing servers share one host-wide coalescing
+chain/mutex: a hung module on an unconfigured server's coalesced delivery can
+stall required coalesced effects (existing main behaviour, outside this change). See
+[required inbound admission](docs/required-inbound-admission.md) for limits.

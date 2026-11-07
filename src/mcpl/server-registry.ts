@@ -5,7 +5,7 @@
  */
 
 import type { McplServerConfig, McplHostCapabilities } from './types.js';
-import { McplServerConnection, McplUnreapedLaunchError } from './server-connection.js';
+import { FRAMEWORK_INBOUND_ADMISSION, McplServerConnection, McplUnreapedLaunchError } from './server-connection.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from '../shutdown.js';
 
 /**
@@ -53,6 +53,8 @@ export class McplServerRegistry {
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
     onRegister?: (connection: McplServerConnection) => void,
+    /** @internal Forwarded only by AgentFramework. */
+    admissionCapability?: typeof FRAMEWORK_INBOUND_ADMISSION,
   ): Promise<McplServerConnection> {
     if (this.servers.has(config.id) || this.adding.has(config.id)) {
       throw new Error(`MCPL server "${config.id}" is already registered`);
@@ -62,8 +64,8 @@ export class McplServerRegistry {
     let connection: McplServerConnection;
     try {
       connection = config.reconnect === true
-        ? await McplServerConnection.connectWithReconnect(config, hostCapabilities, signal)
-        : await McplServerConnection.connect(config, hostCapabilities, signal);
+        ? await McplServerConnection.connectWithReconnect(config, hostCapabilities, signal, admissionCapability)
+        : await McplServerConnection.connect(config, hostCapabilities, signal, admissionCapability);
     } catch (error) {
       if (error instanceof McplUnreapedLaunchError) this.register(config, error.connection);
       throw error;

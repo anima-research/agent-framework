@@ -864,6 +864,14 @@ export type TraceEvent =
       impacts: Array<{ impact: string; subject: string; disposition: string }>;
     })
   | (TraceEventBase & {
+      /** Accepted content remains stored; only not-yet-started module work
+       * is discarded on stop/disconnect, or for a withdrawal notice at capacity. */
+      type: 'mcpl:module-work-dropped';
+      serverId: string;
+      count: number;
+      reason: 'host_stopped' | 'disconnected' | 'admission_module_capacity';
+    })
+  | (TraceEventBase & {
       type: 'mcpl:server-reconnected';
       serverId: string;
       /** How many attempts the reconnect loop needed (1 = first retry succeeded). */

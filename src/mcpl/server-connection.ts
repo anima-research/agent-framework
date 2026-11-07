@@ -1,3 +1,4 @@
+import { AdmissionRefusals, RequiredAdmission, AdmissionConnectError, type RequiredIngress, type RefusalCode } from './inbound-admission.js';
 /**
  * McplServerConnection — manages a single JSON-RPC 2.0 connection to an MCPL server.
  *
@@ -396,6 +397,16 @@ function unmatchedResponse(
     `its error: ${logValueRedacted(response.error, redact)}`;
 }
 
+/** @internal Only AgentFramework installs the lane adapters that enforce admission.
+ * Not exported from the package entry point; this is not a direct-consumer API. */
+export const FRAMEWORK_INBOUND_ADMISSION = Symbol('framework inbound admission');
+function requireFrameworkAdmission(config: McplServerConfig, capability?: typeof FRAMEWORK_INBOUND_ADMISSION): void {
+  if (config.inboundAdmission !== undefined && capability !== FRAMEWORK_INBOUND_ADMISSION) {
+    throw new Error('inboundAdmission is supported only through AgentFramework; direct McplServerConnection consumers have no authorized admission dispatcher');
+  }
+}
+
+
 /**
  * McplServerConnection manages a single JSON-RPC 2.0 connection to an
  * MCPL server over stdio. Use the static `connect()` factory to create
@@ -478,6 +489,65 @@ export class McplServerConnection extends EventEmitter {
   /** Increments at every transport boundary. RFC-007 terminals go only to
    *  the epoch their opening went to, never across a reconnect. */
   transportEpoch = 0;
+  readonly requiredAdmission?: RequiredAdmission;
+  private admissionRevision = 0;
+  private readonly admissionRefusals = new AdmissionRefusals();
+  private requiredFlushActive = false;
+  private requiredFlushDispatching = false;
+  private requiredFlushItem?: HeldItem;
+  private requiredFlushCompletion?: Promise<void>;
+  private requiredFlushDispatched?: Promise<void>;
+
+  /** @internal The contained framework handler supplies completion for the
+   * currently flushed event, including notifications and whole channel batches.
+   * Pair by synchronous dispatch, not by potentially cloned handler params. */
+  trackHeldHandler(event: string, completion: void | Promise<void>): void {
+    if (this.requiredFlushItem?.event === event) this.requiredFlushCompletion = completion || undefined;
+  }
+
+  /** @internal Capture the current held inference's dispatch milestone before
+   * its first await. The full contained handler remains the fallback for
+   * refusals/errors before dispatch, and still owns the eventual reply. */
+  heldInferenceDispatch(): (() => void) | undefined {
+    if (this.requiredFlushItem?.event !== 'inference-request') return undefined;
+    let dispatched!: () => void;
+    this.requiredFlushDispatched = new Promise<void>(resolve => { dispatched = resolve; });
+    return dispatched;
+  }
+
+  private readonly admissionEpochs = new WeakMap<object, number>();
+  private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
+
+  /** Only transport receipt creates an ingress key; never reconstruct one downstream. */
+  admissionFor(params: object): RequiredIngress {
+    return this.admissionReceipts.get(params) ?? this.requiredAdmission!.capture(() => 'admission_missing');
+  }
+
+  /** The same capability response and notification diagnostic on either profile. */
+  private refuseCapability(name: string, requiredCap: string, value: unknown): void {
+    const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
+    const responder = value as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+    if (responder?.respondError) {
+      responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
+    } else {
+      console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
+    }
+  }
+
+  private refuseAdmission(name: string, params: unknown, responder: any, reason: RefusalCode): void {
+    const report = (item: unknown) => this.admissionRefusals.report(trace => super.emit('admission-rejected', trace), this.id,
+      name === 'channels-incoming' ? 'channels/incoming' : name === 'push-event' ? 'push/event' : 'inference/request', reason, item);
+    if (name === 'channels-incoming') {
+      const messages = (params as { messages?: any[] } | null)?.messages;
+      if (Array.isArray(messages) && messages.length) messages.forEach(report); else report(params);
+      responder?.respond?.({ results: Array.isArray(messages) ? messages.map(m => ({ messageId: typeof m?.messageId === 'string' ? m.messageId : '', accepted: false, reason })) : [] });
+    } else {
+      report(params);
+      if (name === 'push-event') responder?.respond?.({ accepted: false, reason });
+      else responder?.respondError?.(-32600, reason);
+    }
+  }
+
 
   private transportEnded = new AbortController();
 
@@ -544,6 +614,7 @@ export class McplServerConnection extends EventEmitter {
    * AFTER the receipt for an expanding one.
    */
   establishGrant(grant: CapabilityGrant): void {
+    this.admissionRevision++;
     this.grant = grant;
     this.policyEstablished = true;
     // RFC-007 §6.5: revoking observe discards the filter; the server sends
@@ -555,6 +626,7 @@ export class McplServerConnection extends EventEmitter {
    * performs a fresh initialize handshake, so authority from the dead epoch
    * must be revoked before the replacement transport is exposed. */
   private resetPolicyForTransportBoundary(): void {
+    this.requiredAdmission?.invalidate();
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
@@ -568,13 +640,20 @@ export class McplServerConnection extends EventEmitter {
     // next one announces its own. What it reported about the world is kept: a
     // channel's incoming messages and its pushes, which the next process
     // doesn't send again when its bridge records them as forwarded first, as
-    // discord-mcpl does with its watermark. They are admitted at the flush
-    // against the next transport's grant, like anything held, and an answer
-    // to one is never written to the next transport (sameTransport); a
+    // discord-mcpl does with its watermark. Unconfigured connections admit
+    // these at flush against the next transport's grant; required connections
+    // trace admission_stale and discard all old-epoch data instead. An answer
+    // is never written to the next transport (sameTransport); a
     // connection closed for good, with no next transport, drops them. The
     // host's own reports about the transport stay too: its lifecycle
     // (connect-failed, reconnect-failed), the server's stderr, and
     // orphaned-response audits.
+    if (this.requiredAdmission) {
+      for (const item of this.bufferedEvents) {
+        if (McplServerConnection.REQUIRED_DATA_EVENTS.has(item.event)) this.refuseAdmission(item.event, item.args[0], item.args[1], 'admission_stale');
+      }
+      this.replaceHeld(this.bufferedEvents.filter(item => !McplServerConnection.REQUIRED_DATA_EVENTS.has(item.event)));
+    }
     this.replaceHeld(this.keepAcrossBoundary(this.bufferedEvents));
     // The next transport numbers its requests afresh (RFC-014's tap).
     this.hintedRequests.clear();
@@ -791,9 +870,11 @@ export class McplServerConnection extends EventEmitter {
     id: string,
     capabilities: McplCapabilities | null,
     transport: McplTransport | null,
+    admission?: RequiredAdmission,
   ) {
     super();
     this.id = id;
+    this.requiredAdmission = admission;
     this.capabilities = capabilities;
     this.transport = transport;
 
@@ -839,7 +920,7 @@ export class McplServerConnection extends EventEmitter {
     this.droppedKeptRequests = 0;
     if (pending.length > 200) {
       console.error(
-        `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
+        `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) ${this.requiredAdmission ? 'sequentially' : 'synchronously'} ` +
         `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
@@ -859,12 +940,22 @@ export class McplServerConnection extends EventEmitter {
    * and the rest is held again, after whatever this flush held.
    *
    * Between transports, the incoming messages and pushes a boundary kept
-   * stay held for the next transport's grant: admitted now, they would meet
+   * on unconfigured connections stay held for the next transport's grant: admitted now, they would meet
    * the empty grant the boundary left, with no transport to answer on. The
    * host's own reports about the transport (a stub's connect-failed, say)
    * need no grant and go on.
    */
   private flushHeld(snapshot: HeldItem[]): void {
+    if (this.requiredAdmission) {
+      // Keep the backlog in the ordinary bounded hold buffer across awaits,
+      // so pause, repeated ready(), and transport boundaries retain ownership.
+      this.replaceHeld(McplServerConnection.admissionOrder([...snapshot, ...this.bufferedEvents]));
+      if (!this.requiredFlushActive) {
+        this.requiredFlushActive = true;
+        void this.flushRequiredHeld().catch(error => this.reportInboundFailure(error, {}));
+      }
+      return;
+    }
     const waits = (item: HeldItem) => item.kept === true && McplServerConnection.WORLD_EVENTS.has(item.event);
     let pending = snapshot;
     if (!this.isConnected && snapshot.some(waits)) {
@@ -885,6 +976,51 @@ export class McplServerConnection extends EventEmitter {
       else this.dispatchInboundEvent(event, ...args);
     }
   }
+
+  /** Required backlogs release one admission and dispatch at a time. Control
+   * traffic and RPC responses stay live; new data joins the bounded backlog. */
+  private async flushRequiredHeld(): Promise<void> {
+    try {
+      while (!this.closedForGood) {
+        const index = this.bufferedEvents.findIndex(item => this.planeReadyFor(item.event)
+          && !(item.kept && McplServerConnection.WORLD_EVENTS.has(item.event) && !this.isConnected));
+        if (index < 0) return;
+        const item = this.bufferedEvents[index]!;
+        if (McplServerConnection.REQUIRED_DATA_EVENTS.has(item.event)) {
+          // Pre-pause live callbacks may still own all slots. A flush waits
+          // rather than manufacturing an overload refusal from held work.
+          const capacity = this.requiredAdmission!.waitForCapacity();
+          if (capacity) { await capacity; continue; }
+        }
+        this.replaceHeld(this.bufferedEvents.filter((_, i) => i !== index));
+        const ended = this.transportEnded.signal;
+        this.requiredFlushItem = item;
+        this.requiredFlushCompletion = undefined;
+        this.requiredFlushDispatched = undefined;
+        this.requiredFlushDispatching = true;
+        try { this.dispatchInboundEvent(item.event, ...item.args); }
+        finally {
+          this.requiredFlushDispatching = false;
+          this.requiredFlushItem = undefined;
+        }
+        const completion = this.requiredFlushCompletion;
+        const dispatched = this.requiredFlushDispatched;
+        this.requiredFlushCompletion = undefined;
+        this.requiredFlushDispatched = undefined;
+        if (completion && !ended.aborted) {
+          let release!: () => void;
+          const boundary = new Promise<void>(resolve => { release = resolve; });
+          ended.addEventListener('abort', release, { once: true });
+          try { await Promise.race(dispatched ? [completion, dispatched, boundary] : [completion, boundary]); }
+          finally { ended.removeEventListener('abort', release); }
+        }
+      }
+    } finally {
+      this.requiredFlushActive = false;
+    }
+  }
+
+  private static readonly REQUIRED_DATA_EVENTS = new Set(['channels-incoming', 'push-event', 'inference-request']);
 
   /** Whether the plane an event belongs to is open (lifecycle events always
    *  pass), as the admission gate (emit) decides it. */
@@ -1012,6 +1148,7 @@ export class McplServerConnection extends EventEmitter {
    * its teardown. A reconnect closes both planes instead.
    */
   pauseDataPlane(): void {
+    this.admissionRevision++;
     this.dataPlaneReady = false;
   }
 
@@ -1022,6 +1159,10 @@ export class McplServerConnection extends EventEmitter {
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
+    if (this.requiredAdmission && this.requiredFlushActive && McplServerConnection.REQUIRED_DATA_EVENTS.has(name)
+      && !(this.requiredFlushDispatching && this.requiredFlushItem?.event === name)) {
+      return this.hold(name, args);
+    }
     if (this.planeReadyFor(name)) {
       // Positive-grant admission (§5.4/§14.1), at the single choke-point
       // every path shares: live routing AND buffer flushes re-enter here, so
@@ -1046,14 +1187,32 @@ export class McplServerConnection extends EventEmitter {
         return true;
       }
       const requiredCap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name];
-      if (requiredCap && !this.grant.has(requiredCap)) {
-        const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
-        const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
-        if (responder?.respondError) {
-          responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
-        } else {
-          console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
+      if (this.requiredAdmission && ['channels-incoming', 'push-event', 'inference-request'].includes(name)) {
+        const params = args[0];
+        const epoch = params && typeof params === 'object' ? this.admissionEpochs.get(params) : undefined;
+        if (requiredCap && !this.grant.has(requiredCap) && (epoch === undefined || epoch === this.transportEpoch)) {
+          this.refuseCapability(name, requiredCap, args[1]);
+          return true;
         }
+        if (epoch === undefined) {
+          this.refuseAdmission(name, params, args[1], 'admission_missing');
+          return true;
+        }
+        if (epoch !== this.transportEpoch || !this.isConnected) {
+          this.refuseAdmission(name, params, args[1], 'admission_stale');
+          return true;
+        }
+        // Held data enters admission only at flush, under the current key.
+        // The receipt epoch still prevents old transport work acquiring it.
+        const revision = this.admissionRevision;
+        this.admissionReceipts.set(params as object, this.requiredAdmission.capture(() => {
+          if (this.transportEpoch !== epoch || !this.isConnected || !this.grant.has(requiredCap!)) return 'admission_stale';
+          if (!this.controlPlaneReady || !this.dataPlaneReady) return 'admission_not_ready';
+          if (revision !== this.admissionRevision) return 'admission_stale';
+        }));
+      }
+      if (requiredCap && !this.grant.has(requiredCap)) {
+        this.refuseCapability(name, requiredCap, args[1]);
         return true;
       }
       // §6.6: a request that will never be answered MUST get an error. A
@@ -1086,9 +1245,18 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Hold an event until its plane opens, `kept` when a transport boundary
-   * keeps it for the next transport's grant (afterBoundary).
+   * on unconfigured connections keeps it for the next transport's grant
+   * (afterBoundary). Required old-epoch data is refused as stale.
    */
   private hold(name: string, args: unknown[], kept?: true): true {
+    // A dispatch-path wrapper or re-entrant plane change must not put the
+    // current data item back into this same drain: with no handler promise,
+    // that would be a synchronous re-dispatch loop starving the event loop.
+    if (this.requiredAdmission && this.requiredFlushDispatching
+      && this.requiredFlushItem?.event === name && McplServerConnection.REQUIRED_DATA_EVENTS.has(name)) {
+      this.refuseAdmission(name, args[0], args[1], 'admission_not_ready');
+      return true;
+    }
     // Held until the plane opens. A long pause (a quiesce, say) on a busy or a
     // runaway server would otherwise grow this array without bound, so
     // requests and notifications each have a bound, counted apart. A request
@@ -1230,8 +1398,11 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    /** @internal Only the framework installs authorized lane adapters. */
+    admissionCapability?: typeof FRAMEWORK_INBOUND_ADMISSION,
   ): Promise<McplServerConnection> {
     McplServerConnection.checkConfig(config);
+    requireFrameworkAdmission(config, admissionCapability);
     return McplServerConnection.connectChecked(config, hostCapabilities, signal);
   }
 
@@ -1244,9 +1415,10 @@ export class McplServerConnection extends EventEmitter {
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
   ): Promise<McplServerConnection> {
+    const admission = config.inboundAdmission === undefined ? undefined : new RequiredAdmission(config.inboundAdmission, config.id);
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
-      established = await McplServerConnection.handshake(config, hostCapabilities, signal);
+      established = await McplServerConnection.handshake(config, hostCapabilities, signal, admission, 0);
     } catch (error) {
       if (!(error instanceof HandshakeCleanupError)) throw error;
       // The launch may still be running. A connection owns it, closed and
@@ -1257,7 +1429,7 @@ export class McplServerConnection extends EventEmitter {
     }
     const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
 
-    const connection = new McplServerConnection(config.id, capabilities, transport);
+    const connection = new McplServerConnection(config.id, capabilities, transport, admission);
     connection.toolsetDeclarations = toolsetDeclarations;
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
@@ -1312,6 +1484,8 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    admission?: RequiredAdmission,
+    epoch = 0,
   ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string; toolsetDeclarations: Record<string, unknown> | null }> {
     const closedWhileConnecting = () => new Error(`MCPL server "${config.id}" was closed while connecting`);
     if (signal?.aborted) throw closedWhileConnecting();
@@ -1401,6 +1575,12 @@ export class McplServerConnection extends EventEmitter {
             transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, result: {} }));
             return;
           }
+          if (admission && envelope.kind === 'request' && ['channels/incoming', 'push/event', 'inference/request'].includes(envelope.method)) {
+            const event = McplServerConnection.METHOD_TO_EVENT[envelope.method]!;
+            const capability = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[event];
+            transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, error: { code: CAPABILITY_DISABLED, message: 'capability_denied', data: { capability } } }));
+            return;
+          }
           if (envelope.kind !== 'response') return;
           const namesNoRequest = msg.id === null || !Object.hasOwn(msg, 'id');
           const answersInitialize = msg.id === initId || (namesNoRequest && msg.jsonrpc === '2.0' && Boolean(msg.error));
@@ -1441,6 +1621,21 @@ export class McplServerConnection extends EventEmitter {
               returned,
               null,
             ));
+            return;
+          }
+          if (admission) {
+            void admission.attest(result).then(() => {
+          const caps = result?.capabilities as Record<string, unknown> | undefined;
+          const experimental = caps?.experimental as Record<string, unknown> | undefined;
+          // §5.1: `tools` capability is the OUTER standard MCP member — the
+          // experimental manifest cannot mint it. Carried alongside so the
+          // grant can join it into §6.4 derivation.
+          resolve({
+            mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
+            mcpToolsAdvertised: caps?.tools !== undefined,
+            protocolVersion: answered,
+          });
+            }, reject);
             return;
           }
           const caps = result?.capabilities as Record<string, unknown> | undefined;
@@ -1497,6 +1692,8 @@ export class McplServerConnection extends EventEmitter {
       const stopCause = transport.stdioStopCause;
       if (stopCause) throw failed(`MCPL server "${config.id}": this host stopped using the server's stdio during the handshake (${stopCause.message})`);
 
+      if (admission) admission.bind(epoch);
+
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
 
@@ -1522,6 +1719,7 @@ export class McplServerConnection extends EventEmitter {
         toolsetDeclarations: toolsetDeclarationsOf(rawCapabilities),
       };
     } catch (err) {
+      admission?.invalidate();
       // Never leak the child / socket if the handshake fails. A cleanup that
       // can't confirm the child exited is part of the failure, never
       // swallowed: the launch may still be running, so the caller keeps it.
@@ -1549,9 +1747,12 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    /** @internal Only the framework installs authorized lane adapters. */
+    admissionCapability?: typeof FRAMEWORK_INBOUND_ADMISSION,
   ): Promise<McplServerConnection> {
     // Outside the retry path below: a configuration error is never retried.
     McplServerConnection.checkConfig(config);
+    requireFrameworkAdmission(config, admissionCapability);
     try {
       return await McplServerConnection.connectChecked(config, hostCapabilities, signal);
     } catch (error) {
@@ -1559,7 +1760,7 @@ export class McplServerConnection extends EventEmitter {
       // a retry stub would restart the server forever for nothing. A connect
       // its caller ended (stop(), or a disconnect of its id) isn't retried
       // either, nor is a launch that couldn't be reaped.
-      if (config.reconnect !== true || error instanceof McplProtocolVersionError || error instanceof McplUnreapedLaunchError || signal?.aborted) {
+      if (config.reconnect !== true || error instanceof McplProtocolVersionError || error instanceof AdmissionConnectError || error instanceof McplUnreapedLaunchError || signal?.aborted) {
         throw error;
       }
 
@@ -1587,7 +1788,7 @@ export class McplServerConnection extends EventEmitter {
     hostCapabilities: McplHostCapabilities,
   ): McplServerConnection {
     // Null transport — the stub is closed until its first background reconnect.
-    const stub = new McplServerConnection(config.id, null, null);
+    const stub = new McplServerConnection(config.id, null, null, config.inboundAdmission === undefined ? undefined : new RequiredAdmission(config.inboundAdmission, config.id));
     stub.closed = true;
     stub.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     stub.config = config;
@@ -2119,7 +2320,8 @@ export class McplServerConnection extends EventEmitter {
 
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
-      established = await McplServerConnection.handshake(config, hostCapabilities, signal);
+      if (this.requiredAdmission) this.resetPolicyForTransportBoundary();
+      established = await McplServerConnection.handshake(config, hostCapabilities, signal, this.requiredAdmission, this.transportEpoch);
     } catch (error) {
       const unreaped = error instanceof HandshakeCleanupError;
       if (unreaped) this.holdUnreaped(error.transport, error.cleanup);
@@ -2135,8 +2337,8 @@ export class McplServerConnection extends EventEmitter {
       // for good: close() can confirm its exit, but close() is terminal, so
       // nothing resumes this connection. Every other failure keeps the
       // backoff loop.
-      if (error instanceof McplProtocolVersionError) this.reconnectEnabled = false;
-      const permanent = unreaped || error instanceof McplProtocolVersionError;
+      if (error instanceof McplProtocolVersionError || error instanceof AdmissionConnectError) this.reconnectEnabled = false;
+      const permanent = unreaped || error instanceof McplProtocolVersionError || error instanceof AdmissionConnectError;
       const message = unreaped ? `${failure.message}; ${this.unreapedFailure()}` : failure.message;
       const stderrTail = stderrTailOf(failure);
       this.emit('reconnect-failed', { error: message, ...(stderrTail ? { stderrTail } : {}), attempt, ...(permanent ? { permanent: true } : {}) });
@@ -2168,7 +2370,7 @@ export class McplServerConnection extends EventEmitter {
     // policy responses are never buffered), and then opens the planes.
     this.controlPlaneReady = false;
     this.dataPlaneReady = false;
-    this.resetPolicyForTransportBoundary();
+    if (!this.requiredAdmission) this.resetPolicyForTransportBoundary();
     this.transport = transport;
     this.capabilities = capabilities;
     this.toolsetDeclarations = toolsetDeclarations;
@@ -2561,6 +2763,10 @@ export class McplServerConnection extends EventEmitter {
       return;
     }
 
+    if (this.requiredAdmission && ['channels-incoming', 'push-event', 'inference-request'].includes(eventName) && request.params && typeof request.params === 'object') {
+      this.admissionEpochs.set(request.params, epoch);
+    }
+
     // Emit the typed event with params and (for requests) a respond callback
     if (requestId !== undefined) {
       // Server expects a response — provide a respond helper
@@ -2591,7 +2797,7 @@ export class McplServerConnection extends EventEmitter {
   /**
    * A request or notification read from a transport after its boundary has
    * passed: the boundary's rule (resetPolicyForTransportBoundary). An
-   * incoming message or push is held as kept, for the next transport's
+   * incoming message or push on an unconfigured connection is held as kept, for the next transport's
    * grant, and any other is dropped and logged. (A response read then goes to
    * handleResponse, flagged late.) A stdio
    * server's transport closes on the child's 'exit', when its stdout may
@@ -2605,6 +2811,10 @@ export class McplServerConnection extends EventEmitter {
   private afterBoundary(request: JsonRpcRequest, requestId: string | number | null | undefined, epoch: number): void {
     const event = Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
       ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
+    if (this.requiredAdmission && event && ['channels-incoming', 'push-event', 'inference-request'].includes(event)) {
+      this.refuseAdmission(event, request.params, requestId !== undefined ? this.responderFor(requestId, epoch) : undefined, 'admission_stale');
+      return;
+    }
     if (this.closedForGood || event === undefined || !McplServerConnection.WORLD_EVENTS.has(event)) {
       console.error(
         `[mcpl] ${this.id}: dropped a message read after its transport closed` +
@@ -2817,7 +3027,8 @@ export class McplServerConnection extends EventEmitter {
     epoch = this.transportEpoch,
   ): void {
     // A refusal that can't be answered still says what it refused: a held
-    // message admitted under the next transport's grant is refused here.
+    // unconfigured message admitted under the next transport's grant is refused
+    // here. Required old-epoch data is instead refused as admission_stale.
     if (!this.sameTransport(id, epoch, `error ${code} ${logDetail(message)}`) || this.closed) return;
     const response: JsonRpcResponse = {
       jsonrpc: '2.0',
