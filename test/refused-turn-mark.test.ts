@@ -14,7 +14,6 @@ const QUIET_AMBIENT = { config: { policies: [{ name: 'quiet', match: { tagsAny: 
 
 type Internals = {
   logFailure(record: Record<string, unknown>): void;
-  deferredMessages: unknown[];
   channelRegistry: { getDesiredState(serverId: string, channelId: string): string | undefined };
 };
 
@@ -82,11 +81,13 @@ async function rig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>;
     await f.framework.runUntilIdle();
   };
   const marked = () => marks.map((m) => [m.name, m.arguments?.channelId, m.arguments?.messageId]);
+  // A message is stored as it arrives (#291), whether or not a turn is alive.
+  const stored = (...messageIds: string[]) => messageIds.every((id) => f.context().includes(`message ${id}`));
   const markSent = async () => {
     await answered(ROOM, 'm-after');
     await eventually(() => f.published.some((p) => JSON.stringify(p).includes('answer to m-after')), 'a later post');
   };
-  return { f, fw, streams, records, marks, marked, incoming, adminMention, answered, markSent };
+  return { f, fw, streams, records, marks, marked, stored, incoming, adminMention, answered, markSent };
 }
 
 describe('a refused turn is marked on the message it answers, and its failure names that message\'s channel', () => {
@@ -175,7 +176,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.f.membrane.calls.length === 1, 'the turn for m-a, held');
     await r.incoming(ROOM, 'm-b');
     await r.incoming(GENERAL, 'm-c', ['chat:ambient', 'chat:from-human']);
-    await eventually(() => r.fw.deferredMessages.length === 2, 'm-b and m-c deferred behind the live turn');
+    await eventually(() => r.stored('m-b', 'm-c'), 'm-b and m-c stored while the turn is alive');
     r.streams.push(() => new MockYieldingStream([refusal()]));
     release();
     await eventually(() => r.records.length === 1 && r.marks.length === 1, 'm-b\'s turn, refused and marked');
@@ -211,7 +212,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
       channelId: ROOM, channelServerId: 'editor', answersMessageId: 'm-a',
     });
     await r.incoming(GENERAL, 'm-g');
-    await eventually(() => r.fw.deferredMessages.length === 1, 'm-g deferred behind the live turn');
+    await eventually(() => r.stored('m-g'), 'm-g stored while the turn is alive');
     r.streams.push(() => new MockYieldingStream([refusal()]));
     release();
     await eventually(() => r.records.length === 1, 'the merged turn, refused');
@@ -232,7 +233,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
       channelId: ROOM, channelServerId: 'editor', answersMessageId: 'm-same',
     });
     await r.incoming(GENERAL, 'm-same');
-    await eventually(() => r.fw.deferredMessages.length === 1, 'general\'s m-same deferred behind the live turn');
+    await eventually(() => r.stored('m-same'), 'general\'s m-same stored while the turn is alive');
     r.streams.push(() => new MockYieldingStream([refusal()]));
     release();
     await eventually(() => r.records.length === 1, 'the merged turn, refused');
@@ -268,14 +269,72 @@ describe('a refused turn is marked on the message it answers, and its failure na
     const quiesced = r.f.framework.quiesce({ reason: 'test window' });
     release();
     await quiesced;
-    const parked = () => (r.f.framework as unknown as { pendingRequests: Array<{ reason: string }> }).pendingRequests
-      .filter((q) => q.reason === 'mcpl:channel-incoming');
-    await eventually(() => parked().length === 1, 'the two messages park as one wake');
+    assert.equal(r.f.membrane.calls.length, 1, 'premise: no turn ran while the host was quiesced');
     await r.f.framework.resume();
     await eventually(() => r.records.length === 1, 'the resumed turn, refused');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
     assert.equal(r.records[0]!.locus, ROOM);
+  });
+
+  it('a second resident\'s wakes for two messages that wait out a quiesce park as one, which answers neither: its refusal marks nothing; for one message, it marks it', async (t) => {
+    // A wake reads its message's row only for the resident the row was
+    // stored for (readsRow), so another resident's wakes share a parking key.
+    const r = await rig(t, { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'second', model: 'test', systemPrompt: 'test' }] });
+    // Messages that arrive while both residents' turns are alive wait behind
+    // them, and park when the host quiesces.
+    const parkedThrough = async (held: string, messageIds: string[]) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      r.streams.push(() => new HeldStream(released, [answer(`answer to ${held}`)]), () => new HeldStream(released, [answer(`answer to ${held}`)]),
+        () => new MockYieldingStream([refusal()]), () => new MockYieldingStream([refusal()]));
+      const before = r.f.membrane.calls.length;
+      await r.incoming(ROOM, held);
+      await eventually(() => r.f.membrane.calls.length === before + 2, `both residents' turns for ${held}, held`);
+      for (const id of messageIds) await r.incoming(ROOM, id);
+      await eventually(() => r.stored(...messageIds), `${messageIds.join(' and ')} stored while the turns are alive`);
+      const quiesced = r.f.framework.quiesce({ reason: 'test window' });
+      release();
+      await quiesced;
+      assert.equal(r.f.membrane.calls.length, before + 2, 'premise: no turn ran while the host was quiesced');
+      await r.f.framework.resume();
+    };
+    await parkedThrough('m-0', ['m-1']);
+    await eventually(() => r.records.length === 2 && r.marks.length === 2, 'control: both residents\' resumed turns for m-1, refused and marked');
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']]);
+    await r.f.framework.runUntilIdle();
+    await parkedThrough('m-4', ['m-2', 'm-3']);
+    await eventually(() => r.records.length === 4, 'both residents\' resumed turns for m-2 and m-3, refused');
+    await r.markSent();
+    assert.deepEqual(r.records.slice(2).map((record) => record.agent).sort(), ['agent', 'second']);
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']], 'neither resumed turn for m-2 and m-3 marks a message');
+  });
+
+  it('a second resident\'s wakes for two messages that its provider\'s stated wait holds as one answer neither: its refusal marks nothing; for one message, it marks it', async (t) => {
+    // One delivery of two messages wakes another resident twice in one
+    // millisecond, with no row to read (readsRow), so its hold keeps them as one.
+    const r = await rig(t, { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'second', model: 'test', systemPrompt: 'test' }] });
+    for (let i = 0; i < 4; i++) r.streams.push(() => new MockYieldingStream([refusal()]));
+    const waits = (r.fw as unknown as { providerWaits: { set(agent: string, model: string, ms: number, why: string): unknown } }).providerWaits;
+    const message = (messageId: string) => ({ channelId: ROOM, messageId, timestamp: TS, author: { id: 'U1', name: 'Antra' }, tags: ADDRESSED, content: [{ type: 'text', text: `message ${messageId}` }] });
+    waits.set('second', 'test', 300, 'a stated wait');
+    await r.incoming(ROOM, 'm-1');
+    await eventually(() => r.records.length === 2 && r.marks.length === 2, 'control: both residents\' turns for m-1, refused and marked, the second\'s after its wait');
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']]);
+    await r.f.framework.runUntilIdle();
+    // Both residents wait this time, so each turn starts from what its hold
+    // kept: the first resident's two wakes, each reading its own row, and the
+    // second resident's one.
+    waits.set('agent', 'test', 300, 'a stated wait');
+    waits.set('second', 'test', 300, 'a stated wait');
+    const now = Date.now();
+    const clock = t.mock.method(Date, 'now', () => now);
+    await r.f.send('channels/incoming', { messages: [message('m-2'), message('m-3')] });
+    clock.mock.restore();
+    await eventually(() => r.records.length === 4, 'both residents\' turns for m-2 and m-3, refused after their waits');
+    await r.markSent();
+    assert.deepEqual(r.records.slice(2).map((record) => record.agent).sort(), ['agent', 'second']);
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']], 'neither turn for m-2 and m-3 marks a message');
   });
 
   it('a provider hold that takes two wakes for different messages as one keeps neither message; for one message, it keeps it', async (t) => {
@@ -345,7 +404,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await r.incoming(ROOM, 'm-2');
     await eventually(() => r.records.length === 1 && r.f.membrane.calls.length === 3, 'the refusal, and its retry held');
     await r.incoming(GENERAL, 'm-c', ['chat:ambient', 'chat:from-human']);
-    await eventually(() => r.fw.deferredMessages.length === 1, 'm-c deferred behind the retry');
+    await eventually(() => r.stored('m-c'), 'm-c stored while the retry is alive');
     release();
     await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the rewind')), 'the retry\'s answer published');
     const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind'));
@@ -361,7 +420,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await r.incoming(ROOM, 'm-2');
     await eventually(() => r.records.length === 1 && r.f.membrane.calls.length === 3, 'the first refusal, and its retry held');
     await r.incoming(GENERAL, 'm-c', ['chat:ambient', 'chat:from-human']);
-    await eventually(() => r.fw.deferredMessages.length === 1, 'm-c deferred behind the retry');
+    await eventually(() => r.stored('m-c'), 'm-c stored while the retry is alive');
     release();
     await eventually(() => r.records.length === 2 && r.marks.length === 1, 'the retry, refused and marked');
     assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-2']]);
@@ -384,7 +443,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await r.incoming(ROOM, 'm-4');
     await eventually(() => r.f.membrane.calls.length === 5, 'the third failure, and the breaker\'s retry held');
     await r.incoming(GENERAL, 'm-c', ['chat:ambient', 'chat:from-human']);
-    await eventually(() => r.fw.deferredMessages.length === 1, 'm-c deferred behind the retry');
+    await eventually(() => r.stored('m-c'), 'm-c stored while the retry is alive');
     release();
     await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the breaker')), 'the retry\'s answer published');
     const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the breaker'));
