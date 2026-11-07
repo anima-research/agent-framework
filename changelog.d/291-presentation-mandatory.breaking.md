@@ -28,7 +28,7 @@
     isn't held back, and neither judges a conversation agent for disposal, as a move does.
   - **A resident is shown another resident's rows only through `observes`** (decision 1): its window takes its own
     rows, the rows meant for it (their audience stamp, see Added: every row says who it is for) and the own rows of each agent
-    it observes (`AgentConfig.observes`, none by default; see Added). In 0.32.0 a resident's
+    it observes (`AgentConfig.observes`, none by default; see Added: `AgentConfig.observes`). In 0.32.0 a resident's
     view was the whole shared slot but held traffic and the other residents' stored context injections, so it was
     shown each co-resident's rounds, replies, tool results and notes, and the mail and messages meant for them. Rows
     stored before the upgrade carry no stamp and stay in the window its write-down takes from the record; a row
