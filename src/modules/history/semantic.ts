@@ -298,7 +298,7 @@ function isHit(hit: unknown): boolean {
 
 export const ERROR_MARK = ', error';
 
-/** Text to embed for one message, or '' when there is nothing worth indexing; with `failed`, the same text shown with each speech call it names marked as an error. */
+/** Text to embed for one message, or '' when there is nothing worth indexing. */
 export function messageIndexText(msg: StoredMessage, includePrivateTools = true, failed: ReadonlySet<string> = new Set()): string {
   const parts: string[] = [];
   for (const block of msg.content as ContentBlock[]) {
