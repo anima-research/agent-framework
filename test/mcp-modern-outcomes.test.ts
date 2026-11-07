@@ -1180,6 +1180,33 @@ test('failures are classified in order: nothing sent first, then the answers, th
     'Listing changes nothing on the server, so it\'s safe to try again.');
   loggedLine(logged, /^MCP server "raw" tools\/list failed: "socket hang up"$/);
 
+  // A POST the server answered 404 for an ended session is a refusal too,
+  // whatever error the call met as the session closed, and the same rule
+  // about an earlier round holds for it.
+  const closed = new Error('Connection closed');
+  const ended = classify({ sessionEnded: true }, closed);
+  assert.equal(outcome(ended), 'error-response');
+  assert.deepEqual((ended as McplRequestError).data, { httpStatus: 404 });
+  // This connection doesn't reconnect, so the agent is told so.
+  assert.equal(ended.message, 'The "raw" server had ended this connection\'s session, so the request didn\'t run. ' +
+    "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
+  loggedLine(logged, /^MCP server "raw" refused tools\/call op: HTTP 404 \(the server had ended this connection's session\)$/);
+  const endedLater = classify({ sessionEnded: true, continued: true }, closed);
+  assert.equal(outcome(endedLater), 'no-response');
+  assert.equal(endedLater.message, 'The "raw" server ended this connection\'s session partway through the request, after asking for more, ' +
+    "so whether it took effect is unknown. This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
+  loggedLine(logged, /^MCP server "raw" refused a later round of tools\/call op: HTTP 404 \(the server had ended this connection's session\)$/);
+  const endedLaterListing = classify({ sessionEnded: true, continued: true }, closed, 'tools/list');
+  assert.equal(endedLaterListing.message, 'The "raw" server ended this connection\'s session partway through the request, after asking for more. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
+
+  // Handed off and unanswered, with no deadline: main's words for a
+  // request that failed before an answer came back.
+  const cut = classify({}, new Error('Connection closed'));
+  assert.equal(outcome(cut), 'no-response');
+  assert.equal(cut.message, 'The request to the "raw" server failed before an answer came back, so whether it took effect is unknown. ' +
+    'Check its effect before trying again.');
+
   const listing = classify({}, new SdkError(SdkErrorCode.RequestTimeout, 'Request timed out'), 'tools/list');
   assert.equal(outcome(listing), 'no-response');
   assert.equal(listing.message, 'The "raw" server didn\'t answer within 1 second, and this host asked it to cancel. ' +
@@ -1252,6 +1279,7 @@ test('a server that shares no revision with this client is a configuration verdi
     assert.ok(err instanceof McplProtocolVersionError, String(err));
     assert.equal(err.kind, 'rejected');
     assert.equal(err.offered, '2026-07-28');
+    assert.deepEqual(err.offeredRevisions, ['2026-07-28']);
     assert.deepEqual(err.supported, ['2099-01-01']);
     assert.match(err.message, /MCP server "raw" does not support MCP 2026-07-28 \(it supports: 2099-01-01\)\./);
     return true;
@@ -1261,6 +1289,42 @@ test('a server that shares no revision with this client is a configuration verdi
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1);
 });
 
+test('a discovery the SDK can\'t read, listing no 2026-07-28, is a verdict on stdio too: no retry', async () => {
+  // The SDK reads such an answer as no modern evidence, and its pin mode
+  // fails without the typed refusal; the list on the wire still decides.
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({
+    id: 'raw', command: process.execPath, args: [SERVER, 'unreadable-older-revision', log], protocol: 'modern',
+    reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60,
+  });
+  cleanups.push(() => connection.close());
+  await assert.rejects(connection.start(), (err: unknown) => {
+    assert.ok(err instanceof McplProtocolVersionError, String(err));
+    assert.equal(err.kind, 'rejected');
+    assert.deepEqual(err.supported, ['2025-11-25']);
+    assert.match(err.message, /MCP server "raw" does not support MCP 2026-07-28 \(it supports: 2025-11-25\)\./);
+    return true;
+  });
+  assert.equal(connection.willReconnect, false, 'nothing will retry it');
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
+});
+
+test('a discovery the SDK can\'t read that lists 2026-07-28 is no verdict on stdio: the connect is retried', async () => {
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({
+    id: 'raw', command: process.execPath, args: [SERVER, 'unreadable-current-revision', log], protocol: 'modern',
+    reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60,
+  });
+  cleanups.push(() => connection.close());
+  const failed: unknown[] = [];
+  connection.on('connect-failed', (f) => failed.push(f));
+  await connection.start();
+  assert.equal(failed.length, 1, 'the first connect failed, and will be retried');
+  assert.equal(connection.willReconnect, true);
+  await until(() => wire(log).filter((e) => e.event === 'start').length >= 2, 'a second launch');
+});
+
 test('a legacy-only server is pointed to what reaches it: its configuration over stdio, stdio or WebSocket for an http url', () => {
   const refusal = new UnsupportedProtocolVersionError({ supported: ['2024-11-05'], requested: '2026-07-28' });
   const verdictFor = (config: Parameters<typeof ModernMcpConnection.create>[0]) =>
@@ -1268,7 +1332,7 @@ test('a legacy-only server is pointed to what reaches it: its configuration over
   const stdio = verdictFor({ id: 'raw', command: process.execPath, args: [SERVER, '', scratchLog()], protocol: 'modern' });
   assert.match(stdio.message, /\(it supports: 2024-11-05\)\. It speaks legacy MCP: configure it without protocol: 'modern'\.$/);
   const http = verdictFor({ id: 'remote', url: 'http://127.0.0.1:1/mcp' });
-  assert.match(http.message, /\(it supports: 2024-11-05\)\. It speaks only legacy MCP, which this client reaches over stdio or WebSocket \(ws:\/\/, wss:\/\/\), not http\(s\)\.$/);
+  assert.match(http.message, /\(it supports: 2024-11-05\)\. It speaks legacy MCP \(2024-11-05\), which this client reaches over stdio or WebSocket \(ws:\/\/, wss:\/\/\), not http\(s\)\.$/);
   assert.doesNotMatch(http.message, /protocol: 'modern'/);
 });
 
