@@ -25,19 +25,24 @@
     stored, as the rest of its rows already go. Whether OpenAI accepts a
     compaction item issued in another conversation isn't known.
   - A stored message holding only such items is sent, but the framework
-    doesn't count it as a turn: the request's last turn, its count of stored
-    injections, a refusal rewind and the shed after inference exhaustion pass
-    over it, as before. The Responses API gets its items, except an Anthropic
-    server-tool block; Anthropic's API gets an assistant turn's paired
-    server-tool blocks, and a lone call in the request's last message; the
-    other wires get none.
+    doesn't count it as a turn: the request's last turn and its count of
+    stored injections pass over it, as before. The Responses API gets its
+    items, except an Anthropic server-tool block; Anthropic's API gets an
+    assistant turn's paired server-tool blocks, and a lone call in the
+    request's last message; the other wires get none. A refusal rewind and the
+    shed after inference exhaustion take such a message, where the request
+    carried it, with the turn before it, in the same step and counted as that
+    one turn, since its items may be what the provider refuses. A reply that
+    continues the agent's own such message follows the `[Continue]` that
+    message followed, so later requests render it before both.
   - The framework doesn't resume a paused Anthropic turn (`pause_turn`)
-    itself. But a round stored as server-tool blocks alone, newest, is no
-    longer followed by a `[Continue]`, so a request whose last message it is
-    sends its lone call last, the shape Anthropic asks for to resume one. A
-    request can still put something after it: a silent tick's opening request,
-    for one, ends on the tick's separator, and then the lone call is left out.
-    Before, every request left the round out.
+    itself. But a round stored as server-tool blocks alone no longer counts as
+    the agent's turn: a `[Continue]` follows it only where the turn before it
+    is the agent's own, and otherwise a request whose last message it is sends
+    it last, the shape Anthropic asks for to resume one. A request can still
+    put something after it: a silent tick's opening request, for one, ends on
+    the tick's separator, and then a lone call is left out. Before, every
+    request left the round out.
   - A tool boundary's note to a context manager that keeps a thinking-binding
     record now names a row holding such an item where the next request
     carries it as the stream sent it, rather than marking it as a difference.

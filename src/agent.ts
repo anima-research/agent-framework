@@ -17,6 +17,7 @@ import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type Marke
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
+  carrierReplyPrompt,
   continueTurn,
   indexRequestOnlyRows,
   renderRequestOnlyRows,
@@ -93,7 +94,9 @@ export interface StartStreamResult {
    *  any, read from the request: a new one when it ends on `[Continue]`;
    *  else, when it ends on tool results, or on tool results and then
    *  stored context injections alone, the prompt of the reply that called
-   *  those tools (`toolLoopPrompt`); else none. The framework stamps the
+   *  those tools (`toolLoopPrompt`); else, when it ends on the agent's own
+   *  reply holding only provider items' carriers, that reply's prompt
+   *  (`carrierReplyPrompt`); else none. The framework stamps the
    *  reply's rows with it (`metadata.promptedBy`), for later compiles to
    *  render it before them. */
   continuePrompt?: RequestOnlyPrompt;
@@ -155,9 +158,10 @@ import type {
  * all context injections. Both count only messages that hold a turn
  * (holdsTurn), as the injection tail is counted: a message holding only
  * provider items' carriers isn't a turn, and is passed over. So a paused
- * Anthropic round stored as server-tool blocks alone, newest, gets no
- * [Continue] after it, though a request can still put something else after
- * it, as a silent tick's opening request puts the tick's separator.
+ * Anthropic round stored as server-tool blocks alone, newest, no longer
+ * counts as the agent's turn: a [Continue] follows it only where the turn
+ * before it is the agent's own, and a request can still put something else
+ * after it, as a silent tick's opening request puts the tick's separator.
  */
 function turnBeforeInjections(messages: NormalizedMessage[], injectionTail: number): { turn: NormalizedMessage | undefined; injectionsOnly: boolean } {
   let counted = 0;
@@ -2222,7 +2226,9 @@ export class Agent {
     // request itself: a new one when it ends on [Continue]; else, when it
     // ends on tool results (apart from stored context injections after
     // them), the prompt of the reply that called those tools, whose tool
-    // loop this reply continues; else none. A request that ends
+    // loop this reply continues; else, when it ends on the agent's own reply
+    // holding only provider items' carriers, such as a paused round, that
+    // reply's prompt, since this reply continues it; else none. A request that ends
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
     let continuePrompt: RequestOnlyPrompt | undefined;
@@ -2242,7 +2248,8 @@ export class Agent {
     } else {
       // What the request ends on apart from the stored injections after it,
       // which aren't something the reply answers.
-      continuePrompt = toolLoopPrompt(turnBeforeInjections(messages, injectionTail).turn, index);
+      continuePrompt = toolLoopPrompt(turnBeforeInjections(messages, injectionTail).turn, index)
+        ?? carrierReplyPrompt(messages, this.presentAs, index);
     }
 
     const request: NormalizedRequest = {

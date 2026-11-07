@@ -99,6 +99,41 @@ test('shed: skips the episode marker and sheds the real turn beneath it', () => 
   assert.deepEqual(removed, ['m1']);
 });
 
+const CARRIER_ROWS = [
+  ['a Responses compaction item', 'cmp_1', [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } }]],
+  ['an Anthropic server-tool call and its result', 'srvtoolu_1', [
+    { type: 'text', text: '', rawItem: { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: {} } },
+    { type: 'text', text: '', rawItem: { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_1', content: [] } },
+  ]],
+] as const;
+
+for (const [kind, , carriers] of CARRIER_ROWS) {
+  test(`shed: a carrier-only row holding ${kind} that the refused request carried goes with the turn before it, and a system row between stays`, () => {
+    const msgs = [
+      { id: 'u1', participant: 'simulect', content: [{ type: 'text', text: 'q' }], metadata: { messageId: '1' } },
+      { id: 'a1', participant: 'labclaude', content: [{ type: 'text', text: 'my answer' }] },
+      { id: 'n1', participant: 'user', content: [{ type: 'text', text: 'a system note' }], metadata: { system: true } },
+      { id: 'c1', participant: 'labclaude', content: [...carriers] },
+    ];
+    const { fw, agent, removed, messages } = makeAgentHarness(msgs);
+    const rec = fw.shedNewestTurn(agent, new Set(['u1', 'a1', 'c1']));
+    assert.deepEqual([...removed].sort(), ['a1', 'c1']);
+    assert.deepEqual([...rec.removedIds].sort(), ['a1', 'c1']);
+    assert.deepEqual(messages.map((m: { id: string }) => m.id), ['u1', 'n1']);
+  });
+
+  test(`shed: a carrier-only row holding ${kind} that the refused request didn't carry stays`, () => {
+    const msgs = [
+      { id: 'u1', participant: 'simulect', content: [{ type: 'text', text: 'q' }], metadata: { messageId: '1' } },
+      { id: 'a1', participant: 'labclaude', content: [{ type: 'text', text: 'my answer' }] },
+      { id: 'c1', participant: 'labclaude', content: [...carriers] },
+    ];
+    const { fw, agent, removed } = makeAgentHarness(msgs);
+    fw.shedNewestTurn(agent, new Set(['u1', 'a1']));
+    assert.deepEqual(removed, ['a1']);
+  });
+}
+
 test('shed: null when only the episode marker remains', () => {
   const msgs = [{ id: 'mk', participant: 'user', content: [{ type: 'text', text: 'x' }], metadata: { system: true } }];
   const { fw, agent } = makeAgentHarness(msgs);
@@ -308,6 +343,27 @@ test('an exchange the refused request carried only by its call is shed whole', a
     assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
   } finally { await rig.close(); }
 });
+
+for (const [kind, mark, carriers] of CARRIER_ROWS) {
+  test(`a rewind step takes a carrier-only row holding ${kind} with the turn before it, and a system row between stays in the window`, async () => {
+    const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });
+    try {
+      await rig.say('first question', 1);
+      const cm = rig.framework.getAgent('scout')!.getContextManager();
+      const note = cm.addMessage('user', [text('a system note')], { system: true } as never);
+      cm.addMessage('scout', [...carriers] as never);
+      await rig.say('second question', 4);
+      assert.equal(rig.requests.length, 4, 'the turn, two refused requests and the retry');
+      assert.ok(JSON.stringify(rig.requests[1]!.messages).includes(mark), 'the premise: the refused request carried the carrier-only row');
+      const retry = rig.requests[3]!;
+      assert.ok(!JSON.stringify(retry.messages).includes(mark), 'the carrier-only row is gone');
+      assert.ok(!rig.texts(retry).some((t) => t.includes('reply 1')), 'with the reply before it');
+      assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes('[refusal-rewind]')), 'what came before stays');
+      assert.equal(cm.windowStatusOf(note), 'in', 'the system row between them stays in the window');
+      assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+    } finally { await rig.close(); }
+  });
+}
 
 test('a row no refused request carried, such as tuned-out traffic, is neither removed nor counted', async () => {
   const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });

@@ -224,7 +224,7 @@ import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } 
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
-import { holdsTurn, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
+import { carriesRawItem, holdsTurn, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, suppressedRow, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -14328,9 +14328,12 @@ export class AgentFramework {
    * With `carried` (the stored bodies a refused request's compile carried,
    * by each body's first message id), only a message that request carried
    * counts, or the stored result of a call it carried, which goes with that
-   * call as one exchange; a row that holds no turn (holdsTurn: nothing a
-   * request sends, or only provider items' carriers) is passed over and
-   * left in place. It adds no
+   * call as one exchange. A row that holds no turn (holdsTurn) is passed
+   * over: one holding only provider items' carriers that the agent is sent
+   * (with `carried`, that the refused request carried) goes with the turn
+   * before it, in the same step, since its items may be what the provider
+   * refuses, and one holding nothing a request sends is left in place. It
+   * adds no
    * marker; the caller keeps one consolidated marker for the episode
    * (updateRewindMarker). The returned record's descriptor says what was
    * set aside and its size, never the content. Returns null when nothing
@@ -14417,8 +14420,23 @@ export class AgentFramework {
       .filter((b) => typeOf(b) === 'text')
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
+    // A body after the turn that holds only provider items' carriers goes with
+    // it in the same step: its items may be what the provider rejects.
+    const carrierBodies: Array<{ from: number; to: number }> = [];
+    for (let j = idx + 1; j < all.length; j++) {
+      const body = bodyRangeIn(all, j);
+      const rows = all.slice(body.from, body.to + 1);
+      const onlyCarriers = rows.every((m) => !Array.isArray(m.content) || !holdsTurn(m.content))
+        && rows.some((m) => Array.isArray(m.content) && m.content.some(carriesRawItem));
+      if (onlyCarriers && !passedOver(all[body.to]!) && wasCarried(body.from, body.to)) carrierBodies.push(body);
+      j = body.to;
+    }
+
     // Determine the complete exchange to shed, newest first.
-    const removedIds: MessageId[] = members.map((m) => m.id).reverse();
+    const removedIds: MessageId[] = [
+      ...carrierBodies.flatMap((b) => all.slice(b.from, b.to + 1).map((m) => m.id)).reverse(),
+      ...members.map((m) => m.id).reverse(),
+    ];
     // Where the exchange starts: this body, or the tool_use turn paired with it.
     let from = first;
     // Each body by its first shard, which names it to retractRows.
@@ -14448,14 +14466,22 @@ export class AgentFramework {
       descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
+    heads.push(...carrierBodies.map((b) => all[b.from]!.id));
     if (windowed) {
       // One call for the whole exchange, so it is never half applied.
       cm.retractRows(heads, { undone: true });
       this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...removedIds].reverse(), reason: 'shed' });
       return { descriptor, removedIds };
     }
-    // One removal for the whole exchange, so it is never half applied.
-    removeStoredMessages(cm, all[from], msg);
+    // Rows the shed leaves can sit between the turn and a carrier body after
+    // it, so each contiguous run is one removal, the newest first.
+    const runs: Array<{ from: number; to: number }> = [{ from, to: idx }];
+    for (const b of carrierBodies) {
+      const last = runs[runs.length - 1]!;
+      if (b.from === last.to + 1) last.to = b.to;
+      else runs.push({ ...b });
+    }
+    for (const run of runs.reverse()) removeStoredMessages(cm, all[run.from]!, all[run.to]!);
     this.retractRemovedElsewhere(cm, removedIds, 'rewind');
     return { descriptor, removedIds };
   }

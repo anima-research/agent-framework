@@ -143,6 +143,28 @@ describe('a turn\'s first request carries the provider items of the turns before
   }
 });
 
+describe('a reply that continues the agent\'s own carrier-only reply', () => {
+  it('follows the prompt that reply followed, so a later compile can render it before both', async () => {
+    const prompt = { turn: 'p-1', text: '[Continue]' };
+    const stored = [
+      { id: 'm1', participant: 'human', content: [{ type: 'text', text: 'Search the tides.' }] },
+      { id: 'm2', participant: 'tester', content: [{ type: 'text', text: 'Searching.' }] },
+      { id: 'm3', participant: 'tester', content: [carrierOf(SEARCH_CALL)], metadata: { promptedBy: prompt } },
+    ];
+    const cm = {
+      compile: async () => ({ messages: stored.map(({ participant, content }) => ({ participant, content })), systemInjections: [] }),
+      getAllMessages: () => stored,
+    } as unknown as ContextManager;
+    const agent = new Agent({ name: 'tester', model: 'test-model', systemPrompt: 'sys' }, cm, {} as Membrane) as unknown as {
+      assembleActivationRequest(tools: unknown[]): Promise<{ request: { messages: NormalizedMessage[] }; continuePrompt?: unknown }>;
+    };
+    const built = await agent.assembleActivationRequest([]);
+    assert.deepEqual(built.request.messages.map((m) => m.participant), ['human', 'tester', 'user', 'tester'],
+      'the premise: the request renders the prompt before the carrier-only reply, and ends on that reply');
+    assert.deepEqual(built.continuePrompt, prompt);
+  });
+});
+
 /** buildActivationRequest only needs compile(); membrane is never touched. */
 function agentCompiling(messages: unknown[]): Agent {
   const cm = { compile: async () => ({ messages, systemInjections: [] }) } as unknown as ContextManager;
@@ -207,6 +229,8 @@ describe('membrane decides per provider what a carried item becomes', () => {
         ['completions', new CompletionsFormatter().buildMessages([...messages], options(assistant)).messages],
       ] as const) {
         const at = `${name}, carrier-only message ${where}`;
+        const handed = JSON.stringify(messages);
+        assert.ok(handed.includes('cmp_') && handed.includes('srvtoolu_user'), `${at}: the premise: the formatter is handed the carriers`);
         for (const m of built as Array<{ content?: unknown }>) {
           if (typeof m.content === 'string') assert.notEqual(m.content.trim(), '', `${at}: an empty message`);
           if (Array.isArray(m.content)) assert.notEqual(m.content.length, 0, `${at}: a message with no content`);
@@ -239,8 +263,21 @@ describe('membrane decides per provider what a carried item becomes', () => {
     assert.deepEqual(built.at(-1)!.content, [SEARCH_CALL]);
   });
 
+  it('leaves out, on the native wire, a server-tool result with no call and a lone call anywhere but the request\'s last message', () => {
+    const native = (messages: unknown[]) => builtBlocks(new NativeFormatter().buildMessages(messages as NormalizedMessage[], options('tester', { anthropicServerBlocks: true })).messages);
+    const ask = { participant: 'human', content: [{ type: 'text', text: 'Search the tides.' }] };
+    const next = { participant: 'human', content: [{ type: 'text', text: 'And?' }] };
+    const loneCall = [ask, { participant: 'tester', content: [carrierOf(SEARCH_CALL), { type: 'text', text: 'Looking.' }] }, next];
+    assert.ok(JSON.stringify(loneCall).includes('srvtoolu_1'), 'the premise: the formatter is handed the call');
+    assert.deepEqual(native(loneCall).filter((b) => b.type === 'server_tool_use'), []);
+    const loneResult = [ask, { participant: 'tester', content: [carrierOf(SEARCH_RESULT), { type: 'text', text: 'Found it.' }] }, next];
+    assert.ok(JSON.stringify(loneResult).includes('web_search_tool_result'), 'the premise: the formatter is handed the result');
+    assert.deepEqual(native(loneResult).filter((b) => b.type === 'web_search_tool_result'), []);
+  });
+
   it('sends the item of a message holding only a carrier on the Responses wire, and no server-tool block', async () => {
     const { messages, assistant } = await requestWithCarriers();
+    assert.ok(JSON.stringify(messages).includes('srvtoolu_1'), 'the premise: the formatter is handed the server-tool carriers');
     const wire = responsesWire(messages, assistant);
     assert.ok(wire.includes('compaction:cmp_2'), wire.join(', '));
     assert.ok(!wire.some((item) => item.startsWith('server_tool_use') || item.startsWith('web_search_tool_result')), wire.join(', '));

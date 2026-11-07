@@ -55,7 +55,7 @@
  */
 import { NOTICE_TAG } from './notice-tags.js';
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import { carriesRawItem } from './sent-rows.js';
+import { carriesRawItem, holdsTurn } from './sent-rows.js';
 
 /** Request-only separator a silent tick's request ends on. It carries the
  * tick's instruction, so the tick's own request reads it as its prompt, and
@@ -239,6 +239,28 @@ export function toolLoopPrompt(
     if (block.type !== 'tool_result') continue;
     const prompt = index.prompts.get(toolUseKey(block.toolUseId));
     if (prompt) return prompt;
+  }
+  return undefined;
+}
+
+/**
+ * The prompt of the agent's own reply holding only provider items' carriers
+ * that a request ends on, apart from stored context injections: a reply that
+ * continues it, such as one resuming a paused round, follows that prompt too.
+ */
+export function carrierReplyPrompt(
+  messages: readonly NormalizedMessage[],
+  agentName: string,
+  index: RequestOnlyRowIndex,
+): RequestOnlyPrompt | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.participant.startsWith('system_context:')) continue;
+    if (message.participant !== agentName || holdsTurn(message.content)) return undefined;
+    for (const key of identityKeys(message.content)) {
+      const prompt = index.prompts.get(key);
+      if (prompt) return prompt;
+    }
   }
   return undefined;
 }
