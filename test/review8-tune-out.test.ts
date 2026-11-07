@@ -2812,6 +2812,100 @@ test("the stop's budget on #844: a stop while the release telling a queued note'
   }
 });
 
+// ---------------------------------------------------------------------------
+// AF #844 (Oscar, nissa's house): a hold whose release was stored, its end
+// not recorded (a throw between the two, or a stop whose wait ran out),
+// stays in force. A check counts only what its next release delivers, and
+// the next boot tells the resident, once, that the tune-out still stands.
+// ---------------------------------------------------------------------------
+
+/** The registry refuses to record the next end, as a store fault between a release and its end would. */
+function endRefused(h: ReturnType<typeof epochSetup>, scope = false): () => void {
+  const registry = (h.coordinator as unknown as { channelRegistry: { cancelTuneOut: (...a: unknown[]) => unknown; writeCoordinatorState: (id: string, v: unknown) => void } }).channelRegistry;
+  const cancel = registry.cancelTuneOut;
+  const write = registry.writeCoordinatorState;
+  if (scope) {
+    registry.writeCoordinatorState = (id: string, value: unknown) => {
+      if (value === null && id.endsWith('/all-except')) throw new Error('the store refused the end (test)');
+      write(id, value);
+    };
+  } else {
+    registry.cancelTuneOut = () => { throw new Error('the store refused the end (test)'); };
+  }
+  return () => { registry.cancelTuneOut = cancel; registry.writeCoordinatorState = write; };
+}
+
+const unended = (h: ReturnType<typeof epochSetup>) => h.added.filter((m) => m.metadata?.kind === 'tune-out-end-unrecorded');
+
+test("Oscar on #844: a hold whose release was stored, its end not recorded, is checked as holding only what came since: what the release delivered is counted and peeked no more", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  try {
+    const epochId = h.enter();
+    const restore = endRefused(h);
+    assert.throws(() => h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), /refused the end/, 'premise: the release is stored, the end refused');
+    restore();
+    assert.equal(h.inForce(), epochId, 'premise: the hold is still in force');
+    h.rows.push({ id: `r${h.rows.length + 1}`, participant: 'user', content: [text('held since')], sequence: h.rows.length + 1,
+      metadata: { author: { name: 'Ann' }, tuneOut: { epochId }, channelId: 'disc:guild:a', serverId: 'disc' } });
+    const check = h.coordinator.check({ peek: { serverId: 'disc', channelId: 'disc:guild:a' } });
+    assert.equal(check.channels.find((c) => c.channelId === 'disc:guild:a')?.held, 1, 'only what came since the release is held');
+    assert.deepEqual(check.peek, ['Ann: held since'], 'and peeked');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("Oscar on #844: the boot tells the resident, once, of a hold in force whose release reached it with its end not recorded; again after a later such release; not for a hold that ended", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    const boots: TuneOutCoordinator[] = [];
+    const boot = (): void => { const next = h.reboot(); boots.push(next); next.resumeActiveEpochs(); };
+    try {
+      const epochId = scope ? h.enterScope() : h.enter();
+      const fail = (): void => {
+        const restore = endRefused(h, scope);
+        assert.throws(() => (scope ? h.coordinator.cancelAllExcept('agent-tool', 'agent request') : h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request')),
+          /refused the end/, 'premise: the release is stored, the end refused');
+        restore();
+      };
+      fail();
+      const where = scope ? 'all-except' : 'channel';
+      boot();
+      assert.equal(unended(h).length, 1, `${where}: the boot tells the resident`);
+      const told = unended(h)[0]!;
+      assert.equal(told.forAgent, undefined, `${where}: in the residents' slot`);
+      assert.deepEqual([told.metadata?.epochId, told.metadata?.scope], [epochId, scope ? 'all-except' : undefined]);
+      assert.match(textOf(told.content), scope
+        ? /^\[Tune-out: the all-except hold \(all channels except disc:guild:x\) is still in force\. Its release above reached you, but its end wasn't recorded before the host stopped, so the hold is still in force: what arrives in those channels is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel" with scope "all-except"\), or at its end time, \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\.\]$/
+        : /^\[Tune-out: disc:guild:a is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\)(, or at its end time, [^\]]+)?\.\]$/,
+      `${where}: saying the release reached it, the end not recorded, the tune-out still in force`);
+      boot();
+      assert.equal(unended(h).length, 1, `${where}: a later boot tells it no second time`);
+      // Held since, so the next cancel writes a release of its own, and fails at its end too.
+      h.rows.push({ id: `r${h.rows.length + 1}`, participant: 'user', content: [text('held since')], sequence: h.rows.length + 1,
+        metadata: { author: { name: 'Ann' }, tuneOut: { epochId }, channelId: scope ? 'disc:guild:b' : 'disc:guild:a', serverId: 'disc' } });
+      fail();
+      boot();
+      assert.equal(unended(h).length, 2, `${where}: a later release whose end failed too is told again`);
+      // The hold ends otherwise (its record gone): a later boot tells nothing of it.
+      if (scope) {
+        for (const id of [...h.states.keys()]) if (id.endsWith('/all-except')) h.states.delete(id);
+      } else {
+        h.endOtherwise();
+      }
+      boot();
+      assert.equal(unended(h).length, 2, `${where}: a hold that has ended is told nothing`);
+    } finally {
+      for (const c of boots) c.stop();
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
 test("review 3 #45: a window-starts record whose start or start in force is ill-formed logs each one it drops, naming the epoch", () => {
   const h = anchored({ active: [{ epochId: 'X', sequence: 30 }], state: { starts: { X: 3, Y: 'seven', Z: -1 } as never, inForce: 2.5 as never }, length: 12 });
   const errors = mock.method(console, 'error', () => {});
