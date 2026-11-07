@@ -1091,15 +1091,29 @@ interface ChannelRegistryOptions {
    * message across ALL channels (markers aside) and misroutes a reply to
    * whichever channel last spoke under concurrency (item-3 redux). The
    * framework keeps both on the live turn's routing state and exposes them
-   * here. For a heartbeat / no-trigger turn it resolves to undefined until the
-   * turn's locus is resolved, so that
-   * resolution takes the global fallback, which the turn then keeps.
-   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
-   * `defaultPublishChannel`. Null where the turn deliberately has no channel,
-   * as one woken for a channel id two servers register, given without its
-   * server: that takes no fallback either.
+   * here. For a no-trigger turn it resolves to undefined until the turn's
+   * locus is resolved, so that resolution takes the global fallback, which the
+   * turn then keeps. Consulted AFTER `homeChannelResolver` (a fork's home
+   * always wins), BEFORE the global fallback. Null where the turn deliberately
+   * has no channel, as a heartbeat's turn, or one woken for a channel id two
+   * servers register, given without its server: that takes no fallback
+   * either.
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
+  /**
+   * FrameworkConfig.unpromptedChannel: where a turn that takes it
+   * (takesUnpromptedChannel) and has no home and no channel of its own is
+   * placed, within the process-global fallback, after an all-except hold's
+   * channel (sharedFallback). A name, as entriesNamed reads one.
+   */
+  unpromptedChannel?: string;
+  /**
+   * Whether the conversation's current turn takes `unpromptedChannel` where it
+   * has no channel of its own: the framework answers true only for a turn
+   * the agent's own timer started, as FrameworkConfig.unpromptedChannel
+   * says. Absent, every turn does.
+   */
+  takesUnpromptedChannel?: (conversationId: string) => boolean;
   /**
    * Whether the agent's current turn has no channel of its own — a
    * heartbeat's, or one woken for a channel that names none — so it replies
@@ -1210,6 +1224,9 @@ export class ChannelRegistry {
   private channellessTurn?: (agentName: string) => boolean;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
+  private unpromptedChannel?: string;
+  private unpromptedChannelWarned = false;
+  private takesUnpromptedChannel?: (conversationId: string) => boolean;
   private store?: JsStore;
 
   /**
@@ -1605,6 +1622,18 @@ export class ChannelRegistry {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
     this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
+      if (tool.name === 'channel_publish') {
+        if (options?.unpromptedChannel === undefined || options.eventGatePresent !== true) return tool;
+        return {
+          ...tool,
+          description: tool.description
+            .replace(
+              'otherwise, while a focus holds, the channel it keeps.',
+              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn\'t routed), the channel this host names for such turns.',
+            )
+            .replace('A turn with no channel of its own, such as', 'A turn with no channel by design, such as'),
+        };
+      }
       if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
       const schema = tool.inputSchema as {
         type: 'object';
@@ -1636,6 +1665,8 @@ export class ChannelRegistry {
     this.activeChannelResolver = options?.activeChannelResolver;
     this.channellessTurn = options?.channellessTurn;
     this.takesGlobalFallback = options?.takesGlobalFallback;
+    this.unpromptedChannel = options?.unpromptedChannel;
+    this.takesUnpromptedChannel = options?.takesUnpromptedChannel;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
     this.initializeLifecycleStore();
@@ -2562,7 +2593,9 @@ export class ChannelRegistry {
     // declared it inbound-only, since speech isn't posted there): a conversation
     // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
-    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none).
+    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none), with
+    // the configured unprompted channel in it where the turn takes it: the
+    // channel channel_publish naming none publishes to, in every prose mode.
     // Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
@@ -2573,9 +2606,11 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): not the
     // all-except hold's channel, not the latest inbound message's channel as
     // its outgoing one, nor that message as the one it is replying to.
-    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback();
+    const fallback = (): ChannelRef | null => agentName !== undefined
+      ? this.globalFallbackFor(agentName, () => this.configuredUnprompted(agentName))
+      : this.sharedFallback();
     // A turn that deliberately has no channel (null) takes no fallback.
-    const outgoing = home ?? (active !== undefined ? active : fallback);
+    const outgoing = home ?? (active !== undefined ? active : fallback());
 
     const context: ChannelContext = {};
 
@@ -5778,7 +5813,8 @@ export class ChannelRegistry {
   }
 
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default), with its server. Public so a multi-segment
+   *  process-global default, with the configured unprompted channel in it
+   *  where the turn takes it), with its server. Public so a multi-segment
    *  caller can snapshot it ONCE and pin every segment to it via
    *  routeSpeech's locus. */
   resolveLocus(conversationId: string): ChannelRef | null {
@@ -5786,7 +5822,33 @@ export class ChannelRegistry {
     if (home) return home;
     // A turn that deliberately has no channel (null) takes no fallback.
     const active = this.activeChannelResolver?.(conversationId);
-    return active !== undefined ? active : this.globalFallbackFor(conversationId);
+    return active !== undefined
+      ? active
+      : this.globalFallbackFor(conversationId, () => this.configuredUnprompted(conversationId));
+  }
+
+  private configuredUnprompted(conversationId: string | undefined): ChannelRef | null {
+    if (!this.unpromptedChannel) return null;
+    if (conversationId !== undefined && this.takesUnpromptedChannel?.(conversationId) === false) return null;
+    const named = this.entriesNamed(this.unpromptedChannel);
+    if (named.length === 1 && !isInboundOnly(named[0]!)) {
+      this.unpromptedChannelWarned = false;
+      return refOf(named[0]!);
+    }
+    if (!this.unpromptedChannelWarned) {
+      this.unpromptedChannelWarned = true;
+      const why = named.length === 0
+        ? 'names no registered channel'
+        : named.length === 1
+          ? 'names a channel its server declared inbound-only'
+          : `names ${named.length} registered channels (name one with its server, as "serverId:channelId")`;
+      console.error(
+        `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn the agent's own timer starts `
+          + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. '
+          + 'Not logged again until a turn has used it.',
+      );
+    }
+    return null;
   }
 
   /**
@@ -5795,19 +5857,21 @@ export class ChannelRegistry {
    * result, so neither the all-except hold's channel nor the latest inbound
    * message's is ever its destination.
    */
-  private globalFallbackFor(conversationId: string): ChannelRef | null {
-    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback();
+  private globalFallbackFor(conversationId: string, unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback(unprompted);
   }
 
   /**
    * What every conversation that takes the global fallback falls back to when
    * neither a home channel nor its own delivery names one: the all-except
-   * hold's channel while one is open, else the latest delivered inbound
-   * channel under the legacy locus rule, else none — the prose stays private
-   * (architecture channel §3 carve-out, 2026-10-06).
+   * hold's channel while one is open, else, for a turn's locus, the
+   * configured unprompted channel where the turn takes it (resolveLocus),
+   * else the latest delivered inbound channel under the legacy locus rule,
+   * else none — the prose stays private (architecture channel §3 carve-out,
+   * 2026-10-06).
    */
-  private sharedFallback(): ChannelRef | null {
-    return this.focusChannelResolver?.() ?? this.fallbackLocus();
+  private sharedFallback(unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.focusChannelResolver?.() ?? unprompted?.() ?? this.fallbackLocus();
   }
 
   private fallbackLocus(): ChannelRef | null {

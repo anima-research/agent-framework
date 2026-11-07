@@ -1298,16 +1298,21 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
+const UNPROMPTED: unique symbol = Symbol('unprompted');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
 interface TurnCarry {
   silence: TurnSilence | null;
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true };
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
+}
+
+function isUnprompted(request: InferenceRequest | undefined): boolean {
+  return request !== undefined && (request as MarkedRequest)[UNPROMPTED] === true;
 }
 
 interface StatedWaitRun { since: number; holds: number; alerted: boolean; model: string; reason: string; heldUntil: number }
@@ -1462,6 +1467,7 @@ interface TurnRouting {
    * wake, so a heartbeat can't start a loop of turns.
    */
   heartbeat?: true;
+  unprompted?: true;
   /**
    * Locked mode (AgentConfig.proseRouting 'locked'): the turn's locus is the
    * agent's prose lock, taken when the turn opens, and only prose_locus moves
@@ -1484,7 +1490,8 @@ interface TurnRouting {
    * lands. Locked mode's is the agent's lock (TurnRouting.locked); the rest
    * of this describes locus and hybrid mode.
    * Frozen when the turn opens (home channel for a fork, else the trigger
-   * channel, else the global default), so ambient chatter, reactions and
+   * channel, else the global default, with the configured unprompted channel
+   * in it where the turn takes it), so ambient chatter, reactions and
    * system markers can't move it (2026-07-21 Cairn lounge misroute). Since
    * 2026-07-31 a re-pin moves it (repinTurnLocus): an addressed message, or a
    * follow-up in a channel the turn engaged. The agent's own channel_open
@@ -2010,6 +2017,12 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
       config.watchdog.enabled,
       'true arms the liveness watchdog, which ends the process when the main thread misses its heartbeat for thresholdMs, ' +
         'and false or leaving it out doesn\'t',
+    );
+  }
+  const unprompted: unknown = config.unpromptedChannel;
+  if (unprompted !== undefined && unprompted !== null && (typeof unprompted !== 'string' || unprompted.trim() === '')) {
+    throw new Error(
+      `unpromptedChannel must name a channel, such as "discord:<guildId>:<channelId>", not ${typeof unprompted === 'string' ? 'a blank string' : kindOf(unprompted)}`,
     );
   }
   // The heartbeat: true or an object turns it on; false, null or leaving it
@@ -4479,6 +4492,7 @@ export class AgentFramework {
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
+  private mcplUnpromptedChannel: string | null = null;
   /** The awareness ledger; null for a framework with neither storePath nor
    *  discordAwarenessOutboxPath, which refuses a marks choice. */
   private readonly discordAwarenessOutbox: DiscordAwarenessOutbox | null;
@@ -4967,7 +4981,7 @@ export class AgentFramework {
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
-          framework.pendingRequests.push({
+          const request: MarkedRequest = {
             agentName, reason, source, timestamp: Date.now(),
             ...framework.readsWriteFor(after, agentName),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -4999,7 +5013,9 @@ export class AgentFramework {
                 ? { channelId: route.channelId, channelServerId: route.serverId, addressed: true }
                 : {};
             })(),
-          });
+          };
+          if (source === 'self-wake' || source === 'sleep') request[UNPROMPTED] = true;
+          framework.pendingRequests.push(request);
         },
         getAgentNames: () => framework.registry.gateRecipients(),
         isHeld: (serverId, channelId) =>
@@ -5110,6 +5126,7 @@ export class AgentFramework {
     // Stored for lazy MCPL initialization (connectMcplServer on a framework
     // that started with zero configured servers).
     framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
+    framework.mcplUnpromptedChannel = config.unpromptedChannel ?? null;
 
     // Client-side programmatic tool calling (code_execution). Made only when
     // enabled — everything downstream gates on the field. create() checked
@@ -20012,7 +20029,7 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's
@@ -20335,6 +20352,8 @@ export class AgentFramework {
       else delete start[TURN_CARRY];
       if (requests.every(isRearmed)) start[REARMED] = true;
       else delete start[REARMED];
+      if (requests.every(isUnprompted)) start[UNPROMPTED] = true;
+      else delete start[UNPROMPTED];
       // A start merged from more than one request, any of them not the
       // turn's, records the batch it was merged from (MERGED_BATCH): until
       // it takes its token it stands for them all.
@@ -21384,6 +21403,10 @@ export class AgentFramework {
   private heartbeatTurnMark(routing: TurnRouting): { heartbeatTurn?: true } {
     // A locked turn's locus is its lock, not a channel the heartbeat answered.
     return routing.heartbeat && (!routing.locus || routing.locked) ? { heartbeatTurn: true } : {};
+  }
+
+  private unpromptedTurnMark(routing: TurnRouting): { [UNPROMPTED]?: true } {
+    return routing.unprompted && !routing.locus ? { [UNPROMPTED]: true } : {};
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
@@ -22884,6 +22907,7 @@ export class AgentFramework {
       source: 'framework',
       timestamp: Date.now(),
       ...this.heartbeatTurnMark(routing),
+      ...this.unpromptedTurnMark(routing),
     });
   }
 
@@ -22980,6 +23004,7 @@ export class AgentFramework {
       ...channel,
       autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
       ...this.heartbeatTurnMark(routing),
+      ...this.unpromptedTurnMark(routing),
     });
   }
 
@@ -23830,6 +23855,7 @@ export class AgentFramework {
         source: 'framework',
         timestamp: Date.now(),
         ...this.heartbeatTurnMark(round.routing),
+        ...this.unpromptedTurnMark(round.routing),
       });
     }
   }
@@ -24707,7 +24733,8 @@ export class AgentFramework {
       // channel/DM-triggered turn, with its server, and none for a
       // no-trigger turn, which doesn't inherit a previous turn's channel: a
       // heartbeat's takes no locus at all (TurnRouting.heartbeat), and any
-      // other falls back to the global default. A wake whose channel,
+      // other falls back to the global default, with the configured
+      // unprompted channel in it where the turn takes it. A wake whose channel,
       // given without its server, names no one registered channel (a host's
       // id that two servers' channels answer to, or that none does) has none
       // either, and takes no fallback: it was for a channel, and the latest
@@ -24726,9 +24753,12 @@ export class AgentFramework {
       // speech is held as a draft (TurnRouting.heartbeat).
       if (isHeartbeatWake(trigger)) routing.heartbeat = true;
       else delete routing.heartbeat;
+      if (isUnprompted(trigger)) routing.unprompted = true;
+      else delete routing.unprompted;
       // Resolve the turn's outbound locus now: the home channel for forks,
       // else the trigger channel, else the global default, which an
-      // ephemeral run never takes (takesGlobalFallback). Ambient mid-turn
+      // ephemeral run never takes (takesGlobalFallback), with the configured
+      // unprompted channel in it where the turn takes it. Ambient mid-turn
       // injections must not redirect the agent's plain prose (ambient
       // chatter and reactions hijacked it before, 2026-07-21); only an
       // addressed message, a follow-up in a channel the turn engaged
@@ -32960,7 +32990,8 @@ export class AgentFramework {
         // a later start of the turn is told where its unprefixed speech lands
         // unless a hybrid `>>>` destination takes it. Empty for a no-trigger
         // turn until its locus is resolved, so that resolution takes the
-        // global fallback (none for an ephemeral run), and the turn then keeps
+        // global fallback, the configured unprompted channel among it (none
+        // for an ephemeral run), and the turn then keeps
         // that channel; null for a heartbeat's turn, which takes none
         // (TurnRouting.heartbeat).
         // A turn with no channel of its own (a heartbeat's, or a wake for a
@@ -32979,7 +33010,9 @@ export class AgentFramework {
         // message's channel is nobody's choice for it (#551). By name, so a
         // speech dispatch that comes after the run's release still counts.
         takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
+        takesUnpromptedChannel: (conversationId) => this.openLogical.get(conversationId)?.unprompted === true,
         eventGatePresent: this.eventGate !== null,
+        unpromptedChannel: this.mcplUnpromptedChannel ?? undefined,
         // A channel tool reads the connect and restart marks a tool call's
         // "connecting" text reads (mcplConnectInFlight, mcplServerAbsentText).
         // This host is connecting to a server while a connect or restart of
