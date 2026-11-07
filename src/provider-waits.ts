@@ -250,14 +250,15 @@ export class ProviderWaits {
   }
 
   /**
-   * The wait binding (agent, model) now, if any. While the recorded waits
-   * cannot be read, an indefinite wait saying so, unless an operator released
-   * this agent's waits since.
+   * The wait binding (agent, model) at `now`, or, when it's left out, at the
+   * store's clock read after any retry of the recorded waits, if any. While
+   * the recorded waits cannot be read, an indefinite wait saying so, unless an
+   * operator released this agent's waits since.
    */
-  active(agent: string, model: string): ProviderWait | undefined {
+  active(agent: string, model: string, now?: number): ProviderWait | undefined {
     this.retry();
     if (this.unreadable && !this.waived(agent, model)) return this.unreadableWait(agent, model);
-    const wait = live(this.view.get(keyOf(agent, model)), this.now());
+    const wait = live(this.view.get(keyOf(agent, model)), now ?? this.now());
     return wait ? { ...wait } : undefined;
   }
 

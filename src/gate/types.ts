@@ -62,12 +62,19 @@ export interface PassiveSampleConfig {
  * good time for the agent to reply. The judge reads the agent's context as one
  * document (its newest part), the agent's own `instructions` and the batch,
  * and answers reply or wait. On reply the
- * batch is delivered as a debounce's is; on wait the agent isn't woken: the
- * events are in its context already, as for `defer`, and the next batch is
- * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
- * of a judge rule wakes the agent without the judge. A judge that fails or
+ * batch is delivered as a debounce's is; on wait (or a failure under
+ * `"skip"`) the agent isn't woken, and the next batch is judged afresh. The
+ * events are in its context either way when they're stored as they arrive, as
+ * MCPL's channel and push events are (apart from a coalesced push its server
+ * sends deferred, which waits outside the context until the server renders it
+ * for a turn), and as the framework's own modules store the message an event
+ * of theirs carries; a wait, like `defer`, adds nothing more. Rules are read
+ * in order, as ever: a mention rule placed ahead of a judge rule wakes the agent without the judge. A judge that fails or
  * times out wakes the agent (fail open),
- * unless the host set its `onError` to `"skip"`.
+ * unless the host set its `onError` to `"skip"`. A call whose request the
+ * framework refuses to send isn't a failure, and `onError` decides it as well: under
+ * `"skip"` its batch is held while the judge's calls are refused
+ * (ReplyJudgeOptions.onError).
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
@@ -330,20 +337,46 @@ export interface ReplyJudgeOptions {
    *  `claude-haiku-5-5`. */
   model?: string;
   /**
-   * The most input tokens one judge request may carry, its instructions and
+   * The budget of input tokens for one judge request, its instructions and
    * the batch included; the context document is cut from its oldest end to
-   * fit. Default 90,000: Claude Haiku 5.5 costs five times as much past
-   * 100,000 input tokens, and the margin covers the estimate's error. The
-   * least is 4,000, a short tail of the conversation: cheaper and quicker,
-   * with less of the room's history to weigh.
+   * fit. Default 90,000, under the 100,000 input tokens past which Claude
+   * Haiku 5.5 costs five times as much. Tokens are estimated from characters,
+   * at a ratio that starts at three characters a token and follows what each
+   * response reports, so a request on text denser than the ratio can carry
+   * more than the budget: code, or Chinese, Japanese or Korean text, before a
+   * response has reported on such text or after the ratio has followed sparser
+   * text. So can one whose newest message alone is over it, since that is
+   * always shown. The least is 4,000, a short tail of the conversation:
+   * cheaper and quicker, with less of the room's history to weigh.
    */
   maxInputTokens?: number;
   /** The longest (ms) a judge request may take before the batch is decided by
    *  `onError`. Default 20,000. */
   timeoutMs?: number;
-  /** What a judge that fails, times out or answers unreadably does: `"wake"`
-   *  wakes the agent as a debounce would (the default, so a judge outage
-   *  never silences the agent); `"skip"` doesn't. */
+  /**
+   * What a judge that fails, times out or answers unreadably does: `"wake"`
+   * wakes the agent as a debounce would (the default, so a judge outage
+   * never silences the agent); `"skip"` doesn't. It decides a call whose
+   * request the framework refuses to send too (a hold on the agent's provider
+   * calls or on the judge's model, a surgery's hold on the store, or a
+   * stopping framework), which isn't counted as a failure. Under `"wake"`,
+   * the refused call's batch is delivered, and while a refusal's stated
+   * wait lasts each judge rule's batch is delivered without the judge being
+   * asked, unless a turn that changes what the judge reads, or the host's
+   * quiesce, holds the batch past the wait's end, or it waits behind a call
+   * of its rule that the judge answers WAIT when its calls are no longer
+   * refused, when it goes to the judge. Under `"skip"`, the batch is held in memory while the judge's
+   * calls are refused. While a refusal's
+   * stated wait lasts, batches that arrive are held with it, a rule keeping
+   * its newest 100 events as it does while a turn holds them, and they go
+   * back to the judge once the wait ends or the hold is released, and no turn that
+   * changes what the judge reads runs and the host isn't quiesced. A
+   * refusal that states no end, or no time left, keeps them held until a later batch's call,
+   * which takes in its own rule's held batch, gets a REPLY or WAIT, or the gate is
+   * told the hold ended or was released (`EventGate.providerCallsReleased`).
+   * A later call that fails lets its batch go, with the held events it took
+   * in, as a failed call's batch goes under `"skip"`.
+   */
   onError?: 'wake' | 'skip';
   /** The judge's effort (`output_config.effort`). Default `"low"`: a short
    *  verdict, quickly. `"none"` sends no effort, for a provider that doesn't
@@ -351,7 +384,8 @@ export interface ReplyJudgeOptions {
   effort?: 'low' | 'medium' | 'high' | 'none';
   /** The prompt cache's lifetime for the judge's context document. `"5m"`
    *  (the default) suits judge rules that fire minutes apart; `"1h"` costs
-   *  more to write and suits ones that fire less often. */
+   *  more to write and suits ones that fire less often. On Bedrock, membrane
+   *  drops it and the cache lives for Bedrock's default. */
   cacheTtl?: '5m' | '1h';
 }
 
@@ -382,14 +416,42 @@ export type UpcomingWakeKind =
   | 'provider-hold';
 
 /**
+ * The agent's last turn, when it failed (its retries spent, or by a throw
+ * before its stream) and no turn has started since, as the reply judge is told it: when it failed, and whether
+ * a wake of the agent's is on its way with no new event, already queued or
+ * held until a provider hold ends (`until`, absent when it states no end, or
+ * when it's the host's, which the host is asked about again then). Neither says the wake starts a turn: the host's inference
+ * policy can still decline it, and a start whose only causes are deferred
+ * batches starts none if they give it nothing to read. `maybe` marks a wake
+ * that may not start a turn: a start whose only causes are deferred batches,
+ * a conversation agent's start assembling its deferred pushes under a provider
+ * wait on its model, which holds it after its compile, or a hold that holds
+ * only starts of the first kind. The wake list gives each one's reason.
+ */
+export interface FailedLastTurn {
+  at: number;
+  again: { kind: 'none' } | { kind: 'queued'; maybe?: true } | { kind: 'held'; until?: number; maybe?: true };
+}
+
+/**
  * Something that will (or, for a batch going to the judge, may) wake the
  * agent with no new event: what the judge is told would happen if it answers
  * wait and nothing else arrives.
  */
 export interface UpcomingWake {
-  /** When (ms), when known; absent for one due as soon as the agent is free. */
+  /**
+   * When (ms), when known. Absent for one that has no time of its own: a
+   * wake already queued, due as soon as the agent is free, and one `when`
+   * describes, such as a batch the judge is deciding, a batch held for the
+   * judge until no turn or quiesce holds it, or events buffered until no turn
+   * runs and the host isn't quiesced.
+   */
   at?: number;
-  /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
+  /** When, in words, for one due at no time anyone can name (a verdict, or a
+   *  hold only a release or another call ends); given without `at`, and
+   *  shown in its place. */
+  when?: string;
+  /** False when it only may wake the agent, such as a judge rule's batch that goes, or may yet go, to the judge, or a start whose only causes are deferred batches, which starts no turn if they give it nothing to read. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
@@ -408,9 +470,12 @@ export interface JudgeRequest {
   events: JudgeEventSummary[];
   /** The agents the batch would wake. */
   agentNames: string[];
-  /** The gate's own timers that will wake those agents with no new event
-   *  (upcomingWakes): their self-wakes, a sleep's end, other rules' pending
-   *  batches. The judge adds what the framework knows besides. */
+  /** The gate's own timers that will wake those agents with no new event, or
+   *  may (`certain` false) (upcomingWakes): their self-wakes, a sleep's end,
+   *  every pending batch but this one, save one delivered without the judge
+   *  under a refusal whose every event's channel is held now, and events
+   *  buffered while a turn runs or the host is quiesced. The framework's own
+   *  judge adds what the framework knows besides. */
   upcomingWakes?: UpcomingWake[];
   /** Aborted when the judge's time is up or the gate is disposed. */
   signal: AbortSignal;
@@ -431,7 +496,11 @@ export interface JudgeVerdict {
   outputTokens?: number;
 }
 
-/** The judge's function, as the framework wires it into the gate. */
+/** The judge's function, as the framework wires it into the gate. A call whose
+ *  request a hold refuses rejects with an error whose `providerAdmission` is
+ *  `'deferred'`, and whose `retryAfterMs` is the hold's time left when it
+ *  states one, as the framework's own judge does: the gate counts that as a
+ *  refusal, and any other rejection as a failed call. */
 export type JudgeFn = (request: JudgeRequest) => Promise<JudgeVerdict>;
 
 // ---------------------------------------------------------------------------
@@ -599,14 +668,15 @@ export interface GatePolicyStats {
     pendingCount: number;
     /** Whether the judge is deciding one of this rule's batches now. */
     judging: boolean;
-    /** Events held for the judge until the agent's turn (or the host's quiesce) ends. */
+    /** Events held for the judge until the agent's turn (or the host's quiesce) ends, or a refusal's hold ends. */
     heldCount: number;
-    /** Verdicts so far: woke the agent, let the batch go by, and judge failures. */
-    verdicts: { reply: number; wait: number; error: number };
+    /** Verdicts so far: woke the agent, let the batch go by, judge failures,
+     *  and calls whose request the framework refused to send. */
+    verdicts: { reply: number; wait: number; error: number; refused: number };
     /** The newest verdict. */
     last?: {
       at: number;
-      verdict: 'reply' | 'wait' | 'error';
+      verdict: 'reply' | 'wait' | 'error' | 'refused';
       reason: string;
       eventCount: number;
       durationMs: number;
