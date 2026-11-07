@@ -25657,7 +25657,10 @@ export class AgentFramework {
     // Set by the complete / aborted / error cases: the stream SAID how it
     // ended. An iterator that just closes says nothing (see after the loop).
     let streamTerminal = false;
-    let silentExhaustion = false;
+    // Set where an uncancelled stream closes with no terminal event: the
+    // failure that end established, which its settlement, trace and log entry
+    // all name, whatever a listener of the trace does to the agent meanwhile.
+    let silentFailure: string | undefined;
     let preserveEventGateForSuccessor = false;
     this.hookOrchestrator?.emitLifecycle({
       inferenceId: outgoingInferenceId,
@@ -27386,7 +27389,8 @@ export class AgentFramework {
           // so the agent stops streaming and a later wake starts a new
           // inference. Nothing retries it or starts its turn again (#907).
           lifecyclePhase = 'failed';
-          const terminal = 'Stream ended without a terminal event';
+          const terminal = 'Stream ended without a final response';
+          silentFailure = terminal;
           this.abandonAgentScripts(agent.name, 'stream ended without a terminal event', streamRouting);
           agent.reset();
           this.noteFailedTurnEnd(agent, streamRouting);
@@ -27400,8 +27404,9 @@ export class AgentFramework {
             agentName: agent.name,
             error: terminal,
           });
+          // Not transient, so nothing re-arms it; a re-armed turn's operator is told why its re-arming ends.
+          this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
           if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
-          silentExhaustion = true;
         }
       }
     } catch (error) {
@@ -27520,17 +27525,19 @@ export class AgentFramework {
         // naming what ended it, so the log carries what the totals count. A
         // stop that reaches its terminal writes its own, through logStream.
         // A silent uncancelled end also logs its failure when no round
-        // finished. Other ends without usage keep their prior no-entry behavior.
-        if (!usageLogged && (countedUsage !== undefined || silentExhaustion)) {
+        // finished, naming the failure it established even when a listener of
+        // its trace has since disposed the agent. Other ends without usage keep
+        // their prior no-entry behavior.
+        if (!usageLogged && (countedUsage !== undefined || silentFailure !== undefined)) {
           const replaced = this.agents.get(agent.name) !== agent;
           const superseded = generationLost || agent.streamId !== myStreamId;
           logStream({
             success: false,
-            error: replaced
+            error: silentFailure ?? (replaced
               ? 'Stream abandoned: its agent was disposed or replaced'
               : superseded
                 ? 'Stream superseded: a newer stream of the agent took over'
-                : 'Stream ended without a final response',
+                : 'Stream ended without a final response'),
             request: compiledRequest ?? { note: 'streaming request' },
             durationMs: Date.now() - startTime,
             tokenUsage: tokenUsageOf(countedUsage),

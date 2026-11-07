@@ -93,12 +93,12 @@ const retryOnce: ErrorPolicy = {
 interface Lifecycle { inferenceId: string; phase: string }
 
 /** A framework whose streams end as `ends` says, with what it emits to MCPL servers' lifecycle grant and its traces. */
-async function frameworkOver(ends: StreamEvent[], errorPolicy: ErrorPolicy) {
+async function frameworkOver(ends: StreamEvent[], errorPolicy: ErrorPolicy, agents = [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }]) {
   const dir = mkdtempSync(join(tmpdir(), 'af-lifecycle-failed-'));
   const membrane = new ScriptedMembrane(ends);
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    agents,
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0, errorPolicy,
   });
   const emitted: Lifecycle[] = [];
@@ -276,6 +276,10 @@ async function settles(done: () => boolean, ms = 10_000): Promise<boolean> {
   return true;
 }
 
+/** The types of `traces` that report a failure: an inference's failure is reported once, as one of these. */
+const failureTypes = (traces: Array<{ type: string }>): string[] =>
+  traces.map((t) => t.type).filter((type) => type === 'inference:failed' || type === 'inference:exhausted');
+
 // Issue #907: a stream whose iterator just ends, with no `complete`, `error` or `aborted` event, and
 // that nobody cancelled, left its agent `streaming` and its lifecycle `completed`, so a later nudge started
 // nothing. retryOnce retries at once, so a retry the silent end took would show before its terminal.
@@ -299,6 +303,7 @@ test('a stream that ends with no event, and nobody cancelled, ends failed, and a
     assert.deepEqual(phases(), [['started', 'failed']], 'its lifecycle ends failed, not completed');
     assert.ok(!types().includes('inference:completed'), `no completion is reported: ${JSON.stringify(types())}`);
     assert.ok(types().includes('inference:exhausted'), `the failure is reported: ${JSON.stringify(types())}`);
+    assert.deepEqual(failureTypes(traces), ['inference:exhausted'], 'it is reported once, as exhausted and not as failed too');
     assert.deepEqual(logged(), ['failed'], 'the inference log holds the failure');
 
     framework.nudgeAgent('resident', 'operator');
@@ -306,6 +311,7 @@ test('a stream that ends with no event, and nobody cancelled, ends failed, and a
     assert.equal(membrane.calls.length, 2, 'the nudge starts one new inference');
     assert.deepEqual(phases(), [['started', 'failed'], ['started', 'completed']]);
     assert.deepEqual(types().filter((t) => t === 'inference:completed'), ['inference:completed']);
+    assert.deepEqual(failureTypes(traces), ['inference:exhausted'], 'the next inference reports no failure');
     assert.deepEqual(logged(), ['failed', 'ok']);
     assert.equal(status(), 'idle');
   } finally {
@@ -314,7 +320,7 @@ test('a stream that ends with no event, and nobody cancelled, ends failed, and a
 });
 
 test('a silent stream log write failure still releases its turn without retrying', { timeout: 60_000 }, async () => {
-  const { framework, membrane, phases, teardown } = await frameworkOver([silentEnd], retryOnce);
+  const { framework, membrane, traces, phases, teardown } = await frameworkOver([silentEnd], retryOnce);
   const internal = framework as unknown as {
     logInference: (entry: { error?: string }) => void;
     activeTurnTokens: Map<string, unknown>;
@@ -338,11 +344,69 @@ test('a silent stream log write failure still releases its turn without retrying
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.deepEqual(phases(), [['started', 'failed']]);
     assert.equal(membrane.calls.length, 1, 'the logging error starts no retry');
+    assert.deepEqual(failureTypes(traces), ['inference:exhausted'], 'its failure is reported once');
     assert.equal(framework.getAgent('resident')?.state.status, 'idle');
     assert.equal(framework.getHostModeStatus().activeTurns, 0);
   } finally {
     console.error = originalError;
     internal.logInference = write;
+    await teardown();
+  }
+});
+
+// A listener of the silent end's inference:exhausted that disposes the agent at once leaves the failure the end
+// established standing: its settlement, its one failure trace and its inference-log row all name it, not the
+// disposal after it. stopAgent ends only an agent that doesn't own default delivery, so the stream is `second`'s.
+test('a silent stream whose failure trace disposes its agent keeps the failure it established', { timeout: 60_000 }, async () => {
+  const { framework, membrane, phases, teardown } = await frameworkOver([silentEnd], retryOnce, [
+    { name: 'resident', model: 'test-model', systemPrompt: 'system' },
+    { name: 'second', model: 'test-model', systemPrompt: 'system' },
+  ]);
+  const internal = framework as unknown as {
+    agents: Map<string, unknown>;
+    activeTurnTokens: Map<string, unknown>;
+    settleAgent: (name: string, outcome: { stopReason?: string; error?: string }, ...rest: unknown[]) => unknown;
+  };
+  const settleAgent = internal.settleAgent;
+  const settled: Array<{ stopReason?: string; error?: string }> = [];
+  internal.settleAgent = (name, outcome, ...rest) => {
+    if (name === 'second') settled.push({ stopReason: outcome.stopReason, error: outcome.error });
+    return settleAgent.call(framework, name, outcome, ...rest);
+  };
+  const failures: Array<{ type: string; error?: string }> = [];
+  let removed: boolean | undefined;
+  let stopError: unknown;
+  framework.onTrace((event) => {
+    const trace = event as unknown as { type: string; agentName?: string; error?: string };
+    if (trace.agentName !== 'second' || (trace.type !== 'inference:failed' && trace.type !== 'inference:exhausted')) return;
+    failures.push({ type: trace.type, error: trace.error });
+    if (trace.type !== 'inference:exhausted' || removed !== undefined) return;
+    try {
+      framework.stopAgent('second', { by: 'test' });
+    } catch (error) {
+      stopError = error;
+    }
+    removed = !internal.agents.has('second');
+  });
+  const logged = () => framework.queryInferenceLogs({ agentName: 'second' }).entries
+    .map((e) => ({ success: e.entry.success, error: e.entry.error }));
+  const cause = 'Stream ended without a final response';
+  try {
+    framework.start();
+    framework.nudgeAgent('second', 'operator');
+    assert.ok(await settles(() => phases().length === 1 && phases()[0].length === 2 && !internal.activeTurnTokens.has('second')),
+      `the silent stream's turn ends: ${JSON.stringify({ phases: phases(), failures })}`);
+    // Room for a retry, which nothing should start.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(stopError, undefined, 'the listener stopped the agent');
+    assert.equal(removed, true, 'the stop removed the agent before the stream logged its end');
+    assert.deepEqual(settled.filter((s) => s.stopReason === 'exhausted'), [{ stopReason: 'exhausted', error: cause }], 'its settlement names the failure');
+    assert.deepEqual(failures, [{ type: 'inference:exhausted', error: cause }], 'its one failure trace names it');
+    assert.deepEqual(logged(), [{ success: false, error: cause }], 'and so does its inference-log row');
+    assert.deepEqual(phases(), [['started', 'failed']], 'its lifecycle ends failed, not completed');
+    assert.equal(membrane.calls.length, 1, 'nothing retries it or starts its turn again');
+  } finally {
+    internal.settleAgent = settleAgent;
     await teardown();
   }
 });

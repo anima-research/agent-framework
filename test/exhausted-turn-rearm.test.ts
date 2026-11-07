@@ -66,6 +66,17 @@ class DeadlineStream implements YieldingStream {
   }
 }
 
+/** A stream that ends at once with no event at all, and that nobody cancels. */
+class SilentStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  provideToolResults(): void { throw new Error('not waiting'); }
+  cancel(): void { this.isCancelled = true; }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> { /* no events */ }
+}
+
 class HeldOpenStream implements YieldingStream {
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
@@ -152,7 +163,7 @@ class ScriptedMembrane extends MockMembrane {
   letGo: () => void = () => {};
   private readonly heldOpen = new Promise<void>((resolve) => { this.letGo = resolve; });
   constructor(private readonly script: (send: number) => (() => Error) | { toolRoundThen: Error } | 'tool round, then a server error' | 'tool calls cut off by a server error'
-    | 'tool round, then a stated wait' | 'a deadline' | 'aborted' | 'held open' | undefined, private readonly failsAt: FailsAt = 'event') { super(); }
+    | 'tool round, then a stated wait' | 'a deadline' | 'aborted' | 'held open' | 'silent' | undefined, private readonly failsAt: FailsAt = 'event') { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     const texts = request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '')
       .filter((t) => t.startsWith('zz-')).join(' | ');
@@ -165,6 +176,7 @@ class ScriptedMembrane extends MockMembrane {
     if (fail === 'aborted') return new DeadlineStream('error');
     if (fail === 'tool round, then a stated wait') return new ToolRoundThenErrorStream(statedWait(250)());
     if (fail === 'held open') return new HeldOpenStream(this.heldOpen, new MockYieldingStream([createMockResponse([{ type: 'text', text: 'zz-answer-late' }])]));
+    if (fail === 'silent') return new SilentStream();
     if (fail && this.failsAt === 'setup') throw fail();
     if (fail && this.failsAt === 'throw') return new ThrowingStream(fail());
     if (fail) return new ErrorStream(fail());
@@ -377,6 +389,26 @@ for (const [name, fail, failsAt] of [['refused by the provider, at its start', i
     assert.equal(r.markers(), 2, 'the agent is told the re-armed turn failed another way');
   });
 }
+
+test("a re-armed send whose stream ends with no event, and that nobody cancelled, makes its one send and says why no re-send is coming", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : 'silent'));
+  const r = await resident(t, membrane);
+  stderr.length = 0;
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the re-armed send to end exhausted');
+  const windowEnded = r.traces.findIndex((tr) => tr.type === 'inference:exhausted');
+  const failures = r.traces.slice(windowEnded + 1).filter((tr) => tr.type === 'inference:failed' || tr.type === 'inference:exhausted');
+  assert.deepEqual(failures.map((tr) => tr.type), ['inference:exhausted'], 'the silent send reports one failure, as exhausted and not failed');
+  assert.equal(rearmLines('resident', "turn not re-armed: its failure isn't transient (Stream ended without a final response)").length, 1,
+    'the operator is told why no re-send is coming');
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'no re-arm follows');
+  await waitFor(() => r.fw.getAgent('resident')?.state.status === 'idle' && r.fw.getHostModeStatus().activeTurns === 0, "the silent send's turn to end");
+  t.mock.timers.tick(1_000);
+  await settle();
+  assert.equal(membrane.sends.length, 4, 'the window, then the re-armed send, and nothing once the next delay has passed');
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'nothing is held');
+  assert.equal(r.count('inference:exhausted'), 2, 'and no later failure');
+});
 
 for (const failsAt of ['event', 'setup', 'throw'] as const) {
   test(`a re-armed send that a deadline membrane marks cuts is sent again at the next delay, once in its chain; cut again, the chain ends (cut ${failsAt === 'setup' ? 'at its start' : failsAt === 'throw' ? 'thrown by its stream' : 'reported by its stream'})`, async (t) => {
