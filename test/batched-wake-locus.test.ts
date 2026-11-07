@@ -9,9 +9,11 @@
  *   - ambient AFTER the DM: the ambient channel became the fallback;
  *   - ambient BEFORE the DM: the DM never displaced it.
  * Now a batch containing an addressed message routes to that message's
- * registered channel. An ambient-only batch names no channel: under the
- * default `speech.locus: 'delivery'` the turn has no locus and its prose
- * stays private; under `'latest-inbound'` it keeps the legacy fallback.
+ * registered channel. An ambient-only batch gives its turn no channel to
+ * route to: under the default `speech.locus: 'delivery'` the turn has no
+ * locus, its prose stays private, and the resident is told which channels
+ * the batch came from; under `'latest-inbound'` it keeps the legacy
+ * fallback.
  *
  * The tests hold the gate's batch until both events are in it (holdBatches),
  * so they don't depend on the second reaching the gate inside the window.
@@ -42,7 +44,11 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
   throw new Error(`timed out waiting for: ${what}`);
 }
 
-function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
+function batchedWakeRig(opts: {
+  speech?: { locus: 'delivery' | 'latest-inbound' };
+  proseRouting?: 'locus' | 'hybrid';
+} = {}) {
+  const { speech, proseRouting } = opts;
   let tempDir: string;
   let statusPath: string;
   let commandPath: string;
@@ -59,7 +65,7 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', ...(proseRouting ? { proseRouting } : {}) }],
       ...(speech ? { speech } : {}),
       gate: {
         config: {
@@ -102,8 +108,9 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
       .map((e) => e.channelId!);
 
   /**
-   * Holds the gate's batches: when a batch's timer fires with fewer than two
-   * events in it, the batch stays pending, and the returned function counts
+   * Holds the gate's batches: when a batch's timer fires with fewer than
+   * `size` events in it (two by default), the batch stays pending, and the
+   * returned function counts
    * those held fires. A test that pairs two sends calls this, sends its first
    * event, waits until that event's batch has been held past its 100 ms
    * window, and then sends the second, which joins the same batch. That batch
@@ -117,7 +124,7 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
    * rename fails at this helper. A batch that fires without passing through
    * the hold never counts a held fire, so its test times out waiting for one.
    */
-  const holdBatches = (): (() => number) => {
+  const holdBatches = (size = 2): (() => number) => {
     const gate = (framework as unknown as {
       eventGate: { debounceTimers: Map<string, { events: unknown[] }>; fireDebounce(policyName: string): void } | null;
     }).eventGate;
@@ -127,7 +134,7 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
     const fire = gate.fireDebounce.bind(gate);
     let held = 0;
     gate.fireDebounce = (policyName) => {
-      if ((gate.debounceTimers.get(policyName)?.events.length ?? 0) >= 2) fire(policyName);
+      if ((gate.debounceTimers.get(policyName)?.events.length ?? 0) >= size) fire(policyName);
       else held++;
     };
     return () => held;
@@ -138,6 +145,37 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
     framework: () => framework,
     dm, dmInTwoParts, incoming, sent, publishes, holdBatches,
   };
+}
+
+function assertNamesBatchChannels(notice: string, channels: string[], chars: number): void {
+  const shown = channels.map((c) => `#${c} (discord:g1:${c})`);
+  const where = shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
+  assert.equal(notice,
+    `[send-undeliverable] Your previous reply (${chars} chars) had no channel to go to — this turn came from ${where}, ` +
+    `and no channel was chosen for its reply; to reply ${channels.length === 1 ? 'there' : 'in one of them'}, ` +
+    'send your reply to that channel explicitly. This is a routing situation, not a channel failure. ' +
+    'This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. ' +
+    'It is saved in your archive.');
+}
+
+async function ambientBatchHasNoLocus(rig: ReturnType<typeof batchedWakeRig>, channels: string[], named: string[]): Promise<void> {
+  const held = channels.length > 1 ? rig.holdBatches(channels.length) : undefined;
+  rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+  rig.incoming(channels[0]!, 'ambient', 'message 1');
+  if (held) {
+    await waitFor(() => rig.sent('incoming-sent') === 1, 'first sent');
+    await waitFor(() => held() >= 1, "the first message's batch held past its window");
+  }
+  channels.slice(1).forEach((channel, i) => rig.incoming(channel, 'ambient', `message ${i + 2}`));
+  await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
+  await rig.framework().runUntilIdle();
+  assert.deepEqual(rig.publishes(), [], 'nothing was published: no delivery woke this turn');
+  const texts = rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
+    .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+  assert.ok(texts.includes('joining in'), 'the prose stays in the window');
+  const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
+  assert.equal(notices.length, 1, JSON.stringify(texts));
+  assertNamesBatchChannels(notices[0]!, named, 'joining in'.length);
 }
 
 describe('batched wake routing', () => {
@@ -212,27 +250,42 @@ describe('batched wake routing', () => {
     assert.ok(!routing.some((t) => t.includes('room')), JSON.stringify(routing));
   });
 
-  it("an ambient-only batch names no channel: under the default rule the turn has no locus and its prose stays private", async () => {
+  it('an ambient batch of one message has no locus: its prose stays private, and the resident is told the channel it came from', async () => {
+    await ambientBatchHasNoLocus(rig, [ROOM], ['room']);
+  });
+
+  it('an ambient batch of two messages from one channel names that channel once', async () => {
+    await ambientBatchHasNoLocus(rig, [ROOM, ROOM], ['room']);
+  });
+
+  it('an ambient batch from two channels has no locus: its prose stays private, and the resident is told which channels the batch came from', async () => {
+    await ambientBatchHasNoLocus(rig, [ROOM, GENERAL], ['room', 'general']);
+  });
+
+  it('an ambient batch of three messages from two channels names each channel once, in the order they first appear', async () => {
+    await ambientBatchHasNoLocus(rig, [ROOM, GENERAL, ROOM], ['room', 'general']);
+  });
+
+  it("a sleep's announcement in a turn from two channels is told those channels", async () => {
     const held = holdBatches();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'sleep-1', name: 'sleep', input: { seconds: 60 } }], 'tool_use'));
     incoming(ROOM, 'ambient', 'first');
     await waitFor(() => sent('incoming-sent') === 1, 'first sent');
     await waitFor(() => held() >= 1, "the first message's batch held past its window");
     incoming(GENERAL, 'ambient', 'second');
     await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
     await rig.framework().runUntilIdle();
-    assert.deepEqual(publishes(), [], 'nothing was published: no delivery woke this turn');
+    assert.deepEqual(publishes(), []);
     const texts = rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
       .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
-    // The announce-on-change baseline treats "no channel" as the state a
-    // resident boots in, so a first turn without a locus adds no notice; a
-    // later turn that loses one is told (announceLocusIfChanged).
-    assert.ok(texts.includes('joining in'), 'the prose stays in the window');
+    const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
+    assert.equal(notices.length, 1, "the announcement's, since a sleep ends the turn: " + JSON.stringify(texts));
+    assertNamesBatchChannels(notices[0]!, ['room', 'general'], "💤 Going quiet for 1m. I'll still see messages, but won't respond until I wake.".length);
   });
 });
 
 describe("batched wake routing under speech.locus 'latest-inbound'", () => {
-  const rig = batchedWakeRig({ locus: 'latest-inbound' });
+  const rig = batchedWakeRig({ speech: { locus: 'latest-inbound' } });
   const { incoming, sent, publishes, holdBatches } = rig;
 
   it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
@@ -244,6 +297,18 @@ describe("batched wake routing under speech.locus 'latest-inbound'", () => {
     incoming(GENERAL, 'ambient', 'second');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [GENERAL]);
+    await rig.framework().runUntilIdle();
+    const texts = rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+    assert.ok(!texts.some((t) => t.startsWith('[send-undeliverable]')), 'a turn the fallback gave a channel gets no notice');
+  });
+});
+
+describe("batched wake routing with proseRouting 'hybrid'", () => {
+  const rig = batchedWakeRig({ proseRouting: 'hybrid' });
+
+  it("an ambient batch from two channels has no locus, and the resident's notice names them", async () => {
+    await ambientBatchHasNoLocus(rig, [ROOM, GENERAL], ['room', 'general']);
   });
 });
 

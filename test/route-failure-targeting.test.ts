@@ -214,6 +214,8 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(secondary.mock.callCount(), 0);
       assert.equal(primary.mock.calls[0]!.arguments[2]?.kind, 'discord-send-failed');
       assert.match(JSON.stringify(primary.mock.calls[0]!.arguments[1]), /\[send-undeliverable\] Your previous reply \(5 chars\) had no channel to go to/);
+      assert.match(JSON.stringify(primary.mock.calls[0]!.arguments[1]), /This is a routing\/configuration situation/,
+        'a turn with no channel at all may be a misconfiguration');
       assert.equal(internals(framework).pendingRequests.length, 0);
     });
 
