@@ -232,3 +232,25 @@ export class MockMembrane {
     return this as unknown as import('@animalabs/membrane').Membrane;
   }
 }
+
+/**
+ * A membrane that gives each turn's stream exactly one queued response, so
+ * several turns' replies can be queued up front, and can hold the next
+ * turn's stream until `holdNext` settles, to queue wakes behind a busy turn.
+ * (MockMembrane's streams take every response queued, which serves
+ * multi-response streams.)
+ */
+export class OneResponsePerTurnMembrane extends MockMembrane {
+  private index = 0;
+  holdNext?: Promise<void>;
+  override streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
+    this.calls.push(request);
+    const response = this.responses[this.index++];
+    const responses = response ? [response] : [];
+    const hold = this.holdNext;
+    this.holdNext = undefined;
+    const stream = hold ? new HeldStream(hold, responses) : new MockYieldingStream(responses, this.supportsInjectedMessages);
+    this.lastStream = stream;
+    return stream;
+  }
+}

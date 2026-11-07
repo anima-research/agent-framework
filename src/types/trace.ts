@@ -688,6 +688,36 @@ export type TraceEvent =
       rules: string[];
     })
 
+  // Message quiet period (FrameworkConfig.messageQuietPeriod)
+  /** An idle agent's turn is held for a burst of message wakes: one event
+   *  when the hold begins, naming the burst (a channel's, `channel`, server
+   *  and id, or a channel-less source's, `source`, name; the parts joined by
+   *  NUL) and how long until it is ready as of this pass (0 for a burst
+   *  ready now that waits only for another burst's turn to start first). */
+  | (TraceEventBase & {
+      type: 'quiet-period:held';
+      agentName: string;
+      burst: string;
+      wakes: number;
+      readyInMs: number;
+    })
+  /** A held burst's hold ends, paired with its `quiet-period:held`: how
+   *  many of its wakes start the turn, how long the hold lasted, and why it
+   *  ended: `quiet` (quietMs since its newest wake), `cap` (maxWaitMs since
+   *  its oldest), `other-wake` (a wake that is no message started it), or
+   *  `gone` (its wakes left the queue without a start: withdrawn, dropped as
+   *  read, or skipped by policy; `wakes` is 0). A burst that starts the
+   *  first time it is seen (already past its deadline, as the first of a
+   *  backlog after a busy turn) emits neither trace. */
+  | (TraceEventBase & {
+      type: 'quiet-period:released';
+      agentName: string;
+      burst: string;
+      wakes: number;
+      heldMs: number;
+      cause: 'quiet' | 'cap' | 'other-wake' | 'gone';
+    })
+
   // Usage lifecycle
   | (TraceEventBase & Fields<UsageUpdatedEvent>)
 
