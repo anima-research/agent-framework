@@ -13,8 +13,13 @@
   - For a resident whose stored history holds items its wire now sends,
     compaction items on the Responses API or server-tool blocks on
     Anthropic's API, the first request after a host takes this release
-    differs from the one before it from the first such item on, so the
-    provider's prompt cache matches it only up to there.
+    differs from the one before it from the first such item on. It differs
+    too, on every wire, for a resident whose history holds a reply carrying
+    such an item, alone or beside its text, with no tool call or thinking
+    signature, after a silent tick or a `[Continue]`: the item's id now
+    identifies the reply, so that prompt is rendered before it, and the
+    request differs from there on. The provider's prompt cache matches such
+    a request only up to the first difference.
   - An agent whose `foreignRounds` is `'raw'`, and a co-resident's rows
     stored before audience stamps, now send another agent's stored items as
     stored, as the rest of its rows already go. Whether OpenAI accepts a
