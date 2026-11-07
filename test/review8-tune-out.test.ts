@@ -948,33 +948,26 @@ test("65 follow-up (Isaac-3593, round 3): a kept notice of a cancel dropped for 
   }
 });
 
-test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, that a loss is told, that a notice that can't be written is kept in the store for the next boot, and that a stop loses the waiting cancel and the note, unless it was delivered already (review 5 #26), but tells the loss", async () => {
+test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, and that a loss, or a stop before the hold ends, is told now or after the restart", async () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup();
   try {
     h.enter();
     h.state.held = true;
     const waits = 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
-      + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-      + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. ';
-    const stop = 'If the host stops before then, the cancel is lost and it is still in force after the restart, unless its '
-      + 'end time has passed by then, or the host starts again with no reader, which ends every hold on record.';
-    const kept = (hold: string) => ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be `
-      + 'delivered then, you are told so in your context, and why. If writing that notice fails too, the failure is '
-      + 'traced for the host, and the notice is tried again every 60 s, except while such a change or refusal lasts, and '
-      + 'as soon as one ends, until it is written. The notice is kept in the store as well, unless the store refuses '
-      + 'that too: if the host stops before the notice is written, the host writes it when it starts again, or keeps '
-      + 'trying as above. The waiting cancel isn\'t kept in the store: if the host stops before '
-      + `${hold} ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note `
-      + 'by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or '
-      + `the host crashes, you are told when it starts again that any cancel of ${hold} then waiting was lost, with any `
-      + 'note left with it that had not been delivered.';
+      + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
+      + 'fails; cancelling again won\'t make it sooner. ';
+    const holds = 'stays in force; when it ends, what it still holds is delivered, up to its backlog cap and what fits in one message. ';
+    const stop = 'If the host stops first, the cancel is lost, and the restart doesn\'t run it.';
+    const kept = (hold: string) => ` Unless the host stops first, your note goes to the resident when a cancel ends ${hold}, or tries to. `
+      + 'If it can\'t be delivered, or the host stops first, you are told what is known of it once the host can write '
+      + 'to you, or when it starts again with you as its reader.';
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc', text: 'Look here.' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}${kept('the tune-out')}` } });
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out ${holds}${stop}${kept('the tune-out')}` } });
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}` } },
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out ${holds}${stop}` } },
       'control: with no note of its own, nothing is said of one');
     h.state.held = false;
     h.coordinator.runDeferredCancels();
@@ -982,7 +975,7 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
     h.state.held = true;
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'all-except', scope: 'all-except', text: 'Look at #b.' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, scope: 'all-except', note: `${waits}The all-except hold stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}${kept('the all-except hold')}` } });
+      { success: true, data: { waiting: true, scope: 'all-except', note: `${waits}The all-except hold ${holds}${stop}${kept('the all-except hold')}` } });
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -1270,18 +1263,13 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
       { channelId: 'disc:guild:a', serverId: 'disc', text: 'Someone asked for you.' }, [], 'reader-1', { epochId: a });
     assert.deepEqual(answer, { success: true, data: { waiting: true, serverId: 'disc', note:
       'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
-      + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-      + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. The tune-out stays in force until '
-      + 'then, and what it held is delivered when it ends, up to its backlog cap. If the host stops before then, the cancel is lost and it is '
-      + 'still in force after the restart, unless its end time has passed by then, or the host starts again with no reader, '
-      + 'which ends every hold on record. Your note waits with the cancel and '
-      + 'goes to the resident as your mail when the tune-out ends, even if your run has ended by then. If it can\'t be '
-      + 'delivered then, you are told so in your context, and why, but only while your run lasts: once it has ended, '
-      + 'nothing can be written to you, so the loss reaches no one and is only traced for the host. If writing that '
-      + 'notice fails while you still run, the failure is traced for the host, and the notice is tried again every '
-      + '60 s, except while such a change or refusal lasts, and as soon as one ends, until it is written, your run '
-      + 'ends, or the host stops. If the host stops before the tune-out ends, your note is lost with the cancel, unless '
-      + 'it was delivered already, and you are not told.' } });
+      + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
+      + 'fails; cancelling again won\'t make it sooner. The tune-out stays in force; when it ends, what it still holds '
+      + 'is delivered, up to its backlog cap and what fits in one message. If the host stops first, the cancel is lost, '
+      + 'and the restart doesn\'t run it. Your note goes to the resident as your mail when a cancel ends the tune-out, '
+      + 'or tries to, even if your run has ended by then. If it can\'t be delivered, you are told so while your run '
+      + 'lasts; after that, no one is. If the host stops before the tune-out ends, your note is lost with the cancel, '
+      + 'unless it went out already, and you are not told.' } });
   } finally {
     h.coordinator.stop();
     errors.mock.restore();

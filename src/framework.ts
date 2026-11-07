@@ -35484,10 +35484,10 @@ export class AgentFramework {
           if (!released.deferred) return status;
           // A cancel that waits is told as the tune-out tools tell one
           // (cancelWaitsNote): what it waits for, that asking again doesn't
-          // end the wait sooner, that its length isn't known, and that a stop
+          // end the wait sooner, and that a stop
           // before it runs loses it. Until the answer is built: a release
           // that ran by then ended the focus, and the answer says so.
-          const waits = `${unregistered ? 'This call' : 'The close'} cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`;
+          const waits = `${unregistered ? 'This call' : 'The close'} asks to cancel the all-except hold that excepts this channel. ${cancelWaitsNote('The all-except hold')}`;
           return () => (over() ? status() : waits);
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,

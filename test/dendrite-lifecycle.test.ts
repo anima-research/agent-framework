@@ -1143,7 +1143,7 @@ describe('Dendrite restart', () => {
   const interruptedNotices = (framework: AgentFramework) => textsIn(framework, 'mira')
     .filter((m) => (m.metadata.dendrite as { event?: unknown } | undefined)?.event === 'interrupted').length;
 
-  /** Fail the primary's write of each notice whose content holds `text`, once each, with `error`; returns how many failed. */
+  /** Fail the first write, by any manager, whose content holds `text`, once, with `error`; returns how many failed (0 or 1). */
   function failWritesOf(text: string, error = (): Error => new Error('EIO: simulated write failure')): { restore: () => void; failed: () => number } {
     const add = ContextManager.prototype.addMessage;
     let failed = 0;
