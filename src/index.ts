@@ -3,6 +3,8 @@ export * from './types/index.js';
 
 // Core classes
 export { AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export { residentViewFilter, subconsciousViewFilter } from './framework.js';
+export { isReasoningLoss } from './reasoning-loss.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';

@@ -1449,9 +1449,8 @@ export class Agent {
   /**
    * A host's hook, called with each committing compile's `thinkingStrip` (never a dry run's) and the key of the
    * branch it read (`branchKey`), as the compile returns, whether or not its request is then sent, since the
-   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets it
-   * at the agent's first stream unless a host has set one, so a host's own observer stands in for the framework's,
-   * whose `[reasoning]` line for the agent then isn't told.
+   * context manager's binding record takes the strip either way. One that throws is logged. It is observational only;
+   * the framework does not write agent-facing reasoning-loss notices.
    */
   onThinkingStrip?: (strip: ThinkingStrip, branch: string) => void;
 
