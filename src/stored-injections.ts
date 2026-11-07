@@ -28,6 +28,8 @@
  */
 
 import type { ContextInjection } from '@animalabs/context-manager';
+import type { ContentBlock } from '@animalabs/membrane';
+import { holdsTurn } from './sent-rows.js';
 import { stableHash } from './stable-hash.js';
 import { injectionsAsStored } from './text-as-stored.js';
 
@@ -104,18 +106,17 @@ export function isStoredKind(injection: ContextInjection): boolean {
 }
 
 /**
- * Whether content leaves anything in a request: a block that isn't a text
- * block, or a text block with non-blank text, as the request's sanitizer
- * keeps (Agent's assembleActivationRequest drops blank text blocks, and a
- * message left with none). An injection with none isn't stored: its row
- * would vanish from every request, and the count of stored rows the
- * request ends on, which keeps [Continue] last, would then be wrong.
- * compile() places it, and the sanitizer drops it, as before.
+ * Whether content holds a turn in a request (holdsTurn): a block the
+ * request's sanitizer keeps (Agent's assembleActivationRequest drops blank
+ * text blocks, and a message left with none) that isn't a provider-native
+ * item's carrier. A message holding only carriers isn't a turn: the
+ * Responses API gets its items, except an Anthropic server-tool block;
+ * Anthropic's API gets an assistant turn's paired server-tool blocks, and
+ * a lone call in the request's last message; the other wires get none. An
+ * injection with no turn isn't stored, as before: compile() places it.
  */
 export function hasRenderedContent(content: ContextInjection['content']): boolean {
-  return Array.isArray(content) && content.some((block) =>
-    !((block as { type?: unknown }).type === 'text'
-      && (typeof (block as { text?: unknown }).text !== 'string' || ((block as { text: string }).text).trim() === '')));
+  return Array.isArray(content) && holdsTurn(content as ContentBlock[]);
 }
 
 /** One injection as its row would store it: its namespace as text (as

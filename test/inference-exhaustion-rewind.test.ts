@@ -120,6 +120,34 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
 });
 
+const CARRIER_ROWS = [
+  ['a Responses compaction item', [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } }]],
+  ['an Anthropic server-tool call and its result', [
+    { type: 'text', text: '', rawItem: { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: {} } },
+    { type: 'text', text: '', rawItem: { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_1', content: [] } },
+  ]],
+] as const;
+
+for (const [kind, carriers] of CARRIER_ROWS) {
+  test(`at the threshold, a row holding only ${kind} goes with the newest turn before it in the one step, and a system row between stays`, () => {
+    const { fw, messages, added, restore } = makeHarness({ messages: [
+      { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },
+      { id: 'a0', participant: 'agent', content: [{ type: 'text', text: 'an answer' }] },
+      { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+      { id: 'n1', participant: 'user', content: [{ type: 'text', text: 'a system note' }], metadata: { system: true } },
+      { id: 'a1', participant: 'agent', content: [...carriers] },
+    ] });
+    try {
+      for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    } finally { restore(); }
+    assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0'],
+      'the newest turn is gone, and the carrier-only row after it with it');
+    assert.ok(messages.some((m) => m.id === 'n1'), 'the system row between them stays');
+    const marker = added.find(isRewindMarker);
+    assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
+  });
+}
+
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {

@@ -178,8 +178,8 @@ const EMPTY_MESSAGE = `[${NOTICE_TAG.emptyMessage}]`;
  * can't touch metadata, so the mark holds for the row's life, and it tells an
  * edit or a sync which block is Discord's to replace. For the same reason a
  * row stored before the mark never gets it, even once a history sync
- * rebuilds it in this layout. The request builder drops an empty text block,
- * as it does wherever one occurs.
+ * rebuilds it in this layout. The request builder drops the empty text
+ * block, as it drops every empty text block that carries no provider item.
  */
 const TEXT_FIRST = 'discordTextFirst';
 

@@ -8,7 +8,7 @@ import { ToolResultGuard } from './tool-result-guard.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
-import { carriedBlock, type SentRow } from './sent-rows.js';
+import { carriedBlock, holdsTurn, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
@@ -150,9 +150,9 @@ import type {
 
 
 /**
- * Whether a request's messages, as sanitized, end on `agentName`'s own
- * message, apart from `injectionTail` stored context injections after it
- * (counted over the messages the sanitizer keeps).
+ * Whether the request's turns end on `agentName`'s own message, apart from
+ * `injectionTail` stored context injections after it (counted over the
+ * messages it's given: the request's turns).
  */
 function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, injectionTail: number): boolean {
   const own = messages[messages.length - 1 - injectionTail];
@@ -2135,8 +2135,10 @@ export class Agent {
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
     }
     // The stored context injections the request ends on, counted over the
-    // messages the sanitizer below keeps (hasRenderedContent), since it drops
-    // a message it leaves empty, a placed blank injection among them.
+    // messages that hold a turn (hasRenderedContent): the sanitizer below
+    // drops a message it leaves empty, a placed blank injection among them,
+    // and a message holding only provider items' carriers isn't a turn
+    // (holdsTurn).
     // [Continue] goes after them, and a tool loop's prompt is read from
     // before them: they're context, not what woke the agent. An injection
     // compile() places ends the tail, as on main, where every one was placed.
@@ -2158,7 +2160,11 @@ export class Agent {
     // through unchanged, so tool pairing is unaffected. (Field-observed
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
     // path entirely; twin of context-manager's stripEmptyTextBlocks on the
-    // compression path.)
+    // compression path.) An exactly empty text block that carries a
+    // provider-native item (`rawItem`), as membrane carries OpenAI's
+    // compaction item and Anthropic's server-tool blocks, stays: membrane's
+    // formatters send it as its item or leave it out, per provider, and none
+    // sends it as an empty text block.
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
     // Another agent's rounds go out as this agent is sent them (setForeignRounds).
@@ -2197,10 +2203,15 @@ export class Agent {
     // loop this reply continues; else none. A request that ends
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
+    // Read over the messages that hold a turn (holdsTurn): one holding only
+    // provider items' carriers isn't one, so a paused Anthropic round stored
+    // as server-tool blocks alone gets a [Continue] after it only where the
+    // turn before it is the agent's own.
+    const turns = messages.filter((m) => holdsTurn(m.content));
     let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
-    } else if (endsOnOwnMessage(messages, this.presentAs, injectionTail)) {
+    } else if (endsOnOwnMessage(turns, this.presentAs, injectionTail)) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
@@ -2214,7 +2225,7 @@ export class Agent {
     } else {
       // What the request ends on apart from the stored injections after it,
       // which aren't something the reply answers.
-      continuePrompt = toolLoopPrompt(messages.at(-1 - injectionTail), index);
+      continuePrompt = toolLoopPrompt(turns.at(-1 - injectionTail), index);
     }
 
     const request: NormalizedRequest = {
