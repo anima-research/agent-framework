@@ -1405,16 +1405,19 @@ export class TuneOutCoordinator {
         if (release === -Infinity || told > release) continue;
         const shown = this.shown(serverId, channelId);
         const expires = params.expiresAtMs !== undefined ? new Date(params.expiresAtMs) : undefined;
-        const until = expires && Number.isFinite(expires.getTime())
-          ? `, or at its end time, ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
-          : '';
+        const endTime = expires && Number.isFinite(expires.getTime()) ? expires.toISOString().replace(/\.\d+Z$/, 'Z') : undefined;
+        // A channel's tune-out also ends by itself at the first wake past its
+        // wake budget (cancelPastBudget, from fireWake and the start); the
+        // all-except hold's budget pauses its reader, and ends nothing.
+        const budget = !scope && typeof params.maxWakes === 'number' && Number.isFinite(params.maxWakes)
+          ? `, or by itself at the first wake past its wake budget (maxWakes ${params.maxWakes})` : '';
         const text = scope
           ? `[${NOTICE_TAG.tuneOut}: the all-except hold (all channels except ${shown}) is still in force. Its release above reached you, but its `
             + 'end wasn\'t recorded before the host stopped, so the hold is still in force: what arrives in those channels is held, and comes '
-            + `with its next release. It ends when it is cancelled (tune_out mode "cancel" with scope "all-except")${until}.]`
+            + `with its next release. It ends when it is cancelled (tune_out mode "cancel" with scope "all-except")${endTime ? `, or at its end time, ${endTime}` : ''}.]`
           : `[${NOTICE_TAG.tuneOut}: ${shown} is still tuned out. Its release above reached you, but its end wasn't recorded before the `
             + 'host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release. It ends when it '
-            + `is cancelled (tune_out mode "cancel")${until}.]`;
+            + `is cancelled (tune_out mode "cancel")${endTime ? `${budget ? ',' : ', or'} at its end time, ${endTime}` : ''}${budget}.]`;
         this.hooks.addMessage('user', [{ type: 'text', text }], {
           system: true, kind: 'tune-out-end-unrecorded', channelId, serverId, epochId, ...(scope ? { scope } : {}),
         });
@@ -3502,8 +3505,11 @@ export class TuneOutCoordinator {
             + "ended, and the store didn't hold it when this was written: it may be lost."
           : '';
         if (drop.found === 'delivered') {
-          // The note's row is stored, no release since, the end of its cancel's hold not.
-          text = `${unrecorded}The note you left with your cancel of it was delivered to ${to} before the stop. ${notRecorded("The cancel's end")}]`;
+          // The note's row is stored, no release since, the end of its cancel's
+          // hold not. The rows prove it is stored at this start, not that it
+          // was before the stop: a note kept in memory then can land after
+          // it, at a release in the same process (Oscar, #844).
+          text = `${unrecorded}The note you left with your cancel of it was delivered to ${to} before this start. ${notRecorded("The cancel's end")}]`;
         } else if (drop.found === 'ran' && drop.own) {
           // Its own cancel stored the release since it asked, the end not.
           const who = drop.asked ? 'The cancel of it you asked for' : 'Your cancel of it';

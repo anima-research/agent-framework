@@ -721,7 +721,8 @@ test("3 (Weft, c55239d5): a note delivered and told in one run, a resident's rel
     const e = h.hold();
     h.note(e);
     h.boot();
-    assert.match(textOf(h.unrecorded()[0]!.content), /was delivered to scout before the stop/);
+    // What the rows prove: the note is stored at this start, not when (Oscar, #844: a kept note can land after the stop).
+    assert.match(textOf(h.unrecorded()[0]!.content), /was delivered to scout before this start/);
     h.release(e, 'agent-tool', 'agent request');
     h.boot();
     assert.equal(textOf(h.unrecorded().at(-1)!.content),
@@ -2002,7 +2003,7 @@ test("review 5 #25: a note, or a release telling a queued note's loss, stored be
       h.boot();
       assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [before.startsWith('control')
         ? `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${e}). The note you left with your cancel of it `
-          + "was delivered to scout before the stop. The cancel's end was not recorded, so that tune-out is still in force.]"
+          + "was delivered to scout before this start. The cancel's end was not recorded, so that tune-out is still in force.]"
         : askedRow(e, 'Look again.')], `${before}: ${before.startsWith('control') ? 'the note after the ask is its own' : 'the ask is told lost, with its note'}`);
     } finally { h.stopAll(); }
   }

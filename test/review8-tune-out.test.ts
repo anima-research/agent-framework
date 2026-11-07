@@ -2880,7 +2880,7 @@ test("Oscar on #844: the boot tells the resident, once, of a hold in force whose
       assert.deepEqual([told.metadata?.epochId, told.metadata?.scope], [epochId, scope ? 'all-except' : undefined]);
       assert.match(textOf(told.content), scope
         ? /^\[Tune-out: the all-except hold \(all channels except disc:guild:x\) is still in force\. Its release above reached you, but its end wasn't recorded before the host stopped, so the hold is still in force: what arrives in those channels is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel" with scope "all-except"\), or at its end time, \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\.\]$/
-        : /^\[Tune-out: disc:guild:a is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\)(, or at its end time, [^\]]+)?\.\]$/,
+        : /^\[Tune-out: disc:guild:a is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\)(, at its end time, [^,\]]+)?, or by itself at the first wake past its wake budget \(maxWakes \d+\)\.\]$/,
       `${where}: saying the release reached it, the end not recorded, the tune-out still in force`);
       boot();
       assert.equal(unended(h).length, 1, `${where}: a later boot tells it no second time`);

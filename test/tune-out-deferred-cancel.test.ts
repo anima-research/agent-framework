@@ -1651,7 +1651,7 @@ describe("a stop whose wait for the kept hold runs out, and a start on the same 
 // tells the resident once, in the pass that tells the subconscious.
 // ---------------------------------------------------------------------------
 
-const STILL_IN_FORCE = /^\[Tune-out: noisy is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\)\.\]$/;
+const STILL_IN_FORCE = /^\[Tune-out: noisy is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\), or by itself at the first wake past its wake budget \(maxWakes 5\)\.\]$/;
 
 /** The resident's window after the start: the release's first line and every row after it that says the tune-out still stands. */
 function residentAfterStart(f: Fixture): { releases: number; stillInForce: string[]; releaseFirst: boolean } {
