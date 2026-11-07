@@ -12,8 +12,9 @@ referenceRegistry.setServerAddress('srv', { url: 'wss://example.test' }, {});
 
 const fields = ['name', 'mimeType', 'expiresAt'] as const;
 const types = ['resource', 'image', 'audio'] as const;
+const NEVER_URI = 'https://example.test/optional-fields-never';
 function reference(type: string, extra: Record<string, unknown> = {}) {
-  const block = { type, uri: 'https://example.test/optional-fields', disposition: 'never', ...extra };
+  const block = { type, uri: 'https://example.test/optional-fields', ...extra };
   const parsed = classifyBlock(block);
   assert.equal(parsed.kind, 'reference');
   if (parsed.kind !== 'reference') throw new Error('expected reference');
@@ -23,13 +24,14 @@ function reference(type: string, extra: Record<string, unknown> = {}) {
 for (const field of fields) {
   test('drops overlong optional ' + field + ' while preserving each reference block and disposition', () => {
     for (const type of types) {
-      const { block, testimony } = reference(type, { [field]: 'x'.repeat(REFERENCE_LIMITS[field] + 1) });
+      const { block, testimony } = reference(type, { uri: NEVER_URI, disposition: 'never', [field]: 'x'.repeat(REFERENCE_LIMITS[field] + 1) });
       assert.equal(testimony[field], undefined, 'invalid optional metadata is absent, not repaired');
       assert.deepEqual(testimony.rejectedFields, [field]);
       assert.equal(testimony.uri, block.uri);
       assert.equal(testimony.disposition, 'never');
-      assert.ok(referenceStubOrNull(block)?.startsWith('[ref_'));
-      assert.ok(!referenceStubOrNull(block)?.includes(block.uri));
+      // From its server, whose own `never` marks the record, as on arrival.
+      assert.ok(referenceStubOrNull(block, undefined, 'srv')?.startsWith('[ref_'));
+      assert.ok(!referenceStubOrNull(block, undefined, 'srv')?.includes(block.uri));
     }
   });
 
@@ -46,7 +48,7 @@ for (const field of fields) {
 }
 
 test('wrong-type optional fields are dropped while a bad required URI rejects the block', () => {
-  const { testimony } = reference('resource', { name: 123, mimeType: null, expiresAt: [] });
+  const { testimony } = reference('resource', { uri: NEVER_URI, disposition: 'never', name: 123, mimeType: null, expiresAt: [] });
   assert.equal(testimony.name, undefined);
   assert.equal(testimony.mimeType, undefined);
   assert.equal(testimony.expiresAt, undefined);

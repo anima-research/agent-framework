@@ -326,13 +326,13 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     // back to the model, so it holds what the model's own line holds.
     servingFiles();
     const withheldUri = 'https://zz-elsewhere.example/withheld-for-script.csv';
-    referenceRegistry.register(testimonyOf({ type: 'resource', uri: withheldUri, name: 'withheld.csv', disposition: 'never' }));
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri: withheldUri, name: 'withheld.csv', disposition: 'never' }), 'zz-files');
     const thirdParty = "third-party origin: it isn't on its server's own address, so this host doesn't fetch it";
     for (const [what, link, shows, refused] of [
       ["off its server's origin, with no credential", { type: 'resource_link', uri: 'https://zz-elsewhere.example/script-plain.csv', name: 'a.csv' }, true, thirdParty],
       ['with a scheme the fetcher refuses', { type: 'resource_link', uri: 'file:///zz/script-plain.csv', name: 'a.csv' }, true, 'scheme not allowed: this host fetches only http and https uris'],
       ['that may carry a credential', { type: 'resource_link', uri: `https://zz-elsewhere.example/script-signed.csv?sig=${SECRET}`, name: 'a.csv' }, false, thirdParty],
-      ['withheld by a reference with disposition never', { type: 'resource_link', uri: withheldUri, name: 'a.csv' }, false, thirdParty],
+      ['withheld by a reference with disposition never', { type: 'resource_link', uri: withheldUri, name: 'a.csv' }, false, referencesModule.PAYLOAD_NEVER.error],
       ['the host can fetch', { type: 'resource_link', uri: 'https://zz-files.example/script-fetchable.csv', name: 'a.csv' }, false, undefined],
     ] as const) {
       // Delivered by the zz-files server, as a script's MCPL call registers it.
@@ -535,9 +535,15 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
 
   it("in a tool result, never shows a uri a reference withheld with disposition never, whatever a link to it says", () => {
     const uri = 'https://zz-elsewhere.example/withheld.csv';
-    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'withheld.csv', disposition: 'never' }));
+    const error = console.error;
+    console.error = () => {};
+    try {
+      referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'withheld.csv', disposition: 'never' }), 'zz-files');
+    } finally {
+      console.error = error;
+    }
     const shown = toolResultDataToHistoryString([TEXT, { type: 'resource_link', uri, name: 'report.csv' }]);
-    assert.match(shown, /^zz-text\n\[ref_[^\]]+\] report\.csv — from tool result — it's not tied to any server/);
+    assert.equal(shown, `zz-text\n[${referenceRegistry.findByUri(uri)!.refId}] report.csv — from tool result — ${referencesModule.PAYLOAD_NEVER.error}`);
     assert.ok(!shown.includes(uri), shown);
   });
 
@@ -608,7 +614,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     assert.deepEqual(referenceRegistry.findByUri(u('linked'))?.serverIds, ['zz-eager-server']);
   });
 
-  it("isn't fetched for a script on demand, where a reference is", async () => {
+  it("isn't fetched for a script on demand, where a reference is, whose fetch reads what its server said, not what a module's result says", async () => {
     const fw = Object.create(AgentFramework.prototype) as {
       getReferenceFetcher(): unknown;
       scriptResultAnswer(result: ToolResult, toolName: string, toServer: boolean): Promise<ScriptAnswer>;
@@ -617,8 +623,9 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       type: 'resource', uri: `https://zz-files.example/wanted.pdf?sig=${SECRET}`, name: 'wanted.pdf',
       digest: `sha256:${'C'.repeat(43)}`, expiresAt: '2099-01-01T00:00:00Z',
     };
-    // A link to the same uri came first, so its record holds the link's
-    // claims until the reference's replace them.
+    // The zz-files server delivered a link to the same uri. A module's
+    // result then carries a reference to it with a digest and an expiry,
+    // which aren't the server's word, so the record keeps the server's.
     referenceRegistry.register(testimonyOf({ type: 'resource_link', uri: reference.uri, name: 'linked.pdf' }), 'zz-files');
     const fetched: string[] = [];
     const claims: unknown[] = [];
@@ -641,7 +648,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     assert.equal(result.isError, false);
     const text = answerText(result);
     assert.deepEqual(fetched, [reference.uri]);
-    assert.deepEqual(claims, [['wanted.pdf', reference.digest, reference.expiresAt]]);
+    assert.deepEqual(claims, [['linked.pdf', undefined, undefined]]);
     // The script reads the text history stores for a protocol result's
     // content: the link, which no server delivered, as the stub that says so.
     assert.match(text, new RegExp(`^zz-text\\n${LINK_STUB.source.slice(0, -1)}\\n\\[ref_[^\\]]+\\] wanted\\.pdf — from tool result[^\\n]+\\n`));
@@ -1012,7 +1019,7 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     // Ada-1017, room-203 #206688: its never counts in the result's claims,
     // on the model's line as a content array and at depth.
     const line = toolResultDataToHistoryString([sealed, link]);
-    assert.ok(line.startsWith(`${INLINE_WITHHELD_TEXT}\n`) && !line.includes(SEALED_URI), line);
+    assert.ok(line.startsWith('[Resource not shown: its content is marked never to reach you or your tools.]\n') && !line.includes(SEALED_URI), line);
     const nested = toolResultDataToHistoryString({ a: sealed, b: link });
     assert.ok(!nested.includes(SEALED_URI), nested);
     assert.equal(contentClaimsOf([sealed]).get(SEALED_URI)?.never, true);
@@ -1020,10 +1027,14 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     const claims = scriptViewClaims([sealed, link], false);
     assert.equal(claims.get(SEALED_URI)?.never, true);
     assert.equal('uri' in (referenceBlockForScript(link, undefined, claims) as object), false);
-    assert.equal((referenceBlockForScript(link, undefined, scriptViewClaims([link], false)) as { uri?: string }).uri, SEALED_URI);
+    const OPEN_URI = 'https://zz-docs.example/open-796.txt';
+    const open = { ...sealed, resource: { ...sealed.resource, uri: OPEN_URI } };
+    const openLink = { ...PLAIN_LINK, uri: OPEN_URI };
+    assert.equal((referenceBlockForScript(openLink, undefined, scriptViewClaims([openLink], false)) as { uri?: string }).uri, OPEN_URI);
     // Another disposition withholds the embedded resource and claims nothing
     // of its uri.
-    assert.equal(toolResultDataToHistoryString([{ ...sealed, disposition: 'ref' }, link]), `${INLINE_WITHHELD_TEXT}\n${linkLine}`);
+    assert.equal(toolResultDataToHistoryString([{ ...open, disposition: 'ref' }, openLink]),
+      `${INLINE_WITHHELD_TEXT}\n[resource link "report.csv": ${OPEN_URI}, text/csv; not fetched]`);
     // An empty uri names nothing, so it marks nothing (#200094).
     assert.equal(contentClaimsOf([{ ...sealed, resource: { ...sealed.resource, uri: '' } }]).size, 0);
   });
@@ -1316,6 +1327,14 @@ describe('one answer for every block of a result', () => {
     const never = { type: 'resource', uri, name: 'order.csv', disposition: 'never' };
     const plain = { type: 'resource', uri, name: 'order.csv' };
     const STUB = /^\[ref_[^\]]+\] order\.csv — from tool result — /;
+    // A server's result, as its arrival leaves it: its never marks the record.
+    const error = console.error;
+    console.error = () => {};
+    try {
+      referenceRegistry.register(testimonyOf(never), 'zz-files');
+    } finally {
+      console.error = error;
+    }
     for (const order of [[link, never, plain], [never, link, plain], [never, plain, link], [plain, never, link], [plain, link, never]]) {
       const what = order.map((b) => (b === link ? 'link' : b === never ? 'never' : 'plain')).join(', ');
       const lines = toolResultDataToHistoryString([TEXT, ...order]).split('\n');
@@ -1403,25 +1422,40 @@ describe('one answer for every block of a result', () => {
     assert.equal(after, before);
   });
 
-  it("lets a later result's plain reference to a uri lift an earlier result's never, whatever the order of its link and reference", () => {
+  it("keeps a server's earlier never on a uri, which marked its payload, so a later result's plain reference doesn't lift it for a link, whatever the order of its link and reference; a never from a result no server sent doesn't follow the uri there", () => {
     const orders: Array<[string, (link: unknown, plain: unknown) => unknown[]]> = [
       ['link-first', (link, plain) => [link, plain]],
       ['reference-first', (link, plain) => [plain, link]],
     ];
-    for (const [order, blocks] of orders) {
-      const uri = `https://zz-elsewhere.example/lifted-${order}.csv`;
-      // An earlier result marks the uri never.
-      toolResultDataToHistoryString([{ type: 'resource', uri, name: 'lifted.csv', disposition: 'never' }]);
-      // The later result's reference is its server's latest word on the
-      // uri, so the link shows it, as if no never had been given.
-      const lines = toolResultDataToHistoryString(blocks(
-        { type: 'resource_link', uri, name: 'lifted.csv' }, { type: 'resource', uri, name: 'lifted.csv' })).split('\n');
-      assert.ok(lines.includes(`[resource link "lifted.csv": ${uri}; not fetched]`), `${order}: ${lines.join('\n')}`);
+    const error = console.error;
+    console.error = () => {};
+    try {
+      for (const [order, blocks] of orders) {
+        for (const server of ['zz-elsewhere', undefined]) {
+          const uri = `https://zz-elsewhere.example/lifted-${order}-${server ?? 'none'}.csv`;
+          // An earlier result says the uri is never: a server's marks its record.
+          const earlier = { type: 'resource', uri, name: 'lifted.csv', disposition: 'never' };
+          if (server !== undefined) referenceRegistry.register(testimonyOf(earlier), server);
+          toolResultDataToHistoryString([earlier]);
+          const lines = toolResultDataToHistoryString(blocks(
+            { type: 'resource_link', uri, name: 'lifted.csv' }, { type: 'resource', uri, name: 'lifted.csv' })).split('\n');
+          const never = lines.filter((line) => /^\[ref_[^\]]+\] lifted\.csv — from tool result — a server asked that its content never reach you/.test(line)).length;
+          if (server !== undefined) {
+            assert.ok(!lines.some((line) => line.includes(uri)), `${order}: ${lines.join('\n')}`);
+            assert.equal(never, 2, `${order}: ${lines.join('\n')}`);
+          } else {
+            assert.equal(never, 0, `${order}, no server: ${lines.join('\n')}`);
+          }
+        }
+      }
+    } finally {
+      console.error = error;
     }
-    // A result naming the uri only in a link leaves the earlier never in force.
+    // An earlier result's never, with no server's word on the uri since,
+    // stays in its record's testimony, so a later link alone is withheld.
     const uri = 'https://zz-elsewhere.example/lifted-link-only.csv';
     toolResultDataToHistoryString([{ type: 'resource', uri, name: 'kept.csv', disposition: 'never' }]);
-    assert.match(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), /^\[ref_[^\]]+\] kept\.csv — from tool result — /);
+    assert.equal(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), '[Reference not shown "kept.csv": its content is marked never to reach you or your tools.]');
   });
 
   it("finds a never inside inline data's other fields, which showing it descends into, before any block is shown", () => {
@@ -1433,8 +1467,7 @@ describe('one answer for every block of a result', () => {
       ],
     };
     const shown = JSON.parse(toolResultDataToHistoryString(data)) as { items: [string, { _meta: { ref: string } }] };
-    assert.match(shown.items[0], /^\[ref_[^\]]+\] meta\.csv — from tool result — /);
-    assert.match(shown.items[1]._meta.ref, /^\[ref_[^\]]+\] meta\.csv — from tool result — /);
+    assert.deepEqual([shown.items[0], shown.items[1]._meta.ref], ['[Reference not shown "meta.csv": its content is marked never to reach you or your tools.]', '[Reference not shown "meta.csv": its content is marked never to reach you or your tools.]']);
     // A content array shows an image, not its fields, so there a reference
     // inside them doesn't count, and the link shows its uri.
     const shownUri = 'https://zz-elsewhere.example/meta-in-array.csv';
@@ -1452,7 +1485,7 @@ describe('one answer for every block of a result', () => {
       { type: 'resource', uri, name: 'evicted.csv', disposition: 'never' }, ...many, { type: 'resource_link', uri, name: 'evicted.csv' },
     ]).split('\n');
     assert.equal(lines.length, 2003);
-    assert.match(lines[2002]!, /^\[ref_[^\]]+\] evicted\.csv — from tool result — /);
+    assert.deepEqual([lines[0], lines[2002]], ['[Reference not shown "evicted.csv": its content is marked never to reach you or your tools.]', '[Reference not shown "evicted.csv": its content is marked never to reach you or your tools.]']);
   });
 
   it("reads claims through toJSON, as serialization does, so a never toJSON gives counts and a getter it leaves out isn't read", () => {
@@ -1464,8 +1497,7 @@ describe('one answer for every block of a result', () => {
     };
     const shown = JSON.parse(toolResultDataToHistoryString({ link: { type: 'resource_link', uri, name: 'to-json.csv' }, value })) as
       { link: string; value: { ref: string } };
-    assert.match(shown.link, /^\[ref_[^\]]+\] to-json\.csv — from tool result — /);
-    assert.match(shown.value.ref, /^\[ref_[^\]]+\] to-json\.csv — from tool result — /);
+    assert.deepEqual([shown.link, shown.value.ref], ['[Reference not shown "to-json.csv": its content is marked never to reach you or your tools.]', '[Reference not shown "to-json.csv": its content is marked never to reach you or your tools.]']);
     assert.equal(reads, 0);
   });
 
@@ -1496,7 +1528,7 @@ describe('one answer for every block of a result', () => {
       data: { files: [{ type: 'resource_link', uri, name: 'kept.csv' }], other: { type: 'resource', uri, name: 'kept.csv', disposition: 'never' } },
       keepWhenWithheld: ['files'],
     }, undefined);
-    assert.ok(kept !== undefined && /^\{"files":\["\[ref_[^\]]+\] kept\.csv — from tool result — /.test(kept), kept);
+    assert.equal(kept, JSON.stringify({ files: ['[Reference not shown "kept.csv": its content is marked never to reach you or your tools.]'] }));
   });
 
   it("keeps nothing of a withheld result whose claims a value stops the walk of, since what the rest claims is unknown", () => {
@@ -1668,7 +1700,7 @@ describe('one answer for every block of a result', () => {
     // On its server's own origin, so the expiry is the one refusal.
     servingFiles();
     const uri = 'https://zz-files.example/expired-link.csv';
-    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'expired.csv', expiresAt: '2001-01-01T00:00:00Z' }));
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'expired.csv', expiresAt: '2001-01-01T00:00:00Z' }), 'zz-files');
     const link = { type: 'resource_link', uri, name: 'expired.csv' };
     const object = referenceBlockForScript(link, 'zz-files') as { uri?: string; refId: string; expired?: string; unfetchable?: string };
     assert.equal(object.uri, uri);
@@ -1805,8 +1837,9 @@ describe('one answer for every block of a result', () => {
       assert.ok(!shown.includes('inline-never'), shown);
     }
     // Only its never counts: an expiry beside its data claims nothing.
-    const dated = { ...sealed, disposition: 'ref', expiresAt: '2000-01-01T00:00:00Z' };
-    assert.ok(toolResultDataToHistoryString([dated, link], undefined, { dataIsContent: true }).includes('inline-never'));
+    const datedUri = 'https://zz-elsewhere.example/inline-dated/report.csv';
+    const dated = { ...sealed, uri: datedUri, disposition: 'ref', expiresAt: '2000-01-01T00:00:00Z' };
+    assert.ok(toolResultDataToHistoryString([dated, { ...link, uri: datedUri }], undefined, { dataIsContent: true }).includes('inline-dated'));
   });
 
   it("withholds a never uri from a link whose uri shows as the same text once well formed, a lone surrogate showing as U+FFFD", () => {
