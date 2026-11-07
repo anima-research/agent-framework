@@ -491,14 +491,35 @@ describe('XML tools: a response that ends at the output limit inside a tool-call
     assert.equal(run.requests.length, 2);
   });
 
-  it('routes the words of a cut-off round whose think membrane read whole as an XML round\'s, outside the private think policy', async () => {
+  // #296: the private think policy reaches an XML round, cut off or not.
+  it('keeps back the words of a cut-off round whose think membrane read whole as an XML round\'s, under the private think policy', async () => {
     const ns = 'an' + 'tml:';
     const run = await turn('xml', [{ xml: `Words here.\n\n<${ns}function_calls>\n<${ns}invoke name="think">\n<${ns}parameter name="thought">hm</${ns}parameter>\n</${ns}invoke>\n</${ns}function_calls>\nMore words`, stop: 'max_tokens' }],
       { sameRoundThinkTextPolicy: 'private' });
     assertRefusedPair(run, [{ name: 'think', says: RAN_NOT }]);
-    assert.ok(run.routed.some((text) => text.includes('Words here.')), JSON.stringify(run.routed));
+    assert.ok(!run.routed.some((text) => text.includes('Words here.')), JSON.stringify(run.routed));
     assert.equal(run.routed.at(-1), NEXT);
     assert.equal(run.requests.length, 2);
+  });
+
+  // #296: an XML round cut off with a private think counts as native's does.
+  const xmlThinkCut = (words: string): Reply => {
+    const ns = 'an' + 'tml:';
+    return { xml: `${words}\n\n<${ns}function_calls>\n<${ns}invoke name="think">\n<${ns}parameter name="thought">hm</${ns}parameter>\n</${ns}invoke>\n</${ns}function_calls>\nMore words`, stop: 'max_tokens' };
+  };
+  const xmlSend: Reply = { xml: 'Telling the room.\n\n<function_calls>\n<invoke name="robot--send_message">\n<parameter name="text">hi</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+
+  it("counts an XML round cut off with a private think as kept private on a turn an earlier send silenced", async () => {
+    const run = await turn('xml', [xmlSend, xmlThinkCut('Musing to myself.')], { sameRoundThinkTextPolicy: 'private' });
+    assert.ok(!run.routed.some((text) => text.includes('Musing to myself.')), JSON.stringify(run.routed));
+    assert.match(receipts(run).join(' | '), /kept private/, receipts(run).join(' | '));
+  });
+
+  it("counts an XML round cut off with a private think once, under disabled routing", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, xmlThinkCut('Musing to myself.')], { proseRouting: 'disabled', sameRoundThinkTextPolicy: 'private' });
+    assert.deepEqual(run.routed, []);
+    assert.match(receipts(run)[0] ?? '', /\bplain-speech segment\(s\) kept in the transcript/, receipts(run).join(' | '));
+    assert.equal(run.requests.length, 3);
   });
 
   it('tells the agent nothing ran when an earlier round ran and the next block was cut off before any call was named', async () => {

@@ -58,10 +58,12 @@ export function splitProseRuns(content: readonly ContentBlock[]): string[] {
 /**
  * A turn's content without the prose of some of its tool rounds, the turn's
  * rounds counted from 0 in order. A round's prose is its text
- * before its calls, and a round starts at the first block after the previous
+ * up to its results, and a round starts at the first block after the previous
  * round's `tool_result` blocks. So a round with no prose still counts, two
  * calls of one round (their `tool_use` blocks come before any result) stay
  * one round, and a round is found by its place, whatever its text holds.
+ * An all-refused XML attempt (`tool_attempt`, answered by a `tool_notice`) was
+ * no round, so the text before either block is no round's and stays.
  * Other rounds' text, every non-text block and the text after the last round
  * stay.
  */
@@ -69,17 +71,30 @@ export function withoutRoundsProse(
   content: readonly ContentBlock[],
   rounds: ReadonlySet<number>,
 ): ContentBlock[] {
+  const dropped = new Set<number>();
   let round = 0;
   let afterResults = false;
-  return content.filter((block) => {
-    if (block.type === 'tool_result') {
+  // The text since the last boundary: whose it is shows at what ends it.
+  let unclaimed: number[] = [];
+  const claim = (): void => {
+    if (rounds.has(round)) for (const at of unclaimed) dropped.add(at);
+    unclaimed = [];
+  };
+  content.forEach((block, at) => {
+    const type = block.type as string;
+    if (type === 'tool_result') {
+      claim();
       afterResults = true;
-      return true;
+      return;
     }
     if (afterResults) {
       round++;
       afterResults = false;
     }
-    return !(block.type === 'text' && rounds.has(round));
+    if (type === 'tool_attempt' || type === 'tool_notice') unclaimed = [];
+    else if (type === 'tool_use') claim();
+    else if (type === 'text') unclaimed.push(at);
   });
+  claim();
+  return content.filter((_, at) => !dropped.has(at));
 }
