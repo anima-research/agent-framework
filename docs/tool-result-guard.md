@@ -220,11 +220,13 @@ it, a process, or a synced copy. Withholding keeps the original out of the
 agent's context, not out of its workspace.
 
 If the active branch changes while the originals are being written (a
-rollback, an undo, a host's switch), no more are written, and the rest are
-recorded as skipped for the branch change. While the store is away from the
-batch's branch, the stub stays as it was; if the branch is back by the edit,
-as after an undo and a redo, each skipped result's stub names the audit
-record. A write already under way names the batch's branch, and the workspace
+rollback, a suppression, a host's switch), no more are written, and the rest
+are recorded as skipped for the branch change. An undo or a redo changes the
+agent's window, not the branch (#291), so it doesn't stop them. While the
+store is away from the batch's branch, the stub stays as it was; if the
+branch is back by the edit, as after a host's switch away and back, each
+skipped result's stub names the audit record. A write already under way
+names the batch's branch, and the workspace
 refuses it where it commits the file (`WorkspaceModule.writeBinary`'s `branch`
 option, whose refusal carries `data: { branchLeft: true }`), so no original's
 tree entry lands on another branch. With `autoMaterialize`, a mount has one

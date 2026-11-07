@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fixture, TS } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
-import { WorkspaceModule } from '../src/index.js';
+import { WorkspaceModule, audienceOf } from '../src/index.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createMockResponse } from './helpers/mock-membrane.js';
@@ -92,6 +92,7 @@ describe('event suppression', () => {
       await settle(f);
       const row = find(f, 'noise one');
       assert.deepEqual(suppressedOf(row), { rule: 'hide-noisy', eventType: 'mcpl:channel-incoming', source: 'editor' });
+      assert.deepEqual(audienceOf(row.metadata)?.audience, [], "stamped for nobody (#291); suppressed, it is presented in no window, an observer's included");
       assert.equal(await inView(f, 'noise one'), false, 'not in the compiled view');
 
       await incoming(f, 'noisy', 'n2', 'agent, look at this', MENTION);
@@ -117,8 +118,11 @@ describe('event suppression', () => {
       const { loop } = await blockInTool(f, gate);
       await incoming(f, 'noisy', 'n1', 'hidden while acting');
       await incoming(f, 'work', 'w2', 'shown while acting');
-      const arrived = (text: string) => () =>
-        internals(f).deferredMessages.some((m) => textOf(m as Stored).includes(text)) || has(f, text);
+      // Every write is stored at once (#291), unless a surgery's hold or a
+      // context manager refusing its work keeps it in memory, and neither is
+      // in force here: one arriving mid-turn is in the store, out of the live
+      // turn's window until a point presents it.
+      const arrived = (text: string) => () => has(f, text);
       await eventually(arrived('hidden while acting'), 'the suppressed message arrived');
       await eventually(arrived('shown while acting'), 'the control arrived');
       f.alwaysRespond();
@@ -216,8 +220,8 @@ describe('event suppression', () => {
 
   it('a module reading a suppressed row is told it\'s held from the residents', async () => {
     const { asModuleRow } = await import('../src/held-writes.js');
-    assert.equal(asModuleRow({ metadata: { suppressed: { rule: 'r', eventType: 'x' } } }).heldFromResidents, true);
-    assert.equal(asModuleRow({ metadata: {} }).heldFromResidents, undefined);
+    assert.equal(asModuleRow({ id: 'm1', metadata: { suppressed: { rule: 'r', eventType: 'x' } } }).heldFromResidents, true);
+    assert.equal(asModuleRow({ id: 'm2', metadata: {} }).heldFromResidents, undefined);
   });
 
   it('a named wake for an event already suppressed at admission wakes nobody', async () => {
