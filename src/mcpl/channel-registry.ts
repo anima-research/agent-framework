@@ -49,6 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
+import { persistentReaderName, tuneOutHeldWords, tuneOutNoReaderAnswer, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
 import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
@@ -276,8 +277,8 @@ function desiredStateRecord(item: unknown): {
 
 /**
  * The desired state `store`'s lifecycle log records for `channelId` on
- * `serverId`, for a reader with no registry yet, as a serving boot's
- * deferred-write flush is, before initializeMcpl: the last decision wins, as
+ * `serverId`, for a reader with no registry yet, as the boot's import of an
+ * earlier release's queued writes is, before initializeMcpl: the last decision wins, as
  * the registry's replay reads it (getDesiredState answers once there is a
  * registry). undefined when no decision names it.
  */
@@ -731,6 +732,34 @@ function channelOnServer(ref: ChannelRef): string {
   return `${quotedValue(ref.channelId)} on server ${quotedValue(ref.serverId)}`;
 }
 
+/** A channel_close's lead where its channel's server no longer registers it. */
+function noLongerRegistered(ref: ChannelRef): string {
+  return `Server ${quotedValue(ref.serverId)} no longer registers channel ${quotedValue(ref.channelId)}, so no close was recorded or sent.`;
+}
+
+/** What a channel_close's bare name reached besides the channel it closed
+ *  (ChannelRegistry.focusNamedBare): each by its id and server, which the
+ *  bare name leaves out, and the channelId and serverId a call closes it
+ *  with: its own id, which needn't be the name the call gave (a focus on
+ *  `b:room` beside server b's `room`), so naming the server alone, the
+ *  name kept, is no channel there. */
+function notClosedText(refs: readonly ChannelRef[]): string {
+  const names = refs.map(channelOnServer);
+  const call = (ref: ChannelRef) => `channelId ${quotedValue(ref.channelId)} and serverId ${quotedValue(ref.serverId)}`;
+  return refs.length === 1
+    ? `Channel ${names[0]} was not closed: to close it, call again with ${call(refs[0]!)}.`
+    : `Channels ${names.slice(0, -1).join(', ')} and ${names.at(-1)} were not closed: to close one, call again with ` +
+      `${refs.slice(0, -1).map(call).join(', with ')}, or with ${call(refs.at(-1)!)}.`;
+}
+
+/** A tool result with a sentence added: a success's after its note (or as
+ *  its note), a failure's after its error. */
+function withSentence(result: ToolResult, sentence: string): ToolResult {
+  if (!result.success) return { ...result, error: result.error ? `${result.error} ${sentence}` : sentence };
+  const data = (result.data ?? {}) as Record<string, unknown>;
+  return { ...result, data: { ...data, note: typeof data.note === 'string' ? `${data.note} ${sentence}` : sentence } };
+}
+
 const CHANNEL_ON_SERVER_AT_END = /("(?:[^"\\]|\\.)*") on server ("(?:[^"\\]|\\.)*")$/;
 
 /**
@@ -1012,16 +1041,31 @@ interface ChannelRegistryOptions {
    * this is ends through the cancel flow (release the backlog, record the
    * end) before the lifecycle state flips to closed. A
    * tuned-out channel's close is refused before this (its cancel ends it).
-   * Returns what it ended, in a sentence the close's answer adds when the
-   * close itself isn't recorded.
+   * `unregistered`: the close names the channel after its server stopped
+   * registering it, so no close is recorded or sent (handleToolClose).
+   * Returns, where a hold excepts the channel, what became of that hold:
+   * a function that says it in a sentence, read when the close's answer is
+   * built, after its transport's round-trip, so the answer says what holds
+   * when it arrives (a release that waited may have run by then). The
+   * answer carries it whatever became of the close: as `note` on a success,
+   * after the error on a failure. Throws, with the answer's text, when the
+   * hold's release fails; one that ended the hold before it failed says so.
    */
-  onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  onToolClose?: ToolCloseHook;
   /**
    * The channel unprefixed speech lands in while an all-except hold is
    * active (its exception), else null. Consulted after a fork's home and
    * the turn's own delivery, before the legacy fallback.
    */
   focusChannelResolver?: () => ChannelRef | null;
+  /**
+   * Who reads a tuned-out channel's traffic (the framework's reader: the
+   * persistent subconscious by its name, or reader forks), for the texts
+   * that tell an agent where a tuned-out channel's messages go. Left out,
+   * the texts name the persistent reader by its default name
+   * (persistentReaderName): there is no hold without a reader (0.33.0).
+   */
+  tuneOutReader?: () => TuneOutReader;
   /**
    * Called when a text-only turn's speech was not delivered to its
    * conversational locus (`failed`), or may not have been (`unknown`), for
@@ -1151,6 +1195,33 @@ interface ChannelRegistryOptions {
 // ChannelRegistry
 // ============================================================================
 
+/** A channel_close call's input (ChannelRegistry.handleToolClose). */
+type ToolCloseInput = {
+  channelId: string;
+  serverId?: string;
+  /** Machine callers name their decision source ('subscription-gc',
+   *  'housekeeping') so the durable record carries honest provenance.
+   *  Honored ONLY for module-origin dispatch — tool input is untrusted,
+   *  so a model-origin call carrying this field is still recorded as
+   *  'agent-tool' (the resident may close their own channel; they may
+   *  not attribute the act to housekeeping). A module-origin call
+   *  without it is the module's own close, MODULE_CLOSE_SOURCE. */
+  source?: string;
+  /** A machine close aimed at an explicitly-opened channel is refused
+   *  unless the caller certifies an explicit idle lease (a configured
+   *  per-channel budget is consent to close at that budget). A tuned-out
+   *  channel is refused even so, since its tune-out's cancel is what
+   *  ends it. Module origin only, like `source`. */
+  overrideExplicitOpen?: boolean;
+};
+
+/** ChannelRegistryOptions.onToolClose: a tool close's end of the all-except hold that excepts its channel. */
+export type ToolCloseHook = (
+  serverId: string,
+  channelId: string,
+  opts?: { unregistered?: true },
+) => (() => string) | undefined;
+
 /**
  * Who is actually making a channel tool call, as established by the
  * framework's own dispatch — model-origin calls come through
@@ -1210,8 +1281,9 @@ export class ChannelRegistry {
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private readonly latestInboundLocus: boolean;
-  private onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  private onToolClose?: ToolCloseHook;
   private focusChannelResolver?: () => ChannelRef | null;
+  private readonly tuneOutReaderFn?: () => TuneOutReader;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
@@ -1506,17 +1578,17 @@ export class ChannelRegistry {
         (reach === 'gone' ? ' If you need the server back, ask whoever runs this host.' : '') +
         (failure === undefined ? ` ${withStop(lifecycleClause(err))}` : '');
     }
-    // A tune-out sends the channel's messages to the subconscious, and
+    // A tune-out holds the channel's messages for its reader, if any, and
     // channel_open refuses a tuned-out channel.
     if (action === 'open' ? now !== 'open' : now !== 'closed') {
       if (action === 'open' && now === 'tuned-out') {
-        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_open doesn't ` +
+        return `Channel ${channel} was tuned out meanwhile: its messages ${this.tuneOutHeld()}, and channel_open doesn't ` +
           `change that. ${this.tuneOutEndText(current)}`;
       }
       // channel_close refuses a tuned-out channel too, so calling it again
       // isn't the way: the tune-out's cancel is, and it delivers the backlog.
       if (action === 'close' && now === 'tuned-out') {
-        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn't ` +
+        return `Channel ${channel} was tuned out meanwhile: its messages ${this.tuneOutHeld()}, and channel_close doesn't ` +
           `change that. ${this.tuneOutEndText(current, 'channel_close')}`;
       }
       // The later decision's own work settles the transport, and its call
@@ -1659,6 +1731,7 @@ export class ChannelRegistry {
     this.latestInboundLocus = options?.latestInboundLocus === true;
     this.onToolClose = options?.onToolClose;
     this.focusChannelResolver = options?.focusChannelResolver;
+    this.tuneOutReaderFn = options?.tuneOutReader;
     this.onRouteFailure = options?.onRouteFailure;
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
@@ -2500,15 +2573,7 @@ export class ChannelRegistry {
         }, origin?.kind === 'agent' ? origin.own : undefined);
 
       case 'channel_close':
-        return this.handleToolClose(
-          input as {
-            channelId: string;
-            serverId?: string;
-            source?: string;
-            overrideExplicitOpen?: boolean;
-          },
-          origin,
-        );
+        return this.handleToolClose(input as ToolCloseInput, origin);
 
       case 'channel_decline':
         return this.handleToolDecline(input as {
@@ -3209,7 +3274,7 @@ export class ChannelRegistry {
 
   /**
    * Make a tuned-out channel's transport match its tune-out, which keeps it
-   * open so its traffic reaches the subconscious (TuneOutParams). The
+   * open so its traffic reaches its reader, or is held (TuneOutParams). The
    * tune-out is recorded first (enterTuneOut), and this writes no decision,
    * so the tune-out stands whatever becomes of the open. Lifecycle work
    * queued for the channel goes first, until none is left, since each
@@ -3221,8 +3286,8 @@ export class ChannelRegistry {
    * tune-out as open), and the answer waits for the work queued after it
    * too, such as a registration that came back, and comes from the state
    * that work leaves. Returns nothing where the transport is open, or, for
-   * tune_out's answer, why the channel's messages don't or may not reach the
-   * subconscious yet and when they will, or that the tune-out isn't in
+   * tune_out's answer, why the channel's messages don't or may not reach its
+   * reader yet, or be received, and when they will, or that the tune-out isn't in
    * effect any more. A call while this tune-out's open is in flight, as a
    * repeated tune_out makes, gets that open's answer rather than send
    * another.
@@ -3295,9 +3360,10 @@ export class ChannelRegistry {
     // that took effect would have its traffic diverted. `again` where calling
     // tune_out again tries the open now: the channel is registered here and
     // its server up.
-    const notYet = (later: string, why: string, again = false): string => withStop(
-      `The tune-out is recorded, but its messages may not reach the subconscious until this host opens the channel, ` +
-      `which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
+    // Where no reader runs, each answer is that alone (tuneOutNoReaderAnswer).
+    const notYet = (later: string, why: string, again = false): string => tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
+      `The tune-out is recorded, but its messages ${this.tuneOutReach('may not reach')} until this host opens the ` +
+      `channel, which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
     );
     const nextRegistration = `when the "${serverId}" server next registers this channel, if this host may open and ` +
       'close its channels then';
@@ -3329,18 +3395,18 @@ export class ChannelRegistry {
       // established.
       const reach = this.serverReach(serverId);
       if (reach !== 'up') {
-        return withStop(
-          `The tune-out is recorded, but its messages don't reach the subconscious until the "${serverId}" server is ` +
-          `connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
+        return tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
+          `The tune-out is recorded, but its messages ${this.tuneOutReach("don't reach")} until the "${serverId}" server ` +
+          `is connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
           (reach === 'gone' ? unreachableRemedy(reach) : ''),
         );
       }
       const transportOpen = this.tuneOutReadsOpen(entry);
       if (!this.directsLifecycle(serverId)) {
         return transportOpen ? undefined
-          : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
-            'subconscious only as that server sends them, and calling tune_out again won\'t change that. If you need ' +
-            'this host to open it, ask whoever runs this host.';
+          : tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages ` +
+            `${this.tuneOutReach('reach')} only as that server sends them, and calling tune_out again won't change ` +
+            'that. If you need this host to open it, ask whoever runs this host.';
       }
       if (!entry) return missing;
       // A flag a close that may have taken effect left gets an open.
@@ -4102,6 +4168,21 @@ export class ChannelRegistry {
     return channelOnServer(ref);
   }
 
+  /** The reader of a tuned-out channel's traffic, as the host says (tuneOutReader), or the default persistent reader. */
+  private tuneOutReaderNow(): TuneOutReader {
+    return this.tuneOutReaderFn?.() ?? { kind: 'persistent', name: persistentReaderName({}) };
+  }
+
+  /** What a tuned-out channel's messages are, after "its messages" (tuneOutHeldWords). */
+  private tuneOutHeld(): string {
+    return tuneOutHeldWords(this.tuneOutReaderNow());
+  }
+
+  /** Whether a tuned-out channel's messages get to its reader, after "its messages" (tuneOutReachWords). */
+  private tuneOutReach(form: Parameters<typeof tuneOutReachWords>[1]): string {
+    return tuneOutReachWords(this.tuneOutReaderNow(), form);
+  }
+
   /**
    * A tool's refusal of a tuned-out channel, whose decision is the tune-out:
    * its cancel is what ends it (tuneOutEndText), and a decision recorded over
@@ -4113,7 +4194,7 @@ export class ChannelRegistry {
       success: false,
       isError: true,
       error:
-        `Channel ${this.quotedShown(refOf(entry))} is tuned out: its messages go to the subconscious, and ${tool} ` +
+        `Channel ${this.quotedShown(refOf(entry))} is tuned out: its messages ${this.tuneOutHeld()}, and ${tool} ` +
         `doesn't change that. ${this.tuneOutEndText(entry, tool)}`,
       data: { refusal: 'tuned-out', channelId: entry.descriptor.id, serverId: entry.serverId },
     };
@@ -4134,7 +4215,7 @@ export class ChannelRegistry {
     return entry ? this.tuneOutEndText(entry) : undefined;
   }
 
-  private tuneOutEndText(entry: ChannelEntry, tool?: string): string {
+  private tuneOutEndText(entry: ChannelEntry, tool?: string, closeWith?: string): string {
     const close = tool === 'channel_close';
     // A name is written as a literal tune_out's channelId takes back
     // (quotedValue, main's #852); one no name picks alone, by its id and
@@ -4144,7 +4225,7 @@ export class ChannelRegistry {
       ? `channelId ${quotedValue(name)}`
       : `channelId ${quotedValue(entry.descriptor.id)}, serverId ${JSON.stringify(entry.serverId)}`;
     return `Call tune_out with ${names} and mode "cancel" for it to resume normal ` +
-      `attention; cancelling delivers the diverted backlog${close ? ', and channel_close closes it after that.' : '.'}`;
+      `attention; cancelling delivers the diverted backlog${close ? `, and channel_close${closeWith ? ` with ${closeWith}` : ''} closes it after that.` : '.'}`;
   }
 
   /**
@@ -5224,36 +5305,38 @@ export class ChannelRegistry {
     }
   }
 
-  private async handleToolClose(
-    input: {
-      channelId: string;
-      serverId?: string;
-      /** Machine callers name their decision source ('subscription-gc',
-       *  'housekeeping') so the durable record carries honest provenance.
-       *  Honored ONLY for module-origin dispatch — tool input is untrusted,
-       *  so a model-origin call carrying this field is still recorded as
-       *  'agent-tool' (the resident may close their own channel; they may
-       *  not attribute the act to housekeeping). A module-origin call
-       *  without it is the module's own close, MODULE_CLOSE_SOURCE. */
-      source?: string;
-      /** A machine close aimed at an explicitly-opened channel is refused
-       *  unless the caller certifies an explicit idle lease (a configured
-       *  per-channel budget is consent to close at that budget). A tuned-out
-       *  channel is refused even so, since its tune-out's cancel is what
-       *  ends it. Module origin only, like `source`. */
-      overrideExplicitOpen?: boolean;
-    },
-    origin?: ChannelToolOrigin,
-  ): Promise<ToolResult> {
-    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, origin?.kind === 'agent' ? origin.own : undefined);
-    const entry = resolved.entry;
-    if (!entry) {
-      return {
-        success: false,
-        error: resolved.error,
-        isError: true,
-      };
+  private async handleToolClose(input: ToolCloseInput, origin?: ChannelToolOrigin): Promise<ToolResult> {
+    const own = origin?.kind === 'agent' ? origin.own : undefined;
+    // An agent's bare name for the channel the all-except hold excepts means
+    // that channel (focusNamedBare), whether its server still registers it
+    // or not: another server's channel with the id, which the name would
+    // reach otherwise, isn't closed, and the answer says so. A module's
+    // close resolves its name as any other: housekeeping doesn't end the
+    // resident's focus.
+    const focused = origin?.kind === 'module' ? undefined : this.focusNamedBare(input.channelId, input.serverId, own);
+    if (focused && 'refusal' in focused) return { success: false, error: focused.refusal, isError: true };
+    if (focused) {
+      const entry = this.entryAt(focused.focus);
+      const result = entry
+        ? await this.closeToolEntry(entry, input, origin)
+        : this.unregisteredFocusClose(focused.focus) ?? { success: false, error: noLongerRegistered(focused.focus), isError: true };
+      return focused.notClosed ? withSentence(result, focused.notClosed) : result;
     }
+    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, own);
+    if (resolved.entry) return this.closeToolEntry(resolved.entry, input, origin);
+    // The name, with its serverId or as the turn's own channel, means the
+    // channel the all-except hold excepts, which its server no longer
+    // registers (unregisteredFocusNamed). A module's close of such a name is
+    // refused as any name no channel answers to.
+    const gone = origin?.kind === 'module' ? undefined : this.unregisteredFocusNamed(input.channelId, input.serverId, own);
+    return (gone && this.unregisteredFocusClose(gone)) || { success: false, error: resolved.error, isError: true };
+  }
+
+  /**
+   * A tool close of the channel `entry`, which its name resolved to
+   * (handleToolClose).
+   */
+  private async closeToolEntry(entry: ChannelEntry, input: ToolCloseInput, origin?: ChannelToolOrigin): Promise<ToolResult> {
     // From here, the channel's own id, whichever name the call gave for it
     // (a server-qualified one included).
     input = { ...input, channelId: entry.descriptor.id };
@@ -5287,19 +5370,21 @@ export class ChannelRegistry {
       // Closed already, perhaps only by default: the agent's close is still
       // its decision, and is recorded as one (setDesiredState), so a later
       // registration's lift of a default leaves the channel closed.
-      const ended = this.onToolClose?.(entry.serverId, input.channelId);
+      const hook = this.toolCloseHook(refOf(entry));
+      if ('error' in hook) return { success: false, error: hook.error, isError: true };
+      const ended = hook.text;
       try {
         this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
       } catch (err) {
         return {
           success: false,
-          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended}` : ''}`,
+          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended()}` : ''}`,
           isError: true,
         };
       }
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed' },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed', ...(ended ? { note: ended() } : {}) },
       };
     }
 
@@ -5339,15 +5424,22 @@ export class ChannelRegistry {
     // A hold around this channel — the all-except scope it is the excepted
     // channel of — ends through the cancel flow: backlog released, end
     // recorded, never by overwriting state (#232 gap 9).
-    const ended = this.onToolClose?.(entry.serverId, input.channelId);
+    const hook = this.toolCloseHook(refOf(entry));
+    if ('error' in hook) return { success: false, error: hook.error, isError: true };
+    const ended = hook.text;
 
     // A decision the log refused changed nothing for the channel, and the
-    // answer says so, and what the hook ended all the same.
+    // answer says so, and what the hook ended all the same. Every answer
+    // carries the hook's sentence, a success's as `note`: whether the close
+    // went through says nothing of the focus, whose end may wait (an
+    // operator's change to the store in progress). The sentence is read as
+    // the answer is built, after the transport's round-trip, during which a
+    // release that waited may have run.
+    const withEnded = (text: string): string => (ended ? `${text} ${ended()}` : text);
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     } catch (err) {
-      const text = this.lifecycleFailureText('close', entry, unrecordedDecision(err));
-      return { success: false, error: ended ? `${text} ${ended}` : text, isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, unrecordedDecision(err))), isError: true };
     }
     // This channel's typing, not every channel with its id (stopTyping's
     // fan-out of a bare name).
@@ -5356,7 +5448,7 @@ export class ChannelRegistry {
     // Refused now, the close stays recorded for the server's next
     // registration, and the text says so.
     if (!this.directsLifecycle(entry.serverId)) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, this.lifecycleRefusal(entry.serverId)), isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, this.lifecycleRefusal(entry.serverId))), isError: true };
     }
 
     try {
@@ -5365,11 +5457,163 @@ export class ChannelRegistry {
       if (applied.open || now !== 'closed') throw new ChannelLifecycleError(supersededClause('close', now), 'superseded');
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed' },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed', ...(ended ? { note: ended() } : {}) },
       };
     } catch (err) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, err), isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, err)), isError: true };
     }
+  }
+
+  /**
+   * The tool-close hook (onToolClose) for a channel, its throw taken as the
+   * answer's text: a release of the hold that failed is the close's answer,
+   * as the registry's other failures are, never a rejected call.
+   */
+  private toolCloseHook(ref: ChannelRef, opts?: { unregistered?: true }): { text?: () => string } | { error: string } {
+    try {
+      return { text: this.onToolClose?.(ref.serverId, ref.channelId, opts) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * A close naming the channel the all-except hold excepts, which its server
+   * no longer registers: the close has nothing left to close, and the hold
+   * nothing left to speak into, so it ends as a close of the registered
+   * channel ends it, what it held released, and the answer says so, as a
+   * failure, since no close ran. Undefined where no hold excepts the channel
+   * (onToolClose answers nothing).
+   */
+  private unregisteredFocusClose(gone: ChannelRef): ToolResult | undefined {
+    const lead = noLongerRegistered(gone);
+    const ended = this.toolCloseHook(gone, { unregistered: true });
+    if ('error' in ended) return { success: false, error: `${lead} ${ended.error}`, isError: true };
+    if (ended.text) return { success: false, error: `${lead} ${ended.text()}`, isError: true };
+    return undefined;
+  }
+
+  /**
+   * The channel the all-except hold excepts (focusChannelResolver), where a
+   * channel_close names it by its id or its server-qualified name alone: no
+   * serverId, and no channel of the calling turn's own answering to the name
+   * (ownChannelNamed, which a turn's name means first). Such a name means
+   * the hold's channel, registered or not, and not another server's channel
+   * with the id, as when the hold's channel's server stopped registering it
+   * and another server registered the id: that one is closed only by a close
+   * that names its server. With it, where other registered channels answer
+   * to the name, the sentence saying they weren't closed (`notClosed`).
+   *
+   * Where the name is the hold channel's and a channel of the calling turn's
+   * own, another channel, answers to it too, the name means neither: a
+   * resident repeating a close that failed before its focus ended, in a turn
+   * that has since opened another server's channel with the id, would
+   * otherwise close that channel and leave the focus in force. That close is
+   * refused, naming both (`refusal`, focusOrOwnRefusal), and a close naming
+   * either's server reaches it. A turn's name for the hold's channel itself,
+   * and a name the turn's channels on more than one server answer to
+   * (ownNeitherRefusal), resolve as any other.
+   *
+   * Undefined where no hold is in force, where the name isn't the hold
+   * channel's, and where the hold's record can't be read, which leaves the
+   * name to resolve as any other (resolveToolChannelEntry).
+   *
+   * Another channel the name reaches that has a tune-out of its own is
+   * refused by a close until that tune-out is cancelled (tunedOutRefusal),
+   * so its sentence says it is tuned out, and names the cancel first, then
+   * the close by its id and server.
+   */
+  private focusNamedBare(
+    name: string,
+    serverId: string | undefined,
+    own: readonly ChannelRef[] | undefined,
+  ): { focus: ChannelRef; notClosed?: string } | { refusal: string } | undefined {
+    if (serverId) return undefined;
+    const mine = this.ownChannelNamed(name, own);
+    if (mine && 'neither' in mine) return undefined;
+    let focus: ChannelRef | null | undefined;
+    try {
+      focus = this.focusChannelResolver?.();
+    } catch {
+      return undefined;
+    }
+    if (!focus || (name !== focus.channelId && name !== qualifiedChannelName(focus))) return undefined;
+    if (mine) return sameChannel(mine.channel, focus) ? undefined : { refusal: this.focusOrOwnRefusal(name, focus, mine.channel, own) };
+    const held = focus;
+    const others = this.entriesNamed(name).filter((entry) => !sameChannel(refOf(entry), held));
+    const tunedOut = others.filter((entry) => this.getDesiredState(entry.serverId, entry.descriptor.id) === 'tuned-out');
+    const closable = others.filter((entry) => !tunedOut.includes(entry)).map(refOf);
+    const sentences = [
+      ...(closable.length > 0 ? [notClosedText(closable)] : []),
+      ...tunedOut.map((entry) => {
+        const ref = refOf(entry);
+        return `Channel ${channelOnServer(ref)} was not closed: it is tuned out, and a close doesn't change that. ` +
+          this.tuneOutEndText(entry, 'channel_close', `channelId ${quotedValue(ref.channelId)} and serverId ${quotedValue(ref.serverId)}`);
+      }),
+    ];
+    return { focus: held, ...(sentences.length > 0 ? { notClosed: sentences.join(' ') } : {}) };
+  }
+
+  /**
+   * The refusal of a channel_close's bare name (focusNamedBare) that both the
+   * channel the all-except hold excepts (`focus`) and another channel of the
+   * calling turn's own (`mine`, ownChannelNamed) answer to, each named by
+   * what reaches it alone. The hold's channel is reached by its
+   * server-qualified name, registered or not (focusNamedBare), unless a
+   * channel of the turn's answers to that too; the turn's channel as a
+   * refusal of the turn's names shows it (ownCandidates), unless another
+   * channel of the turn's has its qualified name for its id. A serverId goes
+   * with the channel's own id, so it's offered only where the name is the id
+   * of both, for the hold's server (registered or not, the close reaches its
+   * channel: unregisteredFocusNamed) and for the turn's channel's where that
+   * server still registers it. Where the name is the hold channel's
+   * server-qualified name, which another of the turn's channels has for its
+   * id, the hold's channel is reached by its id and server.
+   */
+  private focusOrOwnRefusal(name: string, focus: ChannelRef, mine: ChannelRef, own: readonly ChannelRef[] | undefined): string {
+    const qualified = qualifiedChannelName(focus);
+    const focusReaches = this.ownChannelNamed(qualified, own) === undefined;
+    const [theirs] = this.ownCandidates([mine]);
+    // The turn's channel's name, as the focus's: a bare id answers to the
+    // turn's own channels first, so one of them with that id catches it.
+    const theirsReaches = theirs!.reaches && this.ownChannelNamed(theirs!.text, own) === undefined;
+    const parts = [
+      { text: focusReaches ? quotedValue(qualified) : channelOnServer(focus), reaches: focusReaches },
+      { text: theirsReaches ? quotedValue(theirs!.text) : theirs!.reaches ? channelOnServer(mine) : theirs!.text, reaches: theirsReaches },
+    ];
+    const named = parts.filter((p) => p.reaches).map((p) => p.text);
+    const byName = named.length === 2 ? 'channelId set to one of them' : named.length === 1 ? `channelId ${named[0]}` : '';
+    const servers = name === focus.channelId ? [focus.serverId, ...(this.entryAt(mine) ? [mine.serverId] : [])] : [];
+    const byServer = servers.length > 0 ? `serverId set to ${servers.map((id) => JSON.stringify(id)).join(' or ')}` : '';
+    const how = [byName, byServer].filter((h) => h !== '').join(', or with ');
+    const focusRoute = name !== focus.channelId && !focusReaches
+      ? ` For the channel the focus excepts, call again with channelId ${quotedValue(focus.channelId)} and serverId ${JSON.stringify(focus.serverId)}.`
+      : '';
+    return `Channel ${JSON.stringify(name)} names both the channel the all-except focus excepts (${parts[0]!.text}) ` +
+      `and this turn's channel (${parts[1]!.text}), so nothing ran.${how ? ` Call again with ${how}.` : ''}${focusRoute}`;
+  }
+
+  /**
+   * The channel the all-except hold excepts (focusChannelResolver), where a
+   * channel tool's name with a serverId, or the calling turn's own channel's
+   * name, means it though its server no longer registers it: with a
+   * serverId, that server's channel with the id; inside the calling turn,
+   * the turn's own channel the name answers to by its id (ownChannelNamed).
+   * A name given alone is focusNamedBare's. Undefined where no hold is in
+   * force, where its channel is still registered, and where the hold's
+   * record can't be read, which leaves the name's refusal as it was.
+   */
+  private unregisteredFocusNamed(name: string, serverId: string | undefined, own: readonly ChannelRef[] | undefined): ChannelRef | undefined {
+    let focus: ChannelRef | null | undefined;
+    try {
+      focus = this.focusChannelResolver?.();
+    } catch {
+      return undefined;
+    }
+    if (!focus || this.entryAt(focus)) return undefined;
+    if (serverId) return sameChannel(focus, { serverId, channelId: name }) ? focus : undefined;
+    const mine = this.ownChannelNamed(name, own);
+    return mine && 'channel' in mine && sameChannel(mine.channel, focus) ? focus : undefined;
   }
 
   private async handleToolDecline(input: {
@@ -5567,8 +5811,8 @@ export class ChannelRegistry {
               `diverted, and then call channel_close.${serverBack}`
             : `. If you still want it closed, call channel_close.${serverBack}`;
       closeError = decided === 'tuned-out'
-        ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ` +
-          `the subconscious${step}`
+        ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages ` +
+          `${this.tuneOutHeld()}${step}`
         : `The decline is recorded, but a later decision to open the channel replaced it, and that decision stands${step}`;
     } else if (closed) {
       // Closed for certain, whatever became of the decline's own close: one
