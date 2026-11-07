@@ -145,8 +145,9 @@ interface WindowStartsState {
  * waits for, and what a stop meanwhile does. `noteDropped`: the caller's
  * note isn't delivered, as the cancel already waiting carries one.
  * `noteKept`: the caller's note waits with the cancel, and the answer says
- * what becomes of it: delivered when the hold ends, else told lost to its
- * author (tellNoteLost), a notice that can't be written being traced and
+ * where it goes and what the caller is told of it. It is delivered when a
+ * cancel ends the hold, or tries to, else told lost to its author
+ * (tellNoteLost), a notice that can't be written being traced and
  * tried again (writeLossNotices) until it is written, and, for the
  * persistent subconscious (`persistent`), kept in the store too
  * (writeLossRecord), so the next boot writes one a stop left unwritten
@@ -171,8 +172,8 @@ interface WindowStartsState {
  * as of any other, by a notice kept in the store for the next boot (stop),
  * or, where the store refuses that or the host crashes, by the next boot's
  * notice that any cancel then waiting was lost (noteUnstampedStop).
- * The cancel can't wait for the delivery, which comes only when the hold
- * ends.
+ * The cancel can't wait for the delivery, which comes only when a cancel
+ * ends the hold, or tries to.
  * A reader fork's (`fork`) goes out as its mail even after its run has
  * ended (deliverReaderNote), but a notice of its loss reaches it only while
  * it runs: an ended fork is no agent the framework writes to, and the loss
@@ -181,36 +182,27 @@ interface WindowStartsState {
  */
 export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'persistent' | 'fork', unmarked = false): string {
   const hold = what.charAt(0).toLowerCase() + what.slice(1);
-  const retry = 'tried again every 60 s, except while such a change or refusal lasts, and as soon as one ends, until it is ';
   return 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
-    + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-    + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. '
-    + `${what} stays in force until then, and what it held is delivered when it ends, up to its backlog cap. If the host stops before then, `
-    + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then, or the host '
-    + 'starts again with no reader, which ends every hold on record.'
+    + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
+    + 'fails; cancelling again won\'t make it sooner while that lasts. '
+    + `${what} stays in force; when it ends, what it still holds is delivered, up to its backlog cap and what `
+    + 'fits in one message. '
+    + 'If the host stops first, the cancel is lost, and the restart doesn\'t run it.'
     + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '')
     + (noteKept === 'persistent' && !noteDropped
-      ? ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be delivered then, you are `
-        + 'told so in your context, and why. If writing that notice fails too, the failure is traced for the host, and '
-        + `the notice is ${retry}written. The notice is kept in the store as well, unless the store refuses that too: `
-        + 'if the host stops before the notice is written, the host writes it when it starts again, or keeps trying as '
-        + 'above. The waiting cancel isn\'t kept in the store: if the host stops before '
-        + `${hold} ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note `
-        + 'by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or '
-        + `the host crashes, you are told when it starts again that any cancel of ${hold} then waiting was lost, with any `
-        + 'note left with it that had not been delivered.'
+      ? ` Unless the host stops first, your note goes to the resident when a cancel ends ${hold}, or tries to. `
+        + 'If it can\'t be delivered, or the host stops first, you are told what is known of it once the host can write '
+        + 'to you, or when it starts again with you as its reader.'
         + (unmarked
-          ? ' This run\'s start couldn\'t be recorded in the store yet: if the host stops or dies before the cancel runs '
-            + 'while the store still refuses it, you may not be told so when it starts again.'
+          ? ' This run\'s start isn\'t recorded in the store yet: if the host stops or dies before the cancel runs '
+            + 'while the store still refuses it, you may not be told.'
           : '')
       : '')
     + (noteKept === 'fork' && !noteDropped
-      ? ` Your note waits with the cancel and goes to the resident as your mail when ${hold} ends, even if your run `
-        + 'has ended by then. If it can\'t be delivered then, you are told so in your context, and why, but only while '
-        + 'your run lasts: once it has ended, nothing can be written to you, so the loss reaches no one and is only '
-        + 'traced for the host. If writing that notice fails while you still run, the failure is traced for the host, '
-        + `and the notice is ${retry}written, your run ends, or the host stops. If the host stops before ${hold} ends, `
-        + 'your note is lost with the cancel, unless it was delivered already, and you are not told.'
+      ? ` Your note goes to the resident as your mail when a cancel ends ${hold}, or tries to, even if your run has `
+        + 'ended by then. If it can\'t be delivered, you are told so while your run lasts; after that, no one is. If the '
+        + 'host stops before '
+        + `${hold} ends, your note is lost with the cancel, unless it went out already, and you are not told.`
       : '');
 }
 
@@ -303,6 +295,31 @@ function releaseRecordsOf(rows: readonly HeldRow[], epochId: string): ReleaseRec
     }
   }
   return records;
+}
+
+/**
+ * Whether the resident's last word on this hold is the boot's row that it
+ * still stands (`tune-out-end-unrecorded`, tellResidentUnended): one of
+ * that epoch after its latest release. A cancel that then delivers nothing
+ * more writes a release all the same, saying the end is recorded now
+ * (AF #844, Oscar).
+ */
+function toldStillStands(rows: readonly Pick<StoredMessage, 'metadata'>[], epochId: string): boolean {
+  // In store order.
+  let release = -1;
+  let told = -1;
+  rows.forEach((m, at) => {
+    const meta = m.metadata as { kind?: unknown; epochId?: unknown } | undefined;
+    if (meta?.epochId !== epochId) return;
+    if (meta.kind === 'tune-out-cancel') release = at;
+    else if (meta.kind === 'tune-out-end-unrecorded') told = at;
+  });
+  return told > release;
+}
+
+/** What that release adds (toldStillStands), agreeing with the boot's row: the earlier release, nothing held since, the end recorded now. */
+function endedNow(it: 'tune-out' | 'hold'): string {
+  return `Its earlier release reached you before its end was recorded, and nothing has been held since; this release records the end, so the ${it} has ended.`;
 }
 
 function truncationNote(records: readonly ReleaseRecord[]): string {
@@ -1412,16 +1429,19 @@ export class TuneOutCoordinator {
         if (release === -Infinity || told > release) continue;
         const shown = this.shown(serverId, channelId);
         const expires = params.expiresAtMs !== undefined ? new Date(params.expiresAtMs) : undefined;
-        const until = expires && Number.isFinite(expires.getTime())
-          ? `, or at its end time, ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
-          : '';
+        const endTime = expires && Number.isFinite(expires.getTime()) ? expires.toISOString().replace(/\.\d+Z$/, 'Z') : undefined;
+        // A channel's tune-out also ends by itself at the first wake past its
+        // wake budget (cancelPastBudget, from fireWake and the start); the
+        // all-except hold's budget pauses its reader, and ends nothing.
+        const budget = !scope && typeof params.maxWakes === 'number' && Number.isFinite(params.maxWakes)
+          ? `, or by itself at the first wake past its wake budget (maxWakes ${params.maxWakes})` : '';
         const text = scope
           ? `[${NOTICE_TAG.tuneOut}: the all-except hold (all channels except ${shown}) is still in force. Its release above reached you, but its `
             + 'end wasn\'t recorded before the host stopped, so the hold is still in force: what arrives in those channels is held, and comes '
-            + `with its next release. It ends when it is cancelled (tune_out mode "cancel" with scope "all-except")${until}.]`
+            + `with its next release. It ends when it is cancelled (tune_out mode "cancel" with scope "all-except")${endTime ? `, or at its end time, ${endTime}` : ''}.]`
           : `[${NOTICE_TAG.tuneOut}: ${shown} is still tuned out. Its release above reached you, but its end wasn't recorded before the `
             + 'host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release. It ends when it '
-            + `is cancelled (tune_out mode "cancel")${until}.]`;
+            + `is cancelled (tune_out mode "cancel")${endTime ? `${budget ? ',' : ', or'} at its end time, ${endTime}` : ''}${budget}.]`;
         this.hooks.addMessage('user', [{ type: 'text', text }], {
           system: true, kind: 'tune-out-end-unrecorded', channelId, serverId, epochId, ...(scope ? { scope } : {}),
         });
@@ -1829,6 +1849,25 @@ export class TuneOutCoordinator {
    */
   private writeKept(id: string | void): boolean {
     return id === '' && this.writesHeldNow();
+  }
+
+  /**
+   * Whether the resident's last word on a hold (`what`, as the log names
+   * it) is the boot's row that it still stands (toldStillStands), read from
+   * the residents' stored rows for the cancel that ends it with nothing
+   * more to deliver. A read that throws, or rows that can't be read, count
+   * as yes, said once: one redundant release line is the cheaper error
+   * against a "still stands" left as the last word on a tune-out that has
+   * ended (AF #844, Oscar). Never throws.
+   */
+  private residentToldStillStands(epochId: string, what: string): boolean {
+    try {
+      return toldStillStands(this.hooks.getStoredMessages(), epochId);
+    } catch (err) {
+      console.error(`[tune-out] the resident's rows can't be read to tell whether its last word on ${what} is that it still stands, `
+        + `so the cancel that ends it writes it a short release all the same: ${thrownReason(err)}`);
+      return true;
+    }
   }
 
   /** Whether the framework keeps writes in memory now (writesHeld), with `forAgent`'s among them; a hook that throws counts as not. */
@@ -3509,8 +3548,11 @@ export class TuneOutCoordinator {
             + "ended, and the store didn't hold it when this was written: it may be lost."
           : '';
         if (drop.found === 'delivered') {
-          // The note's row is stored, no release since, the end of its cancel's hold not.
-          text = `${unrecorded}The note you left with your cancel of it was delivered to ${to} before the stop. ${notRecorded("The cancel's end")}]`;
+          // The note's row is stored, no release since, the end of its cancel's
+          // hold not. The rows prove it is stored at this start, not that it
+          // was before the stop: a note kept in memory then can land after
+          // it, at a release in the same process (Oscar, #844).
+          text = `${unrecorded}The note you left with your cancel of it was delivered to ${to} before this start. ${notRecorded("The cancel's end")}]`;
         } else if (drop.found === 'ran' && drop.own) {
           // Its own cancel stored the release since it asked, the end not.
           const who = drop.asked ? 'The cancel of it you asked for' : 'Your cancel of it';
@@ -4067,6 +4109,13 @@ export class TuneOutCoordinator {
       // release that tells a queued note's loss, as a boot reads it
       // (noteUnstampedStop).
       releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
+    } else if (this.residentToldStillStands(epochId, name)) {
+      // The boot told the resident this tune-out still stands, after its
+      // last release (tellResidentUnended): this cancel delivers nothing
+      // more, and says it has ended, so that row isn't the resident's last
+      // word on it. It covers none (no `released`).
+      releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: `${lifecycle}\n\n${endedNow('tune-out')}` }],
+        { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) } }));
     }
     // Told, in the release written: not delivered or told again, even if
     // the release isn't made durable below and the queued cancel runs later,
@@ -4608,6 +4657,10 @@ export class TuneOutCoordinator {
     } else if (lost) {
       releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: header }],
         { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) }, lostNote: true }));
+    } else if (this.residentToldStillStands(epochId, 'the all-except hold')) {
+      // As a channel's: the boot told the resident the hold still stands.
+      releaseKept = this.writeKept(this.hooks.addMessage('user', [{ type: 'text', text: `${header}\n\n${endedNow('hold')}` }],
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(askers.length > 0 ? { by: askers[0], askers } : {}) } }));
     }
     if (first?.lost) {
       first.entry.noteSettled = true;

@@ -2,10 +2,8 @@
   hold's cancel waits for held writes (an operator's change to the store,
   or a context that refuses writes), answers as the tune-out tools
   answer a cancel that waits. The answer describes the wait while the
-  writes are held: what the cancel waits for, that how long it lasts isn't
-  known, that cancelling again doesn't end it sooner, and that a stop
-  during it loses the cancel, so the hold is still in force after the
-  restart unless its end time has passed.
+  writes are held: what the cancel waits for, that cancelling again doesn't end it sooner,
+  and that a stop during it loses the cancel, which the restart doesn't run.
   - After the writes are stored again, the cancel's release can still fail
     (its backlog isn't made durable, or a store operation throws). The
     cancel then stays queued, the hold in force, and is tried again at the
@@ -22,4 +20,4 @@
     context, with the reason. A reader fork's is dropped at a stop.
   - A stop before the retry succeeds loses the queued cancel, and the hold
     is still in force after the restart unless its end time has passed, or
-    the host starts again with no reader, which ends every hold on record.
+    the host starts again with no reader, which cancels every hold on record.

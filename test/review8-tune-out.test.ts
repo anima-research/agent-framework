@@ -948,33 +948,26 @@ test("65 follow-up (Isaac-3593, round 3): a kept notice of a cancel dropped for 
   }
 });
 
-test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, that a loss is told, that a notice that can't be written is kept in the store for the next boot, and that a stop loses the waiting cancel and the note, unless it was delivered already (review 5 #26), but tells the loss", async () => {
+test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, and that a loss, or a stop before the hold ends, is told now or after the restart", async () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup();
   try {
     h.enter();
     h.state.held = true;
     const waits = 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
-      + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-      + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. ';
-    const stop = 'If the host stops before then, the cancel is lost and it is still in force after the restart, unless its '
-      + 'end time has passed by then, or the host starts again with no reader, which ends every hold on record.';
-    const kept = (hold: string) => ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be `
-      + 'delivered then, you are told so in your context, and why. If writing that notice fails too, the failure is '
-      + 'traced for the host, and the notice is tried again every 60 s, except while such a change or refusal lasts, and '
-      + 'as soon as one ends, until it is written. The notice is kept in the store as well, unless the store refuses '
-      + 'that too: if the host stops before the notice is written, the host writes it when it starts again, or keeps '
-      + 'trying as above. The waiting cancel isn\'t kept in the store: if the host stops before '
-      + `${hold} ends, the cancel is lost, and your note with it unless it was delivered already; you are told of a lost note `
-      + 'by such a notice, kept in the store for the host to write when it starts again; if the store refuses that too, or '
-      + `the host crashes, you are told when it starts again that any cancel of ${hold} then waiting was lost, with any `
-      + 'note left with it that had not been delivered.';
+      + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
+      + 'fails; cancelling again won\'t make it sooner while that lasts. ';
+    const holds = 'stays in force; when it ends, what it still holds is delivered, up to its backlog cap and what fits in one message. ';
+    const stop = 'If the host stops first, the cancel is lost, and the restart doesn\'t run it.';
+    const kept = (hold: string) => ` Unless the host stops first, your note goes to the resident when a cancel ends ${hold}, or tries to. `
+      + 'If it can\'t be delivered, or the host stops first, you are told what is known of it once the host can write '
+      + 'to you, or when it starts again with you as its reader.';
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc', text: 'Look here.' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}${kept('the tune-out')}` } });
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out ${holds}${stop}${kept('the tune-out')}` } });
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}` } },
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out ${holds}${stop}` } },
       'control: with no note of its own, nothing is said of one');
     h.state.held = false;
     h.coordinator.runDeferredCancels();
@@ -982,7 +975,7 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
     h.state.held = true;
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'all-except', scope: 'all-except', text: 'Look at #b.' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, scope: 'all-except', note: `${waits}The all-except hold stays in force until then, and what it held is delivered when it ends, up to its backlog cap. ${stop}${kept('the all-except hold')}` } });
+      { success: true, data: { waiting: true, scope: 'all-except', note: `${waits}The all-except hold ${holds}${stop}${kept('the all-except hold')}` } });
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -1270,18 +1263,13 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
       { channelId: 'disc:guild:a', serverId: 'disc', text: 'Someone asked for you.' }, [], 'reader-1', { epochId: a });
     assert.deepEqual(answer, { success: true, data: { waiting: true, serverId: 'disc', note:
       'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
-      + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
-      + 'doesn\'t end the wait sooner while that lasts, and how long it lasts isn\'t known here. The tune-out stays in force until '
-      + 'then, and what it held is delivered when it ends, up to its backlog cap. If the host stops before then, the cancel is lost and it is '
-      + 'still in force after the restart, unless its end time has passed by then, or the host starts again with no reader, '
-      + 'which ends every hold on record. Your note waits with the cancel and '
-      + 'goes to the resident as your mail when the tune-out ends, even if your run has ended by then. If it can\'t be '
-      + 'delivered then, you are told so in your context, and why, but only while your run lasts: once it has ended, '
-      + 'nothing can be written to you, so the loss reaches no one and is only traced for the host. If writing that '
-      + 'notice fails while you still run, the failure is traced for the host, and the notice is tried again every '
-      + '60 s, except while such a change or refusal lasts, and as soon as one ends, until it is written, your run '
-      + 'ends, or the host stops. If the host stops before the tune-out ends, your note is lost with the cancel, unless '
-      + 'it was delivered already, and you are not told.' } });
+      + 'refuses writes until the host re-initializes it. The host runs the cancel when that ends and retries it if it '
+      + 'fails; cancelling again won\'t make it sooner while that lasts. The tune-out stays in force; when it ends, what it '
+      + 'still holds is delivered, up to its backlog cap and what fits in one message. If the host stops first, the cancel is lost, '
+      + 'and the restart doesn\'t run it. Your note goes to the resident as your mail when a cancel ends the tune-out, '
+      + 'or tries to, even if your run has ended by then. If it can\'t be delivered, you are told so while your run '
+      + 'lasts; after that, no one is. If the host stops before the tune-out ends, your note is lost with the cancel, '
+      + 'unless it went out already, and you are not told.' } });
   } finally {
     h.coordinator.stop();
     errors.mock.restore();
@@ -2880,7 +2868,7 @@ test("Oscar on #844: the boot tells the resident, once, of a hold in force whose
       assert.deepEqual([told.metadata?.epochId, told.metadata?.scope], [epochId, scope ? 'all-except' : undefined]);
       assert.match(textOf(told.content), scope
         ? /^\[Tune-out: the all-except hold \(all channels except disc:guild:x\) is still in force\. Its release above reached you, but its end wasn't recorded before the host stopped, so the hold is still in force: what arrives in those channels is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel" with scope "all-except"\), or at its end time, \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\.\]$/
-        : /^\[Tune-out: disc:guild:a is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\)(, or at its end time, [^\]]+)?\.\]$/,
+        : /^\[Tune-out: disc:guild:a is still tuned out\. Its release above reached you, but its end wasn't recorded before the host stopped, so the tune-out is still in force: what arrives there is held, and comes with its next release\. It ends when it is cancelled \(tune_out mode "cancel"\)(, at its end time, [^,\]]+)?, or by itself at the first wake past its wake budget \(maxWakes \d+\)\.\]$/,
       `${where}: saying the release reached it, the end not recorded, the tune-out still in force`);
       boot();
       assert.equal(unended(h).length, 1, `${where}: a later boot tells it no second time`);
@@ -2903,6 +2891,172 @@ test("Oscar on #844: the boot tells the resident, once, of a hold in force whose
       h.coordinator.stop();
       errors.mock.restore();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AF #844 (Oscar, at a1195f24): a cancel that ends a hold the boot told the
+// resident still stands writes one short release row, no backlog again;
+// and Weft's two pins on the boot's telling, seconded by Oscar.
+// ---------------------------------------------------------------------------
+
+/** A hold whose release was stored, its end refused, then a boot that tells the resident it still stands. */
+function toldStillStands(h: ReturnType<typeof epochSetup>, scope: boolean): { epochId: string; next: TuneOutCoordinator } {
+  const epochId = scope ? h.enterScope() : h.enter();
+  const restore = endRefused(h, scope);
+  assert.throws(() => (scope ? h.coordinator.cancelAllExcept('agent-tool', 'agent request') : h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request')),
+    /refused the end/, 'premise: the release is stored, the end refused');
+  restore();
+  h.coordinator.stop();
+  const next = h.reboot();
+  next.resumeActiveEpochs();
+  assert.equal(unended(h).length, 1, 'premise: the boot told the resident the hold still stands');
+  return { epochId, next };
+}
+
+test("Oscar on #844: a cancel that ends a hold the boot told the resident still stands, nothing held since, writes one short release row, no backlog again", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    let next: TuneOutCoordinator | undefined;
+    try {
+      ({ next } = toldStillStands(h, scope));
+      const before = h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel').length;
+      const answer = scope ? next.cancelAllExcept('subconscious', 'by Subconscious') : next.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious');
+      assert.equal(answer.ok, true);
+      const where = scope ? 'all-except' : 'channel';
+      assert.equal(scope ? next.getAllExcept() : h.inForce(), null, `${where}: the hold ended`);
+      const rows = h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel').slice(before);
+      assert.equal(rows.length, 1, `${where}: one release row`);
+      assert.equal(rows[0]!.metadata?.released, undefined, `${where}: covering nothing again`);
+      assert.equal(textOf(rows[0]!.content), scope
+        ? '[Tune-out: all channels except disc:guild:x released — by Subconscious, 0 wakes]\n\nIts earlier release reached you before its end was recorded, '
+          + 'and nothing has been held since; this release records the end, so the hold has ended.'
+        : '[Tune-out: disc:guild:a cancelled — by Subconscious, 0 wakes]\n\nIts earlier release reached you before its end was recorded, '
+          + 'and nothing has been held since; this release records the end, so the tune-out has ended.',
+      `${where}: saying the earlier release reached it, and the end is recorded now`);
+    } finally {
+      next?.stop();
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("Oscar on #844: where the cancel can't read the resident's rows to tell whether the boot's \"still stands\" row is its last word, it writes the short release all the same, and says so once", () => {
+  for (const scope of [false, true]) {
+    const errors = mock.method(console, 'error', () => {});
+    const h = epochSetup({ stored: true });
+    let next: TuneOutCoordinator | undefined;
+    try {
+      ({ next } = toldStillStands(h, scope));
+      // The cancel's own read of the backlog lands; the read that tells whether the boot's row is the last word throws.
+      const hooks = (next as unknown as { hooks: { getStoredMessages: () => unknown } }).hooks;
+      const read = hooks.getStoredMessages;
+      let calls = 0;
+      hooks.getStoredMessages = () => {
+        if (++calls === 2) throw new Error("the resident's rows can't be read (test)");
+        return read();
+      };
+      const before = h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel').length;
+      errors.mock.resetCalls();
+      const answer = scope ? next.cancelAllExcept('subconscious', 'by Subconscious') : next.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious');
+      hooks.getStoredMessages = read;
+      const where = scope ? 'all-except' : 'channel';
+      assert.equal(answer.ok, true, `${where}: the cancel ends the hold`);
+      const rows = h.added.filter((m) => m.metadata?.kind === 'tune-out-cancel').slice(before);
+      assert.equal(rows.length, 1, `${where}: the short release is written, one redundant line being the cheaper error against a false "still stands"`);
+      assert.match(textOf(rows[0]!.content), /this release records the end/, `${where}: as the short release`);
+      const said = errors.mock.calls.map((c) => String(c.arguments[0])).filter((l) => l.includes("rows can't be read to tell whether"));
+      assert.equal(said.length, 1, `${where}: said once: ${JSON.stringify(errors.mock.calls.map((c) => String(c.arguments[0])))}`);
+    } finally {
+      next?.stop();
+      h.coordinator.stop();
+      errors.mock.restore();
+    }
+  }
+});
+
+test("Oscar on #844, control: a cancel whose earlier release the resident wasn't told still stands (a run's retry) writes no second row; one with no earlier release writes its release as before", () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  try {
+    const epochId = h.enter();
+    const restore = endRefused(h);
+    assert.throws(() => h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), /refused the end/);
+    restore();
+    assert.equal(h.releasesOf(epochId), 1, 'premise: the first release');
+    assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), { ok: true }, 'a later cancel ends the hold');
+    assert.equal(h.releasesOf(epochId), 1, 'and writes no second row: the resident was told nothing in between');
+    const e2 = h.enter();
+    assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), { ok: true });
+    assert.equal(h.releasesOf(e2), 1, 'a cancel with no earlier release writes its release');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
+test("Weft's pin on #844 (seconded by Oscar): the boot doesn't tell the resident a hold still stands where its channel holds another epoch now", () => {
+  mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  const boots: TuneOutCoordinator[] = [];
+  try {
+    const r = h.coordinator.enter('disc', 'disc:guild:a', { durationSeconds: 60 }, 'agent-tool');
+    assert.ok(r.ok);
+    const e1 = r.params.epochId;
+    const restore = endRefused(h);
+    assert.throws(() => h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), /refused the end/, 'premise: e1 released, its end refused');
+    restore();
+    h.coordinator.stop();
+    mock.timers.tick(120_000);
+    // The boot's own cancel ends e1, its end time passed; a listener of that end tunes the channel out again.
+    let e2: string | undefined;
+    const next = h.reboot();
+    boots.push(next);
+    h.listen((event) => {
+      if (event.type === 'tune-out:cancelled' && event.epochId === e1 && !e2) {
+        const again = next.enter('disc', 'disc:guild:a', {}, 'agent-tool');
+        if (again.ok) e2 = again.params.epochId;
+      }
+    });
+    next.resumeActiveEpochs();
+    h.listen(() => {});
+    assert.ok(e2 && h.inForce() === e2, 'premise: the channel holds a later epoch now');
+    assert.deepEqual(unended(h), [], 'the boot tells nothing of e1, which ended');
+  } finally {
+    for (const c of boots) c.stop();
+    h.coordinator.stop();
+    errors.mock.restore();
+    mock.timers.reset();
+  }
+});
+
+test("Weft's pin on #844 (seconded by Oscar): the boot reads only the rows stored before it began: its own release whose end fails isn't told as the last run's", () => {
+  mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ stored: true });
+  const boots: TuneOutCoordinator[] = [];
+  try {
+    const r = h.coordinator.enter('disc', 'disc:guild:a', { durationSeconds: 60 }, 'agent-tool');
+    assert.ok(r.ok);
+    h.coordinator.stop();
+    mock.timers.tick(120_000);
+    // At the boot its end time has passed: its cancel writes its release, and the end is refused.
+    const restore = endRefused(h);
+    const next = h.reboot();
+    boots.push(next);
+    next.resumeActiveEpochs();
+    restore();
+    assert.equal(h.releasesOf(r.params.epochId), 1, "premise: the boot's own release is written");
+    assert.equal(h.inForce(), r.params.epochId, 'premise: the end refused, the hold is still in force');
+    assert.deepEqual(unended(h), [], "the boot doesn't tell its own release as one that reached the resident before the stop");
+  } finally {
+    for (const c of boots) c.stop();
+    h.coordinator.stop();
+    errors.mock.restore();
+    mock.timers.reset();
   }
 });
 
