@@ -33,6 +33,12 @@ export type TraceEventBase = {
  * For that, use ProcessEvent via the event queue.
  */
 export type TraceEvent =
+  | (TraceEventBase & {
+      type: 'reply:private';
+      serverId: string;
+      /** Fixed fault code; no callback, intent or exception content. */
+      reason: import('../mcpl/reply-routing.js').ReplyPrivateReason;
+    })
   // Process lifecycle
   | (TraceEventBase & { type: 'process:received'; processEvent: ProcessEvent })
   | (TraceEventBase & {
@@ -862,6 +868,14 @@ export type TraceEvent =
       revision: string | null;
       announcedDomains: string[];
       impacts: Array<{ impact: string; subject: string; disposition: string }>;
+    })
+  | (TraceEventBase & {
+      /** Accepted content remains stored; only not-yet-started module work
+       * is discarded on stop/disconnect, or for a withdrawal notice at capacity. */
+      type: 'mcpl:module-work-dropped';
+      serverId: string;
+      count: number;
+      reason: 'host_stopped' | 'disconnected' | 'admission_module_capacity';
     })
   | (TraceEventBase & {
       type: 'mcpl:server-reconnected';

@@ -636,3 +636,28 @@ test('recorded server text uses longest-first, one-pass replacements and is idem
   assert.equal(redactServerText('token0123456789-tail', config), 'redacted');
   assert.equal(redactServerText(clean, config), clean);
 });
+
+const replyAdmission = {
+  timeoutMs: 1000,
+  bind: (connection: import('../src/mcpl/inbound-admission.js').ConnectionKey) => ({ connection, admit: () => ({ store: true as const, mayWake: true }) }),
+  isReplyIntent: () => true,
+};
+const replyAuthority = { timeoutMs: 1000, resolve: () => ({ channelId: 'room' }), authorize: () => true };
+for (const [name, config, expected] of [
+  ['missing inboundAdmission', { inboundAdmission: undefined }, ['replyAuthority requires inboundAdmission']],
+  ...[
+    [0, 'replyAuthority.timeoutMs must be in 1..60000'],
+    [60001, 'replyAuthority.timeoutMs must be in 1..60000'],
+    [1.5, 'replyAuthority.timeoutMs must be an integer'],
+    [NaN, 'replyAuthority.timeoutMs must be an integer'],
+    ['1000', 'replyAuthority.timeoutMs must be an integer'],
+  ].map(([timeoutMs, problem]) => [`timeoutMs=${String(timeoutMs)} (${typeof timeoutMs})`, { replyAuthority: { ...replyAuthority, timeoutMs } }, [problem]] as const),
+  ['non-function resolve', { replyAuthority: { ...replyAuthority, resolve: 'resolve' } }, ['replyAuthority.resolve must be a function']],
+  ['non-function authorize', { replyAuthority: { ...replyAuthority, authorize: true } }, ['replyAuthority.authorize must be a synchronous function']],
+] as const) test(`reply authority config rejects ${name}`, () => {
+  const problems = serverConfigProblems(cfg({ command: 'srv', inboundAdmission: replyAdmission, replyAuthority, ...config } as any));
+  assert.deepEqual(problems, expected);
+});
+for (const timeoutMs of [1, 60000]) test(`reply authority config accepts timeout boundary ${timeoutMs}`, () => {
+  assert.deepEqual(serverConfigProblems(cfg({ command: 'srv', inboundAdmission: replyAdmission, replyAuthority: { ...replyAuthority, timeoutMs } })), []);
+});

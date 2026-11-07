@@ -37,6 +37,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   let socket: WebSocket;
   let next = 1000;
   const replies = new Map<number, (value: unknown) => void>();
+  const notifications: any[] = [];
   const renders: Array<Record<string, unknown>> = [];
   const hostCaps: Array<Record<string, unknown>> = [];
   const published: Array<Record<string, unknown>> = [];
@@ -46,6 +47,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     socket = ws;
     ws.on('message', async (bytes) => {
       const m = JSON.parse(String(bytes));
+      if (m.method && m.id === undefined) notifications.push(m);
       if (!m.method) { replies.get(m.id)?.(m); replies.delete(m.id); return; }
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
       if (m.method === 'initialize') {
@@ -95,8 +97,11 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   });
   await create();
   return {
-    get framework() { return framework; }, membrane, renders, hostCaps, published, create, send, dir,
+    get framework() { return framework; }, membrane, notifications, renders, hostCaps, published, create, send, dir,
     port: (wss.address() as AddressInfo).port,
+    /** Send a request whose transport is intentionally closed before its reply. */
+    sendUnanswered: (method: string, params: unknown) => socket.send(JSON.stringify({ jsonrpc: '2.0', id: next++, method, params })),
+    notify: (method: string, params: unknown) => socket.send(JSON.stringify({ jsonrpc: '2.0', method, params })),
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },
     register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),

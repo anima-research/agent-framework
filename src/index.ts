@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export { MAX_OVERCAP_WITHDRAWAL_TICKETS, MAX_PENDING_REQUIRED_MODULE_WORK, AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';
@@ -217,3 +217,8 @@ export {
   type SilentHeartbeatStamp,
   type SilentHeartbeatTick,
 } from './silent-heartbeat.js';
+
+export type { InboundAdmissionConfig, AdmissionInput, AdmissionVerdict, AdmitInbound, AdmissionLane, ConnectionKey, RefusalCode } from './mcpl/inbound-admission.js';
+
+export { admissionOf, AdmissionConnectError, MAX_ADMISSION_TIMEOUT_MS, MAX_PENDING_ADMISSIONS, type AdmittedEnvelope } from './mcpl/inbound-admission.js';
+export type { ReplyDestination, ReplyAuthorityConfig } from './mcpl/reply-routing.js';
