@@ -283,6 +283,8 @@ describe('a refused turn is marked on the message it answers, and its failure na
     const r = await rig(t, { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'second', model: 'test', systemPrompt: 'test' }] });
     // Messages that arrive while both residents' turns are alive wait behind
     // them, and park when the host quiesces.
+    const parked = (agentName: string) => (r.f.framework as unknown as { pendingRequests: Array<{ agentName: string; reason: string }> }).pendingRequests
+      .filter((q) => q.agentName === agentName && q.reason === 'mcpl:channel-incoming').length;
     const parkedThrough = async (held: string, messageIds: string[]) => {
       let release!: () => void;
       const released = new Promise<void>((resolve) => { release = resolve; });
@@ -297,6 +299,10 @@ describe('a refused turn is marked on the message it answers, and its failure na
       release();
       await quiesced;
       assert.equal(r.f.membrane.calls.length, before + 2, 'premise: no turn ran while the host was quiesced');
+      // The parking key is where the second resident's wakes meet; the first
+      // resident's each read their own row, and meet only at the resumed start.
+      await eventually(() => parked('second') === 1 && parked('agent') === messageIds.length,
+        'premise: the second resident\'s wakes park as one, the first resident\'s apart');
       await r.f.framework.resume();
     };
     await parkedThrough('m-0', ['m-1']);
@@ -325,11 +331,17 @@ describe('a refused turn is marked on the message it answers, and its failure na
     // Both residents wait this time, so each turn starts from what its hold
     // kept: the first resident's two wakes, each reading its own row, and the
     // second resident's one.
-    waits.set('agent', 'test', 300, 'a stated wait');
-    waits.set('second', 'test', 300, 'a stated wait');
+    waits.set('agent', 'test', 1000, 'a stated wait');
+    waits.set('second', 'test', 1000, 'a stated wait');
     const now = Date.now();
+    // The clock stands still until both wakes are held: the host may queue
+    // the second message's wakes after it has answered the delivery.
     const clock = t.mock.method(Date, 'now', () => now);
     await r.f.send('channels/incoming', { messages: [message('m-2'), message('m-3')] });
+    const held = (agentName: string) => (r.fw as unknown as { providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }> })
+      .providerAccelerationCooldowns.get(agentName)?.heldRequests.length;
+    await eventually(() => held('second') === 1 && held('agent') === 2,
+      'premise: the second resident\'s hold keeps its two wakes as one, the first resident\'s apart');
     clock.mock.restore();
     await eventually(() => r.records.length === 4, 'both residents\' turns for m-2 and m-3, refused after their waits');
     await r.markSent();
