@@ -19160,6 +19160,7 @@ export class AgentFramework {
     });
   }
 
+  /**
    * A reader fork's own words to the resident: attributed mail when it has a
    * route, else under its name. Answers the row's id for the latter (empty
    * where the write was kept in memory), and nothing for mail, which the
