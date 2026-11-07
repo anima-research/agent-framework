@@ -2,10 +2,9 @@
  * A batched (debounced) wake's `[Gate: …]` line, end to end over a real MCPL
  * child. The line says which messages a wake is for; for one message that is
  * still the newest entry in the agent's window it says nothing the message
- * right above doesn't, so the delivery agent's wake runs without it. With
- * anything after the message, or several messages in the batch, the line
- * stays. The gate hands such a line to the wake, and a fresh start of the
- * wake's turn decides it (placeWakeLines).
+ * right above doesn't, so the delivery agent's wake runs without it. The
+ * gate hands such a line to the wake, and a start decides it as WakeLine
+ * says (placeWakeLines).
  *
  * Seen live: a resident whose addressed messages wake through a 5 s debounce
  * had a third of its window made of these lines, four in five of them right
@@ -345,14 +344,16 @@ describe('isNewestContextEntry', () => {
     assert.equal(linesIn('LINE-A'), 1, 'written once: a later start writes it no second time');
   });
 
-  it('two handed lines are both written, each naming its message, even when one message is still newest', async () => {
+  it('two handed lines are written as one, naming both messages, even when one message is still newest', async () => {
     command(`dm ev-${++n} 134 1548000000000000001 first DM`);
     const first = await stored('first DM');
     command(`dm ev-${++n} 134 1548000000000000001 second DM`);
     const second = await stored('second DM');
-    (framework as unknown as Placing).placeWakeLines(scout(), [lineFor(first, '[Gate: LINE-1]'), lineFor(second, '[Gate: LINE-2]')]);
-    assert.equal(linesIn('LINE-1'), 1);
-    assert.equal(linesIn('LINE-2'), 1);
+    (framework as unknown as Placing).placeWakeLines(scout(), [lineFor(first, 'LINE-12'), lineFor(second, 'LINE-12')]);
+    const written = internals().agents.get('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).map((b) => (b.type === 'text' ? b.text ?? '' : '')).filter((t) => t.includes('LINE-12'));
+    assert.equal(written.length, 1, 'one line');
+    assert.match(written[0]!, /^\[Gate: 2 events matched\]\n\n- 2 messages in LINE-12 \(oldest ~\d+s ago\)/);
   });
 
   it('a line whose write fails doesn\'t fail the start and stays undecided for a later one; one that landed though its write threw counts as written', async () => {
@@ -398,6 +399,49 @@ describe('isNewestContextEntry', () => {
     assert.equal(linesIn('LINE-E2'), 1, 'the second written: the wake has two causes');
   });
 
+  const writtenLineFor = async (text: string, shown: string) => {
+    const row = await waitForRow(text);
+    return { ...lineFor(row.metadata ?? {}, shown), after: { agent: 'scout', messageId: row.id }, replyTo: { serverId: 'discord', channelId: 'discord:dm:1' } };
+  };
+  const waitForRow = async (text: string) => {
+    await stored(text);
+    return internals().agents.get('scout')!.getContextManager().getAllMessages()
+      .find((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes(text)))! as unknown as { id: string; metadata?: Record<string, unknown> };
+  };
+
+  it('a line with a write left out as newest isn\'t written by the next wake\'s start, whose own newest line is left out too', async () => {
+    const omitted: string[] = [];
+    framework.onTrace((event) => { if (event.type === 'gate:wake-line-omitted') omitted.push((event as unknown as { reason: string }).reason); });
+    command(`dm ev-${++n} 134 1548000000000000001 first DM`);
+    (framework as unknown as Placing).placeWakeLines(scout(), [await writtenLineFor('first DM', '[Gate: LINE-S1E]')]);
+    command(`dm ev-${++n} 134 1548000000000000001 second DM`);
+    (framework as unknown as Placing).placeWakeLines(scout(), [await writtenLineFor('second DM', '[Gate: LINE-S1M]')]);
+    assert.equal(linesIn('LINE-S1'), 0, 'no line for either');
+    assert.deepEqual(omitted, ['newest', 'newest']);
+  });
+
+  it('a line with a write left out as newest isn\'t written by a later start of another wake', async () => {
+    const omitted: string[] = [];
+    framework.onTrace((event) => { if (event.type === 'gate:wake-line-omitted') omitted.push((event as unknown as { reason: string }).reason); });
+    command(`dm ev-${++n} 134 1548000000000000001 a DM`);
+    (framework as unknown as Placing).placeWakeLines(scout(), [await writtenLineFor('a DM', '[Gate: LINE-S2]')]);
+    assert.deepEqual(omitted, ['newest'], 'premise: left out as newest');
+    assert.equal(linesIn('LINE-S2'), 0, 'premise: no line');
+    internals().addMessage('someone', [{ type: 'text', text: 'later, elsewhere' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-later-${n}` });
+    (framework as unknown as Placing).placeWakeLines(scout(), []);
+    assert.equal(linesIn('LINE-S2'), 0);
+  });
+
+  it('a line with a write left out as newest is written by a later start of its own wake once something newer has come', async () => {
+    command(`dm ev-${++n} 134 1548000000000000001 a DM`);
+    const line = await writtenLineFor('a DM', '[Gate: LINE-SAME]');
+    (framework as unknown as Placing).placeWakeLines(scout(), [line]);
+    assert.equal(linesIn('LINE-SAME'), 0, 'premise: left out as newest');
+    internals().addMessage('someone', [{ type: 'text', text: 'during the hold' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-hold-${n}` });
+    (framework as unknown as Placing).placeWakeLines(scout(), [line]);
+    assert.equal(linesIn('LINE-SAME'), 1);
+  });
+
   it('a handed line written later counts its message\'s age to when it is written', async () => {
     command(`dm ev-${++n} 134 1548000000000000001 a DM`);
     const md = await stored('a DM');
@@ -408,7 +452,7 @@ describe('isNewestContextEntry', () => {
     const age = Number(/^\[Gate: 1 event matched\]\n\n- 1 message in LINE-AGE \(oldest ~(\d+)s ago\) — already shown above at arrival; this is a batched wake, not new content$/.exec(written ?? '')?.[1]);
     assert.ok(age >= 60, `counted to the write, not from it: ~${age}s`);
     const fixed = lineFor(md, 'LINE-AGE', 5_000);
-    assert.match(wakeLineText(fixed, 65_000), /^\[Gate: 1 event matched\]\n\n- 1 message in LINE-AGE \(oldest ~60s ago\) — already shown above at arrival/, 'the package\'s wakeLineText counts from the event to the time it\'s given');
+    assert.match(wakeLineText([fixed], 65_000), /^\[Gate: 1 event matched\]\n\n- 1 message in LINE-AGE \(oldest ~60s ago\) — already shown above at arrival/, 'the package\'s wakeLineText counts from the event to the time it\'s given');
   });
 
   it('a registered agent that doesn\'t read the window (an ephemeral run) writes no handed line', async () => {
@@ -687,8 +731,9 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
   const wake = (lines: unknown[], timestamp = Date.now()) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp, wakeLines: lines });
 
-  // Every resident gets every batched wake. Only the delivery agent's start
-  // places the line, so it lands once, before that agent's own answer.
+  // Every resident gets every batched wake. A line with no write is placed
+  // only by the delivery agent's start, so it lands once, before that agent's
+  // own answer.
   it('one wake for two residents, the co-resident first: she writes no line, and the delivery agent\'s start writes it once, after her reply and before its own answer', async () => {
     const b = await bare(['scout', 'mira']);
     try {
@@ -712,6 +757,29 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     } finally { await done(b); }
   });
 
+  it('a line with a write, the co-resident first: her start writes it once, before her answer, and the delivery agent\'s start writes none', async () => {
+    const b = await bare(['scout', 'mira']);
+    try {
+      const messageId = b.internals.addMessage('antra', [{ type: 'text', text: 'are you there?' }], { serverId: 'discord', eventId: 'ev-1', channelId: 'discord:dm:1' });
+      storeChatter(b);
+      const line = { ...dmLine('ev-1', 'LINE-MIRA-WRITES'), after: { agent: 'scout', messageId } };
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'mira answers' }]));
+      b.internals.pendingRequests.push({ ...wake([line]), agentName: 'mira' });
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: mira\'s turn ran');
+      assert.match(JSON.stringify(b.membrane.calls[0]), /LINE-MIRA-WRITES/, 'mira\'s request carries it');
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout answers' }]));
+      b.internals.pendingRequests.push(wake([line]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 2, 'premise: scout\'s turn ran');
+      const all = texts(b);
+      const at = all.findIndex((t) => t.includes('LINE-MIRA-WRITES'));
+      const mira = all.findIndex((t) => t.includes('mira answers'));
+      assert.equal(all.filter((t) => t.includes('LINE-MIRA-WRITES')).length, 1, 'written once');
+      assert.ok(at >= 0 && mira > at, `before mira's answer (line ${at}, mira ${mira})`);
+    } finally { await done(b); }
+  });
+
   it('one wake for two residents, the delivery agent first: it leaves the line out as newest, and the co-resident\'s later start writes none after its answer', async () => {
     const b = await bare(['scout', 'mira']);
     try {
@@ -729,6 +797,59 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       assert.equal(texts(b).filter((t) => t.includes('LINE-SCOUT-FIRST')).length, 0, 'no wake line after an answered DM');
     } finally { await done(b); }
   });
+  it("a line with a write the delivery agent's start left out for a held slot is written by another reader's later start, with no lines of its own", async () => {
+    const b = await bare(['scout', 'mira']);
+    try {
+      const messageId = b.internals.addMessage('antra', [{ type: 'text', text: 'are you there?' }], { serverId: 'discord', eventId: 'ev-1', channelId: 'discord:dm:1' });
+      storeChatter(b);
+      const line = { ...dmLine('ev-1', 'LINE-OWED'), after: { agent: 'scout', messageId } };
+      b.internals.activeTurnTokens.set('mira', 1);
+      try {
+        b.internals.placeWakeLines(b.framework.getAgent('scout'), [line]);
+      } finally {
+        b.internals.activeTurnTokens.delete('mira');
+      }
+      assert.equal(texts(b).filter((t) => t.includes('LINE-OWED')).length, 0, 'premise: held, not written');
+      b.internals.placeWakeLines(b.framework.getAgent('mira'), []);
+      assert.equal(texts(b).filter((t) => t.includes('LINE-OWED')).length, 1);
+    } finally { await done(b); }
+  });
+
+  it("a line whose write went to another agent's window isn't owed to the slot: a later resident start writes none", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wake-line-fork-write-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'conversation-fork', model: 'test-model', systemPrompt: 'You are a fork.' },
+      ],
+      gate: { onboarding: false, config: { policies: [], default: 'skip' } },
+      modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    } as never);
+    try {
+      const internals = framework as unknown as Bare['internals'] & {
+        eventGate: { requestInferenceFn(agentName: string, reason: string, source: string, provenance?: unknown): void };
+        wakeLineDone(agent: unknown, line: unknown): boolean;
+      };
+      internals.addMessage('antra', [{ type: 'text', text: 'for a fork' }], { serverId: 'discord', eventId: 'ev-1', channelId: 'discord:dm:1' });
+      internals.addMessage('someone', [{ type: 'text', text: 'unrelated chatter' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: 'm-chatter' });
+      const fork = framework.getAgent('conversation-fork')!;
+      const forkRow = fork.getContextManager().addMessage('antra', [{ type: 'text', text: 'for a fork' }]) as unknown as string;
+      const line = { ...dmLine('ev-1', 'LINE-FORKS'), after: { agent: 'conversation-fork', messageId: forkRow } };
+      assert.equal(internals.wakeLineDone(fork, line), false, "premise: the fork hasn't answered its write");
+      internals.eventGate.requestInferenceFn('conversation-fork', 'gate:debounce', 'gate', { lines: [line] });
+      internals.pendingRequests.length = 0;
+      internals.placeWakeLines(framework.getAgent('scout'), []);
+      const written = framework.getAgent('scout')!.getContextManager().getAllMessages()
+        .filter((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes('LINE-FORKS')));
+      assert.equal(written.length, 0);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('one wake for two agents: each request carries the gate\'s own line object, which "written once" rests on', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wake-line-identity-'));
     const framework = await AgentFramework.create({
@@ -744,7 +865,7 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
         pendingRequests: Array<{ agentName: string; wakeLines?: unknown[] }>;
       };
       const line = dmLine('ev-1', 'LINE-ID');
-      const provenance = { channelId: 'discord:dm:1', line };
+      const provenance = { channelId: 'discord:dm:1', lines: [line] };
       // As the gate's deliverEvents does: one provenance per batch, to every agent it wakes.
       for (const name of ['scout', 'mira']) internals.eventGate.requestInferenceFn(name, 'gate:debounce', 'gate', provenance);
       const carried = internals.pendingRequests.map((r) => r.wakeLines?.[0]);
@@ -788,7 +909,9 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       assert.deepEqual(omitted.map((t) => t.reason), ['held', 'held', 'held', 'held'], 'each line traced as held, each time');
       await b.framework.resume();
       b.internals.placeWakeLines(scout, lines);
-      assert.equal(texts(b).filter((t) => t.includes('LINE-HELD')).length, 2, 'a later start writes both');
+      const written = texts(b).filter((t) => t.includes('LINE-HELD'));
+      assert.equal(written.length, 1, 'a later start writes both, as one line');
+      assert.ok(written[0]!.includes('in LINE-HELD (') && written[0]!.includes('in LINE-HELD2 ('), 'naming each message');
     } finally { await done(b); }
   });
 

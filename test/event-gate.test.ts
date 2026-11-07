@@ -37,7 +37,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; line?: WakeLine }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; lines?: WakeLine[] }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -1293,8 +1293,7 @@ describe('EventGate: channel patterns and channelId keys through the route resol
  * one message still the newest entry in the window the line would go to, it
  * says nothing the message right above doesn't when the batch fires (the
  * framework answers isNewestEntry), so the gate hands the line to the wake
- * instead of writing it, for a fresh start of the wake's turn to decide
- * (WakeLine). Anything else keeps the line now.
+ * instead of writing it, for a start to decide as WakeLine says.
  */
 describe('a batched wake writes its line only when it says something', () => {
   const fire = (gate: EventGate, policyName: string): void => {
@@ -1316,8 +1315,8 @@ describe('a batched wake writes its line only when it says something', () => {
       metadata: { messageId: 'm1' }, tags: ['chat:addressed'] }));
     fire(gate, 'chat');
     assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['scout', 'mira']);
-    assert.ok(inferenceRequests[0].line, 'premise: the line is handed on');
-    assert.strictEqual(inferenceRequests[1].line, inferenceRequests[0].line, 'not a copy per agent');
+    assert.ok(inferenceRequests[0].lines, 'premise: the line is handed on');
+    assert.strictEqual(inferenceRequests[1].lines?.[0], inferenceRequests[0].lines[0], 'not a copy per agent');
   });
 
   it('one channel message, still newest: no line written, the wake runs carrying it, and the framework is asked about that message', async () => {
@@ -1337,11 +1336,11 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(messages.length, 0, 'no [Gate: …] line');
     assert.strictEqual(inferenceRequests.length, 1, 'the wake runs');
     assert.deepStrictEqual(asked, [{ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', messageId: 'm1' }]);
-    const line = inferenceRequests[0].line;
-    assert.ok(line, 'the wake carries the line');
+    assert.strictEqual(inferenceRequests[0].lines?.length, 1, 'the wake carries the line');
+    const line = inferenceRequests[0].lines[0]!;
     assert.strictEqual(line.shown, '#room (discord:g:room)', 'the channel as the line names it, its label with its id');
     assert.strictEqual(line.at, 1_000_000, 'its time is the message\'s arrival, not the fire');
-    assert.match(wakeLineText(line, line.at + 30_000), /^\[Gate: 1 event matched\]\n\n- 1 message in #room \(discord:g:room\) \(oldest ~30s ago\) — already shown above at arrival/);
+    assert.match(wakeLineText([line], line.at + 30_000), /^\[Gate: 1 event matched\]\n\n- 1 message in #room \(discord:g:room\) \(oldest ~30s ago\) — already shown above at arrival/);
     assert.deepStrictEqual(line.entry, asked[0]);
     assert.deepStrictEqual(line.policyNames, ['chat']);
     assert.strictEqual(line.channelId, 'discord:g:room');
@@ -1362,20 +1361,20 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(messages.length, 0);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(asked[0].eventId, 'ev-1');
-    assert.deepStrictEqual(inferenceRequests[0].line?.entry, asked[0]);
+    assert.deepStrictEqual(inferenceRequests[0].lines?.[0]?.entry, asked[0]);
   });
 
-  it('one message with something after it: the line stays', () => {
+  it('one message with no write and something after it: the line stays', () => {
     const { gate, messages, inferenceRequests } = makeGate(config('quiet-not-newest.json'), { isNewestEntry: () => false });
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
     fire(gate, 'chat');
     assert.strictEqual(messages.length, 1);
     assert.match((messages[0].content as Array<{ text: string }>)[0].text, /already shown above/);
     assert.strictEqual(inferenceRequests.length, 1);
-    assert.strictEqual(inferenceRequests[0].line, undefined, 'written now, so not handed on');
+    assert.strictEqual(inferenceRequests[0].lines, undefined, 'written now, so not handed on');
   });
 
-  it('several messages: the line stays, and the framework is not asked', () => {
+  it('several messages with no write: the line stays, and the framework is not asked', () => {
     let asked = 0;
     const { gate, messages } = makeGate(config('quiet-several.json'), { isNewestEntry: () => { asked++; return true; } });
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a', metadata: { messageId: 'm1' } }));
@@ -1386,7 +1385,7 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(asked, 0);
   });
 
-  it('an event whose content the line quotes (not stored at arrival): the line stays, and the framework is not asked', () => {
+  it('an event with no write whose content the line quotes (not stored at arrival): the line stays, and the framework is not asked', () => {
     let asked = 0;
     const { gate, messages } = makeGate(config('quiet-quoted.json'), { isNewestEntry: () => { asked++; return true; } });
     gate.evaluate(event({ eventType: 'workspace:file-changed', serverId: '', channelId: '', content: 'notes.md changed' }));
@@ -1396,7 +1395,115 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(asked, 0);
   });
 
-  it('a callback that throws keeps the line; without one, every wake writes it, as before', () => {
+  it('a batch whose every event was given its write hands every event\'s line to the wake, each with its write and the channel a reply is owed in', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('handed-written.json'), { isNewestEntry: () => false, agentNames: ['scout', 'mira'] });
+    const addressed = { agent: 'scout', messageId: 'row-1' };
+    const ambient = { agent: 'scout', messageId: 'row-2' };
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a',
+      metadata: { messageId: 'm1' }, tags: ['chat:addressed'] }), addressed);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'b',
+      metadata: { messageId: 'm2' }, tags: ['chat:ambient'] }), ambient);
+    const quoted = { agent: 'scout', messageId: 'row-3' };
+    gate.evaluate(event({ eventType: 'workspace:file-changed', serverId: '', channelId: '', content: 'notes.md changed' }), quoted);
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 0, 'no line written when the batch fires');
+    assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['scout', 'mira']);
+    const lines = inferenceRequests[0].lines!;
+    assert.strictEqual(inferenceRequests[1].lines, lines, 'the same lines for every agent');
+    assert.strictEqual(lines.length, 3, 'one line per event');
+    assert.strictEqual(lines[0]!.after, addressed, 'the write as the host passed it, filled in later as the host fills it');
+    assert.deepStrictEqual(lines[0]!.replyTo, { serverId: 'discord', channelId: 'discord:g:room' });
+    assert.strictEqual(lines[1]!.after, ambient);
+    assert.strictEqual(lines[1]!.replyTo, undefined, 'an ambient message owes no reply');
+    assert.strictEqual(lines[2]!.after, quoted);
+    assert.strictEqual(lines[2]!.content, 'notes.md changed', 'a quoted event\'s line carries its text');
+  });
+
+  it('a handed batch\'s lines read as the line the gate writes for the same batch', () => {
+    const batch = (gate: EventGate, withWrite: boolean): void => {
+      const write = (row: string) => (withWrite ? { agent: 'agent', messageId: row } : undefined);
+      gate.evaluate(event({ eventType: 'workspace:file-changed', serverId: '', channelId: '', content: 'notes.md changed' }), write('row-0'));
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a',
+        metadata: { messageId: 'm1', channelName: 'room' } }), write('row-1'));
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'b',
+        metadata: { messageId: 'm2' } }), write('row-2'));
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:other', content: 'c',
+        metadata: { messageId: 'm3' } }), write('row-3'));
+      fire(gate, 'chat');
+    };
+    const realNow = Date.now;
+    Date.now = () => 1_000_000;
+    try {
+      const handed = makeGate(config('handed-text.json'), { isNewestEntry: () => false });
+      batch(handed.gate, true);
+      const written = makeGate(config('written-text.json'), { isNewestEntry: () => false });
+      batch(written.gate, false);
+      assert.strictEqual(written.messages.length, 1, 'premise: with no write, the line is written now');
+      const text = (written.messages[0]!.content as Array<{ text: string }>)[0]!.text;
+      assert.strictEqual(wakeLineText(handed.inferenceRequests[0].lines!, 1_000_000), text);
+      assert.match(text, /^\[Gate: 4 events matched\]\n\n- \[chat\] \(workspace:file-changed\): notes\.md changed\n- 2 messages in #room \(discord:g:room\) \(oldest ~0s ago\)/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('a host that doesn\'t place handed lines (no isNewestEntry) gets the line written now, a write given or not', () => {
+    for (const write of [{ agent: 'agent', messageId: 'row-1' }, undefined]) {
+      const { gate, messages, inferenceRequests } = makeGate(config(`written-no-host-${write ? 'write' : 'none'}.json`));
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi',
+        metadata: { messageId: 'm1' } }), write);
+      fire(gate, 'chat');
+      assert.strictEqual(messages.length, 1);
+      assert.strictEqual(inferenceRequests[0].lines, undefined);
+    }
+  });
+
+  it('a batch whose every event has a write but that wakes no agent gets its line written when it fires', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('written-no-recipient.json'), { isNewestEntry: () => false, agentNames: [] });
+    for (const [content, messageId, row] of [['a', 'm1', 'row-1'], ['b', 'm2', 'row-2']]) {
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content,
+        metadata: { messageId } }), { agent: 'agent', messageId: row });
+    }
+    fire(gate, 'chat');
+    assert.strictEqual(inferenceRequests.length, 0, 'premise: nobody is woken');
+    assert.strictEqual(messages.length, 1, 'the line is written, with no start to owe it to');
+    assert.match((messages[0]!.content as Array<{ text: string }>)[0]!.text, /^\[Gate: 2 events matched\]/);
+  });
+
+  it('a batch with an event the host gave no filled write is mixed: its whole line is written when it fires', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('mixed-unfilled.json'), { isNewestEntry: () => false });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a',
+      metadata: { messageId: 'm1' } }), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'b',
+      metadata: { messageId: 'm2' } }), { agent: '' });
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 1);
+    assert.match((messages[0]!.content as Array<{ text: string }>)[0]!.text, /^\[Gate: 2 events matched\]/);
+    assert.strictEqual(inferenceRequests[0].lines, undefined);
+  });
+
+  it('a write naming its agent but no id counts as none, for the line and for what the judge is told', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('agent-only-write.json'), { isNewestEntry: () => false });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a',
+      metadata: { messageId: 'm1' } }), { agent: 'agent' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [true], 'a wake no answer can drop is certain');
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 1);
+    assert.strictEqual(inferenceRequests[0].lines, undefined);
+  });
+
+  it('a write the host never filled in counts as none: the batch\'s line is written when it fires', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('unfilled-write.json'), { isNewestEntry: () => false });
+    for (const [content, messageId] of [['a', 'm1'], ['b', 'm2']]) {
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content,
+        metadata: { messageId } }), { agent: '' });
+    }
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 1);
+    assert.strictEqual(inferenceRequests[0].lines, undefined);
+  });
+
+  it('with no write, a callback that throws keeps the line; without one, every wake writes it, as before', () => {
     const throwing = makeGate(config('quiet-throws.json'), { isNewestEntry: () => { throw new Error('boom'); } });
     throwing.gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
     fire(throwing.gate, 'chat');

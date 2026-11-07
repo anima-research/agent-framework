@@ -150,22 +150,30 @@ interface PendingEvent {
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
   eventId?: string;
+  after?: WritePlacement;
+  replyTo?: { serverId: string; channelId: string };
 }
 
-/** Where the host put a message the gate wrote: the agent whose window it
- *  went to and, when it was held for that agent's live turn, the id it waits
- *  under in the host's queue, or else the id it was stored under. */
+/** Where the host put a message, one the gate wrote or an event's own that
+ *  the host passes to `evaluate`: the agent whose window it went to and,
+ *  when it was held for that agent's live turn, the id it waits under in the
+ *  host's queue, or else the id it was stored under. */
 export interface WritePlacement {
   agent?: string;
   deferredId?: string;
   messageId?: string;
 }
 
+export function isWrite(after: WritePlacement | undefined): after is WritePlacement & { agent: string } {
+  return !!after?.agent && !!(after.deferredId || after.messageId);
+}
+
 /**
  * Where a gate-requested wake came from, handed to the framework alongside the
  * reason so the turn's InferenceRequest can carry it (host telemetry stamps
  * "who woke the agent" from it). Ids only, never content or display names,
- * except `line`, which is the batch's own text for the agent's window.
+ * except `lines`, the batch's own text for the agent's window, a quoted
+ * event's text and the channels' names included.
  */
 export interface WakeProvenance {
   /** Composite channel id of the chosen event — telemetry only, never a
@@ -195,12 +203,13 @@ export interface WakeProvenance {
    *  requests can order by event recency, not by flush order. */
   at?: number;
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
-   *  than wrote it: a WakeLine, the parts its text is rendered from when it's
-   *  written (wakeLineText), decided by a fresh start of the wake's turn as
-   *  WakeLine says. Unlike the fields above, this is content for the agent's
-   *  window, not telemetry: it carries the channel's name as the agent is
-   *  shown it. */
-  line?: WakeLine;
+   *  than wrote it: a WakeLine for each of the batch's events, the parts its
+   *  text is rendered from when it's written (wakeLineText), decided at a
+   *  turn's start as WakeLine says. Unlike the fields
+   *  above, this is content for the agent's window, not telemetry: it
+   *  carries the channel's name as the agent is shown it, and a quoted
+   *  event's text. */
+  lines?: WakeLine[];
 }
 
 interface DebounceState {
@@ -337,10 +346,26 @@ function referenceLine(count: number, channel: string, oldest: number, now: numb
     `batched wake, not new content`;
 }
 
-/** A handed batched-wake line's text (WakeLine), as it reads when written at
- *  `now`: the gate's words, its message's age counted to then. */
-export function wakeLineText(line: WakeLine, now: number): string {
-  return `[${NOTICE_TAG.gate}: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
+/** A batched wake's line, for the events `lines` name (WakeLine), as it
+ *  reads when written at `now`: each quoted event's text, then each
+ *  channel's messages, counted, with the oldest one's age counted to then. */
+export function wakeLineText(lines: readonly WakeLine[], now: number): string {
+  const rows: string[] = [];
+  const byChannel = new Map<string, { shown: string; count: number; oldest: number }>();
+  for (const line of lines) {
+    if (line.content !== undefined) {
+      rows.push(`- [${line.policyNames.join(', ')}] (${line.entry.eventType}): ${suppliedValue(line.content)}`);
+      continue;
+    }
+    const shown = line.shown ?? '(unknown channel)';
+    const key = JSON.stringify([line.entry.serverId ?? null, line.channelId ?? line.entry.channelId ?? null, shown]);
+    const group = byChannel.get(key) ?? { shown, count: 0, oldest: line.at };
+    group.count += 1;
+    group.oldest = Math.min(group.oldest, line.at);
+    byChannel.set(key, group);
+  }
+  for (const { shown, count, oldest } of byChannel.values()) rows.push(referenceLine(count, shown, oldest, now));
+  return `[${NOTICE_TAG.gate}: ${lines.length} event${lines.length > 1 ? 's' : ''} matched]\n\n${rows.join('\n')}`;
 }
 
 /** The event's own stored entry, as the framework is asked about it. */
@@ -352,6 +377,11 @@ function entryRef(event: PendingEvent): GateEntryRef {
     ...(event.messageId !== undefined ? { messageId: event.messageId } : {}),
     ...(event.eventId !== undefined ? { eventId: event.eventId } : {}),
   };
+}
+
+function withoutWrite(event: PendingEvent): PendingEvent {
+  const { after: _after, replyTo: _replyTo, ...rest } = event;
+  return rest;
 }
 
 /**
@@ -2241,7 +2271,8 @@ export class EventGate {
 
   // Inference buffering
   private inferring = new Set<string>();
-  private inferenceBuffer: PendingEvent[] = [];
+  private inferenceBuffer: Array<{ event: PendingEvent; batch: number }> = [];
+  private bufferedBatches = 0;
   /** Host quiesce suppression — see setQuiesced. */
   private quiesced = false;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
@@ -2317,6 +2348,7 @@ export class EventGate {
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
+  private isAnsweredFn?: (after: WritePlacement) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2378,11 +2410,28 @@ export class EventGate {
     channelShown?: (channel: { serverId: string; channelId: string }) => string;
     /** Whether an MCPL event's own context entry is still the newest entry in
      *  the window a batched wake's line would be written to, with nothing
-     *  waiting to be written there. A batched wake for that one message
-     *  doesn't write its line when it fires: it hands the line to the wake
-     *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
-     *  (WakeLine). Absent: every batched wake writes its line, as before. */
+     *  waiting to be written there. A batched wake for that one message, or
+     *  one whose every event `evaluate` was given a write for (`after`,
+     *  naming the agent it went to by the time the batch is delivered: when
+     *  it fires, when a judge rule's judging ends in a wake, or, if a turn or
+     *  the host's quiesce holds it, once no agent's turn is running and the
+     *  host isn't quiesced), doesn't write its line when it's delivered: it
+     *  hands the line to the wake (WakeProvenance.lines), for a turn's start
+     *  to decide (WakeLine).
+     *  Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
+    /** Whether the agent an event's write went to (`after`, as `evaluate`
+     *  was given it) has answered a request that carried it, its answer's
+     *  publication not required: `false` only when the host knows it hasn't.
+     *  Asked when a reply judge answers reply, for each event of the batch it
+     *  judged that has a write: an event answered before the judge answered
+     *  keeps the wake and loses its write, so the batch is delivered as any
+     *  batch with an event without a write is: its line written at delivery
+     *  and nothing handed, or, for one message still the newest entry then,
+     *  its line handed to the delivery agent's start. Absent, or an answer
+     *  other than `false` (a throw included): the event counts as answered
+     *  then. */
+    isAnswered?: (after: WritePlacement) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
@@ -2404,6 +2453,7 @@ export class EventGate {
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
     this.isNewestEntryFn = opts.isNewestEntry;
+    this.isAnsweredFn = opts.isAnswered;
     this.eventTypesFromFn = opts.eventTypesFrom;
     this.now = opts.now ?? (() => Date.now());
     this.judgeFn = opts.judge;
@@ -3342,7 +3392,16 @@ export class EventGate {
   // Evaluate — main entry point
   // =========================================================================
 
-  evaluate(info: GateEventInfo): GateDecision {
+  /** `after`: where the host put the event's own message, which it may fill
+   *  in after this call, before the batch is delivered: when it fires, when a
+   *  judge rule's judging ends in a wake, or, if a turn or the host's quiesce
+   *  holds it, once no agent's turn is running and the host isn't quiesced.
+   *  For a host that places handed lines (`isNewestEntry`), a debounced batch
+   *  whose every event has a write hands its lines to the wake with those
+   *  writes (WakeLine.after), for the host's scheduler to drop the wake once
+   *  the agent has read and answered them, as AgentFramework's does for a request with
+   *  `readsWakeLines`; absent, the event keeps its batch's wake. */
+  evaluate(info: GateEventInfo, after?: WritePlacement): GateDecision {
     this.reloadIfChanged();
 
     // Sleep suppression: while asleep, drop EXTERNAL wakes. Two things still
@@ -3387,7 +3446,7 @@ export class EventGate {
     let decision: GateDecision | null = null;
     const observed: string[] = [];
     if (scripted != null) {
-      decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info);
+      decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info, after);
     } else {
       for (const compiled of this.compiledPolicies) {
         // A suppress rule doesn't decide a wake for an event suppression was
@@ -3396,7 +3455,7 @@ export class EventGate {
         // asked (no view to hide it from), it defers, as its behavior says.
         if (compiled.policy.suppress && this.passesOverSuppress(info)) continue;
         if (!this.compiledMatches(compiled, info)) continue;
-        const candidate = this.computeDecision(compiled.policy, info);
+        const candidate = this.computeDecision(compiled.policy, info, after);
         if (candidate.trigger || !compiled.policy.passthrough) {
           decision = candidate;
           break;
@@ -3407,7 +3466,7 @@ export class EventGate {
 
     this.totalEvaluations++;
     if (!decision) {
-      decision = this.computeDecision(null, info);
+      decision = this.computeDecision(null, info, after);
       const bucket = this.defaultByEventType.get(info.eventType)
         ?? { triggered: 0, skipped: 0 };
       if (decision.trigger) {
@@ -3435,7 +3494,7 @@ export class EventGate {
     return decision;
   }
 
-  private computeDecision(policy: GatePolicy | null, info: GateEventInfo): GateDecision {
+  private computeDecision(policy: GatePolicy | null, info: GateEventInfo, after?: WritePlacement): GateDecision {
     if (!policy) {
       const trigger = (this.config.default ?? 'always') === 'always';
       return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
@@ -3468,7 +3527,7 @@ export class EventGate {
 
     if (typeof policy.behavior === 'object') {
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
-        this.handleDebounce(policy, info);
+        this.handleDebounce(policy, info, after);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
       }
       if ('rate_limit' in policy.behavior) {
@@ -3964,10 +4023,14 @@ export class EventGate {
     }
   }
 
-  private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
+  private handleDebounce(policy: GatePolicy, info: GateEventInfo, after?: WritePlacement): void {
     const debounceMs = batchQuietMs(policy.behavior) ?? MIN_DEBOUNCE_MS;
     const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
 
+    const routeChannelId = this.routeChannelFor(info);
+    const replyTo = routeChannelId !== undefined && info.serverId
+      && !info.tags?.includes('chat:ambient') && !info.tags?.includes('chat:system')
+      ? { serverId: info.serverId, channelId: routeChannelId } : undefined;
     const event: PendingEvent = {
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
@@ -3984,9 +4047,10 @@ export class EventGate {
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
-      routeChannelId: this.routeChannelFor(info),
+      routeChannelId,
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
+      ...(after ? { after, ...(replyTo ? { replyTo } : {}) } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -4088,68 +4152,62 @@ export class EventGate {
     // them here would inject a duplicate copy of the message minutes after
     // the fact, reading as fresh input the agent may have already handled.
     // Only events with no context entry of their own carry their content.
-    const quoted = events.filter(e => !e.inContext);
-    const referenced = events.filter(e => e.inContext);
-
-    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${suppliedValue(e.content)}`);
-    // How each referenced channel is named in the line, in order.
-    const shown: string[] = [];
-    if (referenced.length > 0) {
-      // By channel, its server and its id: two servers' channels can share
-      // an id.
-      const byChannel = new Map<string, { name: string; count: number; oldest: number; label?: string }>();
-      for (const e of referenced) {
-        // The registered id when known, so this line names the channel the
-        // same way routing notices and send tools do (a push event's own
-        // channelId is the adapter's raw id), shown as the agent names it
-        // back where the event names its server.
-        // Only a registered id is a channel name; an adapter's raw id is
-        // shown as it is.
-        const id = e.routeChannelId ?? e.channelId;
-        const name = id === undefined
-          ? '(unknown channel)'
-          : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
-            ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
-            : suppliedValue(id);
-        const key = JSON.stringify([e.serverId ?? null, id ?? null]);
-        const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
-        entry.count += 1;
-        entry.oldest = Math.min(entry.oldest, e.timestamp);
-        entry.label = entry.label ?? e.channelLabel;
-        byChannel.set(key, entry);
-      }
-      for (const { name, count, oldest, label } of byChannel.values()) {
-        // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id. A name
-        // may carry its own `#`, so one is added only where the name lacks
-        // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? '' : '#'}${suppliedValue(label)} (${name})` : name;
-        shown.push(channel);
-        lines.push(referenceLine(count, channel, oldest, Date.now()));
-      }
+    // By channel, its server and its id: two servers' channels can share an
+    // id.
+    const channelKey = (e: PendingEvent) => JSON.stringify([e.serverId ?? null, e.routeChannelId ?? e.channelId ?? null]);
+    const byChannel = new Map<string, { name: string; label?: string }>();
+    for (const e of events) {
+      if (!e.inContext) continue;
+      // The registered id when known, so this line names the channel the
+      // same way routing notices and send tools do (a push event's own
+      // channelId is the adapter's raw id), shown as the agent names it
+      // back where the event names its server.
+      // Only a registered id is a channel name; an adapter's raw id is
+      // shown as it is.
+      const id = e.routeChannelId ?? e.channelId;
+      const name = id === undefined
+        ? '(unknown channel)'
+        : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
+          ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
+          : suppliedValue(id);
+      const entry = byChannel.get(channelKey(e)) ?? { name, label: e.channelLabel };
+      entry.label = entry.label ?? e.channelLabel;
+      byChannel.set(channelKey(e), entry);
     }
+    // Prefer the human-readable name; keep the id parenthesized so the
+    // agent can still address tools that want the composite id. A name
+    // may carry its own `#`, so one is added only where the name lacks
+    // it, as at the other places that add a `#`.
+    const shownOf = (e: PendingEvent): string => {
+      const { name, label } = byChannel.get(channelKey(e))!;
+      return label ? `${label.startsWith('#') ? '' : '#'}${suppliedValue(label)} (${name})` : name;
+    };
+    const lines: WakeLine[] = events.map((e) => {
+      const shownChannel = e.routeChannelId ?? e.channelId;
+      return {
+        entry: entryRef(e),
+        policyNames: [e.policyName],
+        at: e.timestamp,
+        ...(shownChannel !== undefined ? { channelId: shownChannel } : {}),
+        ...(e.inContext ? { shown: shownOf(e) } : { content: e.content }),
+        ...(e.after ? { after: e.after } : {}),
+        ...(e.replyTo ? { replyTo: e.replyTo } : {}),
+      };
+    });
 
     // The line says which messages a wake is for. For one message that is
     // still the newest thing in the window it would be written to, it says
     // nothing the message right above doesn't. But the turn compiles later,
     // and what lands in between puts the message above other entries, so the
-    // gate hands the line to the wake (WakeProvenance.line) and a fresh start
-    // of the wake's turn decides it (WakeLine). Several messages, one with
-    // anything after it, or content the line quotes, keep the line now.
-    const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    // gate hands the line to the wake (WakeProvenance.lines) and a turn's start
+    // decides it (WakeLine), as it does for a batch that wakes an agent and
+    // whose every event has a write (isWrite).
+    const recipients = this.getAgentNamesFn();
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
-    let line: WakeLine | undefined;
-    if (only && this.newestEntry(only)) {
-      const shownChannel = only.routeChannelId ?? only.channelId;
-      line = {
-        entry: entryRef(only),
-        policyNames,
-        shown: shown[0],
-        at: only.timestamp,
-        ...(shownChannel !== undefined ? { channelId: shownChannel } : {}),
-      };
-    } else {
-      this.addMessageFn('user', [{ type: 'text', text }], {
+    const handed = this.isNewestEntryFn !== undefined
+      && ((recipients.length > 0 && events.every((e) => isWrite(e.after))) || (only !== undefined && this.newestEntry(only)));
+    if (!handed) {
+      this.addMessageFn('user', [{ type: 'text', text: wakeLineText(lines, Date.now()) }], {
         source: 'gate:debounce',
         policies: policyNames,
       });
@@ -4161,12 +4219,10 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches set no locus. A batch whose line the
-    // gate left to the turn's start carries it too (`line`), one object
-    // shared by every agent the batch wakes, so it is written once.
+    // any traffic. Ambient-only batches set no locus.
     const chosen = wakeProvenance(events);
-    const provenance = line ? { ...chosen, line } : chosen;
-    for (const agentName of this.getAgentNamesFn()) {
+    const provenance = handed ? { ...chosen, lines } : chosen;
+    for (const agentName of recipients) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
@@ -4294,8 +4350,13 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires; a judge rule's goes to the judge, so it only may). A batch,
-   * and a sleep with no agent named, reach the gate's recipients alone.
+   * when it fires, or only may, where its lines go to a host with
+   * `isNewestEntry` and each of its events was written to the window of each
+   * of `agentNames`, since a batch starts no turn for an agent that has
+   * answered every event in it, and an event counts as answered only by the
+   * agent its write went to; a judge rule's goes to the judge, so it only
+   * may). A batch, and a sleep with no agent named, reach the gate's
+   * recipients alone.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4317,7 +4378,7 @@ export class EventGate {
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
         ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        : { at: state.dueAt, certain: this.isNewestEntryFn === undefined || !state.events.every((e) => agentNames.every((agent) => isWrite(e.after) && e.after.agent === agent)), kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
@@ -4350,7 +4411,9 @@ export class EventGate {
   /**
    * Apply the judge's verdict on a batch. Reply: the batch, with any of the
    * rule's batches that fired meanwhile, is delivered as a debounce's is
-   * (held for a turn that started meanwhile, as fireDebounce holds one). Wait:
+   * (held for a turn that started meanwhile, as fireDebounce holds one),
+   * except that a judged event already answered keeps the wake
+   * (answeredWhenJudged). Wait:
    * nothing is delivered, and batches that fired meanwhile go to the judge
    * afresh. A judge that failed, timed out or answered nothing usable decides
    * by onError: "wake" delivers, "skip" doesn't. Each verdict is traced and
@@ -4368,7 +4431,7 @@ export class EventGate {
       const wakes = this.judgeOnError === 'wake';
       console.error(
         `[gate] Rule ${quotedValue(policyName)}: the reply judge made no call (${errorText(err)}), so its batch of ${state.events.length} `
-        + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'is delivered to wake the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
       if (this.disposed) return;
       if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
@@ -4400,7 +4463,7 @@ export class EventGate {
     if (failed) {
       console.error(
         `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${reason}), so its batch of ${state.events.length} `
-        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'is delivered to wake the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
     }
     this.emitTrace({
@@ -4418,10 +4481,21 @@ export class EventGate {
     if (this.disposed) return;
     const judge = this.currentJudge(policyName, state.judge);
     if (wake) {
-      this.deliverOrBuffer([...state.events, ...state.queued]);
+      const judged = outcome === 'reply' ? state.events.map((e) => (this.answeredWhenJudged(e) ? withoutWrite(e) : e)) : state.events;
+      this.deliverOrBuffer([...judged, ...state.queued]);
       return;
     }
     if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, judge);
+  }
+
+  private answeredWhenJudged(e: PendingEvent): boolean {
+    if (!isWrite(e.after)) return false;
+    if (!this.isAnsweredFn) return true;
+    try {
+      return this.isAnsweredFn(e.after) !== false;
+    } catch {
+      return true;
+    }
   }
 
   /** Deliver a batch now, or hold it for the agents' turns and the host's
@@ -4533,19 +4607,25 @@ export class EventGate {
   private flushInferenceBufferIfClear(): void {
     if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
-      const events = this.inferenceBuffer.splice(0);
+      const held = this.inferenceBuffer.splice(0);
+      const unwritten = new Set(held.filter(({ event }) => !isWrite(event.after)).map(({ batch }) => batch));
+      const deliveries = [false, true]
+        .map((part) => held.filter(({ batch }) => unwritten.has(batch) === part).map(({ event }) => event))
+        .filter((events) => events.length > 0);
       // Defer to avoid re-entrancy inside trace callbacks. A delivery that
-      // throws drops what was held, named in the log, as fireDebounce drops a
+      // throws drops what it held, named in the log, as fireDebounce drops a
       // batch: thrown in the microtask, it would be uncaught.
       queueMicrotask(() => {
-        try {
-          this.deliverEvents(events);
-        } catch (err) {
-          const one = events.length === 1;
-          console.error(
-            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
-            + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
-          );
+        for (const events of deliveries) {
+          try {
+            this.deliverEvents(events);
+          } catch (err) {
+            const one = events.length === 1;
+            console.error(
+              `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
+              + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
+            );
+          }
         }
       });
     }
@@ -4582,6 +4662,7 @@ export class EventGate {
 
   /** Called internally when debounce fires during inference. */
   private bufferForInference(events: PendingEvent[]): void {
+    const batch = ++this.bufferedBatches;
     for (const event of events) {
       if (this.inferenceBuffer.length >= MAX_INFERENCE_BUFFER) {
         this.inferenceBuffer.shift(); // Drop oldest
@@ -4598,7 +4679,7 @@ export class EventGate {
           );
         }
       }
-      this.inferenceBuffer.push(event);
+      this.inferenceBuffer.push({ event, batch });
     }
   }
 

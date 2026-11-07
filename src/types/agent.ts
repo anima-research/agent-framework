@@ -615,6 +615,14 @@ export interface InferenceRequest {
    *  published into that channel having read it, or once the message isn't
    *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
+  /** Host-owned: this wake's sole cause is the batch its `wakeLines` name,
+   *  one line per event. Once the agent is done with every line's write
+   *  (WakeLine.after), each judged as `readsDeferredWrite` or
+   *  `readsStoredMessage` is, with the channel its line names a reply as
+   *  owed in (WakeLine.replyTo) as the wake's channel, the wake starts no
+   *  turn. A line with no write, or one written to another agent's window,
+   *  keeps the wake. */
+  readsWakeLines?: true;
   agentName: string;
   reason: string;
   source: string;
@@ -711,10 +719,11 @@ export interface InferenceRequest {
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
   /** Batched-wake lines the gate handed to this wake rather than wrote
-   *  (WakeLine), decided by a fresh start of its turn as WakeLine says: each
-   *  written once into the window it names, or left for a later fresh start
-   *  of the same wake. A retry, or a start that resumes a logical turn,
-   *  decides none. */
+   *  (WakeLine), decided by fresh starts as WakeLine says, each written once
+   *  into the window it names. A later attempt of a start, or a start that
+   *  resumes a logical turn, decides none. A retry the scheduler starts
+   *  again, such as a provider hold's release, is a fresh start and decides
+   *  them as one. */
   wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
