@@ -72,10 +72,11 @@ function stubCm(messages: StoredMessage[], summaries: Array<Record<string, unkno
       // listing gives as `createdMs`.
       return s ? { ...s, created: s.createdMs } : null;
     },
-    queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number }) {
+    queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number; offset?: number }) {
       const all = messages.filter((m) => (o.fromMs === undefined || m.timestamp.getTime() >= o.fromMs) && (o.toMs === undefined || m.timestamp.getTime() <= o.toMs))
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
-      return { messages: all.slice(0, o.limit ?? all.length), totalCount: all.length };
+      const offset = o.offset ?? 0;
+      return { messages: all.slice(offset, offset + (o.limit ?? all.length)), totalCount: all.length };
     },
     getSummariesInRange() { return summaries; },
   } as unknown as ContextManager;
@@ -241,6 +242,32 @@ describe('HistoryModule semantic_search', () => {
       const sdata = sum.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number } };
       assert.ok(!sdata.hits.some((h) => h.id === 'sum:s1'), JSON.stringify(sdata.hits));
       assert.equal(sdata.index.droppedOffBranch, 1);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it("a message hit for a send whose result, stored after it, failed is marked as an error on the send's label, and its chars are the indexed text's", async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const sends = [
+        msg('m11', T0 + 11_000, [{ type: 'tool_use', id: 'u', name: 'discord--send_message', input: { channelId: 'C1', content: 'the dinner is at eight' } }], 'chan-A'),
+        msg('m12', T0 + 12_000, [{ type: 'tool_result', toolUseId: 'u', toolName: 'discord--send_message', content: 'Missing Access', isError: true }], 'chan-A'),
+        msg('m13', T0 + 13_000, [{ type: 'text', text: 'after the send and its result' }], 'chan-B'),
+        msg('m14', T0 + 14_000, [{ type: 'tool_use', id: 'v', name: 'discord--send_message', input: { channelId: 'C1', content: 'the lunch is at noon' } }], 'chan-A'),
+        msg('m15', T0 + 15_000, [{ type: 'tool_result', toolUseId: 'v', toolName: 'discord--send_message', content: 'sent' }], 'chan-A'),
+      ];
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+      mod.bind(stubCm(sends));
+      await mod.syncSemanticIndex()!;
+      const hitFor = async (query: string, id: string) => {
+        const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query, kinds: 'messages' } });
+        assert.equal(res.success, true, JSON.stringify(res));
+        const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number }> }).hits.find((h) => h.id === id);
+        assert.ok(hit, JSON.stringify(res.data));
+        return { snippet: hit.snippet, chars: hit.chars };
+      };
+      assert.deepEqual(await hitFor('dinner is at eight', 'msg:m11'), { snippet: '[send_message, error] the dinner is at eight', chars: '[send_message] the dinner is at eight'.length });
+      assert.deepEqual(await hitFor('lunch is at noon', 'msg:m14'), { snippet: '[send_message] the lunch is at noon', chars: '[send_message] the lunch is at noon'.length });
       await mod.stop();
     } finally { await svc2.stop(); }
   });

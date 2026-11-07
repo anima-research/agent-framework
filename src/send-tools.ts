@@ -1,14 +1,11 @@
 /**
- * Tools whose call carries the resident's words for silencing and the history
- * module, by bare name (an MCPL server's `<prefix>--` stripped), matched on
- * any server, each with the arguments that can hold them, as each server
- * names them: the first one present holds the words, when it's a non-blank
- * string. A `silences` tool delivers them where others
- * read them: the framework reads a call of one as an explicit send
- * that silences the round's auto-routed prose where it may have posted. The
- * history module's search, extract and semantic index read the words of any
- * of them as what the resident wrote to someone, whether or not it was
- * delivered.
+ * Tools whose call carries the resident's words, by bare name (an MCPL
+ * server's `<prefix>--` stripped); edit_message's words are the new text of a
+ * message it sent. The framework reads a call of a `silences` one as an
+ * explicit send that silences the round's auto-routed prose where it may have
+ * posted; the history module reads the words of any of them as what the
+ * resident wrote to someone, whether or not it was delivered. With prose
+ * routing disabled the resident speaks through these.
  */
 const SPEECH_TOOLS: ReadonlyMap<string, { words: readonly string[]; silences: boolean }> = new Map([
   // channel_publish still takes `text` from older callers.

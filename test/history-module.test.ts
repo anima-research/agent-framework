@@ -549,8 +549,8 @@ describe('HistoryModule', () => {
       msg('t3', 3000, 'Glassy', [{ type: 'tool_use', id: 'c', name: 'fixture--send_dm', input: { userId: 'u', text: 'a direct word as text' } }], 'c1'),
       msg('t4', 4000, 'Glassy', [{ type: 'tool_use', id: 'd', name: 'fixture--edit_message', input: { channelId: 'room', messageId: '2', text: 'edited through text' } }], 'c1'),
       msg('t5', 5000, 'Glassy', [{ type: 'tool_use', id: 'e', name: 'slack--send_message', input: { channelId: 'C1', content: 'what content holds', text: 'what text holds' } }], 'c1'),
+      msg('t7', 5500, 'Glassy', [{ type: 'tool_result', toolUseId: 'e', toolName: 'slack--send_message', content: 'not_in_channel', isError: true }], 'c1'),
       msg('t6', 6000, 'Glassy', [{ type: 'tool_use', id: 'f', name: 'slack--upload_file', input: { channelId: 'C1', filename: 'positions.csv', content: 'symbol,qty', comment: 'the positions for Friday' } }], 'c1'),
-      msg('t7', 7000, 'Glassy', [{ type: 'tool_result', toolUseId: 'e', toolName: 'slack--send_message', content: 'not_in_channel', isError: true }], 'c1'),
       msg('t8', 8000, 'Glassy', [{ type: 'tool_result', toolUseId: 'f', toolName: 'slack--upload_file', content: 'uploaded' }], 'c1'),
     ];
     const bound = () => {
@@ -580,7 +580,23 @@ describe('HistoryModule', () => {
       assert.deepEqual(await ids(h, { query: 'symbol,qty' }), [], "the file's contents aren't searched");
     });
 
-    it('extract shows each by its words, and a failed result as an error', async () => {
+    it("search and regex search mark a send whose result, stored after it, failed, on the send's own label, and not one whose result succeeded", async () => {
+      const h = bound();
+      const snippets = async (input: Record<string, unknown>) => {
+        const result = await h.handleToolCall(call('search', input));
+        assert.equal(result.success, true, result.error);
+        return (result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]);
+      };
+      assert.deepEqual(await snippets({ query: 'what content holds' }), [['t5', '[slack--send_message, error] what content holds']]);
+      assert.deepEqual(await snippets({ query: 'content h[a-z]+s', regex: true }), [['t5', '[slack--send_message, error] what content holds']]);
+      assert.deepEqual(await snippets({ query: 'positions for Friday' }), [['t6', '[slack--upload_file] the positions for Friday']]);
+      assert.deepEqual(await snippets({ query: 'through a text argument' }), [
+        ['t1', '[fixture--send_message] sent through a text argument'],
+        ['t2', '[fixture--reply_message] replied through a text argument'],
+      ], 'a send with no result stored after it is shown as it was');
+    });
+
+    it('extract shows each by its words, a send whose result failed as an error on its own label too, and a failed result as an error', async () => {
       const result = await bound().handleToolCall(call('extract', { channelId: 'c1', format: 'text' }));
       assert.equal(result.success, true, result.error);
       const shown = (result.data as { messages: Array<{ content: string }> }).messages.map((m) => m.content);
@@ -589,10 +605,32 @@ describe('HistoryModule', () => {
         '[fixture--reply_message] replied through a text argument',
         '[fixture--send_dm] a direct word as text',
         '[fixture--edit_message] edited through text',
-        '[slack--send_message] what content holds',
-        '[slack--upload_file] the positions for Friday',
+        '[slack--send_message, error] what content holds',
         '[tool_result: slack--send_message, error]',
+        '[slack--upload_file] the positions for Friday',
         '[tool_result: slack--upload_file]',
+      ]);
+    });
+
+    it("reads a send's result across its own body's shards and the results after it, and stops at a message of any other kind", async () => {
+      const shard = (m: StoredMessage, group: string, index: number): StoredMessage => ({ ...m, bodyGroupId: group, shardIndex: index, shardCount: 2 }) as StoredMessage;
+      const store: StoredMessage[] = [
+        shard(msg('s1', 1000, 'Glassy', [{ type: 'tool_use', id: 'p', name: 'fixture--send_message', input: { channelId: 'room', text: 'a sharded send' } }], 'c1'), 'g1', 0),
+        shard(msg('s2', 1000, 'Glassy', [textBlock(' and the rest of its body')], 'c1'), 'g1', 1),
+        msg('s3', 1000, 'Glassy', [{ type: 'tool_result', toolUseId: 'q', toolName: 'other--lookup', content: 'found' }], 'c1'),
+        msg('s4', 1001, 'Glassy', [{ type: 'tool_result', toolUseId: 'p', toolName: 'fixture--send_message', content: 'Missing Access', isError: true }], 'c1'),
+        msg('s5', 2000, 'Glassy', [{ type: 'tool_use', id: 'r', name: 'fixture--send_message', input: { channelId: 'room', text: 'a send with a word between' } }], 'c1'),
+        msg('s6', 2000, 'Ann', [textBlock('a word between the send and its result')], 'c1'),
+        msg('s7', 2001, 'Glassy', [{ type: 'tool_result', toolUseId: 'r', toolName: 'fixture--send_message', content: 'Missing Access', isError: true }], 'c1'),
+      ];
+      const { cm } = buildStub(store);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const result = await h.handleToolCall(call('search', { query: 'a sharded send|a send with a word between', regex: true }));
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual((result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]), [
+        ['s1', '[fixture--send_message, error] a sharded send'],
+        ['s5', '[fixture--send_message] a send with a word between'],
       ]);
     });
   });
