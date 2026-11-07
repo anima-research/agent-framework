@@ -20,7 +20,15 @@
   - A stored message holding only such items is sent, but the framework
     doesn't count it as a turn: the request's last turn, its count of stored
     injections, a refusal rewind and the shed after inference exhaustion pass
-    over it, as before, since every wire but the Responses API leaves it out.
+    over it, as before. The Responses API gets its items, except an Anthropic
+    server-tool block; Anthropic's API gets an assistant turn's paired
+    server-tool blocks, and a lone call in the request's last message; the
+    other wires get none.
+  - The framework doesn't resume a paused Anthropic turn (`pause_turn`)
+    itself. But a request made while a round stored as server-tool blocks
+    alone is newest now ends on that round, with no `[Continue]` after it,
+    which is the shape Anthropic asks for to resume one. Before, the request
+    left the round out.
   - A tool boundary's note to a context manager that keeps a thinking-binding
     record now names a row holding such an item where the next request
     carries it as the stream sent it, rather than marking it as a difference.

@@ -109,10 +109,13 @@ export function isStoredKind(injection: ContextInjection): boolean {
  * Whether content holds a turn in a request (holdsTurn): a block the
  * request's sanitizer keeps (Agent's assembleActivationRequest drops blank
  * text blocks, and a message left with none) that isn't a provider-native
- * item's carrier, which every wire but the Responses API leaves out. An
- * injection with none isn't stored: its row would vanish from a request,
- * and the count of stored rows the request ends on, which keeps [Continue]
- * last, would then be wrong. compile() places it, as before.
+ * item's carrier. A message holding only carriers isn't a turn: the
+ * Responses API gets its items, except an Anthropic server-tool block;
+ * Anthropic's API gets an assistant turn's paired server-tool blocks, and
+ * a lone call in the request's last message; the other wires get none. An
+ * injection with no turn isn't stored: its row would vanish from a
+ * request, and the count of stored rows the request ends on, which keeps
+ * [Continue] last, would then be wrong. compile() places it, as before.
  */
 export function hasRenderedContent(content: ContextInjection['content']): boolean {
   return Array.isArray(content) && holdsTurn(content as ContentBlock[]);

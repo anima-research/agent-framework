@@ -14329,8 +14329,8 @@ export class AgentFramework {
    * by each body's first message id), only a message that request carried
    * counts, or the stored result of a call it carried, which goes with that
    * call as one exchange; a row that holds no turn (holdsTurn: nothing a
-   * request sends, or only provider items' carriers, which every wire but
-   * the Responses API leaves out) is passed over and left in place. It adds no
+   * request sends, or only provider items' carriers) is passed over and
+   * left in place. It adds no
    * marker; the caller keeps one consolidated marker for the episode
    * (updateRewindMarker). The returned record's descriptor says what was
    * set aside and its size, never the content. Returns null when nothing

@@ -226,6 +226,19 @@ describe('membrane decides per provider what a carried item becomes', () => {
     assert.deepEqual(off.filter((b) => b.type === 'server_tool_use' || b.type === 'web_search_tool_result'), []);
   });
 
+  it('ends on a paused round stored as a lone server call, with no [Continue], which the native wire sends last', async () => {
+    // An Anthropic round that paused (pause_turn) on a server tool before any text, stored as its carrier alone.
+    const request = await agentCompiling([
+      { participant: 'human', content: [{ type: 'text', text: 'Search the tides.' }] },
+      { participant: 'tester', content: [carrierOf(SEARCH_CALL)] },
+    ]).buildActivationRequest([]);
+    const messages = request.messages as NormalizedMessage[];
+    assert.deepEqual(messages.map((m) => m.participant), ['human', 'tester']);
+    const built = new NativeFormatter().buildMessages([...messages], options('tester', { anthropicServerBlocks: true })).messages as Array<{ role: string; content: unknown }>;
+    assert.equal(built.at(-1)!.role, 'assistant');
+    assert.deepEqual(built.at(-1)!.content, [SEARCH_CALL]);
+  });
+
   it('sends the item of a message holding only a carrier on the Responses wire, and no server-tool block', async () => {
     const { messages, assistant } = await requestWithCarriers();
     const wire = responsesWire(messages, assistant);

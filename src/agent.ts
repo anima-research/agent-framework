@@ -154,8 +154,9 @@ import type {
  * `injectionTail` stored context injections after it, and whether those are
  * all context injections. Both count only messages that hold a turn
  * (holdsTurn), as the injection tail is counted: a message holding only
- * provider items' carriers is passed over, since every wire but the
- * Responses API leaves it out.
+ * provider items' carriers isn't a turn, and is passed over. So a paused
+ * Anthropic round stored as server-tool blocks alone, newest, ends the
+ * request with no [Continue] after it.
  */
 function turnBeforeInjections(messages: NormalizedMessage[], injectionTail: number): { turn: NormalizedMessage | undefined; injectionsOnly: boolean } {
   let counted = 0;
@@ -2157,7 +2158,8 @@ export class Agent {
     // The stored context injections the request ends on, counted over the
     // messages that hold a turn (hasRenderedContent): the sanitizer below
     // drops a message it leaves empty, a placed blank injection among them,
-    // and a message holding only provider items' carriers isn't a turn.
+    // and a message holding only provider items' carriers isn't a turn
+    // (holdsTurn).
     // [Continue] goes after them, and a tool loop's prompt is read from
     // before them: they're context, not what woke the agent. An injection
     // compile() places ends the tail, as on main, where every one was placed.

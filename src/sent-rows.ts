@@ -36,8 +36,10 @@ export function carriedBlock(block: ContentBlock): boolean {
 
 /**
  * Whether content holds a turn: a block a request carries besides a provider-native item's carrier. A message holding
- * only carriers is carried, so the Responses API gets its items, but every other wire leaves it out, so the framework's
- * own bookkeeping (the request's last turn, its count of stored injections, a shed) doesn't count it as a turn.
+ * only carriers is carried, but the framework's own bookkeeping (the request's last turn, its count of stored
+ * injections, a shed) doesn't count it as a turn: the Responses API gets its items, except an Anthropic server-tool
+ * block; Anthropic's API gets an assistant turn's paired server-tool blocks, and a lone call in the request's last
+ * message; the other wires get none.
  */
 export function holdsTurn(content: readonly ContentBlock[]): boolean {
   return content.some((block) => carriedBlock(block) && !carriesRawItem(block));
