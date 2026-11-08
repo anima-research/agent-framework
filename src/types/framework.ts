@@ -528,7 +528,7 @@ export interface FrameworkConfig {
    * registered channel, several, or one its server declared inbound-only, when
    * a turn would take it, is logged, and logged again only after a turn has
    * used it since; the turn takes what it would without the setting.
-   * `channel_publish`'s description names it among the defaults only on a
+   * `channel_publish`'s description adds a default for such turns only on a
    * framework with an event gate, the only one with such turns; on any other
    * the description is as it is without the setting.
    */

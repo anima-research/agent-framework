@@ -134,7 +134,7 @@ describe("channel_publish's description", () => {
     assert.equal(publishTool({ unpromptedChannel: OPS }).description, MAIN);
   });
 
-  it('with unpromptedChannel and an event gate, it names the channel for a timer\'s turn among the defaults, and nothing else changes', () => {
+  it('with unpromptedChannel and an event gate, it adds a default for a timer\'s turn, the channel this host names for it, and says a heartbeat\'s turn has no channel by design; the rest of the tool is unchanged', () => {
     const tool = publishTool({ unpromptedChannel: OPS, eventGatePresent: true });
     assert.equal(tool.description, "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn't routed), the channel this host names for such turns. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel by design, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.");
     assert.deepEqual({ ...tool, description: MAIN }, publishTool({ eventGatePresent: true }));
