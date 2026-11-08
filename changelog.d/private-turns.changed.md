@@ -34,9 +34,12 @@
   is told the turn is private and should post none of it either (below). The
   framework's typing indicator shows in no channel, though the built-in
   Discord module's `autoTyping` still types in its reply context's channel in
-  a private turn that isn't silent. MCPL servers' `beforeInference` hooks are
-  told no channel the turn speaks in and no message it answers. See
-  docs/dendrite.md, "Private turns".
+  a private turn that isn't silent. At a start that's private when its MCPL
+  servers' `beforeInference` hooks run, they're told no channel the turn
+  speaks in and no message it answers. A start of an agent whose window
+  couldn't be written down that turns private only after its hooks, as the
+  error policy's retry can, has already told them its channel and the message
+  it answers. See docs/dendrite.md, "Private turns".
   - A module that stores a channel's message for an `external-message`
     event whose metadata names no `channelId` now gets a private turn for it
     (under Breaking).
