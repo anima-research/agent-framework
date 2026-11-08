@@ -710,13 +710,13 @@ export function qualifiedChannelName(ref: ChannelRef): string {
 
 /** A channel tool's refusal of a message id given as something other than a
  *  string: one written as a JSON number past 2^53 is rounded when the call is
- *  parsed, so it would reach the server naming another message. */
+ *  parsed, so it would reach the server as a different id. */
 function idNotString(tool: string, field: string, value: unknown): ToolResult | undefined {
   if (value === undefined || value === null || typeof value === 'string') return undefined;
   return {
     success: false,
     error: `Nothing changed: ${tool}'s ${field} must be a string. Give it in quotes, as the invitation notice does: ` +
-      'a message id written as a number can lose its last digits before it reaches the server, and then names another message.',
+      'a message id written as a number can lose its last digits before it reaches the server, and then arrives as a different id.',
     isError: true,
   };
 }

@@ -3,6 +3,6 @@
   before anything changes, with an answer saying to give the id in quotes, as
   the invitation notice does. In 0.33.0 they went to the MCPL server as given,
   and an id the model wrote as a number past 2^53 had already been rounded
-  when the call was parsed, so it reached the server naming another message:
-  a backscroll anchored elsewhere, or an acknowledgment of another message.
+  when the call was parsed, so it reached the server as a different id, as a
+  backscroll's anchor or as the message an acknowledgment is for.
   A string id goes to the server as before, and `null` is handled as before.
