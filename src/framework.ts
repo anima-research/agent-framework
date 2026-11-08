@@ -1325,8 +1325,6 @@ function gotPartway(routing: TurnRouting): boolean {
 
 const REARM_REASON = 'exhausted-turn-rearm';
 
-type WakesOnTheirWay = { queued: string[]; batchOnly?: string[]; held?: { until?: number; rearm?: { number: number; of: number }; maybe?: true } };
-
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
   return (request as MarkedRequest)[MERGED_BATCH];
 }
@@ -4611,7 +4609,6 @@ export class AgentFramework {
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
    *  its admission back; the park, woken, then finds it gone. */
   private parkedContinuations: Set<InferenceRequest> = new Set();
-  private parkedStarts: Set<{ agent: Agent; batchOnly: boolean; trigger?: InferenceRequest }> = new Set();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
    *  token, and a turn that has ended isn't live (liveTurns). A later start
@@ -5549,11 +5546,8 @@ export class AgentFramework {
         // What else wakes the agent with no new event, beside the gate's own
         // timers: a wake already queued for it, and a turn a provider cooldown
         // holds until it ends.
-        wakeReading: (agentName) => {
-          const onTheirWay = framework.wakesOnTheirWay(agentName);
-          const failedLastTurn = framework.failedLastTurnFor(agentName, onTheirWay);
-          return { upcomingWakes: framework.upcomingWakesFor(agentName, onTheirWay), ...(failedLastTurn ? { failedLastTurn } : {}) };
-        },
+        upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
+        failedLastTurn: (agentName) => framework.failedLastTurnFor(agentName),
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
@@ -6724,91 +6718,35 @@ export class AgentFramework {
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
-   * request already queued for it, and one a provider hold keeps until it
-   * ends. The reply judge is told of them beside the gate's own timers, so it
-   * can weigh what waiting costs.
+   * request already queued for it (it runs as soon as the agent is free) and
+   * turns a provider cooldown holds until its end. The reply judge is told of
+   * them beside the gate's own timers, so it can weigh what waiting costs.
    */
-  private upcomingWakesFor(agentName: string, onTheirWay = this.wakesOnTheirWay(agentName)): import('./gate/types.js').UpcomingWake[] {
+  private upcomingWakesFor(agentName: string): import('./gate/types.js').UpcomingWake[] {
     const wakes: import('./gate/types.js').UpcomingWake[] = [];
-    const { queued, batchOnly = [], held } = onTheirWay;
+    const queued = this.pendingRequests.filter((r) => r.agentName === agentName);
     if (queued.length > 0) {
+      const reason = queued[0]!.reason;
       wakes.push({
         certain: true,
         kind: 'queued',
-        what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(queued[0]), 0, 80)})`,
+        what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})`,
       });
     }
-    for (const what of batchOnly) wakes.push({ certain: false, kind: 'queued', what });
-    if (held?.maybe) {
-      const what = 'a start held by a provider hold, which starts no turn if it has nothing to read then';
-      wakes.push({ ...(held.until === undefined ? { when: 'when the hold on it is released' } : { at: held.until }), certain: false, kind: 'provider-hold', what });
-    } else if (held) {
-      wakes.push(held.until === undefined
-        ? { when: 'when the hold on it is released', certain: true, kind: 'provider-hold', what: 'a wake held by a provider hold' }
-        : { at: held.until, certain: true, kind: 'provider-hold', what: held.rearm
-          ? `a turn whose retries ran out, sent again (${held.rearm.number} of ${held.rearm.of})`
-          : 'a wake held by a provider hold, when it ends' });
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
+      wakes.push({ at: cooldown.until, certain: true, kind: 'provider-hold', what: cooldown.rearm
+        ? `a turn whose retries ran out, sent again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
+        : 'a turn held by a provider cooldown, when it ends' });
     }
     wakes.push(...this.heartbeatWakesFor(agentName));
     return wakes;
   }
 
-  private wakesOnTheirWay(agentName: string): WakesOnTheirWay {
-    const agent = this.agents.get(agentName);
-    const model = agent?.model;
-    const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
-    const unread = (r: InferenceRequest): boolean => !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m, true)));
-    const mine = (r: InferenceRequest): boolean => r.agentName === agentName;
-    const arriving = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
-    for (const pass of this.passRequests) for (const taken of pass.values()) arriving.push(...taken.filter(mine));
-    const queued = arriving.filter(unread).map((r) => String(r.reason));
-    const batchOnly: string[] = [];
-    let parkedCount = 0;
-    for (const parked of this.parkedStarts) {
-      if (parked.agent !== agent) continue;
-      parkedCount++;
-      if (parked.trigger !== undefined && !unread(parked.trigger)) batchOnly.push('a start waiting for an auxiliary call to finish, which starts no turn if a hold, a quiesce or a turn stops it then, since it has nothing left to read');
-      else if (parked.batchOnly) batchOnly.push('a start waiting for an auxiliary call to finish, which starts no turn if its deferred pushes give it nothing to read');
-      else queued.push('a start waiting for an auxiliary call to finish');
-    }
-    const passed: string[] = [];
-    const passedMaybe: string[] = [];
-    if (this.assembling.has(agentName)) {
-      const heldAfterCompile = this.registry.homeChannel(agentName) !== undefined && wait !== undefined;
-      const batchOnly = Boolean(this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length);
-      if (batchOnly && heldAfterCompile) passedMaybe.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read, and which a provider wait on its model holds after its compile if the wait still stands then');
-      else if (batchOnly) passedMaybe.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
-      else if (heldAfterCompile) passedMaybe.push('a start assembling its deferred pushes, which a provider wait on its model holds after its compile if the wait still stands then');
-      else passed.push('a start assembling its deferred pushes');
-    }
-    const ends = (until: number | null | undefined): { until?: number } =>
-      (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
-    const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    const expired = cooldown !== undefined && !cooldown.hostHoldError && cooldown.until <= Date.now();
-    const letGo = cooldown !== undefined && (cooldown.rearm !== undefined || expired) && arriving.length + parkedCount > 0;
-    if (letGo) queued.unshift(...cooldown.heldRequests.filter(unread).map((r) => String(r.reason)));
-    const waiting = queued.length + batchOnly.length;
-    if (cooldown && !letGo) {
-      const atRelease = [...cooldown.heldRequests, ...arriving];
-      const releaseWakes = atRelease.some(unread) || (atRelease.length === 0 && !(cooldown.auxiliaryOrigin || cooldown.emptiedBy));
-      if (releaseWakes || waiting > 0) {
-        const waitHold = cooldown.waitModel !== undefined;
-        const until = cooldown.hostHoldError ? undefined
-          : wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
-        return { queued: passed, batchOnly: passedMaybe, held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}), ...(!releaseWakes && queued.length === 0 ? { maybe: true as const } : {}) } };
-      }
-    }
-    if (waiting > 0 && wait) return { queued: passed, batchOnly: passedMaybe, held: { ...ends(wait.until), ...(queued.length === 0 ? { maybe: true as const } : {}) } };
-    return { queued: [...queued, ...passed], batchOnly: [...batchOnly, ...passedMaybe] };
-  }
-
-  private failedLastTurnFor(agentName: string, onTheirWay?: WakesOnTheirWay): import('./gate/types.js').FailedLastTurn | undefined {
+  private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
     const agent = this.agents.get(agentName);
     const at = agent && this.lastStartFailed.get(agent);
-    if (at === undefined) return undefined;
-    const { queued, batchOnly = [], held } = onTheirWay ?? this.wakesOnTheirWay(agentName);
-    if (queued.length > 0 || batchOnly.length > 0) return { at, again: { kind: 'queued', ...(queued.length === 0 ? { maybe: true as const } : {}) } };
-    return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}), ...(held.maybe ? { maybe: true as const } : {}) } : { kind: 'none' } };
+    return at === undefined ? undefined : { at };
   }
 
   /**
@@ -22391,7 +22329,16 @@ export class AgentFramework {
       // notice the render stands for: such a message asked nothing of the
       // agent, so reading it was all its wake was for, as for a chat:system
       // notice. One with neither tag is judged as addressed.
-      const read = requests.filter((r) => this.alreadyRead(agent, r));
+      const read = requests.filter((r) => {
+        if (r.readsRow === undefined) return false;
+        // A chat:system notice asks nothing either, ambient or not, and no
+        // speech is routed by it, so waiting for one in its channel would
+        // keep its wake forever. The channel is on its own server where the
+        // wake names one (a gate's routed wake, whose source is 'gate').
+        const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
+          ? undefined : { serverId: r.channelServerId ?? r.source, channelId: r.channelId };
+        return this.rowDone(agent, r.readsRow, to);
+      });
       if (read.length > 0) {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
@@ -26725,10 +26672,7 @@ export class AgentFramework {
         // owned and the continuation receives it after the in-flight call settles.
         const parkedContinuation = trigger !== undefined && continuesTurn(trigger);
         if (parkedContinuation) this.parkedContinuations.add(trigger);
-        const parkedStart = parkedContinuation ? undefined : { agent, batchOnly: Boolean(trigger?.coalescingBatchSubjects?.length), trigger };
-        if (parkedStart) this.parkedStarts.add(parkedStart);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
-          if (parkedStart) this.parkedStarts.delete(parkedStart);
           // A continuation dropped while it was parked left the set then, with
           // its admission given back.
           if (parkedContinuation && !this.parkedContinuations.delete(trigger)) return;
@@ -26790,7 +26734,6 @@ export class AgentFramework {
           }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
-          if (parkedStart) this.parkedStarts.delete(parkedStart);
           this.releasePrimaryProviderGate(agent.name);
           console.error(`[provider-cooldown] failed to resume primary for ${agent.name}: ${describeFailureWithFrames(error)}`);
         });
@@ -34384,17 +34327,6 @@ export class AgentFramework {
     }
   }
 
-  private alreadyRead(agent: Agent, r: InferenceRequest, readOnly = false): boolean {
-    if (r.readsRow === undefined) return false;
-    // A chat:system notice asks nothing either, ambient or not, and no
-    // speech is routed by it, so waiting for one in its channel would
-    // keep its wake forever. The channel is on its own server where the
-    // wake names one (a gate's routed wake, whose source is 'gate').
-    const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
-      ? undefined : { serverId: r.channelServerId ?? r.source, channelId: r.channelId };
-    return this.rowDone(agent, r.readsRow, to, readOnly);
-  }
-
   /**
    * Whether a wake for a row it reads (InferenceRequest.readsRow) has
    * nothing left for the agent to do, on evidence only. The row is done once
@@ -34406,14 +34338,14 @@ export class AgentFramework {
    * covered, so its wake stays: its turn presents the row. Any doubt keeps
    * the wake, such as a store that can't be read.
    */
-  private rowDone(agent: Agent, readsRow: string, to: PublishDestination | undefined, readOnly = false): boolean {
+  private rowDone(agent: Agent, readsRow: string, to: PublishDestination | undefined): boolean {
     try {
       const cm = agent.getContextManager();
       const row = cm.getMessage(readsRow as MessageId);
       if (!row) return true;
       return this.answeredCovers(agent, cm, row, to);
     } catch (error) {
-      if (!readOnly) console.error(`[wake] ${agent.name}: could not read whether row ${readsRow} was read, so its wake stays:`, error);
+      console.error(`[wake] ${agent.name}: could not read whether row ${readsRow} was read, so its wake stays:`, error);
       return false;
     }
   }

@@ -102,13 +102,10 @@ export interface ReplyJudgeDeps {
    *  timers the request carries: wakes the framework has queued or holds. A
    *  provider that throws counts as knowing of none. */
   upcomingWakes?: (agentName: string) => UpcomingWake[] | Promise<UpcomingWake[]>;
-  /** In one call, what else will wake the agent, as `upcomingWakes` gives
-   *  it, and its last turn, when it failed and no turn has started since:
-   *  the judge then says what woke it may be unanswered. Both come from one
-   *  reading, so they can't disagree. When given, the judge reads it in place
-   *  of `upcomingWakes`. A provider that throws counts as knowing of no wake
-   *  and no failed turn. */
-  wakeReading?: (agentName: string) => { upcomingWakes: UpcomingWake[]; failedLastTurn?: FailedLastTurn };
+  /** The agent's last turn, when it failed and no turn has started since:
+   *  the judge then says what woke it may be unanswered. A provider that
+   *  throws counts as no failed turn. */
+  failedLastTurn?: (agentName: string) => FailedLastTurn | undefined;
 }
 
 /** One message of the agent's context, rendered. */
@@ -262,17 +259,14 @@ function inWhile(at: number | undefined, now: number): string {
   return `in ${h} h${m % 60 ? ` ${m % 60} min` : ''}`;
 }
 
-export function failedTurnLine(failed: FailedLastTurn, agentName: string, now: number): string {
+export function failedTurnLine(failed: FailedLastTurn, wakes: readonly UpcomingWake[], agentName: string, now: number): string {
   const opening = `${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`;
-  const maybe = failed.again.kind !== 'none' && failed.again.maybe ? ', which may not start a turn' : '';
-  switch (failed.again.kind) {
-    case 'queued':
-      return `${opening} A wake for ${agentName} is already queued${maybe}.`;
-    case 'held':
-      return `${opening} A wake for ${agentName} is held, ${failed.again.until !== undefined ? `due to be let go ${inWhile(failed.again.until, now)}` : 'and is let go when the hold on it is released'}${maybe}.`;
-    default:
-      return `${opening} Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes ${agentName}.`;
+  if (wakes.some((w) => w.kind === 'queued' && w.certain)) return `${opening} A wake for ${agentName} is already queued.`;
+  const held = wakes.find((w) => w.kind === 'provider-hold' && w.certain);
+  if (held) {
+    return `${opening} A wake for ${agentName} is held, ${held.at !== undefined ? `due to be let go ${inWhile(held.at, now)}` : 'and is let go when the hold on it is released'}.`;
   }
+  return `${opening} Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes ${agentName}.`;
 }
 
 /**
@@ -290,12 +284,10 @@ export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now
   const more = rest.length > 0 ? [`- and ${rest.length} more${maybe > 0 ? `, ${maybe === rest.length ? 'each' : `${maybe} of them`} only maybe` : ''}`] : [];
   return [
     '<if_you_wait>',
-    ...(failed ? [failedTurnLine(failed, agentName, now)] : []),
+    ...(failed ? [failedTurnLine(failed, wakes, agentName, now)] : []),
     ...(listed.length > 0
       ? [`If you answer WAIT and nothing new arrives, ${agentName} is next woken by:`, ...listed, ...more]
-      : failed && failed.again.kind !== 'none'
-        ? [`Beside that wake, nothing the host knows of is scheduled to wake ${agentName} (a server's own timers, such as a heartbeat, may not be listed).`]
-        : [`Nothing the host knows of is scheduled to wake ${agentName}: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).`]),
+      : [`Nothing the host knows of is scheduled to wake ${agentName}: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).`]),
     '</if_you_wait>',
   ].join('\n');
 }
@@ -390,7 +382,7 @@ export class ReplyJudge {
   private readonly preview: ReplyJudgeDeps['preview'];
   private readonly recordUsage: ReplyJudgeDeps['recordUsage'];
   private readonly extraWakes: ReplyJudgeDeps['upcomingWakes'];
-  private readonly wakeReading: ReplyJudgeDeps['wakeReading'];
+  private readonly failedLastTurn: ReplyJudgeDeps['failedLastTurn'];
   /** Characters per token, corrected from each response's reported input. */
   private charsPerToken = INITIAL_CHARS_PER_TOKEN;
   private readonly anchors = new Map<string, Anchor>();
@@ -418,7 +410,7 @@ export class ReplyJudge {
     this.preview = deps.preview;
     this.recordUsage = deps.recordUsage;
     this.extraWakes = deps.upcomingWakes;
-    this.wakeReading = deps.wakeReading;
+    this.failedLastTurn = deps.failedLastTurn;
   }
 
   /** The gate's judge function. */
@@ -449,22 +441,16 @@ export class ReplyJudge {
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
 
     let pending: UpcomingWake[] | Promise<UpcomingWake[]> | undefined;
+    try {
+      pending = this.extraWakes?.(agentName);
+    } catch {
+      pending = undefined;
+    }
     let failed: FailedLastTurn | undefined;
-    if (this.wakeReading) {
-      try {
-        const reading = this.wakeReading(agentName);
-        pending = reading.upcomingWakes;
-        failed = reading.failedLastTurn;
-      } catch {
-        pending = undefined;
-        failed = undefined;
-      }
-    } else {
-      try {
-        pending = this.extraWakes?.(agentName);
-      } catch {
-        pending = undefined;
-      }
+    try {
+      failed = this.failedLastTurn?.(agentName);
+    } catch {
+      failed = undefined;
     }
     let extra: UpcomingWake[] = [];
     try {

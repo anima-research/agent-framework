@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { MembraneError } from '@animalabs/membrane';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
 import { ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, judgeSystemPrompt, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
-import type { FailedLastTurn, JudgeRequest } from '../src/gate/types.js';
+import type { FailedLastTurn, JudgeRequest, UpcomingWake } from '../src/gate/types.js';
 import { oneLine, quotedValue } from '../src/supplied-text.js';
 
 function msg(participant: string, text: string): NormalizedMessage {
@@ -573,37 +573,66 @@ describe('reply judge: the document', () => {
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
   });
 
-  it("says first that the agent's last turn failed, then what runs it again: nothing, or a queued or held wake, which may not start a turn, beside which nothing else is scheduled, read from the wake reading in place of upcomingWakes", async () => {
+  it("says first that the agent's last turn failed, then what runs it again, by the kinds of wake the list holds: a certain queued wake, else a certain provider hold, else nothing", async () => {
     const now = 1_000_000;
+    const failed: FailedLastTurn = { at: now - 30_000 };
     const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
-    const beside = 'Beside that wake, nothing the host knows of is scheduled to wake Scout';
-    const cases: [FailedLastTurn['again'], string, string][] = [
-      [{ kind: 'none' }, 'Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes Scout.', 'Nothing the host knows of is scheduled to wake Scout:'],
-      [{ kind: 'queued' }, 'A wake for Scout is already queued.', beside],
-      [{ kind: 'queued', maybe: true }, 'A wake for Scout is already queued, which may not start a turn.', beside],
-      [{ kind: 'held', until: now + 180_000 }, 'A wake for Scout is held, due to be let go in 3 min.', beside],
-      [{ kind: 'held', until: now + 180_000, maybe: true }, 'A wake for Scout is held, due to be let go in 3 min, which may not start a turn.', beside],
-      [{ kind: 'held' }, 'A wake for Scout is held, and is let go when the hold on it is released.', beside],
+    const nothing = 'Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes Scout.';
+    const queued = { certain: true, kind: 'queued', what: 'a wake already queued (x)' } as const;
+    const held = { at: now + 180_000, certain: true, kind: 'provider-hold', what: 'a turn held by a provider cooldown, when it ends' } as const;
+    const cases: [UpcomingWake[], string][] = [
+      [[], nothing],
+      [[queued], 'A wake for Scout is already queued.'],
+      [[held], 'A wake for Scout is held, due to be let go in 3 min.'],
+      [[{ when: 'when the hold on it is released', certain: true, kind: 'provider-hold', what: 'a wake held by the host' }], 'A wake for Scout is held, and is let go when the hold on it is released.'],
+      [[held, queued], 'A wake for Scout is already queued.'],
+      [[{ ...queued, certain: false }], nothing],
+      [[{ ...held, certain: false }], nothing],
+      [[{ at: now + 60_000, certain: true, kind: 'heartbeat', what: 'its heartbeat' }, { at: now + 90_000, certain: false, kind: 'judge-batch', what: 'a batch' }], nothing],
+      [[{ certain: true, what: 'a wake already queued (x)' }], nothing],
     ];
-    for (const [again, said, next] of cases) {
-      const failed = { at: now - 30_000, again };
-      assert.strictEqual(failedTurnLine(failed, 'Scout', now), `${opening} ${said}`);
-      const text = ifYouWait([], 'Scout', now, failed);
-      assert.ok(text.startsWith(['<if_you_wait>', `${opening} ${said}`, next].join('\n')), text);
-      if (again.kind !== 'none') assert.ok(!text.includes("isn't woken until a new event arrives"), text);
+    for (const [wakes, said] of cases) {
+      assert.strictEqual(failedTurnLine(failed, wakes, 'Scout', now), `${opening} ${said}`);
+      const text = ifYouWait(wakes, 'Scout', now, failed);
+      assert.ok(text.startsWith(['<if_you_wait>', `${opening} ${said}`, wakes.length > 0 ? 'If you answer WAIT and nothing new arrives, Scout is next woken by:' : 'Nothing the host knows of is scheduled to wake Scout:'].join('\n')), text);
     }
     const { membrane, requests } = fakeMembrane();
-    let listed = false;
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
-      wakeReading: () => ({ upcomingWakes: [], failedLastTurn: { at: Date.now() - 125_000, again: { kind: 'none' } } }),
-      upcomingWakes: () => { listed = true; return []; },
+      upcomingWakes: () => [{ certain: true, kind: 'queued', what: 'a wake already queued (x)' }],
+      failedLastTurn: () => ({ at: Date.now() - 125_000 }),
     });
     await judge.judge(judgeRequest());
     const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
-    assert.ok(last.includes("<if_you_wait>\nScout's last turn, 2m ago, failed and may not have answered all of what woke it. Nothing runs it again"), last);
-    assert.strictEqual(listed, false, 'the wake reading is read in place of upcomingWakes');
+    assert.ok(last.includes("<if_you_wait>\nScout's last turn, 2m ago, failed and may not have answered all of what woke it. A wake for Scout is already queued.\nIf you answer WAIT"), last);
+  });
+
+  it("gives the failed-turn line in the words the judge's model was measured on, with a queued wake listed, a far-off one, or none", () => {
+    const now = 1_000_000;
+    const failed: FailedLastTurn = { at: now - 120_000 };
+    const opening = "scout's last turn, 2m ago, failed and may not have answered all of what woke it.";
+    const nothing = 'Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes scout.';
+    assert.strictEqual(ifYouWait([{ certain: true, kind: 'queued', what: 'a wake already queued (mcpl:channel-incoming)' }], 'scout', now, failed), [
+      '<if_you_wait>',
+      `${opening} A wake for scout is already queued.`,
+      'If you answer WAIT and nothing new arrives, scout is next woken by:',
+      '- as soon as it is free: a wake already queued (mcpl:channel-incoming)',
+      '</if_you_wait>',
+    ].join('\n'));
+    assert.strictEqual(ifYouWait([{ at: now + 6 * 3_600_000, certain: true, kind: 'heartbeat', what: 'its heartbeat (a check-in prompt, every 6 h)' }], 'scout', now, failed), [
+      '<if_you_wait>',
+      `${opening} ${nothing}`,
+      'If you answer WAIT and nothing new arrives, scout is next woken by:',
+      '- in 6 h: its heartbeat (a check-in prompt, every 6 h)',
+      '</if_you_wait>',
+    ].join('\n'));
+    assert.strictEqual(ifYouWait([], 'scout', now, failed), [
+      '<if_you_wait>',
+      `${opening} ${nothing}`,
+      "Nothing the host knows of is scheduled to wake scout: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).",
+      '</if_you_wait>',
+    ].join('\n'));
   });
 
   it("tells the judge that what was stored as it arrived stays stored for when something next wakes the agent, not that the events stay in its context", () => {
@@ -641,10 +670,10 @@ describe('reply judge: the document', () => {
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
-      wakeReading: () => { read++; throw new Error('boom'); },
+      failedLastTurn: () => { read++; throw new Error('boom'); },
     });
     await judge.judge(judgeRequest());
-    assert.strictEqual(read, 1, 'premise: the reading was asked, and threw');
+    assert.strictEqual(read, 1, 'premise: the failed turn was asked about, and threw');
     assert.ok(!(requests[0]!.messages.at(-1)!.content[0] as { text: string }).text.includes('last turn'));
   });
 

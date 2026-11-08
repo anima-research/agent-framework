@@ -364,15 +364,15 @@ export interface ReplyJudgeOptions {
    * wait lasts each judge rule's batch is delivered without the judge being
    * asked, unless a turn that changes what the judge reads, or the host's
    * quiesce, holds the batch past the wait's end, or it waits behind a call
-   * of its rule that the judge answers WAIT when its calls are no longer
-   * refused, when it goes to the judge. Under `"skip"`, the batch is held in memory while the judge's
+   * of its rule that the judge answers WAIT, when it goes to the judge.
+   * Under `"skip"`, the batch is held in memory while the judge's
    * calls are refused. While a refusal's
    * stated wait lasts, batches that arrive are held with it, a rule keeping
    * its newest 100 events as it does while a turn holds them, and they go
    * back to the judge once the wait ends or the hold is released, and no turn that
    * changes what the judge reads runs and the host isn't quiesced. A
-   * refusal that states no end, or no time left, keeps them held until a later batch's call,
-   * which takes in its own rule's held batch, gets a REPLY or WAIT, or the gate is
+   * refusal that states no end, or no time left, keeps them held until a judge call gets
+   * a REPLY or WAIT (a later batch's call takes in its own rule's held batch), or the gate is
    * told the hold ended or was released (`EventGate.providerCallsReleased`).
    * A later call that fails lets its batch go, with the held events it took
    * in, as a failed call's batch goes under `"skip"`.
@@ -417,20 +417,12 @@ export type UpcomingWakeKind =
 
 /**
  * The agent's last turn, when it failed (its retries spent, or by a throw
- * before its stream) and no turn has started since, as the reply judge is told it: when it failed, and whether
- * a wake of the agent's is on its way with no new event, already queued or
- * held until a provider hold ends (`until`, absent when it states no end, or
- * when it's the host's, which the host is asked about again then). Neither says the wake starts a turn: the host's inference
- * policy can still decline it, and a start whose only causes are deferred
- * batches starts none if they give it nothing to read. `maybe` marks a wake
- * that may not start a turn: a start whose only causes are deferred batches,
- * a conversation agent's start assembling its deferred pushes under a provider
- * wait on its model, which holds it after its compile, or a hold that holds
- * only starts of the first kind. The wake list gives each one's reason.
+ * before its stream) and no turn has started since, as the reply judge is
+ * told it: when it failed. The judge reads whether a wake of the agent's is on
+ * its way from the wake list it's given.
  */
 export interface FailedLastTurn {
   at: number;
-  again: { kind: 'none' } | { kind: 'queued'; maybe?: true } | { kind: 'held'; until?: number; maybe?: true };
 }
 
 /**
@@ -451,7 +443,7 @@ export interface UpcomingWake {
    *  hold only a release or another call ends); given without `at`, and
    *  shown in its place. */
   when?: string;
-  /** False when it only may wake the agent, such as a judge rule's batch that goes, or may yet go, to the judge, or a start whose only causes are deferred batches, which starts no turn if they give it nothing to read. */
+  /** False when it only may wake the agent, such as a judge rule's batch that goes, or may yet go, to the judge. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
@@ -472,8 +464,7 @@ export interface JudgeRequest {
   agentNames: string[];
   /** The gate's own timers that will wake those agents with no new event, or
    *  may (`certain` false) (upcomingWakes): their self-wakes, a sleep's end,
-   *  every pending batch but this one, save one delivered without the judge
-   *  under a refusal whose every event's channel is held now, and events
+   *  every pending batch but this one, and events
    *  buffered while a turn runs or the host is quiesced. The framework's own
    *  judge adds what the framework knows besides. */
   upcomingWakes?: UpcomingWake[];

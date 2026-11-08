@@ -632,31 +632,13 @@ test('a wake while the agent waits starts its turn at once, with the re-armed tr
   assert.equal(r.admission().providerAdmission.heldRequests, 0, 'nothing is left held');
 });
 
-test("a wake queued while the agent waits for a re-arm is what the judge is told of, not the re-arm's end, since the wake starts the turn at once", async (t) => {
-  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : undefined));
-  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [60_000] });
-  const internal = r.fw as unknown as {
-    upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
-    failedLastTurnFor(agentName: string): { again: { kind: string } } | undefined;
-  };
-  r.say('zz-question');
-  await waitFor(() => r.count('inference:exhausted') === 1, 'the window to end exhausted');
-  assert.equal(r.admission().providerAdmission.heldRequests, 1, 'premise: the re-armed turn is held');
-  queue(r, { reason: 'zz-wake' });
-  assert.deepEqual(internal.upcomingWakesFor('resident').map((w) => w.what), ['2 wakes already queued (external-message)']);
-  assert.equal(internal.failedLastTurnFor('resident')?.again.kind, 'queued');
-  await waitFor(() => r.count('inference:completed') === 1, 'premise: the queued wake starts the turn');
-  assert.equal(membrane.sends.length, 4, 'premise: at once, with no fourth delay of 60 s');
-  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'premise: the re-arm went with the wake');
-});
-
 for (const silent of [false, true]) {
-  test(`a ${silent ? 'silent ' : ''}start that throws before its stream, at the turn's checkpoint, is a failed last turn the judge is told of, with nothing on its way`, async (t) => {
+  test(`a ${silent ? 'silent ' : ''}start that throws before its stream, at the turn's checkpoint, is a failed last turn the judge is told of`, async (t) => {
     const membrane = new ScriptedMembrane(() => undefined);
     const r = await resident(t, membrane);
     const internal = r.fw as unknown as {
       recordTurnCheckpoint(agentName: string): void;
-      failedLastTurnFor(agentName: string): { at: number; again: { kind: string } } | undefined;
+      failedLastTurnFor(agentName: string): { at: number } | undefined;
       activeTurnTriggers: Map<string, { suppressProse?: boolean }>;
     };
     const record = internal.recordTurnCheckpoint.bind(r.fw);
@@ -672,7 +654,6 @@ for (const silent of [false, true]) {
     await waitFor(() => internal.failedLastTurnFor('resident') !== undefined, 'the judge to be told the last turn failed');
     const failed = internal.failedLastTurnFor('resident')!;
     assert.ok(failed.at >= before && failed.at <= Date.now(), String(failed.at - before));
-    assert.equal(failed.again.kind, 'none', 'nothing queued or held runs it again');
     assert.equal(suppressed === true, silent, "premise: the failing start's trigger kept suppressProse when it had it");
     assert.equal(membrane.sends.length, 0, 'premise: the start threw before sending anything');
     assert.equal(r.count('inference:exhausted'), 0, 'premise: no inference failed');
