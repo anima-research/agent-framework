@@ -3194,10 +3194,13 @@ export class TuneOutCoordinator {
    * of the record reads them in first (lossRecordUnread), and writes this
    * run's kept ones there too; where this run keeps any, that write is
    * made here, before the marker, and the last stop's bound is judged by
-   * the destination's record (carriedNeeded). Never throws.
+   * the destination's record (carriedNeeded). The subconscious's last
+   * looks are read again too, so the next look reads the destination's
+   * record (lastLooks). Never throws.
    */
   branchMoved(): void {
     if (this.stopped) return;
+    this.lastLooksCache = undefined;
     try {
       const branch = this.branchNow();
       if (branch !== undefined && this.runStarts.has(branch)) {
