@@ -22311,6 +22311,7 @@ export class AgentFramework {
         }
       }
 
+      // A marked wake merged into an open turn's start would take that turn's routing, which can be public.
       if (this.openLogical?.has(agentName)) {
         const marked = requests.filter((r) => r.privateCaller && !isTurnContinuation(r.reason) && !isTurnRetry(r));
         if (marked.length > 0 && marked.length < requests.length) {
