@@ -835,8 +835,7 @@ const PROSE_LOCUS_TOOL: import('./types/index.js').ToolDefinition = {
     'until you change it here: the channel a message comes from, a heartbeat and channel_open never move it. ' +
     'While a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or ' +
     'is the newest message you\'ve had, or on a turn that continues one where that held, your plain speech goes to no ' +
-    'channel wherever this points and isn\'t held ' +
-    'as drafts; a change made then is kept for later turns. ' +
+    'channel wherever this points; a change made then is kept for later turns. ' +
     'Leave `to` out (or null) to see where it goes now. `to`: "#channel", "@person" or a channel id posts your ' +
     'plain speech there; "drafts" holds it as drafts instead, posted nowhere unless you resend them with the drafts ' +
     'tool. A change applies from your next round; what you wrote beside the call goes where your speech went before. ' +

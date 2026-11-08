@@ -98,7 +98,8 @@ speech as drafts until the recipe names one. A channel its server hasn't
 registered yet resolves once it has; until then that turn's plain speech is
 held as drafts, and the operator log says why. With no `proseLock`, plain
 speech is held as drafts until the resident chooses. A private turn's plain
-speech isn't held as drafts ("A private turn", above). Once the resident has
+speech isn't held as drafts, unless a send in the turn has left its reach
+unknown ("A private turn", above). Once the resident has
 chosen, its choice outranks the recipe's. A stored choice that can't be
 read, or whose stored entry names no destination, holds speech as drafts
 rather than fall back to the recipe's.

@@ -1,7 +1,8 @@
 /**
  * Held prose drafts (shelf-351): plain speech that is not sent is kept as a
  * private, explicitly resendable draft instead of vanishing, but for a private
- * turn's, which is kept as none (docs/dendrite.md, "Private turns").
+ * turn's, which is kept as none unless a send in the turn has left its reach
+ * unknown (docs/dendrite.md, "Private turns").
  *
  * Unit tests drive ProseDraftStore over a real Chronicle store; end-to-end
  * tests run real turns (MockMembrane) against a real MCPL child (the
