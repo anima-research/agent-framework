@@ -211,7 +211,7 @@ const heardIn = (stream: MockYieldingStream | undefined) => JSON.stringify(strea
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const call = (id: string, name: string, input: Record<string, unknown> = {}) =>
   ({ type: 'tool_use', id, name, input }) as ContentBlock;
-const go = () => ({ type: 'external-message', source: 'test', content: 'go' }) as unknown as ProcessEvent;
+const go = () => ({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: GENERAL }, echoMetadata: false }) as unknown as ProcessEvent;
 const channelMessage = (channelId: string, messageId: string, body: string, addressed = true) => ({
   type: 'mcpl:channel-incoming',
   serverId: 'chat',

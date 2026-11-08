@@ -227,7 +227,7 @@ describe('present while acting', () => {
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: { channelId: 'chan-live-1' },
     } as unknown as ProcessEvent);
   }
 
@@ -2904,6 +2904,7 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     module.interjection = 'look left!';
+    module.interjectionChannelId = 'chan-live-1';
 
     trigger(framework);
     await framework.runUntilIdle();
