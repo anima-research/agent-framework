@@ -13,9 +13,10 @@
  *  - `disposition:"never"` from a server marks its uri's record (§3.1, §5):
  *    while the mark stands, the framework starts no fetch of the payload and
  *    saves none of it, a fetch under way stops at its next chunk, and no
- *    stub, script object or link names a saved copy or the uri. A copy saved before the mark stays in the workspace, one whose save
- *    finished as the mark came is deleted where the delete succeeds, and the
- *    mark goes with a record lost to eviction or a restart;
+ *    stub, script object or link names a saved copy or the uri. A copy
+ *    saved before the mark stays in the workspace, one whose save finished
+ *    as the mark came is deleted where the delete succeeds, and the mark
+ *    goes with a record lost to eviction or a restart;
  *  - stub size is independent of every server-supplied field length (§5);
  *  - unparseable `expiresAt` fails closed (§7.4), and so does one rejected
  *    as a field: it's absent as testimony, never read as immortal;
@@ -25,10 +26,9 @@
  *
  * The ReferenceRegistry is the host-private reference record (§6.2): raw
  * URIs and testimony live here, and model-visible content shows a uri only
- * as a tool result's link line shows one (shownLinkUri). Fetching
- * (§6/§7 origin binding, ceilings, redirects) is deliberately not here yet —
- * the registry is what makes a future host-mediated fetcher and the
- * code-execution materialization hook possible.
+ * as a tool result's link line shows one (shownLinkUri). Fetching (§6/§7
+ * origin binding, ceilings, redirects) is reference-fetcher.ts's, which
+ * reads a record's servers and marks from here.
  */
 import { cutToFit, suppliedValue } from '../supplied-text.js';
 import { NOTICE_TAG } from '../notice-tags.js';
