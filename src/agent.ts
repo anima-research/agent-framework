@@ -173,6 +173,8 @@ function wireDigest(value: unknown): string {
 }
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+/** ContextManager.compile's own budget when it's given none. */
+const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT_BUDGET_TOKENS, reserveForResponse: 4_000 };
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
@@ -670,8 +672,8 @@ export class Agent {
     if (budget) return budget;
     if (this.contextBudgetTokens === undefined) {
       if (this.physicalWindowTokens === undefined) return undefined;
-      // Mirrors ContextManager.compile's own default room (100,000 less its 4,000 reserve).
-      return { maxTokens: 96_000 + this.maxTokens, reserveForResponse: this.maxTokens };
+      const room = CONTEXT_MANAGER_DEFAULT_BUDGET.maxTokens - CONTEXT_MANAGER_DEFAULT_BUDGET.reserveForResponse;
+      return { maxTokens: room + this.maxTokens, reserveForResponse: this.maxTokens };
     }
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
   }
@@ -685,8 +687,7 @@ export class Agent {
     const resolved = this.resolveBudget(budget);
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
-    // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    const base = resolved ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
   }
 
