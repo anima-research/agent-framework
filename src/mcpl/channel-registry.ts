@@ -568,7 +568,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own has no default, so it names one: a heartbeat's, and any turn while a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or is the newest message you've had, or that continues such a turn. A subagent has no default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own has no default, so it names one. Such a turn is a heartbeat's, or any turn while a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or is the newest message you've had, or one that continues such a turn. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {

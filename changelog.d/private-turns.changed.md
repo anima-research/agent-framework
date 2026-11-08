@@ -10,18 +10,22 @@
   surface message in its window. A channel's message there is a row whose
   inbound source is a channel, or a row with no inbound source, as a module
   writes for its channel's message, whose metadata names a `channelId` and
-  that has no `kind` and no `system` flag. A turn that hears one at a tool
-  boundary, or is presented one at a start that continues it, is private for
-  the rest of it and, unless it's silent or ends there, is told so by a
-  `[routing]` notice. The turns that the framework's own wakes from a private
-  turn open, its auto-continue, its ` !` continuation and a prose bounce's
-  resend, are private too (`InferenceRequest.privateCaller`, which the
-  framework sets). In a private turn, an envelope's own words go where
-  they would in any turn, and no envelope sets a destination for the turn's
-  later words. The built-in Discord module posts none of a private turn's
-  speech, and a host's own speech handler is told the turn is private and
-  should post none of it either (below). See docs/dendrite.md, "Private
-  turns".
+  that has no `kind` and no `system` flag. A row tagged as a reaction, an
+  edit, a deletion or a `chat:system` notice isn't one, but for an edit
+  delivered as the agent's first view of its message. A turn that hears an
+  operator's private message at a tool boundary, or is presented one at a
+  start that continues it, is private for the rest of it and, unless it's
+  silent or ends there, is told so by a `[routing]` notice. The turns that the
+  framework's own wakes from a private turn open, its auto-continue, its ` !`
+  continuation and a prose bounce's resend, are private too
+  (`InferenceRequest.privateCaller`, which the framework sets). In a private
+  turn, an envelope's own words go where they would in any turn, and no
+  envelope sets a destination for the turn's later words. `channel_publish`
+  naming no channel is refused in a private turn, and its refusal says to name
+  the channel. The built-in Discord module posts none of a private turn's
+  speech and edits none of its thoughts into a post, and a host's own speech
+  handler is told the turn is private and should post none of it either
+  (below). See docs/dendrite.md, "Private turns".
   - A module that stores a channel's message for an `external-message`
     event whose metadata names no `channelId` now gets a private turn for it
     (under Breaking).

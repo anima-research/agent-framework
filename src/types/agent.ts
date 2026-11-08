@@ -331,7 +331,8 @@ export interface AgentConfig {
    *   send externally; prose remains in Chronicle, and a turn that wrote plain
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    * - 'locked': unprefixed prose goes to one destination the agent chose, on
-   *   every turn, and nothing moves it automatically: not the channel that
+   *   every turn but a private one (docs/dendrite.md, "Private turns"), and
+   *   nothing moves it automatically: not the channel that
    *   woke the turn, not an addressed message, a heartbeat or channel_open.
    *   Only the `prose_locus` tool moves it, to a channel or to drafts (held,
    *   never posted unless the agent resends them). The choice persists
@@ -349,7 +350,9 @@ export interface AgentConfig {
    * `>>` target is, at each turn's start, so a channel its server hasn't
    * registered yet resolves once it has; until it resolves, plain speech is
    * held as drafts. Left out, plain speech is held as drafts until the agent
-   * chooses. The agent's own choice, once made, takes its place. Ignored in
+   * chooses. The agent's own choice, once made, takes its place. A private
+   * turn's plain speech goes to no channel whatever the lock names, and is
+   * held as drafts only as docs/dendrite.md, "Private turns", says. Ignored in
    * the other modes.
    */
   proseLock?: string;
@@ -672,9 +675,11 @@ export interface InferenceRequest {
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events).
-   * A heartbeat's turn takes no channel at all, and holds its plain speech as
-   * drafts; any other falls back to the global default channel, except an
-   * ephemeral run's (a subagent's), which takes no global fallback.
+   * A heartbeat's turn takes no channel at all, and, unless it's private,
+   * holds its plain speech as drafts; any other falls back to the global
+   * default channel, except an ephemeral run's (a subagent's), which takes no
+   * global fallback, and a private turn's, whose plain speech goes to no
+   * channel, whatever woke it (docs/dendrite.md, "Private turns").
    */
   channelId?: string;
   /**
@@ -698,12 +703,13 @@ export interface InferenceRequest {
   autoContinueRun?: AutoContinueRun;
   /**
    * Framework-set: whether this wake's turn is a heartbeat's, which has no
-   * channel and holds its plain speech as drafts. True on a wake that
-   * continues a heartbeat's turn with no channel of its own (an autoContinue
-   * continuation, a bounce's resend wake, a ` !` continuation, and a re-arm,
-   * which copies its trigger), and on a merged batch whose causes include a
-   * heartbeat's wake and name no channel; false on a merged batch with none,
-   * so the batch's first request doesn't decide it. Unset, a wake is a
+   * channel and, unless it's private, holds its plain speech as drafts. True
+   * on a wake that continues a heartbeat's turn with no channel of its own
+   * (an autoContinue continuation, a bounce's resend wake, a ` !`
+   * continuation, and a re-arm, which copies its trigger), and on a merged
+   * batch whose causes include a heartbeat's wake and name no channel; false
+   * on a merged batch with none, so the batch's first request doesn't decide
+   * it. Unset, a wake is a
    * heartbeat's when its `source` is `heartbeat`. Hosts don't set it.
    */
   heartbeatTurn?: boolean;

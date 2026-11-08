@@ -7284,6 +7284,7 @@ export class AgentFramework {
     const request: MarkedRequest = { ...trigger, [REARMED]: true };
     delete request[TURN_RETRY];
     delete request[MERGED_BATCH];
+    if (routing?.private) request.privateCaller = true;
     if (continuation) {
       request.reason = REARM_REASON;
       delete request.counterparty;
@@ -19175,6 +19176,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              ...(this.turnRouting.get(agent.name)?.private ? { privateCaller: true as const } : {}),
             }, currentState.stream ? this.streamCarries.get(currentState.stream)?.() : undefined);
             this.pendingRequests.push(continuation);
             // Context budget exceeded: break the stream, let compile() compress.
@@ -19312,6 +19314,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              ...(this.turnRouting.get(agent.name)?.private ? { privateCaller: true as const } : {}),
             });
           }
         }
@@ -22306,7 +22309,7 @@ export class AgentFramework {
       }
 
       if (this.openLogical?.has(agentName)) {
-        const marked = requests.filter((r) => r.privateCaller && !continuesTurn(r));
+        const marked = requests.filter((r) => r.privateCaller && !isTurnContinuation(r.reason) && !isTurnRetry(r));
         if (marked.length > 0 && marked.length < requests.length) {
           this.pendingRequests.push(...marked);
           const rest = requests.filter((r) => !marked.includes(r));
@@ -23668,6 +23671,11 @@ export class AgentFramework {
    *  heartbeat's turn with no locus of its own (InferenceRequest.heartbeatTurn)
    *  and a private turn (InferenceRequest.privateCaller), so the turn it opens
    *  is one too; nothing for any other turn. */
+  private opensPrivate(agent: Agent, trigger: InferenceRequest | undefined): boolean {
+    return trigger?.privateCaller === true
+      || privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata)) !== undefined;
+  }
+
   private heartbeatTurnMark(routing: TurnRouting): { heartbeatTurn?: true; privateCaller?: true } {
     const privateCaller = routing.private ? { privateCaller: true as const } : {};
     // A locked turn's locus is its lock, not a channel the heartbeat answered.
@@ -25859,12 +25867,12 @@ export class AgentFramework {
    * starts (startAgentStream), with the run's count as it stands and the
    * agent's cap. False when it couldn't be stored.
    */
-  private writeAutoContinueNotice(agent: Agent, mark: AutoContinueRun, heartbeat = false): boolean {
+  private writeAutoContinueNotice(agent: Agent, mark: AutoContinueRun, heartbeat = false, isPrivate = false): boolean {
     const count = this.autoContinueStreaks.get(agent.name) ?? 1;
     const max = agent.autoContinue?.maxConsecutive ?? count;
     const text = autoContinueNotice({
       agentName: agent.name, stop: mark.stop, last: count >= max, heldAfterSend: mark.heldAfterSend,
-      heartbeat,
+      heartbeat, private: isPrivate,
     });
     const before = this.storedCountOf(agent);
     let id: MessageId;
@@ -27409,7 +27417,7 @@ export class AgentFramework {
       const mark = trigger.autoContinueRun;
       const { autoContinueRun: _mark, ...unmarked } = trigger;
       trigger = unmarked;
-      if (!this.writeAutoContinueNotice(agent, mark, trigger.heartbeatTurn === true)) {
+      if (!this.writeAutoContinueNotice(agent, mark, trigger.heartbeatTurn === true, this.opensPrivate(agent, trigger))) {
         this.giveBackAutoContinue(agent.name, 'its row could not be stored');
         if (mark.sole) {
           console.error(`[continue] ${agent.name}: turn not started (the continuation was its only cause)`);
@@ -27511,9 +27519,7 @@ export class AgentFramework {
     this.turnRouting.set(agent.name, routing);
     if (opensTurn) {
       carry = undefined;
-      if (trigger?.privateCaller || privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata)) !== undefined) {
-        routing.private = true;
-      }
+      if (this.opensPrivate(agent, trigger)) routing.private = true;
     } else if (!routing.private) {
       const surface = this.presents(agent)
         ? presented.map((row) => operatorSurface(row.metadata)).find((name) => name !== undefined)
@@ -29542,6 +29548,7 @@ export class AgentFramework {
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
                   source: 'framework',
                   timestamp: Date.now(),
+                  ...(streamRouting.private ? { privateCaller: true as const } : {}),
                 });
                 handledByRewind = true;
               };
@@ -35433,6 +35440,7 @@ export class AgentFramework {
       reason: 'inference-failure-rewind-retry',
       source: 'framework',
       timestamp: Date.now(),
+      ...(this.turnRouting?.get(agent.name)?.private ? { privateCaller: true as const } : {}),
     });
   }
 
