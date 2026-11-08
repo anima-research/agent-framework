@@ -1,35 +1,42 @@
 - A turn that holds an operator's private message, one from a surface with no
   channel (a module's row for an `external-message` or `api:message` event
   whose metadata names no channel, such as a console's, the TUI's or an API
-  call's, other than the framework's own `mcpl:` notices of a server's new
-  tools), now speaks in no channel unless the agent names one, in every prose
-  mode and over a lock. Before, its answer could go wherever the turn's plain
-  speech went otherwise: a focused channel, the latest inbound channel, the
-  lock, or the locus of a room's turn that heard the message. A turn is
-  private while such a message is unanswered or is the newest channel or
-  surface message in its window. A channel's message there is a row whose
-  inbound source is a channel, or a row with no inbound source, as a module
-  writes for its channel's message, whose metadata names a `channelId` and
-  that has no `kind` and no `system` flag. A row tagged as a reaction, an
-  edit, a deletion or a `chat:system` notice isn't one, but for an edit
-  delivered as the agent's first view of its message. A turn that hears an
-  operator's private message at a tool boundary, or is presented one at a
-  start that continues it, is private for the rest of it and, unless it's
-  silent or ends there, is told so by a `[routing]` notice. The turns that the
-  framework's own wakes from a private turn open, its auto-continue, its ` !`
-  continuation and a prose bounce's resend, are private too
+  call's, other than one whose event's `source` begins with `mcpl:`, as the
+  framework's notices of a server's new tools do), now speaks in no channel
+  unless the agent names one, in every prose mode and over a lock. Before, its
+  answer could go wherever the turn's plain speech went otherwise: a focused
+  channel, the latest inbound channel, the lock, or the locus of a room's turn
+  that heard the message. A turn is private while such a message is unanswered
+  or is the newest channel or surface message in its window. Only a round of
+  the agent's that writes words and calls no tool answers it, so an answer
+  given only through a tool, such as a send, leaves it unanswered. A channel's
+  message there is a row whose inbound source is a channel, or a row with no
+  inbound source, as a module writes for its channel's message, whose metadata
+  names a `channelId`, that has no `kind` and no `system` flag, and that isn't
+  a conversation fork's closure prompt. A row tagged as a reaction, an edit, a
+  deletion or a `chat:system` notice isn't one, but for an edit delivered as
+  the agent's first view of its message. A turn that hears an operator's
+  private message at a tool boundary, or is presented one at a start that
+  continues it, is private for the rest of it and, unless it's silent or ends
+  there, is told so by a `[routing]` notice. Plain speech already waiting for
+  a channel to open when the turn turns private still posts there. The turns
+  that the framework's own wakes from a private turn open, its auto-continue,
+  its ` !` continuation and a prose bounce's resend, are private too
   (`InferenceRequest.privateCaller`, which the framework sets). So are a
   private turn's re-runs, each of which takes the mark from the turn: a
-  context-budget restart's continuation, the non-streaming fallback's
-  re-inference, a refusal rewind's or `/unstick`'s retry, the poisoned-history
-  rewind's retry, and a re-arm. In a private turn, an envelope's own words go
-  where they would in any turn, and no envelope sets a destination for the
-  turn's later words. `channel_publish` naming no channel is refused in a
-  private turn, and its refusal says to name the channel. The built-in Discord
-  module posts none of a private turn's speech and edits none of its thoughts
-  into a post, and a host's own speech handler is told the turn is private and
-  should post none of it either (below). See docs/dendrite.md, "Private
-  turns".
+  context-budget restart's continuation, a refusal rewind's or `/unstick`'s
+  retry, the poisoned-history rewind's retry, and a re-arm. In a private turn,
+  an envelope's own words go where they would in any turn, and no envelope
+  sets a destination for the turn's later words. `channel_publish` naming no
+  channel is refused in a private turn, and its refusal says to name the
+  channel. The built-in Discord module posts none of a private turn's speech
+  and edits none of its thoughts into a post, and a host's own speech handler
+  is told the turn is private and should post none of it either (below). The
+  framework's typing indicator shows in no channel, though the built-in
+  Discord module's `autoTyping` still types in its reply context's channel in
+  a private turn that isn't silent. MCPL servers' `beforeInference` hooks are
+  told no channel the turn speaks in and no message it answers. See
+  docs/dendrite.md, "Private turns".
   - A module that stores a channel's message for an `external-message`
     event whose metadata names no `channelId` now gets a private turn for it
     (under Breaking).

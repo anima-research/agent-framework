@@ -1,7 +1,8 @@
 - **Module authors whose module stores a row for an `external-message` event
-  whose metadata names no `channelId`, other than an operator's input from a
-  console, the TUI or an API call, such as a channel's message or a timer's,
-  a webhook's or a service's notice:** that row is now an operator's private
+  whose metadata names no `channelId` and whose `source` doesn't begin with
+  `mcpl:`, other than an operator's input from a console, the TUI or an API
+  call, such as a channel's message or a timer's, a webhook's or a service's
+  notice:** that row is now an operator's private
   message, from a surface with no channel, so the turn that holds it speaks in
   no channel unless the agent names one, and so does each later turn while
   it's unanswered or the newest message (the private-turns entry under
@@ -15,6 +16,12 @@
     operator's message has been answered, the row the module stores for each
     names the `channelId` in its metadata, with no `kind` and no `system`
     flag, as the built-in Discord module's rows do.
-  - **Unchanged:** a module's console, TUI or API input needs nothing, since
-    that input is what this change is for, and nor does a channel delivered
-    through an MCPL server. No sibling package needs a new version.
+  - **Unchanged:** a module that stores console, TUI or API input needs no
+    change, since that input is what this change is for, and nor does a
+    channel delivered through an MCPL server. No sibling package needs a new
+    version.
+- **Integrations that wake a resident with the API's `message.send`:** the
+  message names no channel, so the turn it wakes is private, and its answer
+  goes to no channel unless the agent names one. Before, it went wherever
+  plain speech went, such as a focused or locked channel. `message.send` has
+  no way to name a channel.

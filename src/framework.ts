@@ -1680,8 +1680,8 @@ function answersOperator(row: StoredMessage): boolean {
 }
 
 function channelConversation(metadata: unknown): boolean {
-  const row = metadata as { channelId?: unknown; system?: unknown; kind?: unknown; tags?: unknown; firstView?: unknown } | undefined;
-  if (isMarkerTagged(row?.tags, row?.firstView === true)) return false;
+  const row = metadata as { channelId?: unknown; system?: unknown; kind?: unknown; tags?: unknown; firstView?: unknown; conversationClosure?: unknown } | undefined;
+  if (isMarkerTagged(row?.tags, row?.firstView === true) || row?.conversationClosure === true) return false;
   const source = readInboundSource(metadata);
   if (source) return source.kind === 'channel';
   return typeof row?.channelId === 'string' && row.channelId !== '' && row.system !== true && row.kind === undefined;
@@ -7137,13 +7137,15 @@ export class AgentFramework {
    *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
    *  single subject), and the write a wake reads. A wake with any of them
    *  can be withdrawn or dropped on its own, and must not stand for one
-   *  without. (coalescingBatch is set only beside one of the first two.) */
+   *  without. (coalescingBatch is set only beside one of the first two.)
+   *  And the private mark (privateCaller), so a wake without it never stands
+   *  for one with it. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow &&
+      a.readsRow === b.readsRow && !a.privateCaller === !b.privateCaller &&
       (a.wakeLines ?? []).map(wakeLineKey).join('\n') === (b.wakeLines ?? []).map(wakeLineKey).join('\n');
   }
   /** Keep `request` among a hold's `held` requests, once by
@@ -18793,7 +18795,8 @@ export class AgentFramework {
             if (flushedTurn.unflushedRounds) flushedTurn.unflushedRounds--;
             this.endStatedWaitRun(agent.name);
           }
-          if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent
+          const wordsHadNowhere = flushedTurn?.private && ['locus', 'locked'].includes(this.proseRoutingOf(agent));
+          if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent && !wordsHadNowhere
             && pendingBlocks!.some((b) => b.type === 'text' && (b as { text?: string }).text?.trim())) {
             flushedTurn.unpostedSpeech = true;
           }
@@ -19314,7 +19317,6 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-              ...(this.turnRouting.get(agent.name)?.private ? { privateCaller: true as const } : {}),
             });
           }
         }
@@ -27789,6 +27791,10 @@ export class AgentFramework {
       if (stopAfterHooks) {
         this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn);
         return false;
+      }
+      if (!this.presents(agent) && !routing.private) {
+        const surface = privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata));
+        if (surface !== undefined) this.makeTurnPrivate(agent, routing, routing.silent ? undefined : surface);
       }
       this.nameUnpostedSpeech(agent, routing);
 

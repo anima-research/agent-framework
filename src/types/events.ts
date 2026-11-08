@@ -75,10 +75,11 @@ export interface ExternalMessageEvent {
   content: unknown;
   /**
    * External system metadata. `channelId` names the channel the message is
-   * from. A message whose metadata names none is an operator's private
-   * message, from a surface with no channel such as a console, the TUI or an
-   * API call: the turn that holds it speaks in no channel unless the agent
-   * names one (docs/dendrite.md, "Private turns").
+   * from. A message whose metadata names none, and whose `source` doesn't
+   * begin with `mcpl:`, is an operator's private message, from a surface
+   * with no channel such as a console, the TUI or an API call: the turn that
+   * holds it speaks in no channel unless the agent names one
+   * (docs/dendrite.md, "Private turns").
    */
   metadata: Record<string, unknown>;
   /** Whether this should trigger inference */

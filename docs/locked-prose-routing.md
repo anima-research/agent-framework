@@ -69,7 +69,9 @@ though the lock names one (docs/dendrite.md, "Private turns"). Its plain
 speech is posted nowhere and isn't held as drafts, unless a send in the turn
 has left its reach unknown, which holds it as drafts as in any turn, and
 `channel_publish`
-called with no channel has no default. A `prose_locus` call made in it moves
+called with no channel has no default. Plain speech already waiting for a
+channel to open when the turn turns private still posts there. A
+`prose_locus` call made in it moves
 the lock for later turns only, as a call from outside the turn does, and its
 result says this turn's speech goes to none. Turns speak at the lock again
 once the message has been answered and a channel's message is newer, but for
