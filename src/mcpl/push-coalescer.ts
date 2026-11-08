@@ -6,7 +6,9 @@
  * the ordinary channel/push path the moment it is admitted, exactly as today;
  * the coalescer only remembers WHERE it landed. A later occurrence of the same
  * subject edits or removes that message in place while it is still unread
- * (above the agent's consumed watermark, not folded by compression), and
+ * (above the agent's consumed watermark, a position in the agent's window,
+ * #291: a row not in the window yet is unread wherever it is in the store;
+ * not folded by compression), and
  * appends once it has been read. Nothing is staged, journaled or capped: on
  * any uncertainty (restart, branch switch, eviction) the host behaves as an
  * append-only host would, which is what the RFC's principle 4 asks for.
@@ -67,10 +69,16 @@ export class EmptyContentError extends CoalesceError {
 /** Where an unread occurrence currently lives. */
 export interface CoalescingPlacement {
   agent: string;
-  /** Stored message id in that agent's context manager. */
+  /** Stored message id in that agent's context manager. Absent for a write
+   *  kept in memory (a surgery's hold, or the wait for its agent's
+   *  recovery), which counts as read and can't be removed. */
   messageId?: string;
-  /** Entry id in the framework's deferred-write queue (turn-alive deferral). */
-  deferredId?: string;
+  /** Set on a placement that wasn't presented to `agent` at its write: a
+   *  write kept in memory (no `messageId` yet), or one stored while a turn
+   *  of the agent's was alive, or with a presentation at rest that failed
+   *  (#291's presentation index). No request of the agent's reads it until
+   *  it is presented. */
+  presented?: false;
 }
 
 export interface CoalescingScope { kind: 'featureSet' | 'channel'; id: string }
@@ -98,6 +106,20 @@ export interface CoalescedOccurrence<E = unknown> {
   identity?: { messageId?: string; author?: { id: string; name: string }; threadId?: string };
   /** The event the ordinary path would have queued — the host delivers it. */
   event: E;
+  /**
+   * The suppress rule that took this occurrence, or null when none did, once
+   * the host has decided (its wake, or its row, whichever came first). Decided
+   * once for the occurrence, since a rule's script answers once per event:
+   * its row and any later wake read this. Snapshots carry it.
+   */
+  suppressionDecision?: string | null;
+  /**
+   * Set on a batch's latest occurrence when the batch holds an occurrence
+   * addressed to the agent (`chat:addressed`), this one or an earlier one. An
+   * addressed event is never suppressed, so such a batch is shown, whatever its
+   * latest occurrence would be decided. Snapshots carry it.
+   */
+  batchAddressed?: true;
   /** Set by the coalescer: deliver into this agent only (§3.2 audience may
    *  narrow, never widen — a replacement or notice follows the prior delivery). */
   deliverTo?: string;
@@ -135,8 +157,19 @@ interface DeferredBatch<E> {
    *  acceptance receipt, which doesn't carry it, reads as not all ambient:
    *  the side that keeps a wake. */
   allAmbient?: true;
-  /** Set on a batch restored from a snapshot whose render may have started. */
+  /** Set on a batch restored from a snapshot whose render may have started,
+   *  and on one whose render's delivery threw: its recovery delivers the
+   *  fallback, without asking the server again. */
   noRender?: boolean;
+  /** Set, to the event id the delivery carried, on a batch whose render's
+   *  delivery threw where the host can't tell whether it stored the
+   *  occurrence (CoalescerHost.mayHaveStored). Its recovery's delivery of
+   *  that event says so (DeliveryOptions.mayBeStored), so the host stores the
+   *  fallback only where it doesn't find the occurrence stored. A later
+   *  notice that joins the batch moves its latest event on, and the recovery
+   *  then delivers that one as any fallback. In memory only: a restored
+   *  batch that may have rendered is settled by wasPublished. */
+  mayBeStored?: string;
   /** The batch opened on the agent's first view of its subject: a fresh
    *  `initial` birth, or a first-view occupant it displaced that nothing had
    *  shown. Its first delivery is a first view too, while nothing of the
@@ -166,8 +199,8 @@ export interface AssemblyResult {
    *  read: empty or blank render (§5.2), cancelled, revoked before the render
    *  or at its response, a render-start that could not be made durable (the
    *  batch then waits for its recovery wake), a batch whose audience doesn't
-   *  include the agent, a render placed in a deferred queue (another
-   *  agent's, or this agent's own behind a write held there), a render
+   *  include the agent, a render placed where the turn doesn't read it
+   *  (stored for another agent whose turn is alive, not presented to it), a render
    *  another assembly froze (its compile may show it, as that request's), or
    *  a cause whose batch was withdrawn, displaced or consumed by another
    *  request. */
@@ -293,12 +326,31 @@ export interface CoalescingReceiptRecord {
   batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
 }
 
+export type CoalescingAudit = { subject: string; eventId: string } & (
+  | { kind: 'received'; retract: boolean; deferred: boolean }
+  | { kind: 'removed' }
+  | { kind: 'remove-failed' }
+  | { kind: 'revoked' }
+  | { kind: 'displaced'; batch?: true }
+  | { kind: 'render-cancelled'; reason?: 'suspend' }
+  | { kind: 'recovery-wake'; attempt: number; delayMs: number }
+  | { kind: 'rendered'; source: 'render' | 'fallback'; empty: boolean }
+  | { kind: 'render-failed'; serverId: string; field?: string; error: string }
+  /** The render's delivery threw, and its batch went to the recovery wake.
+   *  `mayBeStored`: the host couldn't tell whether a row landed
+   *  (CoalescerHost.mayHaveStored), so the recovery's delivery reads the
+   *  store before it stores the fallback. */
+  | { kind: 'deliver-failed'; error: string; mayBeStored?: true }
+  | { kind: 'late-render'; discarded: true }
+  | { kind: 'persist-failed'; error: string }
+  | { kind: 'accepted-observer-failed'; error: string }
+);
+
 export interface CoalescerHost<E> {
   /** True iff the placement still exists and, as far as the host can tell,
    *  no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
-  /** True iff nothing may have shown the placement to the agent: it is still
-   *  in the deferred queue and known not to be stored already, or it is
+  /** True iff nothing may have shown the placement to the agent: it is
    *  stored where no committing compile has begun to assemble it and no tool
    *  boundary has injected past it. Unlike
    *  isUnread, a compile counts from its start: a doubt counts as shown. */
@@ -307,18 +359,36 @@ export interface CoalescerHost<E> {
   remove(placement: CoalescingPlacement): boolean;
   /** Ordinary delivery of the event; undefined when routing delivered nowhere.
    *  A replacement is delivered as a fresh message after the unread prior was
-   *  removed: it lands where a fresh event lands (§4.1 allows either place). */
-  deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
+   *  removed: it lands where a fresh event lands (§4.1 allows either place).
+   *  A render's delivery that throws keeps its batch for its recovery wake,
+   *  which delivers the fallback. A throw is taken as a delivery that stored
+   *  none of the occurrence, unless mayHaveStored says the host can't tell:
+   *  so a delivery whose store threw after rows of the occurrence landed
+   *  answers as stored by them, as the framework's does (context-manager's
+   *  WriteLandedError). Where the host can't tell (the framework: context-
+   *  manager's WriteOutcomeUnknownError), the recovery's delivery carries
+   *  `options.mayBeStored`: the host looks for the occurrence's rows first,
+   *  by the delivery identity they carry (subject and event id, as
+   *  wasPublished), and answers the placement of those it finds, storing
+   *  nothing. It stores the fallback where it finds none, and also where
+   *  its store can't be read to tell, saying it may then be stored twice. */
+  deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string, options?: DeliveryOptions): Promise<CoalescingPlacement | undefined>;
+  /** Whether a delivery's throw leaves the host unable to tell whether it
+   *  stored the occurrence (the framework's: context-manager's
+   *  WriteOutcomeUnknownError). Absent, or false, a throw stored none of it. */
+  mayHaveStored?(error: unknown): boolean;
   /** Queue a wake for a batch that has no model-visible content yet. */
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
-  /** Queue an ordinary push wake for `agent`, under the batch's own wake
-   *  policy, to read a render of the batch placed in its deferred queue that
-   *  no request consumed, at `deferredId`. It carries no subject, so the
-   *  subject's other wakes, and later withdrawals of them, leave it.
-   *  `allAmbient`: every notice the render stands for was tagged
-   *  `chat:ambient` (DeferredBatch.allAmbient), so the wake is marked
+  /** Queue an ordinary push wake for the placement's agent, under the
+   *  batch's own wake policy, to read a render of the batch that no request
+   *  consumed, placed where the turn being assembled doesn't read it: stored
+   *  and not presented to the agent (`placement`, which the host reads the
+   *  wake's mark from). It carries
+   *  no subject, so the subject's other wakes, and later withdrawals of
+   *  them, leave it. `allAmbient`: every notice the render stands for was
+   *  tagged `chat:ambient` (DeferredBatch.allAmbient), so the wake is marked
    *  ambient. */
-  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string, deferredId?: string, allAmbient?: boolean): Promise<void>;
+  wakeToRead(occurrence: CoalescedOccurrence<E>, placement: CoalescingPlacement, allAmbient?: boolean): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
   /** The batch's audience still holds the authority it was admitted under. */
@@ -326,7 +396,7 @@ export interface CoalescerHost<E> {
   /** Agents that read this occurrence's delivery target (may spawn a fork). */
   audience(occurrence: CoalescedOccurrence<E>): Promise<string[]>;
   render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
-  audit(record: Record<string, unknown>): void;
+  audit(record: CoalescingAudit): void;
   /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
   save(snapshot: () => CoalescingSnapshot): void;
   /** Persist the snapshot NOW (a render is about to start: that boundary must
@@ -353,6 +423,15 @@ export interface CoalescerHost<E> {
    *  restarts at the head), whatever a stale record says about its history. */
   wasPublished?(subject: string, eventId: string): boolean;
   now?(): number;
+}
+
+/** What the coalescer tells the host of a delivery (CoalescerHost.deliver). */
+export interface DeliveryOptions {
+  /** A render's recovery, after a delivery of this event whose throw left the
+   *  host unable to tell whether it stored the occurrence (mayHaveStored):
+   *  the host looks for its rows first, and stores it where it finds none,
+   *  or can't read its store to tell. */
+  mayBeStored?: true;
 }
 
 export interface CoalescerOptions {
@@ -738,8 +817,9 @@ export class PushCoalescer<E = unknown> {
   /**
    * Remove the occupant and the run it builds on, newest first, auditing each
    * as `kind`. Every member is unread: refreshOccupant has just run, under the
-   * lock. The host's removal may still refuse one, such as a held write the
-   * host can't tell isn't already stored. A member the host
+   * lock. The host's removal may still refuse one, such as a row a reader
+   * fork was handed as framing, or any while a surgery holds the store. A
+   * member the host
    * can't remove may be read, so the walk stops there, leaving it and the
    * renders it builds on, and the history becomes `unknown`.
    * Returns false then. It doesn't touch `state.occupant`, which still names
@@ -937,6 +1017,7 @@ export class PushCoalescer<E = unknown> {
       // Later notices stay in the batch's audience.
       occurrence = { ...occurrence, deliverTo: state.batch.latest.deliverTo };
     }
+    if (occurrence.tags?.includes('chat:addressed') || state.batch?.latest.batchAddressed) occurrence = { ...occurrence, batchAddressed: true };
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
       state.batch.notices.push(notice);
@@ -1003,10 +1084,15 @@ export class PushCoalescer<E = unknown> {
    * A batch that opened while another render ran is rendered once that
    * render settles. Resolves whether it materialized.
    */
-  async materializeNow(agentName: string, subject: string): Promise<boolean> {
+  async materializeNow(agentName: string, subject: string, onlyIfLatest?: string): Promise<boolean> {
     for (;;) {
       if (this.suspended) return false;
-      const started = await this.locked(() => this.freeze(subject, agentName));
+      // `onlyIfLatest`: a newer occurrence took the batch over while this
+      // waited for the lock, and its own decision and wake are the batch's.
+      const started = await this.locked(() => {
+        if (onlyIfLatest !== undefined && this.subjects.get(subject)?.batch?.latest.eventId !== onlyIfLatest) return Promise.resolve(undefined);
+        return this.freeze(subject, agentName);
+      });
       if (!started || started === 'declined') return false;
       await started.done;
       this.persist();
@@ -1086,7 +1172,7 @@ export class PushCoalescer<E = unknown> {
       this.scheduleRecovery(subject, state);
       return 'declined';
     }
-    this.clearRecovery(subject);
+    this.disarmRecovery(subject);
     if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
     // Authority (grant, registration, binding) is re-checked immediately
     // before dispatch: a server id reassigned to another endpoint during the
@@ -1142,9 +1228,13 @@ export class PushCoalescer<E = unknown> {
     }
     // Settlement runs under the lock: between the RPC's return and the state
     // update no admission can withdraw or replace what is being published.
+    let failed = false;
+    let current = false;
+    let recover = false;
     await this.locked(async () => {
       try {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
+        current = true;
         // Rule 4: authority is re-checked at response.
         if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
         const empty = isVisiblyEmptyContent(content);
@@ -1159,15 +1249,82 @@ export class PushCoalescer<E = unknown> {
         // a run's oldest render can be one.
         const run = state.occupant?.rendered ? state.occupant : undefined;
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
-        const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
-        if (placement?.deferredId) {
-          // Landed in a deferred queue: another agent's, whose turn is alive,
-          // or the assembling agent's own, behind a write held there (the
-          // host's bypassDeferralFor), or after its assembly ended, as any
-          // write during its turn. Still unread
-          // there, so it stays replaceable and withdrawable. The turn being
-          // assembled doesn't read it, so it isn't materialized for that turn,
-          // and no request has consumed it. The freeze withdrew the queue's
+        let placement: CoalescingPlacement | undefined;
+        try {
+          placement = await this.deliver(
+            { ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor,
+            batch.mayBeStored === occurrence.eventId ? { mayBeStored: true } : undefined,
+          );
+        } catch (error) {
+          // A delivery that throws goes to its batch's recovery, which
+          // delivers the fallback (the host's deliver). A store that threw
+          // after the occurrence's rows landed (context-manager's own
+          // listener failing after its append, or a sharded append whose
+          // clean-up failed too) doesn't come here: context-manager names
+          // the rows (WriteLandedError), and the framework's delivery takes
+          // the occurrence as stored by them, placed, presented and woken
+          // for, so no fallback is stored beside them. Any other throw stored
+          // nothing, unless the host can't tell (mayHaveStored: the store
+          // couldn't be read to tell whether a row landed). Then nothing is
+          // stored at once: the recovery's delivery says the occurrence may
+          // be stored (mayBeStored), and the host, its store read again,
+          // places the rows it finds and stores no fallback, stores the
+          // fallback where it finds none, and where its store still can't
+          // be read, stores the fallback and logs that the agent may see the
+          // occurrence twice. A batch opened while this render ran (§5.4
+          // rule 1) has its own fallback delivered at the recovery, which
+          // isn't this occurrence and isn't looked for: this render, if it
+          // landed, stays where it is, unplaced. The mark stays on a batch
+          // whose recovery's delivery throws again, so the next one looks
+          // again.
+          failed = true;
+          const mayHaveStored = this.host.mayHaveStored?.(error) === true;
+          this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error), ...(mayHaveStored ? { mayBeStored: true } : {}) });
+          if (state.batch) state.batch.noRender = true;
+          else {
+            batch.noRender = true;
+            if (mayHaveStored) batch.mayBeStored = occurrence.eventId;
+            state.batch = batch;
+          }
+          // Saved now, not only once the assembly's other renders settle: a
+          // newer batch's last snapshot, its acceptance's, has it rendering
+          // as usual, and a restart before the next save would render it on
+          // top of the render the agent never got. Written at once and made
+          // durable, as the render-start boundary is (saveNow, then commit):
+          // the host's throttled save would leave that window open for its
+          // delay. Where either throws, the throttled save is asked for.
+          let written = false;
+          try {
+            if (this.host.saveNow) { this.host.saveNow(this.snapshot()); written = true; }
+          } catch (saveError) {
+            this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(saveError) });
+          }
+          if (!written) this.persist();
+          // Its recovery is armed once the render has settled (the finally
+          // below): a recovery that fires while a render is under way does
+          // nothing and isn't armed again, and the commit may outlast the
+          // backoff.
+          recover = true;
+          if (written) {
+            try {
+              await this.host.commit?.();
+            } catch (commitError) {
+              this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(commitError) });
+              this.persist();
+            }
+          }
+          return;
+        }
+        if (placement?.presented === false) {
+          // Not presented to its agent: stored for another agent, whose
+          // turn is alive, or for the assembling agent after its assembly
+          // ended, as any write during its turn; or kept in memory (no id)
+          // until its hold's release stores it, which the host counts as
+          // read and can't remove, so of what follows only the wake applies
+          // to it. A stored one is still unread there, so it stays
+          // replaceable and withdrawable. The turn being assembled
+          // doesn't read it, so it isn't materialized for that turn, and no
+          // request has consumed it. The freeze withdrew the placement's
           // agent's wake for this batch; give it an ordinary wake, as any
           // delivery during its turn has, beside any wakes a newer batch has,
           // so that its next turn reads the content (the wake starts no turn
@@ -1187,7 +1344,7 @@ export class PushCoalescer<E = unknown> {
             await this.host.wakeForBatch(state.batch.latest);
           }
           state.audienceAgent = placement.agent;
-          await this.host.wakeToRead(occurrence, placement.agent, placement.deferredId, batch.allAmbient === true);
+          await this.host.wakeToRead(occurrence, placement, batch.allAmbient === true);
           return;
         }
         // The materialized occurrence is consumed by the request being
@@ -1199,6 +1356,8 @@ export class PushCoalescer<E = unknown> {
         if (placement) state.audienceAgent = placement.agent;
       } finally {
         if (state.rendering === rendering) state.rendering = undefined;
+        if (current && !failed) this.clearRecovery(subject);
+        if (recover) this.scheduleRecovery(subject, state);
       }
     });
   }

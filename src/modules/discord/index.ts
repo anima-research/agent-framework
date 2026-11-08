@@ -350,7 +350,8 @@ interface LiveCreate {
   /** converting: the live path fetches its attachments; queued: its event
    *  waits in the queue; writing: onProcess answered it, and each Discord
    *  event after it looks for the message's row, and ends the entry once it
-   *  shows. */
+   *  shows, or a release that couldn't store its write ends it with no row
+   *  (`message:lost`, endLostCreate). */
   phase: 'converting' | 'queued' | 'writing';
   /** A delete for the message came before its create was handled, so no row
    *  comes, and the entry waits for that delete to be handled. */
@@ -358,6 +359,11 @@ interface LiveCreate {
   /** The latest edit's text and attachments, from while it converted. */
   text?: string;
   attachments?: DiscordAttachment[];
+  unapplied?: 'delete' | Array<{ text: string; attachments?: DiscordAttachment[] }>;
+  /** A release lost its write without saying whether it landed, and the
+   *  lookup made then threw (endLostCreate): the next sweep that reads the
+   *  store and finds no row ends the entry, as that lookup would have. */
+  lostUnread?: true;
 }
 
 /**
@@ -402,18 +408,24 @@ export class DiscordModule implements Module {
 
   // The Discord messages whose live create is on its way to the store: from
   // the moment the live path takes one up, through its conversion and the
-  // event queue, until a query shows the row onProcess answered with, stored
-  // or held. The framework holds a module's writes while the agent's turn is
-  // alive or the host is quiesced, and queryMessages shows a held write's
-  // row, marked held, so the next Discord event finds it either way and ends
-  // its entry. A history sync stores none of these messages, so no message is
+  // event queue, until a query shows the row onProcess answered with. The
+  // framework stores a module's write at once, whatever the agent's turn or
+  // the host's mode (#291); only a live operator surgery's hold, or a context
+  // manager refusing its work, keeps it in memory, which a restart loses,
+  // until the release or the branch move that re-initializes the manager
+  // stores it. So the next Discord event once it is stored
+  // finds its row, marked held while the agent's window doesn't hold it
+  // (asModuleRow), and ends its entry. A history sync stores none of these messages, so no message is
   // stored twice. A delete before the create is handled drops it: nothing is
   // stored and nobody is woken. Any message's entry ends when its delete is
   // handled, since a sync running then skips the message (noteLive) and a
-  // later one doesn't fetch it. An edit while it converts is folded into it.
-  // A create whose answer the framework fails to write or hold shows no row,
-  // and keeps its entry, and the sync off its message, until its delete is
-  // handled or the module stops.
+  // later one doesn't fetch it, but for an answered create with no row yet
+  // (`writing`), whose entry keeps its delete for the release that stores
+  // it (LiveCreate.unapplied). An edit while it converts is folded into it.
+  // A create whose answer the framework fails to write shows no row,
+  // and keeps its entry, and the sync off its message, until the module
+  // stops, but for one a surgery's hold kept, whose release, losing it,
+  // ends its entry (`message:lost`, endLostCreate).
   private readonly creating = new Map<string, LiveCreate>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
@@ -449,17 +461,28 @@ export class DiscordModule implements Module {
     // inference and its turn ending, so it stays alive for the whole turn
     // (including tool-call cycles) and stops cleanly whether the agent
     // responds, errors, or decides to stay silent.
-    if (this.config.autoTyping) {
-      this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
-        const agentName = (event as { agentName?: string }).agentName;
-        if (!agentName) return;
-        if (event.type === 'inference:started' && !event.silent) {
-          this.startTypingLoop(agentName);
-        } else if (TURN_TERMINAL_TRACES.has(event.type)) {
-          this.stopTypingLoop(agentName);
-        }
-      });
-    }
+    this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
+      // The edits and deletes kept for a held create are applied, or its
+      // record ended, on the trace of the surgery's release that stores or
+      // loses it (applyUnapplied, endLostCreate): the exception the README
+      // names to traces being observability-only.
+      if (event.type === 'message:added' && event.source === 'surgery-release') {
+        this.applyUnapplied();
+        return;
+      }
+      if (event.type === 'message:lost' && event.external?.source === 'discord') {
+        this.endLostCreate(event.external.id, event.mayBeStored === true);
+        return;
+      }
+      if (!this.config.autoTyping) return;
+      const agentName = (event as { agentName?: string }).agentName;
+      if (!agentName) return;
+      if (event.type === 'inference:started' && !event.silent) {
+        this.startTypingLoop(agentName);
+      } else if (TURN_TERMINAL_TRACES.has(event.type)) {
+        this.stopTypingLoop(agentName);
+      }
+    });
 
     // Set up Discord event handlers
     this.client.onMessage((message) => this.handleDiscordMessage(message));
@@ -772,10 +795,13 @@ export class DiscordModule implements Module {
     // A stopped module answers nothing (stop()).
     if (!this.ctx) return {};
 
-    // Each Discord event ends the entries whose row a query shows now, stored
-    // or held.
+    // Each Discord event ends the entries whose row a query shows now,
+    // having applied what was kept for them first (applyUnapplied): an
+    // entry kept where its lost create's read threw (endLostCreate) still
+    // holds the edits or the delete made while its create was held.
     if (event.type.startsWith('discord:')) {
-      for (const [id, live] of this.creating) if (live.phase === 'writing' && this.storedRow(id)) this.creating.delete(id);
+      this.applyUnapplied();
+      this.endShownCreates();
     }
 
     // Handle new Discord message
@@ -834,7 +860,7 @@ export class DiscordModule implements Module {
       const contentBlocks = msg.contentBlocks ?? textFirst(storedOwnText(msg.content));
       this.noteLive(msg.discordMessageId);
 
-      // A message a history sync wrote first, stored or held, keeps that row:
+      // A message a history sync wrote first keeps that row:
       // the create adds none, and still sets the reply context and asks for
       // inference, since the message arrived live. Either way the entry waits
       // until a Discord event finds the message's row.
@@ -864,53 +890,10 @@ export class DiscordModule implements Module {
     }
 
     // Handle Discord message edit
-    if (event.type === 'discord:edit') {
-      const edit = event as DiscordEditEvent;
-      // The message's row, not only its id: an edit changes the message's own
-      // text and keeps what the host added beside it, but for the blocks of
-      // attachments the edit took away, when the client passed the edit's
-      // attachments and the row is text-first.
-      // An edit that comes while the live path converts the message's create
-      // is folded into that create (handleDiscordMessageEdit). Any other edit
-      // to a message with no row, stored or held, is dropped: a history sync
-      // running now stores the text it fetched, and the next sync's text rule
-      // changes it. A row stored in shards can't be edited one shard at a
-      // time, so it keeps its text, and the host's log says so. Only an edit
-      // that writes marks the message live, so an update that changes nothing
-      // leaves a running sync free to rewrite the row.
-      const stored = this.storedRow(edit.discordMessageId);
-      if (!stored) return {};
-      if (stored.bodyGroupId) {
-        console.warn(`Discord: An update to message ${edit.discordMessageId} wasn't applied: it's stored in shards, which can't be edited, so if its text changed, the agent still has the earlier text`);
-        return {};
-      }
-      const texted = contentForText(stored, edit.newContent);
-      const content = edit.attachments && stored.metadata?.[TEXT_FIRST] === true
-        ? withoutGoneAttachments(texted ?? stored.content, edit.attachments)
-        : texted;
-      if (!content || content === stored.content) return {};
-      this.noteLive(edit.discordMessageId);
-      return { editMessages: [{ messageId: stored.id, content }] };
-    }
+    if (event.type === 'discord:edit') return this.answerEdit(event as DiscordEditEvent);
 
     // Handle Discord message delete
-    if (event.type === 'discord:delete') {
-      const del = event as DiscordDeleteEvent;
-      // Every row of the message goes, so one stored twice doesn't outlive
-      // its delete as a copy. A row stored in shards is removed whole: the
-      // framework takes out the body a shard belongs to. The message is the
-      // live path's even when no row is found, so a running sync doesn't
-      // store what its fetch may still hold, and that ends its entry.
-      this.noteLive(del.discordMessageId);
-      this.creating.delete(del.discordMessageId);
-      const rows = this.storedRows(del.discordMessageId);
-      if (rows.length === 0) {
-        return {};
-      }
-      return {
-        removeMessages: oncePerBody(rows),
-      };
-    }
+    if (event.type === 'discord:delete') return this.answerDelete(event as DiscordDeleteEvent);
 
     return {};
   }
@@ -1077,8 +1060,8 @@ export class DiscordModule implements Module {
 
   /**
    * Sync history for a specific channel - compare with Context Manager and update.
-   * Uses queryMessages() to enumerate the channel's rows, a held write's among
-   * them, for proper edit/delete detection.
+   * Uses queryMessages() to enumerate the channel's stored rows, for proper
+   * edit/delete detection.
    *
    * The live path can store, edit or remove a row whenever the sync awaits.
    * So the sync fetches history and runs the live conversion it needs first,
@@ -1232,8 +1215,8 @@ export class DiscordModule implements Module {
    *  edit replaces a row's own text and keeps what the host added beside it.
    *  Each id's rows are in store order. A message stored twice holds two,
    *  of which a sync acts on the first, as the live path does (storedRow),
-   *  and a delete takes both. A write the framework holds is a row too
-   *  (storedRows). */
+   *  and a delete takes both. A row the agent hasn't been shown yet (`held`)
+   *  is a stored row as any other (storedRows). */
   private storedByDiscordId(ctx: ModuleContext, channelId: string): Map<string, StoredMessage[]> {
     const rows = new Map<string, StoredMessage[]>();
     for (const msg of ctx.queryMessages({ source: 'discord', metadata: { channelId } }).messages) {
@@ -1247,8 +1230,12 @@ export class DiscordModule implements Module {
   }
 
   /** The stored rows of a Discord message, by its id in the row's metadata,
-   *  in store order. A write the framework holds comes after them as a held
-   *  row, which an edit or removal reaches as it does a stored one. The
+   *  in store order. Every write is stored (#291), but for one a surgery's
+   *  hold or a context manager refusing its work keeps in memory, which a
+   *  restart loses: a row the agent's window doesn't hold yet reads `held`
+   *  (one a tune-out holds reads `heldFromResidents`, whatever its window),
+   *  in its place, and an edit or a removal
+   *  reaches it as any other, and every window that holds it. The
    *  module context's findMessageByExternalId holds only rows the module
    *  stored through its context, not those a process response added, so it
    *  misses what the live path stored. */
@@ -1256,8 +1243,8 @@ export class DiscordModule implements Module {
     return this.ctx?.queryMessages({ source: 'discord', externalIds: [discordMessageId] }).messages ?? [];
   }
 
-  /** The row an edit or a create acts on: a message's first row, a stored
-   *  one before a held one (storedRows). */
+  /** The row an edit or a create acts on: a message's first row in store
+   *  order (storedRows). */
   private storedRow(discordMessageId: string): StoredMessage | undefined {
     return this.storedRows(discordMessageId)[0];
   }
@@ -1482,13 +1469,174 @@ export class DiscordModule implements Module {
     });
   }
 
+  private answerEdit(edit: DiscordEditEvent): EventResponse {
+    // The message's row, not only its id: an edit changes the message's own
+    // text and keeps what the host added beside it, but for the blocks of
+    // attachments the edit took away, when the client passed the edit's
+    // attachments and the row is text-first.
+    // An edit that comes while the live path converts the message's create
+    // is folded into that create (handleDiscordMessageEdit). One that comes
+    // once onProcess answered the create and finds no row is kept on its
+    // entry (LiveCreate.unapplied), unless a delete is kept there already,
+    // and so is one that comes while edits kept there wait for a sweep that
+    // finds the row (sweptRow threw, or the row came after the sweep): it
+    // goes behind them, and applyUnapplied applies them in order, so an
+    // older kept edit never lands over it. Any other edit
+    // to a message with no row is dropped: a history sync
+    // running now stores the text it fetched, and the next sync's text rule
+    // changes it. A row stored in shards can't be edited one shard at a
+    // time, so it keeps its text, and the host's log says so. Only an edit
+    // that writes marks the message live, so an update that changes nothing
+    // leaves a running sync free to rewrite the row.
+    const kept = this.creating.get(edit.discordMessageId);
+    const keep = () => {
+      if (kept?.phase === 'writing' && kept.unapplied !== 'delete') {
+        kept.unapplied = [...(kept.unapplied ?? []), { text: edit.newContent, ...(edit.attachments ? { attachments: edit.attachments } : {}) }];
+      }
+      return {};
+    };
+    if (kept?.phase === 'writing' && Array.isArray(kept.unapplied)) return keep();
+    const stored = this.storedRow(edit.discordMessageId);
+    if (!stored) return keep();
+    if (stored.bodyGroupId) {
+      console.warn(`Discord: An update to message ${edit.discordMessageId} wasn't applied: it's stored in shards, which can't be edited, so if its text changed, the agent still has the earlier text`);
+      return {};
+    }
+    const texted = contentForText(stored, edit.newContent);
+    const content = edit.attachments && stored.metadata?.[TEXT_FIRST] === true
+      ? withoutGoneAttachments(texted ?? stored.content, edit.attachments)
+      : texted;
+    if (!content || content === stored.content) return {};
+    this.noteLive(edit.discordMessageId);
+    return { editMessages: [{ messageId: stored.id, content }] };
+  }
+
+  private answerDelete(del: DiscordDeleteEvent): EventResponse {
+    // Every row of the message goes, so one stored twice doesn't outlive
+    // its delete as a copy. A row stored in shards is removed whole: the
+    // framework takes out the body a shard belongs to. The message is the
+    // live path's even when no row is found, so a running sync doesn't
+    // store what its fetch may still hold, and that ends its entry, but for
+    // an answered create with no row, whose entry keeps the delete its
+    // handler recorded (LiveCreate.unapplied) for the release.
+    this.noteLive(del.discordMessageId);
+    const rows = this.storedRows(del.discordMessageId);
+    if (rows.length === 0 && this.creating.get(del.discordMessageId)?.phase === 'writing') return {};
+    this.creating.delete(del.discordMessageId);
+    if (rows.length === 0) {
+      return {};
+    }
+    return {
+      removeMessages: oncePerBody(rows),
+    };
+  }
+
+  /**
+   * A write the release of a surgery's hold couldn't store (`message:lost`):
+   * an answered create of the message (`writing`) with no row then ends,
+   * with the edits or delete kept for it (LiveCreate.unapplied), since no
+   * row comes for them to reach. Its delete, a history sync and a live
+   * create of the message are no longer passed over. A definite loss
+   * stored none of it, so it ends with no read. One whose outcome is
+   * unknown (`mayBeStored`) is looked for: where its row landed, no
+   * `message:added` came for it, so what was kept for it is applied now,
+   * and the entry waits, as any answered create, for the next Discord event
+   * to find the row. Where that lookup throws, the entry is flagged
+   * (`lostUnread`), and the next event's sweep that reads the store ends it
+   * where it finds no row.
+   */
+  private endLostCreate(discordMessageId: string, mayBeStored: boolean): void {
+    if (this.creating.get(discordMessageId)?.phase !== 'writing') return;
+    if (mayBeStored) {
+      let landed: boolean;
+      try {
+        landed = this.storedRow(discordMessageId) !== undefined;
+      } catch (error) {
+        console.error(`Discord: whether message ${discordMessageId}'s lost create left a row couldn't be read, so its record waits for the next event to find its row:`, error);
+        const live = this.creating.get(discordMessageId);
+        if (live) live.lostUnread = true;
+        return;
+      }
+      if (landed) {
+        this.applyUnapplied();
+        return;
+      }
+    }
+    this.creating.delete(discordMessageId);
+  }
+
+  /**
+   * The row of an answered create, looked for at an event's sweep, or
+   * undefined where the lookup throws, which is logged: that entry waits
+   * for the next event, and the others are swept all the same.
+   */
+  private sweptRow(discordMessageId: string): { row: StoredMessage | undefined } | undefined {
+    try {
+      return { row: this.storedRow(discordMessageId) };
+    } catch (error) {
+      console.error(`Discord: whether message ${discordMessageId}'s create left a row couldn't be read, so its record waits for the next event:`, error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Ends each answered create (`writing`) whose row a query shows now
+   * (sweptRow), but one still holding what was kept for it, which
+   * applyUnapplied couldn't apply (its lookup threw): it waits for the
+   * next event, so what was kept isn't dropped with it. A lost create
+   * whose release's lookup threw (`lostUnread`) ends where the lookup now
+   * reads no row: no row comes for it.
+   */
+  private endShownCreates(): void {
+    for (const [id, live] of this.creating) {
+      if (live.phase !== 'writing') continue;
+      const swept = this.sweptRow(id);
+      if (swept === undefined) continue;
+      if (swept.row ? live.unapplied === undefined : live.lostUnread) this.creating.delete(id);
+    }
+  }
+
+  private applyUnapplied(): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    for (const [discordMessageId, live] of this.creating) {
+      const unapplied = live.unapplied;
+      if (unapplied === undefined || !this.sweptRow(discordMessageId)?.row) continue;
+      live.unapplied = undefined;
+      const apply = (what: string, step: () => void) => {
+        try {
+          step();
+        } catch (error) {
+          console.error(`Discord: ${what} of message ${discordMessageId}, made while its create was kept in memory, threw as the release applied it, and may not have been applied:`, error);
+        }
+      };
+      if (unapplied === 'delete') {
+        apply('the delete', () => {
+          for (const id of this.answerDelete({ type: 'discord:delete', discordMessageId }).removeMessages ?? []) ctx.removeMessage(id);
+        });
+        continue;
+      }
+      for (const { text, attachments } of unapplied) {
+        apply('an edit', () => {
+          const answer = this.answerEdit({ type: 'discord:edit', discordMessageId, newContent: text, ...(attachments ? { attachments } : {}) });
+          for (const { messageId, content } of answer.editMessages ?? []) ctx.editMessage(messageId, content);
+        });
+      }
+    }
+  }
+
   private handleDiscordMessageDelete(messageId: string): void {
     if (!this.ctx) return;
 
-    // A delete before the message's create is handled drops that create.
-    // Its event still goes, for a row a history sync stored first.
+    // A delete before the message's create is handled drops that create,
+    // and one after it was answered is kept on its entry for the release
+    // that stores it (LiveCreate.unapplied). Its event still goes, for a row
+    // a history sync stored first.
     const live = this.creating.get(messageId);
-    if (live) live.deleted = true;
+    if (live) {
+      live.deleted = true;
+      if (live.phase === 'writing') live.unapplied = 'delete';
+    }
 
     // Only queue the event - state writes happen in onProcess()
     this.ctx.pushEvent({

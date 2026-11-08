@@ -50,13 +50,14 @@ export function locateMessageIndices(
 
 /**
  * Inclusive slot range of the body-group run containing `index` (the slot
- * itself when it is not sharded). Delegates to the store's own
- * `alignToBodyGroups` edge walk — one contiguity assumption, not two.
+ * itself when it is not sharded), and the ids of its rows in store order.
+ * Delegates to the store's own `alignToBodyGroups` edge walk — one
+ * contiguity assumption, not two.
  */
 export function bodyGroupRun(
   cm: SurgeryReadableCm,
   index: number,
-): { from: number; to: number; fromId: string; toId: string; group: boolean } {
+): { from: number; to: number; fromId: string; toId: string; group: boolean; ids: MessageId[] } {
   const win = cm.getMessageWindow(index, 1, { alignToBodyGroups: true, resolveBlobs: false });
   const from = win.startIndex;
   const to = win.startIndex + win.messages.length - 1;
@@ -66,6 +67,7 @@ export function bodyGroupRun(
     fromId: String(win.messages[0].id),
     toId: String(win.messages[win.messages.length - 1].id),
     group: win.messages[0].bodyGroupId !== undefined,
+    ids: win.messages.map((m) => String(m.id) as MessageId),
   };
 }
 
@@ -90,23 +92,45 @@ export function removeStoredMessages(cm: Removals, first: StoredLike, last: Stor
  * Remove one stored message by its id, with the rest of its body when it's
  * in one: a module or a coalescer removes a message it added by the id
  * `addMessage` returned, which for a long message stored in shards is its
- * first shard's.
+ * first shard's. Returns the ids of every row it removed, in store order:
+ * the id given for a message outside any body, each shard's for a body, so
+ * a caller can take them out of the windows of the other agents that held
+ * them (#291).
  */
-export function removeStoredMessage(cm: ContextManager, id: MessageId): void {
+export function removeStoredMessage(cm: ContextManager, id: MessageId): MessageId[] {
   const message = cm.getMessage(id) as StoredLike | null;
   if (!message?.bodyGroupId) {
     cm.removeMessage(id);
-    return;
+    return [id];
   }
   // Found in blob-free windows: a full read of the branch would inflate every
   // attachment on it, once for each message a sweep removes.
   const index = locateMessageIndex(cm, String(id));
   if (index < 0) {
     cm.removeMessage(id);
-    return;
+    return [id];
   }
   const run = bodyGroupRun(cm, index);
   cm.removeMessages(run.fromId as MessageId, run.toId as MessageId);
+  return run.ids;
+}
+
+/**
+ * The ids of the stored messages `firstId`..`lastId` (inclusive, in store
+ * order, every shard of a body), read before a removal of that interval so
+ * the caller knows what it took. Both ends are found tail-first and the
+ * rows between them read in one blob-free window. Empty when either end is
+ * not on the active branch; the ends may be given in either order.
+ */
+export function storedIdsBetween(cm: SurgeryReadableCm, firstId: string, lastId: string): MessageId[] {
+  const found = locateMessageIndices(cm, new Set([firstId, lastId]));
+  const first = found.get(firstId);
+  const last = found.get(lastId);
+  if (!first || !last) return [];
+  const from = Math.min(first.index, last.index);
+  const to = Math.max(first.index, last.index);
+  const { messages } = cm.getMessageWindow(from, to - from + 1, { resolveBlobs: false });
+  return messages.map((m) => String(m.id) as MessageId);
 }
 
 /** removeStoredMessages for an interval known by its ids. */
