@@ -74,9 +74,7 @@ export function wholeCallMs(bounds: InferenceBounds, maxTokens: number | undefin
 
 // membrane 0.8.0 and 0.9.0 mark a deadline they report as run out with this
 // registered symbol (on a sent request, or the Anthropic SDK's timeout, which
-// covers its connect timeout too) and export no reader or marker for it. The
-// one reader: the deadline class here and the transient-failure check of an
-// exhausted turn's re-arm both use it.
+// covers its connect timeout too) and export no reader or marker for it.
 const DEADLINE_EXPIRY = Symbol.for('membrane.deadlineExpiry');
 
 export function isDeadlineExpiry(error: unknown): boolean {
