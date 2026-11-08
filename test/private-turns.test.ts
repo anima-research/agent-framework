@@ -70,6 +70,18 @@ async function make(opts: {
   return { f, probe };
 }
 
+type Told = { defaultOutgoing?: { channelId?: string }; incoming?: { channelId?: string } } | undefined;
+function hooksTold(f: F): Told[] {
+  const told: Told[] = [];
+  const hooks = (f.framework as unknown as { hookOrchestrator: { beforeInference(params: unknown, channelsFor?: (serverId: string) => unknown): Promise<unknown> } }).hookOrchestrator;
+  const beforeInference = hooks.beforeInference.bind(hooks);
+  hooks.beforeInference = (params, channelsFor) => {
+    told.push(channelsFor?.('editor') as Told);
+    return beforeInference(params, channelsFor);
+  };
+  return told;
+}
+
 async function sentinel(f: F, text = 'zz-sentinel'): Promise<void> {
   await eventually(() => sent(f, text).length > 0, 'a later room turn spoke, after anything earlier was sent');
 }
@@ -376,6 +388,7 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
           override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> { throw new Error('provider unavailable'); }
         })([], true);
       };
+      const told = hooksTold(f);
       const live: unknown[] = [];
       const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') live.push(hidden(f).turnRouting.get('agent')); });
       await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
@@ -393,6 +406,10 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       assert.ok(has(f, 'zz-continued'), 'premise: the retry spoke');
       assert.equal(storedText(f, 'so your plain speech goes to no channel for the rest of this turn').length, 1, 'the flip writes its notice');
       assert.ok(retried[0]?.includes('so your plain speech goes to no channel for the rest of this turn'), "the retry's request holds the notice");
+      assert.equal(told.length, 2, 'premise: the room turn and its retry each ran their hooks');
+      assert.equal(told[0]?.defaultOutgoing?.channelId, 'work', "control: the room turn's hooks were told where it speaks");
+      assert.equal(told[1]?.defaultOutgoing, undefined, `the retry's hooks were told no channel it speaks in: ${JSON.stringify(told[1])}`);
+      assert.equal(told[1]?.incoming, undefined, 'nor a message it answers');
       script(f, [say('zz-sentinel')]);
       await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
       await f.framework.runUntilIdle();
@@ -414,6 +431,7 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       const overBudget = act('a1');
       (overBudget as { usage: { inputTokens: number; outputTokens: number } }).usage = { inputTokens: 100, outputTokens: 5 };
       script(f, [overBudget, say('zz-never')], [say('zz-restarted')]);
+      const told = hooksTold(f);
       const reasons: string[] = [];
       const live: unknown[] = [];
       const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') live.push(hidden(f).turnRouting.get('agent')); });
@@ -430,6 +448,10 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       assert.deepEqual(reasons, ['without it', 'holds the message'], "premise: the restart's compile held the operator's message");
       assert.ok(has(f, 'zz-restarted'), 'premise: the restart spoke');
       assert.equal(storedText(f, 'so your plain speech goes to no channel for the rest of this turn').length, 1, 'the flip writes its notice');
+      assert.equal(told.length, 2, 'premise: the room turn and its restart each ran their hooks');
+      assert.equal(told[0]?.defaultOutgoing?.channelId, 'work', "control: the room turn's hooks were told where it speaks");
+      assert.equal(told[1]?.defaultOutgoing, undefined, `the restart's hooks were told no channel it speaks in: ${JSON.stringify(told[1])}`);
+      assert.equal(told[1]?.incoming, undefined, 'nor a message it answers');
       script(f, [say('zz-sentinel')]);
       await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
       await f.framework.runUntilIdle();
