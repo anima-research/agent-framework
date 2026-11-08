@@ -23786,8 +23786,6 @@ export class AgentFramework {
         roundsRan: routing.roundsRan === true, callsCutOff, liveSpeech: routing.liveSpeech === true,
         speechRouting: (routing.speechRouting ?? 0) > 0,
       });
-    } else {
-      this.exhaustedTurns?.delete(agent.name);
     }
   }
 
