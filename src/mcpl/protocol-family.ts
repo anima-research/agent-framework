@@ -25,10 +25,6 @@
  * probe makes some real MCPL servers exit (heartbeat-mcpl closes on any first
  * message that isn't `initialize`), the SDK's stdio probe launches the server
  * twice, and a server's era is a stable fact its configuration can state.
- * Those reasons are stdio's. MCPL has no HTTP binding, so a probe over http(s)
- * can't reach an MCPL server, and a remote server's revision changes when its
- * operator upgrades it: negotiating at every connect follows that, once the
- * old session is over (see ModernMcpConnection's `sessionEnded`).
  */
 import { NOTICE_TAG } from '../notice-tags.js';
 import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js';
@@ -41,13 +37,7 @@ import { kindOf } from '../config-checks.js';
 export const LEGACY_MCP_PROTOCOL_VERSION = '2024-11-05';
 /** The revision the modern engine pins over stdio, and prefers over HTTP. */
 export const MODERN_MCP_PROTOCOL_VERSION = '2026-07-28';
-/**
- * What the modern engine offers an http(s) server, in its order of
- * preference: 2026-07-28, then the 2025 revisions of Streamable HTTP. The list
- * is named here rather than taken from the SDK, whose own list grows with its
- * releases, so a revision reaches servers only once it's tested here.
- * 2024-11-05 isn't offered: its HTTP binding was HTTP+SSE, another transport.
- */
+/** 2024-11-05 isn't offered: its HTTP binding was HTTP+SSE, another transport. */
 export const MODERN_HTTP_PROTOCOL_VERSIONS: readonly string[] = [MODERN_MCP_PROTOCOL_VERSION, '2025-11-25', '2025-06-18', '2025-03-26'];
 
 export type McpProtocolFamily = 'legacy' | 'modern';
