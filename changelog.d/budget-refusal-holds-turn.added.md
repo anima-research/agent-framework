@@ -11,7 +11,7 @@
   alert as it starts waiting, saying it waits for compression, once however
   often it waits again, unless a listener of `inference:held` has ended the
   wait first, and `context-refusal-clear` if it is stopped or removed while
-  it waits, so it doesn't run, worded for which. It's the framework's first
+  it waits, so the waiting start doesn't run, worded for which. It's the framework's first
   `-clear` kind. Both carry the wait's start as their webhook cooldown key,
   so each wait's pair reaches the webhook within the 15-minute cooldown,
   and neither writes failures.log. A refusal after the release goes to the

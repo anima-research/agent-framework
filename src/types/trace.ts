@@ -1091,7 +1091,7 @@ export type TraceEvent =
       /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | …
        *  A kind ending in `-clear` ends the alert of the kind before it:
        *  'context-refusal-clear' is raised when a budget hold ends with its
-       *  turn stopped or removed, so that turn doesn't run. */
+       *  turn stopped or removed, so the waiting start doesn't run. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
