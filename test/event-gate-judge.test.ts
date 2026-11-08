@@ -439,7 +439,7 @@ describe('judge rules: timing', () => {
       const judge = scriptedJudge();
       const { gate } = makeGate(writeConfig(`spread-${route.split(' ')[0]}.json`, {
         policies: [{ name: 'busy', match: {}, behavior: { judge: { debounceMs: 100 } } }],
-      }), { judge: judge.fn });
+      }), { judge: judge.fn, judgeTimeoutMs: 600_000 });
       const original = console.error;
       console.error = () => {};
       try {
