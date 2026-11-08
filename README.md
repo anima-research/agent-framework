@@ -420,16 +420,20 @@ the answer.
 and its `family` stays `modern`. On a 2025 revision:
 - List changes arrive on the session's standalone stream, which is kept
   open while the session lives, whether or not the server issues a session
-  id, unless the server answers its first open with 405: it then offers no
-  stream, and its list changes don't arrive. A failure to open it that may
-  pass is reported as the connection's `error` and tried again, and a
-  stream that drops is reopened: the first try waits the server's `retry`
-  hint, or the first step of the connection's backoff when it gave none,
-  and a try after a failed one waits the longer of the hint and the
-  connection's backoff. Its first open, once the connection is up, and a
-  reopen that missed what came meanwhile each relist the tools of a server
-  that announces list changes, since a change announced while no stream
-  was open never arrives.
+  id, unless the server answers its first open with a status that won't
+  pass: a 405, which says it offers no stream, a 501 or 505, or a 4xx
+  other than 408, 409 and 429. With a `token` or `accessProvider` set, a
+  401 first gets one more try, after the SDK refreshes the credential.
+  Such an open isn't tried again, and the session's list changes don't
+  arrive. A failure to open it that may pass is reported as the
+  connection's `error` and tried again, and a stream that drops is
+  reopened: the first try waits the server's `retry` hint, or the first
+  step of the connection's backoff when it gave none, and a try after a
+  failed one waits the longer of the hint and the connection's backoff.
+  Its first open, once the connection is up, and a reopen that missed what
+  came meanwhile each relist the tools of a server that announces list
+  changes, since a change announced while no stream was open never
+  arrives.
 - A request's stream that the server closes after a priming event is
   resumed for as long as the request lives. Its cancellation at the
   deadline stops the resume too. A stream cut again before it carried a

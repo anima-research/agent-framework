@@ -449,12 +449,14 @@ test('a request stream resumed before the first open is answered leaves that ope
   let changes = 0;
   connection.on('tools-list-changed', () => changes++);
   await until(() => fixture.seen.some((s) => s.method === 'GET' && !s.resumed), 'the first open sent, and held');
-  const calling = connection.callTool('slow', { ms: 150 });
+  const tool = releaser();
+  const calling = connection.callTool('slow', { release: tool.path });
   await until(() => fixture.events.includes('slow-start'), 'the call running');
   const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
   fixture.sessions.get(sessionOf(connection)!)!.closeSSEStream(callId as never);
+  await until(() => fixture.seen.some((s) => s.method === 'GET' && s.resumed && s.status === 200), 'the call\'s stream resumed');
+  tool.release();
   await calling;
-  assert.ok(fixture.seen.some((s) => s.method === 'GET' && s.resumed && s.status === 200), 'the call\'s stream resumed');
   assert.equal(streamOpened(connection), false, 'the resume opened no standalone stream');
   release();
   await until(() => streamOpened(connection), 'the standalone stream open');
