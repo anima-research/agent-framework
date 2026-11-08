@@ -685,7 +685,6 @@ describe('a private turn and the focus', () => {
   });
 
   type ServerContext = { defaultOutgoing?: { channelId: string }; incoming?: { channelId: string } } | undefined;
-  /** A module whose `look` tool records what a server is told for the agent while its turn is open (context/beforeInference's channels). */
   const contextProbe = () => {
     const seen: ServerContext[] = [];
     let bound: Awaited<ReturnType<typeof fixture>> | undefined;

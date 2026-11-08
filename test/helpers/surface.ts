@@ -44,7 +44,6 @@ export const callTool = (id: string, name: string, input: Record<string, unknown
   ] as ContentBlock[], 'tool_use');
 export const act = (id: string, text?: string) => callTool(id, 'probe--act', {}, text);
 
-/** A module whose channel's messages arrive as its own `room:message` events, stored naming the channel, whose `reaction:message` events store a row naming the channel tagged as a reaction, whose `note:message` events store a row shaped as a subconscious's note about that channel, and which hears every turn's speech as a speech handler does. */
 export class SpeechProbe implements Module {
   readonly name = 'speaker';
   readonly heard: Array<{ text: string; private?: true }> = [];
