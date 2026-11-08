@@ -60,10 +60,6 @@ const inlineNever = (uri: string) => ({ type: 'image', uri, data: 'aGk=', mimeTy
 const NEVER_TEXT = 'a server asked that its content never reach you or your tools';
 const NEVER_FAILURE = { ok: false, error: NEVER_TEXT, remedy: "Calling again won't change that." };
 const NEVER_REFUSAL = { error: NEVER_FAILURE.error, remedy: NEVER_FAILURE.remedy };
-const within = <T>(what: string, promise: Promise<T>, ms = 5_000): Promise<T> => Promise.race([
-  promise,
-  new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what}: not settled within ${ms} ms`)), ms).unref()),
-]);
 const quietly = async <T>(fn: () => T | Promise<T>): Promise<{ value: T; logged: string }> => {
   const lines: string[] = [];
   const error = console.error;
@@ -163,6 +159,17 @@ describe('the payload mark', () => {
     const unmarked = referenceRegistry.register(testimonyOf({ type: 'resource', uri: plain }), 'one');
     convertBlock({ type: 'resource', disposition: 'ref', resource: { uri: plain, text: 'the payload' } } as unknown as McplContentBlock, 'attachment on push event', 'zz-never-dialed');
     assert.equal(unmarked.payloadNever, undefined);
+  });
+
+  it("isn't made for a uri longer than a reference's own, which gets no record, while the message's blocks are still withheld", () => {
+    const long = `https://zz-never.example/${randomUUID()}/${'x'.repeat(references.REFERENCE_LIMITS.uri)}`;
+    for (const block of [inlineNever(long), { type: 'resource', disposition: 'never', resource: { uri: long, text: 'the payload', mimeType: 'text/plain' } }]) {
+      const shown = JSON.stringify(convertBlock(block as McplContentBlock, 'attachment on push event', 'zz-never-dialed'));
+      assert.ok(!shown.includes('aGk=') && !shown.includes('the payload') && !shown.includes(long), shown);
+      assert.equal(referenceRegistry.findByUri(long), undefined);
+    }
+    referenceRegistry.markNevers(contentClaims([inlineNever(long)]), 'zz-never-dialed');
+    assert.equal(referenceRegistry.findByUri(long), undefined);
   });
 
   it("governs every block of a push, channel or injection message, whatever their order: an image by uri before a `never` for its uri is its stub, and the record the message makes or has is marked", async () => {
@@ -447,16 +454,16 @@ describe('a fetcher built to withhold', () => {
     const record = reg.register(testimonyOf({ type: 'resource', uri }), 'srv');
     const arrived = new Promise<void>((resolve) => { heard = resolve; });
     const running = f.fetch(record);
-    await within('the request reaching the server', arrived);
+    await arrived;
     const response = held.shift()!;
     try {
       const charged = () => (f as unknown as { totals: Map<string, number> }).totals.get('srv') ?? 0;
-      await within('the first part read', (async () => { while (charged() < 16) await new Promise((resolve) => setTimeout(resolve, 5)); })());
+      await (async () => { while (charged() < 16) await new Promise((resolve) => setTimeout(resolve, 5)); })();
       reg.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'srv');
       response.more();
-      assert.deepEqual(await within('the marked download', running), NEVER_FAILURE);
+      assert.deepEqual(await running, NEVER_FAILURE);
       assert.deepEqual([saved, record.fetchedPath], [[], undefined]);
-      await within('the request closed by the fetcher', response.closed);
+      await response.closed;
     } finally {
       response.end();
     }
@@ -471,22 +478,22 @@ describe('a fetcher built to withhold', () => {
     const record = reg.register(testimonyOf({ type: 'resource', uri }), 'srv');
     const arrived = new Promise<void>((resolve) => { heard = resolve; });
     const running = f.fetch(record);
-    await within('the request reaching the server', arrived);
+    await arrived;
     const response = held.shift()!;
     try {
       const charged = () => (f as unknown as { totals: Map<string, number> }).totals.get('srv') ?? 0;
-      await within('the whole payload read', (async () => { while (charged() < PAYLOAD.length) await new Promise((resolve) => setTimeout(resolve, 5)); })());
+      await (async () => { while (charged() < PAYLOAD.length) await new Promise((resolve) => setTimeout(resolve, 5)); })();
       const joined = f.fetch(record, { timeoutMs: 50 });
       reg.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'srv');
       assert.deepEqual(f.refusal(record), NEVER_REFUSAL, 'refused while its fetch is under way');
       const asked = f.fetch(record);
       const first = await Promise.race([asked, new Promise((resolve) => setImmediate(() => resolve('still waiting')))]);
       assert.deepEqual(first, NEVER_FAILURE);
-      assert.deepEqual(await within('the joined fetch', joined), NEVER_FAILURE);
+      assert.deepEqual(await joined, NEVER_FAILURE);
     } finally {
       response.end();
     }
-    assert.deepEqual(await within('the marked download', running), NEVER_FAILURE);
+    assert.deepEqual(await running, NEVER_FAILURE);
     assert.deepEqual([saved, removed, record.fetchedPath], [[], [], undefined]);
   });
 
@@ -508,15 +515,16 @@ describe('a fetcher built to withhold', () => {
       const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
       const arrived = new Promise<void>((resolve) => { heard = resolve; });
       const running = f.fetch(record);
-      await within('the request reaching the server', arrived);
+      await arrived;
       const response = held.shift()!;
       try {
         crowd();
+        assert.equal(referenceRegistry.findByUri(uri), undefined, "the flight's record is evicted before the mark");
         await quietly(() => convertBlocks([never(uri)] as McplContentBlock[], 'attachment on push event', 'srv'));
       } finally {
         response.end();
       }
-      assert.deepEqual(await within('the crowded download', running), NEVER_FAILURE);
+      assert.deepEqual(await running, NEVER_FAILURE);
       assert.deepEqual([saved, removed, record.fetchedPath], [[], [], undefined]);
     });
   }
@@ -535,14 +543,14 @@ describe('a fetcher built to withhold', () => {
       assert.equal(referenceRegistry.findByUri(uri), undefined, 'evicted before its fetch starts');
       const arrived = new Promise<void>((resolve) => { heard = resolve; });
       const running = f.fetch(record);
-      await within('the request reaching the server', arrived);
+      await arrived;
       const response = held.shift()!;
       try {
         await quietly(() => convertBlocks([never(uri)] as McplContentBlock[], 'attachment on push event', 'srv'));
       } finally {
         response.end();
       }
-      assert.deepEqual(await within('the stale download', running), NEVER_FAILURE);
+      assert.deepEqual(await running, NEVER_FAILURE);
       assert.deepEqual([saved, record.fetchedPath], [[], undefined]);
     });
   }
@@ -658,7 +666,7 @@ describe("the framework's fetches", () => {
         answering = fw.scriptResultAnswer({ success: true, data: [{ type: 'resource', uri: slow }, { type: 'resource', uri: vetoed, disposition: 'never' }], dataIsContent: true }, 'zz_tool', false);
       }
       try {
-        await within('the slow download starting', started);
+        await started;
         const meanwhile = (await quietly(() => real.fetch(record))).value;
         if (pass === 'the script demand') assert.deepEqual(meanwhile, NEVER_FAILURE);
         else assert.deepEqual([meanwhile.ok, record.payloadNever], [true, undefined]);
@@ -762,7 +770,7 @@ describe("the framework's fetches", () => {
       const before = served;
       const answered = new Promise<{ result: { success: boolean; error?: string } }>((resolve) => { fw.pushEvent = (event) => resolve(event as never); });
       fw.dispatchFetchReferenceToolCall('prime', { id: `call_${record.refId}`, name: 'fetch_reference', input: { ref_id: record.refId } });
-      const { result } = await within('fetch_reference answering', answered);
+      const { result } = await answered;
       assert.deepEqual([result.success, result.error], [false, `fetch_reference couldn't fetch "${record.refId}": ${NEVER_TEXT}. Calling again won't change that.`]);
       assert.equal(served, before);
     } finally {
@@ -799,7 +807,7 @@ describe("the framework's fetches", () => {
       const before = served;
       const answered = new Promise<{ result: { success: boolean } }>((resolve) => { fw.pushEvent = (event) => resolve(event as never); });
       fw.dispatchFetchReferenceToolCall('prime', { id: `call_${record.refId}`, name: 'fetch_reference', input: { ref_id: record.refId } });
-      const { result } = await within('fetch_reference answering', answered);
+      const { result } = await answered;
       assert.deepEqual([result.success, served - before, saved.length], [true, 1, 1], "the server's own delivery's id still fetches");
     } finally {
       referenceRegistry.forgetServerAddress('zz-never-module', fw);
@@ -839,12 +847,14 @@ describe("the framework's fetcher", () => {
       () => ({ success: true }),
       () => ({ success: false, isError: true, error: 'zz-delete-refused' }),
       () => { throw new Error('zz-delete-threw'); },
+      () => ({ success: true }),
     ];
+    let written: () => unknown = () => ({ success: true });
     const workspace = {
       writeBinary: async () => {
         reg.register(testimonyOf({ type: 'resource', uri: saving, disposition: 'never' }), 'zz-never-copies');
         afterSave();
-        return { success: true };
+        return written();
       },
       handleToolCall: async (call: ToolCall) => { calls.push([call.name, call.input]); return answers.shift()!(); },
     };
@@ -865,10 +875,14 @@ describe("the framework's fetcher", () => {
       `${fetched[1]!.marked}\n[refs] ${failure(fetched[1]!.path, 'zz-delete-refused')}`,
       `${fetched[2]!.marked}\n[refs] ${failure(fetched[2]!.path, 'zz-delete-threw')}`,
     ]);
+    written = () => ({ success: false, data: { inChronicle: true }, error: 'zz-disk-copy-failed', isError: true });
+    const treeOnly = await fetchOne();
+    assert.deepEqual(calls.at(-1), ['delete', { path: treeOnly.path }], 'a copy stored in the tree alone is deleted too');
+    written = () => ({ success: true });
     afterSave = () => { fw.getWorkspaceModule = () => undefined; };
     const none = await fetchOne();
     assert.equal(none.logged, `${none.marked}\n[refs] ${failure(none.path, 'this host has no workspace')}`);
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 4);
   });
 });
 

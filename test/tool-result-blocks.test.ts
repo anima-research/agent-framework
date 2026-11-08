@@ -1445,6 +1445,7 @@ describe('one answer for every block of a result', () => {
             assert.equal(never, 2, `${order}: ${lines.join('\n')}`);
           } else {
             assert.equal(never, 0, `${order}, no server: ${lines.join('\n')}`);
+            assert.ok(lines.includes(`[resource link "lifted.csv": ${uri}; not fetched]`), `${order}, no server: ${lines.join('\n')}`);
           }
         }
       }
@@ -1456,6 +1457,8 @@ describe('one answer for every block of a result', () => {
     const uri = 'https://zz-elsewhere.example/lifted-link-only.csv';
     toolResultDataToHistoryString([{ type: 'resource', uri, name: 'kept.csv', disposition: 'never' }]);
     assert.equal(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), '[Reference not shown "kept.csv": its content is marked never to reach you or your tools.]');
+    toolResultDataToHistoryString([{ type: 'resource', uri, name: 'kept.csv' }]);
+    assert.equal(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), `[resource link "kept.csv": ${uri}; not fetched]`, 'a later plain word on a uri no server has spoken for lifts it');
   });
 
   it("finds a never inside inline data's other fields, which showing it descends into, before any block is shown", () => {
