@@ -4373,7 +4373,8 @@ export class AgentFramework {
   private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
-  /** Modern-MCP (2026-07-28) servers, by id; read through modernServers().
+  /** Modern-MCP servers (2026-07-28, or a 2025 revision over HTTP), by id;
+   *  read through modernServers().
    *  They are kept apart from the MCPL registry on purpose: they have no
    *  grant, planes or server→host traffic, so the MCPL machinery (quiesce's
    *  plane pauses, policy) never sees them. They take part

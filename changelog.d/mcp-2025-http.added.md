@@ -13,7 +13,9 @@
   `reconnect-failed`, follows `reconnect`, and counts toward the framework's
   alert at the fifth attempt.
 - **`McplProtocolVersionError` over HTTP** names the revisions each side
-  speaks, and its new `offeredRevisions` lists the ones this client offered,
-  with `offered` still the first of them. It isn't retried. A handshake that
-  failed any other way, such as with a 503, is retried as any failed connect
-  is.
+  speaks. It isn't retried. A handshake that failed any other way, such as
+  with a 503, is retried as any failed connect is.
+- **`McplProtocolVersionError`'s new `offeredRevisions`** lists every
+  revision this client offered, with `offered` still the first of them: the
+  legacy engine's one, a modern stdio connection's one, or a modern
+  connection's list over HTTP.

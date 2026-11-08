@@ -42,9 +42,10 @@
  *   2026-07-28, a subscription the server advertises but that didn't open,
  *   or that ended, is reopened; on a 2025 revision, the session's standalone
  *   stream, which carries its list changes, is opened and reopened while the
- *   session lives, with a session id or without. Each connect is a
- *   generation, so a superseded client never touches a newer one. `close()`
- *   owns a connect in flight too.
+ *   session lives, with a session id or without, unless the server answers
+ *   its first open with 405, offering none. Each connect is a generation,
+ *   so a superseded client never touches a newer one. `close()` owns a
+ *   connect in flight too.
  * - **A 2025 session over HTTP** ends when the server answers 404 to a
  *   request that carried its id, but for the standalone stream's first open,
  *   or stops serving its revision (a 400 carrying -32022) or its streams (a
