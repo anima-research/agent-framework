@@ -104,6 +104,18 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
 });
 
+for (const isPrivate of [true, false]) {
+  test(`the rewind's retry of a ${isPrivate ? 'private' : 'public'} turn ${isPrivate ? 'carries' : "doesn't carry"} the private mark, so the turn it opens is ${isPrivate ? 'private' : 'read from the window'}`, () => {
+    const { fw, restore } = makeHarness();
+    fw.turnRouting = new Map([['cairn', isPrivate ? { private: true } : {}]]);
+    try {
+      for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    } finally { restore(); }
+    assert.equal(fw.pendingRequests.length, 1, 'premise: the breaker queued its retry');
+    assert.equal(fw.pendingRequests[0].privateCaller, isPrivate ? true : undefined);
+  });
+}
+
 test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
   const { fw, messages, added, restore } = makeHarness({ messages: [
     { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },

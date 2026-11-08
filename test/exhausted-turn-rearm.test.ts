@@ -924,6 +924,19 @@ test("a re-armed continuation is sent again on its turn's channel", async (t) =>
   assert.deepEqual(internal.turnRouting.get('resident')?.triggerChannel, { serverId: 'zz-srv', channelId: 'zz-chan' });
 });
 
+test("a re-armed restart of a turn a private turn's wake opened is private, though the restart's own wake carries no mark", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n >= 2 && n <= 4 ? serverError : undefined));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100] });
+  const internal = r.fw as unknown as { pendingRequests: unknown[]; turnRouting: Map<string, { private?: true }> };
+  internal.pendingRequests.push({ agentName: 'resident', reason: 'prose-continuation', source: 'framework', timestamp: Date.now(), privateCaller: true });
+  await waitFor(() => r.count('inference:completed') === 1, 'the private turn to answer');
+  assert.equal(internal.turnRouting.get('resident')?.private, true, 'premise: that turn was private');
+  internal.pendingRequests.push({ agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+  await waitFor(() => r.count('inference:completed') === 2, 'the re-armed restart to answer');
+  assert.equal(membrane.sends.length, 5, "premise: the private turn, the restart's window, then the re-armed send");
+  assert.equal(internal.turnRouting.get('resident')?.private, true, 'the re-armed turn is private');
+});
+
 test('a continuation whose turn never found a channel is not re-armed, rather than sent where its turn would not speak', async (t) => {
   const membrane = new ScriptedMembrane((n) => (n >= 2 ? serverError : undefined));
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100] });

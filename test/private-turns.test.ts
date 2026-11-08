@@ -866,6 +866,71 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
     }
   });
 
+  it("a private turn's context-budget restart queues its continuation with the turn's privacy", async () => {
+    const { f } = await make({ agent: { maxTokens: 4_000, physicalWindowTokens: 200_000 } });
+    const restarts: Array<{ privateCaller?: true }> = [];
+    const off = f.framework.onTrace((t) => {
+      if (t.type !== 'inference:stream_restarted') return;
+      restarts.push(...(hidden(f).pendingRequests as Array<{ reason?: string; privateCaller?: true }>).filter((r) => r.reason === 'context_budget_restart'));
+    });
+    try {
+      script(f, [say('zz-first answer')]);
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      assert.ok(has(f, 'zz-first answer'), "premise: a private turn answered the operator's message");
+      await incoming(f, 'work', 'w1', 'zz-chatter', AMBIENT);
+      await f.framework.runUntilIdle();
+      const near = act('a1');
+      (near as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
+      script(f, [near], [say('zz-after the restart')]);
+      wake(f, { reason: 'prose-continuation', source: 'framework', privateCaller: true });
+      await f.framework.runUntilIdle();
+      assert.ok(has(f, 'zz-after the restart'), 'premise: the turn went on after its restart');
+      assert.equal(restarts.length, 1, 'premise: the private turn restarted for its budget');
+      assert.equal(restarts[0]!.privateCaller, true, "the restart's continuation carries the turn's privacy");
+    } finally { off(); await f.close(); }
+  });
+
+  it("a private turn's refusal rewind re-runs it as a private turn", async () => {
+    const speaker = new SpeechProbe();
+    const { f } = await make({ modules: [speaker], agent: { refusalHandling: { autoRewind: true, maxRewinds: 3 } } });
+    try {
+      script(f, [say('zz-first answer')]);
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      assert.ok(has(f, 'zz-first answer'), "premise: a private turn answered the operator's message");
+      await incoming(f, 'work', 'w1', 'zz-chatter one', AMBIENT);
+      await incoming(f, 'work', 'w2', 'zz-chatter two', AMBIENT);
+      await f.framework.runUntilIdle();
+      script(f, [createMockResponse([], 'refusal')], [say('zz-after the rewind')]);
+      wake(f, { reason: 'prose-continuation', source: 'framework', privateCaller: true });
+      await f.framework.runUntilIdle();
+      const after = speaker.heard.find((h) => h.text.includes('zz-after the rewind'));
+      assert.ok(after, `premise: the rewind's retry ran: ${JSON.stringify(speaker.heard)}`);
+      assert.ok(has(f, 'zz-chatter one'), "premise: a room message newer than the operator's is still in the window");
+      assert.equal(after.private, true, "the rewind's retry was private");
+    } finally { await f.close(); }
+  });
+
+  it("a private turn's own tool_results_ready, batched with another wake while the turn is open, starts with the batch", async () => {
+    const { f } = await make();
+    try {
+      script(f, [say('zz-batch')]);
+      const routing = (f.framework as unknown as { routingOf(name: string): Routing }).routingOf('agent');
+      routing.private = true;
+      hidden(f).openLogical.set('agent', routing);
+      hidden(f).pendingRequests.push(
+        { agentName: 'agent', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now(), privateCaller: true },
+        { agentName: 'agent', reason: 'nudge', source: 'test', timestamp: Date.now() + 1 },
+      );
+      await (f.framework as unknown as { processInferenceRequests(): Promise<void> }).processInferenceRequests();
+      assert.deepEqual((hidden(f).pendingRequests as Array<{ reason?: string }>).filter((r) => r.reason === 'tool_results_ready'), [],
+        "the turn's own continuation wasn't sent back to the queue");
+      await f.framework.runUntilIdle();
+      assert.ok(has(f, 'zz-batch'), 'premise: the batch ran');
+    } finally { await f.close(); }
+  });
+
   it("channel_open in a private turn moves nothing, and its result says the turn's speech goes to no channel", async () => {
     const { f } = await make({ rule: 'delivery' });
     try {
@@ -997,6 +1062,9 @@ describe("private turns: the wakes a private turn causes (part 7)", () => {
       await sentinel(f);
       assert.deepEqual(sent(f, 'zz-continued'), [], 'the continuation spoke in no channel');
       assert.deepEqual(sent(f, 'zz-private answer'), [], 'nor did the private turn');
+      const row = stored(f).find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'auto-continue');
+      assert.match(textOf(row!), /plain words you write without it and with no destination go to no channel this turn/,
+        "the continuation's row says where its plain speech goes");
     } finally { await f.close(); }
   });
 
@@ -1011,7 +1079,15 @@ describe("private turns: the wakes a private turn causes (part 7)", () => {
         typing.push({ turn, channel: typeof channel === 'string' ? channel : (channel as { channelId: string }).channelId });
         startTyping(channel, metadata);
       };
-      const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') turn += 1; });
+      let batch: Array<{ channelId?: string; privateCaller?: true }> = [];
+      const off = f.framework.onTrace((t) => {
+        if (t.type !== 'inference:started') return;
+        turn += 1;
+        if (turn !== 2) return;
+        const trigger = (f.framework as unknown as { activeTurnTriggers: Map<string, object> }).activeTurnTriggers.get('agent');
+        const key = trigger && Object.getOwnPropertySymbols(trigger).find((k) => k.description === 'merged-batch');
+        batch = key ? (trigger as Record<symbol, typeof batch>)[key] ?? [] : [];
+      });
       probe.acts.push(() => incoming(f, 'work', 'w1', 'agent, are you there?', MENTION));
       script(f, [act('a1'), say('zz-unprefixed')], [callTool('s1', 'skip_reply', { reason: 'done' })]);
       f.framework.pushEvent(surfaceMessage(SECRET));
@@ -1019,6 +1095,8 @@ describe("private turns: the wakes a private turn causes (part 7)", () => {
       off();
       assert.ok(storedText(f, 'zz-unprefixed').length > 0 && stored(f).some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce'), 'premise: the private turn\'s text bounced');
       assert.equal(turn, 2, 'premise: the bounce and the room mention took one turn');
+      assert.ok(batch.some((r) => r.privateCaller) && batch.some((r) => !r.privateCaller && String(r.channelId ?? '').endsWith('work')),
+        `premise: the second turn merged the bounce's wake with the room mention's: ${JSON.stringify(batch)}`);
       assert.ok(!has(f, 'zz-unscripted'), 'premise: no third turn ran');
       assert.deepEqual(typing.filter((t) => t.turn === 2), [], `the merged turn showed typing in no channel: ${JSON.stringify(typing)}`);
     } finally { await f.close(); }

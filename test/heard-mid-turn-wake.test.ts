@@ -1073,8 +1073,8 @@ describe('a wake for a write heard mid-turn', () => {
       framework.pushEvent(go());
       await framework.runUntilIdle();
 
-      assert.ok(streams[0]!.receivedToolResultOptions.some((o) => (o?.injectedMessages?.length ?? 0) > 0),
-        'the turn heard it at its tool boundary');
+      assert.ok(streams[0]!.receivedToolResultOptions.some((o) => (o?.injectedMessages ?? []).some((m) => !JSON.stringify(m).includes('[routing]'))),
+        'the turn heard it at its tool boundary, not only a routing notice');
       assert.equal(membrane.calls.length, 2, 'its wake started the turn');
       assert.deepEqual(drops, []);
       await framework.stop();

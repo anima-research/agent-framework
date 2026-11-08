@@ -1484,6 +1484,39 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it("the non-streaming fallback's re-inference of a private turn carries the turn's privacy", async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      routingOf(name: string): RoutingState & { private?: true };
+      openLogical: Map<string, unknown>;
+      pendingRequests: InferenceRequest[];
+      handleProcessEvent(event: ProcessEvent): Promise<void>;
+    };
+    const origin = internals.routingOf('assistant');
+    origin.private = true;
+    internals.openLogical.set('assistant', origin);
+    const response = createMockResponse([
+      { type: 'tool_use', id: 'unstreamed-private', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    try {
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'Take the direct inference path.' }]);
+      await agent.runInference(framework.getAllTools());
+      agent.addAssistantResponse(response.content);
+      await internals.handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'unstreamed-private',
+        result: { success: true, data: { ok: true } },
+      } as ProcessEvent);
+      const ready = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
+      assert.ok(ready, 'premise: the fallback scheduled the re-inference');
+      assert.equal(ready.privateCaller, true, "the re-inference carries the turn's privacy");
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("a settle closes the open logical turn only when it is the settling stream's own", async () => {
     const framework = await createFramework('hybrid');
     const internals = framework as unknown as {
