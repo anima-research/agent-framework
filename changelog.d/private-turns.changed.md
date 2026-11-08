@@ -16,8 +16,11 @@
   `[routing]` notice. The turns that the framework's own wakes from a private
   turn open, its auto-continue, its ` !` continuation and a prose bounce's
   resend, are private too (`InferenceRequest.privateCaller`, which the
-  framework sets). The built-in Discord module posts none of a private turn's
-  speech. See docs/dendrite.md, "Private turns".
+  framework sets). In a private turn, an envelope's own words go to the
+  channel it names, and no envelope sets a destination for the turn's later
+  words. The built-in Discord module posts none of a private turn's speech,
+  and a host's own speech handler is told the turn is private and should post
+  none of it either (below). See docs/dendrite.md, "Private turns".
   - A module that stores a channel's message for an `external-message`
     event whose metadata names no `channelId` now gets a private turn for it
     (under Breaking).

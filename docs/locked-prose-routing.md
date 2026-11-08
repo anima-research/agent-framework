@@ -66,7 +66,9 @@ says so. Later turns speak at the new destination.
 A turn that holds an operator's private message, from a surface with no
 channel such as a console, the TUI or an API call, speaks in no channel
 though the lock names one (docs/dendrite.md, "Private turns"). Its plain
-speech is posted nowhere and isn't held as drafts, and `channel_publish`
+speech is posted nowhere and isn't held as drafts, unless a send in the turn
+has left its reach unknown, which holds it as drafts as in any turn, and
+`channel_publish`
 called with no channel has no default. A `prose_locus` call made in it moves
 the lock for later turns only, as a call from outside the turn does, and its
 result says this turn's speech goes to none. Turns speak at the lock again
@@ -95,7 +97,8 @@ take precedence: an id two servers register is ambiguous here, and holds
 speech as drafts until the recipe names one. A channel its server hasn't
 registered yet resolves once it has; until then that turn's plain speech is
 held as drafts, and the operator log says why. With no `proseLock`, plain
-speech is held as drafts until the resident chooses. Once the resident has
+speech is held as drafts until the resident chooses. A private turn's plain
+speech isn't held as drafts ("A private turn", above). Once the resident has
 chosen, its choice outranks the recipe's. A stored choice that can't be
 read, or whose stored entry names no destination, holds speech as drafts
 rather than fall back to the recipe's.

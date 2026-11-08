@@ -1681,9 +1681,10 @@ function answersOperator(row: StoredMessage): boolean {
 }
 
 function channelConversation(metadata: unknown): boolean {
+  const row = metadata as { channelId?: unknown; system?: unknown; kind?: unknown; tags?: unknown; firstView?: unknown } | undefined;
+  if (isMarkerTagged(row?.tags, row?.firstView === true)) return false;
   const source = readInboundSource(metadata);
   if (source) return source.kind === 'channel';
-  const row = metadata as { channelId?: unknown; system?: unknown; kind?: unknown } | undefined;
   return typeof row?.channelId === 'string' && row.channelId !== '' && row.system !== true && row.kind === undefined;
 }
 
@@ -1741,7 +1742,6 @@ interface ProseRound {
   draftsRound?: boolean;
   /** The outgoing stream of the stream that queued the round. */
   onPublished?: SpeechPublished;
-  queuedPublic?: true;
 }
 
 /**
@@ -22266,7 +22266,7 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.privateCaller ? 'p' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's
@@ -22303,6 +22303,16 @@ export class AgentFramework {
           const continuations = requests.filter((r) => isTurnContinuation(r.reason));
           requests.length = 0;
           requests.push(...continuations);
+        }
+      }
+
+      if (this.openLogical?.has(agentName)) {
+        const marked = requests.filter((r) => r.privateCaller && !continuesTurn(r));
+        if (marked.length > 0 && marked.length < requests.length) {
+          this.pendingRequests.push(...marked);
+          const rest = requests.filter((r) => !marked.includes(r));
+          requests.length = 0;
+          requests.push(...rest);
         }
       }
 
@@ -22775,7 +22785,7 @@ export class AgentFramework {
             continue;
           }
           if (to) {
-            if (!(routing.private && round.queuedPublic)) routing.pin = to;
+            if (!routing.private) routing.pin = to;
             delete routing.hybridHold;
           } else {
             delete routing.pin;
@@ -26247,7 +26257,7 @@ export class AgentFramework {
       // A function replacement: a draft's words go in exactly, `$&` and `$$` included.
       if (usedClipboard) body = body.replaceAll('{{unsent}}', () => unsent.draft?.text ?? '');
       const pinned: ChannelRef = { serverId: resolved.serverId, channelId: resolved.channelId };
-      if (!(routing.private && round.queuedPublic)) routing.pin = pinned;
+      if (!routing.private) routing.pin = pinned;
       delete routing.hybridHold;
       if (!body.trim()) {
         console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
@@ -26404,8 +26414,9 @@ export class AgentFramework {
         return;
       }
       targetChannel = { serverId: res.serverId, channelId: res.channelId };
-      // Sticky within the turn: later unprefixed segments follow this target.
-      if (!(routing.private && round.queuedPublic)) routing.pin = targetChannel;
+      // Sticky within the turn, but for a private turn's: later unprefixed
+      // segments follow this target.
+      if (!routing.private) routing.pin = targetChannel;
       body = parsed.body;
     } else {
       const sticky = routing.pin;
@@ -27504,7 +27515,7 @@ export class AgentFramework {
       if (trigger?.privateCaller || privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata)) !== undefined) {
         routing.private = true;
       }
-    } else if (!routing.private && !resumesTurn) {
+    } else if (!routing.private) {
       const surface = this.presents(agent)
         ? presented.map((row) => operatorSurface(row.metadata)).find((name) => name !== undefined)
         : privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata));
@@ -28832,7 +28843,6 @@ export class AgentFramework {
               routing: streamRouting,
               notice: presentsInjections ? 'now' : 'later',
               onPublished: roundPublished,
-              ...(streamRouting.private ? {} : { queuedPublic: true as const }),
             };
             // Routing publishes trimmed segments; held drafts keep the runs
             // exactly as written.
