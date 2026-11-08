@@ -5,8 +5,10 @@
  * presentation index calls. Main published context-manager 0.23.0, then 0.24.0
  * (Dendrite's derive), without them, so the presentation release is 0.25.0, and
  * a range that admitted any 0.24.x would install a context-manager this
- * framework fails to load on. So each caret range of its union starts at
- * 0.25.0 or later, and the range admits 0.25.0 itself, the release the
+ * framework fails to load on. Its floor is 0.25.1, the release with
+ * `noteThinkingDropped`, which the framework calls when the provider sets aside
+ * a stored reply's thinking. So each caret range of its union starts at
+ * 0.25.1 or later, and the range admits 0.25.1 itself, the release the
  * changelog names.
  * chronicle's range takes only a release with the identity-stamped batched
  * append context-manager writes a window with: the published 0.5.0 (Dendrite's
@@ -112,16 +114,17 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.throws(() => startsAt('^0.26.0', '0.25.0', 'x'), /admits x 0\.25\.0/);
   });
 
-  it("takes context-manager only at a release with the window APIs: not main's 0.23.0 or 0.24.0, which have none", (t) => {
+  it("takes context-manager only at a release with the window APIs and noteThinkingDropped: not main's 0.23.0 or 0.24.0, which have no window APIs, or 0.25.0, which can't be told of a set-aside reply", (t) => {
     const range = ours.dependencies?.['@animalabs/context-manager'];
     assert.ok(range, 'agent-framework depends on context-manager');
     for (const published of ['0.23.0', '0.24.0']) {
       assert.equal(admits(range, published), false,
         `${range} admits context-manager ${published}, published without windowStatusOf, presentRows, retractRows or getPresentedMessages`);
     }
-    startsAt(range, '0.25.0', 'context-manager');
+    assert.equal(admits(range, '0.25.0'), false, `${range} admits context-manager 0.25.0, published without noteThinkingDropped`);
+    startsAt(range, '0.25.1', 'context-manager');
     const proto = ContextManager.prototype as unknown as Record<string, unknown>;
-    for (const method of ['windowStatusOf', 'presentRows', 'retractRows', 'getPresentedMessages']) {
+    for (const method of ['windowStatusOf', 'presentRows', 'retractRows', 'getPresentedMessages', 'noteThinkingDropped']) {
       assert.equal(typeof proto[method], 'function', `the context-manager this suite runs on has ${method}`);
     }
     const version = installed('@animalabs/context-manager').version;

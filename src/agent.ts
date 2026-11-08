@@ -115,7 +115,7 @@ export interface StartStreamResult {
   /** Tells the context manager which stored bodies' thinking the provider dropped from a call of this stream, by the
    *  ids `placeDrops` gives for a `reply` drop, with the compile the stream was built from (context-manager's
    *  `noteThinkingDropped`), so its record leaves them without their thinking from the next compile on. Present only
-   *  where `noteRequestSent` is and the context manager has the method. */
+   *  where `noteRequestSent` is. */
   noteThinkingDropped?: (messageIds: readonly MessageId[]) => boolean;
   /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
    *  Absent when the compile reports no provenance. */
@@ -2275,7 +2275,7 @@ export class Agent {
 
   /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given,
    *  and which stored bodies' thinking the provider dropped: where the agent's model binds its thinking
-   *  (context-manager's `noteRequestSent` and `noteThinkingDropped`, the second where the context manager has it). */
+   *  (context-manager's `noteRequestSent` and `noteThinkingDropped`). */
   private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent' | 'noteThinkingDropped'> {
     const identity = binding.identity;
     // Each note names the compile the stream was built from, so a note can't vouch for this stream under a record a
@@ -2284,11 +2284,9 @@ export class Agent {
     const compileId = compiled.provenance?.compileId;
     if (!identity || compileId === undefined) return {};
     const cm = this.contextManager;
-    // A context manager from before noteThinkingDropped is told nothing of the drops.
-    const dropped = (cm as { noteThinkingDropped?: (messageIds: readonly MessageId[], compileId: string) => boolean }).noteThinkingDropped;
     return {
       noteRequestSent: (rows) => cm.noteRequestSent(rows, identity, compileId),
-      ...(typeof dropped === 'function' ? { noteThinkingDropped: (messageIds) => dropped.call(cm, messageIds, compileId) } : {}),
+      noteThinkingDropped: (messageIds) => cm.noteThinkingDropped(messageIds, compileId),
     };
   }
 

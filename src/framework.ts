@@ -4828,11 +4828,11 @@ export class AgentFramework {
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
   private readonly resumesPending = new Map<string, Agent | undefined>();
-  // context-manager 0.23.1: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2897),
+  // context-manager 0.25.1: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3156),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
-  // (context-manager.ts:2343-2359). So such a released manager is collected
+  // (context-manager.ts:4602-4621). So such a released manager is collected
   // only once nothing of its work can still read the store, and stop()
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
@@ -5136,7 +5136,7 @@ export class AgentFramework {
     if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
-          'Install @animalabs/context-manager ^0.25.0, which this package declares (0.23.x and 0.24.0 have no window index)',
+          'Install @animalabs/context-manager ^0.25.1, which this package declares (0.23.x and 0.24.x have no window index)',
       );
     }
 
