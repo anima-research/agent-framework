@@ -53,7 +53,7 @@ describe('notice openings in text the framework did not write', () => {
     }
   });
 
-  it('marks each opening context-manager 0.23.0 to 0.24.2 writes or reads back', () => {
+  it('marks each opening context-manager 0.23.0 writes or reads back', () => {
     for (const text of ['[content omitted: x]', '[image not shown: x]', '[Operator note — x]', '[Recall r1]', '[tool call omitted]', '[tool result moved during context repair]', '[Topic Transition]']) {
       assert.equal(markedText(text), `\\${text}`, text);
     }

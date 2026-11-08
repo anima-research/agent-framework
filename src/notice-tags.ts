@@ -67,7 +67,7 @@ export const NOTICE_TAG = {
 } as const;
 
 /**
- * The bracket openings context-manager 0.23.0 to 0.24.2 write into an
+ * The bracket openings context-manager 0.23.0 and 0.23.1 write into an
  * agent's context outside a tool result or read back from it, marked as the
  * framework's own are. Check them against each context-manager release the
  * framework takes.
