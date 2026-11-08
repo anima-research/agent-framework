@@ -31,6 +31,8 @@ async function refusal(status: number) {
 for (const status of [401, 403, 404, 500, 301, 302, 303, 307, 308]) {
   test(`direct strict ${status} classification ignores peer text`, { timeout: 5000 }, async () => {
     const server = await refusal(status);
+    const httpModule = http as { request: typeof http.request }; const request = httpModule.request; let dials = 0;
+    httpModule.request = ((...args: Parameters<typeof http.request>) => { dials++; return request(...args); }) as typeof http.request;
     try {
       let settlements = 0;
       const result = await WebSocketTransport.open(config(server.url)).then(t => {
@@ -40,10 +42,11 @@ for (const status of [401, 403, 404, 500, 301, 302, 303, 307, 308]) {
       assert.equal(result, `MCPL server "codes": ${reason}`);
       await closed(server.sockets);
       assert.equal(settlements, 1);
-      assert.equal(server.upgrades, 1, 'redirect is never followed');
+      assert.equal(dials, 1, 'redirect is never followed');
+      assert.equal(server.upgrades, 1);
       assert.equal(server.sockets.size, 0, 'server-side socket closed');
       assert.ok(!result.includes('peer'));
-    } finally { await server.close(); }
+    } finally { httpModule.request = request; await server.close(); }
   });
 }
 
