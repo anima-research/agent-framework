@@ -5,7 +5,6 @@ import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
-// A Discord message id: 19 digits, past 2^53, so JSON.parse rounds it when it's written as a number.
 const ID = '1437820485836259419';
 const origin = { kind: 'agent' as const, agentName: 'sol' };
 
@@ -33,7 +32,6 @@ async function makeRegistry() {
   return { registry, opens, acks };
 }
 
-/** A tool call's input as a client parses the model's text of it. */
 const call = (text: string): unknown => JSON.parse(text);
 
 const invited = { serverId: 'discord', channelId: 'invited' };
@@ -68,4 +66,14 @@ test('channel_open and channel_decline pass a string id to the server as it was 
   assert.equal(decline.success, true);
   assert.equal(declined.acks.at(-1)?.messageId, ID);
   assert.equal(declined.registry.closedByAgent(invited), 'declined');
+});
+
+test('channel_open takes a null beforeMessageId as no anchor, as before', async () => {
+  const { registry, opens } = await makeRegistry();
+  const res = await registry.handleChannelToolCall('channel_open', call(`{"channelId":"invited","backscroll":5,"beforeMessageId":null}`), origin);
+  assert.equal(res.success, true);
+  assert.equal(opens.length, 1);
+  const history = opens[0]?.history;
+  assert.ok(history, 'the backscroll asked for history');
+  assert.equal('beforeMessageId' in history, false, 'no anchor was sent');
 });
