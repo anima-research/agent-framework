@@ -22919,7 +22919,7 @@ export class AgentFramework {
     return (
       `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
       `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
-      `held as draft${many ? 's' : ''} ${AgentFramework.draftsNamed(held)} — ${because ? `because ${because}` : AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
+      `held as draft${many ? 's' : ''} ${AgentFramework.draftsNamed(held)}${many ? ', in the order you wrote them' : ''} — ${because ? `because ${because}` : AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
       `${resend.join('; ')}; drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
     );
   }
@@ -22931,7 +22931,7 @@ export class AgentFramework {
   private static draftsNamed(ds: readonly Draft[]): string {
     const named = ds.map((d) => `${d.id} (${AgentFramework.draftLength(d)})`);
     if (named.length < 2) return named.join('');
-    return `${named.slice(0, -1).join(', ')} and ${named.at(-1)}, in the order you wrote them`;
+    return `${named.slice(0, -1).join(', ')} and ${named.at(-1)}`;
   }
 
   /** Compact local time for draft listings. */

@@ -2412,8 +2412,8 @@ describe('present while acting', () => {
       .proseDrafts.open('assistant').reverse();
     assert.deepEqual(drafts.map((d) => d.text), ['the reply that silencing will eat', 'trailing prose, also suppressed (sticky)']);
     assert.deepEqual(receipts, [
-      `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts[0]!.id} (33 chars) and ${drafts[1]!.id} (40 chars), ` +
-        'in the order you wrote them (not sent — drafts can resend them unchanged, or dismiss them)',
+      `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts[0]!.id} (33 chars) and ${drafts[1]!.id} (40 chars) ` +
+        '(not sent — drafts can resend them unchanged, or dismiss them)',
     ]);
 
     await framework.stop();
@@ -2457,8 +2457,8 @@ describe('present while acting', () => {
         .proseDrafts.open('assistant').reverse();
       assert.deepEqual(drafts.map((d) => d.text), ['adjacent prose that must NOT auto-publish', 'trailing prose, also suppressed (sticky)']);
       assert.deepEqual(receipts, [
-        `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts[0]!.id} (41 chars) and ${drafts[1]!.id} (40 chars), ` +
-          'in the order you wrote them (not sent — drafts can resend them unchanged, or dismiss them)',
+        `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts[0]!.id} (41 chars) and ${drafts[1]!.id} (40 chars) ` +
+          '(not sent — drafts can resend them unchanged, or dismiss them)',
       ], `${verb}: suppression is visible in the receipt`);
 
       await framework.stop();

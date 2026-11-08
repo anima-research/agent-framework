@@ -607,7 +607,7 @@ describe('held prose drafts, end to end', () => {
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
-      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids[0]} (25 chars), ${ids[1]} (39 chars) and ${ids[2]} (22 chars), in the order you wrote them (not sent — drafts can resend them unchanged, or dismiss them)`);
+      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids[0]} (25 chars), ${ids[1]} (39 chars) and ${ids[2]} (22 chars) (not sent — drafts can resend them unchanged, or dismiss them)`);
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
@@ -681,7 +681,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
       assert.equal(
         h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held[0]!.id} (25 chars), ${held[1]!.id} (13 chars) and ${held[2]!.id} (22 chars), in the order you wrote them (not sent — drafts can resend them unchanged, or dismiss them)`,
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held[0]!.id} (25 chars), ${held[1]!.id} (13 chars) and ${held[2]!.id} (22 chars) (not sent — drafts can resend them unchanged, or dismiss them)`,
       );
     } finally {
       await h.close();
@@ -2950,6 +2950,23 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       // "still thinking" is the one kept private (live routing does not count
       // the `>>>skip_reply` envelope itself).
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('hybrid: a turn-end receipt naming an earlier turn\'s draft beside the turn\'s own gives each its length and claims no order', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('>>>#nowhere lost words')])]);
+      const [bounce] = h.drafts();
+      assert.equal(bounce?.reason, 'bounced', 'premise: an earlier turn bounced a draft');
+      await h.turn(rounds([text(`>>>${ROOM} {{unsent}}\n>>>${ROOM} P.S. too`), explicitSend('s1')]));
+      const fresh = h.drafts().find((d) => d.text === 'P.S. too');
+      assert.ok(fresh, 'premise: the P.S. is held this turn');
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!;
+      assert.ok(receipt.includes(`${fresh!.id} (8 chars)`) && receipt.includes(`${bounce!.id} (10 chars)`), receipt);
+      assert.ok(!receipt.includes('in the order you wrote them'), receipt);
     } finally {
       await h.close();
     }
