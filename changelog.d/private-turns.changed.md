@@ -18,12 +18,9 @@
   resend, are private too (`InferenceRequest.privateCaller`, which the
   framework sets). The built-in Discord module posts none of a private turn's
   speech. See docs/dendrite.md, "Private turns".
-  - **Hosts:** a module that stores a channel's message for an
-    `external-message` event whose metadata names no `channelId` now gets a
-    private turn for it. Name the channel in the event's metadata. For the
-    module's channel message to make the next turn public once an operator's
-    message has been answered, its row names the `channelId` in its
-    metadata, with no `kind` and no `system` flag.
+  - A module that stores a channel's message for an `external-message`
+    event whose metadata names no `channelId` now gets a private turn for it
+    (under Breaking).
   - **Hosts:** a module that publishes the speech it hears in
     `onAgentSpeech` should post none of it when `SpeechContext.private` is set.
   - The descriptions of `focus`, `tune_out`, `channel_publish` and
