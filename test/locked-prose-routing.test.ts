@@ -1,6 +1,6 @@
 /**
  * Locked prose routing (AgentConfig.proseRouting 'locked'): an agent's plain
- * speech goes to one destination it chose, on every turn, and nothing moves it
+ * speech goes to one destination it chose, on every turn but a private one, and nothing moves it
  * but its own prose_locus call — not the channel a turn came from, an
  * addressed message mid-turn, a heartbeat, or the host's locus rule. Pointed
  * at drafts (or with no destination yet), plain speech is held as drafts.
@@ -215,7 +215,9 @@ describe('locked prose routing', () => {
     assert.equal(state.locusCalls, 0, 'a locked turn never asks the registry for a locus');
     const primers = windowTexts(framework).filter((t) => t.startsWith('[prose-routing]'));
     assert.deepEqual(primers, [
-      '[prose-routing] Locked routing: your plain speech goes to discord:g:main, on every turn, until you move it with prose_locus. ' +
+      '[prose-routing] Locked routing: your plain speech goes to discord:g:main, on every turn, until you move it with prose_locus, ' +
+        'except while a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or is the ' +
+        "newest message you've had, or on a turn that continues one where that held: then it goes to no channel. " +
         'The channel a message comes from no longer moves it; other channels need an explicit send tool.',
     ]);
     assert.ok(!windowTexts(framework).some((t) => t.startsWith('[routing]')), 'no locus announcements');
