@@ -16008,7 +16008,7 @@ export class AgentFramework {
     this.retakeMarks(agent, cm, entry, back, below);
     const ordinals = back.map((id) => cm.ordinalOf(id)).filter((ordinal): ordinal is number => ordinal !== undefined);
     const boundary = {
-      indexLengthBefore: ordinals.length > 0 ? Math.min(...ordinals) : cm.indexLength(),
+      indexLengthBefore: ordinals.length > 0 ? ordinals.reduce((min, ordinal) => Math.min(min, ordinal), Infinity) : cm.indexLength(),
       windowBranch: cm.currentBranch().name,
     };
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -16346,14 +16346,16 @@ export class AgentFramework {
         `[surgery] agent=${agentName}: its context manager is re-initialized, so the ${writes.length} write(s) kept in ` +
         "memory for it while it refused its work go to the move's release, ahead of the writes its hold keeps",
       );
-      recovered.push(...writes);
+      appendAll(recovered, writes);
     }
     if (recovered.length === 0) return;
     // In arrival order across the agents, as each agent's are: writes for
     // two agents whose slot one record holds (residents) land there in the
     // order they came.
     recovered.sort((x, y) => x.heldOrder - y.heldOrder);
-    this.surgeryHeldWrites.unshift(...recovered);
+    const later = this.surgeryHeldWrites.splice(0);
+    appendAll(this.surgeryHeldWrites, recovered);
+    appendAll(this.surgeryHeldWrites, later);
     if (!this.surgeryHold) this.releaseSurgeryHeldWrites();
   }
 
@@ -16420,7 +16422,7 @@ export class AgentFramework {
       return found;
     };
     for (const [agentName, writes] of this.heldForRecovery ?? []) {
-      entry(agentName).recovery.push(...writes.filter((write) => !told.has(write)));
+      appendAll(entry(agentName).recovery, writes.filter((write) => !told.has(write)));
     }
     for (const write of this.surgeryHeldWrites ?? []) {
       if (told.has(write)) continue;
@@ -18831,7 +18833,7 @@ export class AgentFramework {
           // reads the time it's written (clock-rows.ts).
           const clock = injects ? this.storeDueClock(agent, 'tool-boundary') : undefined;
           if (presentsWindow) {
-            heard.push(...this.presentation!.presentAtBoundary(agent, [replyId, resultsId, clock?.id], { injects }).heard);
+            appendAll(heard, this.presentation!.presentAtBoundary(agent, [replyId, resultsId, clock?.id], { injects }).heard);
           }
           // The clock's store and the boundary's presentations run their
           // listeners synchronously too, and one may have stopped the turn,
@@ -38943,7 +38945,7 @@ export class AgentFramework {
           .filter(([, owner]) => owner === serverId)
           .map(([name]) => name);
         const known = new Set(names);
-        tools.push(...(this.mcplTools ?? []).filter((tool) => known.has(tool.name)));
+        appendAll(tools, (this.mcplTools ?? []).filter((tool) => known.has(tool.name)));
         for (const name of names) {
           toolServers.set(name, serverId);
           const featureSet = this.mcplToolFeatureSets?.get(name);
@@ -38953,7 +38955,7 @@ export class AgentFramework {
         }
         kept.set(serverId, names.length);
       } else if (listedServers.has(serverId)) {
-        tools.push(...staged.tools);
+        appendAll(tools, staged.tools);
         for (const [name, featureSet] of staged.featureSets) toolFeatureSets.set(name, featureSet);
         for (const [name, classes] of staged.classes) toolClasses.set(name, classes);
         for (const [name, owner] of staged.servers) toolServers.set(name, owner);
@@ -38966,7 +38968,7 @@ export class AgentFramework {
         console.error(`[mcpl] server "${serverId}": tools/list failed (${error}); ${count > 0 ? `keeping its ${count} known tool(s)` : 'none of its tools are offered'}`);
       }
     }
-    tools.push(...(over.size > 0 ? modernTools.filter((tool) => toolServers.has(tool.name)) : modernTools));
+    appendAll(tools, over.size > 0 ? modernTools.filter((tool) => toolServers.has(tool.name)) : modernTools);
     this.mcplToolsRefreshPublished = generation;
     this.mcplTools = tools;
     this.mcplPublishedConnections = publishedConnections;

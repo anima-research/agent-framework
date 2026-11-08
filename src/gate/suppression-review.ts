@@ -388,7 +388,7 @@ export class SuppressionReview {
     // A rule the reviewer couldn't answer about last time is reviewed from
     // where its unreviewed events begin.
     const fromOf = (name: string): number => Math.min(this.retryFrom.get(name) ?? fromMs, fromMs);
-    const earliest = Math.min(fromMs, ...this.retryFrom.values());
+    const earliest = [...this.retryFrom.values()].reduce((min, from) => Math.min(min, from), fromMs);
     const byRule = new Map<string, SuppressedEventRecord[]>();
     for (const record of this.deps.records(agentName, earliest, toMs)) {
       if (Date.parse(record.at) < fromOf(record.rule)) continue;
@@ -410,7 +410,7 @@ export class SuppressionReview {
       rules.push(await this.judge(agentName, { name, description, ...(rule ?? {}) }, sample, records.length, { fromMs: fromOf(name), toMs }, base));
     }
     const summary: SuppressionReviewSummary = {
-      fromMs: rules.length > 0 ? Math.min(...rules.map((r) => fromOf(r.rule))) : fromMs, toMs, rules,
+      fromMs: rules.length > 0 ? rules.reduce((min, r) => Math.min(min, fromOf(r.rule)), Infinity) : fromMs, toMs, rules,
       total: rules.reduce((n, r) => n + r.suppressed, 0),
       flagged: rules.reduce((n, r) => n + r.flagged.length, 0),
     };
