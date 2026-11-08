@@ -676,7 +676,7 @@ describe('a private turn and the focus', () => {
       await f.framework.runUntilIdle();
       assert.equal(internals(f).tuneOutCoordinator!.getAllExcept()?.params.except.channelId, 'work', 'control: the focus holds');
       const results = stored(f).map((m) => JSON.stringify(m.content));
-      assert.ok(results.some((text) => text.includes('This turn has no channel, so its plain speech goes to none; from your next turn it goes to ')),
+      assert.ok(results.some((text) => text.includes('This turn has no channel, so its plain speech goes to none; from your next turn it goes to home, except while ')),
         `the focus result says this turn's speech stays private, and where the lock sends later speech: ${results.slice(-4).join('\n')}`);
       assert.ok(!results.some((text) => text.includes('excepted channel')), "it doesn't promise the excepted channel, which the lock overrides");
       assert.ok(has(f, 'zz-the code is 4417'), 'premise: the private turn spoke');

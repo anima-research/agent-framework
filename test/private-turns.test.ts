@@ -230,7 +230,10 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
   it('a surface row heard at a tool boundary makes a room turn private for the rest of it, and the turn is told', async () => {
     const { f, probe } = await make({ rule: 'delivery' });
     try {
-      probe.acts.push(() => f.framework.pushEvent(surfaceMessage(SECRET)));
+      probe.acts.push(async () => {
+        await eventually(() => sent(f, 'zz-before the message').length > 0, 'premise: the room turn spoke in work before the message');
+        f.framework.pushEvent(surfaceMessage(SECRET));
+      });
       script(f, [act('a1', 'zz-before the message'), say('zz-after the message')]);
       await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
       await f.framework.runUntilIdle();
@@ -257,8 +260,12 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       script(f, [say('zz-continued')]);
       const scripted = f.membrane.streamYielding.bind(f.membrane);
       let failed = false;
+      const retried: string[] = [];
       f.membrane.streamYielding = (request, options) => {
-        if (failed) return scripted(request, options);
+        if (failed) {
+          retried.push(JSON.stringify(request));
+          return scripted(request, options);
+        }
         failed = true;
         return new (class extends MockYieldingStream {
           override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> { throw new Error('provider unavailable'); }
@@ -280,6 +287,7 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       assert.equal(live[1], live[0], 'premise: the retry continued the room turn');
       assert.ok(has(f, 'zz-continued'), 'premise: the retry spoke');
       assert.equal(storedText(f, 'so your plain speech goes to no channel for the rest of this turn').length, 1, 'the flip writes its notice');
+      assert.ok(retried[0]?.includes('so your plain speech goes to no channel for the rest of this turn'), "the retry's request holds the notice");
       script(f, [say('zz-sentinel')]);
       await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
       await f.framework.runUntilIdle();
@@ -304,8 +312,12 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       script(f, [say('zz-continued')]);
       const scripted = f.membrane.streamYielding.bind(f.membrane);
       let failed = false;
+      const retried: string[] = [];
       f.membrane.streamYielding = (request, options) => {
-        if (failed) return scripted(request, options);
+        if (failed) {
+          retried.push(JSON.stringify(request));
+          return scripted(request, options);
+        }
         failed = true;
         return new (class extends MockYieldingStream {
           override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> { throw new Error('provider unavailable'); }
@@ -327,6 +339,7 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       assert.equal(live[1], live[0], 'premise: the retry continued the room turn');
       assert.ok(has(f, 'zz-continued'), 'premise: the retry spoke');
       assert.equal(storedText(f, 'so your plain speech goes to no channel for the rest of this turn').length, 1, 'the flip writes its notice');
+      assert.ok(retried[0]?.includes('so your plain speech goes to no channel for the rest of this turn'), "the retry's request holds the notice");
       script(f, [say('zz-sentinel')]);
       await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
       await f.framework.runUntilIdle();
@@ -335,10 +348,52 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
     } finally { await f.close(); }
   });
 
+  it("on a host whose window for the agent couldn't be written down, an operator's message its budget restart compiles makes the room turn private", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'private-legacy-restart-'));
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    store.registerState({ id: 'agents/agent/window', strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 100 });
+    store.appendToStateJson('agents/agent/window', { v: 99 });
+    store.close();
+    const { f, probe } = await make({ rule: 'delivery', wakes: false, fixture: { dir }, agent: { maxStreamTokens: 20 } });
+    try {
+      assert.equal(f.framework.getAgent('agent')!.getContextManager().windowMode(), 'legacy', "premise: the agent's window is the record");
+      probe.acts.push(() => f.framework.pushEvent(surfaceMessage(SECRET)));
+      const overBudget = act('a1');
+      (overBudget as { usage: { inputTokens: number; outputTokens: number } }).usage = { inputTokens: 100, outputTokens: 5 };
+      script(f, [overBudget, say('zz-never')], [say('zz-restarted')]);
+      const reasons: string[] = [];
+      const live: unknown[] = [];
+      const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') live.push(hidden(f).turnRouting.get('agent')); });
+      const scripted = f.membrane.streamYielding.bind(f.membrane);
+      f.membrane.streamYielding = (request, options) => {
+        reasons.push(JSON.stringify(request).includes(SECRET) ? 'holds the message' : 'without it');
+        return scripted(request, options);
+      };
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      off();
+      assert.equal(live.length, 2, `premise: the room turn and its budget restart each started a stream: ${reasons.join(', ')}`);
+      assert.equal(live[1], live[0], 'premise: the restart continued the room turn');
+      assert.deepEqual(reasons, ['without it', 'holds the message'], "premise: the restart's compile held the operator's message");
+      assert.ok(has(f, 'zz-restarted'), 'premise: the restart spoke');
+      assert.equal(storedText(f, 'so your plain speech goes to no channel for the rest of this turn').length, 1, 'the flip writes its notice');
+      script(f, [say('zz-sentinel')]);
+      await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
+      await f.framework.runUntilIdle();
+      await sentinel(f);
+      assert.deepEqual(sent(f, 'zz-restarted'), [], 'what the restarted turn said went to no channel');
+    } finally { await f.close(); }
+  });
+
   it("a hybrid `>>>` destination set before a flip takes none of the turn's later words", async () => {
     const { f, probe } = await make({ mode: 'hybrid', rule: 'delivery' });
+    let pinnedBefore = false;
     try {
-      probe.acts.push(() => f.framework.pushEvent(surfaceMessage(SECRET)));
+      probe.acts.push(async () => {
+        await eventually(() => sent(f, 'zz-pinned').length > 0, 'premise: the pinned words went out before the message');
+        pinnedBefore = hidden(f).turnRouting.get('agent')?.pin !== undefined;
+        f.framework.pushEvent(surfaceMessage(SECRET));
+      });
       script(f, [act('a1', '>>>#noisy zz-pinned'), say('zz-after the message')]);
       await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
       await f.framework.runUntilIdle();
@@ -347,6 +402,7 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
       await f.framework.runUntilIdle();
       await sentinel(f);
+      assert.ok(pinnedBefore, 'premise: the `>>>` set the pin before the flip');
       assert.ok(has(f, 'zz-after the message'), 'premise: the turn spoke after the flip');
       assert.deepEqual(sent(f, 'zz-after the message'), [], "the pin didn't take the words after the flip");
     } finally { await f.close(); }
@@ -502,6 +558,47 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
     } finally { await f.close(); }
   });
 
+  for (const tag of ['chat:reaction', 'chat:edited', 'chat:deleted']) {
+    it(`a channel item tagged ${tag} after an answered operator's message isn't a newer channel message, so the next turn stays private`, async () => {
+      const { f } = await make({ mode: 'locked', lock: 'work' });
+      try {
+        script(f, [say('zz-private answer')], [say('zz-after the marker')], [say('zz-sentinel')]);
+        f.framework.pushEvent(surfaceMessage(SECRET));
+        await f.framework.runUntilIdle();
+        assert.ok(has(f, 'zz-private answer'), 'premise: the private turn answered');
+        await incoming(f, 'work', 'm1', 'zz-marker', [tag]);
+        await f.framework.runUntilIdle();
+        assert.equal(storedText(f, 'zz-marker').length, 1, `premise: the ${tag} item is in the window`);
+        if (!has(f, 'zz-after the marker')) {
+          wake(f);
+          await f.framework.runUntilIdle();
+        }
+        assert.ok(has(f, 'zz-after the marker'), 'premise: a turn spoke after the marker');
+        await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+        await f.framework.runUntilIdle();
+        await sentinel(f);
+        assert.deepEqual(sent(f, 'zz-after the marker'), [], 'the turn after the marker spoke in no channel');
+      } finally { await f.close(); }
+    });
+  }
+
+  it("a module's row that names a channel but is tagged as a reaction isn't a message from it, so the next turn stays private", async () => {
+    const speaker = new SpeechProbe();
+    const { f } = await make({ rule: 'delivery', modules: [speaker] });
+    try {
+      script(f, [say('zz-private answer')], [say('zz-after the reaction')]);
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      f.framework.pushEvent({ type: 'reaction:message', content: 'zz-thumbs up' } as never);
+      await f.framework.runUntilIdle();
+      const mine = speaker.heard.find((h) => h.text.includes('zz-private answer'));
+      const after = speaker.heard.find((h) => h.text.includes('zz-after the reaction'));
+      assert.ok(mine && after, `premise: the handler heard both turns: ${JSON.stringify(speaker.heard)}`);
+      assert.equal(mine.private, true, "premise: the operator's turn was private");
+      assert.equal(after.private, true, "the reaction didn't make the next turn public");
+    } finally { await f.close(); }
+  });
+
   it("a row that names a channel but isn't a message from it, such as a subconscious's note at a channel cancel, leaves the next turn private", async () => {
     const speaker = new SpeechProbe();
     const { f } = await make({ rule: 'delivery', modules: [speaker] });
@@ -561,6 +658,23 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
     }
   });
 
+  it("explicit: a sleep in a private turn posts no announcement, though the turn's own `>>` posted its words", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'private-sleep-explicit-'));
+    const { f, probe } = await make({ mode: 'explicit', rule: 'delivery', fixture: { dir }, framework: { gate: { config: { policies: [], default: 'always' }, configPath: join(dir, 'gate.json') } } });
+    try {
+      probe.acts.push(() => eventually(() => sent(f, 'zz-said').length > 0, "premise: the envelope's words went out before the sleep"));
+      script(f, [act('a1', '>>#work zz-said'), callTool('s1', 'sleep', { seconds: 60 })]);
+      const before = f.published.length;
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      assert.ok(stored(f).some((m) => JSON.stringify(m.content).includes('sleepingFor')), 'premise: the sleep ran');
+      assert.deepEqual(f.published.slice(before).filter((p) => !JSON.stringify(p).includes('zz-said')), [], 'nothing but the envelope was posted');
+    } finally {
+      (f.framework as unknown as { eventGate: { clearSleep(): boolean } }).eventGate.clearSleep();
+      await f.close();
+    }
+  });
+
   for (const [mode, prefix] of [['hybrid', '>>>'], ['explicit', '>>']] as const) {
     it(`${mode}: a \`${prefix}\` destination queued before a flip, and delivered after it, isn't kept for the turn's later words`, async () => {
       let release!: () => void;
@@ -613,6 +727,143 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
       assert.ok(has(f, 'zz-after the flip'), 'premise: the turn spoke after the flip');
       assert.deepEqual(sent(f, 'zz-after the flip'), [], "the send's channel took none of the words after the flip");
     } finally { await f.close(); }
+  });
+
+  for (const [mode, prefix] of [['hybrid', '>>>'], ['explicit', '>>']] as const) {
+    it(`${mode}: in a private turn, a \`${prefix}\` envelope posts its own words, and the turn's later unprefixed words go to no channel`, async () => {
+      const { f } = await make({ mode, rule: 'delivery' });
+      try {
+        script(f, [act('a1', `${prefix}#work zz-named`), say('zz-unprefixed after')]);
+        f.framework.pushEvent(surfaceMessage(SECRET));
+        await f.framework.runUntilIdle();
+        await eventually(() => sent(f, 'zz-named').length > 0, "the envelope's own words went to work");
+        script(f, [say(`${prefix}#work zz-sentinel`)]);
+        await incoming(f, 'work', 'w1', 'agent, one more', MENTION);
+        await f.framework.runUntilIdle();
+        await sentinel(f);
+        assert.ok(has(f, 'zz-unprefixed after'), 'premise: the turn wrote unprefixed words after the envelope');
+        assert.deepEqual(sent(f, 'zz-unprefixed after'), [], 'the later unprefixed words went to no channel');
+      } finally { await f.close(); }
+    });
+  }
+
+  it("explicit: a private turn's ` !` continuation that comes while a later room turn is provider-held doesn't join that turn's retry, and runs as its own private turn", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let holds = 0;
+    const speaker = new SpeechProbe();
+    const dir = mkdtempSync(join(tmpdir(), 'private-late-continuation-'));
+    const { f } = await make({
+      mode: 'explicit', rule: 'delivery', modules: [speaker],
+      fixture: { dir, holdPublish: (p: Record<string, unknown>) => (JSON.stringify(p).includes('zz-slow') ? held : undefined) },
+      framework: {
+        gate: { config: { policies: [], default: 'always' }, configPath: join(dir, 'gate.json') },
+        providerHold: (error: Error) => (error.message === 'provider unavailable' && holds++ === 0 ? { holdMs: 60_000, reason: 'test hold' } : undefined),
+      },
+    });
+    const cooldowns = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, { until: number; heldRequests: Array<{ privateCaller?: true }> }> }).providerAccelerationCooldowns;
+    const gate = (f.framework as unknown as { eventGate: { clearSleep(): boolean } }).eventGate;
+    try {
+      script(f, [say('>>#noisy zz-first answer')], [callTool('s1', 'sleep', { seconds: 60 }, '>>#noisy ! zz-slow')], [say('>>#work zz-retry')], [say('>>#noisy zz-continuation')]);
+      const scripted = f.membrane.streamYielding.bind(f.membrane);
+      let streams = 0;
+      f.membrane.streamYielding = (request, options) => {
+        streams += 1;
+        if (streams !== 3) return scripted(request, options);
+        return new (class extends MockYieldingStream {
+          override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> { throw new Error('provider unavailable'); }
+        })([], true);
+      };
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      assert.ok(sent(f, 'zz-first answer').length > 0, "premise: a private turn answered the operator's message");
+      wake(f);
+      let settled = false;
+      void f.framework.runUntilIdle().then(() => { settled = true; });
+      await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-slow')), "premise: the nudge's private turn has its delivery on its way");
+      await eventually(() => settled, 'premise: the private turn ended on its sleep with its delivery still on its way');
+      gate.clearSleep();
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      assert.ok(cooldowns.has('agent'), 'premise: the room turn failed into a provider hold');
+      release();
+      const waiting = () => [...hidden(f).pendingRequests, ...(cooldowns.get('agent')?.heldRequests ?? [])] as Array<{ privateCaller?: true }>;
+      await eventually(() => waiting().some((r) => r.privateCaller), "premise: the continuation the nudge's turn asked for came while the room turn was held, marked as a private turn's");
+      cooldowns.get('agent')!.until = Date.now();
+      (f.framework as unknown as { releaseProviderAccelerationCooldown(agent: string): void }).releaseProviderAccelerationCooldown('agent');
+      await f.framework.runUntilIdle();
+      const retry = speaker.heard.find((h) => h.text.includes('zz-retry'));
+      assert.ok(retry, `premise: the room turn's retry spoke: ${JSON.stringify(speaker.heard)}`);
+      assert.equal(retry.private, undefined, 'premise: the room turn stayed public');
+      const continuation = speaker.heard.find((h) => h.text.includes('zz-continuation'));
+      assert.ok(continuation, `the continuation ran as a turn of its own: ${JSON.stringify(speaker.heard)}`);
+      assert.equal(continuation.private, true, 'and that turn was private');
+    } finally {
+      release();
+      gate.clearSleep();
+      await f.close();
+    }
+  });
+
+  it("explicit: a private turn's late ` !` continuation, parked in a quiesce beside a public turn's own, keeps its mark, and the turn at the lift is private", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const speaker = new SpeechProbe();
+    const dir = mkdtempSync(join(tmpdir(), 'private-quiesce-park-'));
+    const { f, probe } = await make({
+      mode: 'explicit', rule: 'delivery', modules: [speaker],
+      fixture: { dir, holdPublish: (p: Record<string, unknown>) => (JSON.stringify(p).includes('zz-slow') ? held : undefined) },
+      framework: { gate: { config: { policies: [], default: 'always' }, configPath: join(dir, 'gate.json') } },
+    });
+    const gate = (f.framework as unknown as { eventGate: { clearSleep(): boolean } }).eventGate;
+    const marked = (reason: string) => hidden(f).pendingRequests.filter((r) => {
+      const request = r as { reason?: string; privateCaller?: true };
+      return request.reason === reason && request.privateCaller === true;
+    });
+    let quiesced: Promise<unknown> | undefined;
+    try {
+      script(f,
+        [say('>>#noisy zz-first answer')],
+        [callTool('s1', 'sleep', { seconds: 60 }, '>>#noisy ! zz-slow')],
+        [act('a1', '>>#work zz-room'), say('>>#work ! zz-room again')],
+        [say('>>#work zz-after the lift')]);
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      assert.ok(sent(f, 'zz-first answer').length > 0, "premise: a private turn answered the operator's message");
+      wake(f);
+      let settled = false;
+      void f.framework.runUntilIdle().then(() => { settled = true; });
+      await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-slow')), "premise: the nudge's private turn has its delivery on its way");
+      await eventually(() => settled, 'premise: the private turn ended on its sleep with its delivery still on its way');
+      gate.clearSleep();
+      probe.acts.push(async () => {
+        quiesced = f.framework.quiesce({ reason: 'test' });
+        release();
+        await eventually(() => marked('prose-continuation').length > 0, "premise: the private turn's continuation came, marked, during the quiesce");
+        hidden(f).pendingRequests.push(
+          { agentName: 'agent', reason: 'prose-bounce', source: 'framework', timestamp: Date.now(), privateCaller: true },
+          { agentName: 'agent', reason: 'prose-bounce', source: 'framework', timestamp: Date.now() + 1 },
+        );
+      });
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      await quiesced;
+      assert.ok(sent(f, 'zz-room again').length > 0, "premise: the room turn ended with its own ` !`");
+      await (f.framework as unknown as { processInferenceRequests(): Promise<void> }).processInferenceRequests();
+      assert.equal(hidden(f).pendingRequests.filter((r) => (r as { reason?: string }).reason === 'prose-continuation').length, 2,
+        "the room turn's continuation and the private turn's were parked apart");
+      assert.equal(marked('prose-continuation').length, 1, "the private turn's continuation kept its mark in the park");
+      assert.equal(marked('prose-bounce').length, 1, "and so did a private turn's bounce wake");
+      await f.framework.resume();
+      await f.framework.runUntilIdle();
+      const after = speaker.heard.find((h) => h.text.includes('zz-after the lift'));
+      assert.ok(after, `premise: a turn ran at the lift: ${JSON.stringify(speaker.heard)}`);
+      assert.equal(after.private, true, 'the turn at the lift was private');
+    } finally {
+      release();
+      gate.clearSleep();
+      await f.close();
+    }
   });
 
   it("channel_open in a private turn moves nothing, and its result says the turn's speech goes to no channel", async () => {

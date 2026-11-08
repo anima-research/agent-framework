@@ -3,7 +3,8 @@
  * speech goes to one destination it chose, on every turn but a private one, and nothing moves it
  * but its own prose_locus call — not the channel a turn came from, an
  * addressed message mid-turn, a heartbeat, or the host's locus rule. Pointed
- * at drafts (or with no destination yet), plain speech is held as drafts.
+ * at drafts (or with no destination yet), plain speech is held as drafts,
+ * but for a private turn's, which is held as none.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
