@@ -4287,7 +4287,7 @@ export class AgentFramework {
   private pendingRequests: InferenceRequest[] = [];
   private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
   private readonly failedRequests = new Map<string, NormalizedRequest>();
-  private readonly breakerProbes = new Set<{ abort: AbortController; settled: Promise<void> }>();
+  private readonly breakerProbes = new Set<{ agentName: string; abort: AbortController; settled: Promise<void>; stale: boolean }>();
   private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -12650,6 +12650,7 @@ export class AgentFramework {
   }
 
   private forgetFailureAccounting(name: string): void {
+    this.staleBreakerProbes(name);
     this.consecutiveInferenceFailures.delete(name);
     this.exhaustionRewinds.delete(name);
     this.refusalStreak.delete(name);
@@ -34591,6 +34592,7 @@ export class AgentFramework {
       // threshold, so neither the alert nor the breaker would come.
       const name = event.agentName as string | undefined;
       if (name && this.consecutiveInferenceFailures.get(name)) {
+        this.staleBreakerProbes(name);
         this.consecutiveInferenceFailures.set(name, 0);
       }
       if (name && this.exhaustionRewinds.get(name)) {
@@ -34697,7 +34699,9 @@ export class AgentFramework {
    *      the same context is likely to fail the same way, and every new push
    *      event would wake the agent onto that same history. At the hard-down
    *      threshold, it first sends the failed request without its history,
-   *      and only if that is answered does it quarantine: shed the newest complete
+   *      and only if that is answered does it quarantine (later failures in
+   *      the same run of failures, whose history that answer already
+   *      implicated, quarantine without another probe): shed the newest complete
    *      exchange (the same forced-rewind primitive `/unstick` uses —
    *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
    *      bounded by the same rewind cap so the breaker can never eat the
@@ -35111,6 +35115,7 @@ export class AgentFramework {
     const cutAt = (excerpt: string): Record<string, unknown> =>
       excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
+    this.staleBreakerProbes(agentName);
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
 
@@ -35310,7 +35315,6 @@ export class AgentFramework {
     const rowsOf = (): string => (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages())
       .map((m) => m.id).join('\n');
     const sent = {
-      streak: this.consecutiveInferenceFailures.get(name),
       turn: this.activeTurnTokens.get(name),
       branch: this.store.currentBranch().name,
       rows: rowsOf(),
@@ -35323,8 +35327,7 @@ export class AgentFramework {
       (error: unknown): Error => (error instanceof Error ? error : new Error(failureDescription(error))),
     ).then((probeFailure) => {
       const turn = this.activeTurnTokens.get(name);
-      if (this.agents.get(name) !== agent || this.providerAdmissionClosed || this.surgeryHold
-        || this.consecutiveInferenceFailures.get(name) !== sent.streak
+      if (this.agents.get(name) !== agent || this.providerAdmissionClosed || this.surgeryHold || probe.stale
         || (turn !== undefined && turn !== sent.turn)
         || this.store.currentBranch().name !== sent.branch
         || historyMoved || rowsOf() !== sent.rows) {
@@ -35340,19 +35343,36 @@ export class AgentFramework {
       const same = answered.errorType === failure.errorType && answered.httpStatus === failure.httpStatus;
       const status = answered.httpStatus === undefined ? 'with no status' : `at HTTP ${answered.httpStatus}`;
       const answer = `The probe's answer: ${boundFailureText(probeFailure.message, FAILURE_SUMMARY_MAX_CHARS)}`;
+      const next = 'No retry was queued, so the agent tries again only when something next wakes it.';
       const message = same
-        ? `the request fails without its history too, with the same ${String(answered.errorType)} ${status}, so none of the history was shed. ${answer}`
-        : `a probe without its history couldn't tell whether the history is the cause, so none of it was shed. ${answer}`;
+        ? `the request fails without its history too, with the same ${String(answered.errorType)} ${status}, so none of the history was shed. ${next} ${answer}`
+        : `a probe without its history couldn't tell whether the history is the cause, so none of it was shed. ${next} ${answer}`;
       console.error(`[inference-rewind] agent=${name} kept its history: ${message}`);
-      this.opsAlert('history-kept', name, message, { data: { probe: same ? 'fails-without-history' : 'could-not-tell', ...answered } });
+      // Each verdict has its own webhook cooldown, so a conclusive one isn't held back by an inconclusive one.
+      const verdict = same ? 'fails-without-history' : 'could-not-tell';
+      this.opsAlert('history-kept', name, message, { data: { probe: verdict, ...answered }, key: verdict });
     }).catch((error: unknown) => {
       console.error(`[inference-rewind] agent=${name}: the breaker failed while acting on its probe's answer, and may already have shed part of the history: ${describeFailureWithFrames(error)}`);
     }).finally(() => {
       detach();
       this.breakerProbes.delete(probe);
     });
-    const probe = { abort, settled };
+    const probe = { agentName: name, abort, settled, stale: false };
     this.breakerProbes.add(probe);
+  }
+
+  /**
+   * The agent's failure count moved: a failure counted, its streak reset by a
+   * completed turn, or its accounting forgotten. A probe still out for it was
+   * sent for a count that no longer holds, even one the count comes back to,
+   * so it's withdrawn and its answer is set aside.
+   */
+  private staleBreakerProbes(name: string): void {
+    for (const probe of this.breakerProbes) {
+      if (probe.agentName !== name) continue;
+      probe.stale = true;
+      probe.abort.abort();
+    }
   }
   private ownAuxiliaryMembraneFor(agent: Agent): Membrane {
     const release = this.managerReleases.get(agent);

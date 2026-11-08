@@ -7,7 +7,8 @@
  * Now, at the hard-down threshold, when the failure suggests the provider
  * refused the request's content or size (shedMayHelp: an invalid_request at
  * HTTP 400, 413 or 422 or with no status, or a context_length at 413), and
- * the failed request sent without its history is answered, the breaker
+ * the failed request sent without its history is answered (or an earlier
+ * failure's probe in the same run of failures was), the breaker
  * auto-quarantines: sheds the newest complete exchange (the same
  * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
  * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
