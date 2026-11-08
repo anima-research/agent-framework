@@ -5157,14 +5157,17 @@ export class TuneOutCoordinator {
     this.writeLooks(rest);
   }
 
-  /** At boot: the last looks of epochs no longer active go. */
   private pruneLooks(): void {
     if (this.hooks.subconsciousName() == null) return;
     const looks = this.lastLooks();
     if (!looks) return;
-    const active = new Set(this.channelRegistry.tuneOutsOnRecord().map((e) => e.params.epochId));
-    const scope = this.getAllExcept();
-    if (scope) active.add(scope.params.epochId);
+    let active: Set<string>;
+    try {
+      active = new Set(this.holdsOnRecord().map((hold) => hold.epochId));
+    } catch (err) {
+      console.error(`[tune-out] the holds on record could not be read, so the subconscious's last looks are all kept: ${thrownReason(err)}`);
+      return;
+    }
     const kept = Object.fromEntries(Object.entries(looks).filter(([epochId]) => active.has(epochId)));
     if (Object.keys(kept).length !== Object.keys(looks).length) this.writeLooks(kept);
   }

@@ -132,6 +132,56 @@ for (const order of ['before', 'after'] as const) {
   });
 }
 
+test("a start whose read of the holds on record throws keeps every last look and says so; one whose read answers prunes the looks of an epoch no longer on record", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'last-looks-unread-'));
+  const path = join(dir, 'store');
+  const store = JsStore.openOrCreate({ path });
+  let closed = false;
+  let reopened: JsStore | undefined;
+  try {
+    const params: TuneOutParams = { epochId: 'eA', cadenceSeconds: 1800, backlogCap: 200, maxWakes: 5, startedAtSequence: 7 };
+    const registry = registryOn(store);
+    registry.enterTuneOut('disc', CHANNEL, params, 'agent-tool');
+    let sequence = 8;
+    const first = coordinatorOn(registry, () => sequence);
+    inner(first).markLook('eA', 'disc', CHANNEL);
+    sequence = 9;
+    inner(first).markLook('eGone', 'disc', 'disc:guild:b');
+    const marked = inner(first).lastLooks();
+    assert.deepEqual(Object.keys(marked ?? {}).sort(), ['eA', 'eGone'], 'a look of the hold on record, and one of an epoch no longer on it');
+    first.stop();
+    store.sync();
+    store.close();
+    closed = true;
+
+    reopened = JsStore.openOrCreate({ path });
+    const again = registryOn(reopened);
+    const read = again.tuneOutsOnRecord.bind(again);
+    let failing = true;
+    again.tuneOutsOnRecord = () => {
+      if (failing) throw new Error('the store could not read the holds (test)');
+      return read();
+    };
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const second = coordinatorOn(again);
+    second.resumeActiveEpochs();
+    failing = false;
+    second.stop();
+    assert.deepEqual(inner(second).lastLooks(), marked, 'no look pruned on a read that threw');
+    assert.ok(errors.some((e) => e.includes("the subconscious's last looks are all kept")), 'the start says it kept them');
+
+    const third = coordinatorOn(again);
+    third.resumeActiveEpochs();
+    third.stop();
+    assert.deepEqual(Object.keys(inner(third).lastLooks() ?? {}), ['eA'], 'with the read answering, the start prunes the epoch no longer on record');
+  } finally {
+    if (!closed) store.close();
+    reopened?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("ending the all-except hold leaves a channel's own tune-out its pending wake and its tally", (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const dir = mkdtempSync(join(tmpdir(), 'last-looks-hold-end-'));
