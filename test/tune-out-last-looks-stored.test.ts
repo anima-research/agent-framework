@@ -48,7 +48,6 @@ function coordinatorOn(
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => seen.stored?.() ?? [],
-    getDeferredMessages: () => [],
     emitTrace: () => {},
     currentSequence: sequence,
     setSubconsciousAnchor: () => {},
