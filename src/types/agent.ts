@@ -708,6 +708,15 @@ export interface InferenceRequest {
    */
   heartbeatTurn?: boolean;
   /**
+   * Framework-set: this wake comes from a turn that may be answering a
+   * message from a surface with no channel (a console, the TUI, an API
+   * call), so the turn it opens speaks in no channel either. True on the
+   * framework's own wakes from such a turn (an autoContinue continuation, a
+   * bounce's resend wake, a ` !` continuation), and on a merged batch where
+   * any cause has it. Hosts don't set it.
+   */
+  privateCaller?: true;
+  /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
    * batch spans several channels, an addressed channel outranks ambient

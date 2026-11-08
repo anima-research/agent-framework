@@ -1,8 +1,8 @@
 # Locked prose routing (`proseRouting: "locked"`)
 
 Locked routing sends a resident's plain speech (text written without a send
-tool) to one destination the resident chose, on every turn, and lets nothing
-move it automatically.
+tool) to one destination the resident chose, on every turn but a private one
+(below), and lets nothing move it automatically.
 
 ```jsonc
 "agent": { "proseRouting": "locked", "proseLock": "#lounge" }  // proseLock is optional
@@ -15,7 +15,8 @@ Only the resident's own `prose_locus` call moves it. These don't:
 - the channel of the message that woke the turn;
 - an addressed message mid-turn (a mention, reply or DM), under either
   `speech.locus` rule, and a follow-up in a channel the turn sent into;
-- a heartbeat: a heartbeat's turn speaks into the lock like any other;
+- a heartbeat: a heartbeat's turn speaks into the lock like any other turn
+  that isn't private;
 - `channel_open`. Its result says where plain speech still goes;
 - an all-except `tune_out`, or the latest inbound message.
 
@@ -39,8 +40,9 @@ Offered only to a locked agent (and only where its `allowedTools` permit it).
 | `prose_locus { to: "drafts" }` | Holds plain speech as drafts: posted nowhere unless the resident resends them with the `drafts` tool. |
 
 A move is recorded in `framework/state` (`proseLocks`) before it applies, so a
-failed write moves nothing. It applies to the calling turn's later rounds and
-to every later turn, across restarts once the store has synced (the move syncs
+failed write moves nothing. It applies to the calling turn's later rounds,
+unless that turn is private (below), and to every later turn,
+across restarts once the store has synced (the move syncs
 it; a sync that fails is logged, and the write stays in the store's log). What the resident wrote in the same
 round as the call goes where speech went before it: a round's routing is
 decided from the locus that round had.
@@ -57,6 +59,18 @@ can't be told apart. A move during such a turn holds the rest of the turn's
 plain speech as drafts, every later stream of it included (a budget restart's,
 a retry's), sending none of it to either destination, and the move's result
 says so. Later turns speak at the new destination.
+
+## A private turn
+
+A turn that holds an operator's private message, from a surface with no
+channel such as a console, the TUI or an API call, speaks in no channel
+though the lock names one (docs/dendrite.md, "Private turns"). Its plain
+speech is posted nowhere and isn't held as drafts, and `channel_publish`
+called with no channel has no default. A `prose_locus` call made in it moves
+the lock for later turns only, as a call from outside the turn does, and its
+result says this turn's speech goes to none. Turns speak at the lock again
+once the message has been answered and a channel's message is newer, but for
+a turn that continues a private one.
 
 ## Drafts
 
