@@ -16203,7 +16203,6 @@ export class AgentFramework {
     // provider hold's retry on its way) holds the window: its next rows
     // would land on what the undo took out.
     if (this.heldContinuation(agentName) && !this.hasTurn(agentName) && !this.turnAlive(agent)) {
-      if (this.getTurnCheckpoints(agentName).length === 0) return { undone: false };
       this.dropHeldContinuation(agentName, 'an undo took out what its held turn stood on');
     }
     if (this.logicalTurnAlive(agent)) {

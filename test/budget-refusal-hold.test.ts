@@ -383,22 +383,6 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it('an undo while a turn waits, on an agent with no turn to undo, returns undone: false, and the turn still waits', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 1 }, async () => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered go'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        assert.deepEqual(t.internal.getTurnCheckpoints('prime'), [], 'no turn to undo');
-        assert.deepEqual(t.framework.undoLastTurn('prime'), { undone: false });
-        assert.notEqual(t.hold(), null, 'the turn still waits');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
   it('takes a sharded injection out of the window whole at the wait, so an undo of the released turn leaves none', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       let lesson = 'a short lesson';
