@@ -511,11 +511,11 @@ test('providerHold is consulted before the built-in acceleration classification'
   }
 });
 
-// About twice the most a spread can pass as call arguments on Node 24.22.1
+// About twice the most a spread can pass as call arguments on Node 24.22.2
 // (between 124,887 and 125,498 elements).
 const HELD_PAST_A_SPREAD = 250_000;
 
-test('a provider hold releases a held list longer than a spread can pass: the turn starts once and takes every held wake', async (t) => {
+test("a provider hold releases a held list longer than a spread can pass: one turn starts, with the newest held wake's line, and none is left waiting", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'af-provider-cooldown-'));
   const membrane = new AccelerationThenSuccessMembrane();
   const framework = await AgentFramework.create({
@@ -544,7 +544,7 @@ test('a provider hold releases a held list longer than a spread can pass: the tu
     t.mock.timers.tick(1_000);
     await waitFor(framework, () => membrane.calls.length >= 2, 'the turn the release starts');
     await framework.runUntilIdle();
-    assert.equal(membrane.calls.length, 2, 'one turn takes every held wake');
+    assert.equal(membrane.calls.length, 2, 'the release starts one turn');
     assert.ok(JSON.stringify(membrane.calls[1]).includes('in #held-newest '), "the newest held wake's line reaches the turn");
     assert.equal(framework.getHostModeStatus().gatedRequests, 0, 'no held wake is left waiting');
   } finally {

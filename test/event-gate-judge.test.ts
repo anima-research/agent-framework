@@ -431,7 +431,7 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
-  // About twice the most a spread can pass as call arguments on Node 24.22.1
+  // About twice the most a spread can pass as call arguments on Node 24.22.2
   // (between 124,887 and 125,498 elements).
   const PAST_A_SPREAD = 250_000;
   for (const route of ['held while a turn runs', 'queued while the judge decides'] as const) {
