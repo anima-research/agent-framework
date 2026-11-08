@@ -22,8 +22,9 @@ Only the resident's own `prose_locus` call moves it. These don't:
 
 When someone addresses the resident mid-turn from another channel, the same
 `[routing]` notice that `speech.locus: "delivery"` uses rides the injection
-batch: who, from where, and that plain speech still lands in the lock, so
-reaching them takes an explicit send. Messages heard at a boundary that can't
+batch: who, from where, and that plain speech still lands in the lock (in a
+private turn, that it stays in the archive), so reaching them takes an
+explicit send. Messages heard at a boundary that can't
 tell them (over budget, or without a live stream) are told at the turn's next
 start. A turn isn't told at its start that its waking message came from
 elsewhere. The resident chose the lock, and every turn's `[delivered]`
@@ -75,7 +76,7 @@ a turn that continues a private one.
 ## Drafts
 
 A turn locked to drafts, or with no destination yet, holds its plain speech
-as drafts (`no-destination`). Holding is what the resident asked for, so
+as drafts (`no-destination`), unless it's private ("A private turn", above). Holding is what the resident asked for, so
 there's no draft notice for each round. The turn's `[delivered]` receipt
 names the drafts, and they resend or dismiss like any others. Such a turn has
 no outgoing channel: `channel_publish` called with no channel has no default
@@ -105,8 +106,10 @@ Locked routing governs plain speech routed through the channel registry
 (MCPL channels). A module that handles a turn's final speech itself
 (`onAgentSpeech`), such as the in-process Discord module in
 `src/modules/discord`, receives it in locked mode as it does in every other
-mode, `disabled` and `explicit` included. Hosts that rely on locked routing
-should reach channels through MCPL servers rather than such a module.
+mode, `disabled` and `explicit` included. In a private turn it's told so
+(`SpeechContext.private`), and the in-process Discord module posts none of
+it. Hosts that rely on locked routing should reach channels through MCPL
+servers rather than such a module.
 
 ## Unchanged from locus mode
 

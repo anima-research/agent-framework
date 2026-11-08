@@ -1,19 +1,31 @@
 - A turn that holds an operator's private message, one from a surface with no
   channel (a module's row for an `external-message` or `api:message` event
   whose metadata names no channel, such as a console's, the TUI's or an API
-  call's), now speaks in no channel unless the agent names one, in every prose
+  call's, other than the framework's own `mcpl:` notices of a server's new
+  tools), now speaks in no channel unless the agent names one, in every prose
   mode and over a lock. Before, its answer could go wherever the turn's plain
   speech went otherwise: a focused channel, the latest inbound channel, the
   lock, or the locus of a room's turn that heard the message. A turn is
   private while such a message is unanswered or is the newest channel or
-  surface message in its window; a turn that hears one at a tool boundary, or
-  is presented one at a start that continues it, is private for the rest of
-  it and is told so by a `[routing]` notice; and the turns a private turn
-  causes are private too (`InferenceRequest.privateCaller`, which the
-  framework sets). See docs/dendrite.md, "Private turns".
+  surface message in its window. A channel's message there is a row whose
+  inbound source is a channel, or a row with no inbound source, as a module
+  writes for its channel's message, whose metadata names a `channelId` and
+  that has no `kind` and no `system` flag. A turn that hears one at a tool
+  boundary, or is presented one at a start that continues it, is private for
+  the rest of it and, unless it's silent or ends there, is told so by a
+  `[routing]` notice. The turns that the framework's own wakes from a private
+  turn open, its auto-continue, its ` !` continuation and a prose bounce's
+  resend, are private too (`InferenceRequest.privateCaller`, which the
+  framework sets). The built-in Discord module posts none of a private turn's
+  speech. See docs/dendrite.md, "Private turns".
   - **Hosts:** a module that stores a channel's message for an
     `external-message` event whose metadata names no `channelId` now gets a
-    private turn for it. Name the channel in the event's metadata.
+    private turn for it. Name the channel in the event's metadata. For the
+    module's channel message to make the next turn public once an operator's
+    message has been answered, its row names the `channelId` in its
+    metadata, with no `kind` and no `system` flag.
+  - **Hosts:** a module that publishes the speech it hears in
+    `onAgentSpeech` should post none of it when `SpeechContext.private` is set.
   - The descriptions of `focus`, `tune_out`, `channel_publish` and
     `prose_locus` now say this, so a host's prompt cache is rewritten once for
     each resident offered any of them.

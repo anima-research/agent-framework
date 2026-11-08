@@ -1680,7 +1680,14 @@ function answersOperator(row: StoredMessage): boolean {
     && blocks.some((block) => block.type === 'text' && !!(block as { text?: string }).text?.trim());
 }
 
-function windowIsPrivate(cm: ContextManager, agentName: string, sees: (metadata: unknown) => boolean): boolean {
+function channelConversation(metadata: unknown): boolean {
+  const source = readInboundSource(metadata);
+  if (source) return source.kind === 'channel';
+  const row = metadata as { channelId?: unknown; system?: unknown; kind?: unknown } | undefined;
+  return typeof row?.channelId === 'string' && row.channelId !== '' && row.system !== true && row.kind === undefined;
+}
+
+function privateWindowSurface(cm: ContextManager, agentName: string, sees: (metadata: unknown) => boolean): string | undefined {
   const window = cm.getPresentedMessages();
   let answered = false;
   let conversationSeen = false;
@@ -1691,13 +1698,13 @@ function windowIsPrivate(cm: ContextManager, agentName: string, sees: (metadata:
       if (answersOperator(row)) answered = true;
       continue;
     }
-    const operator = operatorSurface(row.metadata) !== undefined;
-    if (operator && (!conversationSeen || !answered)) return true;
-    if (!operator && readInboundSource(row.metadata)?.kind !== 'channel') continue;
+    const surface = operatorSurface(row.metadata);
+    if (surface !== undefined && (!conversationSeen || !answered)) return surface;
+    if (surface === undefined && !channelConversation(row.metadata)) continue;
     conversationSeen = true;
-    if (answered) return false;
+    if (answered) return undefined;
   }
-  return false;
+  return undefined;
 }
 
 /**
@@ -1734,6 +1741,7 @@ interface ProseRound {
   draftsRound?: boolean;
   /** The outgoing stream of the stream that queued the round. */
   onPublished?: SpeechPublished;
+  queuedPublic?: true;
 }
 
 /**
@@ -20678,6 +20686,7 @@ export class AgentFramework {
             // move from outside the turn leaves the turn where it was): no
             // open or reply moves it.
             const open = this.openLogical.get(reader!.name);
+            if (open?.private) return `1. Reply — your plain speech goes to no channel this turn, not here. To reply here, ${sendTool}.\n`;
             const lock = open?.locked ? this.turnSpeaksAt(open) : this.proseLockLocus(reader!);
             // A move made while a turn is held reaches only the next turn, so
             // it's no way to reply here now.
@@ -22766,7 +22775,7 @@ export class AgentFramework {
             continue;
           }
           if (to) {
-            routing.pin = to;
+            if (!(routing.private && round.queuedPublic)) routing.pin = to;
             delete routing.hybridHold;
           } else {
             delete routing.pin;
@@ -26238,7 +26247,7 @@ export class AgentFramework {
       // A function replacement: a draft's words go in exactly, `$&` and `$$` included.
       if (usedClipboard) body = body.replaceAll('{{unsent}}', () => unsent.draft?.text ?? '');
       const pinned: ChannelRef = { serverId: resolved.serverId, channelId: resolved.channelId };
-      routing.pin = pinned;
+      if (!(routing.private && round.queuedPublic)) routing.pin = pinned;
       delete routing.hybridHold;
       if (!body.trim()) {
         console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
@@ -26396,7 +26405,7 @@ export class AgentFramework {
       }
       targetChannel = { serverId: res.serverId, channelId: res.channelId };
       // Sticky within the turn: later unprefixed segments follow this target.
-      routing.pin = targetChannel;
+      if (!(routing.private && round.queuedPublic)) routing.pin = targetChannel;
       body = parsed.body;
     } else {
       const sticky = routing.pin;
@@ -27492,11 +27501,13 @@ export class AgentFramework {
     this.turnRouting.set(agent.name, routing);
     if (opensTurn) {
       carry = undefined;
-      if (trigger?.privateCaller || windowIsPrivate(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata))) {
+      if (trigger?.privateCaller || privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata)) !== undefined) {
         routing.private = true;
       }
     } else if (!routing.private && !resumesTurn) {
-      const surface = presented.map((row) => operatorSurface(row.metadata)).find((name) => name !== undefined);
+      const surface = this.presents(agent)
+        ? presented.map((row) => operatorSurface(row.metadata)).find((name) => name !== undefined)
+        : privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata));
       if (surface !== undefined) this.makeTurnPrivate(agent, routing, routing.silent ? undefined : surface);
     }
     // A turn a start runs on is live again, though an earlier start's settle
@@ -28821,6 +28832,7 @@ export class AgentFramework {
               routing: streamRouting,
               notice: presentsInjections ? 'now' : 'later',
               onPublished: roundPublished,
+              ...(streamRouting.private ? {} : { queuedPublic: true as const }),
             };
             // Routing publishes trimmed segments; held drafts keep the runs
             // exactly as written.
@@ -29585,6 +29597,7 @@ export class AgentFramework {
                 },
                 thoughts: thoughts.length > 0 ? thoughts : undefined,
                 turnId: streamRouting.turnId,
+                ...(streamRouting.private ? { private: true as const } : {}),
               };
               await this.moduleRegistry.dispatchSpeech(
                 agent.name,
@@ -41376,6 +41389,8 @@ export class AgentFramework {
         console.error(`[sleep] ${agentName}: locked turn speaks nowhere now (drafts, or held after a move) — sleep announcement not posted`);
       } else if (!callingTurn.locus && callingTurn.heartbeat) {
         console.error(`[sleep] ${agentName}: a heartbeat turn has no channel — sleep announcement not posted`);
+      } else if (callingTurn.private) {
+        console.error(`[sleep] ${agentName}: a private turn has no channel — sleep announcement not posted`);
       } else {
         const locus = callingTurn.locus ?? null;
         registry.routeSpeech(agentName, announcement(locus), locus).then(noted).catch((err) => {
