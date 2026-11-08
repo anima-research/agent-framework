@@ -282,6 +282,7 @@ function breakAfterToolRound(
   how: 'error' | 'throw' | 'abort' | 'stop',
   opts: {
     fromStart?: boolean;
+    atCompletion?: boolean;
     stopEnds?: 'aborted' | 'error' | 'silent' | 'throw';
     stream?: number;
     failure?: () => Error;
@@ -309,6 +310,7 @@ function breakAfterToolRound(
         }) as unknown as StreamEvent;
         if (opts.fromStart) { yield failure(); return; }
         for await (const event of inner) {
+          if (opts.atCompletion && event.type === 'complete') { await opts.beforeFailure?.(); yield failure(); return; }
           yield event;
           if (event.type !== 'tool-calls') continue;
           while (!resultsGiven && !cancelled) await new Promise<void>((resolve) => { wake = resolve; });
@@ -4335,6 +4337,29 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         assert.deepEqual(markers(h), []);
       } finally {
         await h.close();
+      }
+    });
+
+    it('locus and hybrid: plain speech streamed with no tool round, then a failure, posts nothing and writes no marker; the same turn completing posts it once', async () => {
+      for (const proseRouting of ['locus', 'hybrid'] as const) {
+        for (const fails of [true, false]) {
+          const at = `${proseRouting}, ${fails ? 'failing' : 'completing'}`;
+          const h = await harness({ agents: [{ name: 'scout', proseRouting }], retries: 0 });
+          try {
+            const exhausted: unknown[] = [];
+            h.framework.onTrace((event) => { if ((event as { type: string }).type === 'inference:exhausted') exhausted.push(event); });
+            if (fails) breakAfterToolRound(h.membrane, 'error', { atCompletion: true, beforeFailure: () => speechSettled(h) });
+            await h.turn([createMockResponse([text(SPEECH)])]);
+            if (!fails) await h.until(() => published(h, SPEECH).length === 1, `${at}: the speech is posted`);
+            await speechSettled(h);
+            assert.equal(exhausted.length, fails ? 1 : 0, `premise, ${at}: the turn ${fails ? 'failed' : 'completed'}`);
+            if (fails) assert.deepEqual(h.publishes().filter((p) => p.event === 'publish').map((p) => p.text), [], at);
+            else assert.equal(published(h, SPEECH).length, 1, at);
+            assert.deepEqual(markers(h), [], at);
+          } finally {
+            await h.close();
+          }
+        }
       }
     });
 
