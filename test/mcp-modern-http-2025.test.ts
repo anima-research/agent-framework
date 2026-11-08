@@ -1200,41 +1200,35 @@ test('a cut request stream whose resume meets 405 ends the session, and the call
   assert.equal(count(fixture, (s) => s.rpc === 'tools/call'), 1, 'the cut call was not replayed');
 });
 
-test('two calls whose streams are each cut twice before a new event are both answered, each resume carrying its own call\'s id', async () => {
+test('a call whose stream is cut again before it carried a new event fails at its deadline as no-response, and its session lives on', async () => {
   // SEP-1699's polling, done twice. The SDK resumes a stream cut again
-  // before it carried a new event id without its id (typescript-sdk#2499);
-  // the engine gives back the one its call's resumes last carried.
+  // before it carried a new event id without its id (typescript-sdk#2499),
+  // which the server can't take as this call's stream, so the answer never
+  // arrives. An SDK release with the fix gets the call answered, and this
+  // fails: the README's sentence on a stream cut twice changes with it.
   const fixture = await start2025({ versions: ['2025-11-25'], resumable: {} });
-  const connection = await connect(fixture, { requestTimeoutMs: 10_000, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  const connection = await connect(fixture, { requestTimeoutMs: 3000, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  let reconnects = 0;
+  connection.on('reconnect', () => reconnects++);
   await connection.listTools();
   await until(() => count(fixture, (s) => s.method === 'GET' && !s.resumed && s.status === 200) === 1, 'the standalone stream open');
   const transport = fixture.sessions.get(sessionOf(connection)!)!;
-  const calls = [connection.callTool('slow', { ms: 2000 }), connection.callTool('slow', { ms: 2300 })];
-  await until(() => fixture.events.filter((e) => e === 'slow-start').length === 2, 'both calls running');
-  const [a, b] = fixture.seen.filter((s) => s.rpc === 'tools/call').map((s) => s.id);
-  const streams = (transport as unknown as { _requestToStreamMapping: Map<unknown, string> })._requestToStreamMapping;
-  const [streamA, streamB] = [streams.get(a)!, streams.get(b)!];
-  const resumes = () => fixture.seen.filter((s) => s.method === 'GET' && s.resumed && s.status === 200).map((s) => s.lastEventId!);
-  // The first cuts, a's first, each after its stream's priming event: the
-  // SDK resumes each with its own id.
-  transport.closeSSEStream(a as never);
-  await until(() => resumes().length === 1, 'a resumed');
-  transport.closeSSEStream(b as never);
-  await until(() => resumes().length === 2, 'b resumed');
-  const [primedA, primedB] = resumes();
-  assert.ok(primedA!.startsWith(`${streamA}_`) && primedB!.startsWith(`${streamB}_`), `each resume carried its own stream's id: ${resumes()}`);
-  // The second cuts, on the resumed streams, before anything new: the SDK
-  // resumes each bare, and each gets its own call's id back, a's though b's
-  // came last.
-  transport.closeSSEStream(a as never);
-  await until(() => resumes().length === 3, 'a resumed again');
-  transport.closeSSEStream(b as never);
-  await until(() => resumes().length === 4, 'b resumed again');
-  assert.deepEqual(resumes(), [primedA, primedB, primedA, primedB]);
-  const results = await Promise.all(calls);
-  assert.deepEqual(results.map((r) => r.content), [[{ type: 'text', text: 'slept 2000' }], [{ type: 'text', text: 'slept 2300' }]]);
-  // Only the standalone stream's one GET went out without an id.
-  assert.equal(count(fixture, (s) => s.method === 'GET' && !s.resumed), 1, 'no request stream resumed bare, and the standalone stream left alone');
+  const started = Date.now();
+  const calling = connection.callTool('slow', { ms: 1000 });
+  await until(() => fixture.events.includes('slow-start'), 'the call running');
+  const call = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
+  transport.closeSSEStream(call as never);
+  await until(() => count(fixture, (s) => s.method === 'GET' && s.resumed && s.status === 200) === 1, 'the first resume, with its id');
+  transport.closeSSEStream(call as never);
+  await assert.rejects(calling, (err: unknown) => {
+    assert.ok(err instanceof McplRequestError);
+    assert.equal(err.outcome, 'no-response');
+    return true;
+  });
+  assert.ok(Date.now() - started >= 2900, `the call failed ${Date.now() - started} ms after it started, before its deadline`);
+  assert.equal(reconnects, 0, "the session wasn't restarted");
+  assert.equal(count(fixture, (s) => s.method === 'DELETE'), 0, "the session wasn't ended");
+  assert.ok(connection.isConnected);
 });
 
 test('a session that ends before it answered is a failed connect: refused, reported, and not restarted at once', async () => {

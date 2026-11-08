@@ -168,11 +168,6 @@ interface WireRecord {
    *  which can fail the call before the transport's own 404 error reaches it. */
   sessionEnded?: boolean;
   /**
-   * The last `Last-Event-ID` a resume of this call's stream carried, kept
-   * for a later resume that lost it (see observedFetch).
-   */
-  lastEventId?: string;
-  /**
    * The call's own abort, given to the SDK, which cancels the call when it
    * fires: at the call's deadline, or as soon as the stream that would carry
    * the current leg's answer ends unanswered and can't be resumed (see
@@ -192,13 +187,12 @@ class NotWrittenError extends Error {
 
 /**
  * The logical request a send belongs to. The SDK hands each request to the
- * transport inside the caller's async chain, so the scope reaches `send`, and
- * the resumes of the request's stream, which follow on from that chain
- * (see observedFetch). Anything else started on that chain carries the scope
- * too: a session's end queued from a call's fetch restarts the session
- * inside that call's scope, the new session's standalone stream included. So
- * the scope tells which call a request stream's resume belongs to, never
- * whether a GET is the standalone stream's, which its signal tells.
+ * transport inside the caller's async chain, so the scope reaches `send` and
+ * the request's POST (see observedFetch). Anything else started on that chain
+ * carries the scope too: a session's end queued from a call's fetch restarts
+ * the session inside that call's scope, the new session's requests included.
+ * So a POST's scope alone doesn't make it that call's: its body's id must be
+ * the call's current leg.
  */
 const wireScope = new AsyncLocalStorage<WireRecord>();
 
@@ -1285,15 +1279,6 @@ export class ModernMcpConnection extends EventEmitter {
    *   stream). See {@link streamReopened}. A GET that carries one resumes a
    *   stream, the standalone one or a request's, and the server replays
    *   what that stream missed.
-   * - A request's stream resumed without `Last-Event-ID`. The SDK keeps a
-   *   stream's last event id only for that stream, so once a resumed
-   *   stream that carried no new id is cut too, it resumes without one
-   *   (modelcontextprotocol/typescript-sdk#2499), which the server would
-   *   take for a second standalone stream. The resume runs in its call's
-   *   wire scope, the request's own async chain, so the call's record keeps
-   *   the last id its resumes carried and supplies it then. An id the SDK
-   *   sends itself is left as it is. With no record in scope, the GET goes
-   *   as it is.
    * - A standalone resume the server refuses with 400, as one does for an
    *   event id it no longer holds: retrying the same id can't succeed, and
    *   the SDK would retry it for the session's life. The stream opens again
@@ -1310,21 +1295,9 @@ export class ModernMcpConnection extends EventEmitter {
       const session = sessionOf();
       const http = session.http!;
       const method = (init?.method ?? 'GET').toUpperCase();
-      let resuming = headers.has('last-event-id');
+      const resuming = headers.has('last-event-id');
       if (method === 'GET' && !resuming && http.standaloneSignal === undefined) http.standaloneSignal = init?.signal ?? null;
       const standalone = method === 'GET' && (init?.signal ?? null) === http.standaloneSignal;
-      if (method === 'GET' && !standalone) {
-        // A request's stream resumed, in its call's scope: keep the id it
-        // carries, or give back the last one when the SDK lost it (#2499).
-        const record = wireScope.getStore();
-        if (resuming) {
-          if (record) record.lastEventId = headers.get('last-event-id')!;
-        } else if (record?.lastEventId !== undefined) {
-          headers.set('last-event-id', record.lastEventId);
-          init = { ...init, headers };
-          resuming = true;
-        }
-      }
       const firstOpen = standalone && !http.streamOpened;
       let response: Response;
       let retried = false;
