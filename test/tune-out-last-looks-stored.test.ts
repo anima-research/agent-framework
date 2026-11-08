@@ -33,14 +33,21 @@ function registryOn(store: JsStore): ChannelRegistry {
   return new ChannelRegistry(servers, {} as FeatureSetManager, () => {}, () => {}, { store });
 }
 
-function coordinatorOn(registry: ChannelRegistry, sequence: () => number = () => 0, privileged = false): TuneOutCoordinator {
+function coordinatorOn(
+  registry: ChannelRegistry,
+  sequence: () => number = () => 0,
+  privileged = false,
+  seen: { stored?: () => unknown[]; told?: string[] } = {},
+): TuneOutCoordinator {
   const hooks = {
-    addMessage: () => {},
+    addMessage: (_role: string, content: Array<{ type: string; text?: string }>) => {
+      for (const block of content) if (block.type === 'text' && block.text !== undefined) seen.told?.push(block.text);
+    },
     commitDeliveries: () => true,
     requestInference: () => {},
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
-    getStoredMessages: () => [],
+    getStoredMessages: () => seen.stored?.() ?? [],
     getDeferredMessages: () => [],
     emitTrace: () => {},
     currentSequence: sequence,
@@ -131,6 +138,56 @@ for (const order of ['before', 'after'] as const) {
     }
   });
 }
+
+test("after a restart over the reopened store, the subconscious's first cadence look counts only what was held since its stored last look", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'last-looks-cadence-'));
+  const path = join(dir, 'store');
+  const store = JsStore.openOrCreate({ path });
+  let closed = false;
+  let reopened: JsStore | undefined;
+  try {
+    const params: TuneOutParams = { epochId: 'eA', cadenceSeconds: 30, backlogCap: 200, maxWakes: 5, startedAtSequence: 4 };
+    const held = (sequence: number) => ({ sequence, metadata: { serverId: 'disc', channelId: CHANNEL, tuneOut: { epochId: 'eA' } } });
+    const rows = [held(5), held(6)];
+    const register = (registry: ChannelRegistry) => registry.handleRegister('disc', {
+      channels: [{ id: CHANNEL, type: 'discord', label: '#a', direction: 'bidirectional' }],
+    });
+    const looks = (told: string[]) => told.filter((text) => text.includes('since your last look'));
+
+    const registry = registryOn(store);
+    registry.enterTuneOut('disc', CHANNEL, params, 'agent-tool');
+    await register(registry);
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const toldFirst: string[] = [];
+    const first = coordinatorOn(registry, () => 6, false, { stored: () => rows, told: toldFirst });
+    first.resumeActiveEpochs();
+    t.mock.timers.tick(30_000);
+    assert.equal(looks(toldFirst).length, 1, 'premise: the first cadence period has a look');
+    assert.match(looks(toldFirst)[0]!, /— 2 diverted messages since your last look/, 'premise: counting both held messages');
+    first.stop();
+    t.mock.timers.reset();
+    store.sync();
+    store.close();
+    closed = true;
+
+    rows.push(held(7));
+    reopened = JsStore.openOrCreate({ path });
+    const again = registryOn(reopened);
+    await register(again);
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const toldSecond: string[] = [];
+    const second = coordinatorOn(again, () => 7, false, { stored: () => rows, told: toldSecond });
+    second.resumeActiveEpochs();
+    t.mock.timers.tick(30_000);
+    second.stop();
+    assert.equal(looks(toldSecond).length, 1, 'the first cadence period after the restart has a look');
+    assert.match(looks(toldSecond)[0]!, /— 1 diverted message since your last look/, 'counting the message held since the stored look alone');
+  } finally {
+    if (!closed) store.close();
+    reopened?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("a start whose read of the holds on record throws keeps every last look and says so; one whose read answers prunes the looks of an epoch no longer on record", (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'last-looks-unread-'));
