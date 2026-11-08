@@ -2,7 +2,7 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, withheld, type ReferenceTestimony, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, PAYLOAD_NEVER, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, withheld, type ReferenceTestimony, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -8073,13 +8073,13 @@ export class AgentFramework {
     const eligible = live.filter((record) => fetcher.isEagerEligible(record));
     await Promise.all(eligible.slice(0, MAX_EAGER_PER_RESULT).map(async (record) => {
       const outcome = await fetcher.fetchEager(record);
-      if (!outcome.ok && !record.payloadNever) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
+      if (!outcome.ok && outcome.error !== PAYLOAD_NEVER.error) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
     }));
     if (mode !== 'script') return;
     // A record the eager pass saved returns at once.
     for (const record of live) {
       const outcome = await fetcher.fetch(record);
-      if (!outcome.ok && !record.payloadNever) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+      if (!outcome.ok && outcome.error !== PAYLOAD_NEVER.error) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
     }
   }
 
@@ -28597,7 +28597,7 @@ export class AgentFramework {
             continue;
           }
           const outcome = await fetcher.fetch(record);
-          if (!outcome.ok && !record.payloadNever) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+          if (!outcome.ok && outcome.error !== PAYLOAD_NEVER.error) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
         }
         // Where the loop's registrations are the ones the model's line makes,
         // the treatment's, below, are the script lane's own, which the

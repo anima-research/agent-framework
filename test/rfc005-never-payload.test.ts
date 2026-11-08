@@ -820,6 +820,23 @@ describe("the framework's fetches", () => {
     ].join('\n'), 'the marks, and no failure');
   });
 
+  it("log no failure for a refusal by the uri's mark when the record they hold is unmarked", async () => {
+    // The fetcher refuses by the uri's mark as well as the record's own,
+    // so a record object it's handed can be unmarked while its uri is
+    // marked: one the registry evicted before its fetch, say, whose uri a
+    // later `never` reference made a new, marked record of.
+    const fw = Object.create(AgentFramework.prototype) as Fw;
+    const fetch = async () => NEVER_FAILURE;
+    fw.getReferenceFetcher = () => ({ isEagerEligible: () => true, fetch, fetchEager: fetch });
+    const [eager, module] = [uniq('held-eager.bin'), uniq('held-module.bin')];
+    const { logged } = await quietly(async () => {
+      await fw.autoFetchReferences([{ type: 'resource', uri: eager }], 'zz-never-dialed', 'script');
+      await fw.scriptResultAnswer({ success: true, data: [{ type: 'resource', uri: module }], dataIsContent: true }, 'zz_tool', false);
+    });
+    assert.deepEqual([eager, module].map((u) => referenceRegistry.findByUri(u)?.payloadNever), [undefined, undefined]);
+    assert.equal(logged, '', 'no failure');
+  });
+
   it("answer fetch_reference for a marked record with the reason, and fetch nothing", async () => {
     const fw = Object.create(AgentFramework.prototype) as {
       pushEvent(event: unknown): void;
