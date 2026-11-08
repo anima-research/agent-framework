@@ -337,7 +337,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
 
   it("presents a held first start's arrivals as they come, and one turn answers them all", async () => {
     await withCompression({ fitAt: Infinity }, async (c) => {
-      const t = await resident();
+      const t = await resident({ maintenanceIntervalMs: 0 });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
         t.send('first');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
@@ -347,6 +348,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "its wake joins the hold");
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
         assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
         assert.equal(t.turnCalls().length, 1, 'one turn');
         assert.ok(requestText(t.turnCalls()[0]).includes('first') && requestText(t.turnCalls()[0]).includes('second'));
@@ -358,7 +360,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
 
   it('abortInference() ends a held turn, puts the wakes that joined it back in the queue, and clears the wait', async () => {
     await withCompression({ fitAt: Infinity }, async (c) => {
-      const t = await resident({ replies: ['Answered the second'] });
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered the second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
         t.send('first');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
@@ -379,7 +382,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
 
   it('stop() ends a held turn with inference:aborted, and the hold with it', async () => {
     await withCompression({ fitAt: Infinity }, async () => {
-      const t = await resident();
+      const t = await resident({ maintenanceIntervalMs: 0 });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
         t.send('first');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
@@ -633,7 +637,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
   it('each of two holds within the webhook cooldown reaches it with its open and its clear', async () => {
     await withWebhook(async (posts) => {
       await withCompression({ fitAt: Infinity }, async () => {
-        const t = await resident();
+        const t = await resident({ maintenanceIntervalMs: 0 });
+        t.internal.budgetHoldRecheckMs = 60_000;
         try {
           t.send('first');
           assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
@@ -751,20 +756,25 @@ describe("the hold's note sits where the released turn read it", () => {
 describe('a continuation refused for budget mid-turn waits idle too', () => {
   async function heldContinuation(c: Compression, options: { gate?: boolean; replies?: Reply[] } = {}) {
     c.refuseFrom = 2;
-    const t = await resident({ restart: true, replies: options.replies ?? ['Done after the restart'], ...(options.gate ? { gate: true } : {}) });
+    const t = await resident({ restart: true, maintenanceIntervalMs: 0, replies: options.replies ?? ['Done after the restart'], ...(options.gate ? { gate: true } : {}) });
+    t.internal.budgetHoldRecheckMs = 60_000;
     t.cm().addMessage('user', [text('hello')]);
     t.send('fetch it');
     assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the continuation is held');
     return t;
   }
-  const fit = (c: Compression) => { c.fitAt = c.ticks; c.readyAt = c.ticks; };
+  const fit = (c: Compression, t: Resident) => {
+    c.fitAt = c.ticks;
+    c.readyAt = c.ticks;
+    t.internal.releaseBudgetHold('prime');
+  };
 
   it('runs as before with no surgery', async () => {
     await withCompression({}, async (c) => {
       const t = await heldContinuation(c);
       try {
         assert.equal(t.internal.hasTurn('prime'), false, 'idle for the surgery gate');
-        fit(c);
+        fit(c, t);
         assert.ok(await pollUntil(() => t.stored().includes('Done after the restart')));
         assert.equal(t.of('inference:completed').length, 1);
       } finally {
@@ -782,7 +792,7 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
           assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
           assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
           assert.equal(t.of('inference:aborted').length, 1);
-          fit(c);
+          fit(c, t);
           await sleep(300);
           assert.ok(!t.stored().includes('Done after the restart'), 'nothing runs on the rewound history');
         } finally {
@@ -801,7 +811,7 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
         t.send('MID');
         assert.ok(await pollUntil(() => t.stored().includes('MID')));
         assert.ok(!t.windowText().includes('MID'), 'the arrival waits outside the window');
-        fit(c);
+        fit(c, t);
         assert.ok(await pollUntil(() => t.stored().includes('Read the arrival')));
         const calls = t.turnCalls();
         assert.ok(!requestText(calls.at(-2)).includes('MID'), "the continuation's request leaves it out");
@@ -820,7 +830,7 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
         assert.equal(undone.undone, true);
         assert.equal(t.of('inference:aborted').length, 1);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
-        fit(c);
+        fit(c, t);
         await sleep(300);
         assert.ok(!t.stored().includes('Done after the restart'));
       } finally {
@@ -848,7 +858,7 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
       try {
         assert.ok(t.internal.eventGate, 'the gate is on');
         assert.equal(t.internal.eventGate!.inferring.has('prime'), false, "other agents' batches aren't held behind compression");
-        fit(c);
+        fit(c, t);
         assert.ok(await pollUntil(() => t.stored().includes('Done after the restart')));
       } finally {
         await t.close();
