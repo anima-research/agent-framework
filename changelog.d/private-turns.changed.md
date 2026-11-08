@@ -18,14 +18,18 @@
   silent or ends there, is told so by a `[routing]` notice. The turns that the
   framework's own wakes from a private turn open, its auto-continue, its ` !`
   continuation and a prose bounce's resend, are private too
-  (`InferenceRequest.privateCaller`, which the framework sets). In a private
-  turn, an envelope's own words go where they would in any turn, and no
-  envelope sets a destination for the turn's later words. `channel_publish`
-  naming no channel is refused in a private turn, and its refusal says to name
-  the channel. The built-in Discord module posts none of a private turn's
-  speech and edits none of its thoughts into a post, and a host's own speech
-  handler is told the turn is private and should post none of it either
-  (below). See docs/dendrite.md, "Private turns".
+  (`InferenceRequest.privateCaller`, which the framework sets). So are a
+  private turn's re-runs, each of which takes the mark from the turn: a
+  context-budget restart's continuation, the non-streaming fallback's
+  re-inference, a refusal rewind's or `/unstick`'s retry, the poisoned-history
+  rewind's retry, and a re-arm. In a private turn, an envelope's own words go
+  where they would in any turn, and no envelope sets a destination for the
+  turn's later words. `channel_publish` naming no channel is refused in a
+  private turn, and its refusal says to name the channel. The built-in Discord
+  module posts none of a private turn's speech and edits none of its thoughts
+  into a post, and a host's own speech handler is told the turn is private and
+  should post none of it either (below). See docs/dendrite.md, "Private
+  turns".
   - A module that stores a channel's message for an `external-message`
     event whose metadata names no `channelId` now gets a private turn for it
     (under Breaking).

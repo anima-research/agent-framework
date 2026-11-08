@@ -23671,15 +23671,15 @@ export class AgentFramework {
    *  heartbeat's turn with no locus of its own (InferenceRequest.heartbeatTurn)
    *  and a private turn (InferenceRequest.privateCaller), so the turn it opens
    *  is one too; nothing for any other turn. */
-  private opensPrivate(agent: Agent, trigger: InferenceRequest | undefined): boolean {
-    return trigger?.privateCaller === true
-      || privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata)) !== undefined;
-  }
-
   private heartbeatTurnMark(routing: TurnRouting): { heartbeatTurn?: true; privateCaller?: true } {
     const privateCaller = routing.private ? { privateCaller: true as const } : {};
     // A locked turn's locus is its lock, not a channel the heartbeat answered.
     return routing.heartbeat && (!routing.locus || routing.locked) ? { heartbeatTurn: true, ...privateCaller } : privateCaller;
+  }
+
+  private opensPrivate(agent: Agent, trigger: InferenceRequest | undefined): boolean {
+    return trigger?.privateCaller === true
+      || privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata)) !== undefined;
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
