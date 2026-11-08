@@ -697,8 +697,11 @@ export class Agent {
     if (typeof manager.updateHotContextSettings !== 'function') {
       throw new Error('The active context strategy does not support live context settings');
     }
+    const settings = (s: HotContextSettingsStatus | null) =>
+      JSON.stringify([s?.tailTokens, s?.transitionPaceTokens, s?.preparedWindowTokens]);
+    const before = settings(this.getHotContextSettings());
     const status = manager.updateHotContextSettings(update);
-    this.contextSettingsChangeCount++;
+    if (settings(status) !== before) this.contextSettingsChangeCount++;
     return status;
   }
 

@@ -3088,7 +3088,6 @@ interface BudgetHold {
   state: 'holding' | 'released';
   startedAt: number;
   releasedAt?: number;
-  dueAt?: number;
   turn: InferenceRequest | undefined;
   standsOn: string[];
   wakes: InferenceRequest[];
@@ -3105,6 +3104,7 @@ interface BudgetHold {
   checkQueued?: boolean;
   drainKicked?: boolean;
   noteless?: true;
+  notelessCarry?: { checkpoint: RecordedTurnCheckpoint | undefined; injections: MessageId[] };
   alerted?: true;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
@@ -7173,6 +7173,8 @@ export class AgentFramework {
       return;
     }
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    const mark = (request as MarkedRequest)[BUDGET_HELD];
+    if (mark && mark === this.budgetHolds?.get(request.agentName)) (same as MarkedRequest)[BUDGET_HELD] = mark;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did.
     const batch = mergedBatch(request);
@@ -7393,6 +7395,7 @@ export class AgentFramework {
     routing: TurnRouting,
     noteGiven: boolean,
     baseline: BudgetHoldBaseline | undefined,
+    storedInjections: readonly MessageId[],
     endStart: () => void,
   ): 'held' | 'noteless' | undefined {
     const { errorType } = this.classifyInferenceError(error);
@@ -7405,12 +7408,16 @@ export class AgentFramework {
       if (!ours) return undefined;
       if (noteGiven && !existing.noteless) {
         existing.noteless = true;
+        existing.notelessCarry = { checkpoint, injections: [...storedInjections] };
         return 'noteless';
       }
       this.finishBudgetHold(agent.name, existing, 'nothing_pending');
       return undefined;
     }
-    if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
+    const carried = ours ? existing?.notelessCarry : undefined;
+    if (existing) delete existing.notelessCarry;
+    for (const cp of [checkpoint, carried?.checkpoint]) if (cp !== undefined) this.dropTurnCheckpoint(agent.name, cp);
+    this.retractUnsentInjections(agent, [...storedInjections, ...(carried?.injections ?? [])]);
     const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     if (existing?.state === 'holding' || (existing && !ours)) {
       this.holdRequest(existing.wakes, turn);
@@ -7424,7 +7431,6 @@ export class AgentFramework {
       (turn as MarkedRequest)[BUDGET_HELD] = existing;
       existing.standsOn = standsOn;
       existing.callsAtHold = existing.managerCalls;
-      existing.dueAt = undefined;
       existing.progressAtHold = baseline ? baseline.progress : this.compressionProgressOf(agent);
       existing.settingsAtHold = baseline ? baseline.settings : agent.contextSettingsChanges();
       delete existing.noteless;
@@ -7565,7 +7571,8 @@ export class AgentFramework {
 
   private compressionProgressOf(agent: Agent): string | undefined {
     const progress = this.contextProgress(agent.getContextManager());
-    return progress ? JSON.stringify([progress.chunksCompressed, progress.summaryCounts]) : undefined;
+    if (!progress || (progress.chunksCompressed === undefined && progress.summaryCounts === undefined)) return undefined;
+    return JSON.stringify([progress.chunksCompressed, progress.summaryCounts]);
   }
 
   private closureWaits(agentName: string): boolean {
@@ -7585,14 +7592,9 @@ export class AgentFramework {
 
   private releaseBudgetHold(agentName: string): void {
     const hold = this.budgetHolds?.get(agentName);
-    if (hold?.state !== 'holding') return;
-    if (this.quiesced) {
-      hold.dueAt ??= Date.now();
-      return;
-    }
+    if (hold?.state !== 'holding' || this.quiesced) return;
     hold.state = 'released';
-    hold.releasedAt = hold.dueAt ?? Date.now();
-    hold.dueAt = undefined;
+    hold.releasedAt = Date.now();
     clearInterval(hold.recheck);
     hold.recheck = undefined;
     const requests = [...(hold.turn ? [hold.turn] : []), ...hold.wakes];
@@ -7606,8 +7608,8 @@ export class AgentFramework {
     const size = hold.budget !== undefined && hold.actual !== undefined
       ? ` (${hold.actual.toLocaleString('en-US')} tokens against ${hold.budget.toLocaleString('en-US')})`
       : '';
-    return `[budget-hold] Your context didn't fit its budget${size}, so this turn waited ` +
-      `${describeWait((hold.releasedAt ?? Date.now()) - hold.startedAt)} for compression to make room.`;
+    return `[budget-hold] Your context didn't fit its budget${size} when this turn came to start. ` +
+      `This turn waited ${describeWait((hold.releasedAt ?? Date.now()) - hold.startedAt)}.`;
   }
 
   private budgetHoldNoteFor(agent: Agent, trigger: InferenceRequest | undefined): ContextInjection | undefined {
@@ -7652,7 +7654,7 @@ export class AgentFramework {
         console.error(`[budget-hold] agent=${agent.name}: the note its released turn read could not be stored:`, error);
       }
     }
-    this.finishBudgetHold(agent.name, hold, 'fit');
+    if (this.budgetHolds?.get(agent.name) === hold) this.finishBudgetHold(agent.name, hold, 'fit');
   }
 
   private endReleasedBudgetHold(agentName: string, outcome: 'failed' | 'stopped', cause?: string, start?: InferenceRequest | null): void {
@@ -7675,9 +7677,9 @@ export class AgentFramework {
     if (outcome === 'fit' || !hold.alerted) return;
     const after = describeWait(waitedMs);
     const words = outcome === 'nothing_pending'
-      ? `compression had nothing left to do after ${after}, and the waiting turn's context still didn't fit, so the turn now fails with its budget refusal, as it would without the wait`
+      ? `compression had nothing left to do after ${after}, and the waiting turn's context still didn't fit, so its budget refusal now takes the path it would without the wait`
       : outcome === 'failed'
-        ? `the waiting turn's start failed for another reason after ${after}, so the turn now ends with that failure, as it would without the wait: ${cause ?? 'unknown'}`
+        ? `the waiting turn's start failed for another reason after ${after}, so that failure now takes the path it would without the wait: ${cause ?? 'unknown'}`
         : outcome === 'removed'
           ? `what the waiting turn was for was removed after ${after}, so it doesn't run`
           : `the waiting turn was stopped after ${after}`;
@@ -7692,6 +7694,16 @@ export class AgentFramework {
     const head = `compile refused (${hold.errorType}): `;
     const tail = ' \u2014 the turn waits while compression makes room, and runs once its context fits';
     return head + boundFailureText(hold.reason, FAILURE_TEXT_MAX_CHARS - head.length - tail.length) + tail;
+  }
+
+  private retractUnsentInjections(agent: Agent, ids: readonly MessageId[]): void {
+    if (ids.length === 0 || !this.presents(agent)) return;
+    try {
+      agent.getContextManager().retractRows([...ids], { undone: true });
+      this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...ids], reason: 'unsent-injection' });
+    } catch (error) {
+      console.error(`[budget-hold] agent=${agent.name}: the injection rows its refused start stored could not leave its window:`, error);
+    }
   }
 
   private endHeldTurn(agentName: string, turn: InferenceRequest, drop: ContinuationDrop): void {
@@ -7874,7 +7886,7 @@ export class AgentFramework {
           if (held?.state === 'holding' && this.budgetHoldMoved(agent, held)) {
             this.releaseBudgetHold(agentName);
             if (this.quiesced) break;
-          } else if (held?.managerCalls === calls) {
+          } else if (held?.managerCalls === calls || this.compressionProgressOf(agent) !== undefined) {
             break;
           }
         }
@@ -22162,9 +22174,8 @@ export class AgentFramework {
       if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedBy = 'withdrawal';
     }
     for (const [agentName, hold] of [...(this.budgetHolds?.entries() ?? [])]) {
-      if (hold.state !== 'holding') continue;
       hold.wakes = hold.wakes.filter((r) => !withdrawn(r));
-      if (!hold.turn && hold.wakes.length === 0) this.finishBudgetHold(agentName, hold, 'removed');
+      if (hold.state === 'holding' && !hold.turn && hold.wakes.length === 0) this.finishBudgetHold(agentName, hold, 'removed');
     }
     for (const pass of this.passRequests ?? []) {
       for (const requests of pass.values()) {
@@ -23160,6 +23171,9 @@ export class AgentFramework {
       const carry = requests.map(turnCarryOf).find((c) => c !== undefined);
       if (carry) start[TURN_CARRY] = carry;
       else delete start[TURN_CARRY];
+      const live = this.budgetHolds?.get(agentName);
+      if (live && requests.some((r) => (r as MarkedRequest)[BUDGET_HELD] === live)) start[BUDGET_HELD] = live;
+      else delete start[BUDGET_HELD];
       if (requests.every(isRearmed)) start[REARMED] = true;
       else delete start[REARMED];
       // A start merged from more than one request, any of them not the
@@ -25448,7 +25462,7 @@ export class AgentFramework {
    * returned counts as landed and the rest are placed, so the request may
    * carry a landed one twice, which is logged as unknown.
    */
-  private storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined {
+  private storeInjections(agent: Agent, injections: ContextInjection[] | undefined, stored?: MessageId[]): ContextInjection[] | undefined {
     const plan = this.planInjectionStores(agent, injections);
     if (!plan) return injections;
     // By position, as the plan is: what compile() places, in the order given.
@@ -25468,6 +25482,7 @@ export class AgentFramework {
             system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: row.mark,
           } as MessageMetadata);
           traced.add(key(row.mark));
+          stored?.push(id);
           this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.mark.namespace}` });
         }
       } catch (err) {
@@ -25486,6 +25501,7 @@ export class AgentFramework {
           const mark = markOf.get(copy.id)!;
           kept.add(key(mark));
           if (!traced.has(key(mark))) {
+            stored?.push(copy.id);
             traced.add(key(mark));
             this.emitTrace({ type: 'message:added', messageId: copy.id, source: `context-injection:${mark.namespace}` });
             // The row whose write threw landed: it enters the window as the
@@ -27548,7 +27564,6 @@ export class AgentFramework {
    */
   private endContinuedTurn(agentName: string, drop: ContinuationDrop, opensTurn = false): void {
     console.error(`[turn-continuation] ${agentName}: its turn ends without its continuation: ${drop.why}`);
-    this.endReleasedBudgetHold(agentName, 'stopped');
     const agent = this.agents.get(agentName);
     const startedAt = this.lastInferenceAt.get(agentName)?.startedAt ?? Date.now();
     if (agent && drop.kind !== 'dropped') {
@@ -27578,6 +27593,7 @@ export class AgentFramework {
       // run's, with the drop's reason.
       this.settleAgent(agentName, { stopReason: 'exhausted', speech: '', error: `${agentName}'s turn ended without its continuation: ${drop.why}` }, undefined);
     }
+    this.endReleasedBudgetHold(agentName, 'stopped');
     // The turn's end; a frame that still holds its token presents at its
     // own end instead.
     this.presentAtEndOf(this.agents.get(agentName));
@@ -27978,6 +27994,7 @@ export class AgentFramework {
     let checkpoint: RecordedTurnCheckpoint | undefined;
     let holdNote: ContextInjection | undefined;
     let compileBaseline: BudgetHoldBaseline | undefined;
+    const storedInjections: MessageId[] = [];
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
       checkpoint = this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
@@ -28325,7 +28342,7 @@ export class AgentFramework {
       // last request held, or a newer copy a start stored whose compile then
       // didn't record), when it's left out; the rest go to compile(), as do those
       // it would store while the window is held.
-      injections = this.storeInjections(agent, injections);
+      injections = this.storeInjections(agent, injections, storedInjections);
       // With the presentation index, the backstop before every compile,
       // fresh or resumed: the agent's own rows stored since its start and not
       // in its window yet (a write whose presentation failed) enter it now,
@@ -28520,7 +28537,7 @@ export class AgentFramework {
 
       const retry = trigger && withTurnCarry(trigger, carry);
       const asTransient = this.takeAsTransient(agent.name, err, trigger);
-      const budgetHeld = this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, holdNote !== undefined, compileBaseline,
+      const budgetHeld = this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, holdNote !== undefined, compileBaseline, storedInjections,
         () => this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing));
       if (budgetHeld === 'held') return false;
       if (budgetHeld === 'noteless') {
@@ -35406,7 +35423,8 @@ export class AgentFramework {
 
   /**
    * Ops alert — the one escalation path for "a human should hear about this":
-   * (1) durable failures.log record (unless the caller already wrote one),
+   * (1) durable failures.log record (unless the caller already wrote one, or
+   *     the alert keeps none, as a budget hold's open and clear don't),
    * (2) an `ops:alert` trace so authorized observers get it on the wire,
    * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
    *     (agent, kind) per cooldown window — a persistent failure re-posts

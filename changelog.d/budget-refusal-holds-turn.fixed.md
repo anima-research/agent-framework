@@ -24,22 +24,30 @@
     is pending, they wait again, and each such start traces its own
     `inference:started` and `inference:failed`. A compression call that
     fails releases nothing. The wait drives compression itself, ticking the
-    agent's context manager while each tick lands a call, and with the
-    maintenance timer off it drives it again every 5 seconds. A compression
+    agent's context manager once, and again only while a strategy with no
+    progress snapshot lands a call each tick; with the maintenance timer off
+    it drives it again every 5 seconds. A compression
     call that fails in a tick it drives is reported as one in a maintenance
     pass is.
+  - **What the refused start stored:** the context injections it stored
+    leave the agent's window as its turn starts waiting, since no request
+    carried them, and the released start stores them as it would without
+    the wait. A routing notice it stored stays, so its arrivals stay
+    announced, and an undo of the released turn leaves it.
   - **No time limit:** a turn waits as long as compression stays pending.
     A waiting turn lives in memory, so a restart drops it, and the agent
     waits for its next wake, as after an exhausted turn before.
   - **The note:** the released turn reads "[budget-hold] Your context didn't
-    fit its budget (100,201 tokens against 48,568), so this turn waited
-    7 min for compression to make room." It's stored once that start's
+    fit its budget (100,201 tokens against 48,568) when this turn came to
+    start. This turn waited 7 min.", from the hold to its release. It's
+    stored once that start's
     compile has gone through (a failed write is logged, and the turn runs
     with the note unstored), where the compile placed it, so the next
     request starts with the same messages and a reply keeps its thinking. A
-    start whose window doesn't end on the last `user` message gets no note,
-    since a stored row would land elsewhere: a wake with nothing new, or a
-    start that stored a context injection after the message.
+    start gets no note where a row the agent reads follows the last `user`
+    message, since a stored row would land elsewhere: a wake with nothing
+    new, or a start that stored a context injection after the message. With
+    no `user` message, the note goes at the window's end.
   - **A surgery or an undo:** a waiting turn whose trigger's row a rollback,
     suppression or branch switch removed, or an undo took out of the
     agent's window, is dropped, and so is a turn under way whose opening
@@ -52,8 +60,9 @@
     has written, and one with none yet can't be checked and runs on what the
     surgery left, as a waiting wake does.
   - **When it ends without running:** if compression has nothing left to do
-    and the context still doesn't fit, the start runs once more without the
-    note, and a refusal then takes the error policy's path. `abortInference()`,
+    and the context still doesn't fit, a released start that carried the
+    note runs once more without it, and a refusal then takes the error
+    policy's path. `abortInference()`,
     `stop()` and the agent's end drop a waiting turn, a released one before
     its start begins included, with `inference:aborted`. So does the
     inference policy declining a released turn's start, or the withdrawal

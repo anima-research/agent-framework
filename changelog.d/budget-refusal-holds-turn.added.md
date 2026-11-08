@@ -4,6 +4,9 @@
   or `removed`, and `waitedMs`. `healthSnapshot().agents[].budgetHold`
   gives a waiting turn's `since`, compression's `pending` work, the waiting
   requests, and the refusal's type and figures, or `null`.
+  `presentation:retracted` gains the reason `unsent-injection`, for the
+  context injections a refused start stored, which leave the agent's
+  window as its turn starts waiting.
 - **Hosts and operators:** a waiting turn raises a `context-refusal` ops
   alert as it starts waiting, saying it waits for compression, unless a
   listener of `inference:held` has ended the wait first, and

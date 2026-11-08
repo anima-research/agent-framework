@@ -1101,8 +1101,9 @@ export type TraceEvent =
       agentName: string;
       /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record),
-       *  bounded field by field as that record is. */
+      /** Kind-specific structured payload (mirrors the failures.log record,
+       *  where the alert writes one: a budget hold's 'context-refusal' and its
+       *  clear write none), bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 
@@ -1612,7 +1613,7 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
 
 /**
  * Listener for trace events.
