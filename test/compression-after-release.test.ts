@@ -5,18 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AnthropicAdapter, Membrane, MembraneError, NativeFormatter } from '@animalabs/membrane';
-import { CompressionWithdrawn, ContextManager } from '@animalabs/context-manager';
+import { CompressionWithdrawn } from '@animalabs/context-manager';
 import { JsStore } from '@animalabs/chronicle';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
 import { Agent, AgentFramework, AutobiographicalStrategy, PassthroughStrategy, taskForkSpec } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
-
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-const skip = supported
-  ? false
-  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 class CompressionMembrane extends MockMembrane {
   readonly compressions: number[] = [];
@@ -200,6 +193,14 @@ type ForkInternals = {
   addMessage(participant: string, content: unknown, metadata?: unknown, opts?: { forAgent?: string }): string;
 };
 const home = { serverId: 'world', channelId: 'world:chan' };
+/** Read onto #291: a registered agent's context compresses the rows of its
+ *  window, and a row written past the framework (addBacklog) enters that
+ *  window at the agent's next point. The fork cases below present their
+ *  backlog so, where main compressed the record they wrote it to. (An
+ *  ephemeral run's manager isn't taken on before its run, so it reads the
+ *  record.) */
+const presentTo = (framework: AgentFramework, name: string): void =>
+  (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent(name));
 
 async function createDraining(framework: AgentFramework, name = 'worker') {
   return framework.createEphemeralAgent({
@@ -207,10 +208,12 @@ async function createDraining(framework: AgentFramework, name = 'worker') {
   });
 }
 
-function addBacklog(contextManager: { addMessage: Awaited<ReturnType<typeof createDraining>>['contextManager']['addMessage'] }, count: number, from = 0): void {
+function addBacklog(contextManager: { addMessage: Awaited<ReturnType<typeof createDraining>>['contextManager']['addMessage'] }, count: number, from = 0): string[] {
+  const ids: string[] = [];
   for (let i = from; i < from + count; i++) {
-    contextManager.addMessage(i % 2 === 0 ? 'user' : 'worker', [{ type: 'text', text: `message ${i}: ` + 'word '.repeat(30) }]);
+    ids.push(contextManager.addMessage(i % 2 === 0 ? 'user' : 'worker', [{ type: 'text', text: `message ${i}: ` + 'word '.repeat(30) }]));
   }
+  return ids;
 }
 
 describe('a context manager the framework is done with makes no further provider call (#550)', () => {
@@ -243,30 +246,39 @@ describe('a context manager the framework is done with makes no further provider
     }
   });
 
-  it('a shared-inheritance run that has ended, with compression still queued (the derived manager is on the run\'s membrane)', { timeout: 60_000, skip }, async () => {
+  it('a shared-inheritance run that has ended, with compression still queued (the derived manager is on the run\'s membrane)', { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(200);
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     const { dir, framework } = await setup('af-done-shared-', membrane, { agents: true });
     const errors = captureErrors();
     try {
-      // The parent's slot carries the backlog; the child inherits it shared, on
-      // its own branch, with a draining strategy, so compression queues on the
-      // derived manager (which, before the tenth round, was on the framework's
-      // membrane and so outlived the run's release).
+      // The parent's window carries the backlog (on this branch the derived
+      // window is the parent's, so the rows are presented to trunk first); the
+      // child inherits it shared, on its own branch, with a draining strategy.
+      // A derived manager in presented mode drains from its run on, not at a
+      // write before it as the copy path's record-reading manager does, so the
+      // run is what starts its compression; it ends with chunks still queued.
       addBacklog(framework.getAgent('trunk')!.getContextManager(), 30);
+      presentTo(framework, 'trunk');
       const { agent, contextManager } = await framework.createEphemeralAgent(
         { name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: drainingStrategy() },
         taskForkSpec('worker', { parent: 'trunk', inherit: { mode: 'shared' } }),
       );
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
-      await until(() => membrane.compressions.length >= 1);
+      assert.equal(contextManager.isReady(), false, 'the premise: the derived manager has chunks to compress');
       const run = framework.runEphemeralToCompletion(agent, contextManager);
       framework.start();
       await run;
+      assert.equal(contextManager.isReady(), false, 'compression is still queued when the run ends');
       const sent = membrane.compressions.length;
+      // The premise of the rest: the run itself started the derived manager's compression.
+      assert.ok(sent >= 1, `a compression ran during the run (${sent})`);
       await sleep(1_000);
       assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the run ended');
-      await assert.rejects(contextManager.resetHeadWindow(), (error: unknown) => error instanceof CompressionWithdrawn,
+      // Before the tenth round the derived manager was on the framework's
+      // membrane, and this reset's compression reached the provider.
+      await assert.rejects(contextManager.resetHeadWindow(),
+        (error: unknown) => error instanceof CompressionWithdrawn,
         'a reset with no text is withdrawn');
       assert.equal(membrane.compressions.length, sent, 'and reached no provider');
       assert.deepEqual(drainLines(errors.lines), []);
@@ -292,7 +304,14 @@ describe('a context manager the framework is done with makes no further provider
       const resumed = await framework.resumeAgent('job', {
         model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: drainingStrategy(),
       });
-      addBacklog(resumed.contextManager, 30);
+      // Read onto #291: the job's first run wrote its window down, so the
+      // context its resume reopens is in presented mode and compresses its
+      // window, which a row written past the framework enters only when
+      // presented (main compressed the record). The resumed job isn't
+      // registered, so no presentation point of the framework's takes the
+      // backlog on; it is presented to the reopened manager directly, as the
+      // resumed run's adoption would, and the strategy drains from there.
+      resumed.contextManager.presentRows(addBacklog(resumed.contextManager, 30) as never[]);
       await until(() => membrane.compressions.length >= 1 && membrane.inFlight > 0);
       resumed.cleanup();
       const sent = membrane.compressions.length;
@@ -418,6 +437,7 @@ describe('a context manager the framework is done with makes no further provider
       await internals.createConversationAgent('trunk-chan-g1', home);
       const fork = framework.getAgent('trunk-chan-g1')!.getContextManager();
       addBacklog(fork, 30);
+      presentTo(framework, 'trunk-chan-g1');
       await until(() => membrane.compressions.length >= 1 && membrane.inFlight > 0);
       internals.disposeConversationAgent('trunk-chan-g1');
       const sent = membrane.compressions.length;
@@ -444,6 +464,7 @@ describe('a context manager the framework is done with makes no further provider
     try {
       await internals.createConversationAgent('trunk-chan-g1', home);
       addBacklog(framework.getAgent('trunk-chan-g1')!.getContextManager(), 30);
+      presentTo(framework, 'trunk-chan-g1');
       framework.start();
       await until(() => membrane.inFlight > 0);
       internals.disposeConversationAgent('trunk-chan-g1');
@@ -472,6 +493,7 @@ describe('a context manager the framework is done with makes no further provider
     try {
       const template = framework.getAgent('trunk')!.getContextManager();
       addBacklog(template, 30);
+      presentTo(framework, 'trunk');
       await settle(membrane);
       const before = membrane.compressions.length;
       const compile = template.compile.bind(template);
@@ -487,6 +509,7 @@ describe('a context manager the framework is done with makes no further provider
       template.compile = compile;
       await internals.createConversationAgent('trunk-chan-g1', home);
       addBacklog(framework.getAgent('trunk-chan-g1')!.getContextManager(), 6, 30);
+      presentTo(framework, 'trunk-chan-g1');
       await until(() => membrane.compressions.length > before);
       internals.disposeConversationAgent('trunk-chan-g1');
       assert.deepEqual(drainLines(errors.lines), []);
@@ -525,7 +548,7 @@ describe('a context manager the framework is done with makes no further provider
     }
   });
 
-  it('a fork disposed on a quiesced host makes no call after the disposal, and its held writes land at the resume', { timeout: 60_000 }, async () => {
+  it('a fork disposed on a quiesced host makes no call after the disposal, and a write made while quiesced is stored at once', { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(100);
     const { dir, framework } = await setup('af-done-quiesced-', membrane, { agents: true });
     const internals = framework as unknown as ForkInternals;
@@ -534,16 +557,21 @@ describe('a context manager the framework is done with makes no further provider
       await internals.createConversationAgent('trunk-chan-g1', home);
       const fork = framework.getAgent('trunk-chan-g1')!.getContextManager();
       addBacklog(fork, 40);
+      presentTo(framework, 'trunk-chan-g1');
       await until(() => membrane.compressions.length >= 1);
       await framework.quiesce({ reason: 'test window' });
-      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'HELD WHILE QUIESCED' }], undefined, { forAgent: 'trunk-chan-g1' }), '');
+      // Read onto #291: a write while quiesced is stored at once (a quiesce
+      // freezes windows, not the record) and presented at the resume.
+      assert.notEqual(internals.addMessage('user', [{ type: 'text', text: 'HELD WHILE QUIESCED' }], undefined, { forAgent: 'trunk-chan-g1' }), '');
+      // AF #844 bot review 3, finding 88: in the record at once, while
+      // quiesced; the fork is disposed below, so no resume presents it.
+      assert.ok(fork.getAllMessages().some((message) => JSON.stringify(message.content).includes('HELD WHILE QUIESCED')),
+        'its write is stored at once, while quiesced');
       internals.disposeConversationAgent('trunk-chan-g1');
       const sent = membrane.compressions.length;
       await sleep(800);
       assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the disposal');
       await framework.resume();
-      assert.ok(fork.getAllMessages().some((message) => JSON.stringify(message.content).includes('HELD WHILE QUIESCED')),
-        'its held write landed in its window at the resume');
       await sleep(300);
       assert.equal(membrane.compressions.length, sent, 'nor after the resume');
       assert.deepEqual(drainLines(errors.lines), []);

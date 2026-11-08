@@ -14,8 +14,8 @@
  * a start stored whose compile then didn't record) has the same content,
  * every part of it, and the compile
  * then renders
- * it from the store like any message, where it stays. While the window is
- * held (AgentFramework's slotHeldFrom), `compile()` places it instead. Being a
+ * it from the store like any message, where it stays. While the host is
+ * quiesced, `compile()` places it instead. Being a
  * message, it's history to the strategy: capped by its per-message bound,
  * sharded, selected by the budget and folded like any other.
  *

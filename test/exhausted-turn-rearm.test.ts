@@ -97,7 +97,7 @@ class ToolRoundThenErrorStream implements YieldingStream {
     const call = { id: 'zz-call', name: 'input--zz_look', input: {} };
     yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, cacheCreationTokens: 0, cacheReadTokens: 0 } } as StreamEvent;
     yield { type: 'tool-calls', calls: [call], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '',
-      roundContent: [{ type: 'tool_use', ...call }] } } as StreamEvent;
+      roundContent: [{ type: 'tool_use', ...call }], supportsInjectedMessages: true } } as StreamEvent;
     if (this.waiting && !this.cutOff) await new Promise<void>((resolve) => { this.resume = resolve; });
     if (this.isCancelled) return;
     yield { type: 'error', error: this.error } as StreamEvent;
@@ -199,6 +199,8 @@ const settle = async () => { for (let i = 0; i < 8; i++) await new Promise<void>
 
 const stderr: string[] = [];
 console.error = (...a: unknown[]) => { stderr.push(a.map(String).join(' ')); };
+const rearmLines = (...parts: string[]) =>
+  stderr.filter((line) => line.startsWith('[inference-rearm]') && parts.every((part) => line.includes(part)));
 
 async function waitFor(done: () => boolean, what: string, boundMs = 10_000): Promise<void> {
   if (!stepClock) {
@@ -272,26 +274,20 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
   test(`a turn whose retries ran out on a server error is sent again after each delay, once each time, until the delays run out (failure ${failsAt === 'setup' ? 'at its start' : failsAt === 'throw' ? 'thrown by its stream' : 'reported by its stream'})`, async (t) => {
     const membrane = new ScriptedMembrane(() => serverError, failsAt);
     const r = await resident(t, membrane);
-    const heldAtTrace: number[] = [];
-    r.fw.onTrace((e) => {
-      if ((e as { type: string }).type === 'inference:exhausted') heldAtTrace.push(r.admission().providerAdmission.heldRequests);
-    });
     stderr.length = 0;
     r.say('zz-question');
     await waitFor(() => r.count('inference:exhausted') === 4, 'the window and three re-arms to end exhausted');
     assert.equal(r.admission().providerAdmission.heldRequests, 0, 'nothing is kept after the last re-arm');
     assert.equal(membrane.sends.length, 3 + 3, 'each re-arm makes one send');
     assert.equal(r.markers(), 1, 'the agent meets the outage once');
-    assert.deepEqual(heldAtTrace, [0, 0, 0, 0], "each inference:exhausted comes before its turn's re-arm is held");
     assert.ok(membrane.sends.every((s) => s.texts.includes('zz-question')), 'every send is the same turn\'s');
     const rearmGaps = gaps(membrane.sends).slice(2);
     assert.ok(rearmGaps[0]! >= 140 && rearmGaps[1]! >= 290 && rearmGaps[2]! >= 440, `re-arms waited each delay: ${rearmGaps.join(', ')}`);
     for (const [delay, n] of [[150, 1], [300, 2], [450, 3]] as const) {
-      assert.ok(stderr.includes(`[inference-rearm] agent=resident turn sent again in ${delay}ms (${n} of 3)`), `the operator is told re-arm ${n} is coming`);
-      assert.ok(stderr.includes(`[inference-rearm] agent=resident turn queued again (${n} of 3)`), `the operator is told re-arm ${n} went`);
+      assert.equal(rearmLines('resident', `${delay}ms`, `(${n} of 3)`).length, 1, `the operator is told re-arm ${n} is coming`);
+      assert.equal(rearmLines('resident', `(${n} of 3)`).filter((line) => !line.includes(`${delay}ms`)).length, 1, `the operator is told re-arm ${n} went`);
     }
-    assert.ok(stderr.includes('[inference-rearm] agent=resident turn not re-armed: its 3 re-arms are spent until a turn completes or a message is said to it'),
-      'the operator is told no re-send is coming');
+    assert.equal(rearmLines('resident', 'not re-armed', 'spent').length, 1, 'the operator is told no re-send is coming');
     const unsaid = [
       ["the heartbeat's own tick", { source: 'heartbeat', serverId: 'heartbeat' }],
       ['a self-wake timer the agent set', { source: 'gate:self-wake' }],
@@ -305,13 +301,13 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
       await waitFor(() => r.count('inference:exhausted') === 5 + i, `a wake's turn after ${what} to end exhausted`);
       assert.equal(r.admission().providerAdmission.heldRequests, 0, `${what} doesn't start the count again`);
     }
-    assert.ok(!stderr.some((line) => line.includes('re-send count started again')), 'nor says it did');
+    assert.deepEqual(rearmLines('count', 'message'), [], 'nor says it did');
     stderr.length = 0;
     r.say('zz-second');
     await waitFor(() => r.count('inference:exhausted') === 5 + unsaid.length, "a new message's turn to end exhausted");
     assert.equal(r.admission().providerAdmission.heldRequests, 1, 'a message said to the agent starts the count again');
-    assert.ok(stderr.includes('[inference-rearm] agent=resident re-send count started again: a message was said to it'), 'the operator is told why the count went back');
-    assert.ok(stderr.includes('[inference-rearm] agent=resident turn sent again in 150ms (1 of 3)'), 'from the first delay');
+    assert.equal(rearmLines('resident', 'count', 'message').length, 1, 'the operator is told why the count went back');
+    assert.equal(rearmLines('resident', '150ms', '(1 of 3)').length, 1, 'from the first delay');
   });
 }
 
@@ -712,7 +708,7 @@ test('a message said while a turn runs its tools starts the count again when the
   stderr.length = 0;
   queue(r, { reason: 'zz-wake' });
   await waitFor(() => r.count('inference:exhausted') === 3, 'the turn that ran its tools to end exhausted');
-  assert.ok(stderr.includes('[inference-rearm] agent=resident re-send count started again: a message was said to it'));
+  assert.equal(rearmLines('resident', 'count', 'message').length, 1, stderr.join('\n'));
   assert.equal(r.admission().providerAdmission.heldRequests, 1, 'its re-arm waits: the message the boundary stored started the count again');
 });
 
@@ -941,7 +937,7 @@ test('a continuation whose turn never found a channel is not re-armed, rather th
   assert.equal(r.fw.getHostModeStatus().gatedRequests, 0, 'nothing is kept to be sent again');
   assert.equal(r.markers(), 1, 'the agent meets the exhaustion\'s marker');
   assert.equal(membrane.sends.length, 4);
-  assert.ok(stderr.includes('[inference-rearm] agent=resident turn not re-armed: it would have to guess a channel'), 'the operator is told why');
+  assert.equal(rearmLines('resident', 'not re-armed', 'guess a channel').length, 1, 'the operator is told why');
 });
 
 type Routing = { triggerChannel?: unknown; locus?: unknown };

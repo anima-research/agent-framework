@@ -148,7 +148,7 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
-A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins.
+A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows of the agent's window (#291) that it sees after both the newest of its own messages there and its consumed watermark, in the window's order, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. Those are the rows presented to it since the mark, a row stored before the mark and presented after it included, and a row presented to it again, also when the mark was taken before its window was written down; a row stored and not yet presented is in neither its window nor the pin. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins, or an agent whose configuration sets `turnInputsPin: false`.
 
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
@@ -180,10 +180,17 @@ agent-framework-recover \
 ```
 
 The specified Discord message is the last message the agent will still see;
-everything after it is left on the old branch. The command scans in bounded
-windows, never compiles message content, and activates the new Chronicle
-branch. By default the recovery is local to the resident: nothing is posted to
-Discord. To let the people involved see that the agent no longer has their
+everything after it is left on the old branch (on a window presented since
+#291, but for the rows stored before the write that presented it, which the
+new branch keeps and the window takes again after that message, and the rows
+that one write presented together with it, which stay after it in the window).
+The command
+scans in bounded windows (on a presented window, a `--messages` count and the
+walk of the rows after the anchor, which the cut returns or keeps, read the
+window whole), never compiles
+message content, and activates the new Chronicle branch. By default the
+recovery is local to the resident: nothing is posted to Discord. To let the
+people involved see that the agent no longer has their
 messages, choose awareness marks explicitly with `--marks addressed` (removed
 messages that mentioned or replied to the bot, and DMs) or `--marks all`
 (every removed Discord message). The output counts what will be marked and
@@ -229,7 +236,9 @@ agent-framework-recover \
 
 `--suppress` may be repeated or given a comma-separated list.
 `--suppress-range <first>..<last>` suppresses the inclusive context interval
-between two Discord messages, including intervening agent/tool entries. These
+between two Discord messages, including intervening agent/tool entries: every
+row stored between the two, any agent's, so on a slot residents share, rows
+an agent's window never held too. These
 removals exist only on the recovery branch; the source branch remains intact.
 Suppressed Discord messages follow the same `--marks` choice.
 Selections that split a sharded body group or a tool-use/tool-result exchange
@@ -449,14 +458,15 @@ first.
 
 Plain content stays in context and is delivered on arrival through the ordinary
 channel/push path; the host only remembers where it landed. "Unread" means:
-above the agent's consumed watermark (set when the agent is created, and
+above the agent's consumed watermark (a position in the agent's window, #291:
+a row not in the window yet is unread wherever it is in the store; set when the agent is created, and
 advanced at every compile of a request it sends, which a preview isn't, and at
 a tool boundary that injects messages into a stream declaring it carries them,
 as membrane's native path does from 0.6.0), on the current branch, not a
-sharded message, and not folded into a summary by compression. A message
-injected at a tool boundary whose stream doesn't say whether it carries
-injections, as no membrane 0.5.x stream does, stays unread though the model
-may have seen it. On any doubt — restart, branch switch, eviction — the host
+sharded message, and not folded into a summary by compression. A stream that
+doesn't say whether it carries injections is taken as one that doesn't: at a
+tool boundary nothing is injected into it, and what arrived for the agent
+waits out of its window for the turn's end. On any doubt — restart, branch switch, eviction — the host
 appends, as it does today. There is no per-subject cap: a busy channel's unread
 backlog is simply its unread backlog. Receipts and subject history are kept in
 the `mcpl/coalescing` state (retry window 1 h); audit lines are
@@ -514,9 +524,150 @@ tool list itself (RFC-014 §8.5 host-made toolsets, §8.1 surface presentation;
 and works for every server, with or without RFC-014. The `toolsets--` tools
 are registered for every agent, MCPL or none, unless a module holds the name.
 
+- **Wake onboarding** (`src/gate/wake-onboarding.ts`). An MCPL server's
+  events are often let by, without waking the agent, by a rule written for
+  something else (a catch-all with no `source`) or by the gate's default. The
+  first such event from a server is followed by a `[wake onboarding]` notice:
+  the rule that let it by, and the server's suggested treatment (MCPL RFC-001
+  §5), numbered, with each rule's rationale, presented as the claims of a
+  server that may not be trustworthy. An event tagged `chat:addressed`,
+  `surface:turn` or `surface:alert` wakes the agent to decide.
+  `wake_accept_suggestions { server, rules? }` writes the chosen suggestions as
+  `suggested:<server>:<n>` rules scoped to that server, ahead of the first
+  catch-all; `wake_decline { server }` removes them. Decisions are kept in
+  `wake-decisions.json` beside `gate.json`, keyed to the server's declared
+  ontology, so the agent is asked again only when it changes (and at most once
+  a day per server). `gate_status.catchAll` names the catch-all; `event_tags`
+  shows each server's offer. `gate.onboarding: false` turns it off.
+
+- **Event suppression** (`EventGate.decideSuppression`, `src/gate/suppress-scripts.ts`,
+  `src/gate/suppression-stats.ts`, `src/gate/suppression-review.ts`). A wake
+  rule with `suppress: { description, script? }` keeps the events it takes out
+  of the agent's context entirely. A rule that only doesn't wake still shows
+  its events. A suppressed event is stored in the chronicle as it arrives,
+  with `metadata.suppressed = { rule, eventType }`. Every view filter the
+  framework sets leaves stamped rows out: the residents', the subconscious's,
+  and every view derived from them. The row is stamped for nobody (an empty
+  `metadata.audience`), so the presentation index presents it to no window.
+  So a suppressed row is never compiled,
+  never injected at a tool boundary, never folded into memory, and never
+  woken for. It never becomes the speech locus and never brings a clock row
+  in ahead of it. The decision is made once, at arrival, before the hold, the
+  veto and the gate's evaluate, so no debounce batch forms for the event. The
+  suppress rule's `matchCount` counts what it took, and a passthrough rule ahead
+  of it counts it too, so a sampler fires on schedule. Because the view reads only the stamp, editing or removing the
+  rule changes only what arrives afterwards; the rows already hidden stay
+  hidden, which keeps each row's visibility fixed, as context-manager's
+  `viewFilter` requires. **Rollback needs a step.** A release without
+  suppression doesn't read the stamp. Where compression formed a summary around
+  a hidden row, that summary is non-contiguous under such a release's view, and
+  context-manager refuses the store at open (`StoreTopologyError`), unless the
+  strategy sets `topologyPolicy` or a kv-unified gap flag. Before rolling back,
+  with the host stopped, run this release's `agent-framework-recover --store
+  <path> --agent <name> --remove-suppressed`: it makes and activates a branch
+  without the hidden rows, which such a release opens, and the source branch
+  keeps them. That holds unless this release has made a window write of two or
+  more rows (the first write-down of a window that holds a row, as at the first
+  boot on a store with history, or a presentation of more than one row): the
+  store's MANIFEST is then at version 2, which no earlier release opens, and
+  only a copy taken before the upgrade goes back (the 291-presentation-mandatory
+  changelog entry). Skipped where no summary spans one, the rows render again where
+  they were stored (a prompt-cache miss from the first). Suppress rules load as
+  `defer` in every release back to 0.22, so nothing wakes for their events.
+  Releases 0.22 to 0.26 rewrite gate.json without `suppress` at their first
+  rule edit, so rolling back that far and forward again leaves rules that defer
+  and no longer suppress.
+  - **The rule.** It needs `behavior: "defer"` (or the legacy `"skip"`) written out, so an earlier
+    release that doesn't know `suppress` defers those events instead of
+    waking on them, a match that narrows it, and a `description` of what it's
+    for, which the review checks against. Three kinds of event are never
+    suppressed and go on to the next rules: an event addressed to the agent
+    (`chat:addressed`), the heartbeat's, and console or API input. A suppress
+    rule decides no wake for an event suppression was asked about: `evaluate`
+    and `probe` pass over it there, and the rule-order notes and the catch-all
+    check pass over it always. Where suppression isn't
+    asked, as for an event delivered to a conversation fork's own store, a
+    suppress rule defers the events it matches, as its behavior says.
+  - **The agent's own logic.** `script` is the source of a function
+    `(event, state) => boolean`, called for each event the rule's match takes
+    that reaches it (not one an earlier rule decides, an addressed one, or the
+    heartbeat's);
+    true hides it, and anything else (a truthy string included) lets the event
+    on to the rules after it.
+    `event` carries the event type, source, channel, author, tags, text,
+    arrival time (`at`, ms) and metadata. `state` is the rule's own JSON object
+    (at most 64 KB), which the script reads and changes as it likes, so a rule
+    can hide repeats, count, or keep a window of its own. The framework keeps
+    it between events and across restarts in `suppress-state.json` beside
+    gate.json, and starts it afresh when the script changes or the rule is
+    removed (not for a new description). Scripts run on one worker thread,
+    called synchronously with a 50 ms timeout (`gate.suppressScriptTimeoutMs`), as
+    gate.js is: a robustness boundary for the agent's own code, not a security
+    sandbox. A script that throws, times out, isn't a function, or leaves a
+    state it can't keep lets the event on to the rules after it, as one that
+    says show does, keeps its state as it was, and is named in `gate_status`
+    (`suppress.scriptStatus`). A timeout restarts the worker, which loads every
+    script again one at a time; a script that times out three times in its
+    last twenty runs, probes included, isn't run again until its script
+    changes or the host restarts, and a worker that fails to start is tried again with a later
+    event, later each time. wake_add_rule compiles a
+    script on the worker before it saves the rule. `suppressionFor` runs a
+    script on a copy of its state, for the probe table; the arrival paths call
+    `decideSuppression`, once per event, which keeps the state the script
+    leaves. The worker starts with the first rule that has a script.
+  - **Covered:** MCPL channel messages and push events (admission; a deferred
+    coalesced push is decided once, at its wake, and a suppressed batch is
+    stored at once; a batch's row follows its latest occurrence, as its wake
+    does, unless the batch holds an addressed occurrence, when it's shown), a module's events (every message its responses add, and
+    every wake they ask for, the event decided once whichever module answers
+    first), and a server's `[toolsets]` notices, gated as its
+    `mcpl:tool-changes` events.
+    Not covered: deliveries into a conversation fork's own store, which has no
+    view filter.
+  - **Tools.** `wake_add_rule { …, suppress: {…} }` adds a suppress rule (saved
+    with behavior "defer"), and `wake_remove_rule` removes it. `gate_status`
+    shows each suppress rule's settings and how its script has run, and counts
+    what it suppressed since start. `suppression_stats { rule?, recent?, since? }`
+    reads the stamped rows in the caller's message slot on its current
+    branch, so its counts cover every start and follow the branch. Per rule it
+    reports the count, the text size, the first and last arrival, a breakdown
+    by source and event type, and the newest rows with a one-line preview.
+    Rules removed since are listed with `inForce: false`.
+    `dump_suppressed { path?, rule?, since?, until?, format? }` writes the
+    rows to a workspace file, their text in full and any other block named:
+    a transcript, or JSON lines. Times are when each row was stored. At most
+    4 MB; past that, the newest that fit, and the result counts the rest.
+    Hosts read the same rows with `AgentFramework.suppressedEvents()`.
+  - **Review.** Every `gate.suppressionReview.intervalMs` (two hours by
+    default), for each rule that hid events since the last review, a small
+    model (`model`, Claude Haiku 5.5 by default, on the reply judge's
+    membrane) reads the rule's description, its match and script while it's in
+    force (the script cut to 3,000 characters), and a sample of the events it hid: at most
+    `maxEventsPerRule` (60) spread across the period, sharing 24,000 characters
+    of text, so a short event is read whole and a long one takes what the
+    others leave. These bounds are chosen, not measured: they keep one rule's
+    request to roughly 8,000 input tokens. It flags any that don't fit the
+    description or that the agent would plausibly need to see. The agent gets a `[suppression review]`
+    notice naming each rule, what it hid and what was flagged, with the first
+    five flagged events of each rule shown, each cut short. A rule the
+    reviewer couldn't answer about is reviewed again next time, from where its
+    events begin (at most a week back; older events aren't reviewed again). A flag wakes the agent (`wakeOnFlag`, default true), unless it's asleep. With
+    `notify: "flagged"` the agent is told only of a flag; with the default,
+    `"always"`, after every review in which something was hidden. The notice
+    is the framework's own and never suppressed. Progress, retries and each
+    rule's last description (noted as the rule hides a row) are kept in
+    `suppression-review.json` beside gate.json, written as the review starts,
+    so a restart resumes and a removed rule's events are still judged. Its
+    calls count toward the agent's usage, as the reply judge's do, and a wake
+    on a flag is a full turn of the agent's own model, so a false flag costs
+    that turn.
+    `gate.suppressionReview: false` turns it off; `AgentFramework.reviewSuppression()`
+    runs one now. The `gate:suppression-review` trace records each review.
+
 - **The built-in toolset, `settings`.** The host tools an agent reaches for
   rarely: `agent_settings`, `wake_add_rule`, `wake_remove_rule`,
-  `gate_status`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
+  `wake_accept_suggestions`, `wake_decline`,
+  `gate_status`, `suppression_stats`, `dump_suppressed`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
   `heartbeat--heartbeat_status`, `heartbeat--heartbeat_trigger`,
   `workspace--status`, every module utility (`Module.getUtilities`), and a
   module's tools it places there (`Module.toolPlacement` answering
@@ -691,10 +842,14 @@ Pause the inference thread and MCPL data planes while keeping the framework,
 context managers, and membrane hot — so compression/refold/quarantine work runs
 through the live machinery instead of offline scripts (issue #122). Quiesce
 persists across restarts; `resume` gates on a fresh per-agent feasibility
-preview of the current runtime settings (`force` overrides).
+preview of the current runtime settings (`force` overrides). While quiesced, a
+context write (a module event, an API `message.send`) is stored at once, unless
+a surgery's hold or a context manager refusing its work keeps it in memory, and
+enters the agents' windows at `resume`, or, for an agent whose turn is still
+draining then, at that turn's next point (#291).
 
 ```typescript
-await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });  // throws QuiesceBlockedError if the deferred writes can't reach disk
+await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
 await framework.maintenanceTick();   // drain quarantine / advance merges
 await framework.resume();            // throws ResumeBlockedError if the layout won't compile
 ```
@@ -715,7 +870,8 @@ for deployments that front the port with a proxy.
 message and switches to the fork; `suppressMessages(agent, { messageIds })`
 forks at the head and removes the chosen messages on the fork. The source
 branch stays intact either way. Removing Discord messages from an agent's
-context is local to that agent unless the operator also chooses to mark them:
+context marks nothing on Discord unless the operator also chooses to mark
+them:
 
 ```typescript
 const preview = framework.previewSurgeryMarks('cairn', { rollbackTo: messageId });
@@ -726,6 +882,36 @@ const result = await framework.rollbackToMessage('cairn', {
 });
 // result.markers: { status: 'none' | 'queued' | 'not-scheduled', ... }
 ```
+
+An agent's context follows its own window (#291), so the cut is the write
+that presented the target: a rollback removes only the rows stored after
+that write, and the rows stored before it that the window took after the
+target leave the window (`returnedToArrivals`, on the result and the
+preview). The agent's own rows among them enter it again at its next
+presentation point, the surgery's release; the rest wait outside it until
+the agent's next turn start, so for them the cut holds until the agent
+speaks again, on the rollback's branch: a later move of the store's branch,
+a suppression or rollback through another agent included, ends it. That hold
+is in memory: a restart before then presents them at its pass over every
+agent at rest, or, where it boots quiesced, at the resume. Rows that one write presented together with
+the target stay after it (`keptInWindowAfterTarget`), since no branch cut
+separates them from it: a rollback that only they follow is refused and
+names them, and `suppressMessages` (on the slot's owner, for a row of a slot
+the agent observes, which the refusal names), or, for those with a Discord message id,
+the host's `hide` by it, run on the agent whose own slot holds the row (the
+refusal names it), takes them out. A row holding a result of a call at or
+before the target (a tool boundary presents a round's reply and its results
+in one write) isn't advised for suppression, which would leave the call
+without its result: the refusal says to roll back before the call. The preview's `neverPresented` counts the messages it
+removes that no live agent is shown: no window holds them, or only windows
+whose view leaves them out (a row a tune-out holds); a message that may be in
+a window that couldn't be read isn't counted, and is logged. The host command's
+`/undo n` counts back over the rows of the agent's own slot in its window. A
+removal in place
+(a `hide`, a suppression on its fork, a module's or the coalescer's removal)
+takes the rows out of every other live agent's window on that branch that
+held them too, each at its own place; a window on a branch whose record
+still holds them keeps them.
 
 - **`marks`** is `'none'` (the default), or `{ scope: 'addressed' | 'all', refs? }`.
   `addressed` covers messages tagged `chat:addressed` (mentions, replies to
@@ -858,8 +1044,8 @@ retract of a batch takes off the mark of its emoji from each of its messages,
 whichever batch placed it. 0.22.x reads only versions 1 and 2, and its start
 stops on a version 3 file: to go back to 0.22.x, move the file aside first,
 and 0.22.x then starts with no marks history. A version 1 ledger, which only
-an unreleased commit wrote, is refused until it is moved away, and its error
-says what that gives up.
+an unreleased commit wrote, is refused as any version but 2 and 3 is, until it
+is moved away.
 
 ## Observability
 
@@ -878,7 +1064,11 @@ framework.onTrace((event) => {
 Trace events are observability-only. They are intended for logs, metrics, UI
 updates, and debugging, not framework-internal control flow. Internal lifecycle
 code should use state-machine signals or process events instead of consuming
-traces, so trace emit order does not become an API contract.
+traces, so trace emit order does not become an API contract. One exception: the
+Discord module applies the edits and deletes it kept for a held create on
+`message:added` (source `surgery-release`), and ends a lost create's record on
+`message:lost`, so those two traces, emitted as a surgery's release stores a
+held write or loses it, are a contract.
 
 Query raw inference logs:
 

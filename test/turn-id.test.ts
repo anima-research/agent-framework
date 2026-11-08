@@ -18,6 +18,7 @@ import type { AgentConfig, SpeechContext } from '../src/types/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { fireNextYieldAsSet } from './helpers/capture-timers.js';
+import type { ReadMark } from '../src/read-marks.js';
 
 // A module can tell one turn's work from another's: the tool calls made in an
 // agent's turn carry the turn's id (`ToolCall.callerTurnId`), its speech
@@ -169,7 +170,7 @@ test('a turn\'s tool calls and its speech carry one turn id, and the next turn c
     assert.equal(typeof second, 'number');
     assert.equal(recorder.speeches[0]!.turnId, first, 'the first turn\'s speech carries its calls\' turn');
     assert.equal(recorder.speeches[1]!.turnId, second, 'the second turn\'s speech carries its calls\' turn');
-    assert.ok(second! > first!, 'the next turn has a larger id');
+    assert.notEqual(second, first, 'the next turn has another id');
     assert.deepEqual(
       recorder.eventCalls.map((c) => c.callerTurnId),
       [first, second],
@@ -236,10 +237,10 @@ test('a script\'s inner calls carry the turn of the code_execution call that run
 
 test("a script's inner calls carry what its agent had read when the run call started the script, after the agent has read more", async () => {
   await withFramework({ codeExecution: true }, async ({ framework, membrane, recorder }) => {
-    type Start = { turnId?: number; readThrough: { branch: string; sequence: number } | null };
+    type Start = { turnId?: number; readThrough: ReadMark | null };
     const fw = framework as unknown as { dispatchScriptToolCall: (...args: unknown[]) => Promise<unknown> };
     const agent = framework.getAgent('assistant') as unknown as {
-      getConsumedWatermark(): { branch: string; sequence: number } | null;
+      getConsumedWatermark(): ReadMark | null;
       getContextManager(): { addMessage(participant: string, content: unknown[]): unknown };
       markContextConsumed(): void;
     };

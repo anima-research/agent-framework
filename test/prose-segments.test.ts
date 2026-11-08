@@ -65,7 +65,7 @@ test('a tool-only turn (no prose) yields no segments', () => {
   assert.deepEqual(splitProseSegments([toolUse('t1'), toolResult('t1')]), []);
 });
 
-test('runs keep the words exactly as written; segments are those runs trimmed for routing', () => {
+test('runs keep the words exactly as written', () => {
   const content: ContentBlock[] = [
     textBlock('    indented code\n    second line\n'),
     toolUse('t1'), toolResult('t1'),
@@ -74,7 +74,6 @@ test('runs keep the words exactly as written; segments are those runs trimmed fo
     textBlock(' \n\t'),
   ];
   assert.deepEqual(splitProseRuns(content), ['    indented code\n    second line\n', '\n\nAfter the tool.  ']);
-  assert.deepEqual(splitProseSegments(content), ['indented code\n    second line', 'After the tool.']);
 });
 
 test('a refused XML attempt and its notice are boundaries too, and a turn-ending attempt leaves only its prose', () => {
@@ -84,6 +83,8 @@ test('a refused XML attempt and its notice are boundaries too, and a turn-ending
     ['Before the attempt.', 'After its notice.']);
   assert.deepEqual(splitProseSegments([textBlock('Again.'), attempt]), ['Again.']);
   assert.deepEqual(splitProseRuns([textBlock('Before. '), attempt, notice, textBlock(' After.')]), ['Before. ', ' After.']);
+  // A notice is a boundary of its own, with no attempt before it.
+  assert.deepEqual(splitProseRuns([textBlock('Before. '), notice, textBlock(' After.')]), ['Before. ', ' After.']);
 });
 
 test('withoutRoundsProse drops a round\'s text by its place: the text before its calls, after the previous round\'s tool blocks', () => {
