@@ -636,7 +636,18 @@ export interface ErrorPolicy {
  * Action to take after an error.
  */
 export type ErrorAction =
-  | { retry: true; delayMs: number }
+  | {
+      retry: true;
+      delayMs: number;
+      /** What the policy retries the failure as, such as `overloaded` or
+       *  `rate_limited` (DefaultErrorPolicy says membrane's class). Shown,
+       *  not acted on: the wait reports it in `healthSnapshot()` and on
+       *  `inference:waiting`. A policy that leaves it out is shown without it. */
+      retryClass?: string;
+      /** The most tries that class allows the turn, the first send included,
+       *  shown beside the try the wait leads to. Left out for no bound. */
+      maxTries?: number;
+    }
   | { retry: false; emit?: ProcessEvent };
 
 /**

@@ -136,6 +136,15 @@ export type TraceEvent =
        *  timers, so a stalled event loop can end it later. Absent for a wait
        *  too long for a date. */
       until?: number;
+      /** The try the wait leads to, the turn's first send counting as 1 (a
+       *  deadline's retries count that call's expiries, as the policy does).
+       *  Absent from a framework before this field. */
+      nextTry?: number;
+      /** The most tries the error policy allows (ErrorAction.maxTries), when it says. */
+      maxTries?: number;
+      /** What the error policy retries the failure as (ErrorAction.retryClass),
+       *  such as `overloaded`, when it says. */
+      retryClass?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
