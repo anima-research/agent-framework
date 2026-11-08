@@ -261,8 +261,7 @@ export class ToolResultGuard {
   /** Extra input tokens the pending batch costs on the wire beyond the
    * placeholder the strategy selected against (chars/4 + flat per image,
    * the same heuristic as the physical-window projection). Compilation
-   * without a physical window reserves this so substituting originals cannot
-   * exceed the budget; with one, the originals are priced beside the window. */
+   * reserves this so substituting originals cannot exceed the budget. */
   get pendingWireReserveTokens(): number {
     const pending = this.pending;
     if (!pending) return 0;

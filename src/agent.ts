@@ -678,19 +678,27 @@ export class Agent {
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
   }
 
-  /** Compile budget with the tool-result guard's reservation applied, where
-   * no physical window is set. While a batch is pending the strategy selects
-   * against short placeholders, but prepareRequest substitutes the originals
-   * on the wire; reserve their real cost so the final request still fits (a
-   * budget restart that recompiles small must not re-inflate past the same
-   * window). With a window, the originals are priced beside it instead
-   * (requestBounds). */
+  /** Compile budget with the tool-result guard's reservation applied. While
+   * a batch is pending the strategy selects against short placeholders, but
+   * prepareRequest substitutes the originals on the wire; reserve their real
+   * cost so the final request still fits (a budget restart that recompiles
+   * small must not re-inflate past the same window). Without a physical
+   * window the reserve is added to `reserveForResponse`. With one it comes
+   * off `maxTokens` instead, which leaves the same room, so the window's
+   * limit reserves the reply alone and counts the originals once, priced
+   * beside it (requestBounds). So while a batch is pending on an agent with a
+   * window, an over-budget refusal from context-manager's autobiographical
+   * strategy reads `configured=` as the budget less the reserve and
+   * `response reserve=` as the reply alone; its `input budget=` is the same
+   * as without a window. */
   private compileBudget(budget?: TokenBudget): TokenBudget | undefined {
     const resolved = this.resolveBudget(budget);
-    const reserve = this.physicalWindowTokens === undefined ? this.toolResultGuard.pendingWireReserveTokens : 0;
+    const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
     const base = resolved ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
-    return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+    return this.physicalWindowTokens === undefined
+      ? { ...base, reserveForResponse: base.reserveForResponse + reserve }
+      : { ...base, maxTokens: base.maxTokens - reserve };
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
