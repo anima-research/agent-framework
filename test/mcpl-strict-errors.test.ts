@@ -97,9 +97,11 @@ for (const already of [false, true]) test(`strict provider wait abort (already=$
   httpModule.request = ((...args: Parameters<typeof http.request>) => { dials++; return request(...args); }) as typeof http.request;
   try {
     if (already) controller.abort();
-    const dial = WebSocketTransport.open({ ...config(server.url), accessProvider: () => pending }, controller.signal);
+    let asked = 0;
+    const dial = WebSocketTransport.open({ ...config(server.url), accessProvider: () => { asked++; return pending; } }, controller.signal);
     controller.abort();
     await assert.rejects(dial, { message: 'MCPL server "codes": connection-failed' });
+    if (!already) assert.equal(asked, 1, 'premise: the open was waiting on the provider when it was aborted');
     release(credential()); await pending; await new Promise<void>(r => setImmediate(r));
     assert.equal(dials, 0, 'a credential released after the abort starts no dial');
     assert.equal(server.upgrades, 0);
@@ -132,11 +134,12 @@ for (const mode of ['TLS failure', 'open timeout', 'abort while connecting'] as 
       }) as typeof setTimeout;
     }
     try {
+      const accepted = once(server, 'connection');
       const dial = WebSocketTransport.open(c, controller.signal);
-      if (mode === 'abort while connecting') { await once(server, 'connection'); controller.abort(); }
+      if (mode === 'abort while connecting') { await accepted; controller.abort(); }
       await assert.rejects(dial, { message: 'MCPL server "codes": connection-failed' });
       if (mode === 'open timeout') assert.equal(shortened, 1);
-      await closed(sockets); assert.equal(sockets.size, 0);
+      await accepted; await closed(sockets); assert.equal(sockets.size, 0);
     } finally { globalThis.setTimeout = set; for (const s of sockets) s.destroy(); await new Promise<void>(r => server.close(() => r())); }
   });
 }
