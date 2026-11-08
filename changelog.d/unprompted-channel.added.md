@@ -14,7 +14,7 @@
   not a heartbeat's or a reminder's; not a conversation fork's or an ephemeral
   run's; not a locked agent's, which speaks at its lock or holds its speech as
   drafts; and not a start merged from a timer's wake and any other cause. One
-  value, for every agent on the framework. On a framework with the setting and
-  an event gate, `channel_publish`'s description adds a default for such turns,
-  the channel this host names for them; on any other, the description is
-  unchanged.
+  value, for every agent on the framework. Set to `null`, it reads as not set.
+  On a framework with the setting and an event gate, `channel_publish`'s
+  description adds a default for such turns, the channel this host names for
+  them; on any other, the description is unchanged.

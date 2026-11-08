@@ -479,13 +479,13 @@ describe('unpromptedChannel on a real MCPL server', () => {
       });
     }
 
-    it('create() reads null as not set', async () => {
+    it('create() accepts null', async () => {
       framework = await AgentFramework.create({
         storePath: join(tempDir, 'null.chronicle'),
         membrane: membrane.asMembrane(),
         agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
         modules: [],
-        unpromptedChannel: null as never,
+        unpromptedChannel: null,
       });
     });
 
@@ -543,7 +543,7 @@ describe('unpromptedChannel and the tune-out holds', () => {
     { serverId: 'editor', channelId: except }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
   ).ok);
 
-  it("an all-except hold's channel outranks it: a timer's turn speaks in the excepted channel while the hold is open, and in the unprompted channel before and after", async () => {
+  it("an all-except hold's channel outranks it: a timer's turn's locus is the excepted channel while the hold is open, and the unprompted channel before and after", async () => {
     const f = await withUnprompted();
     try {
       f.alwaysRespond();

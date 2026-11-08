@@ -191,11 +191,13 @@ export interface FrameworkConfig {
    * (architecture channel, 2026-10-06: the §3 carve-out accepted by the
    * residents).
    *
-   * - `'delivery'` (default): the locus comes only from the delivery that
-   *   woke the turn, a conversation fork's home channel, or a channel the
-   *   agent opened during the turn. Incoming traffic never moves it — not
-   *   between turns, not mid-turn. A turn with no such locus keeps its
-   *   prose private, and says so in a `[routing]` notice.
+   * - `'delivery'` (default): the locus comes from the delivery that woke
+   *   the turn, a conversation fork's home channel, or a channel the agent
+   *   opened during the turn, and past those only from an open all-except
+   *   hold's channel or `unpromptedChannel` (below), each for the turns that
+   *   take it. Incoming traffic never moves it — not between turns, not
+   *   mid-turn. A turn with no such locus keeps its prose private, and says
+   *   so in a `[routing]` notice.
    * - `'latest-inbound'`: the previous rule. The most recent delivered
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
@@ -532,7 +534,7 @@ export interface FrameworkConfig {
    * framework with an event gate, the only one with such turns; on any other
    * the description is as it is without the setting.
    */
-  unpromptedChannel?: string;
+  unpromptedChannel?: string | null;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;
