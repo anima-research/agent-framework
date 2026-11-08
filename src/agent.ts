@@ -131,6 +131,7 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  RequestOverhead,
   ThinkingStrip,
 } from '@animalabs/context-manager';
 import type {
@@ -662,10 +663,16 @@ export class Agent {
    * before building a request.
    */
   /** Resolve the compile budget: explicit arg wins, else the per-agent
-   * configured context budget (if any), else the ContextManager default. */
+   * configured context budget (if any), else, with a window set, the
+   * ContextManager default's room with maxTokens as the reply's reserve,
+   * else the ContextManager default. */
   private resolveBudget(budget?: TokenBudget): TokenBudget | undefined {
     if (budget) return budget;
-    if (this.contextBudgetTokens === undefined) return undefined;
+    if (this.contextBudgetTokens === undefined) {
+      if (this.physicalWindowTokens === undefined) return undefined;
+      // Mirrors ContextManager.compile's own default room (100,000 less its 4,000 reserve).
+      return { maxTokens: 96_000 + this.maxTokens, reserveForResponse: this.maxTokens };
+    }
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
   }
 
@@ -1795,7 +1802,12 @@ export class Agent {
   async compileWithInjections(
     budget?: TokenBudget,
     injections?: ContextInjection[],
-    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } & BindingCompileOptions,
+    opts?: {
+      kvUnifiedImmutablePrefixHash?: string;
+      dryRun?: boolean;
+      requestOverhead?: RequestOverhead;
+      requestLimitTokens?: number;
+    } & BindingCompileOptions,
   ): Promise<CompileResult> {
     // A dry run is a compile that will never be sent. The context manager
     // persists no fold resolutions for it and queues none of the compression
@@ -1913,12 +1925,14 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const binding = this.bindingCompileOptions(tools, (injections ?? [])
+    const prospectiveSystemInjections = (injections ?? [])
       .filter((injection) => injection.position === 'system')
-      .flatMap((injection) => injection.content));
+      .flatMap((injection) => injection.content);
+    const binding = this.bindingCompileOptions(tools, prospectiveSystemInjections);
+    const bounds = this.requestBounds(tools, prospectiveSystemInjections);
     const assemble = async (): Promise<NormalizedRequest> => {
       const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
+        () => this.compileWithInjections(budget, injections, { ...(binding.thinkingBinding ? binding : {}), ...bounds }));
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
@@ -2096,17 +2110,12 @@ export class Agent {
         })
       : undefined;
     const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
-    const compiledResult = await this.compileWithInjections(
-      budget,
-      injections,
-      immutablePrefixHash || options.dryRun || binding.thinkingBinding
-        ? {
-            ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
-            ...(options.dryRun ? { dryRun: true } : {}),
-            ...binding,
-          }
-        : undefined,
-    );
+    const compiledResult = await this.compileWithInjections(budget, injections, {
+      ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
+      ...(options.dryRun ? { dryRun: true } : {}),
+      ...binding,
+      ...this.requestBounds(availableTools, prospectiveSystemInjections),
+    });
     let { messages } = compiledResult;
     const { systemInjections } = compiledResult;
     // It counts what the compile selected, so a preview's stand-ins
@@ -2297,6 +2306,16 @@ export class Agent {
    */
   thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
+  }
+
+  private requestBounds(tools: ToolDefinition[], systemInjections: ContentBlock[]): {
+    requestOverhead: RequestOverhead;
+    requestLimitTokens?: number;
+  } {
+    return {
+      requestOverhead: { system: this.buildSystemPrompt(systemInjections), tools: tools.length > 0 ? tools : undefined },
+      ...(this.physicalWindowTokens !== undefined ? { requestLimitTokens: this.physicalWindowTokens } : {}),
+    };
   }
 
   /**

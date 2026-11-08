@@ -64,7 +64,8 @@ test('agent leaves marker ownership unchanged for non-kv strategies', async () =
   );
   const request = await agent.buildActivationRequest([]);
   assert.equal((request as typeof request & KvUnifiedRequestHooks).cacheMarkers, undefined);
-  assert.equal(compileOptions, undefined);
+  assert.deepStrictEqual(compileOptions, { requestOverhead: { system: 'system', tools: undefined } },
+    'no kv-unified prefix: only the request\'s overhead, which every compile that builds a request is given');
 });
 
 test('a new activation closes the receipt flight its predecessor left open before it submits', async () => {

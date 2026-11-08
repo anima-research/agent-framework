@@ -512,10 +512,11 @@ describe('a stream counts its usage once, however it ends', () => {
 
 /** Its first stream holds a tool round over the budget and the turn's end; a later stream, a restart's, the end alone. */
 class ToolRoundThenFinal extends MockMembrane {
+  constructor(private readonly first: DetailedUsage) { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
     const stream = new MockYieldingStream(this.calls.length === 1
-      ? [toolResponse('echo', 'echo-1', firstUsage), finalResponse('Recovered.', secondUsage)]
+      ? [toolResponse('echo', 'echo-1', this.first), finalResponse('Recovered.', secondUsage)]
       : [finalResponse('Recovered.', secondUsage)]);
     this.lastStream = stream;
     return stream;
@@ -526,7 +527,7 @@ describe('an agent whose model binds its thinking, with its window size set, tak
   // A budget restart compiles afresh mid-turn, and what that compile changes ahead of the turn's own earlier rounds
   // takes their reasoning out of the request. The window projection still guards.
   const huge = 1_000_000;
-  for (const [label, limits, restarts] of [
+  for (const [label, limits, restarts, usage] of [
     ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, []],
     ['binds, with no window size: the budget restart, as before', { thinkingBinding: { binds: true } }, ['context_budget']],
     ['a window size, without binds: the budget restart, as before', { physicalWindowTokens: huge }, ['context_budget']],
@@ -535,13 +536,14 @@ describe('an agent whose model binds its thinking, with its window size set, tak
     ['binds, with an infinite window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: Infinity }, ['context_budget']],
     // One a config holds as a string reads as its number, as the projection's comparison always read it.
     ['binds, with a window size given as a string: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: String(huge) as unknown as number }, []],
-    // The first call's projection passes the window: its prompt (170, cache included), its output (20) and the
-    // reserve for the next response (100) make 290, past 250, where without the prompt they'd make 120.
-    ['binds, with a window the stream outgrows: the window restart', { thinkingBinding: { binds: true }, maxTokens: 100, physicalWindowTokens: 250 }, ['physical_window']],
-  ] as const) {
+    // The first call's projection passes the window: its prompt (2,070, cache included), its output (20) and the
+    // reserve for the next response (100) make 2,190, past 2,000, where without the prompt they'd make 120. The
+    // first request itself is within it: the compile keeps it there (requestLimitTokens).
+    ['binds, with a window the stream outgrows: the window restart', { thinkingBinding: { binds: true }, maxTokens: 100, physicalWindowTokens: 2_000 }, ['physical_window'], { ...firstUsage, inputTokens: 2_000 }],
+  ] as ReadonlyArray<readonly [string, Record<string, unknown>, readonly string[], DetailedUsage?]>) {
     it(label, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'af-binds-budget-'));
-      const membrane = new ToolRoundThenFinal();
+      const membrane = new ToolRoundThenFinal(usage ?? firstUsage);
       const framework = await AgentFramework.create({
         storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [],
         modules: [new TurnTools()], syncIntervalMs: 0,
