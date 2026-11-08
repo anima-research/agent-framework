@@ -177,6 +177,7 @@ for (const failsBy of ['event', 'throw'] as const) {
     const alert = r.alerts('history-kept')[0]!;
     assert.match(String(alert.message), /fails without its history too/);
     assert.ok(String(alert.message).includes(WALK4), "the alert gives the probe's own reason");
+    assert.match(String(alert.message), /No retry was queued, so the agent tries again only when something next wakes it\./, 'the alert says what happens next');
     assert.ok(r.traces.filter((tr) => tr.type === 'inference:exhausted').every((tr) => !('request' in tr)), 'the failed request stays off the trace');
     assert.ok(stderr.slice(seen).some((line) => line.startsWith('[inference-rewind] agent=resident kept its history: the request fails without its history too')
       && line.includes(WALK4)), 'the stderr line says so, with the probe\'s answer');
@@ -242,11 +243,13 @@ test("a probe that can't tell, answered 429, sheds nothing, and the alert says t
   await r.quiet(60_000);
   assert.deepEqual(r.history(), ['zz-q1', 'zz-answer-1', 'zz-q2', 'zz-answer-2', 'zz-q3', 'zz-q4', 'zz-q5']);
   assert.equal(r.rewindMarkers(), 0);
+  assert.equal(membrane.sends.length, 2 + 3, 'one send per turn, and no retry');
   const alert = r.alerts('history-kept')[0]!;
   assert.match(String(alert.message), /couldn't tell/);
   assert.ok(String(alert.message).includes('zz rate limited'), "the alert gives the probe's own reason");
+  assert.match(String(alert.message), /No retry was queued, so the agent tries again only when something next wakes it\./, 'the alert says what happens next');
   assert.ok(stderr.slice(seen).some((line) => line.startsWith("[inference-rewind] agent=resident kept its history: a probe without its history couldn't tell")
-    && line.includes('zz rate limited')), "the stderr line says so, with the probe's answer");
+    && line.includes('zz rate limited') && line.includes('No retry was queued')), "the stderr line says so, with the probe's answer and what happens next");
 });
 
 for (const [what, answer] of [
@@ -265,6 +268,7 @@ for (const [what, answer] of [
     await r.quiet(60_000);
     assert.deepEqual(r.history(), ['zz-q1', 'zz-answer-1', 'zz-q2', 'zz-answer-2', 'zz-q3', 'zz-q4', 'zz-q5']);
     assert.equal(r.rewindMarkers(), 0);
+    assert.equal(membrane.sends.length, 2 + 3, 'one send per turn, and no retry');
     assert.match(String(r.alerts('history-kept')[0]!.message), /couldn't tell/);
   });
 }
@@ -484,8 +488,8 @@ test("a run released while its probe is out has the probe withdrawn, as the run'
     last = contextManager as never;
   }
   const setAside = () => stderr.some((line) => line.includes("agent=job: its probe's answer is set aside"));
-  await r.soon(() => membrane.probes.length === 1 || setAside(), 'the breaker to probe the run');
-  assert.ok(membrane.probeOptions.every((o) => o.signal?.aborted === true), 'a probe that went out for the run was withdrawn with it');
+  await r.soon(() => membrane.probes.length === 1, 'the breaker to probe the run');
+  assert.equal(membrane.probeOptions[0]!.signal?.aborted, true, 'the probe that went out for the run was withdrawn with it');
   await r.soon(setAside, "the probe's end to be set aside");
   assert.equal(r.gates().has('job'), false, 'the run has no provider gate, as its own calls take none');
   assert.equal(stderr.filter((line) => line.includes('agent=job') && /kept its history|shed/.test(line)).length, 0, 'nothing was shed or kept for it');

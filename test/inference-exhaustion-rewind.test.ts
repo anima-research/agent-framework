@@ -381,7 +381,19 @@ test('a probe answered after the agent moved on sets its answer aside: nothing i
     ['the agent replaced', (h) => { h.fw.agents.set('cairn', { ...h.fw.agents.get('cairn') }); }],
     ['the framework stopping', (h) => { h.fw.providerAdmissionClosed = true; }],
     ['a surgery holding the store', (h) => { h.fw.surgeryHold = { verb: 'undo', agentName: 'cairn' }; }],
-    ['another failure counted', (h) => { h.fw.consecutiveInferenceFailures.set('cairn', 4); }],
+    ['another failure counted', (h) => { h.fw.noteInferenceExhausted('cairn', REASON, true, 'rate_limit'); }],
+    ['the streak reset by a completed turn and counted back to the same number, with no failure note written', (h) => {
+      // With the notes off, no row moves, so only the count's own history can tell this run from the probe's.
+      const notes = process.env.SUPPRESS_INFERENCE_FAILED_MARKER;
+      process.env.SUPPRESS_INFERENCE_FAILED_MARKER = '1';
+      try {
+        h.fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
+        for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, true, 'rate_limit');
+      } finally {
+        if (notes === undefined) delete process.env.SUPPRESS_INFERENCE_FAILED_MARKER;
+        else process.env.SUPPRESS_INFERENCE_FAILED_MARKER = notes;
+      }
+    }],
     ['another turn holding the agent', (h) => { h.fw.activeTurnTokens.set('cairn', 42); }],
     ['the branch moved', (h) => { h.fw.store = { currentBranch: () => ({ name: 'undo/cairn/1' }) }; }],
     ['a row edited', (h) => { h.cm.editMessage('u1', [{ type: 'text', text: 'edited' }]); }],
@@ -398,6 +410,8 @@ test('a probe answered after the agent moved on sets its answer aside: nothing i
       },
     });
     let setAside = false;
+    let shedThen: string[] = [];
+    let queuedThen = 0;
     try {
       for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
       await settle();
@@ -405,20 +419,30 @@ test('a probe answered after the agent moved on sets its answer aside: nothing i
       answer();
       await settle();
       setAside = h.errs.some((e) => e.includes("its probe's answer is set aside"));
+      shedThen = [...h.removed];
+      queuedThen = h.fw.pendingRequests.length;
       if (what !== 'nothing (the control)') {
+        // A hold that would set the next answer aside too ends first, so the next failure's own probe decides.
+        if (what === 'a surgery holding the store') h.fw.surgeryHold = null;
+        if (what === 'another turn holding the agent') h.fw.activeTurnTokens.delete('cairn');
         h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
         await settle();
+        if (what !== 'the framework stopping') {
+          answer();
+          await settle();
+        }
       }
     } finally { h.restore(); }
     if (what === 'nothing (the control)') {
       assert.deepEqual([...h.removed].sort(), ['a1', 'r1'], 'the control sheds');
       continue;
     }
-    assert.deepEqual(h.removed, [], `${what}: nothing is shed`);
-    assert.equal(h.fw.pendingRequests.length, 0, `${what}: no retry is queued`);
+    assert.deepEqual(shedThen, [], `${what}: nothing is shed`);
+    assert.equal(queuedThen, 0, `${what}: no retry is queued`);
     assert.ok(setAside, `${what}: it says the answer was set aside`);
     assert.equal(probes, what === 'the framework stopping' ? 1 : 2,
       `${what}: the next failure ${what === 'the framework stopping' ? 'sends no probe, once stopping' : 'sends a probe of its own'}`);
+    if (what !== 'the framework stopping') assert.ok(h.removed.length > 0, `${what}: the next failure's own probe, answered, sheds`);
   }
 });
 
@@ -452,13 +476,85 @@ test('a settled probe leaves nothing behind, however it ends: its history listen
   for (const [how, arrange] of ends) {
     const h = makeHarness();
     arrange(h);
+    const membrane = h.fw.auxiliaryMembraneFor;
+    let listening = 0;
+    h.fw.auxiliaryMembraneFor = (name: string) => {
+      const inner = membrane(name);
+      return { complete: (...args: unknown[]) => { listening = h.listeners.size; return inner.complete(...args); } };
+    };
+    const joined: unknown[] = [];
+    const add = h.fw.breakerProbes.add.bind(h.fw.breakerProbes);
+    h.fw.breakerProbes.add = (probe: unknown) => { joined.push(probe); return add(probe); };
     try {
       for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
       await settle();
     } finally { h.restore(); }
+    assert.equal(listening, 1, `${how}: a history listener was attached while the probe was out`);
+    assert.equal(joined.length, 1, `${how}: the probe joined the set stop() waits on`);
     assert.equal(h.fw.breakerProbes.size, 0, `${how}: the probe has left the set stop() waits on`);
     assert.equal(h.listeners.size, 0, `${how}: its history listener is detached`);
   }
+});
+
+test("a later failure withdraws a probe still out for an earlier one, whose answer couldn't be used", async () => {
+  const h = makeHarness();
+  const signals: AbortSignal[] = [];
+  h.fw.auxiliaryMembraneFor = () => ({
+    complete: (_probe: unknown, options: { signal?: AbortSignal }) => {
+      signals.push(options.signal!);
+      return new Promise((resolve) => {
+        options.signal!.addEventListener('abort', () => resolve({ aborted: true, reason: 'zz withdrawn' }), { once: true });
+      });
+    },
+  });
+  let withdrawn: boolean[] = [];
+  let setAside = false;
+  try {
+    for (let i = 0; i < 4; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
+    withdrawn = signals.map((s) => s.aborted);
+    setAside = h.errs.some((e) => e.includes("its probe's answer is set aside"));
+    for (const probe of h.fw.breakerProbes) probe.abort.abort();
+    await settle();
+  } finally { h.restore(); }
+  assert.deepEqual(withdrawn, [true, false], "the third and fourth failures each sent a probe, and the fourth withdrew the third's");
+  assert.ok(setAside, "the withdrawn probe's end is set aside");
+  assert.deepEqual(h.removed, [], 'nothing is shed');
+});
+
+test("the probe's two verdicts each reach the ops webhook, inside each other's cooldown", async () => {
+  const h = makeHarness();
+  const providerFailure = (status: number, type: string, message: string) =>
+    errorFromProviderStatus({ provider: 'anthropic', status, body: { type: 'error', error: { type, message } } });
+  const answers = [providerFailure(429, 'rate_limit_error', 'zz slow down'), providerFailure(400, 'invalid_request_error', 'zz refused again')];
+  h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { throw answers.shift(); } });
+  const failure = providerFailure(400, 'invalid_request_error', 'zz refused');
+  const fields = h.fw.classifyInferenceError(failure);
+  const posts: string[] = [];
+  const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+  const realFetch = globalThis.fetch;
+  process.env.CONNECTOME_OPS_WEBHOOK = 'http://zz-ops.invalid/hook';
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+    posts.push(String(init?.body ?? ''));
+    return new Response('');
+  }) as typeof fetch;
+  h.fw.opsAlertLastSent = new Map();
+  h.fw.opsAlertCooldownMs = 15 * 60_000;
+  try {
+    for (let i = 0; i < 4; i++) {
+      h.fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error: failure.message, ...fields });
+      await settle();
+    }
+  } finally {
+    h.restore();
+    globalThis.fetch = realFetch;
+    if (hook === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK;
+    else process.env.CONNECTOME_OPS_WEBHOOK = hook;
+  }
+  const kept = posts.filter((body) => body.includes('history-kept'));
+  assert.equal(kept.length, 2, 'both verdicts were posted');
+  assert.match(kept[0]!, /couldn't tell/, 'first the probe that got a 429');
+  assert.match(kept[1]!, /fails without its history too/, 'then the one refused the same way');
 });
 
 test('a shed that fails after its probe was answered says the history may already have changed', async () => {
@@ -499,9 +595,11 @@ test('a trip once stop() has begun, or after the agent was let go or replaced, s
     const h = makeHarness();
     if (implicated) h.fw.exhaustionRewinds.set('cairn', 1);
     let probes = 0;
+    let moved = 0;
     h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
     h.fw.onTrace((e: any) => {
       if (e.type !== 'ops:alert' || e.kind !== 'hard-down') return;
+      moved++;
       if (what === 'stopping') h.fw.providerAdmissionClosed = true;
       else if (what === 'replaced') h.fw.agents.set('cairn', { ...h.fw.agents.get('cairn') });
       else h.fw.agents.delete('cairn');
@@ -510,6 +608,7 @@ test('a trip once stop() has begun, or after the agent was let go or replaced, s
       for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
       await settle();
     } finally { h.restore(); }
+    assert.equal(moved, 1, `${what}, implicated ${implicated}: the hard-down alert's listener ran`);
     assert.equal(probes, 0, `${what}, implicated ${implicated}: no probe`);
     assert.deepEqual(h.removed, [], `${what}, implicated ${implicated}: nothing shed`);
     assert.equal(h.fw.pendingRequests.length, 0, `${what}, implicated ${implicated}: no retry queued`);

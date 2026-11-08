@@ -51,6 +51,7 @@ function hugeProviderError(request?: NormalizedRequest): MembraneError {
 function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: string, c: any[], m: any) => void }) {
   const fw = Object.create(FrameworkClass.prototype) as any;
   fw.consecutiveInferenceFailures = new Map<string, number>();
+  fw.breakerProbes = new Set();
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
   fw.rewindEpisode = new Map();
