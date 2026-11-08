@@ -29,17 +29,18 @@
     it drives it again every 5 seconds. A compression
     call that fails in a tick it drives is reported as one in a maintenance
     pass is.
-  - **What the refused start stored:** the context injections it stored
-    leave the agent's window as its turn starts waiting, since no request
-    carried them, and the released start stores them as it would without
-    the wait. A routing notice it stored stays, so its arrivals stay
+  - **What the refused start stored:** for an agent whose window is
+    presented, the context injections it stored leave the window as its
+    turn starts waiting, since no request carried them, and the released
+    start stores them as it would without the wait. A routing notice it stored stays, so its arrivals stay
     announced, and an undo of the released turn leaves it.
-  - **No time limit:** a turn waits as long as compression stays pending.
+  - **No time limit:** a turn can wait as long as compression stays
+    pending.
     A waiting turn lives in memory, so a restart drops it, and the agent
     waits for its next wake, as after an exhausted turn before.
   - **The note:** the released turn reads "[budget-hold] Your context didn't
-    fit its budget (100,201 tokens against 48,568) when this turn came to
-    start. This turn waited 7 min.", from the hold to its release. It's
+    fit its budget (100,201 tokens against 48,568). This turn waited
+    7 min.", from the hold to its release. It's
     stored once that start's
     compile has gone through (a failed write is logged, and the turn runs
     with the note unstored), where the compile placed it, so the next

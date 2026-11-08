@@ -3104,7 +3104,7 @@ interface BudgetHold {
   checkQueued?: boolean;
   drainKicked?: boolean;
   noteless?: true;
-  notelessCarry?: { checkpoint: RecordedTurnCheckpoint | undefined; injections: MessageId[] };
+  notelessCheckpoint?: RecordedTurnCheckpoint;
   alerted?: true;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
@@ -7044,10 +7044,12 @@ export class AgentFramework {
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
       this.refuseHeldProviderModel(agentName, model);
-      const result = await run().catch((error: unknown) => {
+      let result: Awaited<ReturnType<typeof run>>;
+      try { result = await run(); }
+      catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
         throw error;
-      });
+      }
       this.managerCallLanded(agentName);
       return result;
     });
@@ -7395,7 +7397,6 @@ export class AgentFramework {
     routing: TurnRouting,
     noteGiven: boolean,
     baseline: BudgetHoldBaseline | undefined,
-    storedInjections: readonly MessageId[],
     endStart: () => void,
   ): 'held' | 'noteless' | undefined {
     const { errorType } = this.classifyInferenceError(error);
@@ -7408,16 +7409,16 @@ export class AgentFramework {
       if (!ours) return undefined;
       if (noteGiven && !existing.noteless) {
         existing.noteless = true;
-        existing.notelessCarry = { checkpoint, injections: [...storedInjections] };
+        if (checkpoint !== undefined) existing.notelessCheckpoint = checkpoint;
         return 'noteless';
       }
       this.finishBudgetHold(agent.name, existing, 'nothing_pending');
       return undefined;
     }
-    const carried = ours ? existing?.notelessCarry : undefined;
-    if (existing) delete existing.notelessCarry;
-    for (const cp of [checkpoint, carried?.checkpoint]) if (cp !== undefined) this.dropTurnCheckpoint(agent.name, cp);
-    this.retractUnsentInjections(agent, [...storedInjections, ...(carried?.injections ?? [])]);
+    const carried = ours ? existing?.notelessCheckpoint : undefined;
+    if (existing) delete existing.notelessCheckpoint;
+    for (const cp of [checkpoint, carried]) if (cp !== undefined) this.dropTurnCheckpoint(agent.name, cp);
+    this.retractUnsentInjections(agent);
     const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     if (existing?.state === 'holding' || (existing && !ours)) {
       this.holdRequest(existing.wakes, turn);
@@ -7566,6 +7567,9 @@ export class AgentFramework {
     if (!this.compressionPending(agent) || agent.contextSettingsChanges() !== hold.settingsAtHold) return true;
     const progress = this.compressionProgressOf(agent);
     if (progress !== undefined && hold.progressAtHold !== undefined) return progress !== hold.progressAtHold;
+    // The first snapshot that reads, after one that didn't, is the baseline
+    // from here on.
+    if (progress !== undefined) hold.progressAtHold = progress;
     return hold.managerCalls !== hold.callsAtHold;
   }
 
@@ -7608,7 +7612,7 @@ export class AgentFramework {
     const size = hold.budget !== undefined && hold.actual !== undefined
       ? ` (${hold.actual.toLocaleString('en-US')} tokens against ${hold.budget.toLocaleString('en-US')})`
       : '';
-    return `[budget-hold] Your context didn't fit its budget${size} when this turn came to start. ` +
+    return `[budget-hold] Your context didn't fit its budget${size}. ` +
       `This turn waited ${describeWait((hold.releasedAt ?? Date.now()) - hold.startedAt)}.`;
   }
 
@@ -7677,9 +7681,9 @@ export class AgentFramework {
     if (outcome === 'fit' || !hold.alerted) return;
     const after = describeWait(waitedMs);
     const words = outcome === 'nothing_pending'
-      ? `compression had nothing left to do after ${after}, and the waiting turn's context still didn't fit, so its budget refusal now takes the path it would without the wait`
+      ? `compression had nothing left to do after ${after}, and the waiting turn's context still didn't fit, so its budget refusal now goes to the error policy, as it would without the wait`
       : outcome === 'failed'
-        ? `the waiting turn's start failed for another reason after ${after}, so that failure now takes the path it would without the wait: ${cause ?? 'unknown'}`
+        ? `the waiting turn's start failed for another reason after ${after}, so that failure now takes the path it would without the wait, the error policy's or a provider hold's: ${cause ?? 'unknown'}`
         : outcome === 'removed'
           ? `what the waiting turn was for was removed after ${after}, so it doesn't run`
           : `the waiting turn was stopped after ${after}`;
@@ -7696,11 +7700,13 @@ export class AgentFramework {
     return head + boundFailureText(hold.reason, FAILURE_TEXT_MAX_CHARS - head.length - tail.length) + tail;
   }
 
-  private retractUnsentInjections(agent: Agent, ids: readonly MessageId[]): void {
-    if (ids.length === 0 || !this.presents(agent)) return;
+  private retractUnsentInjections(agent: Agent): void {
+    if (!this.presents(agent)) return;
     try {
-      agent.getContextManager().retractRows([...ids], { undone: true });
-      this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...ids], reason: 'unsent-injection' });
+      const ids = agent.unsentInjectionRows();
+      if (ids.length === 0) return;
+      agent.getContextManager().retractRows(ids, { undone: true });
+      this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: ids, reason: 'unsent-injection' });
     } catch (error) {
       console.error(`[budget-hold] agent=${agent.name}: the injection rows its refused start stored could not leave its window:`, error);
     }
@@ -16320,8 +16326,8 @@ export class AgentFramework {
     // A turn alive (its start, its stream, its tools, a continuation or a
     // provider hold's retry on its way) holds the window: its next rows
     // would land on what the undo took out.
-    if (this.heldContinuation(agentName) && !this.hasTurn(agentName) && !this.turnAlive(agent)
-      && this.getTurnCheckpoints(agentName).length > 0) {
+    if (this.heldContinuation(agentName) && !this.hasTurn(agentName) && !this.turnAlive(agent)) {
+      if (this.getTurnCheckpoints(agentName).length === 0) return { undone: false };
       this.dropHeldContinuation(agentName, 'an undo took out what its held turn stood on');
     }
     if (this.logicalTurnAlive(agent)) {
@@ -22787,7 +22793,14 @@ export class AgentFramework {
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
-        requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
+        const live = this.budgetHolds?.get(agentName);
+        requests = requests.flatMap((r) => {
+          const batch = mergedBatch(r);
+          if (!batch) return [r];
+          if (!live || (r as MarkedRequest)[BUDGET_HELD] !== live || batch.some((m) => (m as MarkedRequest)[BUDGET_HELD] === live)) return batch;
+          const at = Math.max(0, batch.findIndex((m) => this.sameInferenceRequest(m, r)));
+          return batch.map((m, i) => (i === at ? { ...m, [BUDGET_HELD]: live } as MarkedRequest : m));
+        });
       }
 
       // A provider's stated wait on this agent's primary model, including one
@@ -22829,6 +22842,7 @@ export class AgentFramework {
         // trigger that carried one parks without the mark.
         if (requests.some(carriesContinuation)) {
           this.giveBackAutoContinue(agentName, 'the host is quiesced');
+          this.dropReleasedHeldStart(agentName, requests.filter((r) => r.reason === AUTO_CONTINUE_REASON), 'an auto-continue wake doesn\'t outlast a quiesce');
           requests = requests
             .filter((r) => r.reason !== AUTO_CONTINUE_REASON)
             .map((r) => {
@@ -22856,7 +22870,7 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${(request as MarkedRequest)[BUDGET_HELD] ? 'held' : ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${(request as MarkedRequest)[BUDGET_HELD] === this.budgetHolds?.get(agentName) && (request as MarkedRequest)[BUDGET_HELD] ? 'held' : ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's
@@ -22973,6 +22987,7 @@ export class AgentFramework {
         return this.rowDone(agent, r.readsRow, to);
       });
       if (read.length > 0) {
+        this.dropReleasedHeldStart(agentName, read, 'its wake\'s row was read or removed');
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
         requests.push(...left);
@@ -25462,7 +25477,7 @@ export class AgentFramework {
    * returned counts as landed and the rest are placed, so the request may
    * carry a landed one twice, which is logged as unknown.
    */
-  private storeInjections(agent: Agent, injections: ContextInjection[] | undefined, stored?: MessageId[]): ContextInjection[] | undefined {
+  private storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined {
     const plan = this.planInjectionStores(agent, injections);
     if (!plan) return injections;
     // By position, as the plan is: what compile() places, in the order given.
@@ -25482,7 +25497,6 @@ export class AgentFramework {
             system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: row.mark,
           } as MessageMetadata);
           traced.add(key(row.mark));
-          stored?.push(id);
           this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.mark.namespace}` });
         }
       } catch (err) {
@@ -25501,7 +25515,6 @@ export class AgentFramework {
           const mark = markOf.get(copy.id)!;
           kept.add(key(mark));
           if (!traced.has(key(mark))) {
-            stored?.push(copy.id);
             traced.add(key(mark));
             this.emitTrace({ type: 'message:added', messageId: copy.id, source: `context-injection:${mark.namespace}` });
             // The row whose write threw landed: it enters the window as the
@@ -27563,7 +27576,8 @@ export class AgentFramework {
    * meanwhile is presented now (presentAtEndOf), or at that frame's end.
    */
   private endContinuedTurn(agentName: string, drop: ContinuationDrop, opensTurn = false): void {
-    console.error(`[turn-continuation] ${agentName}: its turn ends without its continuation: ${drop.why}`);
+    const ends = opensTurn ? 'its waiting start ends' : 'its turn ends without its continuation';
+    console.error(`[turn-continuation] ${agentName}: ${ends}: ${drop.why}`);
     const agent = this.agents.get(agentName);
     const startedAt = this.lastInferenceAt.get(agentName)?.startedAt ?? Date.now();
     if (agent && drop.kind !== 'dropped') {
@@ -27591,9 +27605,10 @@ export class AgentFramework {
       // A registered ephemeral run's caller waits on the run's settle, which
       // no frame gives once its continuation is gone: the turn's end is the
       // run's, with the drop's reason.
-      this.settleAgent(agentName, { stopReason: 'exhausted', speech: '', error: `${agentName}'s turn ended without its continuation: ${drop.why}` }, undefined);
+      this.settleAgent(agentName, { stopReason: 'exhausted', speech: '', error: `${agentName}'s ${opensTurn ? 'waiting start ended' : 'turn ended without its continuation'}: ${drop.why}` }, undefined);
     }
-    this.endReleasedBudgetHold(agentName, 'stopped');
+    const hold = this.budgetHolds?.get(agentName);
+    if (hold?.turn && continuesTurn(hold.turn)) this.endReleasedBudgetHold(agentName, 'stopped');
     // The turn's end; a frame that still holds its token presents at its
     // own end instead.
     this.presentAtEndOf(this.agents.get(agentName));
@@ -27994,7 +28009,6 @@ export class AgentFramework {
     let checkpoint: RecordedTurnCheckpoint | undefined;
     let holdNote: ContextInjection | undefined;
     let compileBaseline: BudgetHoldBaseline | undefined;
-    const storedInjections: MessageId[] = [];
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
       checkpoint = this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
@@ -28342,7 +28356,7 @@ export class AgentFramework {
       // last request held, or a newer copy a start stored whose compile then
       // didn't record), when it's left out; the rest go to compile(), as do those
       // it would store while the window is held.
-      injections = this.storeInjections(agent, injections, storedInjections);
+      injections = this.storeInjections(agent, injections);
       // With the presentation index, the backstop before every compile,
       // fresh or resumed: the agent's own rows stored since its start and not
       // in its window yet (a write whose presentation failed) enter it now,
@@ -28537,7 +28551,7 @@ export class AgentFramework {
 
       const retry = trigger && withTurnCarry(trigger, carry);
       const asTransient = this.takeAsTransient(agent.name, err, trigger);
-      const budgetHeld = this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, holdNote !== undefined, compileBaseline, storedInjections,
+      const budgetHeld = this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, holdNote !== undefined, compileBaseline,
         () => this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing));
       if (budgetHeld === 'held') return false;
       if (budgetHeld === 'noteless') {

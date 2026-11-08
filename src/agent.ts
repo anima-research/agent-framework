@@ -1666,6 +1666,31 @@ export class Agent {
     return newest && { contentHash: newest.contentHash, whole: newest.held.size === newest.parts };
   }
 
+  /** The ids of this agent's stored injections, of every namespace, stored
+   *  on its branch since its last compile built to send and in its window
+   *  where it's presented, in the record's order, a sharded body's first
+   *  shard first: the rows unsentInjection counts, which no request has
+   *  carried. Reads only, so an unset point gives none. */
+  unsentInjectionRows(): MessageId[] {
+    const ids: MessageId[] = [];
+    const since = this.unsentSince.get(branchKey(this.contextManager.currentBranchRef()));
+    if (since === undefined) return ids;
+    const presented = this.contextManager.windowMode?.() === 'presented';
+    scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
+      const span = Math.min(end, 64);
+      const { messages } = this.contextManager.getMessageWindow(end - span, span, { resolveBlobs: false });
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const row = messages[i]!;
+        if (row.sequence <= since) break scan;
+        if (storedInjectionMarkOf(row.metadata)?.agent !== this.name) continue;
+        if (presented && this.contextManager.windowStatusOf(row.id) !== 'in') continue;
+        ids.push(row.id);
+      }
+      end -= span;
+    }
+    return ids.reverse();
+  }
+
   /** Record which of this agent's stored injections a compile built to send
    *  rendered. Another agent's stored rows never reach this agent's compile,
    *  since every compile of a shared store leaves them out by its view
