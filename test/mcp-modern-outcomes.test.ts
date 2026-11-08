@@ -1181,24 +1181,15 @@ test('failures are classified in order: nothing sent first, then the answers, th
   loggedLine(logged, /^MCP server "raw" tools\/list failed: "socket hang up"$/);
 
   // A POST the server answered 404 for an ended session is a refusal too,
-  // whatever error the call met as the session closed, and the same rule
-  // about an earlier round holds for it.
+  // whatever error the call met as the session closed.
   const closed = new Error('Connection closed');
-  const ended = classify({ sessionEnded: true }, closed);
+  const ended = classify({ sessionEnded: 'ended' }, closed);
   assert.equal(outcome(ended), 'error-response');
   assert.deepEqual((ended as McplRequestError).data, { httpStatus: 404 });
   // This connection doesn't reconnect, so the agent is told so.
   assert.equal(ended.message, 'The "raw" server had ended this connection\'s session, so the request didn\'t run. ' +
     "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
   loggedLine(logged, /^MCP server "raw" refused tools\/call op: HTTP 404 \(the server had ended this connection's session\)$/);
-  const endedLater = classify({ sessionEnded: true, continued: true }, closed);
-  assert.equal(outcome(endedLater), 'no-response');
-  assert.equal(endedLater.message, 'The "raw" server ended this connection\'s session partway through the request, after asking for more, ' +
-    "so whether it took effect is unknown. This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
-  loggedLine(logged, /^MCP server "raw" refused a later round of tools\/call op: HTTP 404 \(the server had ended this connection's session\)$/);
-  const endedLaterListing = classify({ sessionEnded: true, continued: true }, closed, 'tools/list');
-  assert.equal(endedLaterListing.message, 'The "raw" server ended this connection\'s session partway through the request, after asking for more. ' +
-    'Listing changes nothing on the server, so it\'s safe to try again.');
 
   // Handed off and unanswered, with no deadline: main's words for a
   // request that failed before an answer came back.

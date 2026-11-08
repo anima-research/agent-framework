@@ -422,9 +422,10 @@ and its `family` stays `modern`. On a 2025 revision:
   open while the session lives, whether or not the server issues a session
   id. A failure to open it that may pass is reported as the connection's
   `error` and tried again, and a stream that drops is reopened, after the
-  server's `retry` hint or the connection's backoff. A reopen that missed
-  what came meanwhile relists the tools of a server that announces list
-  changes.
+  server's `retry` hint or the connection's backoff. Its first open, once
+  the connection is up, and a reopen that missed what came meanwhile each
+  relist the tools of a server that announces list changes, since a change
+  announced while no stream was open never arrives.
 - A request's stream that the server closes after a priming event is
   resumed for as long as the request lives. Its cancellation at the
   deadline stops the resume too. A stream cut again before it carried a
@@ -460,7 +461,8 @@ and its `family` stays `modern`. On a 2025 revision:
   longer restarts at most once an interval, and each restart costs the
   calls in flight: the client can't tell a balancer that moves a session's
   requests from a server that restarts. Once the framework's `stop()` has
-  begun, an ended session isn't started again.
+  begun, an ended session isn't started again, and a new one already
+  connecting doesn't come up.
 - A server that moves to `2026-07-28` in place is followed, since the
   session's end brings a new connect, which negotiates afresh. Two more
   answers end a 2025 session, with a session id or without: a 400 carrying
@@ -470,10 +472,12 @@ and its `family` stays `modern`. On a 2025 revision:
   stream's reopen, or a request stream's resume), as that handler answers a
   2025 session it serves statelessly (its default). A call refused with
   `-32022` fails as `error-response` with the server's data, its code in
-  the host's log, and isn't replayed. A server that keeps serving a 2025
-  revision statelessly to a connection that never had a standalone stream
-  isn't followed, unless its upgrade cut a call's stream, whose resume then
-  meets the 405: that connection stays on 2025 until its next connect.
+  the host's log, and isn't replayed. Its words say the server refused the
+  session's revision, so the request didn't run, and whether this host is
+  reconnecting. A server that keeps serving a 2025 revision statelessly to
+  a connection that never had a standalone stream isn't followed, unless
+  its upgrade cut a call's stream, whose resume then meets the 405: that
+  connection stays on 2025 until its next connect.
 - Each session the server holds by its id is ended with a `DELETE` when the
   connection lets it go, waiting at most 3 s: at `close()`, and so `stop()`
   or a disconnect, a connect in flight included, and when a connect fails
