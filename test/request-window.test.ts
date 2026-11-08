@@ -209,11 +209,37 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
         const beside = (sent.opts?.requestOverhead as { messages?: ContentBlock[][] } | undefined)?.messages ?? [];
         assert.ok(beside.some((m) => m.some((b) => isDeepStrictEqual(b, result))), 'the compile was given the result as the request sends it');
         assert.equal((sent.budget as { reserveForResponse: number }).reserveForResponse, REPLY, 'only the reply is reserved');
+        const unused = WINDOW - requestTokens(request);
+        assert.ok(unused < Math.ceil(RESULT_DATA.length / 4), `the batch counts once against the window: ${unused} tokens of it unused`);
       } finally {
         await t.close();
       }
     });
   }
+
+  it('with a window that doesn\'t bind, the guard\'s pending results take the room they take without one, and the compile selects the same', async () => {
+    const select = async (window: number | undefined) => {
+      const t = await open(window, { callsTool: true, toolResultGuard: true, contextBudgetTokens: 5_000 });
+      try {
+        const tools = t.framework.getAllTools();
+        await t.agent.runInference(tools);
+        t.agent.provideToolResult('tu1' as never, { success: true, data: RESULT_DATA } as never);
+        await t.agent.runInference(tools);
+        const budget = t.compiled[t.compiled.length - 1]!.budget as { maxTokens: number; reserveForResponse: number };
+        const request = t.membrane.calls[t.membrane.calls.length - 1]!;
+        return { room: budget.maxTokens - budget.reserveForResponse, reply: budget.reserveForResponse, request };
+      } finally {
+        await t.close();
+      }
+    };
+    const without = await select(undefined);
+    const within = await select(100_000);
+    assert.ok(!JSON.stringify(without.request.messages).includes('Message 0:'), 'premise: the budget binds');
+    assert.ok(requestTokens(within.request) < 100_000 / 2, 'premise: the window doesn\'t');
+    assert.equal(within.room, without.room, 'the same room as without a window');
+    assert.equal(within.reply, REPLY, 'the reply alone is reserved within the window');
+    assert.deepStrictEqual(within.request.messages, without.request.messages, 'the same request');
+  });
 
   it('without a window, the guard\'s pending results keep their reserve and nothing is priced beside the window', async () => {
     const t = await open(undefined, { callsTool: true, toolResultGuard: true });
