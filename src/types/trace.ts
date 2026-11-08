@@ -160,12 +160,13 @@ export type TraceEvent =
       /**
        * A start whose compile was refused for budget while compression was
        * pending waits in the agent's budget hold, idle, instead of failing
-       * (#304). It follows the refused attempt's `inference:failed`. Each
-       * time compression lands a call, a maintenance pass ends (with the
-       * maintenance timer off, at each of the hold's own rechecks), or a
-       * quiesce ends, the held requests are queued, and their start's own
-       * compile is the check: refused again while compression is pending,
-       * they wait again, with no new `inference:held`.
+       * (#304). It follows the refused attempt's `inference:failed`. Once
+       * something the refused compile depends on has changed (compression's
+       * progress, nothing left pending, a surgery or an undo, the agent's
+       * budget or live context settings, or a quiesce's end), the held
+       * requests are queued, and their start's own compile is the check:
+       * refused again while compression is pending, they wait again, with no
+       * new `inference:held`.
        * `inference:hold_ended` follows, once.
        */
       type: 'inference:held';
@@ -192,11 +193,13 @@ export type TraceEvent =
        * note where it carried one, and the refusal takes the error policy's
        * path. 'failed': a released start failed for another reason, and that
        * failure takes its own path. 'stopped': the held turn was ended by
-       * `abortInference()`, `stop()` or its agent's end, reported after its
-       * `inference:aborted`, or a released start was stopped before its
-       * compile went through. 'removed': a surgery or an undo removed what
-       * every held request stood on, reported after the held turn's
-       * `inference:aborted`.
+       * `abortInference()`, `stop()` or its agent's end, or its released start
+       * was declined by the inference policy or withdrawn with its wake, each
+       * reported after its `inference:aborted`, or a released start was
+       * stopped before its compile went through. 'removed': a surgery or an
+       * undo removed what the held turn stood on, reported after its
+       * `inference:aborted`, and the wakes that joined it go back to the
+       * queue.
        */
       outcome: 'fit' | 'nothing_pending' | 'failed' | 'stopped' | 'removed';
       /** Since the hold started (`inference:held`'s `since`). */

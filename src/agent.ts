@@ -435,6 +435,7 @@ export class Agent {
    * the next change.
    */
   private liveBudgetEpoch = 0;
+  private contextSettingsChangeCount = 0;
   /**
    * Counts changes of the descent (each arm of one, the same target included,
    * a reset, a cancel, a settle). A settle proves its target only to a
@@ -696,7 +697,16 @@ export class Agent {
     if (typeof manager.updateHotContextSettings !== 'function') {
       throw new Error('The active context strategy does not support live context settings');
     }
-    return manager.updateHotContextSettings(update);
+    const status = manager.updateHotContextSettings(update);
+    this.contextSettingsChangeCount++;
+    return status;
+  }
+
+  /** How many times the live budget, its descent target or the hot context
+   *  settings have changed.
+   *  @internal For the framework's budget holds; not a host API. */
+  contextSettingsChanges(): number {
+    return this.contextSettingsChangeCount;
   }
 
   getRuntimeSettings(): AgentRuntimeSettingsSnapshot {
@@ -763,6 +773,7 @@ export class Agent {
   private setContextBudget(budget: number | undefined, target: number | undefined, armed = false): void {
     if (budget !== this.contextBudgetTokens) this.liveBudgetEpoch++;
     if (armed || target !== this.contextBudgetTargetTokens) this.descentEpoch++;
+    if (budget !== this.contextBudgetTokens || target !== this.contextBudgetTargetTokens) this.contextSettingsChangeCount++;
     this.contextBudgetTokens = budget;
     this.contextBudgetTargetTokens = target;
   }
