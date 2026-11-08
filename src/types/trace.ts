@@ -1107,9 +1107,9 @@ export type TraceEvent =
        *  'context-hold' | … A kind ending in `-clear` ends the alert of the
        *  kind before it: 'context-hold-clear' is raised when a turn's budget
        *  hold episode ends, which raised one 'context-hold' however often the
-       *  turn was released and held again; a provider hold that takes the
-       *  released turn ends the episode, so a budget hold after that raises
-       *  another. */
+       *  turn's released start was refused and held again; a provider hold
+       *  that takes the released turn ends the episode, so a budget hold
+       *  after that raises another. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;

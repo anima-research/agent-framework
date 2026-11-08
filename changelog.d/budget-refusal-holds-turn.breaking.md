@@ -27,8 +27,9 @@
   kind as silent, posts nothing while a resident waits on its budget.
   - **Migration:** give `context-hold` a place where you post alerts. Its
     end is `context-hold-clear`, so a host that pairs `-clear` kinds closes
-    it with no more work. A held turn raises one of each, however often it's
-    released and held again, unless a provider hold takes it between.
+    it with no more work. A held turn raises one of each, however often its
+    released start is refused and held again, unless a provider hold takes
+    it between.
   - **Unchanged:** `context-refusal` is still raised when a hold ends with
     nothing left for compression to do and the turn's compile is refused
     again, as for any exhausted turn.

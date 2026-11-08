@@ -36,12 +36,13 @@
     description of its pending work now (`pending`, bounded to 2,000
     characters, or null), the held count, and the refusal's type and figures.
   - A held turn raises `context-hold` (under Added) rather than
-    `context-refusal`, since it goes on: once, however often it's released
-    and held again, unless a provider hold takes it between. Before, the refused compile's
-    exhaustion raised `context-refusal`; a hold that ends because compression
-    had nothing left to do, and whose turn's compile is refused again, still
-    does. After a hold whose check failed, a refusal while compression is
-    pending holds the turn again. The hold's start
+    `context-refusal`, since it goes on: once, however often its released
+    start is refused and held again, unless a provider hold takes it
+    between. Before, the refused compile's exhaustion raised
+    `context-refusal`; a hold that ends because compression had nothing left
+    to do, and whose turn's compile is refused again, still does. After a
+    hold whose check failed, a refusal while compression is pending holds the
+    turn again. The hold's start
     logs a `[budget-hold]` line, unless an `inference:held` listener has
     already ended it, saying the turn runs once a check finds its context fits
     its budget, followed by context-manager's own description of its pending

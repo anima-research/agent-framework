@@ -9,11 +9,11 @@
   start is refused again while compression is pending is held again in the
   same episode: its release raises no clear, and its new hold no
   `context-hold`. So a held turn raises one start and one clear however
-  often it's released and held again, unless a provider hold takes it
-  between, which ends the episode, so that a budget hold after it raises
-  another pair. A request that joins a held turn raises neither, and
-  `inference:held` and `inference:hold_ended` mark each hold and each end.
-  It's the framework's first alert kind with a clear.
+  often its released start is refused and held again, unless a provider
+  hold takes it between, which ends the episode, so that a budget hold after
+  it raises another pair. A request that joins a held turn raises neither,
+  and `inference:held` and `inference:hold_ended` mark each hold and each
+  end. It's the framework's first alert kind with a clear.
   - **Its words:** the turn is held until compression makes room, the
     refused compile's reason, bounded so the whole stays within 2,000
     characters, and the way on that a surgery's refusal names, a quiesce with
