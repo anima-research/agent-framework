@@ -27691,6 +27691,7 @@ export class AgentFramework {
         thinkingRecordedAfter,
         thinkingBranch,
         noteRequestSent,
+        noteThinkingDropped,
         carriedBodies,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
@@ -27812,6 +27813,7 @@ export class AgentFramework {
               place: placeDrops,
               ...(thinkingRecordedAfter !== undefined ? { recordedAfter: thinkingRecordedAfter } : {}),
               ...(thinkingBranch !== undefined ? { branch: thinkingBranch } : {}),
+              ...(noteThinkingDropped ? { noteDropped: noteThinkingDropped } : {}),
             }
           : undefined,
         streamCarry,
@@ -30103,6 +30105,12 @@ export class AgentFramework {
             // Against the branch's binding record, when the context manager keeps one: a drop it can't account
             // for tells the operators (noteThinkingLoss), and a call with no report shows no such drop.
             const placedDrops = thinkingDrops && thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [];
+            // The stored replies' bodies among them, as placed, go to the record, so the next compile sends them
+            // without their thinking and the provider drops none of them again.
+            const droppedBodies = placedDrops.flatMap((drop) => drop.kind === 'reply' ? drop.bodies.map((body) => body.messageId) : []);
+            if (droppedBodies.length > 0 && thinkingDrops?.noteDropped) {
+              try { thinkingDrops.noteDropped(droppedBodies); } catch { /* noting is best-effort, as the sample is */ }
+            }
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, placedDrops, thinkingDrops.recordedAfter);
             }
