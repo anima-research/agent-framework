@@ -166,7 +166,9 @@ export type TraceEvent =
        * first; `inference:hold_ended` follows, for a release once the turn's
        * requests are queued again, and then its fresh compile, unless the turn
        * was stopped while held or a listener of `inference:hold_ended` stops
-       * it. After a hold that ended because compression had nothing left to
+       * it, or, after a hold that ended because compression had nothing left
+       * to do, a listener of its `context-hold-clear`, which then comes at
+       * once. After a hold that ended because compression had nothing left to
        * do, a refusal of that compile takes the error policy's path; after one
        * whose check failed, a refusal while compression is pending holds the
        * turn again.

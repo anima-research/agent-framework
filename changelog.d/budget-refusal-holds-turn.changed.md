@@ -21,9 +21,11 @@
     new trace `inference:held`; `inference:hold_ended` follows when the hold
     ends, for a release once the turn's requests are queued again, and the
     released turn's next start emits `inference:started` again, unless a
-    listener of `inference:hold_ended` stops the turn first. A
-    listener of the hold's `context-hold` alert that ends the turn at once
-    puts its `inference:aborted` before `inference:held`.
+    listener of `inference:hold_ended` stops the turn first, or, after a
+    hold that ended because compression had nothing left to do, a listener
+    of its `context-hold-clear`, which then comes at once. A listener of the
+    hold's `context-hold` alert that ends the turn at once puts its
+    `inference:aborted` before `inference:held`.
     `healthSnapshot()` gives each agent's `budgetHold` (or null): since when
     it holds, when the hold last saw compression's own work change
     (`compressionChangedAt`: the summaries it has made and whether a call is
