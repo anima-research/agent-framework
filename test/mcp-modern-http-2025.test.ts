@@ -806,7 +806,6 @@ test('on 2026-07-28 a call whose stream the transport gives up on fails then, no
   fixture.resumeAnswers.push(...Array<number>(10).fill(503));
   const connection = await connect(fixture, { requestTimeoutMs: 10_000, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
   assert.equal(connection.protocolVersion, '2026-07-28');
-  const began = Date.now();
   await assert.rejects(connection.callTool('echo', { text: 'lost' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response', err.message);
@@ -859,7 +858,6 @@ test('on a 2025 revision a call whose stream ends with neither its answer nor an
   });
   const connection = await connect(fixture, { requestTimeoutMs: 10_000 });
   await connection.listTools();
-  const began = Date.now();
   await assert.rejects(connection.callTool('echo', { text: 'lost' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response', err.message);
@@ -1504,7 +1502,7 @@ test('a request whose POST fails keeps nothing for the session\'s life', async (
 test('a deadline on a 2025 call: cancellation is POSTed, and the server sees the abort', async () => {
   const fixture = await start2025({ versions: ['2025-06-18'] });
   const connection = await connect(fixture, { requestTimeoutMs: 300 });
-  await assert.rejects(connection.callTool('slow', { ms: 1500 }), (err: unknown) => {
+  await assert.rejects(connection.callTool('slow', { release: releaser().path }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'no-response');
     assert.match(err.message, /^The "remote" server didn't answer within 0\.3 seconds, so whether the request took effect is unknown: this host asked it to cancel/);

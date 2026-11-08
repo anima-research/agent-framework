@@ -421,9 +421,10 @@ and its `family` stays `modern`. On a 2025 revision:
 - List changes arrive on the session's standalone stream, which is kept
   open while the session lives, whether or not the server issues a session
   id, unless the server answers its first open with a status that won't
-  pass: a 405, which says it offers no stream, a 501 or 505, or a 4xx
-  other than 408, 409 and 429. With a `token` or `accessProvider` set, a
-  401 first gets one more try, after the SDK refreshes the credential.
+  pass: a 405, which says it offers no stream, a 501 or 505, a 4xx other
+  than 408, 409 and 429, or a redirect the SDK doesn't follow, such as one
+  off the server's origin. With a `token` or `accessProvider` set, a 401
+  first gets one more try, after the SDK refreshes the credential.
   Such an open isn't tried again, and the session's list changes don't
   arrive. A failure to open it that may pass is reported as the
   connection's `error` and tried again, and a stream that drops is
