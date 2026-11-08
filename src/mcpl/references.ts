@@ -714,10 +714,11 @@ const MAX_RECORDS = 2000;
 /**
  * Host-private store of received references. Raw URIs live here and in stubs
  * never (under `never`) or by policy only (`ref`/absent). Ids are stable and
- * never reused within the process (vector 20). Past MAX_RECORDS the record
- * registered least recently that no fetch holds (pin) is evicted
- * (registering a uri the registry holds makes its record the newest), and a
- * stale lookup returns undefined — a defined miss, never a different record.
+ * never reused within the process (vector 20). Past MAX_RECORDS the records
+ * registered least recently that no fetch holds (pin) are evicted, down to
+ * MAX_RECORDS (registering a uri the registry holds makes its record the
+ * newest), and a stale lookup returns undefined — a defined miss, never a
+ * different record.
  *
  * Process-wide singleton by design: ids are host-local *names*, not
  * capabilities, and the record carries the servers that delivered it for the
@@ -748,14 +749,26 @@ export class ReferenceRegistry {
   /** How many fetches hold each record (pin), by refId. */
   private pins = new Map<string, number>();
 
-  /** Hold a record while a fetch of it runs, so eviction passes it over and
-   *  a `never` for its uri, in whatever shape it comes, finds the record the
-   *  fetch reads its mark from. Call the release once the fetch ends. */
-  pin(refId: string): () => void {
+  /** Hold the record the registry keeps for a fetch's uri while the fetch
+   *  runs, putting the fetch's own record back as the newest where none is
+   *  kept, so eviction passes it over and a `never` for the uri, in whatever
+   *  shape it comes, finds the record the fetch reads its mark from. The
+   *  release, once the fetch ends, lets go of that record. */
+  pin(record: ReferenceRecord): () => void {
+    const uri = record.testimony.uri;
+    let held = this.findByUri(uri);
+    if (held === undefined) {
+      this.keepFirst(uri);
+      this.records.set(record.refId, record);
+      this.byKey.set(uri, record.refId);
+      held = record;
+    }
+    const refId = held.refId;
     this.pins.set(refId, (this.pins.get(refId) ?? 0) + 1);
+    this.evict(refId);
     return () => {
-      const held = (this.pins.get(refId) ?? 0) - 1;
-      if (held > 0) this.pins.set(refId, held);
+      const left = (this.pins.get(refId) ?? 0) - 1;
+      if (left > 0) this.pins.set(refId, left);
       else this.pins.delete(refId);
     };
   }
@@ -882,14 +895,20 @@ export class ReferenceRegistry {
     }
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
+    this.evict(refId);
+    return record;
+  }
+
+  /** Past MAX_RECORDS, evict the records registered least recently that no
+   *  fetch holds, sparing `newest`, the record just added. */
+  private evict(newest: string): void {
     for (const [oldest, old] of this.records) {
       if (this.records.size <= MAX_RECORDS) break;
-      if (this.pins.has(oldest) || oldest === refId) continue;
+      if (this.pins.has(oldest) || oldest === newest) continue;
       this.keepFirst(old.testimony.uri);
       this.records.delete(oldest);
       this.byKey.delete(old.testimony.uri);
     }
-    return record;
   }
 
   get(refId: string): ReferenceRecord | undefined {

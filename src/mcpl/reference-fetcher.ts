@@ -422,7 +422,7 @@ export class ReferenceFetcher {
   }
 
   private start(record: ReferenceRecord, ceiling: number, deadline: number, timeoutMs: number): Flight {
-    const release = referenceRegistry.pin(record.refId);
+    const release = referenceRegistry.pin(record);
     const flight: Flight = {
       ceiling,
       timeoutMs,

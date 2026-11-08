@@ -605,6 +605,57 @@ describe('a fetcher built to withhold', () => {
     });
   }
 
+  for (const [shape, never] of [
+    ['a reference', (uri: string) => ({ type: 'resource', uri, disposition: 'never' })],
+    ['inline data', inlineNever],
+    ['an embedded resource', (uri: string) => ({ type: 'resource', disposition: 'never', resource: { uri, text: 'the payload', mimeType: 'text/plain' } })],
+  ] as const) {
+    it(`saves nothing and names no path for a fetch started on a record the registry had evicted, whose uri ${shape} marks \`never\` while it runs`, async () => {
+      const saved: string[] = [];
+      const f = fetcher({ saved });
+      const uri = `${ORIGIN}/hold?stale-${randomUUID()}`;
+      const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
+      crowd();
+      assert.equal(referenceRegistry.findByUri(uri), undefined, 'evicted before its fetch starts');
+      const arrived = new Promise<void>((resolve) => { heard = resolve; });
+      const running = f.fetch(record);
+      await within('the request reaching the server', arrived);
+      const response = held.shift()!;
+      try {
+        await quietly(() => convertBlocks([never(uri)] as McplContentBlock[], 'attachment on push event', 'srv'));
+      } finally {
+        response.end();
+      }
+      assert.deepEqual(await within('the stale download', running), NEVER_FAILURE);
+      assert.deepEqual([saved, record.fetchedPath], [[], undefined]);
+    });
+  }
+
+  it("keeps the record that holds the uri when a fetch of an evicted record of it starts, so a `never` after 2,000 more registrations still stops it", async () => {
+    const saved: string[] = [];
+    const f = fetcher({ saved });
+    const uri = `${ORIGIN}/hold?replaced-${randomUUID()}`;
+    const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
+    crowd();
+    const holder = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
+    assert.notEqual(holder, record, 'a new record holds the uri');
+    const arrived = new Promise<void>((resolve) => { heard = resolve; });
+    const running = f.fetch(record);
+    await within('the request reaching the server', arrived);
+    const response = held.shift()!;
+    try {
+      crowd();
+      assert.equal(referenceRegistry.findByUri(uri), holder, 'the record that holds the uri is kept while the fetch runs');
+      await quietly(() => convertBlocks([inlineNever(uri)] as McplContentBlock[], 'attachment on push event', 'srv'));
+    } finally {
+      response.end();
+    }
+    assert.deepEqual(await within('the replaced download', running), NEVER_FAILURE);
+    assert.deepEqual([saved, record.fetchedPath, holder.payloadNever], [[], undefined, true]);
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri: `https://zz-never.example/evict/${randomUUID()}` }), 'srv');
+    assert.equal(referenceRegistry.findByUri(uri), undefined, 'the record the fetch kept goes once it has ended');
+  });
+
   it('keeps a record its fetch holds past 2,000 later registrations, so a `never` marks that record, and lets it go once the fetch ends', async () => {
     const saved: string[] = [];
     const f = fetcher({ saved });
@@ -631,7 +682,7 @@ describe('a fetcher built to withhold', () => {
   it('keeps every record fetches hold, and the one just registered, past 2,000, and evicts down to 2,000 once they are let go', () => {
     const reg = new ReferenceRegistry();
     const uris = Array.from({ length: 2000 }, () => uniq('held.bin'));
-    const releases = uris.map((uri) => reg.register(testimonyOf({ type: 'resource', uri }), 'srv')).map((record) => reg.pin(record.refId));
+    const releases = uris.map((uri) => reg.register(testimonyOf({ type: 'resource', uri }), 'srv')).map((record) => reg.pin(record));
     const newest = uniq('newest.bin');
     reg.register(testimonyOf({ type: 'resource', uri: newest }), 'srv');
     assert.deepEqual([reg.findByUri(uris[0]!) !== undefined, reg.findByUri(newest) !== undefined], [true, true], 'nothing held is evicted, nor the record just registered');
