@@ -172,6 +172,18 @@ describe('the payload mark', () => {
     assert.equal(referenceRegistry.findByUri(long), undefined);
   });
 
+  it("isn't made by an image or audio by a uri longer than a reference's link may be, which a push, channel or injection lane rejects whole, as it rejects such a reference, whatever its disposition", () => {
+    const long = `https://zz-never.example/${randomUUID()}/${'x'.repeat(references.REFERENCE_LIMITS.uri)}`;
+    const rejected = { type: 'text', text: references.REFERENCE_LINK_TOO_LONG_TEXT };
+    for (const type of ['image', 'audio'] as const) {
+      for (const disposition of [undefined, 'ref', 'never'] as const) {
+        const block = { type, uri: long, mimeType: type === 'image' ? 'image/png' : 'audio/wav', ...(disposition ? { disposition } : {}) };
+        assert.deepEqual(convertBlock(block as McplContentBlock, 'attachment on push event', 'zz-never-dialed'), rejected, `${type}, ${disposition ?? 'no disposition'}`);
+      }
+    }
+    assert.equal(referenceRegistry.findByUri(long), undefined);
+  });
+
   it("governs every block of a push, channel or injection message, whatever their order: an image by uri before a `never` for its uri is its stub, and the record the message makes or has is marked", async () => {
     await quietly(() => {
       const known = uniq('order-known.png');
@@ -704,14 +716,17 @@ describe("the framework's fetches", () => {
   it("register a server's `never` reference nested in its result, bound to that server and marked, and no plain nested one, whatever the call's mode", async () => {
     for (const mode of ['register', 'model', 'script'] as const) {
       const fetched: string[] = [];
-      const [nested, plain] = [uniq('nested-never.bin'), uniq('nested-plain.bin')];
+      const [nested, plain, moduleMade] = [uniq('nested-never.bin'), uniq('nested-plain.bin'), uniq('nested-module-made.bin')];
+      const unbound = referenceRegistry.register(testimonyOf({ type: 'resource', uri: moduleMade }));
       const content = [
         { type: 'text', text: 'one attachment', attachment: { type: 'resource', uri: nested, disposition: 'never' } },
         { type: 'text', text: 'another', attachment: { type: 'resource', uri: plain } },
+        { type: 'text', text: 'a third', attachment: { type: 'resource', uri: moduleMade, disposition: 'never' } },
       ];
       await quietly(() => framework(fetched).autoFetchReferences(content, 'zz-never-dialed', mode));
       const record = referenceRegistry.findByUri(nested);
       assert.deepEqual([record?.payloadNever, record?.serverIds, referenceRegistry.findByUri(plain), fetched], [true, ['zz-never-dialed'], undefined, []], mode);
+      assert.deepEqual([unbound.payloadNever, unbound.serverIds], [true, ['zz-never-dialed']], `${mode}: a record no server had bound is bound to the server whose never marks it`);
     }
   });
 
