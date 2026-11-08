@@ -261,7 +261,8 @@ export class ToolResultGuard {
   /** Extra input tokens the pending batch costs on the wire beyond the
    * placeholder the strategy selected against (chars/4 + flat per image,
    * the same heuristic as the physical-window projection). Compilation
-   * reserves this so substituting originals cannot exceed the budget. */
+   * without a physical window reserves this so substituting originals cannot
+   * exceed the budget; with one, the originals are priced beside the window. */
   get pendingWireReserveTokens(): number {
     const pending = this.pending;
     if (!pending) return 0;
@@ -276,6 +277,12 @@ export class ToolResultGuard {
       chars -= GUARD_NOTICES[pending.notices.get(result.toolUseId) ?? 'ran'].length;
     }
     return Math.max(0, Math.ceil(chars / 4) + images * 1600);
+  }
+
+  get pendingWireBlocks(): ContentBlock[] {
+    return this.pending?.wireResults.map((result) => ({
+      type: 'tool_result', toolUseId: result.toolUseId, content: result.content, isError: result.isError,
+    }) as ContentBlock) ?? [];
   }
 
   /** Ordered storage work, separate from batches awaiting a provider verdict.

@@ -104,11 +104,28 @@ export interface AgentConfig {
    * from a turn's first on, is kept within the window as context-manager
    * prices it: the compile is given the window as context-manager's
    * `requestLimitTokens`, beside the request's system prompt and tools as
-   * `requestOverhead`, so the compiled context, its message injections, the
-   * system prompt, the tools and the reply's reserve (the agent's maxTokens,
-   * unless a caller passes its own budget) come within it, and a window the
-   * system prompt and tools leave no room in refuses the compile as over
-   * budget.
+   * `requestOverhead`, with what the request may send besides the compiled
+   * context as its `messages`: the direct API's tool results ready before
+   * its compile, the tool-result guard's pending originals (priced whenever a batch is
+   * pending, beside the placeholders the compile also prices, which can only
+   * leave more room than needed), a `prefillUserMessage`, and the turn a
+   * stream's start may end its request on (a silent tick's separator, or
+   * `[Continue]`). So the compiled context, its message injections, those
+   * messages, the system prompt, the tools and the reply's reserve (the
+   * agent's maxTokens, unless a caller passes its own budget) come within
+   * it, and a window they leave no room in refuses the compile as over
+   * budget. Some of what a request sends is outside that price, and reaches
+   * context-manager only as its calibration takes it in from the provider's
+   * count: the request-only turns rendered again before earlier replies (a
+   * surviving silent tick's separator, 199 characters, 69 tokens by
+   * context-manager's estimator, and 10 characters for each surviving reply
+   * to `[Continue]`), which grow with the ticks the window keeps; another
+   * agent's rounds sent as transcript lines (`setForeignRounds`), which can
+   * cost a little more than the stored rows: about the tool's name and 13
+   * characters a line on a short call or result, and 9 characters for a row
+   * left with nothing; on the direct API, a tool result that becomes ready
+   * during its compile, which only a framework-driven turn on the same agent
+   * can bring; and what membrane adds as it renders the request.
    * Unset → no projection and no limit on the compile; only the
    * maxStreamTokens restart applies. A value is converted to a number as a
    * comparison converts it, so a string such as "200000" reads as its number;

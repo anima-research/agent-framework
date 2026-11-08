@@ -678,14 +678,16 @@ export class Agent {
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
   }
 
-  /** Compile budget with the tool-result guard's reservation applied. While
-   * a batch is pending the strategy selects against short placeholders, but
-   * prepareRequest substitutes the originals on the wire; reserve their real
-   * cost so the final request still fits (a budget restart that recompiles
-   * small must not re-inflate past the same window). */
+  /** Compile budget with the tool-result guard's reservation applied, where
+   * no physical window is set. While a batch is pending the strategy selects
+   * against short placeholders, but prepareRequest substitutes the originals
+   * on the wire; reserve their real cost so the final request still fits (a
+   * budget restart that recompiles small must not re-inflate past the same
+   * window). With a window, the originals are priced beside it instead
+   * (requestBounds). */
   private compileBudget(budget?: TokenBudget): TokenBudget | undefined {
     const resolved = this.resolveBudget(budget);
-    const reserve = this.toolResultGuard.pendingWireReserveTokens;
+    const reserve = this.physicalWindowTokens === undefined ? this.toolResultGuard.pendingWireReserveTokens : 0;
     if (reserve === 0) return resolved;
     const base = resolved ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
@@ -1918,6 +1920,8 @@ export class Agent {
       this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults, undefined,
         DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     }
+    const readyResults = this._state.status === 'ready' && !guardedResults
+      ? this.buildToolResultMessages(this._state.toolResults).map((message) => message.content) : [];
 
     // Compile the context (with optional injections) into a request. The
     // guard's refusal retry is assembled the same way, afresh. It is compiled
@@ -1930,10 +1934,12 @@ export class Agent {
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content);
     const binding = this.bindingCompileOptions(tools, prospectiveSystemInjections);
-    const bounds = this.requestBounds(tools, prospectiveSystemInjections);
     const assemble = async (): Promise<NormalizedRequest> => {
       const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections, { ...(binding.thinkingBinding ? binding : {}), ...bounds }));
+        () => this.compileWithInjections(budget, injections, {
+          ...(binding.thinkingBinding ? binding : {}),
+          ...this.requestBounds(tools, prospectiveSystemInjections, readyResults),
+        }));
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
@@ -2115,7 +2121,8 @@ export class Agent {
       ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
       ...(options.dryRun ? { dryRun: true } : {}),
       ...binding,
-      ...this.requestBounds(availableTools, prospectiveSystemInjections),
+      ...this.requestBounds(availableTools, prospectiveSystemInjections,
+        [options.silentHeartbeat !== undefined ? silentHeartbeatSeparatorTurn().content : continueTurn().content]),
     });
     let { messages } = compiledResult;
     const { systemInjections } = compiledResult;
@@ -2309,13 +2316,21 @@ export class Agent {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
-  private requestBounds(tools: ToolDefinition[], systemInjections: ContentBlock[]): {
+  private requestBounds(tools: ToolDefinition[], systemInjections: ContentBlock[], beside: ContentBlock[][] = []): {
     requestOverhead: RequestOverhead;
     requestLimitTokens?: number;
   } {
+    const requestOverhead: RequestOverhead = { system: this.buildSystemPrompt(systemInjections), tools: tools.length > 0 ? tools : undefined };
+    if (this.physicalWindowTokens === undefined) return { requestOverhead };
+    const pending = this.toolResultGuard.pendingWireBlocks;
+    const messages: ContentBlock[][] = [
+      ...beside,
+      ...(pending.length > 0 ? [pending] : []),
+      ...(this.prefillUserMessage ? [[{ type: 'text', text: this.prefillUserMessage } as ContentBlock]] : []),
+    ];
     return {
-      requestOverhead: { system: this.buildSystemPrompt(systemInjections), tools: tools.length > 0 ? tools : undefined },
-      ...(this.physicalWindowTokens !== undefined ? { requestLimitTokens: this.physicalWindowTokens } : {}),
+      requestOverhead: messages.length > 0 ? { ...requestOverhead, messages } : requestOverhead,
+      requestLimitTokens: this.physicalWindowTokens,
     };
   }
 
