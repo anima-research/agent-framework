@@ -501,6 +501,7 @@ describe('explicit prose routing', () => {
         // turn's bounce waited for this failure.
         const notice = context(framework).texts.filter((t) => t.startsWith('[prose-routing]') && t.includes(original.id)).at(-1)!;
         assert.ok(notice.includes('{{unsent}}'), `the failure came back before the next turn's bounce: ${notice}`);
+        assert.ok(notice.includes(`It is held as draft ${original.id} (14 chars)`), `the draft's own length, not the token's: ${notice}`);
       } else {
         // Held after the failure's copy, the next turn's bounce is the latest.
         assert.notEqual(copy.id, original.id);
