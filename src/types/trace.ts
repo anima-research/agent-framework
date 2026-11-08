@@ -186,7 +186,7 @@ export type TraceEvent =
       type: 'inference:hold_ended';
       agentName: string;
       /**
-       * 'fit': a released start's compile went through, and the turn runs.
+       * 'fit': a released start's compile went through.
        * 'nothing_pending': a released start's compile was refused with
        * compression having nothing pending, after one run without the hold's
        * note where it carried one, and the refusal takes the error policy's
