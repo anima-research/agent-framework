@@ -28,12 +28,12 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, DiscordAwarenessOutbox, OperatorActionError } from '../src/index.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/surgery-marks-mcpl-server.mjs', import.meta.url));
 
 function jsonl<T = Record<string, unknown>>(path: string): T[] {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
+  return jsonLines<T>(path);
 }
 
 async function waitFor(description: string, predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -114,20 +114,26 @@ describe('surgery and awareness marks', () => {
    * channel; those whose index is in `addressed` addressed the resident.
    */
   function seed(n: number, addressed: number[] = []): { tail: string; removed: string[] } {
-    cm().addMessage('Operator', [{ type: 'text', text: 'kept' }], {
-      serverId: 'discord', channelId: 'discord:g1:dm', messageId: 'kept',
-    });
-    const tail = String(cm().addMessage('Operator', [{ type: 'text', text: 'last good' }], {
-      serverId: 'discord', channelId: 'discord:g1:dm', messageId: 'tail',
-    }));
+    // Each row enters the resident's window as it is stored, as a write for
+    // an idle agent does (#291): a rollback cuts at the write that presented
+    // its target (AF-7), so one to the tail removes the rows stored after it.
+    // Rows never presented would enter at a later boot in one presentation,
+    // and a rollback to any of them would then remove nothing.
+    const add = (participant: string, text: string, metadata: Record<string, unknown>): string => {
+      const id = cm().addMessage(participant, [{ type: 'text', text }], metadata);
+      cm().presentRows([id]);
+      return String(id);
+    };
+    add('Operator', 'kept', { serverId: 'discord', channelId: 'discord:g1:dm', messageId: 'kept' });
+    const tail = add('Operator', 'last good', { serverId: 'discord', channelId: 'discord:g1:dm', messageId: 'tail' });
     const removed: string[] = [];
     for (let i = 0; i < n; i++) {
-      removed.push(String(cm().addMessage(`Member${i}`, [{ type: 'text', text: `message ${i}` }], {
+      removed.push(add(`Member${i}`, `message ${i}`, {
         serverId: 'discord',
         channelId: 'discord:g1:c1',
         messageId: `amb-${i}`,
         tags: addressed.includes(i) ? ['chat:addressed', 'chat:mention'] : ['chat:ambient'],
-      })));
+      }));
     }
     return { tail, removed };
   }

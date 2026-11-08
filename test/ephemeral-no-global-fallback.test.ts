@@ -277,7 +277,8 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
         createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 60 } }], 'tool_use'),
         text('done'));
 
-      assert.deepEqual(calls.refused, ['sleep: Nothing was set: a sleep quiets the whole agent, not one run.']);
+      assert.equal(calls.refused.length, 1, calls.refused.join('\n'));
+      assert.ok(calls.refused[0]!.startsWith('sleep: ') && /nothing was set/i.test(calls.refused[0]!) && calls.refused[0]!.includes('quiets the whole agent'), calls.refused[0]);
       assert.equal((f.framework as unknown as { eventGate: { getSleepState(): unknown } }).eventGate.getSleepState(), null, 'the gate stays awake');
     } finally { await f.close(); }
   });

@@ -153,7 +153,8 @@ describe('ephemeral agents share one usage entry', () => {
     });
     try {
       const byAgent = framework.getSessionUsage().byAgent;
-      assert.deepEqual(byAgent.map((a) => [a.agentName, a.ephemeral, a.inferenceCount, a.usage.inputTokens]), [
+      const byName = (rows: unknown[][]) => [...rows].sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+      assert.deepEqual(byName(byAgent.map((a) => [a.agentName, a.ephemeral, a.inferenceCount, a.usage.inputTokens])), byName([
         // A configured agent's name, a resident's or a conversation agent's
         // namespace, the subconscious's name, and a name with no ephemeral
         // namespace each keep their entry.
@@ -163,7 +164,7 @@ describe('ephemeral agents share one usage entry', () => {
         ['Subconscious', undefined, 1, 7],
         ['unknown', undefined, 1, 5],
         [EPHEMERAL_USAGE_NAME, true, 7, 1300],
-      ]);
+      ]));
       // The fold keeps each entry's cache counts and cost.
       const shared = byAgent.find((a) => a.ephemeral)!.usage;
       assert.deepEqual([shared.outputTokens, shared.cacheCreationTokens, shared.cacheReadTokens, shared.estimatedCost?.currency], [3, 10, 60, 'USD']);

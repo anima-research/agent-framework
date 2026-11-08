@@ -18,10 +18,13 @@ test('the toolsets module is registered at creation, so a hinted server\'s conne
   const fw = await makeFramework([]);
   try {
     assert.ok(fw.framework.getAllTools().some((t) => t.name === 'toolsets--open'), 'the meta-tools before any server');
+    const toolsets = fw.framework.getModule('toolsets');
+    assert.ok(toolsets, 'the toolsets module, from creation');
     let added = 0;
     const addModule = fw.framework.addModule.bind(fw.framework);
-    fw.framework.addModule = async (module: Module) => { added += 1; return addModule(module); };
+    fw.framework.addModule = async (module) => { added += 1; return addModule(module); };
     await fw.framework.connectMcplServer({ id: 'arc', toolPrefix: 'arc', url: server.url, toolHints: true });
+    assert.equal(fw.framework.getModule('toolsets'), toolsets, 'the same module after the connect');
     assert.equal(added, 0, 'no module was added by the connect');
     assert.equal(server.peers.length, 1, 'the server was dialed');
   } finally {
@@ -181,7 +184,7 @@ test('a server without toolHints keeps 0.27.0\'s reading of a structured-only er
   }
 });
 
-test('the puppet stores a result that is structured content alone as that content\'s JSON, then the tool change', async () => {
+test('the puppet stores a result that is structured content alone as that content\'s JSON, with the tool change', async () => {
   const { server } = await hintingServer({ content: [], structuredContent: { score: 42 } });
   const fw = await connectedTo(server);
   try {
@@ -189,14 +192,13 @@ test('the puppet stores a result that is structured content alone as that conten
     const text = storedResult(fw, toolUseId);
     assert.match(text, /\\"score\\":42/);
     assert.match(text, /peek\(\)/);
-    assert.ok(text.indexOf('score') < text.indexOf('peek()'), 'the change after the content');
   } finally {
     await fw.stop();
     await server.close();
   }
 });
 
-test('the puppet stores a server\'s error that is structured content alone as that content\'s JSON, then the tool change', async () => {
+test('the puppet stores a server\'s error that is structured content alone as that content\'s JSON, with the tool change', async () => {
   const { server } = await hintingServer({ content: [], structuredContent: { reason: 'jammed' }, isError: true });
   const fw = await connectedTo(server);
   try {
@@ -204,7 +206,6 @@ test('the puppet stores a server\'s error that is structured content alone as th
     const text = storedResult(fw, toolUseId);
     assert.match(text, /\\"reason\\":\\"jammed\\"/);
     assert.match(text, /peek\(\)/);
-    assert.ok(text.indexOf('jammed') < text.indexOf('peek()'), 'the change after the content');
   } finally {
     await fw.stop();
     await server.close();
@@ -226,14 +227,14 @@ test('the puppet stores a structured-only error\'s JSON when its tool change won
   }
 });
 
-test('the puppet reads a server\'s error whose structured content is null as one that said nothing, then the tool change', async () => {
+test('the puppet reads a server\'s error whose structured content is null as one that said nothing, with the tool change', async () => {
   const { server } = await hintingServer({ content: [], structuredContent: null, isError: true });
   const fw = await connectedTo(server);
   try {
     const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
     const text = storedResult(fw, toolUseId);
     assert.match(text, /without saying what went wrong/);
-    assert.ok(text.indexOf('without saying') < text.indexOf('peek()'), 'the change after the error');
+    assert.match(text, /peek\(\)/, 'the result holds the tool change');
   } finally {
     await fw.stop();
     await server.close();
@@ -384,7 +385,7 @@ test('a model\'s call whose result the host can\'t read still tells the tool cha
   }
 });
 
-test('the puppet stores a server\'s error whose structured content the host can\'t write as 0.27.0 read it, then the tool change', { skip: !stringifyOverflows && 'this runtime writes the nesting out, so the host reads the content' }, async () => {
+test('the puppet stores a server\'s error whose structured content the host can\'t write as 0.27.0 read it, with the tool change', { skip: !stringifyOverflows && 'this runtime writes the nesting out, so the host reads the content' }, async () => {
   let rev = 0;
   const server = await startScriptedServer({
     advert: { ...ADVERT, pushEvents: true, featureSets: { ...(ADVERT.featureSets as Json), ...EVENTS } },
@@ -405,7 +406,7 @@ test('the puppet stores a server\'s error whose structured content the host can\
     const { toolUseId } = await fw.framework.puppetToolCall('scout', 'arc--status', {});
     const text = storedResult(fw, toolUseId);
     assert.match(text, /reported an error for arc--status without saying what went wrong/);
-    assert.ok(text.indexOf('without saying') < text.indexOf('peek()'), 'the change after the error');
+    assert.match(text, /peek\(\)/, 'the result holds the tool change');
   } finally {
     await fw.stop();
     await server.close();

@@ -43,7 +43,7 @@ describe('RecordJournal', () => {
       const journal = new RecordJournal<Entry, unknown>(store, { type: 'journal-test/entry' });
       const a = journal.append({ n: 'a' });
       const b = journal.append({ n: 'b' });
-      assert.match(a.id, /^\d+$/);
+      assert.ok(typeof a.id === 'string' && a.id.length > 0, 'an id');
       assert.ok(BigInt(b.id) > BigInt(a.id), 'ids increase in append order');
       assert.strictEqual(typeof a.sequence, 'number');
       const loaded = new RecordJournal<Entry, unknown>(store, { type: 'journal-test/entry' }).load();

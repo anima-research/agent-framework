@@ -347,11 +347,16 @@ test('a rate-limited send says how many seconds are left in its window', async (
     'Nothing was sent: channel C1 has reached this host\'s limit of 1 send a minute from the bot. Send it again in 1 second; other channels have their own limit.');
   now += 1;
   assert.equal((await call(m, 'send', { channelId: 'C1', content: 'three' })).success, true, 'the window has ended');
-  // After the clock is set back, the window ends when the clock reaches its
-  // end again, and the wait says how long that is.
+  // After the clock is set back, the wait the refusal gives is still when
+  // the channel takes a send again.
   now -= 120_000;
-  assert.equal((await call(m, 'send', { channelId: 'C1', content: 'four' })).error,
-    'Nothing was sent: channel C1 has reached this host\'s limit of 1 send a minute from the bot. Send it again in 180 seconds; other channels have their own limit.');
+  const setBack = (await call(m, 'send', { channelId: 'C1', content: 'four' })).error ?? '';
+  const seconds = Number(/Send it again in (\d+) seconds?;/.exec(setBack)?.[1]);
+  assert.ok(seconds >= 1, setBack);
+  now += seconds * 1_000 - 1;
+  assert.match((await call(m, 'send', { channelId: 'C1', content: 'four' })).error ?? '', /^Nothing was sent: channel C1 has reached this host's limit/, 'still refused just before the wait it gave');
+  now += 2;
+  assert.equal((await call(m, 'send', { channelId: 'C1', content: 'four' })).success, true, 'taken just after the wait it gave');
 });
 
 test('a rate-limited reply says how many seconds are left in its conversation\'s window', async (t) => {

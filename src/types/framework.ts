@@ -131,12 +131,12 @@ export interface FrameworkConfig {
      */
     announceOrphans?: boolean;
     /**
-     * By default every derivation tells the agent it was made from, in one
-     * host-framed line. After this many derivations of one kind from one
-     * agent, that agent hears a count line every so many instead of a line
-     * per fork, so a reader loop that forks a hundred times a session doesn't
-     * fill its source's context with stamps; every derivation still emits its
-     * `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     * With a `derivationNotice`, after this many derivations of one kind from
+     * one agent, the line it's given is a count line every so many instead of
+     * a line per fork, so a reader loop that forks a hundred times a session
+     * doesn't fill its source's context with stamps; every derivation still
+     * emits its `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     * Without a `derivationNotice` the source is told nothing.
      */
     collapseDerivationNoticesAfter?: number;
     /**
@@ -152,9 +152,11 @@ export interface FrameworkConfig {
     beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
     /**
      * What an agent is told when something is derived from it. Given the
-     * record, the agent it was derived from and the framework's default line,
-     * return the text to add, or null to add nothing. Absent, the default
-     * line is used. The `dendrite:agent-created` trace is emitted either way.
+     * record, the agent it was derived from and the framework's own line,
+     * return the text to add (that line, or the host's own), or null to add
+     * nothing. Absent, nothing is added: an agent isn't told of derivations
+     * unless the host asks for it. The `dendrite:agent-created` trace is
+     * emitted either way.
      */
     derivationNotice?: (record: import('../dendrite/types.js').AgentRecord, from: string, defaultText: string) => string | null;
   };
@@ -167,16 +169,14 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * Tune-out without a reader (issue #232 §3.3). The hold machinery always
-   * runs when MCPL channels exist, so a persisted epoch is resumed and
-   * released whatever the configuration; this switch only decides whether
-   * residents are offered `tune_out` when no reader is configured. Without
-   * a reader a tune-out is a silent hold: no cadence, no wake budget,
-   * mentions are acknowledged, the backlog is released on cancel.
+   * Tune-out settings. Residents are offered `tune_out` only with a reader
+   * (`subconscious`), or while a hold a failed release left is still on
+   * record to check or cancel: a hold nothing summarizes would hand the resident an
+   * undated backlog all at once when it ends. `enabled`, which offered one
+   * without a reader, was removed in 0.33.0: `enabled: true` is refused at
+   * `create` (`false` is still accepted, from JavaScript, and does nothing).
    */
   tuneOut?: {
-    /** Offer `tune_out` without a subconscious. Default: only with one. */
-    enabled?: boolean;
     /**
      * Announce the all-except scope in the excepted channel: one bracketed
      * line under the resident's name when it opens (who, for how long) and
@@ -200,7 +200,9 @@ export interface FrameworkConfig {
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
    *
-   * Held traffic never moves the locus under either rule.
+   * Held traffic never moves the locus under either rule. Neither rule
+   * applies to an agent under locked prose routing (AgentConfig.proseRouting
+   * 'locked'): its turns speak at its lock, whatever arrives.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';
@@ -237,9 +239,29 @@ export interface FrameworkConfig {
   hostModePath?: string;
 
   /**
-   * Branch-independent durable queue of context writes deferred while
-   * quiesced. Defaults to `<storePath>/recovery/deferred-writes.json`; same
-   * rationale and fallback as `hostModePath`.
+   * Where a release before #291 kept its durable queue of deferred context
+   * writes. Defaults to `<storePath>/recovery/deferred-writes.json`; without
+   * either, the store's `framework/deferred-writes` slot. This release keeps
+   * no durable queue: a write is stored when it is made, and enters each
+   * agent's window at that agent's presentation points. Two holds keep a
+   * write in memory instead, and a crash loses it: a live operator surgery
+   * (a rollback, a suppression, a branch switch), until its release stores
+   * it, and an agent's context manager refusing its work after a failed
+   * re-initialization, until a branch move (switchBranch, a rollback or a
+   * suppression) re-initializes it.
+   *
+   * create() reads the record once and stores its writes. A write for an
+   * agent no longer registered goes to the primary when it is a failed
+   * reply, a channel notice its reader could act on, or a module's write
+   * for a run or a fork, and is dropped otherwise, logged. It then rewrites
+   * the record with what it left for the next boot: a write it couldn't
+   * store, or couldn't tell had already landed, with that agent's later
+   * writes. A write the store refuses as malformed is dropped, logged, as an
+   * earlier release's flush dropped it. When the store doesn't sync after
+   * the import, the record is left as it was.
+   *
+   * @deprecated Read once at boot by the deferred-write importer; removed in
+   * the next release.
    */
   deferredWritesPath?: string;
 

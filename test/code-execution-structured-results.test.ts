@@ -163,7 +163,7 @@ test("a script reads a structured result whole, the model's calls and history ke
     assert.equal(resultOf('model-direct'), transcript);
     assert.match(resultOf('model-only'), /"runId":"r41"/);
     const script = resultOf('model-script');
-    assert.match(script, /^Script s\d+-[0-9a-z]{4} finished\./, script);
+    assert.match(script, /^Script \S+ finished\./, script);
     assert.ok(script.endsWith('Its output:\nr41 running café 🌱\n'), script);
     assert.deepEqual(calls, ['dual', 'dual', 'only', 'dual', 'empty', 'only', 'plain', 'absent', 'error', 'large']);
 

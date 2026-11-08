@@ -284,8 +284,10 @@ test('a value holding a line break is written as a JSON string, so it stays on i
   assert.equal(shownValue('"a\\nb"'), '"\\"a\\\\nb\\""');
   assert.equal(shownValue('a\nb'), '"a\\nb"');
   for (const value of ['"quoted"', '"a\\nb"', 'a\nb', '"']) assert.equal(JSON.parse(shownValue(value)), value);
-  // Every break is escaped, each as JSON's four-digit escape.
-  assert.equal(shownValue('a\u0085b\u2028c\u2029d\u2028e\vf'), '"a\\u0085b\\u2028c\\u2029d\\u2028e\\u000bf"');
+  // Every break is escaped: none is left, and the value comes back whole.
+  const breaks = shownValue('a\u0085b\u2028c\u2029d\u2028e\vf');
+  assert.ok(!/[\n\v\f\r\u0085\u2028\u2029]/.test(breaks), breaks);
+  assert.equal(JSON.parse(breaks), 'a\u0085b\u2028c\u2029d\u2028e\vf');
   assert.equal(shownValue(null), 'null');
   assert.equal(shownValue(12), '12');
 

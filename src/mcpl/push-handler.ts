@@ -22,6 +22,7 @@ import type { InboundSource } from './inbound-source.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -35,6 +36,8 @@ import { RefusalLines } from './refusal-lines.js';
  * events.ts modification is deferred.
  */
 export interface McplPushEvent {
+  /** The occurrence's suppression, when a coalesced push's wake decided it (CoalescedOccurrence.suppressionDecision). */
+  suppressionDecision?: string | null;
   type: 'mcpl:push-event';
   serverId: string;
   featureSet: string;
@@ -48,13 +51,15 @@ export interface McplPushEvent {
   targetAgents?: string[];
   /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
   coalescingSubject?: string;
-  /** RFC-006 assembly: materialized for this agent's turn, stored directly
-   *  while its assembly runs, after what is queued for it (the framework's
-   *  addMessage, bypassDeferralFor). */
+  /** RFC-006 assembly: materialized for this agent's turn while its
+   *  assembly runs, which presents it before the turn's compile. */
   assemblingFor?: string;
   /** The coalescer's mark: the agent's first view of the subject (see
    *  CoalescedOccurrence.firstView). */
   firstView?: boolean;
+  /** A batch's recovery after a delivery that may have stored the push (the
+   *  framework's FrameworkWriteOptions.mayBeStored). */
+  mayBeStored?: true;
   /** Host acceptance time (epoch ms), stamped where the push is admitted. */
   acceptedAt?: number;
   /** Framework-owned source envelope, frozen at a coalesced occurrence's
@@ -111,7 +116,7 @@ interface Responder {
 export class PushHandler {
   private featureSetManager: FeatureSetManager;
   private pushEventFn: (event: McplPushEvent) => void;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private dedup = new DedupSet(1000);
   /** Holds back repeats of the line for a channel-scoped push refused because
@@ -121,7 +126,7 @@ export class PushHandler {
   constructor(
     featureSetManager: FeatureSetManager,
     pushEventFn: (event: McplPushEvent) => void,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
     /** An ordinary (uncoalesced) push was just admitted, before it is queued
