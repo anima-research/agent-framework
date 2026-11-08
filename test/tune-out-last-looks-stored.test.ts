@@ -79,6 +79,11 @@ test("the subconscious's last looks are read back from the store, by a coordinat
     const marked = first.lastLooks();
     assert.equal(Object.keys(marked ?? {}).length, 3, 'three epochs marked');
     assert.equal(Object.keys(marked?.['e-all-except'] ?? {}).length, 2, 'the same channel id on two servers is two looks');
+    assert.deepEqual(registryOn(store).readCoordinatorState('tune-out/scout/last-looks'), {
+      'e-channel': { '["disc","disc:guild:a"]': 8 },
+      'e-channel-b': { '["disc","disc:guild:b"]': 9 },
+      'e-all-except': { '["disc","disc:guild:c"]': 11, '["other","disc:guild:c"]': 11 },
+    }, 'the stored form, which a later release reads: each look by epoch, under its channel as the JSON pair of its server and channel');
 
     assert.deepEqual(inner(coordinatorOn(registryOn(store))).lastLooks(), marked, 'read back over the same store');
     store.sync();
