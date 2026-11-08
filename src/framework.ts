@@ -3088,6 +3088,7 @@ interface BudgetHold {
   state: 'holding' | 'released';
   startedAt: number;
   releasedAt?: number;
+  dueAt?: number;
   turn: InferenceRequest | undefined;
   standsOn: string[];
   wakes: InferenceRequest[];
@@ -7423,6 +7424,7 @@ export class AgentFramework {
       (turn as MarkedRequest)[BUDGET_HELD] = existing;
       existing.standsOn = standsOn;
       existing.callsAtHold = existing.managerCalls;
+      existing.dueAt = undefined;
       existing.progressAtHold = baseline ? baseline.progress : this.compressionProgressOf(agent);
       existing.settingsAtHold = baseline ? baseline.settings : agent.contextSettingsChanges();
       delete existing.noteless;
@@ -7583,9 +7585,14 @@ export class AgentFramework {
 
   private releaseBudgetHold(agentName: string): void {
     const hold = this.budgetHolds?.get(agentName);
-    if (hold?.state !== 'holding' || this.quiesced) return;
+    if (hold?.state !== 'holding') return;
+    if (this.quiesced) {
+      hold.dueAt ??= Date.now();
+      return;
+    }
     hold.state = 'released';
-    hold.releasedAt = Date.now();
+    hold.releasedAt = hold.dueAt ?? Date.now();
+    hold.dueAt = undefined;
     clearInterval(hold.recheck);
     hold.recheck = undefined;
     const requests = [...(hold.turn ? [hold.turn] : []), ...hold.wakes];
@@ -21108,7 +21115,8 @@ export class AgentFramework {
         !this.hasTurn(agentName) &&
         !this.activeStreams.has(agentName) &&
         !this.pendingRequests.some((r) => r.agentName === agentName) &&
-        this.budgetHolds?.get(agentName)?.state !== 'holding'
+        !this.closureWaits(agentName) &&
+        !this.budgetHolds?.has(agentName)
       ) {
         this.disposeConversationAgent(agentName, 'idle-ttl');
       }
