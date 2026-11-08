@@ -9,7 +9,7 @@ import { WebSocketTransport } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const credential = () => `CANARY-${randomBytes(24).toString('hex')}`;
-const pause = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+const closed = (sockets: Set<net.Socket>) => Promise.all([...sockets].map(s => new Promise(r => s.once('close', r))));
 const config = (url: string): McplServerConfig => ({ id: 'codes', url,
   credentialRequired: true, tokenTransport: 'header', accessProvider: async () => credential() } as McplServerConfig);
 async function refusal(status: number) {
@@ -29,7 +29,7 @@ async function refusal(status: number) {
 }
 
 for (const status of [401, 403, 404, 500, 301, 302, 303, 307, 308]) {
-  test(`direct strict ${status} classification ignores peer text`, async () => {
+  test(`direct strict ${status} classification ignores peer text`, { timeout: 5000 }, async () => {
     const server = await refusal(status);
     try {
       let settlements = 0;
@@ -38,7 +38,7 @@ for (const status of [401, 403, 404, 500, 301, 302, 303, 307, 308]) {
       }, error => { settlements++; return (error as Error).message; });
       const reason = status === 401 || status === 403 ? 'credential-rejected' : 'connection-failed';
       assert.equal(result, `MCPL server "codes": ${reason}`);
-      await pause(20);
+      await closed(server.sockets);
       assert.equal(settlements, 1);
       assert.equal(server.upgrades, 1, 'redirect is never followed');
       assert.equal(server.sockets.size, 0, 'server-side socket closed');
@@ -47,7 +47,7 @@ for (const status of [401, 403, 404, 500, 301, 302, 303, 307, 308]) {
   });
 }
 
-test('strict response listener removes itself and the open timer', async () => {
+test('strict response listener removes itself and the open timer', { timeout: 5000 }, async () => {
   for (const status of [401, 403, 404, 500, 302]) {
     const server = await refusal(status);
     const originalOnce = WebSocket.prototype.once;
@@ -65,9 +65,9 @@ test('strict response listener removes itself and the open timer', async () => {
     globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => { timers.delete(timer); clear(timer); }) as typeof clearTimeout;
     try {
       await assert.rejects(WebSocketTransport.open(config(server.url)), new RegExp((status === 401 || status === 403 ? 'credential-rejected' : 'connection-failed') + '$'));
-      await pause(20);
-      assert.equal(listeners, 1, 'strict-only structured-status listener installed once');
       assert.ok(client);
+      if (client.readyState !== WebSocket.CLOSED) await new Promise(r => client!.once('close', r));
+      assert.equal(listeners, 1, 'strict-only structured-status listener installed once');
       assert.equal(client.listenerCount('unexpected-response'), 0);
       assert.equal(client.listenerCount('open'), 0);
       assert.equal(client.readyState, WebSocket.CLOSED);
@@ -90,16 +90,20 @@ for (const flag of [undefined, false, null]) test(`legacy flag ${flag} installs 
   } finally { WebSocket.prototype.once = original; await server.close(); }
 });
 
-for (const already of [false, true]) test(`strict provider wait abort (already=${already}) is connection-failed`, async () => {
+for (const already of [false, true]) test(`strict provider wait abort (already=${already}) is connection-failed`, { timeout: 5000 }, async () => {
   const server = await refusal(401); const controller = new AbortController(); let release!: (s: string) => void;
   const pending = new Promise<string>(r => { release = r; });
+  const httpModule = http as { request: typeof http.request }; const request = httpModule.request; let dials = 0;
+  httpModule.request = ((...args: Parameters<typeof http.request>) => { dials++; return request(...args); }) as typeof http.request;
   try {
     if (already) controller.abort();
     const dial = WebSocketTransport.open({ ...config(server.url), accessProvider: () => pending }, controller.signal);
     controller.abort();
     await assert.rejects(dial, { message: 'MCPL server "codes": connection-failed' });
-    release(credential()); await pause(20); assert.equal(server.upgrades, 0);
-  } finally { release(credential()); await server.close(); }
+    release(credential()); await pending; await new Promise<void>(r => setImmediate(r));
+    assert.equal(dials, 0, 'a credential released after the abort starts no dial');
+    assert.equal(server.upgrades, 0);
+  } finally { httpModule.request = request; release(credential()); await server.close(); }
 });
 
 test('strict connection refused is connection-failed', async () => {
@@ -132,7 +136,7 @@ for (const mode of ['TLS failure', 'open timeout', 'abort while connecting'] as 
       if (mode === 'abort while connecting') { await once(server, 'connection'); controller.abort(); }
       await assert.rejects(dial, { message: 'MCPL server "codes": connection-failed' });
       if (mode === 'open timeout') assert.equal(shortened, 1);
-      await pause(20); assert.equal(sockets.size, 0);
+      await closed(sockets); assert.equal(sockets.size, 0);
     } finally { globalThis.setTimeout = set; for (const s of sockets) s.destroy(); await new Promise<void>(r => server.close(() => r())); }
   });
 }
@@ -153,7 +157,7 @@ test('real malformed frame after open reports connection-failed', async t => {
 
 
 for (const status of [undefined, '401', NaN, Infinity]) {
-  test(`strict refused upgrade without finite numeric status (${String(status)}) is engine-unsupported`, async () => {
+  test(`strict refused upgrade without finite numeric status (${String(status)}) is engine-unsupported`, { timeout: 5000 }, async () => {
     const server = await refusal(401);
     const emit = WebSocket.prototype.emit;
     // Keep a real upgrade and teardown, replacing only the runtime's status metadata.
@@ -166,7 +170,7 @@ for (const status of [undefined, '401', NaN, Infinity]) {
         message: 'MCPL server "codes": engine-unsupported',
       });
       assert.equal(server.upgrades, 1);
-      await pause(20);
+      await closed(server.sockets);
       assert.equal(server.sockets.size, 0);
     } finally { WebSocket.prototype.emit = emit; await server.close(); }
   });
