@@ -18,6 +18,7 @@ import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import { jsonLines } from './helpers/json-lines.js';
 
 const ROOM = 'discord:g1:room';
@@ -414,6 +415,7 @@ async function harness(opts: {
   /** The fixture server's requestTimeoutMs (the framework's default when unset). */
   requestTimeoutMs?: number;
   sendTool?: boolean;
+  sendToolName?: string;
   codeExecution?: boolean;
   serverConfig?: Record<string, unknown>;
   channels?: Array<{ id: string; label: string; direction?: 'inbound' | 'outbound' | 'bidirectional' }>;
@@ -460,6 +462,7 @@ async function harness(opts: {
         env: {
           STATUS_PATH: statusPath, COMMAND_PATH: commandPath,
           ...(opts.sendTool ? { SEND_TOOL: '1' } : {}),
+          ...(opts.sendToolName ? { SEND_TOOL_NAME: opts.sendToolName } : {}),
           ...(opts.channels ? { CHANNELS: JSON.stringify(opts.channels) } : {}),
         },
         ...(opts.sendTool ? { toolPrefix: 'discord' } : {}),
@@ -536,6 +539,8 @@ async function harness(opts: {
     texts: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text),
     messages: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages(),
+    /** The agent's window, in its order (#291): a row stored mid-round enters it at the round's boundary where the stream carries injected messages, else at the turn's end. */
+    window: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getPresentedMessages(),
     /** Text of every tool result the last stream received, in call order
      *  within each round (results arrive in completion order). */
     toolResults: () => (membrane.lastStream?.receivedToolResults ?? []).flatMap((round, i) => {
@@ -589,9 +594,12 @@ describe('held prose drafts, end to end', () => {
       assert.ok(held.every((d) => d.reason === 'explicit-send'));
       const ids = held.map((d) => d.id);
 
-      // Safe in-band ordering: each mid-turn notice is stored after the tool
-      // result it rode with, and was injected into the live stream there.
-      const msgs = h.messages();
+      // Safe in-band ordering: each mid-turn notice enters the window after
+      // the tool result it rode with, and was injected into the live stream
+      // there. (Since #291 the window's order, not the record's: the notice
+      // is stored at once, and presented at the boundary after the round's
+      // own rows.)
+      const msgs = h.window();
       const noticeIdx = msgs.findIndex((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('[drafts]')));
       assert.ok(noticeIdx > 0, 'a held-draft notice was stored');
       assert.ok(msgs[noticeIdx - 1]!.content.some((b) => b.type === 'tool_result'), 'right after the tool result');
@@ -603,13 +611,14 @@ describe('held prose drafts, end to end', () => {
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
-      // needs nothing more of it): nothing yet in room.
-      const scout = h.framework.getAgent('scout') as unknown as {
-        getConsumedWatermark(): { branch: string; sequence: number };
-        publishedAfterReading(channelId: string, branch: string, sequence: number): boolean;
-      };
+      // needs nothing more of it): nothing yet in room. A mark taken in
+      // presented mode covers a row by its place in the window, so the
+      // checks ask it of real rows.
+      const scout = h.framework.getAgent('scout')!;
+      const cm = scout.getContextManager();
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
-      assert.equal(scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0), false, 'nothing published in room yet');
+      const firstRow = cm.getPresentedMessages()[0]!;
+      assert.equal(scout.publishedAfterReading(room, firstRow, cm), false, 'nothing published in room yet');
 
       // Next turn: list (every field present, nulls), read, then resend all three.
       await h.turn([
@@ -619,9 +628,13 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       const readThrough = scout.getConsumedWatermark();
-      assert.equal(scout.publishedAfterReading(room, readThrough.branch, readThrough.sequence), true,
+      assert.equal(scout.publishedAfterReading(room, newestCovered(readThrough, cm), cm), true,
         'the resend is noted as a publish into room, made having read what the turn read');
-      assert.equal(scout.publishedAfterReading(room, readThrough.branch, readThrough.sequence + 1), false, 'and nothing stored since');
+      // A row stored in room after the resend, and presented: a real row in
+      // the window, which the resend's mark doesn't cover.
+      const later = cm.addMessage('someone', [text('said in room after the resend')], { serverId: 'discord', channelId: ROOM });
+      cm.presentRows([later]);
+      assert.equal(scout.publishedAfterReading(room, cm.getMessage(later)!, cm), false, 'and nothing stored since');
       const [list, read, resend] = h.toolResults();
       assert.match(list!, /3 open drafts, newest first/);
       assert.ok(read!.endsWith(`exactly as a resend publishes it):\n${segments[1]}`), `read shows the text in full: ${read}`);
@@ -760,6 +773,56 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("a reply_to_message to another channel, whose answer names no channel, holds the prose bound for the woken channel too: it's held for every destination (#524)", async () => {
+    const elsewhere = 'telegram:me:chat:42';
+    const h = await harness({ sendTool: true, sendToolName: 'reply_to_message' });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([
+        createMockResponse([text('Here it is.'), call('s1', 'discord--reply_to_message', { channelId: elsewhere, text: 'the reply elsewhere' })], 'tool_use'),
+        createMockResponse([text('Sent it.')]),
+      ]);
+      assert.deepEqual(h.sends().map((s) => s.channelId), [elsewhere], 'the reply went to the other channel');
+      assert.deepEqual(h.publishes(), [], 'the prose bound for the woken channel was held too');
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]).reverse(), [['Here it is.', 'explicit-send'], ['Sent it.', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a send through reply_to_message, telegram-mcpl's reply, whose answer names no channel, holds the prose beside it and after it (#524)", async () => {
+    const h = await harness({ sendTool: true, sendToolName: 'reply_to_message' });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([
+        createMockResponse([text('Here it is.'), call('s1', 'discord--reply_to_message', { channelId: ROOM, text: 'the explicit words' })], 'tool_use'),
+        createMockResponse([text('Sent it.')]),
+      ]);
+      assert.deepEqual(h.sends().map((s) => s.channelId), [ROOM], 'the send went out');
+      assert.deepEqual(h.publishes(), [], 'no plain speech went out beside it');
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]).reverse(), [['Here it is.', 'explicit-send'], ['Sent it.', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const name of ['edit_message', 'send_file', 'send_scheduled_message', 'create_poll', 'upload_file']) {
+    it(`a call of ${name} doesn't hold the round's prose: it still goes out (#524)`, async () => {
+      const h = await harness({ sendTool: true, sendToolName: name });
+      try {
+        await h.turn([
+          createMockResponse([text('Beside it.'), call('s1', `discord--${name}`, { channelId: ROOM, text: 'the words it carries' })], 'tool_use'),
+          createMockResponse([text('After it.')]),
+        ]);
+        assert.deepEqual(h.sends().map((s) => s.channelId), [ROOM], 'the call reached the server');
+        assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'Beside it.'], [ROOM, 'After it.']]);
+        assert.deepEqual(h.drafts(), []);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
   it('disabled mode stays draft-free: its narration is private by configuration', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'disabled' }] });
     try {
@@ -794,12 +857,10 @@ describe('held prose drafts, end to end', () => {
       }).dispatchToolCall('scout', { id: 'from-script', name: 'drafts', input: { action: 'resend', draftIds: [held.id], destination: ROOM } });
       await h.until(() => finished, 'the resend to finish');
       assert.ok(h.publishes().some((p) => p.channelId === ROOM && p.text === 'words held for later'), 'the resend delivered');
-      const scout = h.framework.getAgent('scout') as unknown as {
-        getConsumedWatermark(): { branch: string; sequence: number };
-        publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-      };
+      const scout = h.framework.getAgent('scout')!;
+      const cm = scout.getContextManager();
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
-      assert.equal(scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0), false,
+      assert.equal(scout.publishedAfterReading(room, cm.getPresentedMessages()[0]!, cm), false,
         "a background script's resend is not noted");
 
       // Through executeToolCall, as the admin puppet and ephemeral agents call.
@@ -814,7 +875,7 @@ describe('held prose drafts, end to end', () => {
       });
       assert.equal(result.success, true, `the puppet's resend delivered: ${JSON.stringify(result)}`);
       assert.ok(h.publishes().some((p) => p.channelId === ROOM && p.text === 'more words held'));
-      assert.equal(scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0), false, "a puppet's resend is not noted");
+      assert.equal(scout.publishedAfterReading(room, cm.getPresentedMessages()[0]!, cm), false, "a puppet's resend is not noted");
     } finally {
       await h.close();
     }
@@ -836,13 +897,13 @@ describe('held prose drafts, end to end', () => {
         turnRouting: Map<string, unknown>;
         scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string }>;
       };
-      const scout = h.framework.getAgent('scout') as unknown as {
-        getConsumedWatermark(): { branch: string; sequence: number };
-        publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-      };
+      const scout = h.framework.getAgent('scout')!;
+      // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+      const cm = bySequence(scout.getContextManager());
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
-      const now = scout.getConsumedWatermark();
-      const atStart = { branch: now.branch, sequence: now.sequence - 1 };
+      const now = scout.getConsumedWatermark()!;
+      // What the agent had read when the script started: a mark just before now's.
+      const atStart = legacyMarkFrom(now, -1);
       fw.turnRouting.set('scout', { turnId: 99, wasIn: [], engaged: new Set() });
 
       let answered: { ok: boolean; json: string } | undefined;
@@ -852,8 +913,8 @@ describe('held prose drafts, end to end', () => {
 
       assert.ok(h.publishes().some((p) => p.channelId === ROOM && p.text === 'words a script will send'), `the resend delivered: ${answered!.json}`);
       assert.equal(JSON.parse(answered!.json).isError, false, `the call succeeded: ${answered!.json}`);
-      assert.equal(scout.publishedAfterReading(room, atStart.branch, atStart.sequence), true, 'noted with what the agent had read when the script started');
-      assert.equal(scout.publishedAfterReading(room, now.branch, now.sequence), false, 'not with what it has read since');
+      assert.equal(scout.publishedAfterReading(room, rowAt(headOf(atStart)), cm), true, 'noted with what the agent had read when the script started');
+      assert.equal(scout.publishedAfterReading(room, rowAt(headOf(now)), cm), false, 'not with what it has read since');
     } finally {
       await h.close();
     }
@@ -902,12 +963,10 @@ describe('held prose drafts, end to end', () => {
         drafts(id, { action: 'resend', draftIds: [draft!.id], destination: ROOM, ...(confirm ? { confirmDuplicate: true } : {}) });
 
       // Only a delivered resend is noted as a publish into its channel.
-      const scout = h.framework.getAgent('scout') as unknown as {
-        getConsumedWatermark(): { branch: string; sequence: number };
-        publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-      };
+      const scout = h.framework.getAgent('scout')!;
+      const cm = scout.getContextManager();
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
-      const noted = () => scout.publishedAfterReading(room, scout.getConsumedWatermark().branch, 0);
+      const noted = () => scout.publishedAfterReading(room, cm.getPresentedMessages()[0]!, cm);
 
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
@@ -1185,7 +1244,7 @@ describe('held prose drafts, end to end', () => {
       h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice on this branch names: /);
+      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice in your context names: /);
       assert.match(notice, /d-[a-z2-9]{7} \(held \(not sent\); explicit send in its turn\)/);
       assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in its turn\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
@@ -1203,7 +1262,7 @@ describe('held prose drafts, end to end', () => {
       const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}` }], 'explicit-send').held[0]!);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice on this branch names: /);
+      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice in your context names: /);
       // Newest first: the eight newest with their state, then the two oldest
       // by id alone. No draft's words appear.
       const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(held \(not sent\); explicit send in its turn\)/g)].map((m) => m[1]);
@@ -1228,7 +1287,7 @@ describe('held prose drafts, end to end', () => {
       ]);
       const [draft] = h.drafts();
       assert.ok(h.texts().some((t) => t.includes(`held as draft ${draft!.id}`)), 'the turn-end receipt names it');
-      const catchUps = () => h.texts().filter((t) => t.includes('that no recent notice on this branch names'));
+      const catchUps = () => h.texts().filter((t) => t.includes('that no recent notice in your context names'));
       assert.deepEqual(catchUps(), []);
       // The rollback takes the turn, and its notices, off the branch; the
       // draft stays, as drafts do.
@@ -1236,7 +1295,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice on this branch names: ${draft!.id} \\(held \\(not sent\\); explicit send in its turn\\)`));
+      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice in your context names: ${draft!.id} \\(held \\(not sent\\); explicit send in its turn\\)`));
       assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');
@@ -1433,7 +1492,7 @@ describe('held prose drafts, end to end', () => {
           const naming = () => h.texts().filter((t) => t.includes(held!.id));
           if (naming().length === 0) await h.turn([createMockResponse([])]);
           assert.equal(naming().length, 1, `one notice names it: ${JSON.stringify(naming())}`);
-          assert.ok(naming()[0]!.includes('that no recent notice on this branch names'), `a catch-up, not a mid-turn offer: ${naming()[0]}`);
+          assert.ok(naming()[0]!.includes('that no recent notice in your context names'), `a catch-up, not a mid-turn offer: ${naming()[0]}`);
         } else {
           assert.deepEqual(h.drafts(), [], 'nothing is left held');
           assert.ok(receipt?.includes('1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)'), receipt);
@@ -2000,7 +2059,7 @@ describe('draft notices and turn-end settlement', () => {
     const cm = agent.getContextManager();
     const catchUps = () => cm.getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
-      .filter((t) => t.includes('that no recent notice on this branch names'));
+      .filter((t) => t.includes('that no recent notice in your context names'));
     return { framework, internals, agent, cm, catchUps, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
   };
 
@@ -2078,25 +2137,29 @@ describe('draft notices and turn-end settlement', () => {
     }
   });
 
-  it('the catch-up leaves out a draft that a notice still waiting to be written names', async () => {
+  // Ported for #291: the notice this test once queued by hand in the
+  // deferral queue is stored at once while the turn is alive, and waits
+  // outside the window for the agent's next point.
+  it('the catch-up leaves out a draft that a notice stored and not yet presented names', async () => {
     const t = await catchUpFixture();
-    const queue = (t.framework as unknown as { deferredMessages: Array<Record<string, unknown>> }).deferredMessages;
+    const tokens = (t.framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
     try {
       const [waiting, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'waiting' }, { text: 'lost' }], 'bounced').held;
-      // A bounce notice deferred while a turn is alive: not in the history
-      // yet, but on its way.
-      queue.push({
-        id: 'deferred-notice', seq: 1, participant: 'user',
-        content: [{ type: 'text', text: '[prose-routing] …' }],
-        metadata: { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [waiting!.id] },
-        forAgent: 'scout',
-      });
+      // A bounce notice written while a turn is alive: in the record, not in
+      // the window yet.
+      tokens.set('scout', 1);
+      const stored = (t.framework as unknown as {
+        addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata: Record<string, unknown>, opts: { forAgent: string }): string;
+      }).addMessage('user', [{ type: 'text', text: '[prose-routing] …' }],
+        { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [waiting!.id] }, { forAgent: 'scout' });
+      tokens.delete('scout');
+      assert.equal(t.cm.ordinalOf(stored as never), undefined, 'premise: the notice waits outside the window');
       t.internals.noticeUnnoticedDrafts(t.agent);
       const [catchUp] = t.catchUps();
       assert.ok(catchUp?.includes(lost!.id), 'the draft no notice names is named');
       assert.ok(!catchUp!.includes(waiting!.id), `the one a waiting notice names is not: ${catchUp}`);
     } finally {
-      queue.length = 0;
+      tokens.delete('scout');
       await t.close();
     }
   });
@@ -2117,6 +2180,69 @@ describe('draft notices and turn-end settlement', () => {
       assert.equal(t.internals.proseDrafts.get('scout', own!.id)!.noticedIn, undefined, 'and stays for its settlement');
     } finally {
       await t.close();
+    }
+  });
+});
+
+describe('a draft whose notice an undo takes out of the window', () => {
+  type Harness = Awaited<ReturnType<typeof harness>>;
+  const undo = async (h: Harness): Promise<void> => {
+    const undone = h.framework.undoLastTurn('scout');
+    assert.equal(undone.undone, true, 'the turn is undone');
+    await undone.settled;
+    await (h.framework as unknown as { runUntilIdle(): Promise<void> }).runUntilIdle();
+  };
+  const windowNames = (h: Harness, id: string): boolean =>
+    JSON.stringify(h.framework.getAgent('scout')!.getContextManager().getPresentedMessages()).includes(id);
+  const catchUpsNaming = (h: Harness, id: string): string[] =>
+    h.texts().filter((t) => t.includes('that no recent notice in your context names') && t.includes(id));
+
+  it("is named again at the next start when the undone turn's receipt was its only notice, and only once", async () => {
+    const h = await harness({ xml: true });
+    try {
+      await h.turn([createMockResponse([text('hello')])]);
+      await h.turn([
+        createMockResponse([text('Narration before the send.'), explicitSend('s1')], 'tool_use'),
+        { ...createMockResponse([text('Narration before the send.'), explicitSend('s1'), text('And after it.')]), toolCalls: [] },
+      ]);
+      const [draft] = h.drafts();
+      assert.ok(windowNames(h, draft!.id), "the turn's receipt names it");
+      await undo(h);
+      assert.ok(!windowNames(h, draft!.id), 'the undo took the receipt out of the window');
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'the next start names it');
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'a later start does not name it again');
+      assert.ok(h.drafts().some((d) => d.id === draft!.id), 'it is still open');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("is named again at the next start when the undo took its mid-turn notice out with the turn's rows, the notice being the agent's own row", async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('hello')])]);
+      await h.turn([
+        createMockResponse([text('words a send held back'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      const cm = h.framework.getAgent('scout')!.getContextManager();
+      const midTurn = h.messages().find((m) => (m.metadata as { kind?: string; draftIds?: string[] } | undefined)?.kind === 'prose-drafts'
+        && (m.metadata as { draftIds?: string[] }).draftIds?.includes(draft!.id));
+      assert.ok(midTurn, 'premise: the mid-turn notice names the draft');
+      assert.equal((midTurn!.metadata as { ownRowOf?: string }).ownRowOf, 'scout', "it is the agent's own row");
+      assert.equal(cm.windowStatusOf(midTurn!.id), 'in', 'premise: its window holds it before the undo');
+      await undo(h);
+      assert.ok(!windowNames(h, draft!.id), 'the undo took its notices out of the window');
+      await h.turn([createMockResponse([])]);
+      assert.equal(cm.windowStatusOf(midTurn!.id), 'undone', "the mid-turn notice stays out, as the turn's other rows do");
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'the next start names the draft');
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'a later start does not name it again');
+    } finally {
+      await h.close();
     }
   });
 });
@@ -4665,4 +4791,49 @@ describe('a closed channel\'s invitation offers the reply its agent\'s mode read
       });
     }
   }
+});
+
+// AF #844 bot review 3, finding 108: the held-draft notice written while
+// its agent's turn is alive waits out of that agent's window for the turn's
+// next point, but the other readers of its slot that are idle (a resident
+// that observes it, the persistent subconscious) are presented it at once,
+// as addMessage presents any write mid-turn to them.
+describe('the held-draft notice written mid-turn', () => {
+  it("enters an idle observer's window at its write, and its own agent's at the turn's next point", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-observer-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', observes: ['scout'] },
+      ],
+      modules: [],
+    });
+    try {
+      const internals = framework as unknown as {
+        activeTurnTokens: Map<string, number>;
+        holdProseDrafts(agent: unknown, texts: string[], reason: string, opts: { routing: unknown; notice: 'now' }): unknown[];
+        presentAtEndOf(agent: unknown): void;
+      };
+      const scout = framework.getAgent('scout')!;
+      internals.activeTurnTokens.set('scout', 9999);
+      const held = internals.holdProseDrafts(scout, ['words held back'], 'explicit-send', { routing: { drafts: [], wasIn: [] }, notice: 'now' });
+      assert.equal(held.length, 1, 'setup: one draft held');
+      const notice = scout.getContextManager().getAllMessages()
+        .find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-drafts');
+      assert.ok(notice, 'the notice is stored');
+      assert.equal(scout.getContextManager().ordinalOf(notice.id), undefined, "out of scout's window while its turn is alive");
+      assert.notEqual(framework.getAgent('nova')!.getContextManager().ordinalOf(notice.id), undefined,
+        "in nova's window at once: she observes scout, and is idle");
+      internals.activeTurnTokens.delete('scout');
+      // AF #844 bot review 4, finding 102: the turn's end point presents it
+      // to scout, as the title says.
+      internals.presentAtEndOf(scout);
+      assert.notEqual(scout.getContextManager().ordinalOf(notice.id), undefined, "in scout's window at its turn's end");
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -12,6 +12,1014 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.33.0 — 2026-11-07
+
+### Breaking
+
+- **Hosts and packages that install agent-framework:** it now depends on `@animalabs/chronicle` `^0.6.0` (was
+  `^0.5.1`) and `@animalabs/context-manager` `^0.25.0` (was `^0.24.0`): the chronicle release with the
+  identity-stamped batched append (`appendManyToStateJsonWithIdentity`, with `appendManyToStateJson`,
+  `getStateItemsJson` and `getRecords`), and the context-manager release that keeps each agent's window
+  (`windowStatusOf`, `presentRows`, `retractRows`, `getPresentedMessages`), writes a window write of several rows as
+  one record through that append (context-manager 0.25.0's release notes), names the rows of an add that failed after
+  storing them (`WriteLandedError`), and says when the store can't be read to tell what of a failed add landed
+  (`WriteOutcomeUnknownError`). Neither floor can be lower: chronicle 0.5.1 and earlier have none of the batched
+  calls, and context-manager before 0.25.0 has no window index, so `AgentFramework.create()` refuses a store handle
+  without `appendManyToStateJsonWithIdentity` before it writes anything to the store, and a context-manager without
+  `ContextManager.presentRows` before it opens one, each with an error that names the range this package declares. The
+  framework reads context-manager's two errors from its exports as it loads, so on 0.24.0, which has neither, the
+  package still loads and `create()` gives that error. chronicle 0.6.0 and context-manager 0.25.0 carry 0.5.0's and
+  0.24.0's changes, so what 0.30.0's entry says of derived agents and branch views holds under them too.
+  **Who needs to act:** a host that depends on chronicle or context-manager itself, such as connectome-host, which
+  takes the same ranges alongside this release so that npm installs one copy of each; and a host that opens its own
+  `JsStore` and passes it as `FrameworkConfig.store`, whose handle must come from chronicle 0.6.0 or later.
+  **Migration:** take `@animalabs/chronicle` `^0.6.0` and `@animalabs/context-manager` `^0.25.0` alongside this
+  release. The first window write-down that holds a row, or any presentation of more than one row, moves the store's
+  `MANIFEST` to version 2, which chronicle 0.5.1 and earlier refuse (see Breaking: every agent's context follows its
+  own presentation index).
+
+- **Hosts and module authors: the deferral queue is gone** (#291). A context write is stored at once, whatever its
+  agent's turn and whether the host is quiesced, and enters each agent's window at that agent's presentation points
+  (see the presentation index's entries). Two things still keep a write in memory, with the id `''`: a live operator
+  surgery (a rollback, a suppression, a branch switch), whose release stores it in arrival order; and an agent's
+  context manager that refuses its work after a failed re-initialization, which keeps each write for the agent,
+  uncapped, until a branch move (`switchBranch()`, a rollback or a suppression) re-initializes it and the move's
+  release stores them in arrival order, across agents too (writes for residents land in their shared record in the
+  order they came). `HostModeStatus.deferredWrites` counts them, and the `context-reinit-failed` alert that names
+  the refusal says writes are kept meanwhile. An agent that ends while either keeps writes for it takes them out
+  then: those the primary takes in its place (a module's write for a run or a fork, a failed reply's notice, a
+  channel notice it could act on) go on to it, held by a hold still up, and the rest are dropped, logged, with an
+  `ops:alert` of kind `store-held-lost` for the agent (`data`: `count`, `passedOn`, `kinds`, `mail`,
+  `agentEnded: true`). A release meeting a write for an agent gone, or for a name another agent has registered under
+  since, does the same, so a new agent of that name never gets an ended one's writes. A crash during the surgery, or
+  before the recovery, loses such a write, where earlier releases kept a quiesced host's queue on disk, with the
+  writes a surgery deferred while the host was quiesced or its queue already on disk; so does a release whose store throws for one, none of its
+  rows landing: the writes after it go on, and the release logs the loss and raises `store-held-lost` with the counts
+  and kinds, where earlier releases queued that write, and its agent's later ones, for the next drain.
+  A write whose store throws after its rows landed (context-manager's `WriteLandedError` names them) counts as
+  stored, here and on the write paths the release replays (an inbound channel message or push, a fork's channel
+  message, a module's write): it is placed, presented and answered by those rows, the throw logged, so a coalesced
+  occurrence stored that way isn't stored again as its fallback, and a surgery's release traces it as stored. An
+  agent's own row that throws so (its rounds, its tool results, a row written through `storeOwnRow`) enters its
+  window before the error is passed on, so a later own row can't enter ahead of it. A write whose store throws where
+  the store can't be read to tell what landed (`WriteOutcomeUnknownError`, naming the rows context-manager knows are
+  stored and counting those it can't name) is answered by that error, not as stored, on the same paths, the rows it
+  names presented (for an own row, those the store reads as held) and the throw logged. A module's `addMessage`
+  throws it, and a write that carried `metadata.external` is then looked up by `findMessageByExternalId`. A
+  surgery's release counts such a write as one that may be lost: it traces the first row named as stored, and its
+  `store-held-lost` alert names the rows the store holds and may hold (`data.mayBeStored`: `count`, `landed`,
+  `unknown`, `unnamed`). A coalesced render's delivery stores nothing then: its batch's recovery wake delivers it
+  again saying it may be stored, the agent's store read first for the occurrence's rows by the subject and event id
+  they carry. Rows found are placed as the delivery, with no fallback; with none found the fallback is stored, and where the store
+  still can't be read the fallback is stored and a logged line names the occurrence the agent may then see twice.
+  Any other throw means none of the write landed. A write the store refuses as it is made, on the ordinary write
+  path, is lost, logged, where earlier releases queued it during its agent's turn (or while quiesced, or during a
+  surgery) and the queue kept it when its flush was refused, so a refused failure notice for a fork reached the
+  primary at the fork's release.
+  A tune-out's cancel asked for meanwhile (its end time passing, a wake past its budget, a tool's or a host's
+  cancel), or while the primary's or the subconscious's context manager refuses its work before anything is kept for
+  it, waits, the tune-out in force, until the release has stored the writes, or told of those it couldn't, then runs,
+  so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()` answer
+  `{ ok: true, deferred: true }` then. A later cancel while one waits adds its note to the waiting cancel if the waiting cancel has no note, or if its own note has already gone out. Otherwise the later note is dropped and logged, and the answer adds `noteDropped: true`. The tools say so to the
+  agent, where they answered `cancelled`: the resident's `tune_out` cancel answers `waiting` (the channel's name, or
+  `'all-except'`) and the subconscious's `cancel_tuneout` `waiting: true` (with `scope: 'all-except'` for that
+  hold), each with a `note`: not cancelled yet, since an operator's change to the store is in progress or a context
+  the cancel writes to refuses writes until the host re-initializes it; cancelling again doesn't end the wait
+  sooner while that lasts (once writes are stored, a cancel whose run failed is retried at the next release or within 60 s, and another cancel of the hold can end it first); the tune-out stays in force, and when it ends what it still holds is delivered, up to its backlog cap and what fits in one message; and a host that stops first loses the cancel, which the restart doesn't run. After such a restart the tune-out is still in force, even where its release reached the resident, until it is cancelled: the restart cancels it itself if its end time has passed or, for a channel's tune-out, its wakes have gone past their budget, and cancels every hold if the host starts again with no reader. A note left with a waiting cancel is accounted for when the host stops or crashes first. A stop keeps a notice of its loss in the store (`tune-out/<primary>/loss-notices`) and stamps the holds it accounted for (`tune-out/<primary>/stop-stamp`, with its run's `branch` and the turns still owed, `wakesOwed`); a stop whose budget runs out while such a note is still in memory leaves that hold out of its stamp. The next boot tells the persistent subconscious, with a turn to read it, what became of that cancel and its note, from the notice the stop kept or, for a hold the stamp doesn't cover, from that run's stored rows (with the tool-result guard on, the original `cancel_tuneout` answer is read from `framework/tool-result-guard`'s staged batch): that the cancel ran, that the note was delivered, that the cancel was lost with its note, or that this isn't known and the note may be lost. Those notices carry `lossNoticeId`, `keptAtSequence` and `lostAtStop`, so a later boot neither tells a loss twice nor takes a later ask as told. On the first start on a store with no stamp, as every store an earlier release wrote, the holds on record count as stopped cleanly, and a line is logged. While the store hasn't recorded this run's start, a waiting `cancel_tuneout` answer to the persistent subconscious whose cancel carries its note warns that a stop or a death before the cancel runs may go untold. The subconscious's waiting answer names the server (`serverId`) where a bare channel id answers two servers' holds. A reader fork's note lost at a stop is logged. A release records who asked for its cancel (`cancel.by`, `cancel.askers`). Traces: `tune-out:deferred-cancel-dropped` (`hold-ended`, `note-undelivered`, `stopped`, `superseded`) and `tune-out:stop-unrecorded` (`found`: `ran`, `delivered`, `asked` or `unknown`).
+  `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A waiting cancel ends only the hold it was asked for: one whose hold has ended meanwhile, or that a cancel of a later hold there finds waiting, is dropped, ending nothing, and the author of a note it carried is told in its own context that the note was dropped with it. A note left with a waiting cancel goes to the resident when any cancel of that hold ends it, ahead of that cancel's own: the persistent subconscious's before the release, under its name, and a reader fork's after it, as its mail, even after the fork's run has ended. If writing it fails, its author is told so and why, the persistent subconscious in the release itself, with a turn to read it, and a reader fork in its own context while its run lasts; a notice that can't be written yet is tried again until it is, and one written after a drop says whether the later hold it names is still in force. A `channel_close` of the
+  channel an all-except hold excepts carries what became of the focus, whatever became of the close (`note` on a
+  success, where it said nothing, and after the error on a failure): that the focus ended, or that the focus is still in force while its release waits for held writes. While the release still waits, the close answers "The close asks to cancel the all-except hold that excepts this channel." ("This call asks …" for a channel its server no longer registers) and the waiting note. The `store-held-long` alert says a restart loses the writes the hold keeps in memory and those kept
+  for a manager refusing its work, but mail, which stays held in the registry for the next boot, where 0.32.0's (0.28.0's
+  text) said writes still queued at exit survive only in a persisted deferral queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
+  its manager refuses its work (lost) and those a surgery whose operation outlived `stop()`'s wait still holds, it
+  logs one `[stop] agent=<name>: …` line and raises an `ops:alert` of kind `store-held-lost` with the counts and
+  kinds (`data`: `count`, `keptForRecovery`, `heldBySurgery`, `kinds`, `mail`); mail among them stays held in the
+  registry, and the next boot delivers it. The `context-reinit-failed` alert for a conversation agent a move disposes counts the writes held for it, by
+  the move's hold or while its manager refused its work, and how many of them went to the primary, stored at the
+  release; the rest, such as its channel's messages, are dropped, logged. A write made while quiesced is on the
+  branch the store was on when it was made: a rollback or a branch switch later in the same quiesce leaves it there,
+  where it used to land on the branch chosen by resume.
+  - **Module authors:** `ModuleContext.addMessage` answers the stored id, never a `held:` handle. A write kept in
+    memory (by a surgery's hold, or for a manager refusing its work) is answered `''`, and until it lands
+    `getMessage`, `editMessage` and `removeMessage` have no id for it, and `queryMessages` and
+    `findMessageByExternalId`, which read the store, don't find it. Its release stores it as first given and traces
+    it synchronously (`message:added`, source `surgery-release`, the stored id), so a module that must change it
+    applies the change then, as the Discord module does for an edit or a delete of a message whose create was kept.
+    A write carrying `metadata.external` maps its external id to the row it stored, during its agent's turn too, so
+    `findMessageByExternalId` answers the newer row of an id mapped twice, where a write held for a live turn mapped
+    the id to `''` and the lookup answered the first row stored under it. `ModuleMessage.held` keeps its name with a
+    new meaning: the row is stored and not in the window of the agent the read is for (not yet presented to it,
+    taken out as an undone turn's, or never presented to it: another agent's own row, a row meant for another agent,
+    a row a tune-out holds, for a resident), and it is never set on an agent whose window is the record; its `id`,
+    `sequence` and `timestamp` are the store's. `queryMessages` answers the stored rows in store order, so marked,
+    with the store's `totalCount`, no longer appending held writes' rows as the newest. An edit or a removal of a row
+    reaches it in the store, and changes what any window holding it sends next. For one release, `getMessage`,
+    `editMessage` and `removeMessage` (and a process answer's edits and removals) still take a `held:` handle an
+    earlier release answered, reaching the row its write landed as; the release after drops that.
+  - **Tune-out hosts:** `ReaderInvocation.queued`, the `QueuedHeldMessage` type and
+    `TuneOutFrameworkHooks.getDeferredMessages` are removed: a held message is stored as it arrives, so
+    `ReaderInvocation.backlog` (and `ReaderFramingContext.backlog`) holds every message, as stored rows.
+    `ReaderFramingContext.queuedCount` is deprecated and never set. A cancel's notice to the subconscious no longer
+    carries held messages as `tune-out-cancel-held` rows after it: its view holds them stored. The trace
+    `tune-out:reader-fork` loses `queued`. With no queue, a cancel's release fails to be stored or made durable
+    only where its write throws or the store's sync fails (`commitDeliveries` answers false), and one kept in memory
+    as it is written (a hold that begins with that write), as a queued run's note may be, makes the cancel wait, as
+    above: no queue over its cap keeps a tune-out in force (0.31.0's entry on the order of a cancel's dump and its
+    end). A dump's record of what it covered (`released`) names a held message by its id, and one an earlier release
+    queued by its queued write's id.
+  - **Hosts:** `WritePlacement.deferredId` and `CoalescingPlacement.deferredId` are removed (a placement names its
+    stored `messageId`, or only its agent while the write is kept in memory). `HostModeStatus.deferredWrites` is
+    deprecated, and counts the writes kept in memory, a live surgery's and those waiting for an agent's recovery (0
+    otherwise). `quiesce()` no longer writes a queue and never throws `QuiesceBlockedError`, which stays exported,
+    deprecated, for one release; the API server's 409 for it and the `host/command` refusal are gone. `FrameworkConfig.deferredWritesPath` is deprecated: it names where an
+    earlier release's queue is read from at boot, once. `InferenceRequest.readsRow` is always a stored id.
+  - **Traces:** `puppet:tool-call` loses `deferred`; `dendrite:mail-deferred` fires only for mail kept in memory (a
+    surgery holds it, or its recipient's context manager refuses its work); `message:added` no longer comes with the
+    `deferred-flush:*` sources (an imported write's is `deferred-import`). A write kept in memory is traced once, as
+    its release stores it, under `surgery-release`: its arrival is no longer traced with the id `''` (or
+    `'deferred'`), as a module's process response, a resident's or a fork's channel message, a push event and a
+    script's wake traced it, so a consumer keyed on the id or counting a source sees it once.
+  - **Rollback:** going back to a release before this one needs a copy of the store taken before the upgrade (see
+    Breaking: every agent's context follows its own presentation index), and loses what this release stored after
+    the copy. The queue's record this release leaves (empty once its writes are imported) reads to an earlier
+    release as an empty queue. A store not yet at MANIFEST version 2 still opens there, read as an earlier release
+    reads any store, interleaved: rows stored for an agent during its turn are in its next compile where the record
+    put them.
+
+  **Migration:** a module that kept a `held:` handle across the upgrade can keep using it for one release, and
+  should store the id `addMessage` answers from now on. A module that filtered `held` rows out of a query as not
+  stored yet drops that filter: every row a query answers is stored, and `held` now also marks rows that never
+  enter the agent's window (another agent's own rows, rows meant for another agent, rows a tune-out holds, for a
+  resident), which such a filter leaves out for good. A host that read `deferredWrites` to know whether a quiesce held anything
+  finds nothing held by it: a write made during a quiesce is stored at once (unless a hold above keeps it) and reaches
+  disk at the store's next periodic sync, which keeps running while the host is quiesced, where earlier releases kept
+  it in the queue the quiesce wrote; an agent's own rows enter its window as they are written, and the rest enter the
+  window of each agent with no turn alive at resume, and a draining turn's agent's at that turn's next presentation
+  point.
+
+- **Hosts: every agent's context follows its own presentation index** (#291), in every framework, with no setting
+  to turn it on or off (see the presentation index's entries). `create()` refuses a context-manager without
+  `ContextManager.presentRows` (one before 0.25.0), and a store handle without chronicle's
+  `appendManyToStateJsonWithIdentity` (one from chronicle 0.5.1 or earlier), each naming the range this package
+  declares (see Breaking: the chronicle `^0.6.0` dependency). An agent whose window
+  can't be written down at its registration (another version's index format, a failed write) stays in legacy mode (logged, and raised as an ops alert of kind `presentation-legacy` beside the `presentation:failed` trace, which carries `legacy: true`), its window the whole record, as before, until a branch move writes its window down on the new branch. A
+  conversation fork is seeded with its template's window, so a row a host writes into the template's context
+  manager directly, past the framework, reaches a fork only once the template's next point has presented it.
+  - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
+    agent's window, its own as undone and others' back to arrived, and `redo` puts them back. In a turn an earlier
+    release recorded, whose rows carry no audience stamp, a row stored under the agent's name, one holding only
+    results of its own calls, or a framework notice whose metadata names it as its owner (a drafts notice or a
+    delivery receipt by `draftOwner`, an `[auto-continue]` row by `agentName`, a stored context injection by its
+    mark's `agent`), is its own. Neither writes the
+    record or moves a branch, so neither reverts the workspace or `_config` mounts, MCPL checkpoints or the
+    inference log any more: `rollbackToMessage` is the record-level revert. Neither marks the Discord messages it
+    takes out of the window as removed, as no turn undo has since 0.24.0 made awareness marks one-shot; a host that
+    wants them marked rolls back instead, with `rollbackToMessage`'s `marks` or a `host/command` undo by messages
+    with `marks`. The result's `fromBranch` and `toBranch`
+    are both the store's branch and its `window` says how many rows left or entered; the `undo:completed` and
+    `redo:completed` traces are removed in favour of `window:undone` (the one exception to every trace's name staying unchanged, as Breaking's entry on the trace callback's type says), and the API server broadcasts `window:undone` in place of `branch:switched` for
+    them. Both are refused while a turn of the agent's is alive, and for an agent
+    whose window isn't presented; a redo also on another branch than its undo's, which the base redo switched back
+    to. Moving no branch, an undo or redo reserves nothing and re-initializes no context manager, as a branch move
+    does (0.28.0's entry on the context managers after a branch move), so every other agent goes on compiling, and
+    the result carries no `settled`. So neither takes 0.28.0's `agent-busy` refusals while another agent sharing
+    the store is busy or a conversation agent is being created, a coalesced update or retraction made meanwhile
+    isn't held back, and neither judges a conversation agent for disposal, as a move does.
+  - **A resident is shown another resident's rows only through `observes`** (decision 1): its window takes its own
+    rows, the rows meant for it (their audience stamp, see Added: every row says who it is for) and the own rows of each agent
+    it observes (`AgentConfig.observes`, none by default; see Added: `AgentConfig.observes`). In 0.32.0 a resident's
+    view was the whole shared slot but held traffic and the other residents' stored context injections, so it was
+    shown each co-resident's rounds, replies, tool results and notes, and the mail and messages meant for them. Rows
+    stored before the upgrade carry no stamp and stay in the window its write-down takes from the record; a row
+    stored since that is another resident's own enters a resident's window only through `observes`, and one meant
+    only for another resident (its mail, a message addressed to it) enters none of the others'.
+  - **An observe edge `{ agent }` with no `slot` reads that agent's own slot**, where 0.32.0's `ObserveEdge`
+    documented the shared slot (though nothing chose a slot by one then). A resident's own slot is the shared slot, so
+    only an edge naming another kind of agent, such as a subconscious or an isolated agent, reads a different one;
+    `AgentConfig.observes` builds edges on residents. **Migration:** a spec meaning the shared slot names neither
+    `agent` nor `slot`; a record an earlier release stored is restored with its edge on the shared slot.
+  - **Context-manager's MANIFEST:** the first window write-down that holds rows, or any presentation of more than
+    one row, moves the store's MANIFEST to version 2, which chronicle 0.5.1 and earlier refuse, and so does a release
+    whose chronicle range resolves one, such as agent-framework 0.30.0 or context-manager 0.24.0 (context-manager
+    0.25.0's release notes). Going back to an earlier release after that needs a copy of the store taken before
+    the upgrade.
+
+  **Migration:** a host that listened for `undo:completed`, `redo:completed`, or `branch:switched` with reason
+  `undo`/`redo`, to refresh a view listens for `window:undone`.
+  A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`. A host whose
+  residents read each other's rounds sets `observes` on each resident, naming the others: an edge is one way, so
+  two residents that share their rounds each name the other. It sets `foreignRounds: 'raw'` too where they should
+  read those rounds as stored: the default, `'transcript'`, sends a line per call and per result and none of their
+  thinking. Mail and messages meant for a co-resident stay out of
+  a resident's window either way.
+
+- **Hosts that read an agent's watermarks, or queue wakes with `readsDeferredWrite` or `readsStoredMessage`:** an
+  agent's read marks move to its window (#291).
+  - `Agent.getConsumedWatermark()`, `getShownWatermark()` and `getAnsweredWatermark()` return an opaque `ReadMark`
+    (exported, with `covers`, `coverTest`, `markAtOrAfter` and `describeReadMark`), not `{ branch, sequence }`: it
+    keeps the store's head, as before, and the window's index length once the agent's context presents rows. Ask
+    whether it covers a row with `covers(mark, agent.getContextManager(), row)`: `'covered'`, `'not-covered'`, or
+    `'doubt'` for no mark or a mark on another branch. A mark taken while the window is the record covers a row by
+    its own sequence, as `<=` did, so a host whose window is never written down gets the answers it got; once the
+    window is written down, the same mark covers the rows the window held as of the mark, where they still stand,
+    and not a row stored after it, taken out of the window, or presented again after it. (A `MarkCm` double without
+    `getPresentedMessages` and `branchSequenceOf` is read by sequence.) `markAtOrAfter(a, b)` orders two marks on
+    one branch by their index lengths where both keep one and they differ, and by the store's head otherwise.
+    `markAnswered` and `notePublished` take a `ReadMark`, and `publishedAfterReading(destination, row, cm)` takes
+    the row and the agent's context in place of a branch and a sequence.
+  - `InferenceRequest.readsDeferredWrite` is renamed `readsRow`, and `readsStoredMessage` (0.28.0, #814) is folded
+    into it: its value is the stored row the wake is for, where it was the deferred queue entry's id (the queue is
+    gone), and a wake for a message stored as it arrived is judged as one for a row stored during the agent's turn
+    (see Changed: what an agent has read is what its window held). The wake is dropped, as before, once an answered
+    request covered the row (and, with a channel, the agent spoke there after), or once the row is gone.
+  - `WritePlacement.messageId` names the stored row of every write stored at once, and `WritePlacement` gains
+    `presented?: false` (a row stored and not presented to its agent: its turn was alive, or, at rest, its
+    presentation at the write failed).
+
+  **Migration:** compare marks through `covers` and `markAtOrAfter` instead of reading `.sequence`; rename
+  `readsDeferredWrite` and `readsStoredMessage` to `readsRow`, and give it the stored id the write was answered.
+
+- **Hosts that build `EventGate` or `ChannelRegistry` themselves:** the trace callback each takes, `EventGate`'s `emitTrace` option and `ChannelRegistry`'s `emitTraceFn` argument, is now typed `(event: TraceEventInput) => void`, a member of the `TraceEvent` union without its `timestamp`, in place of `{ type: string; [key: string]: unknown }` (#899). A callback whose parameter is inferred from it, and that reads a field not every trace has without narrowing on `type` first, no longer compiles.
+  - **Migration:** narrow on `type` before reading a trace's fields, as in `if (event.type === 'gate:decision') record(event.eventType)`.
+  - **`EventGate`'s traces carry no `timestamp` of their own:** a host that builds `EventGate` itself got the gate's `timestamp` in its callback, and now stamps its own, as `AgentFramework`'s `emitTrace` always did. A framework's `onTrace` listeners see no change, since that `emitTrace` replaced the gate's stamp with its own.
+- **Hosts with a table or `switch` that must cover every `TraceEvent['type']`:** the union names 28 more types (under Added), so a `Record<TraceEvent['type'], …>`, or a `switch` checked exhaustively with `never`, needs an entry for each.
+- **Code that reads a field of an `mcpl:coalescing` trace that isn't declared:** the member had an index signature, `[key: string]: unknown`. It's now typed by `kind`: the coalescer's records, a connection's `late-render` and the framework's `turn-withdrawn`. So reading a field that its `kind` doesn't carry no longer compiles. Narrow on `kind` first. A `late-render` comes in two shapes, the coalescer's with `subject` and a connection's with `serverId`, so narrow it again with `'subject' in event`.
+- **Code that augments `TraceEventBase` by declaration merging:** it's now a type alias, so an `interface TraceEventBase` in a `declare module` block no longer merges with it, and `tsc` reports TS2300, duplicate identifier `TraceEventBase`. Being an alias keeps a direct cast of a trace to an index-signature type, such as `event as Record<string, unknown>`, compiling as it did while `mcpl:coalescing` had one.
+  - **Migration:** remove the augmentation, and give the host's own fields a type of the host's, such as `type HostTrace = TraceEvent & { hostField?: string }`, read where the host reads them, as in `framework.onTrace((event: HostTrace) => record(event.hostField))`.
+- **Unchanged:** every trace's name, and its fields at run time, apart from `tool:failed`'s `error` (under Fixed) and `EventGate`'s own `timestamp` above. `onTrace` and its listener's type, `TraceEventListener`, are as they were. No sibling package needs a new version.
+
+- **Modules and MCPL servers that write `metadata.suppressed`:** the key is now the framework's, the stamp a suppress rule leaves on a row.
+  - **Who needs to act:** only code that stores a value of its own under that key. Nothing in this repository does.
+  - **Migration:** rename the key. A value written from this release on is dropped. A row already stored whose value is an object with a string `rule` reads as suppressed: it leaves residents' views, and `--remove-suppressed` removes it.
+  - **Unchanged:** every other metadata key. A row a module reads through its context is new only in being marked `heldFromResidents` when a suppress rule hid it, as a tuned-out row is.
+
+- **Hosts:** `AgentConfig.proseRouting` and `Agent.proseRouting` gain
+  `'locked'` (locked prose routing, below). A host that switches over either
+  exhaustively, or keys a record by it, needs a case for `'locked'`: an
+  ephemeral run of a locked agent routes as `'disabled'`, and a conversation
+  fork of one as `'locus'`, so a host describing a subagent's routing can
+  treat it as one of those. Nothing else changes for an agent that doesn't
+  set the mode. A host that accepts `'locked'` in its configuration needs
+  this release or later; connectome-host does from the release with
+  anima-research/connectome-host#603.
+
+- **Hosts that set `tuneOut.enabled`:** it's removed, and `create` refuses
+  `tuneOut: { enabled: true }`. Residents are offered `tune_out` and `focus`
+  only with a reader (`subconscious`, persistent or reader forks). A hold
+  without one summarized nothing and woke no one, then handed the resident
+  its backlog, undated, all at once when it ended. **Migration:** remove the
+  key (a TypeScript host that writes `enabled: false` must drop it to
+  compile); to keep tune-out, configure a `subconscious`.
+  - A hold on record at a start with no reader configured (one this option
+    left, or one whose reader the config no longer has), per channel or
+    all-except, now ends there (with no MCPL server configured, when the
+    first one connects) with its backlog delivered to the resident,
+    under the reason "no reader is configured". Before, a per-channel one
+    ended with its held messages left out of the resident's view for good,
+    and an all-except one stayed on record. A hold whose release fails, as
+    when its backlog can't be made durable, stays on record, and the next
+    start releases it.
+  - When a persistent reader is stopped, its holds end with it, each backlog
+    to the resident ("its reader ended"), where an open-ended one used to
+    stay, unread and unwoken, until the resident cancelled it.
+  - A hold asked for with no reader is refused, for `focus` (all-except) as
+    for one channel, before its options are read.
+  - The `tune_out` description drops its sentence about a silent hold, and
+    the tool results their silent-hold notes. `tuneOut.announce` is
+    unchanged.
+  - **Sibling versions:** none raised; this needs context-manager
+    `^0.24.0`, membrane `^0.8.0` and chronicle `^0.5.1`, as 0.32.0 does.
+  - When the persistent reader ends while a hold's release fails (its
+    backlog can't be made durable), the release is tried again, backing off
+    from a minute, five tries in all; after the last, the hold stays until
+    the resident cancels it, or the next start releases it (with no reader)
+    or resumes it (with one). `tune_out` / `focus` stay listed while a
+    reader is there, or while such a hold is still on record to check or
+    cancel.
+
+### Added
+
+- Every row the framework stores now says who it is for, in its metadata (#291). `metadata.audience` lists the agents the row is meant for, computed when it is written: the agent a write names; for an admitted inbound message, the recipients admission delivered it to, and for the `[wake onboarding]` notice that follows one, that message's recipients that read the slot it lands in; for a module's process response whose `requestInference` names agents, those of them registered that read the slot it lands in; and nobody for a write that carries a tune-out's hold (`metadata.tuneOut`), whichever agent's store it lands in, unless it names an agent whose own view keeps held traffic, such as the persistent subconscious, which it is for. A message a suppress rule took (`metadata.suppressed`) is for nobody, whatever its write names: no view renders it, the subconscious's included, so the presentation index presents it to no window. A write that names no agent (a module's `addMessage`, a response with `requestInference: true` or none) is for the agents that take untargeted inbound in the slot it lands in: every resident on a residents' host, and on a host with one resident that resident, as before. So is a response or a batched-wake line the gate writes (`source: 'gate:debounce'`) whose named agents don't read the slot it lands in, such as an isolated job or a conversation fork: stamped for them alone, it would be in no window. One naming such an agent beside a resident is for the resident, and one naming no registered agent is for the agent it is delivered to. An onboarding notice's recipient that doesn't read that slot, such as a conversation fork, gets its own copy where it reads, stamped for it, and the notice for an event with no recipients is for the agents that take untargeted inbound. So the record tells an untargeted row from one written for the primary. An inbound message's target is stamped as named even where it doesn't read the slot the row lands in, such as a worker named by an inbound message stored in the residents' slot; how such a row is presented is left to the presentation index. `metadata.ownRowOf` names the agent whose own row it is: its rounds and tool results, a puppeted call, and the rows the framework writes for that agent's own turn (clock rows, `[continue]` rows, batched-wake lines, notices about its own speech, routing or failures, a derived agent's inheritance and framing). "Own" goes by who stored the row, not by its participant, so mail a shared fork's parent sends it is the fork's to read, not the fork's own row. Mail and agent-lifecycle notices also name their recipient as `metadata.dendrite.to`. Both keys are the framework's: a write through it replaces any stamp its metadata carried. Rows stored earlier carry none. Writes an earlier version left in the deferred-write queue are stamped when the boot's import stores them, as any write is (see Added: a store left by a release that still had writes in its deferred queue). Exported for reading and writing it: `audienceOf`, `isOwnRowOf`, `withAudience`, `asOwnRow`, `storeOwnRow`, `AUDIENCE_KEY`, `OWN_ROW_KEY` and the `AudienceStamp` type. The presentation index (#291) reads this stamp to decide which agents' windows take in a row.
+- The agent registry records where each agent's own rows are stored, apart from the slots it observes: `AgentRecord.ownSlot` (and `AgentSpec.ownSlot`, which the framework fills from how it opens the agent's context) is a `MessageSlotRef`, `{ namespace: null }` for the residents' shared slot, a namespace for an isolated slot, and a branch too for a shared fork. New queries: `ownSlotOf(name)`, `slotOwners(slot)`, `observersOf(slot, { held })`, `readersOf(slot)` and `observedSlotOf(edge)`, with `RESIDENTS_SLOT`, `sameSlot` and `observedSlot`. Residents own the shared slot; the subconscious owns `subconscious/<resident>` and reads the shared slot through the observe edge it always declared. An observe edge reads the slot it names; one that names an agent and no slot reads that agent's own slot (on its branch, for a shared fork), not the shared slot; one that names neither reads the shared slot. `observedSlotOf` looks the agent up in the registry's records, an ended agent's included; `observedSlot(edge, ownSlotOf)` takes the lookup. `readsSharedSlot` (on specs and records, and the registry's `readsSharedSlot` and `sharedSlotReaders`) is deprecated: a record's flag is now derived from the split, again at every registration, so a watcher registered before a resident it observes reads it once the resident registers, and a spec or record without `ownSlot`, one restored from an earlier version included, is read as its flag meant, so nothing needs migrating but a spec's edge naming an agent: an edge `{ agent }` with no `slot` meant the residents' shared slot (as 0.32.0's `ObserveEdge` documented it, though nothing chose a slot by an edge then), so a spec meaning that declares `{}` (or `{ slot }` for another namespace) instead; a record stored before is restored with such an edge on the shared slot. A spec still written the old way (no `ownSlot`, `readsSharedSlot: true`, its own namespace, such an edge) is read as that restored record is: it owns its namespace's slot and observes the shared slot. `residentSpec` and `subconsciousSpec` still set `readsSharedSlot: true` beside `ownSlot`, for this release, for a host that reads the flag off a preset's spec; the registry reads `ownSlot` first, and a later release drops the flag from the presets. `ObserveEdge.fromMessageId` is added beside `fromSequence`, which is deprecated; nothing reads either yet.
+
+- `switchBranch(name, { requester?, note? })` writes the switch to the operator log as a `checkout`, with its source
+  and target branches, or with its error when it is refused or fails (a call after `stop()` has begun is refused
+  before anything is logged) (#291); the API server's `branch.switch` logs
+  one with requester `{ via: 'api' }`. Before, a branch switch was the one branch move the operator log didn't
+  record.
+- `PresentationOccasion` gains `'rebase'`: the store's branch moved under a live agent, and its window was written
+  down on the new branch, or couldn't be (`presentation:presented` and `presentation:failed`). A move of the store's
+  branch carries every live agent's window to the new branch: it is written down where that branch has none, and the
+  agent's own rows not in its window are presented. An agent whose window can't be written down there stays in legacy mode until the next move, and the move itself stands. So does an agent whose context manager a failed rollback's or suppression's restore couldn't re-initialize, its kept writes waiting for a move that does; a refusing manager whose own rollback or suppression succeeds works again. Every agent's redo entries are dropped at a move.
+
+- A store left by a release that still had writes in its deferred queue boots and stores each of them once (#291,
+  for one release). `create()` reads the queue's record (`recovery/deferred-writes.json`, or the store's
+  `framework/deferred-writes` slot), after the quiesced flags and before the boot's pass over the windows and the
+  agent registry's reconcile, and stores its writes in the order they arrived, each under its queued id
+  (`metadata.deferredWriteId`), with a `message:added` trace whose source is `deferred-import`. A write keeps the audience stamp it was queued with; one queued before the stamp is stamped as any write,
+  and a puppeted tool-call pair as its agent's own round. A write for an agent no longer registered goes to the
+  primary as its by-name notice, stamped for the primary alone whatever stamp it was queued with, when it is a
+  failed reply, a channel notice its reader could act on, or a module's write for a run or a fork; anything else is
+  dropped, logged. A tune-out's release among them wakes its agent, and mail among them is released as it is stored
+  and wakes its recipient. The store is synced, and only then is the record cleared; where it doesn't sync, the
+  record is left as it was and the next boot skips what landed. A write that can't be stored stays in the record for the next boot, with that agent's later writes. An unreadable record,
+  or one that holds anything but a queue, still fails `create()`. The imported rows enter each agent's window at the
+  boot's pass, or at `resume()` on a quiesced host, apart from an agent's own rows. The release after this one
+  deletes the importer, so a host boots this release until its record is empty (the `deferred-import` alert says
+  when writes stay queued, such as those for an agent a move cut), and doesn't upgrade past it from a release that
+  kept a queue.
+- A tune-out's release for the resident, and its notices for the subconscious, are stored at once and made durable,
+  where 0.32.0 queued them behind a live turn of their agent and made the release durable in the persisted queue,
+  but the wake each asks for is in memory. At boot, such a row still out of its agent's window (stored
+  while a turn of the agent's was alive, the process ending before the turn did) asks its agent's wake again
+  (`tune-out released (restored)` for the resident, `tune-out (restored)` for the subconscious), as 0.32.0's
+  restored queue did for the resident's release (#232 gap 6).
+- Mail (a job's result, an agent's message) is stored for its recipient as it is delivered, whatever the recipient's
+  turn, and its hold is released once the store has synced the row; the wake the delivery asks for is in memory. At
+  boot, mail stored for an agent and still out of its window (it arrived during a turn the process ended before
+  finishing) wakes that agent again, once per sender and kind (`agent-result:<sender>`, `agent-message:<sender>`,
+  source `dendrite`), before the boot's pass presents it. Earlier releases kept such mail held while its write
+  waited, and the boot's redelivery woke the recipient. Mail sent with `wake: false` asks for no wake at the boot
+  either: its row records it (`dendrite.wake: false`). Mail an earlier release left queued records no such ask (that
+  release didn't record `wake: false` with a queued write), so the boot wakes its recipient for it whatever its
+  sender asked; 0.32.0's boot asked no wake for any queued mail. An interrupted job whose
+  result is stored this way tells its recipient nothing about ending without a result, as 0.32.0 told nothing
+  while the result was held; 0.32.0 told the recipient of a result already stored and released before the restart
+  that the job ended without one (see Fixed: at boot, an interrupted job's end is told from what its recipient's store holds).
+
+- At boot, each agent the restart interrupted passes the primary the notices it never read that the primary takes in its place when an agent ends (#291): a failed reply's notice and a channel notice it could act on, as the primary's by-name notice, and a module's write for a run or a fork, as the write itself. 0.32.0's boot passed such writes for an agent gone from its deferred queue. Each notice passed carries `metadata.passedOn` (the agent's record and the row), so a later boot that finds the record still interrupted passes none the primary's store already holds. The agent's record settles only once its notices are passed on: where its context can't be read, or a notice's write to the primary fails, the record stays interrupted, logged, and each later boot passes those not yet passed, and a recipient already told of the interruption isn't told again. A notice no one is to be told of lets the record settle.
+
+- The presentation index (#291): each agent's context follows its own window, the rows it was shown in the order
+  its requests carried them, kept by context-manager (`presentRows`) beside the store's record. Every framework
+  constructs the index's module, which needs a context-manager with `ContextManager.presentRows` (create() refuses
+  one without it), and runs its presentation points (see Added: each agent's context follows its own window). It checks each write's
+  audience stamp, and a write stamped only for agents none of whom reads the slot it is stored in, as an owner or
+  through an observe edge, is traced as `presentation:unreadable-audience` and stored as named. The trace types the
+  index will emit are in `TraceEvent` now: `presentation:presented`, `presentation:repaired`,
+  `presentation:unreadable-audience`, `presentation:failed` (with `messageIds`, the rows left out of the window, where known), `presentation:hand-off-mismatch`,
+  `presentation:retracted` and `window:undone`.
+- `observedRowFor(edge, row, { observer, owners })`: what an observe edge shows of the slot it reads (#291, decision
+  1). Another agent's stored context injection, and a row stored under the observer's own name, never; a held row
+  only through an edge with `includeHeld`; a row with no audience stamp, an owner's own row, a row whose audience
+  names an owner, and one that is nobody's own row and whose audience names the observer itself (an operator's
+  message or a module's write addressed to the subconscious alone, stored in the residents' slot, which the merged
+  view showed it), yes; anything else, no. An agent that observes more than one slot has each row weighed by its
+  edges on the slot the row is stored in, with that slot's owners, and a row of another slot it has no edge on is
+  never its arrival.
+- The own-row sink the presentation index presents an agent's own rows through, as they are written:
+  `Agent.setOwnRowSink(sink)` and `Agent.ownRowsStored(ids)`, `OwnRowWriter.ownRowsStored?(ids)`, and a `present`
+  argument on `storeOwnRow` (default true; `false` stores the row without telling the sink, for a row written where
+  a turn it isn't part of may be alive). The index installs it for each agent it takes on.
+
+- Each agent's context follows its own window (#291). Registering an agent takes it on: its window is written down
+  from the record, the rows it took in that are elsewhere to it (another agent's own rows, mail stamped for a
+  co-resident, a held row) are taken out, traced as `presentation:retracted` with reason `elsewhere`, and its own rows
+  not in it are presented; a row stored before the audience stamp stays. A row enters each reader's window at that
+  reader's presentation points, never inside its turn: the agent's own rows as they are written; another writer's rows
+  meant for it at its turn's start, at its tool boundary (a prefix its stream can carry, each body whole, cut at the
+  first row the stream can't take) and at its turn's end, and at once while no turn of it is alive. A boundary hands
+  its stream exactly the rows its window took, or notes the stream's later rounds as unvouched
+  (`presentation:hand-off-mismatch`); one whose read of the store throws is traced as `presentation:failed`, and the
+  turn goes on. An own row whose presentation at its write failed is presented ahead of the agent's next own row, so a
+  reply never lands after its own results, and a fresh turn start whose rows from elsewhere can't be taken out of the
+  window fails rather than compile with them. An agent left in legacy mode still has each idle reader of its slot
+  presented its own rows as it writes them. The held-draft notice written during an agent's turn is presented at once
+  to an idle agent that observes it, or to the persistent subconscious, and to its own agent at the turn's next point.
+  Two residents of one slot whose turns overlap each keep a window that is what their requests carried, so each
+  request starts with the one before it and their rounds' signed thinking is sent again.
+  - A wake for a row stored where it would have been queued reads that row (`WritePlacement.presented` false), and a
+    write stored during a turn takes no clock row, which the turn's boundary or next start takes. A debounced batch
+    with a message that names its agents (`targetAgents`, or the one agent a correction is delivered to) wakes each
+    agent with the messages it may see, those naming it and those naming no agent, and agents that may see the same
+    messages share one line and its wake's route; a batched wake for one message still newest in the window of each
+    agent it's for hands its line to the wake, which each agent writes at its start as its own row, or leaves out
+    while the message is still newest there. Another reader's live turn no longer holds back an agent's clock rows,
+    `[continue]` rows or stored injections.
+- `undoLastTurn` and `redo` work on the agent's window (see Breaking: every agent's context follows its own
+  presentation index): the result's `window` is `{ retracted, represented }`, and `TurnCheckpoint` records the
+  window's index length and branch. A redo first takes out the rows presented since its undo, which the agent's next
+  point presents after the redone turn, and the read marks that covered the undone rows cover them again. An undo cut
+  short after rows left the window is refused with `OperatorActionError` `'failed'` and can be redone, or finished by
+  another undo. A redo is refused on another branch than its undo's (`getUndoRedoState().canRedo` false), and every
+  branch move the framework makes drops the redo entries. A stored injection whose copy an undo took out is stored
+  again at the next start.
+- `WorkspaceModule.useWindow(lookup, turnAlive?)`: how the framework tells the workspace whether an agent's window
+  still holds the turn that wrote a mount direct, so the head-move notice follows an undo that moves no branch. A turn
+  an earlier release stored, with no audience stamp, is the agent's by the rule the undo takes it out by; a write made
+  while no turn of the agent's is alive is judged by the branch's position alone, as `turnAlive` tells the workspace,
+  and the saved positions carry that mark (`outsideTurn`).
+
+- `rollbackToMessage`'s result, and `previewSurgeryMarks` for a rollback, carry `returnedToArrivals` on a presented
+  window (#291): the rows after the target in the agent's window that the cut keeps in the record. They leave the
+  window; the agent's own rows among them enter it again at the surgery's release, and the others wait outside it
+  until the agent's next turn start, which presents them after what its window holds then, so for them the operator's
+  cut is what the window holds until the agent speaks again. Both also carry `keptInWindowAfterTarget`: the rows after
+  the target that one write presented together with it (such as two messages that entered at the turn's end), which
+  stay in the window after the target, since a branch cut can't separate them from it. Neither set is removed or
+  marked. `SurgeryMarksPreview.neverPresented` counts the messages a rollback or suppression would remove that no live
+  agent is shown: no window holds them, or only windows whose view leaves them out (a row a tune-out holds, another
+  agent's stored context injection); one that may be in a window that couldn't be read isn't counted, and is logged.
+  All three are set only on a presented window; the operator log records the first two, and the host command's
+  message-granular undo answers them too.
+- `ModuleContext.windowStatusOf(id, { forAgent })`: where a stored row stands with an agent's window, as
+  context-manager's `WindowStatus` (`'in'`, `'out'`, `'undone'`, `'absent'`), for the delivery agent or a named,
+  registered one. `ModuleContext.observes(observer, observed)`: whether one agent reads another's own rows through an
+  observe edge. `ModuleContext.viewKeeps(row, { forAgent })`: whether an agent's view keeps a stored row, so its
+  requests carry it while its window holds it (`windowStatusOf` can read `'in'` for a row a resident's view leaves
+  out). `ModuleContext.agentNameOf(contextManager)`: the live agent whose context a context manager is. All optional,
+  offered by the framework's module contexts.
+- With the framework's window lookup, the history tools' `extract`, `search` and `semantic_search` mark each row the
+  calling agent isn't shown (#291) (the delivery agent, for a call no agent made): `window: 'not-shown'` (never
+  presented to it, in a slot it doesn't read, or held by its window and left out by its view) or `window: 'undone'`
+  (taken out by an undo or a refusal rewind). Their descriptions say so in one more sentence, and `overview`'s says
+  when its summaries' text is left out, so the tool block changes and the first request after the upgrade misses the
+  prompt cache. `stats` and `overview`'s counts stay aggregates over the record. Without the lookup (an earlier
+  framework's context, or a host's own) every tool and answer is as it was.
+- `PresentationRetractReason`, the reasons `presentation:retracted` gives: `hide`, `suppress`, `coalescer`, `module`,
+  `resume`, `rewind`, `shed`, `boot` and `elsewhere` (rows stamped for other agents, taken out of an agent's window
+  when it is taken on or rebased).
+
+- `AgentConfig.observes`: the other configured agents whose own rows an agent's window takes (#291, decision 1).
+  Residents share one slot, and each is now shown only its own rows and the rows meant for it, where 0.32.0 showed each the others' rounds, replies, tool results and notes (see Breaking: every agent's context follows its own presentation index). The history tools and these entries call seeing another agent's thread a declared relationship; this is
+  how a resident declares one. Each name is an observe edge
+  on that agent in the resident's registry record (`{ agent: 'nova' }`, the path the subconscious's edge takes), and
+  the presentation index presents that agent's own rows to it at its points, as any arrival; the history tools
+  leave them in for its calls. Rows that agent stored before the edge was declared enter at the observer's next
+  point too, all at once, after what its window holds. Only own rows: mail and channel traffic meant for that agent, and its stored context
+  injections, stay out, and so do a third resident's rows. One way: `mira` observing `nova` shows mira nova's rows,
+  not nova mira's. None by default: a resident with none is shown no other resident's own rows stored since the upgrade.
+  `create()` refuses a name that is the
+  agent's own or no configured agent's, and anything but a list of names. The rounds an agent observes go out in its
+  requests as `AgentConfig.foreignRounds` says, as the persistent subconscious's do: `'transcript'` (the default) or `'raw'`. An agent whose window is still the record (its write-down failed) is sent them `'raw'` until a branch move presents its window; an agent derived from one sent transcripts (`deriveAgent`, shared or copy), and a conversation fork of such a template, are sent them as it is. `AgentRegistry.register` takes `declaredWith`, the names declared with the agent, so an edge may name a
+  resident registered after it, and two may observe each other; `residentSpec` takes `observes`.
+
+- The persistent subconscious reads on its own window (#291): the residents' slot is still merged into its
+  context, as the record its window is presented from, and the residents' rows enter its window by its observe edge
+  at its own points, so a row the slot takes during its turn enters at its tool boundary or its next start, never
+  inside the turn.
+  - Its window starts at the oldest active tune-out's start as an index ordinal, fixed once per tune-out, once no
+    row it is owed from before the start is out of its window, and kept in `subconscious/<primary>/window-starts`;
+    a later tune-out's enter or a restart sets that ordinal again rather than converting the tune-out's sequence
+    anew, and a kept ordinal past a shorter window (after a rollback) is clamped, and kept at the clamped ordinal. New trace `tune-out:subconscious-window` (`how: 'fixed' | 'clamped'`).
+  - A cancel of the oldest tune-out while another stays active leaves the start where it was, so the
+    subconscious's report on the one cancelled reads what it held, and the start in force is kept too (`inForce`
+    in the same state): a restart sets it again rather than the start of the oldest tune-out still active, so the
+    window is the same across the restart. The next tune-out's enter sets the oldest active one's start, as it
+    always has.
+  - A resident's rounds go out to it as a transcript: a line per tool call (the tool's name and its input in brief)
+    and per result (the outcome in brief), and none of the resident's thinking, the same in its compiles and in
+    what its tool boundary injects (`Agent.setForeignRounds`, `Agent.injectedAsSent`). Its own rounds go as
+    stored, and it keeps their signed thinking across a row heard from the residents' slot. That is the default of
+    a new setting, `subconscious.foreignRounds`: `'raw'` sends a resident's rounds as stored, its thinking and
+    tool blocks included, as 0.32.0 and earlier releases did, and any other value is refused at `create()`. A result is told by the nearest call before it with its id, so a resident's result
+    whose id a call of the subconscious's also has (calls numbered per response, `c1`, `call_0`) is transcribed. A call answers one result: another agent's result whose id a call of the watcher's had, and which comes after that call's own result, is sent as a line ("a tool returned: …"), not as a second result of the watcher's call.
+  - A reader fork's framing hand-off presents the held rows it is handed into the fork's window when its run takes
+    it on: the fork holds them while it lives (`presentedToAnyone`), so a coalescer doesn't withdraw a row a reader
+    was handed, and its view keeps them out of its compile, where the framing shows them. A fork its run refuses
+    before taking it on (the host quiesced or stopping, a surgery holding the store) holds none of them: its
+    handed rows go back to the next reader, as before, and no row counts as held by a reader that never ran.
+- `residentContextOptions(name)`, `subconsciousContextOptions({ serves, name?, reAnchorFraction?,
+  maxMessageTokens? })`, `residentViewFilter(name)`, `subconsciousViewFilter(name)` and the
+  `ContextManagerOpenOptions` type: how the framework opens a resident's context and the subconscious's, for a host
+  that opens one itself (an audit of the store): `ContextManager.open({ store, ...subconsciousContextOptions({
+  serves, name, reAnchorFraction, maxMessageTokens }) })` reads what the live subconscious reads (its requests then
+  send other agents' rounds as a transcript, `foreignRounds`, which `transcribeForeignRounds` applies to what the
+  context reads), with `serves` the
+  primary's name, `reAnchorFraction` the host's `subconscious.reAnchorFraction` and `maxMessageTokens` the
+  primary's `strategy.maxMessageTokens`, which the framework mirrors. `name` is the name the host gave the reader
+  (`subconscious.name`); left out, it is the one the framework runs a reader the host didn't name under.
+
+- `AgentConfig.turnInputsPin`: `false` turns off 0.31.0's turn-opening pin (`agent-framework:turn-inputs`) for an
+  agent, which had no setting. Its turns then pin nothing, so the rows a turn opens with are compressed as any others
+  while it runs, and a pin of the name left from before is removed at the next start that opens a turn, as a silent
+  start removes one. On when left out, so nothing changes unless it is set; anything but true or false is refused.
+
+- `TraceEvent` now lists every trace the framework raises, with its fields as raised, 28 more than before (#899):
+  - from the gate: `gate:config-reconciled`, `gate:policy-added`, `gate:policy-removed` and `gate:shadow-warnings`;
+  - from MCPL channels: `mcpl:channels-register`, `mcpl:channels-changed`, `mcpl:channels-incoming`, `mcpl:channel-descriptor-rejected`, `mcpl:channel-lazy-registered`, `mcpl:channel-opened-by-send`, `mcpl:channel-open-failed`, `mcpl:channel-open-substituted`, `mcpl:channel-reconcile-failed` and `mcpl:channel-reconcile-skipped`;
+  - from MCPL pushes, inference and state: `mcpl:push_event`, `mcpl:inference_start`, `mcpl:inference_complete`, `mcpl:inference_fail`, `mcpl:state_registered`, `mcpl:checkpoint_recorded` and `mcpl:state_rollback`;
+  - from tune-out: `tune-out:entered`, `tune-out:cancelled`, `tune-out:announced`, `tune-out:announce-failed`, `tune-out:ack-failed`, `tune-out:timer-failed` and `tune-out:wake-budget-paused`.
+
+  The compiler now checks every raise's name against the union, so a table keyed on `TraceEvent['type']` can name every trace a host receives. It also checks each field a raise writes in its object literal against the raise's member, though not a field the raise adds through a spread.
+- `TraceEventInput`, exported: a trace as raised, before its `timestamp` is stamped.
+- Fields that were raised but not declared: `gate:config-reloaded`'s `removedPolicies` and `stateClearedPolicies`, `gate:decision`'s `observed`, and `tool:failed`'s optional `durationMs`.
+
+- Event suppression: a wake rule with `suppress: { description, script? }`
+  (and `behavior: "defer"`, written out so an earlier release defers rather
+  than wakes) keeps the events it takes out of the agent's context. Each such
+  event is stored with `metadata.suppressed = { rule, eventType }`, decided
+  once as it arrives, before the hold, the veto and the gate. Every view the
+  framework sets leaves stamped rows out, so they're never compiled,
+  injected, folded into memory, woken for, or taken as the locus, and they
+  bring no clock row in. Editing or removing the rule changes only what
+  arrives afterwards. Events addressed to the agent (`chat:addressed`), the
+  heartbeat's, and console or API input are never suppressed, and a suppress
+  rule decides no wake for an event suppression was asked about (where it
+  wasn't, it defers). Covers MCPL channel messages and push events, a
+  module's events with their messages and wake, and a server's `[toolsets]`
+  notices (gated as `mcpl:tool-changes`). `wake_add_rule` takes `suppress`;
+  `gate_status` shows each suppress rule's settings and how its script has
+  run, and counts what it suppressed since start.
+- A suppress rule's `script` is the agent's own logic: the source of a
+  function `(event, state) => boolean`, true hiding the event, with `state`
+  the rule's own JSON object (at most 64 KB), kept across events and restarts
+  in `suppress-state.json` beside gate.json and started afresh when the
+  script changes or the rule is removed. Scripts run on a worker thread with
+  a 50 ms timeout (`gate.suppressScriptTimeoutMs`); one that fails or times
+  out lets the event on to the rules after it, and one that times out three
+  times in its last twenty runs is set aside until its script changes or the
+  host restarts. wake_add_rule compiles
+  a script before saving it.
+- `suppression_stats { rule?, recent?, since? }` and `dump_suppressed { path?,
+  rule?, since?, until?, format? }`, in the built-in settings toolset, read
+  the stamped rows on the current branch (times are when each was stored). The first reports, per rule, the
+  count, the text size, the first and last arrival, a breakdown by source and
+  event type, and the newest few with a preview (a removed rule with
+  `inForce: false`). The second writes the rows to a workspace file, their text in full and other blocks named, as
+  a transcript or JSON lines, at most 4 MB. `AgentFramework.suppressedEvents()`
+  gives hosts the same rows.
+- The suppression review (`gate.suppressionReview`, on by default): every two
+  hours (`intervalMs`, at least ten minutes), Claude Haiku 5.5 (`model`) reads
+  what each suppress rule hid against its description, a sample of at most
+  `maxEventsPerRule` (60), and flags what doesn't fit or what the agent would
+  plausibly need to see. The agent gets a `[suppression review]` notice, and a
+  wake on a flag (`wakeOnFlag`); `notify: "flagged"` tells it only of flags.
+  Progress is kept in `suppression-review.json` beside gate.json.
+  `AgentFramework.reviewSuppression()` runs one now. New traces:
+  `gate:suppressed`, `gate:suppression-review`; `admission:decided` gains
+  `suppressed`.
+- **Hosts rolling back past this release:** run its `agent-framework-recover
+  --store <path> --agent <name> --remove-suppressed` first, with the host
+  stopped. A release without suppression doesn't read the stamp, and where
+  compression formed a summary around a hidden row, it refuses the store at
+  open (`StoreTopologyError`). The command makes and activates a branch without
+  the hidden rows; the source branch keeps them. That holds unless this release
+  has made a window write of two or more rows (the first write-down of a window
+  that holds a row, as at the first boot on a store with history, or a
+  presentation of more than one row): the store's MANIFEST is then at version 2, which
+  no earlier release opens, and only a copy of the store taken before the
+  upgrade goes back (see Breaking: every agent's context follows its own presentation index). It cleans the agent's own
+  branch, not a derived context's (`dendrite/…`), so finish any such context
+  first. With an anchor it starts at that message, where a row an earlier run
+  removed is back, so run it last with no anchor. Suppress rules load as `defer`
+  in every release back to 0.22, so nothing wakes for their events; 0.22 to
+  0.26 drop `suppress` from gate.json at their first rule edit.
+- The changed `wake_add_rule` definition and the two new tools change the tool
+  definitions once, in the built-in settings toolset, or in the tool list on a
+  host without host presentation, where it's one prompt-cache miss. The review's calls count toward the agent's
+  usage, as the reply judge's do, and a wake on a flag is a full turn of the
+  agent's own model.
+
+- `proseRouting: "locked"`: an agent's plain speech goes to one destination it
+  chose, on every turn, and nothing moves it automatically. Not the channel
+  that woke the turn, an addressed message, a heartbeat, `channel_open` or the
+  host's `speech.locus` rule. The new `prose_locus` tool, offered only to
+  locked agents, reads the lock or moves it to a channel (`"#channel"`,
+  `"@person"`, an id) or to `"drafts"`, which holds plain speech as drafts.
+  A move is stored in `framework/state` and survives restarts. The optional
+  `AgentConfig.proseLock` sets the destination until the agent first chooses.
+  An earlier agent-framework doesn't support the mode: it routes the speech
+  as `locus` but tells the agent it's in explicit mode, and doesn't silence
+  speech beside a send. Upgrade agent-framework before any recipe sets it; connectome-host needs
+  its companion release (anima-research/connectome-host#603) to accept it in
+  a recipe. Agents that don't set the mode route as before. The lock governs
+  routing through the channel registry (MCPL channels): a module that handles
+  a turn's final speech itself (`onAgentSpeech`, such as the in-process
+  Discord module) receives it in every mode, this one included. See
+  docs/locked-prose-routing.md.
+
+- `healthSnapshot()` reports each agent's `upcomingWakes`: the wakes the reply judge is told of, soonest first and at most eight, as `{ at?, kind, certain }`. `kind` is the new `UpcomingWakeKind` (`heartbeat`, `reminder`, `self-wake`, `sleep-end`, `debounce`, `judge-batch`, `queued`, `provider-hold`), also set on `UpcomingWake`. No wake's description is included, since it can quote a reminder or a queue reason. The list is a forecast of timers, not everything that could wake the agent: a timer in another MCPL server, events buffered behind a running turn (`gate.bufferedEvents` counts those) and the suppression review aren't in it. The field is left out when it can't say: when the read fails, and when the heartbeat is heartbeat-mcpl.
+- `EventGate.upcomingWakes` gives an agent the gate doesn't wake only its own self-wake and a sleep naming it, since a batch or an untargeted sleep doesn't reach it.
+
+- Trace `message:lost` (`source: 'surgery-release'`, `agentName`, and the write's `external` address when it gave
+  one): a write kept in memory until a surgery's release whose store threw there, none of it stored, or, with
+  `mayBeStored: true`, context-manager couldn't tell what of it landed (the rows it names as stored are traced as
+  `message:added`). One per write, as the release meets it; the agent's lost writes are told of once besides, by
+  the `store-held-lost` ops alert. The Discord module ends its record of a create lost so, so a later delete,
+  history sync or live create of the message isn't left waiting on a row that never comes (the next sync stores
+  the message, and its delete reaches that row); where `mayBeStored` and the row did land, it applies the edits
+  or delete it kept for the create to that row.
+
+- `tune-out:deferred-cancel-dropped` trace: a tune-out cancel that waited for held writes was taken off its queue
+  with its work undone. It names the hold's channel (the excepted one for the all-except hold, with `scope`), the
+  epoch the cancel was asked for (`epochId`), and why (`reason`): `hold-ended`, that hold ended without it
+  (`currentEpochId`: the epoch in force then, if any); `note-undelivered`, the hold ended and the note it carried
+  couldn't be delivered (`error`); `stopped`, the host stopped while it waited, and the next boot resumes the hold
+  without running it; or `superseded`, it joined an earlier cancel of the hold that was running, whose note stands.
+  `noteLost` says whether a reader's note it carried is lost with it, `noteAuthor` whose it was (the name it would
+  be delivered under), and `noteMayBeStored`, with `error`, that storing the note threw where the store couldn't
+  tell whether it landed, so its author is told it may be lost.
+- `tune-out:note-loss-untold` trace: a notice telling a note's author of its loss wasn't written. It names the hold
+  as above, `noteAuthor` and `reason`: `author-gone`, the author is no agent the framework writes to any more (a
+  reader fork whose run has ended); or `write-failed`, with the `error`, traced at its first failure, after which
+  the notice is tried again until it is written.
+
+- Wake onboarding: the first event from an MCPL server that the agent's wake
+  rules let go by without deciding about it — skipped by the gate's default, or
+  by a rule that names neither its server, its channel nor its tags (a
+  `discord-ambient` catch-all, or a bare `tagsAny: ["*"]`) — is followed by a
+  `[wake onboarding]` notice with that server's suggested treatment (MCPL
+  RFC-001 §5 `suggestedTreatment`, or the deprecated `defaultTreatment`), from
+  the feature sets the host enabled, numbered, with each rule's `rationale`,
+  presented as the claims of a server that may not be trustworthy: the agent is
+  told to accept with reasonable caution and, when in doubt, to ask a person or
+  another agent first. An event tagged `chat:addressed`, `surface:turn` or
+  `surface:alert` wakes the agent to decide; any other leaves the notice for its
+  next turn. A server that suggests nothing usable gets one host-written rule:
+  wake for its events tagged that way. Offered once per declared ontology (a
+  digest of it, kept in `wake-decisions.json` beside `gate.json`), and at most
+  once a day per server. `gate.onboarding: false` turns it off.
+- `wake_accept_suggestions { server, rules? }` writes the chosen suggestions as
+  `suggested:<server>:<n>` rules matching only that server's events, ahead of
+  the first catch-all that lets events by (rules that wake, such as a mention
+  rule, keep their place), replacing any accepted before, as one change (a
+  failed write puts the earlier set back), and reports any shadow warnings; it
+  refuses, and shows the list again, when the server's suggestions changed
+  since the agent was told. `wake_decline { server }` removes them, as one
+  change too, and records the decline. Both are in the built-in settings
+  toolset. Nothing a server suggests is applied without one of them (RFC-001
+  §5.2).
+- `gate_status` names the first rule that lets MCPL events by without naming a
+  server, a channel or a tag (`catchAll`); `event_tags` shows each connected
+  server's offer and the decisions recorded (`onboarding`). The `tagOntology`
+  declaration type reads `suggestedTreatment`.
+
+### Changed
+
+- A `proseRouting: "disabled"` turn shows a typing indicator in the channel of
+  the message that woke it, by the rule an explicit mode turn already follows,
+  where before it showed none. A turn woken by a gate batch of ambient messages
+  alone, a heartbeat's turn and a silent wake's show none, as in explicit mode.
+  Typing is all it gains: its `inference:tokens` and `inference:content_block`
+  traces still carry no `channelId`, since its text is never sent to a channel.
+
+- **A message a tune-out holds is stored at once** (#291, #793's P1), as every write now is, instead of waiting in
+  the deferred queue behind its target's live turn. No resident is shown it, so it lands inside no request a
+  resident's turn is shown, and its reader has it while the resident is busy: the persistent subconscious's view at
+  its next wake, and a reader fork's framing, which names it by its stored id (`heldMessageIds`). A module's context
+  reads it as the stored row it is, always with `heldFromResidents`, and with `held` for a read for a resident whose
+  window is written down and doesn't hold it: every held message stored since the audience stamp, but not one an
+  earlier release stored, which a window written down from the record holds, its view leaving it out. A cancel's
+  dump reads it from the record. While a surgery holds the store, a `check` counts and peeks the held messages the
+  hold keeps in memory too (#232 gap 7).
+- A cancel the subconscious makes itself, with its note, gets it a report turn when some of its tune-out's stored
+  messages are ones it hadn't been shown when it wrote the note (those its window doesn't hold); the notice says how
+  many.
+- `inspectAgentContext` on an ended agent reopens its context with the view its live one had: a resident's leaves
+  out the other residents' stored context injections as well as held traffic, as in 0.32.0, and the subconscious's
+  leaves out the residents' stored injections and keeps the held traffic it reads. 0.32.0 reopened an ended
+  subconscious through the residents' view, which left out held traffic as well (and on the residents' slot: see
+  Fixed: an ended subconscious that `inspectAgentContext` reopens).
+- The subconscious's window anchor counts an active all-except hold when a channel's tune-out is entered during it,
+  so the anchor stays at the hold's start rather than moving forward past it.
+
+- What changes for a host now that each agent's context follows its own window (#291):
+  - A quiesce freezes every window but for each agent's own rows: a write is stored at once, taking no clock row, and
+    presented at resume, and a turn draining through the quiesce hears nothing at its tool boundaries. The clock row
+    due by then is written at the agent's next turn start, after the write, where 0.32.0's resume wrote it ahead of
+    the queued write.
+  - A row stored for an agent is in its context's record at once: a host that reads `getAllMessages()` sees rows its
+    agent's window doesn't hold yet (`getPresentedMessages()` is the window).
+  - A turn's continuation (a budget restart, a tool-result guard's retry) presents no arrival: a message stored while
+    it was on its way enters the window as the turn ends, and its wake starts a turn of its own, where in 0.32.0 a
+    message stored while the continuation waited rode in the continuation's request.
+
+- Once an agent's context presents rows (#291), what it has read is what its window held as of its mark: a row
+  stored and not yet presented to it is unread, whatever the store's head was, and so is a row presented to another
+  agent alone. The coalescer takes back a row no reader consumed, presented to a window or not, as it took back a
+  queued one, and the row leaves every window that held it; it keeps a row a reader fork was handed as framing, and
+  places the newer occurrence after it. A released fork's or run's notice that it never had in its window as of its
+  mark goes on to the primary, and so does one whose mark a branch switch left behind; a notice in the record a
+  shared fork or a resident shares, meant for its parent or a co-resident (its audience, or with no stamp, stored
+  after a shared fork's derivation point), is that agent's, and no release of another passes it on. The gate's
+  "newest entry", the next clock row and the drafts catch-up read the window's order.
+- A wake for a row stored for its agent carries `InferenceRequest.readsRow` (the row's stored id) whether or not the
+  row was presented to that agent at its write: #814's mark for a message stored as it arrived (0.28.0), read onto
+  the presentation index. The wake is dropped only once an answered request carried the row, by the row's place in
+  the agent's window, or once the row is gone from the agent's store on its current branch (removed, or left on a
+  branch it has moved from), so a request that never carried a stored row keeps its wake; a resumed turn (a
+  context-budget restart, a tool-result guard's held retry) presents nothing that arrived meanwhile, so such a row's
+  wake still starts its turn. A conversation fork's channel message, routed or delivered to it by name
+  (`deliverTo`), marks the fork's wake the same way, and one its server tagged `chat:ambient` marks it ambient, as
+  a resident's, so it asks no answer in its channel. A gate batch's `[Gate: …]` line marks the delivery agent's wake
+  with its row, as the self-wake's notice does; other agents' wakes for the batch stay plain.
+
+- A refusal rewind's shed, forced by `/unstick` or not, and the inference-failure quarantine's work on the agent's
+  window once it is presented (#291): the agent's newest exchange in its window leaves it as an undone turn's rows do,
+  and the record keeps it. A co-resident's round the agent doesn't observe, a row it was never shown, a system change,
+  a held row and another agent's stored injection aren't shed, and no other agent's window, cache prefix or signed
+  thinking changes. In 0.32.0 the shed took the newest exchange from the record, a co-resident's round included, and
+  the quarantine's also a row the agent was never shown or one a tune-out held; neither took a row marked `system`,
+  such as another agent's stored injection. An undone row stays out across later starts, a restart or a redo of
+  another turn, reads `'undone'` (`windowStatusOf`) and is marked so in the history tools. On a window that is still
+  the record the shed removes the rows from it, as before.
+- For an agent's call, the history tools (`extract`, `search`, `semantic_search`) leave out another agent's own rows
+  (its rounds, its notes, its stored context injections, a puppeted call) that the caller isn't shown, unless the
+  caller observes that agent (`AgentConfig.observes`), and count them as `leftOut`, each once across a chain of
+  resumes (`search` stopped at its `limit` counts those up to its last scanned candidate). A row a resident's window
+  holds but its view leaves out (another agent's stored injection, a held row) isn't shown: the injection is left out,
+  the held row marked `not-shown`. A stored injection from before the audience stamp is the own row of the agent its
+  mark names. An `extract` around a row left out answers that no message has its id. A call no agent made stays
+  record-wide, and so does the bound agent's own.
+- For another agent's call that doesn't observe the agent the history module is bound to, the summaries it reads are
+  left out for now, since they fold that agent's own rounds and notes: `overview` returns each summarized span with
+  its time, level and counts but without its text (`content: null`, `contentLeftOut: true`, counted in
+  `summariesLeftOut`), and `semantic_search` leaves out summary hits, counted in `index.leftOut`. So does an agent's
+  call where the framework can't say whose context the module is bound to (no `ModuleContext.agentNameOf`, or no live
+  agent's).
+- The host command's message-granular undo (`messages: n`) and offline recovery's count mode count back in the agent's
+  presented window, over the rows of its own slot: a row of a slot it observes (a residents' row in a persistent
+  subconscious's window) isn't counted, and a rollback to such a row is refused (`unknown-message`) as in a slot it
+  observes, not as off the active branch.
+
+- **Residents: `tune_out`'s description, and the `[tuned out]` note on a send into a tuned-out channel, name the
+  reader this host configures.** The tool said "Divert a channel to your subconscious … Your
+  subconscious watches it instead — summarizing on a cadence in its own voice, judging whether mentions merit
+  interrupting", and the note that the channel's "traffic still goes to your subconscious", whatever the
+  configuration: a persistent reader the host named was still "your subconscious", and so were reader forks. Now the
+  text names a persistent reader by the name it runs under (`subconscious.name`), and says reader forks are forks of
+  the resident's context; each says what the reader can do (report, cancel) and when it runs, not what it judges. A
+  tool block's bytes change, so the first request after the upgrade misses the prompt cache. `tuneOutTool(reader)`
+  builds the tool for each case.
+- **Readers: the four reader tools' descriptions say what each tool does, not when to use it.** `deliver_summary`
+  said "in your own voice, addressed to them (second person). Use at cadence when the diverted traffic merits it;
+  staying silent is always allowed — an empty period needs no report"; `cancel_tuneout`, "use when something needs
+  the resident's full attention … and normal attention resumes"; `speak_in_channel`, "in your own words and clearly
+  as yourself (not as the resident) … Use sparingly — e.g. to tell someone the resident is tuned out and when to
+  expect them"; and `note_disposition`'s examples named a real person ("antra's pings always escalate", "ignore
+  release-bot"). Each now says what the tool does: a summary or a cancel's note arrives verbatim (leading and
+  trailing whitespace trimmed) under the reader's own name, a cancel delivers the backlog and the channel's traffic
+  reaches the resident as before, a disposition is kept under its key and shown to the reader each time it runs
+  (its example a placeholder), and a post goes out as written, trimmed the same way, under the resident's account
+  with nothing in it naming the reader. `deliver_summary`'s refusal of an empty `text`
+  no longer adds "staying silent is allowed", and `speak_in_channel`'s refusal where channel speech is off no longer
+  says "tell it what's needed with deliver_summary, or, if the channel is tuned out and needs the resident now, end
+  the tune-out": it says what each does (deliver_summary puts the reader's text in the resident's context;
+  cancel_tuneout ends the tune-out and delivers its backlog). A host that wants a policy for its reader gives it in the reader's
+  `systemPrompt` (persistent) or `voice` / `framing` (forks). The four tools are in every reader's tool block, and
+  under reader forks in every resident's, unless the resident's `allowedTools` leaves them out (then its reader
+  forks aren't shown them either), so the first request after the upgrade misses the prompt cache there too.
+- **Residents and readers: the rest of the text about a tuned-out channel names the reader this host configures, and
+  a reader's cancel says who made it.** A channel tool's refusal of a tuned-out channel
+  (`channel_open`, `channel_close`, `channel_decline`, a decline a tune-out replaced) said "its messages go to the
+  subconscious"; tune_out's answers about the channel's transport said its messages "may not reach", "don't reach"
+  or "reach the subconscious"; and tune_out with no reader said "this host has no subconscious resident to watch a
+  channel". Now the messages "are held from you and read by <name>" (a persistent reader, by the name it runs
+  under) or "… read by forks of your context" (reader forks); they "reach <name>" or "the reader"; and the refusals
+  say "No reader is running here". A reader's `cancel_tuneout` gave its cancel the reason "subconscious judgment", which the
+  resident read in "[Tune-out: … cancelled — subconscious judgment, N wakes]", the reader in its cancel notice, the
+  excepted channel in an all-except hold's release line, and a host in the `tune-out:cancelled` trace; the reason is
+  now "by <name>", the reader's name or a reader fork's own (or "by the reader" where the call names none), except
+  in the line posted in the excepted channel, which says "[Focus: <resident> released — by its reader.]" so that no
+  agent's name, a reader fork's structural one included, reaches the channel. The
+  channel registry takes the reader from the new `tuneOutReader` option, which the framework gives it; a registry
+  made without one names the persistent reader by its default name, "Subconscious".
+- **Hosts: `create()`'s refusal of reader forks with no `model` no longer calls the resident's model a copy of the
+  resident.** It said to give the resident's model "for a copy of the resident"; it now says `model` is the model the resident runs or another by name.
+- **Residents and readers: where no reader runs, the text says so, and a cancel that can wait says it can.** After
+  the persistent reader ended, or at a start with none configured, for a hold whose release failed, a held channel's
+  messages, in a channel tool's refusal and the `[tuned out]` send note, are held "with no reader running here to
+  read them, until the tune-out's release, which failed, is tried again" (`TuneOutReader`'s `running: false`), and
+  so are they in tune_out's answers about the channel's transport. `tune_out`'s refusal with no reader says none "is running here", a reader
+  that ended included. `cancel_tuneout`'s description no longer says it ends the tune-out "now": its answer says
+  when the cancel has to wait, and whether the note waits with it, and the channel's traffic reaches the resident
+  again unless the all-except hold holds it too; `speak_in_channel`'s refusal where speech is off, and `tune_out`'s
+  refusal of a channel already tuned out, say a cancel's answer tells if it waits, where tune_out's said a cancel
+  delivers the backlog now and speak_in_channel's said to end the tune-out if the channel needs the resident now.
+
+- **The turn-opening pin and an undeclared stream read the window (#291).** 0.31.0's turn-opening pin
+  (`agent-framework:turn-inputs`) pinned the rows stored after the agent's newest own message and its consumed
+  watermark; it now pins the rows presented to the agent since its mark, in the window's order, a row stored before
+  the mark and presented after it included, and no row stored and not yet presented (in legacy mode, where the
+  window is the record, the rows stored since). A mark taken before the window was written down is read the same way
+  once it is. And 0.31.0's rule that a stream whose tool calls don't declare `supportsInjectedMessages` carries no
+  injected messages now means that what arrived for the agent during its turn waits out of its window for the turn's
+  end; a tool boundary with no stream, as the direct API's, presents what arrived.
+
+- A call of `reply_to_message`, telegram-mcpl's reply, is an explicit send, by that name on any server: it holds the round's plain speech as a send does, where it posted when its answer gives a `channelId` the framework knows, and for every destination when it doesn't, as telegram-mcpl's plain-text answer doesn't, a failed reply's included, since telegram-mcpl doesn't flag its failures. In locus or hybrid routing, a `code_execution` script that names it makes its round wait before its prose is routed, as one that names `send_message` does.
+- `history--extract`'s text form shows a call of `channel_publish`, `send_message`, `reply_message`, `send_dm`, `reply_to_message`, `send_file`, `send_scheduled_message`, `create_poll`, `edit_message`, `upload_file`, `say` or `whisper`, by that name on any server, as its name and its words when it carries any, such as `[telegram--send_message] …`, where it showed `[tool_use: telegram--send_message]` with the words left out. A call of any other tool, or one with no words, shows as before. A tool result flagged as an error shows as `[tool_result: NAME, error]`, or `[tool_result, error]` when it has no name, where it showed `[tool_result: NAME]` or `[tool_result]`, so a send whose server flags its result as an error doesn't read as sent. The send's own label carries the same mark when its result, stored after it, is flagged as an error: `[telegram--send_message, error] …` in `history--extract` and in `history--search`'s and its regex search's snippets, and `[send_message, error] …` in a `history--semantic_search` hit whose snippet, which holds the hit's first 400 characters, reaches the send, so such a hit gives the account `history--extract` gives. A search snippet whose match falls in a send's words starts with the send's label, marked so when its result is flagged as an error, and then shows the words around the match, so the label stays in a snippet cut from a long message. Its description says so, so an agent with the history tools sees its tool list change once.
+
+### Fixed
+
+- A typing stop is sent only to a server whose grant includes `channels.typing`,
+  as its start and each refresh already were (SPEC §14.1). A server without
+  the grant no longer gets a stop for a start it never received.
+
+- On a model that binds its thinking (`thinkingBinding.binds`), a tool boundary that told the agent someone had
+  addressed it from another channel (`speech.locus: 'delivery'`) no longer costs the rest of its stream's thinking.
+  The `[routing]` notice was stored and injected with the round, but the boundary noted it to context-manager as a
+  row the store doesn't hold, after which nothing the stream sent kept its thinking at the next compile. It is now
+  noted by its stored id, as the re-pin notice already was.
+
+- An ended subconscious that `inspectAgentContext` reopens now opens on its own isolated slot, with the residents'
+  slot it observed merged into its view as when it ran. Its record said `readsSharedSlot: true`, so it was reopened
+  on the residents' shared slot and showed none of its own rows.
+- At boot, held mail is redelivered unless a stored copy was delivered to its own recipient
+  (`metadata.dendrite.to`). In the residents' shared slot a copy delivered to another resident under the same mail id
+  counted, and the mail was released without reaching its recipient; a copy for another recipient also released the
+  mail as it landed. A copy stored before mail named its recipient still counts by its mail id, as before.
+- The never-rewrite check for a row in the subconscious's own isolated slot weighs only the subconscious's reading
+  of it. It weighed every resident's watermark too, since the subconscious was counted as a reader of the shared
+  slot.
+
+- When a stream completes while its round's tools still run, the round and its results are stored back to back, as
+  at an ordinary tool boundary: each call still running gets an error result as before, the results are built first
+  (a spilled result's workspace write included), and the round and its results are stored with no await between.
+  Before, the round was stored ahead of the build and its results after it, so a write that landed meanwhile (another
+  resident's own row in the shared slot, a module's `tool_result`, a channel's row in a fork) was stored between the
+  round's `tool_use` and its result; it is now stored before both. While the results are built the round stays the
+  agent's pending round (`getPendingAssistantRound`), and a child derived meanwhile (`deriveAgent`) is framed with
+  the round and the results the agent holds: each that came in, and the error result of each call still running.
+- A fork derived inside a tool call is handed the results already received (all of them while a tool boundary
+  builds them for storing), with the note for the call that derived it and for any call still running, so it never
+  meets a dangling `tool_use` (0.30.0's `pendingRound`, now carried onto the presentation index).
+
+- A released fork's or run's unread notice passed on to the primary is
+  stamped for the primary alone (`metadata.audience`).
+
+- A row removed from the record leaves every live agent's window that held it (#291), each at its own place, so no
+  other row's place moves, traced as `presentation:retracted` with the removal's reason: after a `hide`, a
+  suppression, a module's `removeMessage` and a process answer's `removeMessages`, the coalescer's removal of an
+  unread row, a suppression a start finishes, and a refusal rewind's shed of a window that is still the record. A
+  window on a branch whose record still holds the row (a fork, a derived agent's view made before the removal) keeps
+  it, a window that is still the record is never written to, and a rollback needs none: it is a branch cut, made at
+  the same place in every window.
+- A suppression on a presented window takes its rows out of what every reader of them folded (#291): every other
+  agent's strategy hears the rows leave its window, and an autobiographical strategy drops each summary that folded
+  one of them, with every summary above it, and folds the rows it keeps again. Before, a suppression was not
+  retroactive over derived state, and a summary that had folded a suppressed row went on showing it; on a window that
+  is still the record it still isn't. The agent isn't told that its summaries were dropped and folded again, after a
+  suppression, a hide or an undo alike: a current limit, which docs/dendrite.md names.
+- At start, each window lets go of the rows its record no longer holds that no live context heard removed, such as an
+  offline recovery's suppressions (`presentation:retracted`, reason `boot`).
+- A rollback's accounting on a presented window is the cut's: `branchAt` cuts at the write that presented the target,
+  so the rows stored between the target and that write stay on the new branch, and `messagesRemoved`, the removed refs
+  and the Discord marks of `rollbackToMessage`, its preview, the host command's message-granular undo and offline
+  recovery are exactly the rows stored after the cut (offline recovery checks those rows' tool pairs only). A rollback
+  that would remove nothing and take nothing out of the window is refused as a no-op, saying why. When its target was
+  presented in one write with rows after it, the refusal names the first of them and points to `suppressMessages` with
+  every one of their row ids, grouped by the agent each goes through (for a row of a slot the agent observes, the
+  agent whose own slot holds it, or, where that slot holds no other row, that the suppression there is refused), or,
+  where any has a Discord message id, to the host's `hide` with the ids of those that have one, each with the agent to
+  run it on. A row holding a result of a call at or before the target isn't advised for suppression, which would leave
+  the call without its result: the refusal says to roll back before the call, naming the message before it, and offers
+  suppression for the rest.
+- Offline recovery on a presented window:
+  - refuses a cut that would change nothing, as the live rollback does, a dry run too, and an anchor already at the
+    window's tail. Its refusal names the rows with a Discord id for `--suppress` (`suppressMessageIds`) in the same
+    recovery, and a row without one (an agent's round, a tool row), which that suppression can't name, by its row id
+    for the live `suppressMessages` once the host runs; it says to anchor before the call for a row holding a call's
+    result at or before the anchor, and offers no `--suppress-range`, which would take every row between its ends, any
+    agent's. Its suppression may name a row the cut keeps after the anchor.
+  - reports the rows its cut returns to the arrivals as `returnedToArrivals`, a dry run too (a row the same recovery
+    suppresses is counted as suppressed instead), so a cut that only returns rows doesn't read as changing nothing
+    (`messagesRemoved: 0`, `messagesSuppressed: 0`); `0` for a run with no anchor, absent on a window that is still
+    the record. It reads the agent's own slot alone, so a row of a slot the agent observes isn't counted there or
+    weighed by the no-op check, which the refusal says.
+  - with `removeSuppressed` alone (`--remove-suppressed`, no anchor) takes the newest row as on a legacy window,
+    branching at the head with the suppressed rows removed, and a run with nothing left to suppress makes its branch,
+    removing 0.
+
+- A stop or an operator's quiesce abandon that lands while the results of a stream that completed with its tools
+  still running are built (a spilled result's workspace write) now drops the round, as at an ordinary tool boundary:
+  neither the round, its results nor the reply after its last tool block is stored, one `tool:result_dropped` goes
+  out for the first call that was still running, and the turn ends with the stop's one `inference:aborted` (a
+  caller's stop also leaves its `[turn-interrupted]` marker), with no `inference:completed`. Before, the round and its
+  results were stored and the turn reported itself completed.
+
+- MCPL tells a server's request from its notification by whether the message has an `id` member, as JSON-RPC 2.0 and MCPL §4.1 define them (#475). So a request with `"id": null` is now dispatched and answered, with `id: null`, where it was taken for a notification and never answered. That includes a ping, on a connected transport and during the initialize handshake.
+  - **A message with an `id` and no `method` is a response,** whatever the id's value, and is never answered. So is an error with no `id`, which MCP lets a server send for a request it couldn't read, in a message whose `jsonrpc` is `"2.0"`; it was ignored silently before. A response whose `id` is neither a string nor a number, or that has none, can't be matched to a request of the host's, whose ids are numbers, so it's no longer surfaced as an orphaned response. When it's a JSON-RPC 2.0 error it's logged, with its error member; any other, such as a server's own JSON log line with `"id": null`, is ignored silently, as before. A server sends an error with `id: null`, or under MCP with no `id`, for a request it couldn't read. Once connected, the request it was meant for gets nothing from it, ending as any unanswered request does, by its timeout where it has one. During the initialize handshake, `initialize` is the only request the host has out, so such an error, in a message whose `jsonrpc` is `"2.0"`, is its answer: the connect fails at once, with the server's error, even if the server answers `initialize` after it. Before, it waited out the 30 s timeout, or connected on that later answer. Of the handshake's other responses, a JSON-RPC 2.0 error whose `id` is neither a string nor a number is logged, as on a connected transport, and any other is ignored, as before. Any other object with neither a `method` nor an `id` isn't JSON-RPC, and is ignored, as before.
+  - **An invalid request is answered once with `-32600` "Invalid Request",** saying what was wrong, and isn't dispatched. That's a message whose `id` isn't a string, a number or null, which was echoed back in the answer, or whose `method` isn't a string, which got -32601 "Method not found" with an `id` and no answer without one. One with no `id` is answered too, since it isn't a valid request, and so isn't a notification either, as JSON-RPC 2.0's own example shows. The answer carries the request's `id` where that's a string or a number, and `null` otherwise. During the initialize handshake, which answers only pings, it's ignored, as other requests are. A ping with an invalid `id` was answered there before, with that `id`.
+  - **A streaming `inference/request` with `id: null`** is answered with its whole result, since its chunks name the request by its id.
+- The MCP server, `McpServer`, which the `agent-framework-mcp` command runs and the package root exports, reads a message's envelope by the same rule (#475).
+  - **An invalid request now gets one `-32600` "Invalid Request",** saying what was wrong, and isn't handled. Before, a request whose `id` isn't a string, a number or null had that `id` echoed back in the answer, one whose `method` isn't a string got -32601 "Method not found", and one of those with no `id` got no answer.
+  - **A message with an `id` and no `method` is a response,** and so is a JSON-RPC 2.0 error with no `id`. This server sends no requests, so it logs a response and never answers it. Before, one with an `id` was answered -32601, and an error with no `id` was ignored.
+  - **A JSON value that isn't an object gets `-32600` with `id: null`,** and a batch's answer says this server doesn't accept batches. Before, a number, a string or `null` got -32700 "Parse error", and an array got no answer.
+  - **An object with neither a `method` nor an `id` gets `-32600` with `id: null` too,** where it was taken for a notification and got no answer.
+  - **A request named `initialized` gets -32601 "Method not found"**, as any unknown method does, where it got no answer. MCP's acknowledgment is the `notifications/initialized` notification, which needs none.
+
+- `history--search` finds what an agent said through a send tool: a call of `channel_publish`, `send_message`, `reply_message`, `send_dm`, `reply_to_message`, `send_file`, `send_scheduled_message`, `create_poll`, `edit_message`, `upload_file`, `say` or `whisper`, by that name on any server, is found by the words it carries (a poll by its question), which search used to leave out. The semantic index reads the same words, labelled with the tool's bare name as before, now also under telegram-mcpl's argument names (`send_message`'s and `send_scheduled_message`'s `message`, `reply_to_message`'s `text`, `send_file`'s `caption`, `create_poll`'s `question` and `edit_message`'s `new_text`), slack-mcpl's (`upload_file`'s `comment`, not the file) and Eidoverse's (`say`'s and `whisper`'s `text`). An established semantic index walks on from where it stopped, less its overlap window, so a send whose words it couldn't read before this release, walked past outside that window and not edited since, stays out of it; plain search finds it. Switching the index's `namespace` makes its next pass walk from that namespace's own newest indexed message, less its overlap, since its cursors belong to the namespace they were kept for, or from the first message for a namespace with nothing indexed yet, at the cost of embedding the store again (anima-research/connectome-host#524).
+
+- An agent's bare `channel_close({ channelId: "work" })` that both the all-except focus's channel (`editor`'s `work`) and the calling turn's own channel on another server (`other`'s `work`, opened in the turn) answer to is now refused, closing neither and leaving the focus in force: "Channel "work" names both the channel the all-except focus excepts ("editor:work") and this turn's channel ("other:work"), so nothing ran. Call again with channelId set to one of them, or with serverId set to "editor" or "other"." In 0.32.0 it closed `other`'s `work` and left the focus in force; a close naming either server is unchanged.
+- Where another of the turn's channels has the server-qualified name (`"other:work"`) for its id, that refusal names the turn's channel by its id and server instead.
+
+- A tune-out whose release reached the resident but whose end wasn't recorded, as a store fault between the release and the end leaves it, stays in force, while the resident's last row on it said it was cancelled. The next boot now tells the resident, by a row after that release, that the release reached it but its end wasn't recorded, so the tune-out is still in force, what arrives is held for its next release, and how it ends. A cancel that then ends it with nothing held since writes the resident a short release saying this release records the end; the held messages aren't delivered again. A check no longer counts or peeks as held the messages that release already delivered (Oscar, nissa's house).
+
+- Where a failed tool's result held no `error`, for the `heartbeat`, `channels`, `workspace` and `agent` modules' tools and the gate's wake-rule tools, its `tool:failed` trace had `error` `undefined`, against its type. It's now `tool returned an error`, as an MCPL tool's already was (#899).
+
+- An MCPL server whose `tools/list` fails during a re-list keeps the tools it last listed, while its connection still serves it (connected, or reconnecting), instead of vanishing from the tool list. Every reconnect re-lists all servers, so one connector reconnecting while another was briefly down removed the second one's tools: a full prompt-cache rewrite (the tool list tops every request), the tools missing unannounced, and a second rewrite when they returned. A call to a down server fails on its own, as before. A modern MCP server's tools still leave the list while it isn't connected or its listing fails, as before.
+  - **What's kept:** exactly the names the serving connection published, each tool offered or not, as the list stands when the re-list publishes, with its feature set and the server its calls go to. It keeps the class the server declared for it (RFC-008), unless the server's connection has closed since that class was published, as a close forgets its tools' classes; then, unless an operator's class override applies, it's unclassed, the restrictive answer, until the server lists again.
+  - **A server that closes mid-re-list:** a server whose connection closes while the re-list is still listing other servers keeps, while it serves, the tools published before, and nothing of the listing its closed session gave; before, it lost its tools until its reconnect listed them, or for the whole outage.
+  - **After a reconnect:** a kept tool stays offered while its server reconnects and after, until the server lists again, so a call of one reaches the new session, which may no longer have that tool.
+  - **With RFC-014 tool hints:** a listing read whole updates the server's toolset presence as it arrives, before the re-list decides whether it counts. When it isn't published, because the server's connection closed before the re-list published, or because a newer re-list whose listing failed published first, presence runs ahead of the kept list until a listing is published. Meanwhile a tool that listing moved into a toolset can still be called by its name from the list, even while that toolset isn't open, and the call reaches the server with no instance; a tool it moved out of a toolset is out of the list and not shown in an open toolset, though both a call by its name and `toolsets--act` still run it.
+  - **What isn't:** a server halted for good or closed by the host keeps nothing, nor does one that stops serving before the re-list publishes, nor a new connection under the server's id, from a connect or a restart. A server whose latest handshake advertised no MCP tools keeps nothing, connected or reconnecting; a connected one whose listing fails has listed nothing, as before.
+  - **The log:** each re-list that publishes logs one line for each server whose listing failed and whose handshake advertised tools, saying how many known tools it keeps, or that none of its tools are offered, with the server's error text redacted as other server errors are. Nothing is logged once `stop()` has begun.
+- A `tools/list` answer holding an entry that isn't an object with a string `name` is refused whole, as a page with no `tools` array already was, so it changes nothing the host believes. Every version through 0.32.0 published the tools read before such an entry, and since RFC-014's tool hints the page's other entries also reached the server's toolset presence; now a server that advertised tools keeps its last good list, and a move between its tool list and its toolsets waits for the next listing that is read whole. `McplServerConnection.sendToolsList` rejects such a page with an error naming the entry's place, where 0.32.0 returned the page with the entry in it. While a server that advertised tools keeps sending one, each re-list's line says its listing failed, and it stays unlisted, so a tool-pattern check waiting on it doesn't decide.
+
+- A `channel_close` of the channel an all-except hold excepts answers, once its focus has ended, "The focus on it
+  ended, and what the other channels held was delivered, up to its backlog cap." (0.32.0: "The focus on it ended
+  all the same, and what the other channels held was delivered."). Where the focus's release fails, it answers
+  the failure with what holds of the focus: "The close wasn't recorded: <reason>. The focus on it ended before
+  that failure, and what the other channels held was delivered, up to its backlog cap." where a step after the
+  end (such as the resident's wake) threw; otherwise "The close wasn't recorded: <reason>. The focus on it is
+  still in force: what the other channels hold stays held until it ends.", or, where the release couldn't be
+  made durable after its notice was stored, "… The focus on it is still in force, but its release notice, with
+  what the other channels held up to its backlog cap, was stored before that failure: what they hold from now on
+  stays held until it ends.", each followed by "A resident ends it with tune_out { mode: 'cancel', scope:
+  'all-except' }, or asks this close again." In 0.32.0 such a failure rejected `executeToolCall` with "The close
+  wasn't recorded: <reason>" and said nothing of the focus; it is now the close's answer, as the registry's other
+  failures are.
+- An agent's close of the excepted channel after its server stopped registering it (removed by
+  `channels/changed`, or the server removed), by the channel's id, its server-qualified name, its id with its
+  `serverId`, or, inside the turn whose channel it was, its id, now ends the focus as a close of the registered
+  channel does, its backlog released, the release's reason "a close of the excepted channel, which its server no
+  longer registers". It answers as a failure, since no close ran: "Server "editor" no longer registers channel
+  "work", so no close was recorded or sent." and what holds of the focus as above ("A step of the focus's release
+  failed: <reason>." or "The focus on it wasn't ended: <reason>." where the release fails). In 0.32.0 it was
+  refused ("No channel has the id "work", so nothing ran. …", or a like refusal for another form of its name), the
+  focus left in force. A module's close of such a name is refused as before.
+- A `channel_close` answer built after its focus ended names an all-except focus in force by then in its place:
+  "… A new all-except focus is in force now, excepting <server>/<channel>: not this close's, and what the other
+  channels hold stays held until it ends."
+- An agent's bare `channel_close({ channelId: "work" })` that the excepted channel answers to now acts on that
+  channel, not on another server's `work`. Where the focus's channel (`editor`'s `work`) is no longer registered
+  and `other` registers a `work`, it ends the focus as above and closes nothing on `other`, where 0.32.0 closed
+  `other`'s `work` outside a turn of the focus's channel and left the focus in force; where both are registered,
+  it closes the focus's channel, where it was refused as on more than one server. Either answer adds "Channel
+  "work" on server "other" was not closed: to close it, call again with channelId "work" and serverId "other"." A
+  close naming `other` (`serverId: "other"` or `"other:work"`) closes `other`'s `work` and leaves the focus alone,
+  and a name the calling turn's own channel answers to (unless the focus's channel answers to it too, which is
+  refused), a module's close and any close while no focus is in force resolve as before.
+
+- The `context-reinit-failed` alert, which says a restart loses the writes
+  kept in memory for a manager that refuses its work, excepts mail, which
+  stays held in the registry (0.32.0's said a restart can lose the
+  manager's queued writes, mail not excepted). The `store-held-lost` alert
+  and its log line, which say the next boot delivers the held mail, add that mail
+  whose recipient is gone by then stays held there, marked
+  `recipient-gone`.
+
+- A host that stopped quiesced now restores its quiesce mode before its
+  modules start. A write a module makes from its `start()` on such a boot
+  is handled as a write to a quiesced host: it takes no clock row. Before,
+  the mode was read after the modules started, so that write took one.
+
+- The `context-reinit-failed` alerts, a failed surgery's restore message,
+  the `store-held-lost` alert at stop, and the log line for writes kept in
+  memory for a manager that refuses its work now say that any branch move
+  re-initializes the manager and stores those writes: `switchBranch()` to
+  the current branch, as they suggest, or a rollback or suppression made
+  through another agent. In 0.32.0 the `context-reinit-failed` alerts and
+  the restore message, the two of these it had, named `switchBranch()`
+  alone.
+
+- A surgery's release (a rollback, a suppression, `switchBranch()`) now
+  replays the writes its hold kept one at a time, and the store counts as
+  held until the last one is stored. A tune-out cancel that a trace
+  listener asks for during the replay waits for its end, as during the
+  hold, so its backlog has every held message. Before, the release took
+  every write off the queue first: a cancel asked for then ran at once
+  and dumped its backlog without the messages still to replay. During the
+  replay, `HostModeStatus.deferredWrites` counts the writes still waiting,
+  and a write made then is stored after them.
+
+- An undo or a redo on an agent's window (`undoLastTurn`, `redo`) whose later step fails after its rows left or
+  returned is refused with `OperatorActionError` `'failed'`, saying how many rows left and how many returned; the
+  failure is traced (`window:undone`) and written to the operator log with its error, and the redo entry stays.
+  In 0.32.0 a redo whose checkpoint save failed after its switch threw the store's error, its entry already taken
+  off the stack. A redo's `window:undone` trace is emitted after its entry leaves the redo stack, so a listener
+  that undoes the turn again keeps its own entry.
+
+- A coalesced render delivered to a conversation fork while a turn of the fork's was alive is placed as not
+  presented to it (`presented: false`), as a resident's is (#291): the render stays replaceable by the next push
+  for its subject, and the fork is woken to read it. Before, the render counted as read by a turn that never saw
+  it, so the next push was appended after it and no wake was queued. A write to an agent with no turn alive whose
+  presentation at its write failed is placed so too, for a resident or a fork.
+
+- A turn start whose presentation fails (a read of the window or the record that throws, or a write of the window
+  that leaves a row out) fails the start (#291). It is traced (`presentation:failed` at `turn-start` or `assembly`)
+  and logged, the agent's turn ends, its trigger is dropped as any start's that throws is, and the rows wait outside
+  its window for its next presentation point, so the agent doesn't answer an older context. In 0.32.0 a start whose
+  flush of the deferred queue failed compiled without the writes it couldn't store, which stayed queued.
+
+- When a coalesced render's delivery to the store fails while a newer batch of that subject is open, the coalescer writes the newer batch's fallback mark at once and makes it durable, as it does at a render's start, so a crash right after doesn't restore the newer batch as an ordinary pending one for the server to render again, on top of the render the agent never got. Where the immediate write or its commit fails, the host's throttled save (two seconds in the framework) is asked for.
+
+- Held mail whose copy the boot finds in its recipient's store is released only once the store has synced, as a delivery releases it. Where the boot stored an earlier release's deferred writes and the store's sync failed (this release's import, or 0.32.0's flush of its restored queue at a serving boot), the copy could be in memory only while the release was already written to the registry's recovery file, so a crash could lose the copy with the mail released. A failed sync now leaves the mail held, and it isn't delivered twice.
+
+- At boot, an interrupted job's end is told from what its recipient's store holds: a result there counts as the
+  job's own only when it was produced (`metadata.dendrite.producedAt`) at or after the job's record was created,
+  so a result an earlier job of the same single-use name and incarnation delivered (a name whose counter aged out
+  of the registry starts again at 1) doesn't stop the recipient from being told that the new job ended without a
+  result. 0.32.0 looked for the result among the registry's held mail by the job's name alone, so an earlier
+  job's result still held there stopped the recipient from being told, and a result already stored and released
+  went unseen, the recipient told the job ended without one.
+
+- The persistent subconscious's own voice is its name alone. Its config was the primary's with a few fields
+  replaced, and kept the primary's `selfParticipants` and `presentAs`, so a row stored under one of the primary's
+  other names was its own turn to it: it went out as its assistant turn, the primary's thinking and tool calls
+  with it, where a resident's rounds go out to it as a transcript (#291), and its own turns went out under the
+  primary's `presentAs`.
+
 ## 0.32.0 — 2026-10-31
 
 ### Breaking

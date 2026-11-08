@@ -17,6 +17,7 @@ export type {
   JudgeVerdict,
   ReplyJudgeOptions,
   UpcomingWake,
+  UpcomingWakeKind,
   SuppressConfig,
   SuppressionReviewOptions,
 } from './types.js';

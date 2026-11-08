@@ -771,6 +771,8 @@ test("the subconscious's cancel_tuneout gets its turn's own channels from the fr
   fw.tuneOutCoordinator = {
     handleSubconsciousTool: async (_name: string, _input: unknown, own?: readonly ChannelRef[]) => { seen.push(own); return { success: true }; },
     stop: () => {},
+    // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+    stopTimers: () => {},
   };
   fw.turnRouting.set('scout', { turnId: 7, wasIn: [b], triggerChannel: b, engaged: new Set() });
   fw.dispatchToolCall('scout', { id: 'c1', name: 'cancel_tuneout', input: { channelId: 'general' } }, 7);
@@ -1763,6 +1765,8 @@ for (const order of orders) {
       cancel: (serverId: string, channelId: string) => { entered.push(`cancel ${serverId} ${channelId}`); return { ok: true }; },
       hasReader: () => true,
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     // The tune-out's transport is another test's (tune-out-transport): here
     // it opens at once, so the answer names only the channel and settings.
@@ -1809,6 +1813,8 @@ for (const order of orders) {
       cancel: () => ({ ok: true }),
       hasReader: () => true,
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     (f.i.channelRegistry as unknown as { openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> })
       .openForTuneOut = async () => undefined;
@@ -1839,6 +1845,8 @@ for (const order of orders) {
       cancel: () => ({ ok: true }),
       hasReader: () => true,
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     reg.openForTuneOut = async () => {
       await reg.handleRegister('b', { channels: [{ id: 'solo', type: 'chat', label: 'solo', direction: 'bidirectional' }] } as never);
@@ -1864,6 +1872,8 @@ for (const order of orders) {
       enter: () => ({ ok: false, error: 'already', alreadyTunedOut: true }),
       cancel: () => ({ ok: true }),
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     reg.getTuneOutState = () => ({ params, wakeCount: 0 });
     reg.tuneOutTransportOpen = () => false;
