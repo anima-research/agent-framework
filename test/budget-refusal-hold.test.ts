@@ -3,29 +3,129 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AutobiographicalStrategy, ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
-import type { EventResponse, InferencePolicy, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
+import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
+import { MembraneError, type ContentBlock, type NormalizedRequest, type NormalizedResponse, type YieldingStream } from '@animalabs/membrane';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { MembraneError, type NormalizedRequest, type NormalizedResponse, type YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
-class FailsAfterToolsStream extends MockYieldingStream {
-  override provideToolResults(results: unknown[], options?: Parameters<MockYieldingStream['provideToolResults']>[1]): void {
-    super.provideToolResults(results, options);
-    (this as unknown as { events: unknown[] }).events.push({ type: 'error', error: new Error('stream broke') });
+const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
+const NOTE = /\[budget-hold\] Your context didn't fit its budget \(100,201 tokens against 48,568\), so this turn waited \d+ (s|min) for compression to make room\./;
+
+async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return cond();
+}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const overBudget = () => Object.assign(
+  new Error('Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=48568'),
+  { name: 'OverBudgetError', budget: 48_568, actual: 100_201 },
+);
+
+/** Compression as the tests drive it: compiles from the `refuseFrom`th on are
+ *  refused until `fitAt` ticks have run since the first refusal, and
+ *  compression is pending until `readyAt` ticks. With `calls`, each tick
+ *  while compression is pending makes one call through the agent's
+ *  auxiliary membrane, as compression's own calls go. */
+interface Compression {
+  ticks: number; compiles: number; refusals: number; refusing: boolean;
+  fitAt: number; readyAt: number; refuseFrom: number;
+  noteTips: boolean; calls: boolean;
+  failNext?: Error;
+  injections: string[][];
+}
+type Patchable = Record<'compile' | 'tick' | 'isReady' | 'getPendingWork', (...args: unknown[]) => unknown>;
+async function withCompression<T>(state: Partial<Compression>, run: (c: Compression) => Promise<T>): Promise<T> {
+  const c: Compression = {
+    ticks: 0, compiles: 0, refusals: 0, refusing: false,
+    fitAt: Infinity, readyAt: state.readyAt ?? state.fitAt ?? Infinity, refuseFrom: 1,
+    noteTips: false, calls: false, injections: [], ...state,
+  };
+  const pending = () => c.ticks < c.readyAt;
+  const proto = ContextManager.prototype as unknown as Patchable;
+  const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady, getPendingWork: proto.getPendingWork };
+  proto.compile = async function (this: unknown, ...args: unknown[]) {
+    if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun === true) return original.compile.apply(this, args);
+    c.compiles++;
+    const injections = ((args[1] ?? []) as ContextInjection[]).map((i) => String(i.namespace));
+    c.injections.push(injections);
+    if (c.failNext) {
+      const error = c.failNext;
+      c.failNext = undefined;
+      throw error;
+    }
+    const withNote = injections.includes('framework:budget-hold');
+    if (c.compiles >= c.refuseFrom && (c.ticks < c.fitAt || (c.noteTips && withNote))) {
+      c.refusing = true;
+      c.refusals++;
+      throw overBudget();
+    }
+    return original.compile.apply(this, args);
+  };
+  proto.tick = async function (this: { membrane: { complete(request: unknown): Promise<unknown> } }) {
+    if (!c.refusing) return;
+    const working = pending();
+    c.ticks++;
+    if (c.calls && working) await this.membrane.complete({ messages: [], config: { model: 'test-model', maxTokens: 100 } });
+  };
+  proto.isReady = function () { return !pending(); };
+  proto.getPendingWork = function () { return pending() ? { description: 'zz compression pending', started: new Date() } : null; };
+  try {
+    return await run(c);
+  } finally {
+    Object.assign(proto, original);
   }
 }
 
-class ScriptedStreamMembrane extends MockMembrane {
-  constructor(private readonly scripts: Array<Array<NormalizedResponse | 'fails'>>) { super(); }
-  override streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
-    this.calls.push(request);
-    const script = this.scripts.shift() ?? [];
-    const rounds = script.filter((r): r is NormalizedResponse => r !== 'fails');
-    const stream = script.includes('fails') ? new FailsAfterToolsStream(rounds) : new MockYieldingStream(rounds);
-    this.lastStream = stream;
-    return stream;
+class InboxModule implements Module {
+  readonly name = 'inbox';
+  ctx?: ModuleContext;
+  gatherContext?: () => Promise<Array<{ namespace: string; position: 'afterUser'; content: ContentBlock[] }>>;
+  constructor(context?: () => string) {
+    if (context) this.gatherContext = async () => [{ namespace: 'inbox:status', position: 'afterUser', content: [text(context())] }];
   }
+  async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+  async stop(): Promise<void> {}
+  getTools() { return []; }
+  async handleToolCall(): Promise<never> { throw new Error('no tools'); }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }], requestInference: true };
+  }
+}
+
+class BlobToolModule implements Module {
+  readonly name = 'canned';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(): Promise<ToolResult> {
+    return { success: true, data: { blob: 'x'.repeat(30_000) } };
+  }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }], requestInference: true };
+  }
+}
+
+class PingModule implements Module {
+  readonly name = 'pings';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'ping', description: 'ping', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(): Promise<ToolResult> {
+    return { success: true, data: 'pong' };
+  }
+  async onProcess(): Promise<EventResponse> { return {}; }
 }
 
 class SequentialStreamMembrane extends MockMembrane {
@@ -38,412 +138,88 @@ class SequentialStreamMembrane extends MockMembrane {
   }
 }
 
-async function pollUntil(cond: () => boolean, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (cond()) return true;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  return cond();
-}
-
-function stored(framework: AgentFramework): Array<{ text: string; metadata: Record<string, unknown> }> {
-  const cm = framework.getAgent('prime')?.getContextManager();
-  const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{
-    content: Array<{ type: string; text?: string }>;
-    metadata?: Record<string, unknown>;
-  }>;
-  return msgs.map((m) => ({
-    text: (m.content ?? []).filter((b) => b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n'),
-    metadata: m.metadata ?? {},
-  }));
-}
-const storedText = (framework: AgentFramework): string => stored(framework).map((m) => m.text).join('\n');
-const noteCount = (text: string): number => text.split('[budget-hold]').length - 1;
-const turnCalls = (membrane: MockMembrane): NormalizedRequest[] => (membrane.calls as NormalizedRequest[]).filter((c) => c.messages.length > 0);
-const presented = (framework: AgentFramework): Array<{ content?: Array<{ type: string; text?: string }> }> =>
-  (framework.getAgent('prime')!.getContextManager() as unknown as { getPresentedMessages(): Array<{ content?: Array<{ type: string; text?: string }> }> })
-    .getPresentedMessages();
-const windowText = (framework: AgentFramework): string =>
-  presented(framework).map((m) => (m.content ?? []).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')).join('\n');
-const windowToolBlocks = (framework: AgentFramework): number =>
-  presented(framework).flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
-const toolBlocks = (framework: AgentFramework): number => {
-  const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content?: Array<{ type: string }> }>;
-  return msgs.flatMap((m) => m.content ?? []).filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
-};
-const turnOver = (t: { of: (type: string) => unknown[]; internal: { activeTurnTokens: Map<string, number> } }, completed = 1): Promise<boolean> =>
-  pollUntil(() => t.of('inference:completed').length >= completed && !t.internal.activeTurnTokens.has('prime'), 5_000);
-
-async function errorLines<T>(run: (lines: string[]) => Promise<T>): Promise<T> {
-  const lines: string[] = [];
-  const original = console.error;
-  console.error = (...args: unknown[]) => {
-    lines.push(args.map(String).join(' '));
-    original(...args);
-  };
-  try {
-    return await run(lines);
-  } finally {
-    console.error = original;
-  }
-}
-
-interface Backlog {
-  ticks: number; fitAt: number; readyAt: number; fit: boolean;
-  refused: boolean;
-  alwaysPending: boolean; stalled: boolean; previewless: boolean; refuseCompiles: number;
-  previews: number; dryRuns: number; dryRunsRunning: number; mostDryRunsRunning: number; compiles: number;
-  dryRunsAcrossFit: number;
-  noProgress: boolean;
-  progress?: number;
-  pendingDescription?: string;
-  pendingWorkError?: Error;
-  tickGate?: Promise<void>;
-  refusalName?: string;
-  refusalTail?: string;
-  /** A dry compile resolves whether the context fits or not, as
-   *  context-manager's resolves an over-budget plan (SelectOptions.dryRun). */
-  dryRunResolves?: boolean;
-  previewError?: Error; dryRunGate?: Promise<void>; dryRunMs?: number;
-  compileGate?: { nth: number; until: Promise<void> };
-  bindings: { compile: unknown[]; dryRun: unknown[]; preview: unknown[] };
-  thrown: Error[]; previewBudgets: unknown[];
-  spare?: number; foldsDeeper?: boolean | 'throws';
-  notePrice?: number | 'throws' | 'none';
-  dryShort?: boolean;
-  dryBudgets: unknown[];
-}
-const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
-const pending = (b: Backlog): boolean => b.alwaysPending || (!fits(b) && b.ticks < b.readyAt);
-let refusalName = 'OverBudgetError';
-let refusalTail = '';
-const overBudget = (actual = 100_201) => Object.assign(
-  new Error('Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=48568' + refusalTail),
-  { name: refusalName, budget: 48_568, actual },
-);
-
-type Patchable = Record<'compile' | 'tick' | 'isReady' | 'getPendingWork' | 'previewContext', (...args: unknown[]) => unknown>;
-
-async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Promise<T>): Promise<T> {
-  const b: Backlog = {
-    ticks: 0, fitAt: Infinity, readyAt: Infinity, fit: false, refused: false,
-    alwaysPending: false, stalled: false, previewless: false, refuseCompiles: 0,
-    previews: 0, dryRuns: 0, dryRunsRunning: 0, mostDryRunsRunning: 0, compiles: 0,
-    dryRunsAcrossFit: 0, noProgress: false, bindings: { compile: [], dryRun: [], preview: [] },
-    thrown: [], previewBudgets: [], dryBudgets: [],
-    ...backlog,
-  };
-  refusalName = b.refusalName ?? 'OverBudgetError';
-  refusalTail = b.refusalTail ?? '';
-  const proto = ContextManager.prototype as unknown as Patchable;
-  const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady, getPendingWork: proto.getPendingWork, previewContext: proto.previewContext };
-  const passthrough = PassthroughStrategy.prototype as unknown as { getProgressSnapshot?: () => unknown };
-  proto.compile = async function (this: unknown, ...args: unknown[]) {
-    if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun === true) {
-      b.bindings.dryRun.push((args[2] as { thinkingBinding?: unknown }).thinkingBinding);
-      b.dryRuns++;
-      b.dryBudgets.push(args[0]);
-      const asked = (args[0] as { maxTokens?: number } | undefined)?.maxTokens ?? 100_000;
-      const first = (b.dryBudgets[0] as { maxTokens?: number } | undefined)?.maxTokens ?? 100_000;
-      b.mostDryRunsRunning = Math.max(b.mostDryRunsRunning, ++b.dryRunsRunning);
-      try {
-        const fitsNow = fits(b);
-        if (b.dryRunGate) await b.dryRunGate;
-        if (b.dryRunMs) await new Promise((r) => setTimeout(r, b.dryRunMs));
-        if (!fitsNow && fits(b)) b.dryRunsAcrossFit++;
-        if (!fitsNow && !b.dryRunResolves) throw overBudget();
-        if (b.dryShort && asked < first) throw overBudget();
-      } finally {
-        b.dryRunsRunning--;
-      }
-      return original.compile.apply(this, args);
-    }
-    b.compiles++;
-    b.bindings.compile.push((args[2] as { thinkingBinding?: unknown } | undefined)?.thinkingBinding);
-    if (b.compileGate?.nth === b.compiles) await b.compileGate.until;
-    if (!fits(b)) {
-      b.refused = true;
-      b.thrown.push(overBudget());
-      throw b.thrown.at(-1);
-    }
-    if (b.refuseCompiles > 0) {
-      b.refuseCompiles--;
-      b.refused = true;
-      b.thrown.push(overBudget(49_000));
-      throw b.thrown.at(-1);
-    }
-    return original.compile.apply(this, args);
-  };
-  proto.previewContext = function (...args: unknown[]) {
-    b.previews++;
-    b.previewBudgets.push(args[0]);
-    b.bindings.preview.push((args[2] as { thinkingBinding?: unknown } | undefined)?.thinkingBinding);
-    if (b.previewError) {
-      const error = b.previewError;
-      b.previewError = undefined;
-      throw error;
-    }
-    if (b.previewless) return null;
-    // As context-manager's preview does: an over-budget plan answers
-    // fits: false, and any other refusal, a context refusal among them, is
-    // rethrown.
-    if (!fits(b) && refusalName !== 'OverBudgetError') throw overBudget();
-    if (b.spare === undefined || !fits(b)) return { fits: fits(b) };
-    const budget = args[0] as { maxTokens: number; reserveForResponse: number };
-    const budgetTokens = budget.maxTokens - budget.reserveForResponse;
-    const full = Math.max(...(b.previewBudgets as Array<{ maxTokens: number }>).map((p) => p.maxTokens));
-    if (budget.maxTokens >= full) return { fits: true, budgetTokens, finalTokens: budgetTokens - b.spare };
-    if (b.foldsDeeper === 'throws') throw new Error('zz preview failed');
-    return b.foldsDeeper ? { fits: true, budgetTokens, finalTokens: budgetTokens } : { fits: false, budgetTokens, finalTokens: budgetTokens + 1 };
-  };
-  proto.tick = async function () {
-    if (b.tickGate) await b.tickGate;
-    if (b.refused) b.ticks++;
-  };
-  proto.isReady = function () { return !pending(b); };
-  proto.getPendingWork = function () {
-    if (b.pendingWorkError) throw b.pendingWorkError;
-    return pending(b) ? { description: b.pendingDescription ?? 'zz compression pending', started: new Date() } : null;
-  };
-  const priced = PassthroughStrategy.prototype as unknown as { estimateTokens?: (content: unknown) => number };
-  if (b.notePrice !== 'none') {
-    priced.estimateTokens = function () {
-      if (b.notePrice === 'throws') throw new Error('zz no estimate');
-      return typeof b.notePrice === 'number' ? b.notePrice : 47;
-    };
-  }
-  if (!b.noProgress) {
-    passthrough.getProgressSnapshot = function () {
-      return { chunksCompressed: b.progress ?? (b.stalled ? 0 : b.ticks), fits: fits(b) };
-    };
-  }
-  try {
-    return await run(b);
-  } finally {
-    Object.assign(proto, original);
-    delete passthrough.getProgressSnapshot;
-    delete priced.estimateTokens;
-    refusalName = 'OverBudgetError';
-    refusalTail = '';
-  }
-}
-
-interface CompressionCalls {
-  landed: number; fitAt: number; workUntil: number;
-  ticks: number; started: number;
-  refused: boolean;
-  pauseAfter: number;
-  gate?: Promise<void>; gateCall?: number;
-  previewless: boolean; dryRunGate?: Promise<void>;
-  exclusive: boolean; inFlight: number;
-  tickGate?: Promise<void>;
-  mints: number; mayCall?: () => boolean;
-}
-
-async function withCompressionCalls<T>(state: Partial<CompressionCalls>, run: (c: CompressionCalls) => Promise<T>): Promise<T> {
-  const c: CompressionCalls = {
-    landed: 0, fitAt: Infinity, workUntil: Infinity, ticks: 0, started: 0, refused: false, pauseAfter: Infinity, previewless: false,
-    exclusive: false, inFlight: 0, mints: 0, ...state,
-  };
-  const fitsNow = () => c.landed >= c.fitAt;
-  const working = () => c.refused && c.landed < c.workUntil;
-  const proto = ContextManager.prototype as unknown as Patchable;
-  const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady, previewContext: proto.previewContext };
-  const passthrough = PassthroughStrategy.prototype as unknown as { getProgressSnapshot?: () => unknown };
-  proto.compile = async function (this: unknown, ...args: unknown[]) {
-    const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
-    if (dryRun && c.dryRunGate) await c.dryRunGate;
-    if (!fitsNow()) {
-      if (!dryRun) c.refused = true;
-      throw overBudget();
-    }
-    return original.compile.apply(this, args);
-  };
-  proto.previewContext = function () { return c.previewless ? null : { fits: fitsNow() }; };
-  proto.isReady = function () { return !working(); };
-  proto.tick = async function (this: { membrane: { complete(request: unknown): Promise<unknown> } }) {
-    if (!c.refused) return;
-    c.ticks++;
-    if (c.tickGate) await c.tickGate;
-    if (c.mints > 0 && working()) {
-      c.mints--;
-      c.landed++;
-      return;
-    }
-    if (c.started >= c.pauseAfter || !working() || (c.mayCall && !c.mayCall())) return;
-    if (c.exclusive && c.inFlight > 0) return;
-    const call = ++c.started;
-    c.inFlight++;
-    try {
-      await this.membrane.complete({ messages: [], config: { model: 'test-model', maxTokens: 100 } });
-    } finally {
-      c.inFlight--;
-    }
-    if (c.gate && (c.gateCall === undefined || c.gateCall === call)) await c.gate;
-    c.landed++;
-  };
-  passthrough.getProgressSnapshot = function () { return { chunksCompressed: c.landed }; };
-  try {
-    return await run(c);
-  } finally {
-    Object.assign(proto, original);
-    delete passthrough.getProgressSnapshot;
-  }
-}
-
-class InboxModule implements Module {
-  readonly name = 'inbox';
-  gatherContext?: () => Promise<Array<{ namespace: string; position: 'afterUser'; content: Array<{ type: 'text'; text: string }> }>>;
-  constructor(context?: () => string) {
-    if (context) this.gatherContext = async () => [{ namespace: 'inbox:status', position: 'afterUser', content: [{ type: 'text', text: context() }] }];
-  }
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getTools() { return []; }
-  async handleToolCall(): Promise<never> { throw new Error('no tools'); }
-  async onProcess(event: ProcessEvent): Promise<EventResponse> {
-    if (event.type !== 'external-message') return {};
-    const metadata = (event as { metadata?: Record<string, unknown> }).metadata;
-    return {
-      addMessages: [{
-        participant: 'User',
-        content: (event as { content: unknown }).content as never,
-        ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
-      }],
-      requestInference: true,
-    };
-  }
-}
-
-class InboxModuleForStatus implements Module {
-  readonly name = 'status';
-  constructor(private readonly status: () => string) {}
-  async gatherContext() {
-    return [{ namespace: 'status:now', position: 'afterUser' as const, content: [{ type: 'text' as const, text: this.status() }] }];
-  }
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getTools() { return []; }
-  async handleToolCall(): Promise<never> { throw new Error('no tools'); }
-  async onProcess(): Promise<EventResponse> { return {}; }
-}
-
-class BlobToolModule implements Module {
-  readonly name = 'canned';
-  constructor(private readonly duringCall?: () => unknown) {}
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getTools(): ToolDefinition[] {
-    return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
-  }
-  async handleToolCall(): Promise<ToolResult> {
-    await this.duringCall?.();
-    return { success: true, data: { blob: 'x'.repeat(30_000) } };
-  }
-  async onProcess(event: ProcessEvent): Promise<EventResponse> {
-    if (event.type !== 'external-message') return {};
-    return {
-      addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
-      requestInference: true,
-    };
-  }
-}
-function nearCapToolResponse() {
-  const r = createMockResponse([
-    { type: 'text', text: 'Working' },
-    { type: 'tool_use', id: 'call_1', name: 'canned--fetch', input: {} },
-  ], 'tool_use');
-  (r as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
-  return r;
-}
-
-async function heldRestart(texts: string[], options: {
-  fits?: boolean;
-  duringTool?: (internal: Internal) => unknown;
-  inferencePolicy?: InferencePolicy;
-  guardRetry?: boolean;
-  failsAfterTools?: boolean;
-} = {}) {
-  const proto = ContextManager.prototype as unknown as Patchable;
-  const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
-  let fit = options.fits === true;
-  let committing = 0;
-  proto.compile = async function (this: unknown, ...args: unknown[]) {
-    const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
-    const refused = dryRun ? !fit : ++committing >= 2 && !fit;
-    if (refused) throw overBudget(49_000);
-    return original.compile.apply(this, args);
-  };
-  proto.tick = async function () {};
-  proto.isReady = function () { return fit; };
-  const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-restart-'));
-  const scripted = options.guardRetry || options.failsAfterTools;
-  const membrane = scripted
-    ? new ScriptedStreamMembrane([
-      [
-        createMockResponse([{ type: 'tool_use', id: 'call_1', name: 'canned--fetch', input: {} }], 'tool_use'),
-        options.guardRetry
-          ? { ...createMockResponse([{ type: 'text', text: 'refused partial' }], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test-category' } } } } as NormalizedResponse
-          : 'fails',
-      ],
-      ...texts.map((text) => [createMockResponse([{ type: 'text', text }])]),
-    ])
-    : new SequentialStreamMembrane();
-  if (!scripted) {
-    membrane.pushResponse(nearCapToolResponse());
-    for (const text of texts) membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
-  }
-  const framework = await AgentFramework.create({
-    storePath: join(tempDir, 'store'),
-    membrane: membrane.asMembrane(),
-    agents: [options.guardRetry
-      ? { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, toolResultGuard: true }
-      : { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
-    modules: [new BlobToolModule(() => options.duringTool?.(internal))],
-    syncIntervalMs: 0,
-    maintenanceIntervalMs: 50,
-    errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
-    ...(options.inferencePolicy ? { inferencePolicy: options.inferencePolicy } : {}),
-  });
-  const internal = framework as unknown as Internal;
-  const traces: TraceEvent[] = [];
-  framework.onTrace((e) => traces.push(e));
-  let looks = 0;
-  const hold = framework as unknown as { checkBudgetHold?: (agentName: string) => Promise<void> };
-  const checkBudgetHold = hold.checkBudgetHold?.bind(framework);
-  if (checkBudgetHold) hold.checkBudgetHold = (agentName: string) => { looks++; return checkBudgetHold(agentName); };
-  framework.start();
-  framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'fetch it' }]);
-  internal.pendingRequests.push({ agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now() } as unknown as { agentName: string });
-  return {
-    framework,
-    internal,
-    membrane,
-    of: (type: string) => traces.filter((e) => e.type === type) as unknown as Array<Record<string, unknown>>,
-    looks: () => looks,
-    fit: () => { fit = true; },
-    close: async () => {
-      try {
-        await framework.stop();
-      } finally {
-        Object.assign(proto, original);
-        rmSync(tempDir, { recursive: true, force: true });
-      }
-    },
-  };
-}
-
 interface Internal {
   budgetHoldRecheckMs: number;
   budgetHolds: Map<string, unknown>;
   activeTurnTokens: Map<string, number>;
-  pendingRequests: Array<{ agentName: string }>;
-  providerGateBlocked: (agentName: string) => boolean;
-  disposeConversationAgent: (agentName: string) => void;
-  overBudgetDrains: Set<Promise<void>>;
+  pendingRequests: Array<Record<string, unknown>>;
+  hasTurn(agentName: string): boolean;
+  releaseBudgetHold(agentName: string): void;
+  providerAccelerationCooldowns: Map<string, { until: number; heldRequests: unknown[] }>;
+  releaseProviderAccelerationCooldown(agentName: string): void;
+  eventGate: { inferring: Set<string> } | null;
 }
-type HeldRequest = { agentName: string; reason: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; coalescingSubject?: string };
+
+type Reply = string | NormalizedResponse;
+async function resident(options: {
+  maintenanceIntervalMs?: number;
+  replies?: Reply[];
+  modules?: Module[];
+  context?: () => string;
+  binds?: boolean;
+  restart?: boolean;
+  gate?: boolean;
+  policyRetries?: number;
+} = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'budget-hold-'));
+  const inbox = new InboxModule(options.context);
+  const membrane = new SequentialStreamMembrane();
+  if (options.restart) {
+    const near = createMockResponse([text('Working'), { type: 'tool_use', id: 'call_1', name: 'canned--fetch', input: {} } as ContentBlock], 'tool_use');
+    (near as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
+    membrane.pushResponse(near);
+  }
+  for (const reply of options.replies ?? ['Answered once it fit']) {
+    membrane.pushResponse(typeof reply === 'string' ? createMockResponse([text(reply)]) : reply);
+  }
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{
+      name: 'prime', model: 'test-model', systemPrompt: 'You are prime.',
+      ...(options.restart ? { allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 } : {}),
+      ...(options.binds ? { thinkingBinding: { binds: true, dropBlock: false } } : {}),
+    }],
+    modules: [options.restart ? new BlobToolModule() : inbox, ...(options.modules ?? [])],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: options.maintenanceIntervalMs ?? 50,
+    errorPolicy: { maxRetries: options.policyRetries ?? 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < (options.policyRetries ?? 3) ? { retry: true, delayMs: 0 } : { retry: false }) },
+    ...(options.gate ? { gate: { config: { policies: [], default: 'always' } } } : {}),
+  } as Parameters<typeof AgentFramework.create>[0]);
+  const internal = framework as unknown as Internal;
+  const traces: TraceEvent[] = [];
+  framework.onTrace((e) => traces.push(e));
+  const send = (body: string) => framework.pushEvent({
+    type: 'external-message', source: 'test', content: [text(body)], metadata: {}, triggerInference: true,
+  } as unknown as ProcessEvent);
+  framework.start();
+  const cm = () => framework.getAgent('prime')!.getContextManager();
+  const rows = () => cm().getAllMessages() as unknown as Array<{ id: string; participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> }>;
+  const bodyOf = (row: { content: Array<{ type: string; text?: string }> }) => row.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+  const of = (type: string) => traces.filter((e) => e.type === type) as unknown as Array<Record<string, unknown>>;
+  return {
+    framework, internal, membrane, traces, send, cm, rows, of,
+    sendForPrime: (body: string) => {
+      const id = String(inbox.ctx!.addMessage('User', [text(body)], undefined, { forAgent: 'prime' } as never));
+      internal.pendingRequests.push({ agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now(), readsRow: id });
+    },
+    stored: () => rows().map(bodyOf).join('\n'),
+    rowWith: (body: string) => rows().find((r) => bodyOf(r) === body)!,
+    windowText: () => (cm().getPresentedMessages() as unknown as Array<{ content: Array<{ type: string; text?: string }> }>).map(bodyOf).join('\n'),
+    turnCalls: () => (membrane.calls as NormalizedRequest[]).filter((call) => call.messages.length > 0),
+    alerts: (kind: string) => of('ops:alert').filter((e) => e.kind === kind),
+    hold: () => (framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: Record<string, unknown> | null }> })
+      .agents.find((a) => a.name === 'prime')?.budgetHold ?? null,
+    close: async () => {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+type Resident = Awaited<ReturnType<typeof resident>>;
+const requestText = (request: NormalizedRequest | undefined) => JSON.stringify(request?.messages ?? null);
+const notesStored = (t: Resident) => t.rows().filter((r) => JSON.stringify(r.content).includes('[budget-hold]')).length;
+
 async function withWebhook<T>(run: (posts: string[]) => Promise<T>): Promise<T> {
   const env = process.env.CONNECTOME_OPS_WEBHOOK;
   const fetchWas = globalThis.fetch;
@@ -464,983 +240,94 @@ async function withWebhook<T>(run: (posts: string[]) => Promise<T>): Promise<T> 
   }
 }
 
-const holdOf = (t: { internal: Internal }) =>
-  (t.internal.budgetHolds as unknown as Map<string, { state: string; heldRequests: HeldRequest[] }>).get('prime');
-
-const heldRequests = (framework: AgentFramework): number | undefined => {
-  const agents = (framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { heldRequests: number } | null }> }).agents;
-  return agents.find((a) => a.name === 'prime')?.budgetHold?.heldRequests;
-};
-
-async function residentTurn(options: {
-  maintenanceIntervalMs: number; recheckMs?: number; responses?: number; inferencePolicy?: InferencePolicy;
-  thinkingBinding?: { binds: boolean; dropBlock: boolean };
-  context?: () => string;
-  storePath?: string;
-  failFirstStream?: () => void;
-  policyErrors?: Error[];
-  policyAsked?: () => void;
-  clock?: { intervalSeconds: number };
-}) {
-  const tempDir = options.storePath === undefined ? mkdtempSync(join(tmpdir(), 'budget-hold-')) : undefined;
-  const membrane = new SequentialStreamMembrane();
-  if (options.failFirstStream) {
-    const stream = membrane.streamYielding.bind(membrane);
-    let failed = false;
-    membrane.streamYielding = (request: NormalizedRequest, opts?: unknown): YieldingStream => {
-      if (failed) return stream(request, opts);
-      failed = true;
-      options.failFirstStream!();
-      throw new Error('provider overloaded');
-    };
-  }
-  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered once it fit' }]));
-  for (let i = 1; i < (options.responses ?? 1); i++) {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: `Answered turn ${i + 1}` }]));
-  }
-  const framework = await AgentFramework.create({
-    storePath: options.storePath ?? join(tempDir!, 'store'),
-    membrane: membrane.asMembrane(),
-    agents: [{
-      name: 'prime', model: 'test-model', systemPrompt: 'You are prime.',
-      ...(options.thinkingBinding ? { thinkingBinding: options.thinkingBinding } : {}),
-      ...(options.clock ? { clock: options.clock } : {}),
-    }],
-    modules: [new InboxModule(options.context)],
-    syncIntervalMs: 0,
-    maintenanceIntervalMs: options.maintenanceIntervalMs,
-    ...(options.inferencePolicy ? { inferencePolicy: options.inferencePolicy } : {}),
-    errorPolicy: { maxRetries: 3, onInferenceError: (error, _agent, attempt) => {
-      options.policyErrors?.push(error);
-      options.policyAsked?.();
-      return attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false };
-    } },
-  });
-  const internal = framework as unknown as Internal;
-  if (options.recheckMs !== undefined) internal.budgetHoldRecheckMs = options.recheckMs;
-  const traces: TraceEvent[] = [];
-  framework.onTrace((e) => traces.push(e));
-  let looks = 0;
-  const hold = framework as unknown as { checkBudgetHold?: (agentName: string) => Promise<void> };
-  const checkBudgetHold = hold.checkBudgetHold?.bind(framework);
-  if (checkBudgetHold) hold.checkBudgetHold = (agentName: string) => { looks++; return checkBudgetHold(agentName); };
-  const send = (text: string, metadata: Record<string, unknown> = {}) => framework.pushEvent({
-    type: 'external-message',
-    source: 'test',
-    content: [{ type: 'text', text }],
-    metadata,
-    triggerInference: true,
-  } as unknown as ProcessEvent);
-  framework.start();
-  const of = (type: string) => traces.filter((e) => e.type === type) as unknown as Array<Record<string, unknown>>;
-  const kinds = (types: string[]) => traces.filter((e) => types.includes(e.type)).map((e) => e.type);
-  return {
-    framework,
-    internal,
-    membrane,
-    send,
-    of,
-    kinds,
-    looks: () => looks,
-    close: async () => {
-      await framework.stop();
-      if (tempDir) rmSync(tempDir, { recursive: true, force: true });
-    },
-  };
-}
-
-describe('a compile refused for budget holds its turn (#304)', () => {
-  it('runs the refused turn once compression makes the context fit, with no new wake', async () => {
-    await withBacklog({ fitAt: 40 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+describe('a turn refused for budget while compression is pending waits idle, and runs once there is room (#304)', () => {
+  it('runs the refused turn once compression makes room, with a note saying why it waited', async () => {
+    await withCompression({ fitAt: 3 }, async () => {
+      const t = await resident();
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.equal(t.internal.providerGateBlocked('prime'), false, 'the hold leaves the provider gate open, so compression runs');
-        assert.ok(await pollUntil(() => fits(backlog), 10_000), 'compression should catch up');
-        const answered = await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000);
-        assert.ok(answered, 'the refused turn should run once the context fits, with no new message to wake it');
-        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 5_000), 'and completes');
-        assert.equal(t.membrane.calls.length, 1, 'one provider call: the fresh compile after the hold, never a refused one');
-
-        const held = t.of('inference:held');
-        assert.equal(held.length, 1);
-        assert.equal(held[0]!.errorType, 'over_budget');
-        assert.equal(held[0]!.budget, 48_568);
-        assert.equal(held[0]!.actual, 100_201);
-        assert.deepEqual(t.of('ops:alert').filter((e) => e.kind === 'context-refusal'), [], 'a hold raises no context-refusal: its turn goes on');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')), 'the turn ran once there was room, with no new message to wake it');
+        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1));
+        assert.equal(t.of('inference:held').length, 1);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
         assert.deepEqual(t.of('inference:exhausted'), [], 'the turn never failed');
-        assert.deepEqual(
-          t.kinds(['inference:started', 'inference:failed', 'inference:held', 'inference:hold_ended', 'inference:completed', 'inference:exhausted']),
-          ['inference:started', 'inference:failed', 'inference:held', 'inference:hold_ended', 'inference:started', 'inference:completed'],
-          'the refused attempt fails, the hold starts and ends, and the turn starts again and completes',
-        );
-        assert.ok(!storedText(t.framework).includes('[inference-failed]'), 'no failure marker is written for a held turn');
-        assert.equal(t.internal.budgetHoldRecheckMs, 5_000, 'unshortened, the hold paces itself at the maintenance timer\'s default interval');
+        assert.equal(t.turnCalls().length, 1, 'one request reached the provider');
+        assert.match(requestText(t.turnCalls()[0]), NOTE);
+        assert.equal(t.alerts('context-refusal').length, 1, 'the wait is announced once');
+        assert.deepEqual(t.alerts('context-refusal-clear'), [], 'a turn that runs needs no clear');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('tells the agent why its turn waited, in a note stored where the released turn read it', async () => {
-    await withBacklog({ fitAt: 12 }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50, responses: 2 });
+  it('fails as before when compression has nothing pending', async () => {
+    await withCompression({ fitAt: Infinity, readyAt: 0 }, async () => {
+      const t = await resident();
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 10_000));
-        const note = /\[budget-hold\] Your context didn't fit its budget \(100,201 tokens against 48,568\), so this turn waited \d+ s for compression to make room\./;
-        assert.match(JSON.stringify(t.membrane.calls[0]), note);
-        const notes = stored(t.framework).filter((m) => m.text.includes('[budget-hold]'));
-        assert.equal(notes.length, 1, 'the note is stored once');
-        assert.match(notes[0]!.text, note);
-        t.send('And now?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered turn 2'), 5_000));
-        assert.equal(t.membrane.calls.length, 2);
-        assert.equal(JSON.stringify(t.membrane.calls[1]).split('[budget-hold]').length - 1, 1,
-          'the next turn reads the stored note as history, and gets no note of its own');
+        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1));
+        assert.deepEqual(t.of('inference:held'), []);
+        assert.equal(t.alerts('context-refusal').length, 1, "the failure's own alert");
       } finally {
         await t.close();
       }
     });
   });
 
-  it('stores the note once: a restart inside the released turn compiles it where it was, with no second copy', async () => {
-    await withBacklog({ fitAt: 12 }, async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-restart-'));
-      const membrane = new SequentialStreamMembrane();
-      membrane.pushResponse(nearCapToolResponse());
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered after the restart' }]));
-      const framework = await AgentFramework.create({
-        storePath: join(tempDir, 'store'),
-        membrane: membrane.asMembrane(),
-        agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
-        modules: [new BlobToolModule()],
-        syncIntervalMs: 0,
-        maintenanceIntervalMs: 50,
-        errorPolicy: { maxRetries: 3, onInferenceError: (_error, _agent, attempt) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
-      });
-      const traces: TraceEvent[] = [];
-      framework.onTrace((e) => traces.push(e));
-      try {
-        framework.start();
-        framework.pushEvent({
-          type: 'external-message', source: 'test', content: [{ type: 'text', text: 'fetch it' }], metadata: {}, triggerInference: true,
-        } as unknown as ProcessEvent);
-        assert.ok(await pollUntil(() => storedText(framework).includes('Answered after the restart'), 10_000));
-        assert.ok(traces.some((e) => e.type === 'inference:held'), 'the turn was held first');
-        assert.ok(traces.some((e) => e.type === 'inference:stream_restarted'), 'and restarted inside the turn');
-        assert.equal(membrane.calls.length, 2);
-        const copies = (i: number) => JSON.stringify(membrane.calls[i]).split('[budget-hold]').length - 1;
-        assert.equal(copies(0), 1, 'the first compile after the release carries the note');
-        assert.equal(copies(1), 1, 'the restart\'s compile has it once, where it was stored');
-        assert.equal(stored(framework).filter((m) => m.text.includes('[budget-hold]')).length, 1);
-      } finally {
-        await framework.stop();
-        rmSync(tempDir, { recursive: true, force: true });
-      }
-    });
-  });
-
-  it('stores the note as the host\'s own row, which leaves the turn\'s routing as it was', async () => {
-    await withBacklog({ fitAt: 12 }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      type Routing = { triggerChannel?: unknown; locus?: string; engaged: Set<string>; pin?: string; destination: string | null; arrivals: unknown[] };
-      const routingNow = () => {
-        const r = (t.framework as unknown as { turnRouting: Map<string, Routing> }).turnRouting.get('prime');
-        return r && {
-          triggerChannel: r.triggerChannel, locus: r.locus, engaged: [...r.engaged].sort(), pin: r.pin,
-          destination: r.destination, arrivals: r.arrivals.length,
-        };
-      };
-      const atStart: unknown[] = [];
-      const afterCompile: unknown[] = [];
-      t.framework.onTrace((e) => {
-        if (e.type === 'inference:started') atStart.push(routingNow());
-        if (e.type === 'inference:completed') afterCompile.push(routingNow());
-      });
-      try {
-        await (t.framework as unknown as { handleMcplChannelIncoming: (e: unknown) => Promise<unknown> }).handleMcplChannelIncoming({
-          type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:guild:chanA', messageId: 'm-1',
-          author: { id: 'U1', name: 'owner' }, content: [{ type: 'text', text: 'Are you there?' }],
-          timestamp: new Date().toISOString(), metadata: {}, triggerInference: true,
-        });
-        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 10_000));
-        assert.equal(t.of('inference:held').length, 1);
-        assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the released compile carried the note');
-        const rows = (t.framework.getAgent('prime')!.getContextManager().queryMessages({}).messages as unknown as Array<{ metadata?: Record<string, unknown> }>)
-          .filter((m) => JSON.stringify(m).includes('[budget-hold]'));
-        assert.equal(rows.length, 1);
-        assert.equal(rows[0]!.metadata?.system, true, 'stored as the host\'s own row');
-        assert.equal(rows[0]!.metadata?.kind, 'context-injection');
-        assert.equal(afterCompile.length, 1);
-        const released = atStart[atStart.length - 1] as { triggerChannel?: unknown };
-        assert.deepEqual(released.triggerChannel, { serverId: 'discord', channelId: 'discord:guild:chanA' }, 'the released turn starts from the message\'s channel');
-        assert.deepEqual(afterCompile[0], released, 'and the stored note leaves its routing as it was');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('takes later wakes into the held turn, for one compile', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('First message');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        t.send('Second message, while held');
-        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000), 'the second wake joins the hold');
-        assert.equal(t.membrane.calls.length, 0, 'no compile while held, so no provider call');
-        assert.equal(t.of('inference:failed').length, 1, 'only the first refusal: the second wake never compiled while held');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        assert.equal(t.membrane.calls.length, 1, 'both wakes ran as one turn');
-        const request = JSON.stringify(t.membrane.calls[0]);
-        assert.ok(request.includes('First message') && request.includes('Second message, while held'));
-        assert.equal(t.of('inference:held').length, 1, 'the second wake joined the hold, and started none');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('keeps today\'s failure when nothing is pending: compression cannot change it', async () => {
-    await withBacklog({ readyAt: 0 }, async () => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000), 'the turn fails, as before the hold');
-          assert.deepEqual(t.of('inference:held'), []);
-          assert.equal(t.of('inference:exhausted')[0]!.errorType, 'over_budget');
-          assert.ok(storedText(t.framework).includes('[inference-failed]'), 'the agent gets the failure marker');
-          assert.ok(await pollUntil(() => lines.some((l) => l.includes('drain kicked for prime')), 3_000));
-          const kicks = lines.filter((l) => l.includes('drain kicked for prime'));
-          assert.ok(kicks.every((l) => l.startsWith('[inference-failed] drain kicked for prime (OverBudget breaker, ')),
-            `the breaker's kick logs as the breaker's: ${kicks.join(' | ')}`);
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('ends the hold when compression has nothing left to do and the context still does not fit, and the turn fails as a refused compile did', async () => {
-    await withBacklog({ readyAt: 20 }, async (backlog) => {
-      const policyErrors: Error[] = [];
-      const t = await residentTurn({ maintenanceIntervalMs: 50, policyErrors });
+  it('waits again quietly when a released start is refused while compression is still pending, with no failure marker and no hard-down', async () => {
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident();
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
-        assert.equal(noteCount(storedText(t.framework)), 0, "no note: compression made no room");
-        const exhausted = t.of('inference:exhausted')[0]!;
-        assert.equal(exhausted.errorType, 'over_budget');
-        assert.match(String(exhausted.error), /the turn was first held \d+ s ago; compression had nothing left to do and it still didn't fit/);
-        assert.equal(t.membrane.calls.length, 0);
-        const last = policyErrors.at(-1) as Error & { budget?: number; actual?: number };
-        assert.equal(last, backlog.thrown.at(-1), 'the error policy gets the refusal itself');
-        assert.equal(last.budget, 48_568, 'with its figures');
-        assert.match(last.message, /the turn was first held/);
+        assert.ok(await pollUntil(() => c.refusals >= 4), 'released starts were refused again');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
+        assert.equal(t.of('inference:held').length, 1, 'one hold');
+        assert.equal(t.alerts('context-refusal').length, 1, 'one alert');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.equal(t.of('inference:hold_ended')[0]!.waitedMs as number >= 0, true);
+        assert.ok(!t.stored().includes('[inference-failed]'), 'no failure marker');
+        assert.deepEqual(t.alerts('hard-down'), [], 'no hard-down');
+        assert.equal(notesStored(t), 1, 'refused releases stored no note');
       } finally {
         await t.close();
       }
     });
   });
 
-  const noteCases = [
-    { name: 'the spare covers the note', spare: 60, notePrice: 47, looks: 1, noted: true },
-    { name: 'the spare is short, and a deeper fold fits it', spare: 5, foldsDeeper: true, notePrice: 47, looks: 2, noted: true },
-    { name: 'the spare is short, and no deeper fold fits it', spare: 5, foldsDeeper: false, notePrice: 47, looks: 2, noted: false },
-    { name: 'the spare is short, and the look at the smaller budget fails', spare: 5, foldsDeeper: 'throws', notePrice: 47, looks: 2, noted: false },
-    { name: "the strategy can't price the note", spare: 5, notePrice: 'throws', looks: 1, noted: false },
-    { name: 'the strategy has no estimate', spare: 5, notePrice: 'none', looks: 1, noted: false },
-    { name: 'the preview gives no figures, and the smaller budget fits the note', notePrice: 47, looks: 2, noted: true },
-  ] as const;
-  for (const c of noteCases) {
-    it(`decides the note at the check that finds the fit: ${c.name}`, async () => {
-      await withBacklog({ spare: 'spare' in c ? c.spare : undefined, foldsDeeper: 'foldsDeeper' in c ? c.foldsDeeper : undefined, notePrice: 'notePrice' in c ? c.notePrice : undefined }, async (backlog) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-          const before = backlog.previewBudgets.length;
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs');
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-          const looked = (backlog.previewBudgets.slice(before) as Array<{ maxTokens: number }>).map((b) => b.maxTokens);
-          assert.equal(looked.length, c.looks);
-          if (c.looks === 2) assert.equal(looked[0]! - looked[1]!, 47, "the second look is at the budget less the note's price");
-          assert.equal(noteCount(JSON.stringify(turnCalls(t.membrane)[0])), c.noted ? 1 : 0);
-          assert.equal(noteCount(storedText(t.framework)), c.noted ? 1 : 0);
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  }
-
-  const dryNoteCases = [
-    { name: 'the note fits at the smaller budget', notePrice: 47, dryShort: false, smaller: true, noted: true },
-    { name: "the note fits at the smaller budget, beside the tool-result guard's reserve", notePrice: 47, dryShort: false, smaller: true, noted: true, reserve: 500 },
-    { name: "the note doesn't fit at the smaller budget", notePrice: 47, dryShort: true, smaller: true, noted: false },
-    { name: 'the strategy has no estimate', notePrice: 'none', dryShort: false, smaller: false, noted: false },
-  ] as const;
-  for (const c of dryNoteCases) {
-    it(`on the dry-compile path, decides the note by a dry compile at the budget less its price: ${c.name}`, async () => {
-      await withBacklog({ previewless: true, notePrice: c.notePrice, dryShort: c.dryShort }, async (backlog) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1, 5_000));
-          const agent = t.framework.getAgent('prime')!;
-          if ('reserve' in c) Object.defineProperty(agent.toolResultGuard, 'pendingWireReserveTokens', { get: () => c.reserve, configurable: true });
-          const next = agent.nextCompileBudget();
-          if ('reserve' in c) assert.equal(next.reserveForResponse, 4_000 + c.reserve, "premise: the next compile's budget carries the guard's reserve");
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs');
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-          const smaller = (backlog.dryBudgets as Array<{ maxTokens: number; reserveForResponse: number } | undefined>)
-            .filter((budget) => budget !== undefined && budget.maxTokens < next.maxTokens);
-          assert.deepEqual(smaller, c.smaller ? [{ maxTokens: next.maxTokens - 47, reserveForResponse: next.reserveForResponse }] : [],
-            "one dry compile at the next compile's budget less the note's price");
-          assert.equal(noteCount(JSON.stringify(turnCalls(t.membrane)[0])), c.noted ? 1 : 0);
-          assert.equal(noteCount(storedText(t.framework)), c.noted ? 1 : 0);
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  }
-
-  for (const c of [
-    { ending: 'its context fits', backlog: {}, fits: true },
-    { ending: 'compression has nothing left to do', backlog: { readyAt: 20 }, fits: false },
-  ] as const) {
-  it(`tells an agent addressed from another channel while its turn was held that the turn waited for compression, when the hold ends as ${c.ending}`, async () => {
-    await withBacklog(c.backlog, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const registry: Record<string, unknown> = {
-        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
-        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
-          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
-        getDefaultPublishChannel: () => null,
-        isChannelOpen: () => true,
-        getDescriptor: () => undefined,
-        getChannelTools: () => [],
-        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
-        nameShown: (channel: { channelId: string }) => channel.channelId,
-      };
-      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
-        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
-      });
+  it('runs once without the note when a released start that carried it is refused with nothing pending, whatever the error policy says', async () => {
+    await withCompression({ fitAt: 2, readyAt: 2, noteTips: true }, async (c) => {
+      const t = await resident({ policyRetries: 0 });
       try {
-        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        if (c.fits) {
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs');
-        } else {
-          assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000), 'the turn is exhausted');
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
+        assert.deepEqual(c.injections.slice(-2).map((i) => i.includes('framework:budget-hold')), [true, false], 'the note, then a run without it');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.equal(notesStored(t), 0);
+        assert.doesNotMatch(requestText(t.turnCalls()[0]), NOTE);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('when compression has nothing left and the context still does not fit, clears the wait, and the failure reaches the webhook and the trace', async () => {
+    await withWebhook(async (posts) => {
+      await withCompression({ fitAt: Infinity, readyAt: 2 }, async () => {
+        const t = await resident();
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1));
           assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
-        }
-        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
-        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
-        assert.ok(notice, `the released start announces the arrival: ${JSON.stringify(notices)}`);
-        assert.ok(notice!.includes('while your turn waited for compression'), `and says what the turn waited on: ${notice}`);
-        assert.ok(!notice!.includes('provider hold'), notice);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-  }
-
-  it('tells an agent addressed while a provider hold kept the start its budget hold released that the turn waited on a provider hold', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const registry: Record<string, unknown> = {
-        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
-        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
-          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
-        getDefaultPublishChannel: () => null,
-        isChannelOpen: () => true,
-        getDescriptor: () => undefined,
-        getChannelTools: () => [],
-        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
-        nameShown: (channel: { channelId: string }) => channel.channelId,
-      };
-      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
-        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
-      });
-      const recordWait = () => (t.framework as unknown as { recordProviderWait(agent: string, model: string, error: Error): unknown })
-        .recordProviderWait('prime', t.framework.getAgent('prime')!.model, new MembraneError({
-          type: 'rate_limit', retryable: true, retryAfterMs: Infinity, message: 'zz quota held until further notice', rawError: undefined,
-        }));
-      try {
-        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        recordWait();
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000), 'the budget hold releases the turn');
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(turnCalls(t.membrane).length, 0, 'premise: the provider wait keeps the released start');
-        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        t.framework.releaseProviderWait('prime');
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs once the wait is released');
-        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
-        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
-        assert.ok(notice, `the start announces the arrival: ${JSON.stringify(notices)}`);
-        assert.ok(notice!.includes('provider hold'), `and says what the turn waited on last: ${notice}`);
-        assert.ok(!notice!.includes('waited for compression'), notice);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("tells it the same where the scheduler lets a provider hold's kept start go itself, the hold's time having passed before its timer fired", async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const registry: Record<string, unknown> = {
-        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
-        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
-          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
-        getDefaultPublishChannel: () => null,
-        isChannelOpen: () => true,
-        getDescriptor: () => undefined,
-        getChannelTools: () => [],
-        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
-        nameShown: (channel: { channelId: string }) => channel.channelId,
-      };
-      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
-        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
-      });
-      const i = t.framework as unknown as {
-        pendingRequests: Array<Record<string | symbol, unknown>>;
-        providerAccelerationCooldowns: Map<string, { until: number; heldRequests: unknown[] }>;
-      };
-      const timer = setTimeout(() => {}, 60_000);
-      timer.unref?.();
-      try {
-        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        i.providerAccelerationCooldowns.set('prime', {
-          startedAt: Date.now(), until: Date.now() + 60_000, timer, heldRequests: [], reason: 'zz-provider', failures: 0,
-        } as never);
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000), 'the budget hold releases the turn');
-        assert.ok(await pollUntil(() => (i.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) >= 1, 2_000),
-          'premise: the provider hold keeps the released start');
-        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        assert.equal(turnCalls(t.membrane).length, 0, 'premise: nothing ran while the provider hold kept the start');
-        i.providerAccelerationCooldowns.get('prime')!.until = Date.now() - 1;
-        i.pendingRequests.push({ agentName: 'prime', reason: 'zz-wake', source: 'zz-server', timestamp: Date.now() });
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the scheduler lets the start go, and it runs');
-        assert.equal(i.providerAccelerationCooldowns.has('prime'), false, 'premise: the scheduler dropped the provider hold itself');
-        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
-        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
-        assert.ok(notice, `the start announces the arrival: ${JSON.stringify(notices)}`);
-        assert.ok(notice!.includes('provider hold'), `and says what the turn waited on last: ${notice}`);
-        assert.ok(!notice!.includes('waited for compression'), notice);
-      } finally {
-        clearTimeout(timer);
-        await t.close();
-      }
-    });
-  });
-
-  it('marks a budget release taken by a provider hold only where that hold lets go a start the release pushed', async () => {
-    await withBacklog({ stalled: true }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const i = t.framework as unknown as {
-        pendingRequests: Array<Record<string | symbol, unknown>>;
-        providerAccelerationCooldowns: Map<string, unknown>;
-        releaseBudgetHold(name: string, outcome: string, note: string | null): void;
-        releaseProviderAccelerationCooldown(name: string): void;
-      };
-      const providerHold = (held: unknown[]) => ({
-        startedAt: Date.now(), until: Date.now() - 1, timer: setTimeout(() => {}, 0), heldRequests: held, reason: 'zz', failures: 0,
-      });
-      const marked = () => (holdOf(t) as { providerTook?: true } | undefined)?.providerTook === true;
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        i.releaseBudgetHold('prime', 'fit', null);
-        const released = i.pendingRequests.at(-1)!;
-        assert.equal(holdOf(t)?.state, 'released', 'premise: the release pushed its start');
-        const clears = () => t.of('ops:alert').filter((e) => e.kind === 'context-hold-clear').length;
-        assert.equal(clears(), 0, 'the release keeps its clear until the turn leaves the hold');
-        i.providerAccelerationCooldowns.set('prime', providerHold([{ agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() }]));
-        i.releaseProviderAccelerationCooldown('prime');
-        assert.equal(marked(), false, 'a provider hold letting other requests go leaves the release unmarked');
-        assert.equal(clears(), 0);
-        i.providerAccelerationCooldowns.set('prime', providerHold([{ ...released }]));
-        i.releaseProviderAccelerationCooldown('prime');
-        assert.equal(marked(), true, 'one letting the released start go, as a copy of it, marks it');
-        assert.equal(clears(), 1, 'and the provider hold taking the turn ends its budget hold\'s episode');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('sends a released turn\'s clear when its hold is dropped before the start it released runs', async () => {
-    await withBacklog({ stalled: true }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const i = t.framework as unknown as {
-        releaseBudgetHold(name: string, outcome: string, note: string | null): void;
-        dropBudgetHold(name: string): void;
-      };
-      const clears = () => t.of('ops:alert').filter((e) => e.kind === 'context-hold-clear').length;
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        i.releaseBudgetHold('prime', 'fit', null);
-        assert.equal(holdOf(t)?.state, 'released', 'premise: released, its start not yet run');
-        assert.equal(clears(), 0);
-        i.dropBudgetHold('prime');
-        assert.equal(holdOf(t), undefined);
-        assert.equal(clears(), 1);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('names compression again for a released turn a provider hold let go and the budget then held again', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const registry: Record<string, unknown> = {
-        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
-        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
-          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
-        getDefaultPublishChannel: () => null,
-        isChannelOpen: () => true,
-        getDescriptor: () => undefined,
-        getChannelTools: () => [],
-        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
-        nameShown: (channel: { channelId: string }) => channel.channelId,
-      };
-      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
-        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
-      });
-      const recordWait = () => (t.framework as unknown as { recordProviderWait(agent: string, model: string, error: Error): unknown })
-        .recordProviderWait('prime', t.framework.getAgent('prime')!.model, new MembraneError({
-          type: 'rate_limit', retryable: true, retryAfterMs: Infinity, message: 'zz quota held until further notice', rawError: undefined,
-        }));
-      try {
-        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        recordWait();
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000), 'the budget hold releases the turn');
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(turnCalls(t.membrane).length, 0, 'premise: the provider wait keeps the released start');
-        backlog.fit = false;
-        t.framework.releaseProviderWait('prime');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'premise: its start is refused for budget again, and held');
-        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs once its context fits');
-        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
-        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
-        assert.ok(notice, `the start announces the arrival: ${JSON.stringify(notices)}`);
-        assert.ok(notice!.includes('while your turn waited for compression'), `and says what the turn waited on last: ${notice}`);
-        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
-          ['context-hold', 'context-hold-clear', 'context-hold', 'context-hold-clear'], 'the provider hold taking the released turn ended its episode, so the hold after it opened another');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("gives a held turn's pending work and its last change in healthSnapshot()", async () => {
-    await withBacklog({ stalled: true, pendingDescription: 'zz 3 chunks pending' }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const hold = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: Record<string, unknown> | null }> })
-        .agents.find((a) => a.name === 'prime')!.budgetHold!;
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        const first = hold();
-        assert.equal(first.pending, 'zz 3 chunks pending', "context-manager's description of its pending work, read now");
-        assert.equal(first.compressionChangedAt, first.since, 'nothing it watches has changed since it started');
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(hold().compressionChangedAt, first.since, 'a pass that changes nothing moves nothing');
-        backlog.pendingDescription = 'zz 2 chunks pending';
-        backlog.progress = 1;
-        assert.ok(await pollUntil(() => (hold().compressionChangedAt as number) > (first.since as number), 2_000), 'compression moving is a change it saw');
-        assert.equal(hold().pending, 'zz 2 chunks pending');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("stamps compressionChangedAt for compression that moved between the hold's start and its first look", async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      t.framework.onTrace((event) => {
-        if (event.type !== 'inference:held') return;
-        backlog.progress = 1;
-        const since = Date.now();
-        while (Date.now() <= since + 1) { /* the first look comes at least 2 ms after the hold's start */ }
-      });
-      const hold = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { since: number; compressionChangedAt: number } | null }> })
-        .agents.find((a) => a.name === 'prime')!.budgetHold!;
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => hold().compressionChangedAt > hold().since, 2_000), 'the first look stamps the move');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("gives nextCompileBudget()'s default as a frozen object, so a caller can't change another agent's", async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        const agent = t.framework.getAgent('prime')! as unknown as { nextCompileBudget(): { maxTokens: number } };
-        const first = agent.nextCompileBudget() as { maxTokens: number };
-        const was = first.maxTokens;
-        try {
-          assert.throws(() => { first.maxTokens = 1; }, TypeError);
-          assert.equal(agent.nextCompileBudget().maxTokens, was);
-        } finally {
-          if (first.maxTokens !== was) first.maxTokens = was;
-        }
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("keeps a held turn's compressionChangedAt at the change while a slow dry compile looks at it", async () => {
-    await withBacklog({ previewless: true, stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { compressionChangedAt: number } | null }> })
-        .agents.find((a) => a.name === 'prime')!.budgetHold!.compressionChangedAt;
-      let release: () => void = () => {};
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
-        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
-        const changed = Date.now();
-        backlog.progress = 1;
-        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 1, 2_000), 'a look starts its dry compile');
-        assert.ok(await pollUntil(() => changedAt() >= changed, 2_000), 'the change is stamped while that look waits');
-        const seen = changedAt();
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        assert.equal(changedAt(), seen, 'and not again by the passes while it waits');
-        const released = Date.now();
-        backlog.dryRunGate = undefined;
-        release();
-        assert.ok(seen <= released, 'stamped before the look ended');
-        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 0, 2_000));
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        assert.equal(changedAt(), seen, 'nor after it');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        release();
-        await t.close();
-      }
-    });
-  });
-
-  it("stamps a held turn's compressionChangedAt for a change back to the state its last verdict saw, and not for a pass with no change", async () => {
-    await withBacklog({ previewless: true, stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { compressionChangedAt: number } | null }> })
-        .agents.find((a) => a.name === 'prime')!.budgetHold!.compressionChangedAt;
-      let release: () => void = () => {};
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
-        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
-        const away = Date.now();
-        backlog.progress = 1;
-        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 1, 2_000), 'the change brings a look, whose dry compile waits');
-        assert.ok(await pollUntil(() => changedAt() >= away, 2_000), 'the change is stamped');
-        const first = changedAt();
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        const back = Date.now();
-        assert.ok(back > first, 'premise: the clock has moved past the first stamp');
-        backlog.progress = undefined;
-        assert.ok(await pollUntil(() => changedAt() >= back, 2_000), 'the return to the state the last verdict saw is stamped too, while the look still waits');
-        const second = changedAt();
-        backlog.dryRunGate = undefined;
-        release();
-        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 0, 2_000));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(changedAt(), second, 'and passes with no change stamp nothing');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        release();
-        await t.close();
-      }
-    });
-  });
-
-  it("keeps a held turn's compressionChangedAt where compression left it while messages keep arriving", async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { since: number; compressionChangedAt: number } | null }> })
-        .agents.find((a) => a.name === 'prime')!.budgetHold!;
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        const looks = backlog.previews;
-        for (let i = 0; i < 3; i++) {
-          t.send(`zz more traffic ${i}`);
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
-        assert.ok(backlog.previews > looks, 'premise: the hold saw the traffic and looked again');
-        assert.equal(changedAt().compressionChangedAt, changedAt().since, 'traffic moves nothing compression did');
-        const changed = Date.now();
-        backlog.progress = 1;
-        assert.ok(await pollUntil(() => changedAt().compressionChangedAt >= changed, 2_000), 'compression moving does');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('takes no new look for a suppressed row stored while a turn is held, and does for a row that shows', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const add = (text: string, suppressed: boolean) => (t.framework as unknown as {
-        addMessage(participant: string, content: unknown[], metadata?: unknown, opts?: unknown): unknown;
-      }).addMessage('user', [{ type: 'text', text }], {}, suppressed ? { suppressedBy: { rule: 'zz-rule', eventType: 'zz-event' } } : {});
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        const looks = backlog.previews;
-        const added: Array<Record<string, unknown> | undefined> = [];
-        t.framework.getAgent('prime')!.getContextManager().onMessage((event) => {
-          if (event.type === 'add') added.push(event.message.metadata as Record<string, unknown> | undefined);
-        });
-        add('zz a suppressed arrival', true);
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        assert.ok(added.some((metadata) => metadata?.suppressed !== undefined), 'premise: the suppressed row reached the store');
-        assert.equal(backlog.previews, looks, 'a row no compile renders brings no new look');
-        add('zz an arrival that shows', false);
-        assert.ok(await pollUntil(() => backlog.previews > looks, 2_000), 'a row that shows does');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('takes no new look for an edit of a suppressed row while a turn is held, and does for an edit of a row that shows', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const cm = t.framework.getAgent('prime')!.getContextManager();
-      const add = (text: string, suppressed: boolean) => (t.framework as unknown as {
-        addMessage(participant: string, content: unknown[], metadata?: unknown, opts?: unknown): unknown;
-      }).addMessage('user', [{ type: 'text', text }], {}, suppressed ? { suppressedBy: { rule: 'zz-rule', eventType: 'zz-event' } } : {});
-      const ids: Array<{ id: string; suppressed: boolean }> = [];
-      cm.onMessage((event) => {
-        if (event.type === 'add') ids.push({ id: event.message.id, suppressed: (event.message.metadata as Record<string, unknown> | undefined)?.suppressed !== undefined });
-      });
-      try {
-        add('zz a suppressed row', true);
-        add('zz a row that shows', false);
-        const suppressed = ids.find((row) => row.suppressed)?.id;
-        const shown = ids.find((row) => !row.suppressed)?.id;
-        assert.ok(suppressed && shown, 'premise: both rows are stored, one suppressed');
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        const looks = backlog.previews;
-        cm.editMessage(suppressed!, [{ type: 'text', text: 'zz the suppressed row, edited' }]);
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        assert.equal(backlog.previews, looks, 'an edit of a row no compile renders brings no new look');
-        cm.editMessage(shown!, [{ type: 'text', text: 'zz the shown row, edited' }]);
-        assert.ok(await pollUntil(() => backlog.previews > looks, 2_000), 'an edit of a row that shows does');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("bounds the pending description in healthSnapshot() as the hold's start line bounds it", async () => {
-    await withBacklog({ stalled: true, pendingDescription: `zz ${'pending work '.repeat(300)}` }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const pending = String((t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { pending?: unknown } | null }> })
-          .agents.find((a) => a.name === 'prime')!.budgetHold!.pending);
-        assert.ok(pending.length <= 2_000 && pending.length > 1_000, `cut at 2,000 (${pending.length})`);
-        assert.match(pending, /characters omitted/);
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("releases a held list past the engine's spread limit without throwing, with every request in the queue", async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const hold = holdOf(t)!;
-        const now = Date.now();
-        for (let i = 0; i < 249_999; i++) hold.heldRequests.push({ agentName: 'prime', reason: 'zz-wake', timestamp: now + i } as unknown as HeldRequest);
-        const release = (t.framework as unknown as { releaseBudgetHold: (agentName: string, outcome: 'fit') => void }).releaseBudgetHold.bind(t.framework);
-        assert.doesNotThrow(() => release('prime', 'fit'));
-        assert.equal(t.internal.pendingRequests.filter((r) => (r as { reason?: string }).reason === 'zz-wake').length, 249_999);
-        assert.equal(t.of('inference:hold_ended')[0]!.heldRequests, 250_000);
-        const kept = t.internal.pendingRequests.filter((r) => (r as { reason?: string }).reason !== 'zz-wake');
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length, ...kept);
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 5_000), 'the turn runs');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("ends a stopped held turn whose list is past the engine's spread limit, putting every wake back in the queue", async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const hold = holdOf(t)!;
-        const now = Date.now();
-        for (let i = 0; i < 249_999; i++) hold.heldRequests.push({ agentName: 'prime', reason: 'zz-wake', timestamp: now + i } as unknown as HeldRequest);
-        let stopped = false;
-        assert.doesNotThrow(() => { stopped = t.framework.abortInference('prime'); });
-        assert.equal(stopped, true);
-        assert.equal(t.internal.pendingRequests.filter((r) => (r as { reason?: string }).reason === 'zz-wake').length, 249_999);
-        const kept = t.internal.pendingRequests.filter((r) => (r as { reason?: string }).reason !== 'zz-wake');
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length, ...kept);
-        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the turn ends');
-        assert.equal(holdOf(t), undefined);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("holds a turn whose compression an until-released provider wait stops, however long, alerted once by that wait, and runs it once release-provider-wait lets compression on", async (tc) => {
-    tc.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
-    const settle = async () => { for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve)); };
-    const step = async (ms: number) => { tc.mock.timers.tick(ms); await settle(); };
-    const until = async (done: () => boolean, what: string) => {
-      for (let stepped = 0; !done(); stepped += 1_000) {
-        if (stepped >= 5 * 60_000) assert.fail(`${what} didn't happen within 5 min of the mocked clock`);
-        await step(1_000);
-      }
-    };
-    const strategy = PassthroughStrategy.prototype as unknown as { releaseCompressionPause?: (model?: string) => boolean; estimateTokens?: () => number };
-    try {
-      await withCompressionCalls({ fitAt: 2, workUntil: 2 }, async (c) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 60_000 });
-        strategy.releaseCompressionPause = () => { c.pauseAfter = Infinity; return true; };
-        strategy.estimateTokens = () => 47;
-        const complete = t.membrane.complete.bind(t.membrane);
-        let compressionCalls = 0;
-        t.membrane.complete = async (request: NormalizedRequest) => {
-          if (compressionCalls++ === 0) {
-            c.pauseAfter = c.started;
-            throw new MembraneError({
-              type: 'rate_limit', retryable: true, retryAfterMs: Infinity,
-              message: 'zz quota held until further notice', rawError: undefined,
-            });
-          }
-          return complete(request);
-        };
-        const alerts = (kind: string) => t.of('ops:alert').filter((e) => e.kind === kind);
-        try {
-          t.send('Are you there?');
-          await until(() => alerts('provider-wait').length === 1, "the wait's alert");
-          for (let minute = 0; minute < 180; minute++) await step(60_000);
-          assert.equal(holdOf(t)?.state, 'holding', 'still held three hours on');
-          assert.equal(alerts('provider-wait').length, 1, 'alerted once, by the wait');
-          assert.match(String(alerts('provider-wait')[0]!.message), /holds until an operator releases it/);
-          assert.deepEqual(alerts('context-refusal'), [], 'the hold raises no refusal alert');
-          assert.equal(alerts('context-hold').length, 1, 'and its own alert once, at its start');
-          assert.equal(compressionCalls, 1, 'no compression call while the wait holds');
-          assert.equal(turnCalls(t.membrane).length, 0);
-          t.framework.releaseProviderWait('prime');
-          await until(() => turnCalls(t.membrane).length === 1, 'the turn to run once compression lands');
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-          assert.match(JSON.stringify(turnCalls(t.membrane)[0]), /so this turn waited 18\d min for compression to make room/);
-          await until(() => t.of('inference:completed').length === 1, 'the turn to complete');
-        } finally {
-          let closed = false;
-          void t.close().finally(() => { closed = true; });
-          await until(() => closed, 'the framework to stop');
-        }
-      });
-    } finally {
-      delete strategy.releaseCompressionPause;
-      delete strategy.estimateTokens;
-      tc.mock.timers.reset();
-    }
-  });
-
-  it('keeps context-manager\'s word whole in the line that logs a hold\'s start up to that line\'s own bound, and logs the line without it when it can\'t be read', async () => {
-    const long = `zz ${'pending work '.repeat(300)}`;
-    const startLine = (lines: string[]) => lines.find((l) => l.startsWith('[budget-hold] agent=prime compile refused'));
-    await withBacklog({ pendingDescription: long }, async (backlog) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-          const line = startLine(lines)!;
-          assert.match(line, /Held: this turn runs once a check finds its context fits its budget\. Compression: zz pending work/);
-          const word = line.slice(line.indexOf(' Compression: ') + ' Compression: '.length);
-          assert.ok(long.length > 2_000 && word.length <= 2_000 && word.length > 1_000, `the description is cut at the log's own bound (${word.length})`);
-          assert.match(word, /characters omitted/);
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        } finally {
-          await t.close();
-        }
-      });
-    });
-    await withBacklog({ pendingWorkError: new Error('zz readiness unreadable') }, async (backlog) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the turn is held all the same');
-          const line = startLine(lines)!;
-          assert.ok(line.endsWith('Held: this turn runs once a check finds its context fits its budget.'), line);
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+          const clears = t.alerts('context-refusal-clear');
+          assert.equal(clears.length, 1);
+          assert.match(String(clears[0]!.message), /compression had nothing left to do/);
+          assert.deepEqual(t.of('ops:alert').map((e) => e.kind).filter((k) => String(k).startsWith('context-refusal')),
+            ['context-refusal', 'context-refusal-clear', 'context-refusal'], "the wait's open, its clear, then the failure's own");
+          assert.ok(await pollUntil(() => posts.length === 3));
+          assert.deepEqual(posts, ['context-refusal', 'context-refusal-clear', 'context-refusal']);
         } finally {
           await t.close();
         }
@@ -1448,2330 +335,412 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it("keeps a refusal's whole reason, up to the log's own bound, in the hold's trace, its log line and a surgery's refusal", async () => {
-    const tail = ` (head=0, tail=377, ${'zz-diagnostic=1, '.repeat(60)}rawPins: zz-inputs)`;
-    await withBacklog({ refusalTail: tail }, async (backlog) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-          const whole = String(overBudget().message);
-          assert.ok(whole.length > 1_000 && whole.length < 2_000, `premise: a reason past 300 characters and within 2,000 (${whole.length})`);
-          assert.equal(t.of('inference:held')[0]!.error, whole, "the trace carries the refusal's whole reason");
-          assert.ok(lines.some((l) => l.startsWith('[budget-hold] agent=prime compile refused') && l.includes(whole)), 'and so does the start line');
-          await assert.rejects(t.framework.switchBranch('main'), (error: Error) => error.message.includes(whole));
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('holds a later turn afresh after a hold that ended in failure, and after one that ran', async () => {
-    await withBacklog({ readyAt: 20 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+  it("presents a held first start's arrivals as they come, and one turn answers them all", async () => {
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident();
       try {
-        t.send('First');
-        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-        backlog.readyAt = Infinity;
-        t.send('Second');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'a failed turn\'s spent hold does not pass to the next turn');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        backlog.fit = false;
-        const before = Date.now();
-        t.send('Third');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 3, 5_000));
-        const third = t.of('inference:held')[2]!;
-        assert.ok((third.since as number) >= before, 'its own start, not the released turn\'s');
+        t.send('first');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        assert.equal(t.internal.hasTurn('prime'), false, 'the agent is idle while it waits');
+        t.send('second');
+        assert.ok(await pollUntil(() => t.windowText().includes('second')), 'an arrival is presented while the first start waits');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "its wake joins the hold");
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
+        assert.equal(t.turnCalls().length, 1, 'one turn');
+        assert.ok(requestText(t.turnCalls()[0]).includes('first') && requestText(t.turnCalls()[0]).includes('second'));
       } finally {
         await t.close();
       }
     });
   });
 
-  it('runs the turn when the check fails for another reason, and the clear names the check\'s error', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+  it('abortInference() ends a held turn, puts the wakes that joined it back in the queue, and clears the wait', async () => {
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident({ replies: ['Answered the second'] });
       try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        backlog.previewError = new Error('store read failed');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['check_failed']);
-        assert.equal(backlog.previewError, undefined, 'the preview met the error');
-        const clear = t.of('ops:alert').find((e) => e.kind === 'context-hold-clear');
-        assert.equal((clear?.data as Record<string, unknown> | undefined)?.cause, 'store read failed');
-        assert.match(String(clear?.message), /^the hold's check failed after \d+ s: the turn compiles again \(store read failed\)$/);
-        assert.equal(noteCount(JSON.stringify(t.membrane.calls[0])), 0, "no note: the check didn't find room");
-        assert.equal(noteCount(storedText(t.framework)), 0);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('paces compression with the maintenance timer off: the drain kick runs again until it fits', async () => {
-    await withBacklog({ fitAt: 20 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000),
-          'the kick goes on past its 8 ticks while compression is pending');
-        assert.ok(backlog.ticks >= 20);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('with the maintenance timer off, logs a hold\'s drain once and keeps one check queued at a time, however long it holds', async () => {
-    await withBacklog({ alwaysPending: true, stalled: true }, async (backlog) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 20 });
-        const fw = t.framework as unknown as { compressForBudgetHold: (agent: unknown) => void; overBudgetDrainAfter: Map<string, unknown[]> };
-        const compress = fw.compressForBudgetHold.bind(t.framework);
-        let rechecks = 0;
-        fw.compressForBudgetHold = (agent: unknown) => { rechecks++; compress(agent); };
-        let open!: () => void;
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && t.looks() >= 10, 5_000), 'ten looks, each after a drain the interval kicked');
-          assert.deepEqual(lines.filter((l) => l.includes('drain kicked for prime')),
-            ['[budget-hold] drain kicked for prime (budget hold, 1 ticks)'], 'one line, at the first kick');
-          backlog.tickGate = new Promise<void>((resolve) => { open = resolve; });
-          const firings = rechecks;
-          assert.ok(await pollUntil(() => rechecks >= firings + 6, 5_000), 'the interval fired while a drain waited on its tick');
-          assert.ok((fw.overBudgetDrainAfter.get('prime')?.length ?? 0) <= 1, 'one check queued behind the drain, not one per firing');
-          open();
-          backlog.alwaysPending = false;
-          backlog.stalled = false;
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        } finally {
-          open?.();
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('with the maintenance timer off, looks before each drive it paces, so a context that now fits runs without waiting for another call', async () => {
-    let release = () => {};
-    const further = new Promise<void>((resolve) => { release = resolve; });
-    await withCompressionCalls({ fitAt: 2, workUntil: 5, pauseAfter: 1 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1 && c.ticks >= 2
-          && t.internal.overBudgetDrains.size === 0, 3_000), 'held, after a drive that made one call and ended at a tick that started none');
-        c.gate = further;
-        c.gateCall = 2;
-        c.pauseAfter = Infinity;
-        c.landed = 2;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the context fit by the next firing, and the turn ran with a further call\'s landing still held back');
-        assert.equal(c.landed, 2, 'no further call landed before the turn ran');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        release();
-        await t.close();
-      }
-    });
-  });
-
-  it('drives compression itself from the hold\'s start, looking after each call, and runs the turn as soon as one makes it fit', async () => {
-    await withCompressionCalls({ fitAt: 12, workUntil: 20 }, async (c) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-            'the turn ran with no maintenance pass: the hold ticked on while each tick started a call');
-          assert.equal(c.landed, 12, 'it looked after each call, and the one that made the context fit was the last');
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-          assert.deepEqual(lines.filter((l) => l.includes('drain kicked for prime')),
-            ['[budget-hold] drain kicked for prime (budget hold, 12 ticks)'], 'one drive, logged as the hold\'s');
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('drives a conversation agent\'s compression as it drives a resident\'s', async () => {
-    await withCompressionCalls({ fitAt: 0, workUntil: 20 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      const fw = t.framework as unknown as {
-        conversationRouter: unknown;
-        createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
-      };
-      const fork = 'prime--chanA';
-      try {
-        fw.conversationRouter = {
-          templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
-          getBinding: () => undefined, closurePrompt: () => undefined,
-        };
-        await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
-        c.fitAt = 12;
-        t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);
-        assert.ok(await pollUntil(() => t.of('inference:completed').some((e) => e.agentName === fork), 3_000),
-          'the fork\'s turn ran with no maintenance pass');
-        assert.equal(c.landed, 12);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => [e.agentName, e.outcome]), [[fork, 'fit']]);
-      } finally {
-        fw.conversationRouter = undefined;
-        await t.close();
-      }
-    });
-  });
-
-  it('drives compression again when a call it didn\'t make lands, so compression under way at its start releases it with no pass', async () => {
-    let ownTick: (() => Promise<void>) | undefined;
-    let ticked = false;
-    await withCompressionCalls({ fitAt: 2, workUntil: 2, exclusive: true }, async (c) => {
-      const t = await residentTurn({
-        maintenanceIntervalMs: 3_600_000,
-        context: () => {
-          if (!ticked && ownTick) { ticked = true; void ownTick(); }
-          return 'status';
-        },
-      });
-      let land = () => {};
-      try {
-        const cm = t.framework.getAgent('prime')!.getContextManager() as unknown as { tick(): Promise<void> };
-        const landing = new Promise<void>((resolve) => { land = resolve; });
-        const complete = t.membrane.complete.bind(t.membrane);
-        t.membrane.complete = async (request) => { await landing; return complete(request); };
-        c.refused = true;
-        ownTick = () => cm.tick();
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1 && c.ticks >= 2
-          && t.internal.overBudgetDrains.size === 0 && t.looks() >= 1, 3_000),
-          'held, with the call begun during its turn still in flight, and the drive over at a tick that started none');
-        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-        assert.equal(storedText(t.framework).includes('Answered once it fit'), false, 'still held before the call lands');
-        land();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the call landing let the hold drive the call that made it fit, with no maintenance pass');
-        assert.equal(c.started, 2, 'the call under way, then the one the hold drove');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        land();
-        await t.close();
-      }
-    });
-  });
-
-  it('drives compression again when a call it didn\'t make lands for a conversation agent too', async () => {
-    await withCompressionCalls({ fitAt: 0, workUntil: 1, exclusive: true }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      const fw = t.framework as unknown as {
-        conversationRouter: unknown;
-        agents: Map<string, { getContextManager(): { tick(): Promise<void> } }>;
-        createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
-      };
-      const fork = 'prime--chanA';
-      let land = () => {};
-      try {
-        fw.conversationRouter = {
-          templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
-          getBinding: () => undefined, closurePrompt: () => undefined,
-        };
-        await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
-        const landing = new Promise<void>((resolve) => { land = resolve; });
-        const complete = t.membrane.complete.bind(t.membrane);
-        t.membrane.complete = async (request) => { await landing; return complete(request); };
-        c.fitAt = 2;
-        c.workUntil = 2;
-        c.refused = true;
-        void fw.agents.get(fork)!.getContextManager().tick();
-        assert.equal(c.started, 1, 'the fork\'s own compression call is in flight');
-        t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);
-        assert.ok(await pollUntil(() => t.of('inference:held').some((e) => e.agentName === fork) && c.ticks >= 2
-          && t.internal.overBudgetDrains.size === 0, 3_000), 'the fork\'s turn is held, and its drive is over');
-        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-        assert.equal(t.of('inference:completed').some((e) => e.agentName === fork), false, 'still held before the call lands');
-        land();
-        assert.ok(await pollUntil(() => t.of('inference:completed').some((e) => e.agentName === fork), 3_000),
-          'the fork\'s turn ran once the call landed, with no maintenance pass');
-        assert.equal(c.started, 2, 'the fork\'s call under way, then the one its hold drove');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => [e.agentName, e.outcome]), [[fork, 'fit']]);
-      } finally {
-        land();
-        fw.conversationRouter = undefined;
-        await t.close();
-      }
-    });
-  });
-
-  it('looks before it drives when a call it didn\'t make lands, so a context that call made fit runs without waiting for another', async () => {
-    let ownTick: (() => Promise<void>) | undefined;
-    let ticked = false;
-    let release = () => {};
-    const further = new Promise<void>((resolve) => { release = resolve; });
-    await withCompressionCalls({ fitAt: 1, workUntil: 3, exclusive: true, gate: further, gateCall: 2 }, async (c) => {
-      const t = await residentTurn({
-        maintenanceIntervalMs: 3_600_000,
-        context: () => {
-          if (!ticked && ownTick) { ticked = true; void ownTick(); }
-          return 'status';
-        },
-      });
-      let land = () => {};
-      try {
-        const cm = t.framework.getAgent('prime')!.getContextManager() as unknown as { tick(): Promise<void> };
-        const landing = new Promise<void>((resolve) => { land = resolve; });
-        const complete = t.membrane.complete.bind(t.membrane);
-        t.membrane.complete = async (request) => { await landing; return complete(request); };
-        c.refused = true;
-        ownTick = () => cm.tick();
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1 && c.ticks >= 2
-          && t.internal.overBudgetDrains.size === 0 && t.looks() >= 1, 3_000),
-          'held, with the call begun during its turn still in flight, and the drive over');
-        land();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the call that landed made the context fit, and the turn ran with a further call\'s landing still held back');
-        assert.equal(c.landed, 1, 'no further call landed before the turn ran');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        land();
-        release();
-        await t.close();
-      }
-    });
-  });
-
-  it('joins a breaker\'s drain a call lands during, when that call leaves it short, and looks once that drain ends', async () => {
-    let ownTick: (() => Promise<void>) | undefined;
-    let ticked = false;
-    await withCompressionCalls({ fitAt: 2, workUntil: 2, exclusive: true }, async (c) => {
-      const t = await residentTurn({
-        maintenanceIntervalMs: 3_600_000,
-        context: () => {
-          if (!ticked && ownTick) { ticked = true; void ownTick(); }
-          return 'status';
-        },
-      });
-      const fw = t.framework as unknown as { kickOverBudgetDrain(agentName: string, agent: unknown): string };
-      let land = () => {};
-      let letTick = () => {};
-      let letRest = () => {};
-      try {
-        const cm = t.framework.getAgent('prime')!.getContextManager() as unknown as { tick(): Promise<void> };
-        const landing = new Promise<void>((resolve) => { land = resolve; });
-        const complete = t.membrane.complete.bind(t.membrane);
-        t.membrane.complete = async (request) => { await landing; return complete(request); };
-        c.refused = true;
-        ownTick = () => cm.tick();
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1 && c.ticks >= 2
-          && t.internal.overBudgetDrains.size === 0 && t.looks() >= 1, 3_000),
-          'held, with the call begun during its turn still in flight, and the hold\'s drive over');
-        c.tickGate = new Promise<void>((resolve) => { letTick = resolve; });
-        const ticks = c.ticks;
-        assert.equal(fw.kickOverBudgetDrain('prime', t.framework.getAgent('prime')), 'kicking');
-        assert.ok(await pollUntil(() => c.ticks === ticks + 1, 3_000), 'the breaker\'s drain is at its first tick');
-        land();
-        assert.ok(await pollUntil(() => c.landed === 1, 3_000), 'the call landed during the breaker\'s drain');
-        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-        assert.equal(storedText(t.framework).includes('Answered once it fit'), false, 'still held while that drain runs');
-        c.tickGate = new Promise<void>((resolve) => { letRest = resolve; });
-        letTick();
-        assert.ok(await pollUntil(() => c.landed === 2 && c.ticks === ticks + 2, 3_000),
-          'the breaker\'s drain made call 2, the one that fits, and waits at its next tick');
-        await new Promise((r) => setTimeout(r, 20));
-        assert.deepEqual(t.of('inference:hold_ended'), [],
-          'still held after a later timer than any look call 2\'s landing could start: the hold joined that drain, so the fit waits for its end');
-        c.tickGate = undefined;
-        letRest();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the hold looked once that drain ended, with no maintenance pass');
-        assert.equal(c.started, 2);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        land();
-        letTick();
-        letRest();
-        await t.close();
-      }
-    });
-  });
-
-  it('drives compression itself once a drain kick it joined at its start has ended', async () => {
-    await withCompressionCalls({ fitAt: 12, workUntil: 12 }, async (c) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-        const fw = t.framework as unknown as {
-          maintenancePass: unknown;
-          kickOverBudgetDrain: (name: string, agent: unknown) => string;
-        };
-        let letGo = () => {};
-        try {
-          assert.ok(await pollUntil(() => fw.maintenancePass === null, 3_000), 'the start pass is done');
-          c.refused = true;
-          c.gate = new Promise<void>((resolve) => { letGo = resolve; });
-          assert.equal(fw.kickOverBudgetDrain('prime', t.framework.getAgent('prime')), 'kicking');
-          assert.ok(await pollUntil(() => c.started === 1, 3_000), 'the breaker\'s kick is in its first call');
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && (t.internal.budgetHolds.get('prime') as { checkQueued?: boolean } | undefined)?.checkQueued === true, 3_000),
-            'the hold joined the kick in flight');
-          letGo();
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-            'once the kick\'s eight ticks ended, the hold drove the rest with no maintenance pass');
-          assert.equal(c.landed, 12);
-          assert.ok(lines.includes('[budget-hold] drain kicked for prime (budget hold, 4 ticks)'), 'its own first drive logs as the hold\'s');
-        } finally {
-          letGo();
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('waits for a look already in flight before it ticks again', async () => {
-    await withCompressionCalls({ fitAt: 3, workUntil: 6, previewless: true, gateCall: 3 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      const fw = t.framework as unknown as { checkBudgetHold: (agentName: string) => Promise<void> };
-      let letGo = () => {};
-      let letLook = () => {};
-      try {
-        c.gate = new Promise<void>((resolve) => { letGo = resolve; });
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => c.started === 3, 3_000), 'the third call, which makes the context fit, is in flight');
-        c.dryRunGate = new Promise<void>((resolve) => { letLook = resolve; });
-        (holdOf(t) as unknown as { lookedAt?: string }).lookedAt = undefined;
-        void fw.checkBudgetHold('prime');
-        assert.ok((holdOf(t) as unknown as { checking?: unknown }).checking, 'the look\'s dry compile waits at its gate');
-        letGo();
-        assert.ok(await pollUntil(() => c.landed === 3, 3_000), 'the third call landed');
-        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-        assert.equal(c.started, 3, 'no call while the look was pending');
-        letLook();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
-        assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
-        assert.equal(c.landed, 3, 'no call after the one that made it fit');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        letGo();
-        letLook();
-        await t.close();
-      }
-    });
-  });
-
-  it('waits for a look in flight before the first tick of a drive', async () => {
-    await withCompressionCalls({ fitAt: 2, workUntil: 6, previewless: true, pauseAfter: 1 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      const fw = t.framework as unknown as {
-        checkBudgetHold: (agentName: string) => Promise<void>;
-        compressForBudgetHold: (agent: unknown) => void;
-      };
-      let letLook = () => {};
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => c.ticks >= 2 && t.internal.overBudgetDrains.size === 0, 3_000),
-          'a first drive made one call, then ended at a tick that started none');
-        assert.equal(c.started, 1);
-        c.fitAt = 1;
-        c.dryRunGate = new Promise<void>((resolve) => { letLook = resolve; });
-        (holdOf(t) as unknown as { lookedAt?: string }).lookedAt = undefined;
-        void fw.checkBudgetHold('prime');
-        assert.ok((holdOf(t) as unknown as { checking?: unknown }).checking, 'the look\'s dry compile waits at its gate');
-        c.pauseAfter = Infinity;
-        fw.compressForBudgetHold(t.framework.getAgent('prime'));
-        assert.equal(t.internal.overBudgetDrains.size, 1, 'the new drive is in flight');
-        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-        assert.equal(c.started, 1, 'the new drive started no call while the look was pending');
-        assert.equal(t.internal.overBudgetDrains.size, 1, 'and it is still waiting');
-        letLook();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
-        assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
-        assert.equal(c.started, 1, 'and none after it');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        letLook();
-        await t.close();
-      }
-    });
-  });
-
-  it('stops driving compression at a tick that starts no call, such as a paused lane\'s, and drives it again after the next maintenance pass', async () => {
-    await withCompressionCalls({ fitAt: 12, workUntil: 12, pauseAfter: 3 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => c.ticks >= 4 && t.internal.overBudgetDrains.size === 0, 3_000), 'the hold drove compression, and its drive ended');
-        assert.equal(c.ticks, 4, 'three ticks that each started a call, then one that started none, and no tick after it');
-        assert.equal(holdOf(t)?.state, 'holding');
-        c.pauseAfter = Infinity;
-        await t.framework.maintenanceTick();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'after the pass, whose eight ticks left it one call short, the hold drove compression on until it fit');
-        assert.equal(c.landed, 12);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('drives compression after a maintenance pass that made progress with no call of its own', async () => {
-    await withCompressionCalls({ fitAt: 2, workUntil: 2, pauseAfter: 0 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => c.ticks >= 1 && t.of('inference:held').length === 1
-          && t.internal.overBudgetDrains.size === 0, 3_000), 'held, and the hold\'s drive ended at a tick that started no call');
-        assert.equal(c.started, 0);
-        c.pauseAfter = Infinity;
-        c.mints = 1;
-        c.mayCall = () => t.internal.overBudgetDrains.size > 0;
-        await t.framework.maintenanceTick();
-        assert.equal(c.mints, 0, 'the pass landed a chunk with no call');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'after the pass, the hold drove the call that made it fit');
-        assert.equal(c.started, 1, 'one call, made in the hold\'s drive, since no call is made outside a drain');
-        assert.equal(c.landed, 2);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('reports a compression call that fails in a tick it drives as a maintenance pass reports one, and holds on', async () => {
-    await withCompressionCalls({ fitAt: 12, workUntil: 12 }, async (c) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-        const failures = () => t.of('ops:alert').filter((e) => e.kind === 'context-maintenance-failed');
-        const complete = t.membrane.complete.bind(t.membrane);
-        let calls = 0;
-        t.membrane.complete = async (request: NormalizedRequest) => {
-          if (++calls === 2) throw new Error('zz compression call failed');
-          return complete(request);
-        };
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => failures().length === 1, 3_000), 'the failure reached the operator');
-          assert.equal(failures()[0]!.agentName, 'prime');
-          assert.match(String(failures()[0]!.message), /zz compression call failed/);
-          assert.equal((failures()[0]!.data as { scope?: string }).scope, 'agent');
-          assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000));
-          assert.equal(c.ticks, 2, 'the failing tick ended the drive');
-          assert.equal(c.landed, 1);
-          assert.equal(failures().length, 1);
-          assert.deepEqual(lines.filter((l) => l.includes('drain kick failed')), [], 'the drive writes no failure line of its own');
-          assert.equal(holdOf(t)?.state, 'holding', 'the turn stays held');
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('reports a compression call\'s failure while a turn is held again after a drive without one, and the hold ends by itself once compression lands', async () => {
-    await withCompressionCalls({ fitAt: 12, workUntil: 12, pauseAfter: 3 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 50 });
-      const failures = () => t.of('ops:alert').filter((e) => e.kind === 'context-maintenance-failed');
-      const complete = t.membrane.complete.bind(t.membrane);
-      let calls = 0;
-      t.membrane.complete = async (request: NormalizedRequest) => {
-        calls++;
-        if (calls === 2 || calls === 4) throw new Error('zz compression call failed');
-        return complete(request);
-      };
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => failures().length === 1, 3_000), 'the first failure is reported');
-        assert.ok(await pollUntil(() => c.started === 3 && c.landed === 2 && t.internal.overBudgetDrains.size === 0, 3_000),
-          'a later drive\'s call landed, and that drive ended at a tick that started none');
-        c.pauseAfter = Infinity;
-        assert.ok(await pollUntil(() => failures().length === 2, 3_000), 'the same failure after it is reported again');
-        assert.equal(calls, 4);
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'compression lands, and the turn runs');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.equal(failures().length, 2);
-        assert.deepEqual(t.of('ops:alert').filter((e) => !['context-maintenance-failed', 'context-hold', 'context-hold-clear'].includes(String(e.kind))), [], 'no other alert');
-        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind), ['context-hold', 'context-hold-clear'], "and the hold's own, once each");
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('drives no further tick of an agent disposed while a tick it drove was in flight, and logs why it stopped', async () => {
-    await withCompressionCalls({}, async (c) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-        const fw = t.framework as unknown as {
-          conversationRouter: unknown;
-          createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
-        };
-        const fork = 'prime--chanA';
-        let letGo = () => {};
-        try {
-          fw.conversationRouter = {
-            templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
-            getBinding: () => undefined, closurePrompt: () => undefined,
-          };
-          c.fitAt = 0;
-          await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
-          c.fitAt = Infinity;
-          c.gate = new Promise<void>((resolve) => { letGo = resolve; });
-          t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);
-          assert.ok(await pollUntil(() => c.started === 1, 5_000), 'the hold\'s first tick has made its call');
-          t.framework.stopAgent(fork);
-          letGo();
-          assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
-          assert.equal(c.ticks, 1, 'no tick after the disposal');
-          assert.ok(lines.includes(`[budget-hold] drain kicked for ${fork} (budget hold, 1 ticks, stopped as the agent was disposed)`),
-            lines.filter((l) => l.includes('drain kicked')).join('\n'));
-        } finally {
-          letGo();
-          fw.conversationRouter = undefined;
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('drives no tick while a surgery holds the store, and logs why it stopped', async () => {
-    await withCompressionCalls({}, async (c) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-        const fw = t.framework as unknown as { surgeryHold: unknown };
-        let letGo = () => {};
-        try {
-          c.gate = new Promise<void>((resolve) => { letGo = resolve; });
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => c.started === 1, 5_000), 'the hold\'s first tick has made its call');
-          fw.surgeryHold = { verb: 'rollback', agentName: 'other', since: Date.now() };
-          letGo();
-          assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
-          assert.equal(c.ticks, 1, 'no tick while the store is held');
-          assert.ok(lines.includes('[budget-hold] drain kicked for prime (budget hold, 1 ticks, stopped while a surgery holds the store)'),
-            lines.filter((l) => l.includes('drain kicked')).join('\n'));
-          assert.equal(holdOf(t)?.state, 'holding');
-        } finally {
-          fw.surgeryHold = null;
-          letGo();
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('with the maintenance timer off, a backlog that never moves costs a kick an interval, not a loop', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 100 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const since = Date.now();
-        assert.ok(await pollUntil(() => backlog.ticks >= 16, 5_000), 'it does kick again');
-        await new Promise((r) => setTimeout(r, 300));
-        const intervals = Math.ceil((Date.now() - since) / 100) + 1;
-        assert.ok(backlog.ticks <= intervals + 1, `${backlog.ticks} ticks in ${intervals} intervals: one a kick, as its tick starts no call`);
-        assert.ok(backlog.previews <= intervals + 1, `${backlog.previews} checks in ${intervals} intervals`);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('with the maintenance timer off and the provider gate closed, looks again an interval later', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 50 });
-      const open = t.internal.providerGateBlocked.bind(t.framework);
-      let blocked = true;
-      t.internal.providerGateBlocked = (name: string) => (name === 'prime' && blocked) || open(name);
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await new Promise((r) => setTimeout(r, 200));
-        assert.equal(backlog.ticks, 0, 'no kick while the gate is closed: its calls would park there');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000),
-          'the hold looked again an interval later, with the gate still closed, and released the turn');
-        assert.equal(backlog.ticks, 0);
-        blocked = false;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('keeps the held turn alive: the host reads it as undrained, its status shows the hold, and a surgery is refused naming it', async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const status = t.framework.getHostModeStatus();
-        assert.equal(status.drained, false, 'a held turn is a turn alive');
-        assert.deepEqual(status.activeTurnAgents, ['prime']);
-        const agents = (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: Record<string, unknown> | null }> }).agents;
-        const hold = agents.find((a) => a.name === 'prime')!.budgetHold;
-        assert.ok(hold, 'the status names the hold');
-        assert.equal(hold!.errorType, 'over_budget');
-        assert.equal(hold!.heldRequests, 1);
-        assert.equal(status.gatedRequests, 0, 'the turn\'s own retry is no gated wake');
-        t.send('Joined while held');
-        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
-        assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'a wake that joined the hold waits to start');
-        await assert.rejects(t.framework.switchBranch('main'), (e: Error) => {
-          assert.equal((e as Error & { code?: string }).code, 'agent-busy');
-          assert.match(e.message, /prime is idle\+turn-alive \(a budget hold keeps its turn to start again once its context fits: Compile plan would exceed hard budget/);
-          assert.match(e.message, /end it with quiesce with abandon: true/);
-          return true;
-        });
-        assert.equal(heldRequests(t.framework), 2, 'the turn is still held');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('refuses a rollback while a turn is held, so the turn never runs on history rewound under it', async () => {
-    await withBacklog({ fit: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50, responses: 2 });
-      try {
-        t.send('First');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        const msgs = t.framework.getAgent('prime')!.getContextManager().queryMessages({}).messages as unknown as Array<{ id: unknown }>;
-        const answer = String(msgs[msgs.length - 1]!.id);
-        backlog.fit = false;
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        await assert.rejects(t.framework.rollbackToMessage('prime', { messageId: answer }), (e: Error) => {
-          assert.equal((e as Error & { code?: string }).code, 'agent-busy');
-          assert.match(e.message, /prime is idle\+turn-alive \(a budget hold/);
-          return true;
-        });
-        assert.ok(storedText(t.framework).includes('Are you there?'), 'the held turn\'s message is still on the branch');
-        backlog.fit = true;
-        t.send('Still there?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered turn 2'), 5_000));
-        assert.ok(JSON.stringify(t.membrane.calls[1]).includes('Are you there?'), 'the released turn reads the message it was held for');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('stops the hold\'s drive once stop() begins, and starts no drive after it', async () => {
-    await withCompressionCalls({}, async (c) => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-        const fw = t.framework as unknown as {
-          overBudgetDrainAfter: Map<string, unknown[]>;
-          kickOverBudgetDrain: (name: string, agent: unknown, after?: () => void, by?: 'breaker' | 'hold') => string;
-        };
-        let letGo = () => {};
-        let stopping: Promise<void> | undefined;
-        try {
-          c.gate = new Promise<void>((resolve) => { letGo = resolve; });
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1, 5_000),
-            'the hold\'s drive is in its first call');
-          let stopped = false;
-          stopping = t.close().then(() => { stopped = true; });
-          await new Promise((r) => setTimeout(r, 200));
-          assert.equal(stopped, false, 'stop() waits for the tick in flight');
-          const waiting = fw.overBudgetDrainAfter.get('prime')?.length ?? 0;
-          assert.equal(fw.kickOverBudgetDrain('prime', t.framework.getAgent('prime'), () => {}, 'hold'),
-            'not kicked: the framework is stopping');
-          assert.equal(fw.overBudgetDrainAfter.get('prime')?.length ?? 0, waiting, 'and keeps no callback');
-          letGo();
-          await stopping;
-          assert.equal(c.ticks, 1, 'the drive ticked no more once stop() began, though its tick had made a call');
-          const kicks = lines.filter((l) => l.includes('drain kicked for prime'));
-          assert.deepEqual(kicks, ['[budget-hold] drain kicked for prime (budget hold, 1 ticks, stopped as the framework stops)']);
-        } finally {
-          letGo();
-          await (stopping ?? t.close());
-        }
-      });
-    });
-  });
-
-  it('joins a drain kick already in flight: no second kick, and the hold looks when it ends', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      const fw = t.framework as unknown as {
-        maintenancePass: unknown;
-        overBudgetDrains: Set<Promise<void>>;
-        overBudgetDrainAfter: Map<string, unknown[]>;
-        kickOverBudgetDrain: (name: string, agent: unknown, after?: () => void, by?: 'breaker' | 'hold') => string;
-      };
-      const proto = ContextManager.prototype as unknown as Patchable;
-      let letGo = () => {};
-      try {
-        assert.ok(await pollUntil(() => fw.maintenancePass === null, 3_000), 'the start pass is done');
-        const gate = new Promise<void>((resolve) => { letGo = resolve; });
-        proto.tick = async function () { backlog.ticks++; await gate; };
-        const before = backlog.ticks;
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.ticks === before + 1, 5_000),
-          'the hold\'s kick is in its first tick');
-        assert.equal(fw.overBudgetDrains.size, 1);
-        let joined = 0;
-        assert.equal(fw.kickOverBudgetDrain('prime', t.framework.getAgent('prime'), () => { joined++; }, 'hold'),
-          'already draining');
-        assert.equal(fw.overBudgetDrains.size, 1, 'no second kick starts');
-        assert.equal(fw.overBudgetDrainAfter.get('prime')?.length, 2, 'its callback waits beside the hold\'s own');
-        const asked = t.looks();
-        letGo();
-        assert.ok(await pollUntil(() => joined === 1 && !fw.overBudgetDrainAfter.has('prime'), 3_000),
-          'both callbacks ran when the kick ended');
-        assert.ok(t.looks() > asked, 'the hold looked when the kick ended');
-        assert.equal(backlog.ticks, before + 1, 'one drive, which ended at its tick that started no call');
-        assert.ok(await pollUntil(() => fw.overBudgetDrains.size === 0, 1_000), 'and the one kick has left the drains');
-      } finally {
-        letGo();
-        await t.close();
-      }
-    });
-  });
-
-  it('keeps holding where a dry compile would resolve but the preview says the context does not fit', async () => {
-    await withBacklog({ dryRunResolves: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 3, 5_000));
-        assert.deepEqual(t.of('inference:hold_ended'), [], 'held through each look');
-        assert.equal(backlog.compiles, 1, 'and never released into the refusal');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('asks for its verdict with the thinking binding the turn\'s compile carries, from the preview and from a dry compile', async () => {
-    for (const previewless of [false, true]) {
-      await withBacklog({ fitAt: 12, previewless }, async (backlog) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50, thinkingBinding: { binds: true, dropBlock: true } });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 10_000));
-          const binding = { binds: true, dropBlock: true, participant: 'prime' };
-          assert.deepEqual(backlog.bindings.compile, [binding, binding], 'the refused compile and the released one');
-          const asked = previewless ? backlog.bindings.dryRun : backlog.bindings.preview;
-          assert.ok(asked.length >= 1);
-          for (const given of asked) assert.deepEqual(given, binding);
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit'], 'the verdict was a fit, not a failed check');
-        } finally {
-          await t.close();
-        }
-      });
-    }
-  });
-
-  it('lets a dry verdict release only the hold phase it was taken for', async () => {
-    await withBacklog({ previewless: true, alwaysPending: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      let release: () => void = () => {};
-      t.framework.onTrace((event) => {
-        if (event.type === 'inference:held' && t.of('inference:held').length === 2) backlog.fit = false;
-      });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
-        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
-        backlog.fit = true;
-        backlog.progress = 1;
-        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 1, 2_000), 'premise: a dry compile that found a fit waits');
-        backlog.dryRunGate = undefined;
-        backlog.refuseCompiles = 1;
-        backlog.previewless = false;
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'premise: a preview released the hold, and the turn was held again');
-        assert.equal(backlog.dryRunsRunning, 1, 'premise: the first phase\'s dry compile still waits');
-        const ended = t.of('inference:hold_ended').length;
-        release();
-        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 0, 2_000));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(t.of('inference:hold_ended').length, ended, "the first phase's fit releases nothing of the second");
-        assert.equal(holdOf(t)?.state, 'holding');
-      } finally {
-        release();
-        await t.close();
-      }
-    });
-  });
-
-  it('falls back to a dry compile for a strategy with no preview, one at a time, and lands a fit', async () => {
-    await withBacklog({ previewless: true, dryRunMs: 300, fitAt: 40, readyAt: 40 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000),
-          'the turn runs soon after the fit');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit'],
-          'a refusal decided before compression finished is not taken for nothing pending');
-        assert.ok(backlog.dryRuns >= 1 && backlog.previews >= 1, 'the preview had nothing to say, and a dry compile decided');
-        assert.equal(backlog.mostDryRunsRunning, 1, 'one dry compile at a time');
-        assert.ok(backlog.dryRunsAcrossFit >= 1, 'a dry compile began before the fit and ended after it, which is what this test is for');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('on the fallback path, looks again at the next pass after a message a dry compile straddled', async () => {
-    await withBacklog({ previewless: true, stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
-        let release!: () => void;
-        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
-        const dryRuns = backlog.dryRuns;
-        t.send('A message while held');
-        assert.ok(await pollUntil(() => backlog.dryRuns === dryRuns + 1, 2_000));
-        backlog.fit = true;
-        t.send('A second message while held');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('A second message while held'), 2_000));
-        backlog.dryRunGate = undefined;
-        release();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the stale refusal stood only until the next pass, which the second message had given something new to look at');
-        assert.equal(backlog.mostDryRunsRunning, 1);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('on the fallback path, sets aside a refusal that compression coming back made stale', async () => {
-    await withBacklog({ previewless: true, noProgress: true, alwaysPending: true, readyAt: 0 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
-        let release!: () => void;
-        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
-        const dryRuns = backlog.dryRuns;
-        backlog.alwaysPending = false;
-        assert.ok(await pollUntil(() => backlog.dryRuns === dryRuns + 1, 2_000));
-        backlog.alwaysPending = true;
-        backlog.dryRunGate = undefined;
-        release();
-        await new Promise((r) => setTimeout(r, 300));
-        assert.deepEqual(t.of('inference:hold_ended'), [], 'the stale refusal did not end the hold as one with nothing pending');
-        assert.deepEqual(t.of('inference:exhausted'), []);
-        backlog.fit = true;
-        t.send('Still there?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('on the fallback path, holds on when compression comes back during a dry compile that its progress does not show', async () => {
-    await withBacklog({ previewless: true, stalled: true, alwaysPending: true, readyAt: 0 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
-        let release!: () => void;
-        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
-        const dryRuns = backlog.dryRuns;
-        backlog.alwaysPending = false;
-        t.send('Still there?');
-        assert.ok(await pollUntil(() => backlog.dryRuns === dryRuns + 1, 2_000));
-        backlog.alwaysPending = true;
-        backlog.dryRunGate = undefined;
-        release();
-        await new Promise((r) => setTimeout(r, 300));
-        assert.deepEqual(t.of('inference:hold_ended'), [], 'the refusal met compression with work again, so the hold goes on');
-        assert.deepEqual(t.of('inference:exhausted'), []);
-        backlog.fit = true;
-        t.send('And now?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('refuses an undo while a turn is held, as a turn alive', async () => {
-    await withBacklog({ fit: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      try {
-        t.send('A turn that fits');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        backlog.fit = false;
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.throws(() => t.framework.undoLastTurn('prime'), (e: Error) => {
-          assert.equal((e as Error & { code?: string }).code, 'agent-busy');
-          assert.match(e.message, /Cannot undo: a turn of prime's is alive/);
-          return true;
-        });
-        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 2, 'the earlier turn and the held one are there to undo once it ends');
-        assert.ok(storedText(t.framework).includes('Are you there?'));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('makes one held turn one undo step, which keeps the inputs that joined it', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('First message');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        t.send('Second message, while held');
-        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
-        backlog.fit = true;
-        assert.ok(await turnOver(t));
-        assert.ok(storedText(t.framework).includes('Answered once it fit'));
-        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the refused start left no undo step of its own');
-        assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        const text = windowText(t.framework);
-        assert.ok(!text.includes('Answered once it fit'), 'the undo takes the reply out of the window');
-        assert.ok(text.includes('First message') && text.includes('Second message, while held'),
-          'and leaves both inputs in it: the released start recorded the checkpoint again after presenting them');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('makes a turn held on its error policy\'s retry one undo step too', async () => {
-    await withBacklog({ fit: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50, failFirstStream: () => { backlog.fit = false; } });
-      try {
-        t.send('First message');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the retry\'s compile is refused and held');
-        t.send('Second message, while held');
-        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
-        backlog.fit = true;
-        assert.ok(await turnOver(t));
-        assert.ok(storedText(t.framework).includes('Answered once it fit'));
-        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
-        assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        const text = windowText(t.framework);
-        assert.ok(!text.includes('Answered once it fit'), 'which takes the reply out of the window');
-        assert.ok(text.includes('First message'), 'and leaves the input its first start presented before its checkpoint');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('leaves a held turn that is stopped its own undo step, so an undo takes nothing from the turn before', async () => {
-    await withBacklog({ fit: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000, responses: 2 });
-      try {
-        t.send('First message');
-        assert.ok(await turnOver(t));
-        backlog.fit = false;
-        t.send('Second message');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.equal(t.framework.abortInference('prime'), true);
-        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000));
-        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 2, 'the turn before and the stopped one');
-        assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        const text = storedText(t.framework);
-        assert.ok(text.includes('Answered once it fit') && text.includes('Second message'), 'the undo takes the stopped turn alone');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('keeps the checkpoint of a turn held on its error policy\'s retry after its rounds ran, so its undo takes them', async () => {
-    const t = await heldRestart(['Answered once it fit'], { failsAfterTools: true });
-    try {
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the retry after the failed stream is refused and held');
-      assert.ok(toolBlocks(t.framework) >= 2, 'the turn\'s tool round is in its history');
-      t.fit();
-      assert.ok(await turnOver(t));
-      assert.ok(storedText(t.framework).includes('Answered once it fit'));
-      assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'one undo step for the turn');
-      assert.equal(t.framework.undoLastTurn('prime').undone, true);
-      assert.equal(windowToolBlocks(t.framework), 0, 'the undo takes the rounds the turn ran before its hold out of the window');
-      const text = windowText(t.framework);
-      assert.ok(!text.includes('Answered once it fit'), 'and the reply');
-      assert.ok(text.includes('fetch it'), 'and leaves the input its first start presented before its checkpoint');
-    } finally {
-      await t.close();
-    }
-  });
-
-  it('keeps the turn\'s one undo step when its tool-result guard\'s retry is held', async () => {
-    const t = await heldRestart(['Answered once it fit'], { guardRetry: true });
-    try {
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the guard\'s retry is refused and held');
-      assert.ok(toolBlocks(t.framework) >= 2, 'the round the guard\'s retry follows is in the turn\'s history');
-      t.fit();
-      assert.ok(await turnOver(t));
-      assert.ok(storedText(t.framework).includes('Answered once it fit'));
-      assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the turn\'s first start recorded its one undo step, and the hold gave none of it back');
-      assert.equal(t.framework.undoLastTurn('prime').undone, true);
-      assert.equal(windowToolBlocks(t.framework), 0, 'the undo takes the tool round the guard\'s retry followed out of the window');
-    } finally {
-      await t.close();
-    }
-  });
-
-  it('gives up the undo step of a start that reaches its compile while the hold waits', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('First message');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime'), 3_000));
-        const fw = t.framework as unknown as { startAgentStream: (agent: unknown, trigger: unknown, attempt: number) => Promise<unknown> };
-        await fw.startAgentStream(t.framework.getAgent('prime'), { agentName: 'prime', reason: 'test-start', source: 'test', timestamp: Date.now() }, 0);
-        assert.equal(t.of('inference:held').length, 1, 'it joined the hold rather than starting another');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the held turn is still one undo step');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('holds a released turn again with its first refusal\'s start when its own compile still refuses', async () => {
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 3 }, async () => {
-      await errorLines(async (lines) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-          const held = t.of('inference:held');
-          assert.equal(held.length, 3, 'each refusal of the released turn held it again');
-          assert.ok(held.every((e) => e.since === held[0]!.since), 'with the first refusal\'s start');
-          assert.deepEqual(t.of('inference:exhausted'), []);
-          assert.deepEqual(t.of('ops:alert').filter((e) => e.kind === 'context-refusal'), [], 'no context-refusal');
-          assert.equal(lines.filter((l) => l.includes('— Held: this turn runs once')).length, 1, 'one start line in the log');
-          assert.equal(lines.filter((l) => /\[budget-hold\] agent=prime released turn refused again \(over_budget\): .* — held again, as of its first hold \d+ s ago$/.test(l)).length, 2,
-            'and a line for each time it was held again');
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it("raises context-hold at a hold's start, naming the refusal and the way on, and its clear at the hold's end; a request that joins the held turn raises neither", async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const holdAlerts = () => t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold'));
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => holdAlerts().length === 1, 5_000));
-        const [start] = holdAlerts();
-        assert.equal(start!.kind, 'context-hold');
-        assert.equal(start!.agentName, 'prime');
-        assert.match(String(start!.message), /^turn held until compression makes room, since its compile was refused for budget: .+; a quiesce lets a held turn start when its hold ends and finish, so to go on sooner, end it with quiesce with abandon: true/);
-        assert.equal((start!.data as Record<string, unknown>).errorType, 'over_budget');
-        t.send('and another thing');
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(holdOf(t)?.heldRequests.length, 2, 'premise: the second request joined the held turn');
-        assert.equal(holdAlerts().length, 1, 'a join raises nothing');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
-        assert.deepEqual(holdAlerts().map((e) => e.kind), ['context-hold', 'context-hold-clear']);
-        assert.equal((holdAlerts()[1]!.data as Record<string, unknown>).outcome, 'fit');
-        assert.deepEqual(t.of('ops:alert').filter((e) => e.kind === 'context-refusal'), []);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('raises one context-hold and one clear for a turn released and held again, the clear once the turn runs, on the trace and to the webhook', async () => {
-    await withWebhook(async (posts) => {
-      await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 2 }, async () => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-          assert.equal(t.of('inference:held').length, 2, 'premise: held, then held again');
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit', 'fit'], 'the trace marks each hold');
-          assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
-            ['context-hold', 'context-hold-clear']);
-          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold', 'context-hold-clear']);
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('clears context-hold when compression has nothing left to do, and then raises context-refusal as an exhausted turn does', async () => {
-    await withBacklog({ readyAt: 20 }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
-        assert.deepEqual(t.of('ops:alert').filter((e) => ['context-hold', 'context-hold-clear', 'context-refusal'].includes(String(e.kind))).map((e) => e.kind),
-          ['context-hold', 'context-hold-clear', 'context-refusal']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('raises context-hold before its clear when a listener of inference:held ends the turn at once', async () => {
-    await withBacklog({ stalled: true }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      let ended = false;
-      t.framework.onTrace((event) => {
-        if (event.type === 'inference:held' && !ended) { ended = true; t.framework.abortInference('prime'); }
-      });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped'], 'premise: the listener ended the hold');
-        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
-          ['context-hold', 'context-hold-clear']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('raises one clear for a turn released, held again and then ended with nothing left for compression to do, before its exhaustion\'s context-refusal', async () => {
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 2 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      let held = 0;
-      t.framework.onTrace((event) => {
-        if (event.type === 'inference:held' && ++held === 2) {
-          backlog.fit = false;
-          backlog.alwaysPending = false;
-          backlog.readyAt = 0;
-        }
-      });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit', 'nothing_pending'], 'premise: released, held again, then nothing left to do');
-        assert.deepEqual(t.of('ops:alert').filter((e) => ['context-hold', 'context-hold-clear', 'context-refusal'].includes(String(e.kind))).map((e) => e.kind),
-          ['context-hold', 'context-hold-clear', 'context-refusal']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('posts no clear and no second context-hold to the ops webhook for a turn released and held again, so the last it sends while the turn is held is the start', async () => {
-    await withWebhook(async (posts) => {
-      await withBacklog({ stalled: true }, async (backlog) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        let ended = 0;
-        t.framework.onTrace((event) => {
-          if (event.type === 'inference:hold_ended' && ++ended === 1) backlog.fit = false;
-        });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'premise: released, then held again within the cooldown');
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          assert.equal(holdOf(t)?.state, 'holding', 'premise: the turn is held');
-          assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind), ['context-hold']);
-          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold']);
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it("reports a hold that a listener of its context-hold alert ends at once in order, on the trace and in what it sends the webhook", async () => {
-    await withWebhook(async (posts) => {
-      await withBacklog({ stalled: true }, async () => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        const order: string[] = [];
-        t.framework.onTrace((event) => {
-          if (event.type === 'ops:alert' && String(event.kind).startsWith('context-hold')) order.push(String(event.kind));
-          else if (event.type === 'inference:held' || event.type === 'inference:hold_ended') order.push(event.type);
-        });
-        let ended = false;
-        t.framework.onTrace((event) => {
-          if (event.type === 'ops:alert' && event.kind === 'context-hold' && !ended) { ended = true; t.framework.abortInference('prime'); }
-        });
-        try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000));
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped'], 'premise: the listener ended the hold');
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          assert.deepEqual(order, ['context-hold', 'inference:held', 'inference:hold_ended', 'context-hold-clear']);
-          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold', 'context-hold-clear']);
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  });
-
-  it('clears context-hold when the held turn is ended', async () => {
-    await withBacklog({ stalled: true }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.equal(t.framework.abortInference('prime'), true);
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 2_000));
-        const holdAlerts = t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold'));
-        assert.deepEqual(holdAlerts.map((e) => e.kind), ['context-hold', 'context-hold-clear']);
-        assert.equal((holdAlerts[1]!.data as Record<string, unknown>).outcome, 'stopped');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('does not release a turn its compile refused again until compression moves or the store changes', async () => {
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'released once, refused, and held again');
-        const compiles = backlog.compiles;
-        const asked = t.looks();
-        await new Promise((r) => setTimeout(r, 600));
-        assert.ok(t.looks() > asked, 'passes asked the hold to look');
-        assert.equal(t.of('inference:held').length, 2, 'no release on the same evidence, pass after pass');
-        assert.equal(backlog.compiles, compiles, 'and no compile refused for it');
-        t.send('A message while held');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 3, 3_000),
-          'a message is new evidence: the hold looks, releases, and holds again');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('looks again only once something that could make the context fit has changed', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        let previews = backlog.previews;
-        let asked = t.looks();
-        await new Promise((r) => setTimeout(r, 500));
-        assert.ok(t.looks() > asked, 'passes asked the hold to look');
-        assert.equal(backlog.previews, previews, 'and it took no verdict while nothing changed');
-        t.framework.updateAgentRuntimeSettings('prime', { contextBudgetTokens: 200_000 });
-        previews = backlog.previews;
-        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'it looks once the budget changes');
-        previews = backlog.previews;
-        asked = t.looks();
-        await new Promise((r) => setTimeout(r, 300));
-        assert.ok(t.looks() > asked);
-        assert.equal(backlog.previews, previews);
-        backlog.stalled = false;
-        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'and once compression moves');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('does not release a re-refused turn again on what its own start stored, an injection whose content changed included', async () => {
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, stalled: true }, async (backlog) => {
-      let starts = 0;
-      const t = await residentTurn({ maintenanceIntervalMs: 50, context: () => `status at start ${++starts}` });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'released once, refused, and held again');
-        const stored = (t.framework.getAgent('prime')!.getContextManager().queryMessages({}).messages as unknown as Array<{ content: Array<{ text?: string }> }>)
-          .filter((m) => (m.content[0]?.text ?? '').startsWith('status at start'));
-        assert.equal(stored.length, 2, 'each start stored the injection, changed');
-        const compiles = backlog.compiles;
-        await new Promise((r) => setTimeout(r, 600));
-        assert.equal(t.of('inference:held').length, 2, 'no release on what the released start stored');
-        assert.equal(backlog.compiles, compiles);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('does not release a re-refused turn again on the clock row its own start stored', async () => {
-    await withBacklog({ alwaysPending: true, stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50, clock: { intervalSeconds: 1 } });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        const cm = t.framework.getAgent('prime')!.getContextManager();
-        const clockRows = (): number => (cm.queryMessages({}).messages as unknown as Array<{ metadata?: { kind?: string } }>)
-          .filter((m) => m.metadata?.kind === 'clock').length;
-        const before = clockRows();
-        await new Promise((r) => setTimeout(r, 1_100));
-        backlog.fit = true;
-        backlog.refuseCompiles = Infinity;
-        const messages = cm.queryMessages({}).messages;
-        cm.editMessage(messages[messages.length - 1]!.id, [{ type: 'text', text: 'Hi?' }]);
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'released on the edit, refused, and held again');
-        assert.equal(clockRows(), before + 1, 'the released start stored a clock row, a boundary after the last');
-        const compiles = backlog.compiles;
-        await new Promise((r) => setTimeout(r, 600));
-        assert.equal(t.of('inference:held').length, 2, 'no release on the clock row the released start stored');
-        assert.equal(backlog.compiles, compiles);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('looks again when the budget its next compile plans at changes, as when a tool-result reserve settles', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      let reserve = 5_000;
-      const agent = t.framework.getAgent('prime') as unknown as { toolResultGuard: object };
-      Object.defineProperty(agent.toolResultGuard, 'pendingWireReserveTokens', { get: () => reserve, configurable: true });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        await new Promise((r) => setTimeout(r, 200));
-        const previews = backlog.previews;
-        const before = backlog.previewBudgets.at(-1) as { reserveForResponse: number };
-        reserve = 0;
-        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'a smaller reserve, which can make the context fit, brings a look');
-        assert.equal((backlog.previewBudgets.at(-1) as { reserveForResponse: number }).reserveForResponse, before.reserveForResponse - 5_000,
-          'at the budget the next compile plans at, with the reserve settled');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('for a strategy that reports no progress, does not release a re-refused turn again until compression finishes', async () => {
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, noProgress: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'released once, refused, and held again');
-        const compiles = backlog.compiles;
-        const asked = t.looks();
-        await new Promise((r) => setTimeout(r, 600));
-        assert.ok(t.looks() > asked, 'passes asked the hold to look');
-        assert.equal(t.of('inference:held').length, 2, 'no release pass after pass, with no progress to go on');
-        assert.equal(backlog.compiles, compiles);
-        backlog.alwaysPending = false;
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 2, 3_000), 'it looks again once nothing is pending');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('looks again when compression moved while a released turn compiled, though that compile was refused', async () => {
-    let let2: () => void = () => {};
-    const until = new Promise<void>((resolve) => { let2 = resolve; });
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 2, progress: 0, compileGate: { nth: 2, until } }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => backlog.compiles === 2, 5_000), 'released, and its compile has begun');
-        backlog.progress = 1;
-        let2();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000),
-          'the step that landed during the refused compile brought a look, which released the turn again');
-        assert.equal(t.of('inference:held').length, 2);
-      } finally {
-        let2();
-        await t.close();
-      }
-    });
-  });
-
-  it('looks again when a message is removed while held', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        await new Promise((r) => setTimeout(r, 200));
-        const previews = backlog.previews;
-        const asked = t.looks();
-        await new Promise((r) => setTimeout(r, 300));
-        assert.ok(t.looks() > asked, 'passes asked the hold to look');
-        assert.equal(backlog.previews, previews, 'and nothing had changed, so it took no verdict');
-        const cm = t.framework.getAgent('prime')!.getContextManager();
-        const messages = cm.queryMessages({}).messages;
-        cm.removeMessage(messages[messages.length - 1]!.id);
-        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'a removed message brings a look');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('looks again when a message is removed and another arrives between two looks', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        await new Promise((r) => setTimeout(r, 200));
-        const previews = backlog.previews;
-        const cm = t.framework.getAgent('prime')!.getContextManager();
-        const length = cm.getMessageCount();
-        const messages = cm.queryMessages({}).messages;
-        cm.removeMessage(messages[messages.length - 1]!.id);
-        cm.addMessage('User', [{ type: 'text', text: 'Still there?' }]);
-        assert.equal(cm.getMessageCount(), length, 'the store is as long as it was');
-        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'yet the removal brings a look');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('looks again when a message is edited while held', async () => {
-    await withBacklog({ stalled: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        await new Promise((r) => setTimeout(r, 200));
-        const previews = backlog.previews;
-        const cm = t.framework.getAgent('prime')!.getContextManager();
-        const messages = cm.queryMessages({}).messages;
-        cm.editMessage(messages[messages.length - 1]!.id, [{ type: 'text', text: 'Hi?' }]);
-        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'an edit, which can shrink the context, brings a look');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('ends a released turn refused with nothing pending as a hold whose context fit at its release', async () => {
-    let let2: () => void = () => {};
-    const until = new Promise<void>((resolve) => { let2 = resolve; });
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, compileGate: { nth: 2, until } }, async (backlog) => {
-      const clearsWhenAsked: number[] = [];
-      const t: Awaited<ReturnType<typeof residentTurn>> = await residentTurn({
-        maintenanceIntervalMs: 50,
-        policyAsked: () => clearsWhenAsked.push(t.of('ops:alert').filter((e) => e.kind === 'context-hold-clear').length),
-      });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => backlog.compiles === 2, 5_000), 'released, and its compile has begun');
-        backlog.alwaysPending = false;
-        let2();
-        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-        assert.equal(t.of('inference:held').length, 1, 'not held again');
-        assert.match(String(t.of('inference:exhausted')[0]!.error),
-          /the turn was first held \d+ s ago; its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do\)$/);
-        assert.deepEqual(t.of('ops:alert').filter((e) => ['context-hold', 'context-hold-clear', 'context-refusal'].includes(String(e.kind))).map((e) => e.kind),
-          ['context-hold', 'context-hold-clear', 'context-refusal']);
-        assert.equal(clearsWhenAsked[0], 1, 'the clear is out when the error policy is first asked about the refusal, not at the exhaustion');
-      } finally {
-        let2();
-        await t.close();
-      }
-    });
-  });
-
-  it('starts no hold for a compile refused once stop() has closed admission', async () => {
-    let let1: () => void = () => {};
-    const until = new Promise<void>((resolve) => { let1 = resolve; });
-    await withBacklog({ compileGate: { nth: 1, until } }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      t.send('Are you there?');
-      assert.ok(await pollUntil(() => backlog.compiles === 1, 5_000), 'the turn\'s compile has begun');
-      const closing = t.close();
-      assert.ok(await pollUntil(() => (t.framework as unknown as { providerAdmissionClosed: boolean }).providerAdmissionClosed, 2_000), 'premise: stop() has closed admission');
-      let1();
-      await closing;
-      assert.ok(await pollUntil(() => t.of('inference:failed').length === 1, 3_000), 'the compile was refused');
-      assert.deepEqual(t.of('inference:held'), [], 'and no hold began, since stop had closed admission');
-    });
-  });
-
-  it('holds a context refusal as it holds an over-budget one', async () => {
-    await withBacklog({ fitAt: 40, refusalName: 'UncoveredDropError' }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 10_000));
-        const held = t.of('inference:held');
-        assert.equal(held.length, 1);
-        assert.equal(held[0]!.errorType, 'context_refusal');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.deepEqual(t.of('inference:exhausted'), []);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('says when a spent turn was first held as of each refusal it reports', async () => {
-    let open!: () => void;
-    const until = new Promise<void>((resolve) => { open = resolve; });
-    await withBacklog({ readyAt: 20, compileGate: { nth: 2, until } }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
-        assert.equal(heldRequests(t.framework), undefined, 'a released turn is not waiting, so the status shows no hold');
-        (t.internal.budgetHolds as unknown as Map<string, { startedAt: number }>).get('prime')!.startedAt -= 600_000;
-        open();
-        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-        assert.match(String(t.of('inference:exhausted')[0]!.error), /the turn was first held 10 min ago; compression had nothing left to do/);
-      } finally {
-        open();
-        await t.close();
-      }
-    });
-  });
-
-  it('says a wait of minutes in minutes, in the note and in the failure', async () => {
-    type Times = { state: string; startedAt: number };
-    const times = (t: { internal: Internal }) => (t.internal.budgetHolds as unknown as Map<string, Times>).get('prime')!;
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        times(t).startedAt = Date.now() - 7 * 60_000;
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 5_000));
-        assert.ok(JSON.stringify(t.membrane.calls[0]).includes(
-          "[budget-hold] Your context didn't fit its budget (100,201 tokens against 48,568), so this turn waited 7 min for compression to make room."));
-      } finally {
-        await t.close();
-      }
-    });
-    let open!: () => void;
-    const until = new Promise<void>((resolve) => { open = resolve; });
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, compileGate: { nth: 2, until } }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => times(t)?.state === 'released' && backlog.compiles === 2, 5_000), 'released, and its compile has begun');
-        times(t).startedAt = Date.now() - 30 * 60_000;
-        backlog.alwaysPending = false;
-        open();
-        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-        assert.ok(String(t.of('inference:exhausted')[0]!.error).endsWith(
-          "(the turn was first held 30 min ago; its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do)"),
-          String(t.of('inference:exhausted')[0]!.error));
-      } finally {
-        open();
-        await t.close();
-      }
-    });
-  });
-
-  it('ends a released turn the inference policy declines: nothing of its hold reaches a later turn', async () => {
-    await withBacklog({}, async (backlog) => {
-      let decline = false;
-      const t = await residentTurn({ maintenanceIntervalMs: 50, inferencePolicy: { shouldInfer: () => !decline } });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const openLogical = (t.framework as unknown as { openLogical: Map<string, unknown> }).openLogical;
-        assert.ok(openLogical.has('prime'), 'the held turn\'s logical turn stays open');
-        decline = true;
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1 && t.internal.budgetHolds.size === 0, 3_000),
-          'released, declined, and its record gone');
-        assert.equal(t.membrane.calls.length, 0);
-        assert.ok(!openLogical.has('prime'), 'and the decline closed it');
-        decline = false;
-        t.send('A later turn');
-        assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 3_000));
-        assert.ok(!JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the later turn carries no note of the declined one\'s wait');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('ends a released turn that a stop reaches before it sends anything: its record goes, and a later turn gets no note of its own', async () => {
-    let open!: () => void;
-    const until = new Promise<void>((resolve) => { open = resolve; });
-    await withBacklog({ compileGate: { nth: 2, until } }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50, responses: 2 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => backlog.compiles === 2, 3_000), 'the hold released the turn into its compile');
-        assert.equal(t.framework.abortInference('prime'), true, 'a stop made while the released turn compiles is reported taken');
-        open();
-        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the stop ended the turn at the check after its compile');
-        assert.equal(t.of('inference:completed').length, 0, 'the stopped turn completed nothing');
-        assert.equal(t.internal.budgetHolds.size, 0, 'the hold\'s record went with the turn');
-        t.send('A later turn');
-        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 3_000), 'the later turn ran');
-        const later = t.membrane.calls[t.membrane.calls.length - 1];
-        assert.equal(JSON.stringify(later).split('[budget-hold]').length - 1, 1,
-          'the later turn reads the note the stopped turn\'s start stored, and gets none of its own');
-      } finally {
-        open();
-        await t.close();
-      }
-    });
-  });
-
-  it('ends a turn whose compile a stop reached, rather than holding it, when that compile is refused for budget', async () => {
-    let open!: () => void;
-    const until = new Promise<void>((resolve) => { open = resolve; });
-    await withBacklog({ compileGate: { nth: 1, until } }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => backlog.compiles === 1, 5_000), 'the turn is in its compile');
-        assert.equal(t.framework.abortInference('prime'), true, 'a stop made while the turn compiles is reported taken');
-        open();
-        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the stop ended the turn at its failure');
-        assert.equal(t.of('inference:held').length, 0, 'the refused turn was not held');
-        assert.equal(t.internal.budgetHolds.size, 0);
-        assert.equal(t.membrane.calls.length, 0, 'nothing was sent');
-      } finally {
-        open();
-        await t.close();
-      }
-    });
-  });
-
-  it('drops a held conversation agent\'s hold when the agent is ended through stopAgent', async () => {
-    await withBacklog({ fit: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const fw = t.framework as unknown as {
-        conversationRouter: unknown;
-        createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
-      };
-      const fork = 'prime--chanA';
-      try {
-        fw.conversationRouter = {
-          templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
-          getBinding: () => undefined, closurePrompt: () => undefined,
-        };
-        await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
-        backlog.fit = false;
-        t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);
-        assert.ok(await pollUntil(() => t.of('inference:held').some((e) => e.agentName === fork), 5_000), 'the fork\'s refused turn is held');
-        t.framework.stopAgent(fork);
-        assert.deepEqual(t.of('inference:hold_ended').filter((e) => e.agentName === fork).map((e) => e.outcome), ['stopped']);
-        assert.equal(t.internal.budgetHolds.has(fork), false, 'no hold is left under its name');
-        assert.deepEqual(t.internal.pendingRequests.filter((r) => r.agentName === fork), [], 'and nothing of its waits to run');
-
-        const second = 'prime--chanB';
-        backlog.fit = true;
-        await fw.createConversationAgent(second, { serverId: 'stub', channelId: 'chanB' });
-        (t.internal.budgetHolds as unknown as Map<string, unknown>).set(second, {
-          state: 'released', startedAt: Date.now(), heldRequests: [], errorType: 'over_budget', reason: 'zz',
-          budget: undefined, actual: undefined, checking: false, checkpoint: undefined,
-        });
-        t.framework.stopAgent(second);
-        assert.equal(t.internal.budgetHolds.has(second), false, 'a record its turn hasn\'t settled yet goes with the agent too');
-      } finally {
-        fw.conversationRouter = undefined;
-        await t.close();
-      }
-    });
-  });
-
-  it('holds a conversation agent\'s refused turn as it holds a resident\'s', async () => {
-    await withBacklog({ fit: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const fw = t.framework as unknown as {
-        conversationRouter: unknown;
-        createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
-      };
-      const fork = 'prime--chanA';
-      try {
-        fw.conversationRouter = {
-          templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
-          getBinding: () => undefined, closurePrompt: () => undefined,
-        };
-        await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
-        backlog.fit = false;
-        backlog.fitAt = backlog.ticks + 12;
-        t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);
-        assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 10_000), 'the fork\'s turn runs once its context fits');
-        const held = t.of('inference:held');
-        assert.deepEqual(held.map((e) => e.agentName), [fork], 'the fork\'s refused turn was held');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => [e.agentName, e.outcome]), [[fork, 'fit']]);
-        assert.deepEqual(t.of('inference:exhausted'), []);
-      } finally {
-        fw.conversationRouter = undefined;
-        await t.close();
-      }
-    });
-  });
-
-  it('leaves nothing of a hold after a restart: its messages stay, and the next wake compiles afresh', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'budget-hold-restart-'));
-    try {
-      await withBacklog({}, async (backlog) => {
-        const first = await residentTurn({ maintenanceIntervalMs: 50, storePath: join(dir, 'store') });
-        try {
-          first.send('Are you there?');
-          assert.ok(await pollUntil(() => first.of('inference:held').length === 1, 5_000));
-        } finally {
-          await first.close();
-        }
-        assert.deepEqual(first.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        backlog.fit = true;
-        const second = await residentTurn({ maintenanceIntervalMs: 50, storePath: join(dir, 'store') });
-        try {
-          assert.equal(heldRequests(second.framework), undefined, 'no hold after the restart');
-          assert.ok(storedText(second.framework).includes('Are you there?'), 'the held turn\'s message is in the store');
-          second.send('Still there?');
-          assert.ok(await pollUntil(() => second.membrane.calls.length === 1, 5_000));
-          const request = JSON.stringify(second.membrane.calls[0]);
-          assert.ok(request.includes('Are you there?') && request.includes('Still there?'),
-            'the next wake compiles afresh, from the store');
-          assert.deepEqual(second.of('inference:held'), []);
-        } finally {
-          await second.close();
-        }
-      });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('leaves an ephemeral run to fail as before: its caller is waiting', async () => {
-    await withBacklog({}, async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-eph-'));
-      const framework = await AgentFramework.create({
-        storePath: join(tempDir, 'store'),
-        membrane: new MockMembrane().asMembrane(),
-        agents: [],
-        modules: [],
-        syncIntervalMs: 0,
-        maintenanceIntervalMs: 50,
-        errorPolicy: { maxRetries: 3, onInferenceError: (_error, _agent, attempt) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
-      });
-      const traces: TraceEvent[] = [];
-      framework.onTrace((e) => traces.push(e));
-      try {
-        const { agent, contextManager } = await framework.createEphemeralAgent({
-          name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
-        });
-        contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
-        const run = framework.runEphemeralToCompletion(agent, contextManager);
-        framework.start();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const bound = new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error('the run was still waiting after 5 s')), 5_000);
-        });
-        try {
-          await assert.rejects(Promise.race([run, bound]), /exceed hard budget/);
-        } finally {
-          clearTimeout(timer);
-        }
-        assert.deepEqual(traces.filter((e) => e.type === 'inference:held'), []);
-      } finally {
-        await framework.stop();
-        rmSync(tempDir, { recursive: true, force: true });
-      }
-    });
-  });
-
-  it('holds a batch-only start\'s request as an ordinary cause, which no cancellation withdraws', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.internal.pendingRequests.push({
-          agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
-          coalescingSubject: 'zz-subject', coalescingBatch: true, coalescingBatchSubjects: ['zz-subject'],
-        } as unknown as { agentName: string });
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const held = holdOf(t)!.heldRequests;
-        assert.equal(held.length, 1);
-        assert.equal(held[0]!.coalescingBatch, undefined, 'no longer batch-only, so the released start keeps its turn');
-        assert.equal(held[0]!.coalescingBatchSubjects, undefined);
-        (t.framework as unknown as { cancelCoalescedWakes: (subject: string) => void }).cancelCoalescedWakes('zz-subject');
-        assert.equal(holdOf(t)!.heldRequests.length, 1, 'the turn keeps its own cause');
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('lets a withdrawn coalesced wake leave a hold, as it leaves a provider hold', async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        t.internal.pendingRequests.push({
-          agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(), coalescingSubject: 'zz-retracted',
-        } as unknown as { agentName: string });
-        assert.ok(await pollUntil(() => holdOf(t)?.heldRequests.length === 2, 5_000), 'the wake joins the hold');
-        (t.framework as unknown as { cancelCoalescedWakes: (subject: string) => void }).cancelCoalescedWakes('zz-retracted');
-        assert.deepEqual(holdOf(t)!.heldRequests.map((r) => r.coalescingSubject), [undefined], 'the withdrawn wake is gone, the turn\'s own stays');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('keeps a closing conversation\'s held closure turn from the reaper', async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const fw = t.framework as unknown as {
-        conversationRouter: unknown; lastConversationSweep: number; closingConversationAgents: Set<string>;
-        sweepExpiredConversations: () => void; agents: Map<string, unknown>;
-      };
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        fw.conversationRouter = { expired: () => [] };
-        fw.lastConversationSweep = 0;
-        fw.closingConversationAgents.add('prime');
-        fw.sweepExpiredConversations();
-        assert.ok(fw.agents.has('prime'), 'the held closure turn is unfinished work');
-        assert.ok(holdOf(t), 'and its hold stays');
-      } finally {
-        fw.closingConversationAgents.delete('prime');
-        fw.conversationRouter = undefined;
-        await t.close();
-      }
-    });
-  });
-
-  it('drops the hold\'s record when the released start fails outside its compile', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const fw = t.framework as unknown as { recordTurnCheckpoint: (name: string) => void };
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime'), 3_000));
-        const original = fw.recordTurnCheckpoint;
-        let failed = 0;
-        fw.recordTurnCheckpoint = function (this: unknown, name: string) {
-          if (failed++ === 0) throw new Error('ENOSPC: no space left on device');
-          return original.call(this, name);
-        };
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => failed > 0 && t.internal.budgetHolds.size === 0, 3_000),
-          'nothing of the failed turn\'s hold is left for the next');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('opens the event gate again when a held continuation resumes', async () => {
-    const proto = ContextManager.prototype as unknown as Patchable;
-    const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
-    let real = 0;
-    proto.compile = async function (this: unknown, ...args: unknown[]) {
-      const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
-      if (!dryRun && ++real === 2) {
-        throw Object.assign(new Error('Compile plan would exceed hard budget: budget=48568'), { name: 'OverBudgetError', budget: 48_568, actual: 49_000 });
-      }
-      return original.compile.apply(this, args);
-    };
-    proto.tick = async function () {};
-    proto.isReady = function () { return false; };
-    const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-gate-'));
-    const membrane = new SequentialStreamMembrane();
-    membrane.pushResponse(nearCapToolResponse());
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered after the restart' }]));
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'store'),
-      membrane: membrane.asMembrane(),
-      agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
-      modules: [new BlobToolModule()],
-      syncIntervalMs: 0,
-      maintenanceIntervalMs: 50,
-      gate: { config: { policies: [], default: 'skip' } },
-      errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
-    });
-    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
-    const traces: TraceEvent[] = [];
-    const inferringDuringResume: string[][] = [];
-    framework.onTrace((e) => {
-      traces.push(e);
-      if (e.type === 'inference:content_block' && traces.some((x) => x.type === 'inference:hold_ended')) {
-        inferringDuringResume.push(gate.inferenceDiagnostics().inferring);
-      }
-    });
-    try {
-      framework.start();
-      framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'fetch it' }]);
-      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now() });
-      assert.ok(await pollUntil(() => storedText(framework).includes('Answered after the restart'), 10_000));
-      const held = traces.filter((e) => e.type === 'inference:held');
-      assert.equal(held.length, 1, 'the restart\'s refused compile was held');
-      assert.ok(inferringDuringResume.length >= 1);
-      assert.ok(inferringDuringResume.every((names) => names.includes('prime')), 'the resumed turn is inferring at the gate, so its events buffer');
-      assert.ok(await pollUntil(() => !gate.inferenceDiagnostics().inferring.includes('prime'), 2_000), 'the gate closes when the turn ends');
-    } finally {
-      await framework.stop();
-      Object.assign(proto, original);
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('ends the held turn and drops the hold, its requests and what it left for the name, at stop and at disposal', async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      let closed = false;
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await t.close();
-        closed = true;
+        t.send('first');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2));
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.deepEqual(t.of('inference:aborted').map((e) => e.reason), ['zz-stop']);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.of('inference:aborted').length, 1, 'the stop ended the held turn');
-        assert.deepEqual(t.internal.pendingRequests.filter((r) => r.agentName === 'prime'), [], 'the held request went with the stop');
-        assert.equal(t.membrane.calls.length, 0);
-        assert.equal(t.internal.budgetHolds.size, 0);
-      } finally {
-        if (!closed) await t.close();
-      }
-    });
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        t.internal.disposeConversationAgent('prime');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.of('inference:aborted').length, 1, 'the disposal ended the held turn');
-        assert.equal(t.internal.budgetHolds.size, 0, 'a later agent of the name starts with none of it');
-        assert.deepEqual(t.internal.pendingRequests.filter((r) => r.agentName === 'prime'), []);
+        assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /was stopped/);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered the second')), 'the wake that joined runs as its own turn');
       } finally {
         await t.close();
       }
     });
   });
-  it('lets a quiesce wait for a held continuation, which runs once its hold ends while the wakes that joined it wait for resume', async () => {
-    const t = await heldRestart(['Answered after the restart', 'Answered the wake']);
-    try {
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 10_000), 'the restart is held');
-      t.internal.pendingRequests.push({ agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now() } as unknown as { agentName: string });
-      assert.ok(await pollUntil(() => holdOf(t)?.heldRequests.length === 2, 3_000), 'a wake joins the hold');
-      const status = await t.framework.quiesce({ reason: 'test', timeoutMs: 1_000 });
-      assert.equal(status.drained, false, 'the held turn is alive, so the drain waits for it');
-      assert.deepEqual(status.activeTurnAgents, ['prime']);
-      assert.equal(t.membrane.calls.length, 1);
-      t.fit();
-      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 5_000),
-        'the continuation runs while the host is quiesced, as a turn alive at the quiesce does');
-      assert.ok(await pollUntil(() => t.framework.getHostModeStatus().drained, 3_000), 'and the host is then drained');
-      assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'with the joined wake waiting');
-      assert.equal(t.membrane.calls.length, 2);
-      await t.framework.resume();
-      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered the wake'), 5_000), 'the wake runs at resume');
-      assert.equal(t.membrane.calls.length, 3);
-    } finally {
-      await t.close();
-    }
+
+  it('stop() ends a held turn with inference:aborted, and the hold with it', async () => {
+    await withCompression({ fitAt: Infinity }, async () => {
+      const t = await resident();
+      try {
+        t.send('first');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        await t.framework.stop();
+        assert.deepEqual(t.of('inference:aborted').map((e) => e.reason), ['shutdown']);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+        assert.equal(t.alerts('context-refusal-clear').length, 1);
+      } finally {
+        await t.close();
+      }
+    });
   });
 
-  it('ends a held turn at a quiesce\'s abandon, and the wakes that joined it wait for resume', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+  it('a quiesce drains at once while a turn waits, and a release that comes due meanwhile runs at resume()', async () => {
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident();
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        t.send('Joined while held');
-        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
-        const status = await t.framework.quiesce({ reason: 'test', timeoutMs: 1_000, abandon: true });
-        assert.equal(status.drained, true, 'the abandon ended the held turn');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.of('inference:aborted').length, 1, 'one terminal event for the turn');
-        assert.equal(t.internal.budgetHolds.size, 0);
-        assert.equal(status.gatedRequests, 1, 'the wake that joined it waits for resume');
-        await t.framework.switchBranch('main');
-        backlog.fit = true;
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const status = await t.framework.quiesce({ timeoutMs: 2_000 });
+        assert.equal(status.drained, true);
+        assert.deepEqual(status.activeTurnAgents, []);
+        assert.equal(status.gatedRequests, 1, 'the held request is counted as waiting');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await sleep(300);
+        assert.equal(t.turnCalls().length, 0, 'nothing runs while quiesced');
+        assert.notEqual(t.hold(), null, 'it still waits');
         await t.framework.resume();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000),
-          'the joined wake runs as a turn of its own at resume');
-        assert.equal(t.membrane.calls.length, 1);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
       } finally {
         await t.close();
       }
     });
   });
 
-  it('ends a held turn at a caller\'s stop, and the wakes that joined it run as a turn of their own', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+  it('admits a surgery while a turn waits, keeps a held first start whose row is untouched, and drops one whose row a rollback removed', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        t.send('Joined while held');
-        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
-        backlog.fit = true;
-        assert.equal(t.framework.abortInference('prime'), true, 'the stop is reported taken');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.of('inference:aborted').length, 1, 'one terminal event for the turn');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000),
-          'the joined wake runs as a turn of its own');
-        assert.equal(t.membrane.calls.length, 1);
-        assert.equal(t.of('inference:held').length, 1);
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('Hi').id] });
+        assert.equal(t.of('inference:hold_ended').length, 0, 'a suppression of another row leaves the held start');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed'], 'the rollback dropped it as it ended');
+        assert.equal(t.of('inference:aborted').length, 1, 'the held turn ends');
+        assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /was removed/);
+        await sleep(300);
+        assert.equal(t.turnCalls().length, 1, 'no turn ran for the removed row');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('reports a stopped hold\'s end once its turn has ended and the wakes that joined it are back in the queue', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+  it('admits a branch switch, a puppet call, an undo and a redo while a first start waits, and the start keeps waiting', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'], modules: [new PingModule()] });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        t.send('Joined while held');
-        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
-        let atEnd: { aborted: number; queued: number } | undefined;
-        t.framework.onTrace((e) => {
-          if (e.type === 'inference:hold_ended') {
-            atEnd = { aborted: t.of('inference:aborted').length, queued: t.internal.pendingRequests.filter((r) => r.agentName === 'prime').length };
-          }
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const store = (t.framework as unknown as { store: { currentBranch(): { name: string } } }).store;
+        const before = store.currentBranch().name;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('Hi').id] });
+        await t.framework.switchBranch(before);
+        assert.equal(store.currentBranch().name, before, 'the branch switch was admitted');
+        const puppet = await t.framework.puppetToolCall('prime', 'pings--ping', {});
+        assert.equal(puppet.result.success, true, 'the puppet call was admitted');
+        assert.equal(t.framework.undoLastTurn('prime').undone, true, 'the undo was admitted');
+        assert.equal(t.framework.redo('prime').redone, true, 'the redo was admitted');
+        assert.notEqual(t.hold(), null, 'the start still waits');
+        assert.deepEqual(t.of('inference:hold_ended'), []);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('drops a released first start still in the queue when a surgery removes its row', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1), 'dropped as it starts');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        assert.equal(t.of('inference:aborted').length, 1);
+        await sleep(300);
+        assert.equal(t.turnCalls().length, 1, 'the queued start never ran');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('takes a released first start out of the start it was merged into once a surgery removed its row, and the wakes merged with it run', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2));
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), 'the wake merged with it runs as a turn of its own');
+        const last = t.turnCalls().at(-1);
+        assert.ok(requestText(last).includes('second') && !requestText(last).includes('"go"'));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('drops a released first start a provider wait kept, once a surgery removed its row', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2, calls: true }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const complete = t.membrane.complete.bind(t.membrane);
+      let rateLimit = false;
+      t.membrane.complete = async (request: NormalizedRequest) => {
+        if (!rateLimit) return complete(request);
+        rateLimit = false;
+        throw new MembraneError({
+          type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 600_000,
+          message: 'zz rate limit reached for requests', rawError: { status: 429 }, rawRequest: request,
         });
-        assert.equal(t.framework.abortInference('prime'), true);
-        assert.deepEqual(atEnd, { aborted: 1, queued: 1 }, 'the turn had ended and its joined wake was queued when the end was reported');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('reports a stopped hold\'s end even when the turn\'s teardown throws', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      const fw = t.framework as unknown as { endContinuedTurn: (...args: unknown[]) => void };
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
-        fw.endContinuedTurn = () => { throw new Error('teardown broke'); };
-        assert.throws(() => t.framework.abortInference('prime'), /teardown broke/);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-      } finally {
-        delete (fw as Partial<typeof fw>).endContinuedTurn;
-        await t.close();
-      }
-    });
-  });
-
-  it('gives a deferred batch\'s wake that joins a held continuation a fresh turn of its own', async () => {
-    const t = await heldRestart(['Answered after the restart', 'Answered the batch']);
-    try {
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 10_000), 'the restart is held');
-      t.internal.pendingRequests.push({
-        agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
-        coalescingSubject: 'zz-subject', coalescingBatch: true, coalescingBatchSubjects: ['zz-subject'],
-      } as unknown as { agentName: string });
-      assert.ok(await pollUntil(() => holdOf(t)?.heldRequests.length === 2, 3_000), 'the batch\'s wake joins the hold');
-      t.fit();
-      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 5_000), 'the continuation runs');
-      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered the batch'), 5_000), 'the batch\'s wake gets a fresh turn');
-      assert.equal(t.membrane.calls.length, 3);
-    } finally {
-      await t.close();
-    }
-  });
-
-  it('holds nothing in a framework that was never started: the refusal takes the error policy\'s path, as before', async () => {
-    await withBacklog({}, async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-unstarted-'));
-      const framework = await AgentFramework.create({
-        storePath: join(tempDir, 'store'),
-        membrane: new SequentialStreamMembrane().asMembrane(),
-        agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.' }],
-        modules: [new InboxModule()],
-        syncIntervalMs: 0,
-        maintenanceIntervalMs: 50,
-        errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
-      });
-      const traces: TraceEvent[] = [];
-      framework.onTrace((e) => traces.push(e));
-      try {
-        framework.pushEvent({
-          type: 'external-message', source: 'test', content: [{ type: 'text', text: 'Are you there?' }], metadata: {}, triggerInference: true,
-        } as unknown as ProcessEvent);
-        await framework.runUntilIdle();
-        assert.equal(traces.filter((e) => e.type === 'inference:held').length, 0, 'no run loop would run a released turn');
-        const exhausted = traces.filter((e) => e.type === 'inference:exhausted') as unknown as Array<{ errorType?: string }>;
-        assert.equal(exhausted.length, 1, 'the turn fails before runUntilIdle returns');
-        assert.equal(exhausted[0]!.errorType, 'over_budget', 'from the refusal, by the error policy\'s path');
-      } finally {
-        await framework.stop();
-        rmSync(tempDir, { recursive: true, force: true });
-      }
-    });
-  });
-
-  it('looks again when compression stops being pending though the strategy\'s progress snapshot stands still', async () => {
-    await withBacklog({ progress: 1, readyAt: 30 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => backlog.ticks >= 30, 5_000), 'compression stops being pending');
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000), 'the hold ends without waiting for its deadline');
-        assert.equal(t.of('inference:hold_ended')[0]!.outcome, 'nothing_pending');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('keeps the undo history at its limit as a turn without a hold leaves it', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const checkpoints = t.framework as unknown as {
-        getTurnCheckpoints: (agentName: string) => Array<{ turnIndex: number }>;
-        saveTurnCheckpoints: (agentName: string, checkpoints: unknown[]) => void;
-        turnCounters: Map<string, number>;
       };
       try {
-        const full = Array.from({ length: 20 }, (_, i) => ({ agentName: 'prime', turnIndex: i, sequenceBefore: i * 3, branchName: `b${i}`, timestamp: i }));
-        checkpoints.saveTurnCheckpoints('prime', full.map((c) => ({ ...c })));
-        checkpoints.turnCounters.set('prime', 20);
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        backlog.fit = true;
-        assert.ok(await turnOver(t));
-        const kept = checkpoints.getTurnCheckpoints('prime');
-        assert.deepEqual(kept.slice(0, 19), full.slice(1), 'the nineteen newest from before the turn, each as it was');
-        assert.equal(kept.length, 20);
-        assert.equal(kept[19]!.turnIndex, 20, 'and the turn\'s own, with the index it took');
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        rateLimit = true;
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        assert.ok(await pollUntil(() => (t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) > 0),
+          'the released start waits in the provider hold');
+        assert.equal(t.internal.hasTurn('prime'), false);
+        await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.framework.releaseProviderWait('prime');
+        const cooldown = t.internal.providerAccelerationCooldowns.get('prime');
+        if (cooldown) {
+          cooldown.until = Date.now();
+          t.internal.releaseProviderAccelerationCooldown('prime');
+        }
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1), 'dropped as it starts');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        await sleep(300);
+        assert.equal(t.turnCalls().length, 1, 'the start the provider wait kept never ran');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('invalidates redo at a held start, as at any turn\'s first start', async () => {
-    await withBacklog({ fit: true }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      try {
-        t.send('A turn that fits');
-        assert.ok(await turnOver(t));
-        assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        const before = t.framework.getUndoRedoState('prime');
-        assert.equal(before.redoDepth, 1, 'the undone turn can be redone');
-        backlog.fit = false;
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.deepEqual(t.framework.getUndoRedoState('prime'), { ...before, canUndo: true, undoDepth: before.undoDepth + 1, canRedo: false, redoDepth: 0 },
-          'the held start invalidated redo and its turn is one undo step');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('ends a held turn whose stop comes as its hold is reported', async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
-      let stopped: boolean | undefined;
-      t.framework.onTrace((e) => {
-        if (e.type === 'inference:held' && stopped === undefined) stopped = t.framework.abortInference('prime');
-      });
+  it('drives compression itself with the maintenance timer off, and runs the turn as soon as a call makes room', async () => {
+    await withCompression({ fitAt: 3, calls: true }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0 });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000));
-        assert.equal(stopped, true, 'the stop is reported taken');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.of('inference:aborted').length, 1);
-        assert.equal(t.internal.budgetHolds.size, 0);
-        assert.equal(t.framework.getHostModeStatus().drained, true);
-        assert.deepEqual(t.of('ops:alert').filter((e) => e.kind === 'context-refusal'), [], 'no context-refusal says the ended turn is held');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit'), 5_000));
       } finally {
         await t.close();
       }
     });
   });
 
-  it('ends a released turn whose stop comes as its hold\'s end is reported, and runs it no more', async () => {
-    await withBacklog({ fitAt: 12 }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50, responses: 2 });
-      let stopped: boolean | undefined;
-      t.framework.onTrace((e) => {
-        if (e.type === 'inference:hold_ended' && stopped === undefined) stopped = t.framework.abortInference('prime');
-      });
+  it('with the maintenance timer off and no call to make, looks again an interval later', async () => {
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0 });
+      t.internal.budgetHoldRecheckMs = 100;
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 5_000));
-        assert.equal(stopped, true, 'the stop is reported taken');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.equal(t.internal.budgetHolds.size, 0);
-        t.send('Still there?');
-        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 5_000), 'a later message gets its turn');
-        assert.equal(t.membrane.calls.length, 1, 'and the stopped turn never ran');
-        assert.equal(t.of('inference:aborted').length, 1);
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        c.fitAt = 0;
+        c.readyAt = 0;
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit'), 3_000));
       } finally {
         await t.close();
       }
     });
   });
 
-  it('leaves no record of a released turn whose compile a stop or a disposal reaches', async () => {
-    for (const end of ['stop', 'disposal'] as const) {
-      let open!: () => void;
-      const until = new Promise<void>((resolve) => { open = resolve; });
-      await withBacklog({ compileGate: { nth: 2, until } }, async (backlog) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 50 });
-        let closed = false;
+  it('gives a waiting turn in healthSnapshot()', async () => {
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident();
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.hold() !== null));
+        const hold = t.hold()!;
+        assert.equal(hold.errorType, 'over_budget');
+        assert.equal(hold.budget, 48_568);
+        assert.equal(hold.actual, 100_201);
+        assert.equal(hold.heldRequests, 1);
+        assert.equal(hold.pending, 'zz compression pending');
+        assert.equal(typeof hold.since, 'number');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
+        assert.equal(t.hold(), null);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('ends a hold whose released start fails for another reason as failed, and the turn takes that error\'s path', async () => {
+    await withCompression({ fitAt: 2 }, async (c) => {
+      const t = await resident();
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        c.failNext = new Error('zz store unavailable');
+        c.fitAt = 0;
+        c.readyAt = 0;
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['failed']);
+        assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /failed for another reason after .*zz store unavailable/);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')), "the error policy's retry runs it");
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('each of two holds within the webhook cooldown reaches it with its open and its clear', async () => {
+    await withWebhook(async (posts) => {
+      await withCompression({ fitAt: Infinity }, async () => {
+        const t = await resident();
         try {
-          t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-          backlog.fit = true;
-          assert.ok(await pollUntil(() => backlog.compiles === 2, 3_000), 'the hold released the turn into its compile');
-          if (end === 'stop') {
-            const stopping = t.close();
-            open();
-            await stopping;
-            closed = true;
-          } else {
-            t.internal.disposeConversationAgent('prime');
-            open();
-            assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the compile ended with the agent gone');
-          }
-          assert.equal(t.internal.budgetHolds.size, 0, `nothing of the hold is left after the ${end}`);
+          t.send('first');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+          t.framework.abortInference('prime');
+          t.send('second');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 2));
+          t.framework.abortInference('prime');
+          assert.ok(await pollUntil(() => posts.length === 4));
+          assert.deepEqual(posts, ['context-refusal', 'context-refusal-clear', 'context-refusal', 'context-refusal-clear']);
         } finally {
-          open();
-          if (!closed) await t.close();
+          await t.close();
         }
       });
-    }
+    });
+  });
+});
+
+describe("the hold's note sits where the released turn read it", () => {
+  const thinking = (answer: string) => createMockResponse([
+    { type: 'thinking', thinking: `reasoning for ${answer}`, signature: `sig-${answer}` } as ContentBlock, text(answer)]);
+
+  it('stores the note once, where it was placed, so the next start keeps the prefix and the reply its thinking', async () => {
+    await withCompression({ fitAt: 3 }, async () => {
+      const t = await resident({ binds: true, replies: [thinking('reply one'), thinking('reply two')] });
+      try {
+        t.send('one');
+        assert.ok(await pollUntil(() => t.stored().includes('reply one')));
+        assert.equal(notesStored(t), 1);
+        const order = t.rows().map((r) => r.content.map((b) => b.text ?? b.type).join(''));
+        const at = order.findIndex((b) => b.includes('[budget-hold]'));
+        assert.ok(order[at - 1]!.includes('one') && order[at + 1]!.includes('reply one'), JSON.stringify(order));
+        t.send('two');
+        assert.ok(await pollUntil(() => t.stored().includes('reply two')));
+        const [released, next] = t.turnCalls();
+        assert.deepEqual(next!.messages.slice(0, released!.messages.length), released!.messages, 'the next request starts with the released one, byte for byte');
+        assert.ok(JSON.stringify(next!.messages).includes('reasoning for reply one'), 'the reply keeps its thinking');
+      } finally {
+        await t.close();
+      }
+    });
   });
 
-  it('refuses a puppeted tool call while a turn is held, naming the hold', async () => {
-    await withBacklog({}, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+  it('gives no note to a released wake whose window ends on the agent\'s own reply, and the next start keeps the prefix', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ replies: ['Hi', 'Woke', 'Answered three'] });
       try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await assert.rejects(t.framework.puppetToolCall('prime', 'inbox--anything', {}),
-          /puppet refused: agent prime is idle\+turn-alive \(a budget hold keeps its turn to start again once its context fits/);
-        assert.equal(heldRequests(t.framework), 1, 'the turn is still held');
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.ok(await pollUntil(() => t.stored().includes('Woke')));
+        assert.equal(notesStored(t), 0);
+        c.refuseFrom = Infinity;
+        t.send('three');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered three')));
+        const calls = t.turnCalls();
+        const released = calls[1]!;
+        const next = calls[2]!;
+        assert.doesNotMatch(requestText(released), /budget-hold/);
+        assert.equal(JSON.stringify(released.messages.at(-1)), JSON.stringify({ participant: 'user', content: [text('[Continue]')] }),
+          'a wake with nothing new ends its request on [Continue], which a later request leaves out before a plain reply like this one');
+        const read = released.messages.slice(0, -1);
+        assert.deepEqual(next.messages.slice(0, read.length), read, 'the next request starts with what the released one read, byte for byte');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("gives no note to a person's held message whose refused start stored an injection after it, and the next start keeps the prefix", async () => {
+    let n = 0;
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident({ context: () => `status ${++n}`, replies: ['Answered one', 'Answered two'] });
+      try {
+        t.send('one');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.ok(await pollUntil(() => t.stored().includes('Answered one')));
+        assert.equal(notesStored(t), 0);
+        t.send('two');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered two')));
+        const [released, next] = t.turnCalls();
+        assert.doesNotMatch(requestText(released), /budget-hold/);
+        assert.deepEqual(next!.messages.slice(0, released!.messages.length), released!.messages);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('stores a row for each of two holds whose notes read the same', async () => {
+    await withCompression({ fitAt: 1 }, async (c) => {
+      const t = await resident({ replies: ['Answered one', 'Answered two'] });
+      try {
+        t.send('one');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered one')));
+        c.fitAt = c.ticks + 1;
+        c.readyAt = c.ticks + 1;
+        t.send('two');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered two')));
+        assert.equal(t.of('inference:held').length, 2);
+        const notes = t.rows().filter((r) => JSON.stringify(r.content).includes('[budget-hold]')).map((r) => JSON.stringify(r.content));
+        assert.equal(notes.length, 2);
+        assert.equal(notes[0], notes[1], 'the two notes read the same');
       } finally {
         await t.close();
       }
@@ -3779,349 +748,111 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
 });
 
-describe('the release check takes context-manager\'s verdict on the real strategy (#304)', () => {
-  async function realResident(adaptiveResolution: boolean, withStrategy?: (strategy: AutobiographicalStrategy) => void, modules: Module[] = [], given?: AutobiographicalStrategy) {
-    const proto = ContextManager.prototype as unknown as {
-      tick: () => Promise<void>; previewContext: (...args: unknown[]) => unknown; compile: (...args: unknown[]) => unknown;
-    };
-    const tick = proto.tick;
-    proto.tick = async () => {};
-    const previewContext = proto.previewContext;
-    const previewBudgets: unknown[] = [];
-    proto.previewContext = function (this: unknown, ...args: unknown[]) {
-      previewBudgets.push(args[0]);
-      return previewContext.apply(this, args);
-    };
-    const compile = proto.compile;
-    const compileBudgets: unknown[] = [];
-    proto.compile = function (this: unknown, ...args: unknown[]) {
-      if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun !== true) compileBudgets.push(args[0]);
-      return compile.apply(this, args);
-    };
-    const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-real-'));
-    const membrane = new SequentialStreamMembrane();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered once it fit' }]));
-    const strategy = given ?? new AutobiographicalStrategy({ adaptiveResolution, targetChunkTokens: 300, recentWindowTokens: 400 });
-    withStrategy?.(strategy);
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'store'),
-      membrane: membrane.asMembrane(),
-      agents: [{
-        name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', contextBudgetTokens: 400_000, maxTokens: 1_000,
-        strategy,
-      }],
-      modules,
-      syncIntervalMs: 0,
-      maintenanceIntervalMs: 50,
-      errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
-    });
-    const traces: TraceEvent[] = [];
-    framework.onTrace((e) => traces.push(e));
-    const cm = framework.getAgent('prime')!.getContextManager();
-    const seeded: string[] = [];
-    for (let i = 0; i < (given ? 0 : 16); i++) {
-      seeded.push(cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]));
-    }
-    (cm as unknown as { presentRows(ids: string[]): void }).presentRows(seeded);
-    const budget = (maxTokens: number) => ({ maxTokens, reserveForResponse: 1_000 });
-    return {
-      framework,
-      membrane,
-      of: (type: string) => traces.filter((e) => e.type === type) as unknown as Array<Record<string, unknown>>,
-      preview: (maxTokens: number) => (cm as unknown as {
-        previewContext: (b: { maxTokens: number; reserveForResponse: number }) => { fits: boolean; finalTokens: number; budgetTokens: number };
-      }).previewContext(budget(maxTokens)),
-      addMessage: (text: string) => cm.addMessage('User', [{ type: 'text', text }]),
-      dryCompileResolves: (maxTokens: number) => cm.compile(budget(maxTokens), undefined, { dryRun: true } as never).then(() => true, () => false),
-      setBudget: (tokens: number) => framework.updateAgentRuntimeSettings('prime', { contextBudgetTokens: tokens, immediate: true }, { allowInfeasible: true }),
-      wake: () => (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
-        agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now(),
-      }),
-      previews: () => previewBudgets.length,
-      previewBudgets,
-      compileBudgets,
-      close: async () => {
-        await framework.stop();
-        proto.tick = tick;
-        proto.previewContext = previewContext;
-        proto.compile = compile;
-        rmSync(tempDir, { recursive: true, force: true });
-      },
-    };
+describe('a continuation refused for budget mid-turn waits idle too', () => {
+  async function heldContinuation(c: Compression, options: { gate?: boolean; replies?: Reply[] } = {}) {
+    c.refuseFrom = 2;
+    const t = await resident({ restart: true, replies: options.replies ?? ['Done after the restart'], ...(options.gate ? { gate: true } : {}) });
+    t.cm().addMessage('user', [text('hello')]);
+    t.send('fetch it');
+    assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the continuation is held');
+    return t;
   }
+  const fit = (c: Compression) => { c.fitAt = c.ticks; c.readyAt = c.ticks; };
 
-  async function pinnedResident(kind: 'pin' | 'document mark') {
-    class SeededStrategy extends AutobiographicalStrategy {
-      seedL1(content: string, sourceIds: string[]): void {
-        this.pushSummary({
-          id: `L1-${this.nextSummaryIdCounter()}`, level: 1, content, tokens: Math.ceil(content.length / 4), sourceLevel: 0,
-          sourceIds, sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! }, created: Date.now(),
-        } as never);
-      }
-    }
-    const strategy = new SeededStrategy({
-      headWindowTokens: 0, targetChunkTokens: 100, recentWindowTokens: 200, adaptiveResolution: true, autoTickOnNewMessage: false,
-    });
-    const t = await realResident(true, undefined, [], strategy);
-    const cm = t.framework.getAgent('prime')!.getContextManager();
-    const inputs: string[] = [];
-    for (let i = 0; i < 8; i++) inputs.push(cm.addMessage('User', [{ type: 'text', text: `Input ${i}. ` + 'word '.repeat(80) }]));
-    strategy.seedL1('The user gave eight inputs.', inputs);
-    const rounds: string[] = [];
-    for (let i = 0; i < 10; i++) rounds.push(cm.addMessage('prime', [{ type: 'text', text: `Round ${i}. ` + 'step '.repeat(30) }]));
-    (cm as unknown as { presentRows(ids: string[]): void }).presentRows([...inputs, ...rounds]);
-    const pinId = kind === 'pin' ? cm.pinRange(inputs[0]!, inputs[inputs.length - 1]!, { name: 'zz-inputs' }) : cm.markDocument(inputs[3]!, { name: 'zz-brief' });
-    const fits = (maxTokens: number, excludePins?: string[]) => (cm as unknown as {
-      previewContext: (b: object, o?: undefined, opts?: object) => { fits: boolean } | null;
-    }).previewContext({ maxTokens, reserveForResponse: 1_000 }, undefined, excludePins ? { excludePins } : undefined)?.fits === true;
-    const lowest = (excludePins?: string[]) => {
-      let lo = 1_000;
-      let hi = 400_000;
-      while (hi - lo > 1) {
-        const mid = Math.floor((lo + hi) / 2);
-        if (fits(mid, excludePins)) hi = mid; else lo = mid;
-      }
-      return hi;
-    };
-    return { t, cm, pinId, pinned: lowest(), free: lowest([pinId]) };
-  }
-
-  it("keeps compressionChangedAt where compression left it while traffic is written, which no held window is presented, and moves it when compression makes a summary", async () => {
-    class SeededStrategy extends AutobiographicalStrategy {
-      seedL1(content: string, sourceIds: string[]): void {
-        this.pushSummary({
-          id: `L1-${this.nextSummaryIdCounter()}`, level: 1, content, tokens: Math.ceil(content.length / 4), sourceLevel: 0,
-          sourceIds, sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! }, created: Date.now(),
-        } as never);
-      }
-    }
-    const strategy = new SeededStrategy({ adaptiveResolution: true, targetChunkTokens: 300, recentWindowTokens: 400, autoTickOnNewMessage: false });
-    const t = await realResident(true, undefined, [], strategy);
-    const cm = t.framework.getAgent('prime')!.getContextManager();
-    const hold = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { since: number; compressionChangedAt: number } | null }> })
-      .agents.find((a) => a.name === 'prime')!.budgetHold;
-    try {
-      const ids: string[] = [];
-      for (let i = 0; i < 16; i++) {
-        ids.push(cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]));
-      }
-      (cm as unknown as { presentRows(ids: string[]): void }).presentRows(ids);
-      t.setBudget(3_000);
-      t.framework.start();
-      t.wake();
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'held, with compression pending');
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      const before = strategy.getProgressSnapshot();
-      const write = (text: string): string => (t.framework as unknown as {
-        addMessage(participant: string, content: Array<{ type: 'text'; text: string }>): string;
-      }).addMessage('User', [{ type: 'text', text }]);
-      const traffic: string[] = [];
-      for (let round = 0; round < 3; round++) {
-        for (let i = 0; i < 6; i++) traffic.push(write(`zz traffic ${round}.${i} ` + 'lorem ipsum dolor sit amet '.repeat(60)));
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
-      const after = strategy.getProgressSnapshot();
-      assert.deepEqual([...new Set(traffic.map((id) => cm.windowStatusOf(id as never)))], ['out'], 'the traffic is stored, and not presented to the held window');
-      assert.equal(after.totalChunks, before.totalChunks, 'so it adds no chunk there');
-      assert.equal(after.chunksCompressed, before.chunksCompressed, 'premise: and nothing compressed anything');
-      assert.equal(hold()!.compressionChangedAt, hold()!.since, 'traffic moves nothing compression did');
-      const changed = Date.now();
-      strategy.seedL1('zz a summary compression made', ids.slice(0, 2));
-      assert.ok(await pollUntil(() => (hold()?.compressionChangedAt ?? 0) >= changed, 2_000), 'a summary compression makes does');
-    } finally {
-      await t.close();
-    }
-  });
-
-  for (const kind of ['pin', 'document mark'] as const) {
-    it(`releases a held turn once the ${kind} its compile was refused for is removed, with nothing else changing`, async () => {
-      const { t, cm, pinId, pinned, free } = await pinnedResident(kind);
+  it('runs as before with no surgery', async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c);
       try {
-        assert.ok(free < pinned, `premise: the ${kind} keeps the inputs raw, and without it they fold (${free} < ${pinned})`);
-        t.setBudget(Math.floor((free + pinned) / 2));
-        t.framework.start();
-        t.wake();
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'held with the inputs kept raw');
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        assert.deepEqual(t.of('inference:hold_ended'), [], 'still held over several maintenance passes');
-        assert.equal(cm.unpin(pinId), true);
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 3_000), `the turn runs once the ${kind} is removed`);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.equal(t.internal.hasTurn('prime'), false, 'idle for the surgery gate');
+        fit(c);
+        assert.ok(await pollUntil(() => t.stored().includes('Done after the restart')));
+        assert.equal(t.of('inference:completed').length, 1);
       } finally {
         await t.close();
       }
     });
-  }
-
-  function fitEdge(t: Awaited<ReturnType<typeof realResident>>): { lo: number; hi: number } {
-    let lo = 2_000;
-    let hi = 400_000;
-    assert.equal(t.preview(lo).fits, false);
-    while (hi - lo > 1) {
-      const mid = Math.floor((lo + hi) / 2);
-      if (t.preview(mid).fits) hi = mid; else lo = mid;
-    }
-    return { lo, hi };
-  }
-
-  for (const compression of ['still pending', 'finished'] as const) {
-    it(`runs a released turn without its note where its context fits only without it, with compression ${compression}`, async () => {
-      const t = await realResident(true);
-      const proto = ContextManager.prototype as unknown as { isReady: () => boolean };
-      const isReady = proto.isReady;
-      try {
-        const { lo, hi } = fitEdge(t);
-        const atHi = t.preview(hi);
-        assert.ok(atHi.budgetTokens - atHi.finalTokens < 10, 'at the edge, too little to spare for the note');
-        t.setBudget(lo);
-        t.framework.start();
-        t.wake();
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the turn\'s compile is refused below the edge');
-        if (compression === 'finished') proto.isReady = function () { return true; };
-        t.setBudget(hi);
-        assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 5_000), 'the hold releases it, and the turn runs at the edge');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.equal(t.of('inference:held').length, 1, 'held once');
-        assert.equal(noteCount(JSON.stringify(t.membrane.calls[0])), 0, 'its request carries no note');
-        assert.equal(noteCount(storedText(t.framework)), 0, 'and none is stored');
-        assert.deepEqual(t.of('inference:exhausted'), []);
-        assert.deepEqual(t.of('ops:alert').filter((e) => e.kind === 'context-refusal'), []);
-      } finally {
-        proto.isReady = isReady;
-        await t.close();
-      }
-    });
-  }
-
-  it('stores the note, and the released turn reads it, where the check\'s preview leaves room for it', async () => {
-    const t = await realResident(true);
-    try {
-      const { lo, hi } = fitEdge(t);
-      t.setBudget(lo);
-      t.framework.start();
-      t.wake();
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-      t.setBudget(hi + 1_000);
-      assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 5_000));
-      assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      assert.equal(noteCount(JSON.stringify(t.membrane.calls[0])), 1, 'its request carries the note');
-      assert.equal(noteCount(storedText(t.framework)), 1, 'stored once');
-      assert.match(storedText(t.framework), /\[budget-hold\] Your context didn't fit its budget \([\d,]+ tokens against [\d,]+\), so this turn waited \d+ s for compression to make room\./);
-    } finally {
-      await t.close();
-    }
   });
 
-  for (const compression of ['still pending', 'finished'] as const) {
-    it(`where what a released start stores besides the note tips its compile over, ${compression === 'still pending' ? 'holds it again and later reads each note it stored' : 'fails it saying the context fit at the check that released it and its compile did not'}`, async () => {
-      let status = 0;
-      const context = new InboxModuleForStatus(() => `zz status ${++status} ` + 'lorem ipsum dolor sit amet '.repeat(40));
-      const t = await realResident(true, undefined, [context]);
-      const proto = ContextManager.prototype as unknown as { isReady: () => boolean };
-      const isReady = proto.isReady;
-      try {
-        const { lo, hi } = fitEdge(t);
-        t.setBudget(lo);
-        t.framework.start();
-        t.wake();
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const edge = fitEdge(t);
-        assert.ok(edge.hi >= hi, 'the refused start stored its status row');
-        if (compression === 'finished') proto.isReady = function () { return true; };
-        t.setBudget(edge.hi + 60);
-        if (compression === 'still pending') {
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000),
-            'the released start stores a changed status row, its compile is refused, and the turn is held again');
-          assert.equal(t.membrane.calls.length, 0);
-          t.setBudget(edge.hi + 3_000);
-          assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 5_000), 'a budget with room runs the turn');
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit', 'fit']);
-          assert.equal(noteCount(JSON.stringify(t.membrane.calls[0])), 2, 'its compile reads the note each release stored');
-          assert.deepEqual(t.of('inference:exhausted'), []);
-        } else {
-          assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-          assert.equal(t.membrane.calls.length, 0);
-          const error = String(t.of('inference:exhausted')[0]!.error);
-          assert.match(error, /the turn was first held \d+ s ago; its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do\)$/);
-          assert.doesNotMatch(error, /still didn't fit/);
+  for (const [label, past] of [['its rounds', 'fetch it'], ['its trigger', 'hello']] as const) {
+    it(`is dropped after a rollback past ${label}`, async () => {
+      await withCompression({}, async (c) => {
+        const t = await heldContinuation(c);
+        try {
+          await t.framework.rollbackToMessage('prime', { messageId: t.rowWith(past).id });
+          assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
+          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+          assert.equal(t.of('inference:aborted').length, 1);
+          fit(c);
+          await sleep(300);
+          assert.ok(!t.stored().includes('Done after the restart'), 'nothing runs on the rewound history');
+        } finally {
+          await t.close();
         }
-      } finally {
-        proto.isReady = isReady;
-        await t.close();
-      }
+      });
     });
   }
 
-  it('holds a context refusal once on the preview path, and runs the turn once the refusal clears', async () => {
-    let drop = true;
-    const t = await realResident(true, (strategy) => {
-      const s = strategy as unknown as { mergeAdjacentBodyGroupRaw: (...args: unknown[]) => unknown[] };
-      const merge = s.mergeAdjacentBodyGroupRaw.bind(strategy);
-      s.mergeAdjacentBodyGroupRaw = (...args: unknown[]) => {
-        const out = merge(...args);
-        if (drop && out.length > 2) out.splice(1, 1);
-        return out;
-      };
-    });
-    try {
-      assert.throws(() => t.preview(400_000), (e: unknown) => (e as { name?: string }).name === 'UncoveredDropError',
-        'the preview rethrows the context refusal');
-      t.framework.start();
-      t.wake();
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-      assert.equal(t.of('inference:held')[0]!.errorType, 'context_refusal');
-      for (let i = 0; i < 4; i++) {
-        const looked = t.previews();
-        t.addMessage(`later ${i}`);
-        assert.ok(await pollUntil(() => t.previews() > looked, 3_000), `a look after message ${i + 1}`);
+  it("is kept through a suppression of a row it doesn't stand on; arrivals stay out of its request and run as a turn of their own after it", async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c, { replies: ['Done after the restart', 'Read the arrival'] });
+      try {
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('hello').id] });
+        assert.equal(t.of('inference:hold_ended').length, 0, 'kept');
+        t.send('MID');
+        assert.ok(await pollUntil(() => t.stored().includes('MID')));
+        assert.ok(!t.windowText().includes('MID'), 'the arrival waits outside the window');
+        fit(c);
+        assert.ok(await pollUntil(() => t.stored().includes('Read the arrival')));
+        const calls = t.turnCalls();
+        assert.ok(!requestText(calls.at(-2)).includes('MID'), "the continuation's request leaves it out");
+        assert.ok(requestText(calls.at(-1)).includes('MID'), 'its own turn reads it');
+      } finally {
+        await t.close();
       }
-      assert.equal(t.of('inference:held').length, 1, 'held once while the refusal stands, through those looks');
-      assert.deepEqual(t.of('inference:hold_ended'), []);
-      assert.deepEqual(t.of('ops:alert').filter((e) => e.kind === 'context-refusal'), []);
-      assert.equal(t.membrane.calls.length, 0);
-      drop = false;
-      t.addMessage('after the defect');
-      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000), 'the turn runs once the refusal clears');
-      assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-    } finally {
-      await t.close();
-    }
+    });
   });
 
-  it('falls back to a dry compile where the preview needs adaptive resolution', async () => {
-    const t = await realResident(false);
-    try {
-      // The hierarchical strategy refuses an over-budget context in its
-      // preview and in a dry compile alike. A context that fits has no fold
-      // plan to preview: context-manager 0.23.0's preview throws, and from
-      // 0.23.1 it returns null. The dry compile decides.
-      let fitsFrom = 10_000;
-      while (!(await t.dryCompileResolves(fitsFrom)) && fitsFrom < 400_000) fitsFrom += 1_000;
-      assert.ok(fitsFrom < 400_000);
-      assert.equal(await t.dryCompileResolves(Math.round(fitsFrom * 0.8)), false,
-        'its dry compile refuses where the context does not fit, as a committing compile does');
-      let verdict: unknown;
+  it('lets an undo run, ending the held continuation first, and nothing runs on the undone window', async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c);
       try {
-        verdict = t.preview(fitsFrom);
-      } catch (error) {
-        assert.match((error as Error).message, /requires adaptiveResolution/);
-        verdict = null;
+        const undone = t.framework.undoLastTurn('prime');
+        assert.equal(undone.undone, true);
+        assert.equal(t.of('inference:aborted').length, 1);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        fit(c);
+        await sleep(300);
+        assert.ok(!t.stored().includes('Done after the restart'));
+      } finally {
+        await t.close();
       }
-      assert.equal(verdict, null, 'the preview gives no verdict for a context that fits');
-      t.setBudget(Math.round(fitsFrom * 0.8));
-      t.framework.start();
-      const before = t.previews();
-      t.wake();
-      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-      assert.ok(await pollUntil(() => t.previews() > before, 3_000), 'the release check has looked');
-      await new Promise((r) => setTimeout(r, 500));
-      assert.deepEqual(t.of('inference:hold_ended'), [], 'it stays held while the context does not fit');
-      t.setBudget(fitsFrom + 2_000);
-      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-      assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit'], 'the dry compile said it fits');
-    } finally {
-      await t.close();
-    }
+    });
+  });
+
+  it('refuses nothing to a redo while it waits: its start emptied the redo stack, so there is nothing to redo', async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c);
+      try {
+        assert.deepEqual(t.framework.redo('prime'), { redone: false });
+        assert.notEqual(t.hold(), null, 'it still waits');
+        assert.deepEqual(t.of('inference:hold_ended'), []);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("lets go of the event gate's entry while it waits", async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c, { gate: true });
+      try {
+        assert.ok(t.internal.eventGate, 'the gate is on');
+        assert.equal(t.internal.eventGate!.inferring.has('prime'), false, "other agents' batches aren't held behind compression");
+        fit(c);
+        assert.ok(await pollUntil(() => t.stored().includes('Done after the restart')));
+      } finally {
+        await t.close();
+      }
+    });
   });
 });

@@ -158,20 +158,15 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * A turn whose compile was refused for budget is held while compression
-       * makes its context fit, instead of failing (#304). It follows the
-       * refused attempt's `inference:failed`, as a provider hold does. Its
-       * logical turn stays open, unless a listener of the hold's
-       * `context-hold` alert ended it, whose `inference:aborted` then comes
-       * first; `inference:hold_ended` follows, for a release once the turn's
-       * requests are queued again, and then its fresh compile, unless the turn
-       * was stopped while held or a listener of `inference:hold_ended` stops
-       * it, or, after a hold that ended because compression had nothing left
-       * to do, a listener of its `context-hold-clear`, which then comes at
-       * once. After a hold that ended because compression had nothing left to
-       * do, a refusal of that compile takes the error policy's path; after one
-       * whose check failed, a refusal while compression is pending holds the
-       * turn again.
+       * A start whose compile was refused for budget while compression was
+       * pending waits in the agent's budget hold, idle, instead of failing
+       * (#304). It follows the refused attempt's `inference:failed`. Each
+       * time compression lands a call, a maintenance pass ends (with the
+       * maintenance timer off, at each of the hold's own rechecks), or a
+       * quiesce ends, the held requests are queued, and their start's own
+       * compile is the check: refused again while compression is pending,
+       * they wait again, with no new `inference:held`.
+       * `inference:hold_ended` follows, once.
        */
       type: 'inference:held';
       agentName: string;
@@ -182,39 +177,30 @@ export type TraceEvent =
       /** The refused compile's budget and size in tokens, when context-manager gave them. */
       budget?: number;
       actual?: number;
-      /** When the hold started (epoch ms): this refusal, or for a released
-       *  turn refused again, the refusal that first held it. */
+      /** When the hold started (epoch ms). */
       since: number;
-      /** Requests the hold holds as it starts: the refused start's own. Later
-       *  joins are counted in `inference:hold_ended`. */
+      /** Requests the hold holds as it starts: the refused start's own. */
       heldRequests: number;
     })
   | (TraceEventBase & {
       type: 'inference:hold_ended';
       agentName: string;
       /**
-       * 'fit': context-manager's preview, of the stored context at the turn's
-       * next compile budget, says it fits (a dry compile does, for a strategy
-       * with no preview), and the held requests are queued for one fresh
-       * compile. The preview doesn't see what that start adds before it
-       * compiles. 'check_failed': that
-       * check failed for a reason other than the budget, and the requests are
-       * queued for the turn's own compile to meet it. 'nothing_pending':
-       * compression has nothing pending and the context still doesn't fit;
-       * the requests are queued too, for one fresh compile, and a refusal of
-       * it takes the error policy's path, as a refused compile did before the
-       * hold. A hold has no time limit: while compression stays pending, it
-       * holds until one of these. 'stopped':
-       * the turn ended while it was held (an abandon, a stop of the turn or of
-       * the framework, or the agent's leaving), reported after its
-       * `inference:aborted`, once the wakes that joined it are back in the
-       * queue (after an abandon or a stop of the turn) or gone with it
-       * (otherwise).
+       * 'fit': a released start's compile went through, and the turn runs.
+       * 'nothing_pending': a released start's compile was refused with
+       * compression having nothing pending, after one run without the hold's
+       * note where it carried one, and the refusal takes the error policy's
+       * path. 'failed': a released start failed for another reason, and that
+       * failure takes its own path. 'stopped': the held turn was ended by
+       * `abortInference()`, `stop()` or its agent's end, reported after its
+       * `inference:aborted`, or a released start was stopped before its
+       * compile went through. 'removed': a surgery or an undo removed what
+       * every held request stood on, reported after the held turn's
+       * `inference:aborted`.
        */
-      outcome: 'fit' | 'check_failed' | 'nothing_pending' | 'stopped';
+      outcome: 'fit' | 'nothing_pending' | 'failed' | 'stopped' | 'removed';
       /** Since the hold started (`inference:held`'s `since`). */
       waitedMs: number;
-      heldRequests: number;
     })
 
   // Streaming inference lifecycle
@@ -1103,20 +1089,16 @@ export type TraceEvent =
   // this stream, not a separate system. See connectome docs/observability.md.
   | (TraceEventBase & {
       type: 'ops:alert';
-      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' |
-       *  'context-hold' | … A kind ending in `-clear` ends the alert of the
-       *  kind before it: 'context-hold-clear' is raised when a turn's budget
-       *  hold episode ends, which raised one 'context-hold' however often the
-       *  turn's released start was refused and held again; a provider hold
-       *  that takes the released turn ends the episode, so a budget hold
-       *  after that raises another. */
+      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | …
+       *  A kind ending in `-clear` ends the alert of the kind before it:
+       *  'context-refusal-clear' is raised when a budget hold's wait ends
+       *  without its turn running. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
       /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record,
-       *  where the alert has one: `context-hold` and its clear have none),
+      /** Kind-specific structured payload (mirrors the failures.log record),
        *  bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })

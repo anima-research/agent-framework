@@ -1296,13 +1296,13 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
-const BUDGET_RELEASED: unique symbol = Symbol('budget-released');
+const BUDGET_HELD: unique symbol = Symbol('budget-held');
 interface TurnCarry {
   silence: TurnSilence | null;
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [BUDGET_RELEASED]?: BudgetHold };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [BUDGET_HELD]?: object };
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
@@ -1526,6 +1526,7 @@ interface TurnRouting {
   /** The turn asked for a ` !` continuation; taken once. */
   continuation: boolean;
   start?: { branch: string; sequence: number };
+  firstRow?: string;
   roundsRan?: true;
   unflushedRounds?: number;
   unpostedSpeech?: true;
@@ -1868,6 +1869,8 @@ const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stoppin
 /** The reason on the inference:aborted that ends a turn whose continuation
  *  was dropped before it started, other than by an abandon or a stop. */
 const CONTINUATION_DROPPED = "a turn's continuation was dropped before it started";
+
+const BUDGET_HELD_TURN_REMOVED = 'a turn waiting for compression was dropped: what it stood on was removed';
 
 /** One frame's window while it holds a turn with no stream and one of its
  *  checks is ahead (AgentFramework.checkAhead). `abandoned` is an operator's
@@ -2494,18 +2497,18 @@ export interface HostModeStatus {
    * settled teardown, strictly wider than activeStreams), no continuation
    * of a turn on its way to its start (a budget restart's or a tool-result
    * guard's retry, queued, held by a provider hold, parked or in a scheduler
-   * pass), no turn whose call failed into a provider hold, or whose compile
-   * was refused for budget, waiting for the hold to release its retry
-   * (wherever that retry then waits), and no wake parked on provider
-   * admission. It covers the framework's own turns: a caller of the direct
-   * Agent API (`Agent.runInference`) owns its turns' timing. */
+   * pass), no turn whose call failed into a provider hold waiting for the
+   * hold to release its retry (wherever that retry then waits), and no wake
+   * parked on provider admission. It covers the
+   * framework's own turns: a caller of the direct Agent API
+   * (`Agent.runInference`) owns its turns' timing. */
   drained: boolean;
   activeTurns: number;
   /** The agents with a turn alive, the ones `activeTurns` counts, sorted:
    * each from its turn's dequeue to its settled teardown, so a turn in its
    * hooks or compile, one finishing its deliveries, one whose continuation
-   * is on its way to its start, or one a provider hold or a budget hold
-   * keeps for its retry, is listed. These are the agents an abandon or
+   * is on its way to its start, or one a provider hold keeps for its retry,
+   * is listed. These are the agents an abandon or
    * a stop() made now would find mid-turn. */
   activeTurnAgents: string[];
   /** Wakes that own provider admission while waiting for an in-flight
@@ -2523,7 +2526,8 @@ export interface HostModeStatus {
    * start parked on provider admission behind an auxiliary call counts once in
    * `parkedAdmissions` instead, however many wakes are merged into it.
    * Continuations of a turn (budget restart, tool results) and a held turn's
-   * retry, which a quiesce lets through, are never counted. */
+   * retry, which a quiesce lets through, are never counted, but for those a
+   * budget hold holds, which every request it holds is counted with. */
   gatedRequests: number;
   /** code_execution scripts still running that no call is waiting on: left
    * running after a yield, outside any turn. Quiesce does NOT stop them —
@@ -3069,39 +3073,27 @@ const TURN_RETRY_SETTINGS: RetrySettings = {
 } as RetrySettings;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 const BUDGET_HOLD_NOTE_NAMESPACE = 'framework:budget-hold';
-type BudgetHoldOutcome = 'fit' | 'check_failed' | 'nothing_pending' | 'stopped';
+type BudgetHoldOutcome = 'fit' | 'nothing_pending' | 'failed' | 'stopped' | 'removed';
 function describeWait(ms: number): string {
   return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`;
 }
 interface BudgetHold {
-  state: 'holding' | 'released' | 'spent';
+  state: 'holding' | 'released';
   startedAt: number;
-  heldRequests: InferenceRequest[];
+  turn: InferenceRequest | undefined;
+  standsOn: string[];
+  wakes: InferenceRequest[];
   errorType: 'over_budget' | 'context_refusal';
   reason: string;
   budget: number | undefined;
   actual: number | undefined;
   recheck?: ReturnType<typeof setInterval>;
-  checking: Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null; cause?: string }> | undefined;
   managerCalls: number;
-  lookedAt?: string;
-  compressionSeen?: string;
-  compressionChangedAt: number;
-  announcing?: Array<() => void>;
-  providerTook?: true;
-  phase: number;
-  checkpoint: RecordedTurnCheckpoint | undefined;
+  callsAtHold: number;
   checkQueued?: boolean;
   drainKicked?: boolean;
-  outcome?: Exclude<BudgetHoldOutcome, 'stopped'>;
-  note?: string | null;
-  /** The ops alerts treat a hold, its release and a re-hold of the same
-   *  turn as one episode: `alerted` while its `context-hold` is out with no
-   *  clear, and `clear` the released turn's `context-hold-clear`, sent when
-   *  the episode ends: its start gets past its compile, it ends, the error
-   *  policy takes its refusal, or a provider hold takes it. */
-  alerted?: boolean;
-  clear?: () => void;
+  noteless?: true;
+  alerted?: true;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -3990,7 +3982,8 @@ type FrameworkCancelKind = 'turn_ended' | 'budget_restart' | 'quiesce_abandoned'
  *  start; any other drop ends it as a start dropped before it sends anything.
  *  `why` is said in the line its end logs. */
 type ContinuationDrop =
-  | { kind: 'quiesce_abandoned' | 'shutdown' | 'dropped'; why: string }
+  | { kind: 'quiesce_abandoned' | 'shutdown'; why: string }
+  | { kind: 'dropped'; why: string; reason?: string }
   /** A caller's stop (abortInference) of a turn whose continuation or retry
    *  is on its way, with the reason it gave. */
   | { kind: 'caller'; reason?: string; why: string };
@@ -4343,7 +4336,6 @@ export class AgentFramework {
   private budgetHolds: Map<string, BudgetHold> = new Map();
   private overBudgetDrainAfter: Map<string, Array<() => void>> = new Map();
   private budgetHoldRecheckMs = DEFAULT_MAINTENANCE_INTERVAL_MS;
-  private readonly storeChanges = new WeakMap<ContextManager, { count: number }>();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private inferenceBounds: InferenceBounds | null = resolveInferenceBounds(undefined);
@@ -6330,7 +6322,9 @@ export class AgentFramework {
     });
     // A stopped host must never hang behind its own cooldown.
     step(() => this.cancelProviderAdmission());
-    for (const name of [...(this.budgetHolds?.keys() ?? [])]) step(() => this.dropBudgetHold(name));
+    for (const name of [...(this.budgetHolds?.keys() ?? [])]) {
+      step(() => this.dropBudgetHold(name, { kind: 'shutdown', why: 'the framework is stopping' }));
+    }
     // An open logical turn doesn't survive a stop.
     this.openLogical.clear();
 
@@ -6981,10 +6975,7 @@ export class AgentFramework {
   private managerCallSettled(agentName: string): void {
     const hold = this.budgetHolds?.get(agentName);
     if (hold?.state !== 'holding' || hold.checkQueued) return;
-    const look = setTimeout(() => {
-      const agent = this.agents.get(agentName);
-      if (agent) void this.checkBudgetHold(agentName).then(() => this.compressForBudgetHold(agent));
-    }, 0);
+    const look = setTimeout(() => this.releaseBudgetHold(agentName), 0);
     look.unref?.();
   }
   /**
@@ -7384,88 +7375,119 @@ export class AgentFramework {
   private holdForBudgetRefusal(
     agent: Agent,
     error: Error,
-    trigger: InferenceRequest | undefined,
+    retry: InferenceRequest | undefined,
     checkpoint: RecordedTurnCheckpoint | undefined,
+    routing: TurnRouting,
+    noteGiven: boolean,
     endStart: () => void,
-  ): boolean {
+  ): 'held' | 'noteless' | undefined {
     const { errorType } = this.classifyInferenceError(error);
-    if (errorType !== 'over_budget' && errorType !== 'context_refusal') return false;
-    if (!this.budgetHolds || !this.running) return false;
-    if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent) return false;
+    if (errorType !== 'over_budget' && errorType !== 'context_refusal') return undefined;
+    if (!this.budgetHolds || !this.running || this.providerAdmissionClosed) return undefined;
+    if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent) return undefined;
     const existing = this.budgetHolds.get(agent.name);
-    if (existing?.state === 'spent') return false;
-    const own = asTurnRetry(trigger
-      ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() });
+    if (!this.compressionPending(agent)) {
+      if (existing?.state !== 'released') return undefined;
+      if (noteGiven && !existing.noteless) {
+        existing.noteless = true;
+        return 'noteless';
+      }
+      this.finishBudgetHold(agent.name, existing, 'nothing_pending');
+      return undefined;
+    }
+    if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
+    const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     if (existing?.state === 'holding') {
-      this.holdRequest(existing.heldRequests, own);
-      if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
+      this.holdRequest(existing.wakes, turn);
       endStart();
-      return true;
+      return 'held';
     }
-    if (!this.compressionPending(agent)) return false;
-    const now = Date.now();
+    const came = this.activeTurnTriggers.get(agent.name) as MarkedRequest | undefined;
+    const standsOn = existing && came?.[BUDGET_HELD] === existing && !continuesTurn(turn)
+      ? existing.standsOn
+      : this.rowsTurnStandsOn(agent, turn, routing);
+    if (existing) {
+      existing.state = 'holding';
+      existing.turn = turn;
+      (turn as MarkedRequest)[BUDGET_HELD] = existing;
+      existing.standsOn = standsOn;
+      existing.callsAtHold = existing.managerCalls;
+      delete existing.noteless;
+      this.startBudgetHoldRecheck(agent, existing);
+      endStart();
+      console.error(`[budget-hold] agent=${agent.name} released turn refused again (${errorType}) while compression is pending: ` +
+        `held again, as of its first hold ${describeWait(Date.now() - existing.startedAt)} ago`);
+      this.driveBudgetHoldSoon(agent);
+      return 'held';
+    }
     const figures = error as Error & { budget?: unknown; actual?: unknown };
-    const hold: BudgetHold = existing ?? {
-      state: 'holding', startedAt: now, heldRequests: [],
-      errorType, reason: '', budget: undefined, actual: undefined, checking: undefined, managerCalls: 0, checkpoint: undefined,
-      compressionChangedAt: now, compressionSeen: this.budgetHoldProgressKey(agent), phase: 0,
+    const hold: BudgetHold = {
+      state: 'holding',
+      startedAt: Date.now(),
+      turn,
+      standsOn,
+      wakes: [],
+      errorType,
+      reason: boundFailureText(String(error.message)),
+      budget: typeof figures.budget === 'number' ? figures.budget : undefined,
+      actual: typeof figures.actual === 'number' ? figures.actual : undefined,
+      managerCalls: 0,
+      callsAtHold: 0,
     };
-    hold.state = 'holding';
-    hold.phase++;
-    delete hold.providerTook;
-    delete hold.clear;
-    hold.checkpoint = checkpoint;
-    hold.heldRequests = [own];
-    hold.errorType = errorType;
-    hold.reason = boundFailureText(String(error.message));
-    hold.budget = typeof figures.budget === 'number' ? figures.budget : undefined;
-    hold.actual = typeof figures.actual === 'number' ? figures.actual : undefined;
-    if (this.maintenanceIntervalMs <= 0) {
-      hold.recheck = setInterval(() => {
-        void this.checkBudgetHold(agent.name).then(() => this.compressForBudgetHold(agent));
-      }, this.budgetHoldRecheckMs);
-      hold.recheck.unref?.();
-    }
+    (turn as MarkedRequest)[BUDGET_HELD] = hold;
     this.budgetHolds.set(agent.name, hold);
+    this.startBudgetHoldRecheck(agent, hold);
     endStart();
-    hold.announcing = [];
-    const opens = hold.alerted !== true;
+    this.emitTrace({
+      type: 'inference:held',
+      agentName: agent.name,
+      errorType,
+      error: hold.reason,
+      ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
+      ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
+      since: hold.startedAt,
+      heldRequests: 1,
+    });
+    if (this.budgetHolds.get(agent.name) !== hold) return 'held';
     hold.alerted = true;
-    try {
-      if (opens) this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
-        skipLog: true,
-        everyTime: true,
-        data: {
-          errorType,
-          since: hold.startedAt,
-          ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
-          ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
-        },
-      });
-      this.emitTrace({
-        type: 'inference:held',
-        agentName: agent.name,
+    this.opsAlert('context-refusal', agent.name, this.budgetHoldOpenText(hold), {
+      skipLog: true,
+      key: String(hold.startedAt),
+      data: {
         errorType,
-        error: hold.reason,
+        since: hold.startedAt,
         ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
         ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
-        since: hold.startedAt,
-        heldRequests: hold.heldRequests.length,
-      });
-    } finally {
-      const ends = hold.announcing ?? [];
-      delete hold.announcing;
-      for (const end of ends) end();
+      },
+    });
+    if (this.budgetHolds.get(agent.name) !== hold) return 'held';
+    const readiness = this.contextReadiness(agent.getContextManager());
+    const compression = 'pending' in readiness && readiness.pending ? ` Compression: ${boundFailureText(readiness.pending)}` : '';
+    console.error(`[budget-hold] agent=${agent.name} compile refused (${errorType}): ${hold.reason} \u2014 Held: ` +
+      `the turn waits, idle, and runs once compression makes room.${compression}`);
+    this.driveBudgetHoldSoon(agent);
+    return 'held';
+  }
+
+  private rowsTurnStandsOn(agent: Agent, turn: InferenceRequest, routing: TurnRouting): string[] {
+    if (!continuesTurn(turn)) {
+      const row = this.activeTurnTriggers.get(agent.name)?.readsRow;
+      return row !== undefined ? [row] : [];
     }
-    if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
-    if (!existing) this.logBudgetHold(agent, hold);
-    else {
-      console.error(`[budget-hold] agent=${agent.name} released turn refused again (${errorType}): ${hold.reason} \u2014 ` +
-        `held again, as of its first hold ${describeWait(now - hold.startedAt)} ago`);
+    const rows = routing.firstRow !== undefined ? [routing.firstRow] : [];
+    const from = routing.start?.sequence;
+    if (from === undefined) return rows;
+    try {
+      const ownCalls = new Set<string>();
+      for (const row of agent.getContextManager().getPresentedMessages()) {
+        if (!ownWindowRow(row, agent, ownCalls) || row.sequence <= from) continue;
+        if (storedInjectionMarkOf(row.metadata) !== undefined || clockStampOf(row.metadata) !== undefined) continue;
+        rows.push(String(row.id));
+      }
+    } catch (error) {
+      console.error(`[budget-hold] agent=${agent.name}: could not read the rows its held turn stands on, so a surgery checks its first row alone:`, error);
     }
-    const kick = setTimeout(() => this.compressForBudgetHold(agent), 0);
-    kick.unref?.();
-    return true;
+    return rows;
   }
 
   private compressionPending(agent: Agent): boolean {
@@ -7476,293 +7498,48 @@ export class AgentFramework {
     }
   }
 
-  private checkBudgetHolds(): void {
-    if (!this.budgetHolds?.size) return;
-    for (const name of [...this.budgetHolds.keys()]) {
-      void this.checkBudgetHold(name).then(() => {
-        const agent = this.agents.get(name);
-        if (agent) this.compressForBudgetHold(agent);
-      });
-    }
+  private startBudgetHoldRecheck(agent: Agent, hold: BudgetHold): void {
+    clearInterval(hold.recheck);
+    hold.recheck = undefined;
+    if (this.maintenanceIntervalMs > 0) return;
+    hold.recheck = setInterval(() => this.releaseBudgetHold(agent.name), this.budgetHoldRecheckMs);
+    hold.recheck.unref?.();
   }
 
-  private logBudgetHold(agent: Agent, hold: BudgetHold): void {
-    const readiness = this.contextReadiness(agent.getContextManager());
-    const compression = 'pending' in readiness && readiness.pending
-      ? ` Compression: ${boundFailureText(readiness.pending)}`
-      : '';
-    console.error(`[budget-hold] agent=${agent.name} compile refused (${hold.errorType}): ${hold.reason} \u2014 Held: ` +
-      `this turn runs once a check finds its context fits its budget.${compression}`);
+  private driveBudgetHoldSoon(agent: Agent): void {
+    const kick = setTimeout(() => this.driveBudgetHold(agent), 0);
+    kick.unref?.();
   }
 
-  private async checkBudgetHold(agentName: string): Promise<void> {
-    const hold = this.budgetHolds?.get(agentName);
-    const agent = this.agents.get(agentName);
-    if (hold?.state !== 'holding' || !agent) return;
-    const pending = this.compressionPending(agent);
-    const progress = this.budgetHoldProgressKey(agent);
-    if (progress !== undefined && progress !== hold.compressionSeen) {
-      if (hold.compressionSeen !== undefined) hold.compressionChangedAt = Date.now();
-      hold.compressionSeen = progress;
-    }
-    const signature = this.budgetHoldSignature(agent, pending);
-    if (signature !== undefined && signature === hold.lookedAt) return;
-    const preview = this.budgetHoldPreview(agent);
-    let verdict = preview?.verdict;
-    let note: string | null = null;
-    let cause = preview?.cause;
-    if (verdict === undefined) {
-      if (hold.checking) return;
-      const phase = hold.phase;
-      const check = this.budgetHoldDryRun(agent, hold);
-      hold.checking = check;
-      try {
-        ({ verdict, note = null, cause } = await check);
-      } finally {
-        if (hold.checking === check) hold.checking = undefined;
-      }
-      if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding' || hold.phase !== phase) return;
-      if (this.agents.get(agentName) !== agent) return;
-      // A refusal seen before a change could keep the turn held wrongly, so it
-      // waits for the next look; a fit seen before one releases the turn, whose
-      // start then compiles against the change.
-      if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
-    } else if (verdict === 'fit') {
-      note = this.budgetHoldNoteWhereItFits(agent, hold, preview?.plan);
-    }
-    if (verdict === 'refused' && pending) {
-      hold.lookedAt = signature;
-    } else if (verdict === 'refused') {
-      this.releaseBudgetHold(agentName, 'nothing_pending', null);
-    } else {
-      hold.lookedAt = signature;
-      this.releaseBudgetHold(agentName, verdict, verdict === 'fit' ? note : null, cause);
-    }
-  }
-
-  private budgetHoldNotePrice(agent: Agent, hold: BudgetHold): { note: string; price: number } | undefined {
-    const note = this.budgetHoldNote(hold);
-    const strategy = agent.getContextManager().getStrategy() as unknown as { estimateTokens?: (content: ContentBlock[]) => number };
-    if (typeof strategy.estimateTokens !== 'function') return undefined;
-    try {
-      return {
-        note,
-        price: strategy.estimateTokens(asStoredRow({
-          namespace: BUDGET_HOLD_NOTE_NAMESPACE, position: 'afterUser', content: [{ type: 'text', text: note }],
-        }).content as ContentBlock[]),
-      };
-    } catch {
-      return undefined;
-    }
-  }
-
-  private budgetHoldNoteWhereItFits(
-    agent: Agent,
-    hold: BudgetHold,
-    plan: { finalTokens: number; budgetTokens: number } | undefined,
-  ): string | null {
-    const priced = this.budgetHoldNotePrice(agent, hold);
-    if (!priced) return null;
-    const { note, price } = priced;
-    const cm = agent.getContextManager();
-    if (plan && plan.budgetTokens - plan.finalTokens >= price) return note;
-    const budget = agent.nextCompileBudget();
-    const thinkingBinding = agent.thinkingBindingOption();
-    try {
-      const smaller = (cm as unknown as {
-        previewContext: (budget: TokenBudget, overrides?: undefined, opts?: { thinkingBinding?: ThinkingBinding }) => { fits?: unknown } | null;
-      }).previewContext({ ...budget, maxTokens: budget.maxTokens - price }, undefined, thinkingBinding ? { thinkingBinding } : undefined);
-      return smaller?.fits === true ? note : null;
-    } catch {
-      return null;
-    }
-  }
-
-  private budgetHoldPreview(agent: Agent): { verdict: 'fit' | 'refused' | 'check_failed'; plan?: { finalTokens: number; budgetTokens: number }; cause?: string } | undefined {
-    const cm = agent.getContextManager() as unknown as {
-      previewContext?: (budget: TokenBudget, overrides?: undefined, opts?: { thinkingBinding?: ThinkingBinding }) => { fits?: unknown; finalTokens?: unknown; budgetTokens?: unknown } | null;
-    };
-    if (typeof cm.previewContext !== 'function') return undefined;
-    const thinkingBinding = agent.thinkingBindingOption();
-    // context-manager's preview answers an over-budget plan with fits: false
-    // and rethrows any other error. A dry compile can resolve a plan the
-    // committing compile refuses (SelectOptions.dryRun), so it decides only
-    // where there is no preview.
-    try {
-      const preview = cm.previewContext(agent.nextCompileBudget(), undefined, thinkingBinding ? { thinkingBinding } : undefined);
-      if (!preview) return undefined;
-      if (preview.fits !== true) return { verdict: 'refused' };
-      const { finalTokens, budgetTokens } = preview;
-      return typeof finalTokens === 'number' && typeof budgetTokens === 'number'
-        ? { verdict: 'fit', plan: { finalTokens, budgetTokens } }
-        : { verdict: 'fit' };
-    } catch (error) {
-      // The hierarchical strategy's preview has no fold plan for a context
-      // that fits: context-manager 0.23.0 throws, 0.23.1 returns null. Its dry
-      // compile refuses as its compile does.
-      if (error instanceof Error && error.message.includes('requires adaptiveResolution')) return undefined;
-      return this.budgetHoldThrownVerdict(error);
-    }
-  }
-
-  private async budgetHoldDryRun(agent: Agent, hold: BudgetHold): Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null; cause?: string }> {
-    try {
-      await this.previewActivation(agent.name);
-    } catch (error) {
-      return this.budgetHoldThrownVerdict(error);
-    }
-    const priced = this.budgetHoldNotePrice(agent, hold);
-    if (!priced) return { verdict: 'fit', note: null };
-    const budget = agent.nextCompileBudget();
-    const reserve = agent.toolResultGuard.pendingWireReserveTokens;
-    try {
-      await this.previewActivation(agent.name, {
-        budget: { maxTokens: budget.maxTokens - priced.price, reserveForResponse: budget.reserveForResponse - reserve },
-      });
-      return { verdict: 'fit', note: priced.note };
-    } catch {
-      return { verdict: 'fit', note: null };
-    }
-  }
-
-  private budgetHoldThrownVerdict(error: unknown): { verdict: 'refused' } | { verdict: 'check_failed'; cause: string } {
-    const { errorType } = this.classifyInferenceError(error instanceof Error ? error : new Error(String(error)));
-    return errorType === 'over_budget' || errorType === 'context_refusal'
-      ? { verdict: 'refused' }
-      : { verdict: 'check_failed', cause: boundFailureText(error instanceof Error ? String(error.message) : failureDescription(error)) };
-  }
-
-  private budgetHoldSignature(agent: Agent, pending = this.compressionPending(agent)): string | undefined {
-    try {
-      const cm = agent.getContextManager();
-      return JSON.stringify([
-        this.contextProgress(cm) ?? null,
-        // A strategy's progress snapshot needn't show what its readiness reads,
-        // and some strategies report none.
-        pending,
-        this.storeChangeCount(cm),
-        agent.getRuntimeSettings(),
-        agent.nextCompileBudget(),
-        cm.listPins()
-          .map((pin) => [pin.id, pin.firstMessageId, pin.lastMessageId, pin.kind, pin.level ?? null, pin.maxLevel ?? null])
-          .sort(([a], [b]) => (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0)),
-      ]);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /** Compression's own work, from its progress snapshot: the summaries it
-   *  has made (`chunksCompressed`, `summaryCounts`) and whether a call is in
-   *  flight (`pending`), as context-manager's AutobiographicalProgressSnapshot
-   *  documents them. Its other fields, and readiness, move with what the
-   *  window is presented: a presented message can close or queue a chunk.
-   *  A snapshot without those
-   *  three fields is taken whole. */
-  private budgetHoldProgressKey(agent: Agent): string | undefined {
-    try {
-      const progress = this.contextProgress(agent.getContextManager());
-      if (progress === undefined) return JSON.stringify(null);
-      const { chunksCompressed, summaryCounts, pending } = progress;
-      return JSON.stringify(typeof chunksCompressed === 'number' && typeof pending === 'boolean'
-        && summaryCounts !== null && typeof summaryCounts === 'object'
-        ? [chunksCompressed, summaryCounts, pending]
-        : progress);
-    } catch {
-      return undefined;
-    }
-  }
-
-  private storeChangeCount(cm: ContextManager): number {
-    let changes = this.storeChanges.get(cm);
-    if (!changes) {
-      const counted = { count: 0 };
-      cm.onMessage((event) => {
-        if (event.type === 'add'
-          && (storedInjectionMarkOf(event.message.metadata) !== undefined || clockStampOf(event.message.metadata) !== undefined
-            || suppressedRow(event.message.metadata as Record<string, unknown> | undefined))) return;
-        // context-manager's edit event names only the row's id, and a removed
-        // row can't be read, so a removal still counts.
-        if (event.type === 'edit'
-          && suppressedRow(cm.getMessage(event.messageId)?.metadata as Record<string, unknown> | undefined)) return;
-        counted.count++;
-      });
-      this.storeChanges.set(cm, counted);
-      changes = counted;
-    }
-    return changes.count;
-  }
-
-  private compressForBudgetHold(agent: Agent): void {
+  private driveBudgetHold(agent: Agent): void {
     const hold = this.budgetHolds?.get(agent.name);
-    if (hold?.state !== 'holding' || this.agents.get(agent.name) !== agent) return;
-    if (this.providerGateBlocked(agent.name)) {
-      void this.checkBudgetHold(agent.name);
-      return;
-    }
-    if (hold.checkQueued) return;
+    if (hold?.state !== 'holding' || this.agents.get(agent.name) !== agent || hold.checkQueued) return;
+    if (this.providerGateBlocked(agent.name)) return;
     const kicked = this.kickOverBudgetDrain(agent.name, agent, () => {
       hold.checkQueued = false;
-      void this.checkBudgetHold(agent.name).then(() => {
-        if (kicked === 'already draining') this.compressForBudgetHold(agent);
-      });
+      if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return;
+      if (hold.managerCalls !== hold.callsAtHold) this.releaseBudgetHold(agent.name);
+      else if (kicked === 'already draining') this.driveBudgetHold(agent);
     }, 'hold', hold.drainKicked);
     if (kicked === 'kicking' || kicked === 'already draining') hold.checkQueued = true;
     if (kicked === 'kicking') hold.drainKicked = true;
   }
 
-  private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>, note: string | null, cause?: string): void {
+  private releaseBudgetHolds(): void {
+    for (const name of [...(this.budgetHolds?.keys() ?? [])]) this.releaseBudgetHold(name);
+  }
+
+  private releaseBudgetHold(agentName: string): void {
     const hold = this.budgetHolds?.get(agentName);
-    if (hold?.state !== 'holding') return;
-    this.clearBudgetHoldRecheck(hold);
-    const waitedMs = Date.now() - hold.startedAt;
-    const released = hold.heldRequests;
-    for (const request of released) {
-      (request as MarkedRequest)[BUDGET_RELEASED] = hold;
-      this.pendingRequests.push(request);
-    }
-    hold.state = outcome === 'nothing_pending' ? 'spent' : 'released';
-    hold.outcome = outcome;
-    hold.note = note;
-    hold.heldRequests = [];
-    console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}${cause !== undefined ? `: ${cause}` : ''}) ` +
-      `after ${waitedMs}ms; ${released.length} held request(s) queued for one fresh compile`);
-    this.budgetHoldEnded(hold, agentName, outcome, waitedMs, released.length, cause);
-  }
-
-  private budgetHoldEnded(hold: BudgetHold, agentName: string, outcome: BudgetHoldOutcome, waitedMs: number, heldRequests: number, cause?: string): void {
-    const after = describeWait(waitedMs);
-    const words = outcome === 'fit' ? `the held turn's context fits, after ${after}: the turn runs`
-      : outcome === 'nothing_pending' ? `compression had nothing left to do after ${after}: the turn compiles again, and a refusal now takes the error policy's path`
-        : outcome === 'check_failed' ? `the hold's check failed after ${after}: the turn compiles again`
-          : `the held turn was ended after ${after}`;
-    const clear = (): void => this.opsAlert('context-hold-clear', agentName, cause !== undefined ? `${words} (${cause})` : words, {
-      skipLog: true,
-      everyTime: true,
-      data: { outcome, waitedMs, ...(cause !== undefined ? { cause } : {}) },
-    });
-    const report = (): void => {
-      this.emitTrace({
-        type: 'inference:hold_ended',
-        agentName,
-        outcome,
-        waitedMs,
-        heldRequests,
-      });
-      if (hold.state === 'released' && this.budgetHolds?.get(agentName) === hold) hold.clear = clear;
-      else {
-        hold.alerted = false;
-        clear();
-      }
-    };
-    if (hold.announcing) hold.announcing.push(report);
-    else report();
-  }
-
-  private contextHoldText(wholeReason: string): string {
-    const head = 'turn held until compression makes room, since its compile was refused for budget: ';
-    const tail = `; ${heldTurnWayOn(false)}`;
-    return head + boundFailureText(wholeReason, FAILURE_TEXT_MAX_CHARS - head.length - tail.length) + tail;
+    if (hold?.state !== 'holding' || this.quiesced) return;
+    hold.state = 'released';
+    clearInterval(hold.recheck);
+    hold.recheck = undefined;
+    const requests = [...(hold.turn ? [hold.turn] : []), ...hold.wakes];
+    hold.wakes = [];
+    this.pendingRequests.push(...requests);
+    console.error(`[budget-hold] agent=${agentName} released after ${Date.now() - hold.startedAt}ms: ` +
+      `${requests.length} request(s) queued, and the start's own compile is the check`);
   }
 
   private budgetHoldNote(hold: BudgetHold): string {
@@ -7773,82 +7550,169 @@ export class AgentFramework {
       `${describeWait(Date.now() - hold.startedAt)} for compression to make room.`;
   }
 
-  private dropBudgetHold(agentName: string): void {
-    this.takeBudgetHold(agentName)?.report('dropped with it');
-  }
-
-  private takeBudgetHold(agentName: string): { requests: InferenceRequest[]; report: (wakes: string) => void } | undefined {
-    const hold = this.budgetHolds?.get(agentName);
-    if (!hold) return undefined;
-    this.budgetHolds.delete(agentName);
-    if (hold.state !== 'holding') {
-      this.sendBudgetHoldClear(hold);
+  private budgetHoldNoteFor(agent: Agent): ContextInjection | undefined {
+    const hold = this.budgetHolds?.get(agent.name);
+    if (hold?.state !== 'released' || hold.noteless) return undefined;
+    // context-manager's compile places an afterUser injection after the last
+    // message whose participant is `user`, or at the end when there's none
+    // (ContextManager.compile, 0.25.0); a stored row is appended at the
+    // window's end, so the two agree only where nothing the agent reads
+    // follows that message.
+    try {
+      const rows = agent.getContextManager().getPresentedMessages();
+      let last: StoredMessage | undefined;
+      for (let at = rows.length - 1; at >= 0; at--) {
+        const row = rows[at]!;
+        if (!this.agentSees(agent, row.metadata)) continue;
+        if (row.participant.toLowerCase() === 'user') {
+          if (last !== undefined) return undefined;
+          break;
+        }
+        last ??= row;
+      }
+    } catch (error) {
+      console.error(`[budget-hold] agent=${agent.name}: could not read where its window ends, so its released turn has no note:`, error);
       return undefined;
     }
-    this.clearBudgetHoldRecheck(hold);
-    const waitedMs = Date.now() - hold.startedAt;
-    const requests = hold.heldRequests;
-    return {
-      requests,
-      report: (wakes) => {
-        const others = requests.filter((r) => !continuesTurn(r)).length;
-        console.error(`[budget-hold] agent=${agentName} hold ended (stopped) after ${waitedMs}ms with its turn; ` +
-          `${others} other held request(s) ${wakes}`);
-        this.budgetHoldEnded(hold, agentName, 'stopped', waitedMs, requests.length);
-      },
-    };
+    return { namespace: BUDGET_HOLD_NOTE_NAMESPACE, position: 'afterUser', content: [{ type: 'text', text: this.budgetHoldNote(hold) }] };
   }
 
-  private releasedByBudgetHold(agentName: string): boolean {
-    const hold = this.budgetHolds?.get(agentName);
-    return hold !== undefined && hold.state !== 'holding' && hold.providerTook !== true;
-  }
-
-  private noteProviderTookRelease(agentName: string, requests: readonly InferenceRequest[]): void {
-    const hold = this.budgetHolds?.get(agentName);
-    if (hold === undefined || hold.state === 'holding') return;
-    const releasedBy = (request: InferenceRequest) => (request as MarkedRequest)[BUDGET_RELEASED] === hold;
-    if (requests.some((request) => releasedBy(request) || (mergedBatch(request) ?? []).some(releasedBy))) {
-      hold.providerTook = true;
-      this.sendBudgetHoldClear(hold);
+  private budgetHoldCompiled(agent: Agent, note: ContextInjection | undefined): void {
+    const hold = this.budgetHolds?.get(agent.name);
+    if (hold?.state !== 'released') return;
+    if (note) {
+      const row = asStoredRow(note);
+      const mark: StoredInjectionMark = { agent: agent.name, namespace: row.namespace, contentHash: unitHash([row]), part: 0, parts: 1 };
+      try {
+        const id = storeOwnRow(agent, row.participant, row.content, {
+          system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: mark,
+        } as MessageMetadata);
+        this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.namespace}` });
+      } catch (error) {
+        console.error(`[budget-hold] agent=${agent.name}: the note its released turn read could not be stored:`, error);
+      }
     }
+    this.finishBudgetHold(agent.name, hold, 'fit');
   }
 
-  private settleBudgetHold(agentName: string): void {
+  private endReleasedBudgetHold(agentName: string, outcome: 'failed' | 'stopped', cause?: string): void {
     const hold = this.budgetHolds?.get(agentName);
-    if (hold === undefined || hold.state === 'holding') return;
-    this.budgetHolds.delete(agentName);
-    this.sendBudgetHoldClear(hold);
+    if (hold?.state === 'released') this.finishBudgetHold(agentName, hold, outcome, cause);
   }
 
-  private sendBudgetHoldClear(hold: BudgetHold): void {
-    const clear = hold.clear;
-    if (clear === undefined) return;
-    delete hold.clear;
-    hold.alerted = false;
-    clear();
-  }
-
-  private clearBudgetHoldRecheck(hold: BudgetHold): void {
+  private finishBudgetHold(agentName: string, hold: BudgetHold, outcome: BudgetHoldOutcome, cause?: string): void {
+    if (this.budgetHolds?.get(agentName) === hold) this.budgetHolds.delete(agentName);
     clearInterval(hold.recheck);
     hold.recheck = undefined;
+    const waitedMs = Date.now() - hold.startedAt;
+    console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}${cause !== undefined ? `: ${cause}` : ''}) after ${waitedMs}ms`);
+    this.emitTrace({ type: 'inference:hold_ended', agentName, outcome, waitedMs });
+    if (outcome === 'fit' || !hold.alerted) return;
+    const after = describeWait(waitedMs);
+    const words = outcome === 'nothing_pending'
+      ? `compression had nothing left to do after ${after}, and the waiting turn's context still didn't fit: the turn now takes the error policy's path`
+      : outcome === 'failed'
+        ? `the waiting turn's start failed for another reason after ${after}: ${cause ?? 'unknown'}`
+        : outcome === 'removed'
+          ? `what the waiting turn was for was removed after ${after}, so it doesn't run`
+          : `the waiting turn was stopped after ${after}`;
+    this.opsAlert('context-refusal-clear', agentName, words, {
+      skipLog: true,
+      key: String(hold.startedAt),
+      data: { outcome, waitedMs, ...(cause !== undefined ? { cause } : {}) },
+    });
   }
 
-  private afterBudgetHold(agentName: string, error: Error): Error {
-    const { errorType } = this.classifyInferenceError(error);
-    if (errorType !== 'over_budget' && errorType !== 'context_refusal') return error;
+  private budgetHoldOpenText(hold: BudgetHold): string {
+    const head = `compile refused (${hold.errorType}): `;
+    const tail = ' \u2014 the turn waits while compression makes room, and runs once its context fits';
+    return head + boundFailureText(hold.reason, FAILURE_TEXT_MAX_CHARS - head.length - tail.length) + tail;
+  }
+
+  private endHeldTurn(agentName: string, turn: InferenceRequest, drop: ContinuationDrop): void {
+    this.endContinuedTurn(agentName, drop, !continuesTurn(turn));
+  }
+
+  private dropBudgetHold(agentName: string, drop: ContinuationDrop, wakes: 'back' | 'gone' = 'gone'): boolean {
     const hold = this.budgetHolds?.get(agentName);
-    if (hold?.state === 'released') {
-      const agent = this.agents.get(agentName);
-      if (agent && !this.compressionPending(agent)) hold.state = 'spent';
+    if (!hold) return false;
+    if (hold.state === 'released') {
+      this.finishBudgetHold(agentName, hold, 'stopped');
+      return false;
     }
-    if (hold?.state !== 'spent') return error;
-    this.sendBudgetHoldClear(hold);
-    error.message = `${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ` +
-      (hold.outcome === 'fit'
-        ? "its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do)"
-        : "compression had nothing left to do and it still didn't fit)");
-    return error;
+    this.budgetHolds.delete(agentName);
+    const { turn } = hold;
+    hold.turn = undefined;
+    const left = hold.wakes;
+    hold.wakes = [];
+    try {
+      if (turn) this.endHeldTurn(agentName, turn, drop);
+      if (wakes === 'back') this.pendingRequests.push(...left);
+    } finally {
+      this.finishBudgetHold(agentName, hold, 'stopped');
+    }
+    return turn !== undefined;
+  }
+
+  private heldContinuation(agentName: string): boolean {
+    const hold = this.budgetHolds?.get(agentName);
+    return hold?.state === 'holding' && hold.turn !== undefined && continuesTurn(hold.turn);
+  }
+
+  private dropHeldContinuation(agentName: string, why: string): void {
+    const hold = this.budgetHolds?.get(agentName);
+    if (hold?.state !== 'holding' || !hold.turn || !continuesTurn(hold.turn)) return;
+    const turn = hold.turn;
+    hold.turn = undefined;
+    hold.standsOn = [];
+    this.endHeldTurn(agentName, turn, { kind: 'dropped', why, reason: BUDGET_HELD_TURN_REMOVED });
+    if (hold.wakes.length === 0) this.finishBudgetHold(agentName, hold, 'removed');
+  }
+
+  private rowGone(agent: Agent, row: string): boolean {
+    try {
+      return agent.getContextManager().getMessage(row as MessageId) === null;
+    } catch (error) {
+      console.error(`[budget-hold] agent=${agent.name}: could not read whether row ${row} is still there, so what waits on it stays:`, error);
+      return false;
+    }
+  }
+
+  private releasedTurnRemoved(agent: Agent, trigger: InferenceRequest | undefined): boolean {
+    const hold = this.budgetHolds?.get(agent.name);
+    const turn = hold?.state === 'released' ? hold.turn : undefined;
+    if (!hold || !turn || !trigger) return false;
+    const batch = mergedBatch(trigger);
+    const heldBy = (request: InferenceRequest): boolean => (request as MarkedRequest)[BUDGET_HELD] === hold;
+    if (!heldBy(trigger) && !batch?.some(heldBy)) return false;
+    if (!hold.standsOn.some((row) => this.rowGone(agent, row))) return false;
+    this.budgetHolds.delete(agent.name);
+    hold.turn = undefined;
+    if (batch) this.pendingRequests.push(...batch.filter((r) => !heldBy(r)));
+    this.endHeldTurn(agent.name, turn, { kind: 'dropped', why: 'a surgery removed what its held turn stood on', reason: BUDGET_HELD_TURN_REMOVED });
+    this.finishBudgetHold(agent.name, hold, 'removed');
+    return true;
+  }
+
+  private checkBudgetHoldsAfterSurgery(): void {
+    for (const [agentName, hold] of [...(this.budgetHolds?.entries() ?? [])]) {
+      const agent = this.agents.get(agentName);
+      if (!agent) continue;
+      const gone = (row: string): boolean => this.rowGone(agent, row);
+      if (hold.state !== 'holding') continue;
+      const wakes = hold.wakes.filter((wake) => wake.readsRow === undefined || !gone(wake.readsRow));
+      if (wakes.length < hold.wakes.length) {
+        console.error(`[budget-hold] agent=${agentName}: ${hold.wakes.length - wakes.length} held wake(s) dropped, their rows removed`);
+      }
+      hold.wakes = wakes;
+      if (hold.turn && hold.standsOn.some(gone)) {
+        const turn = hold.turn;
+        hold.turn = undefined;
+        hold.standsOn = [];
+        this.endHeldTurn(agentName, turn, { kind: 'dropped', why: 'a surgery removed what its held turn stood on', reason: BUDGET_HELD_TURN_REMOVED });
+      }
+      if (!hold.turn && hold.wakes.length === 0) this.finishBudgetHold(agentName, hold, 'removed');
+    }
   }
 
   private kickOverBudgetDrain(
@@ -7893,18 +7757,13 @@ export class AgentFramework {
         }
         const holding = () => this.budgetHolds.get(agentName)?.state === 'holding';
         while ((by === 'hold' ? holding() : ticks < 8) && !this.providerAdmissionClosed && !this.surgeryHold && this.agents.get(agentName) === agent) {
-          const looking = by === 'hold' ? this.budgetHolds.get(agentName)?.checking : undefined;
-          if (looking) {
-            await looking;
-            await this.checkBudgetHold(agentName);
-            continue;
-          }
           const calls = by === 'hold' ? this.budgetHolds.get(agentName)?.managerCalls : undefined;
           await cm.tick();
           ticks++;
           if (by === 'breaker') continue;
           if (this.budgetHolds.get(agentName)?.managerCalls === calls) break;
-          await this.checkBudgetHold(agentName);
+          this.releaseBudgetHold(agentName);
+          if (this.quiesced) break;
         }
         if (by === 'hold' && ticks > 0) this.maintenanceFailureReported.delete(agentName);
         const stopped = by === 'breaker' && ticks >= 8 ? ''
@@ -7990,7 +7849,6 @@ export class AgentFramework {
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
       reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
     this.pendingRequests.push(...requests);
-    this.noteProviderTookRelease(agentName, requests);
     console.error(cooldown.rearm
       ? `[inference-rearm] agent=${agentName} turn queued again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
       : `[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
@@ -8325,7 +8183,7 @@ export class AgentFramework {
     this.maintenancePass = pass;
     void pass.finally(() => {
       if (this.maintenancePass === pass) this.maintenancePass = null;
-      this.checkBudgetHolds();
+      this.releaseBudgetHolds();
     });
     begin(this.runQueuedMaintenance().catch((error) => {
       // The alert cuts its own copies from the whole message, so the
@@ -8862,6 +8720,9 @@ export class AgentFramework {
     if (!result && this.pendingContinuationAgents().has(agentName)) {
       this.dropContinuations(agentName, { kind: 'caller', reason, why: 'a stop ended the turn' });
       return true;
+    }
+    if (!result && this.budgetHolds?.get(agentName)?.state === 'holding' && this.budgetHolds.get(agentName)!.turn) {
+      return this.dropBudgetHold(agentName, { kind: 'caller', reason, why: 'a stop ended the turn' }, 'back');
     }
     return !!result;
   }
@@ -10075,7 +9936,6 @@ export class AgentFramework {
     // operator tests build one, sets none of these.
     for (const r of this.pendingRequests ?? []) add(r);
     for (const cooldown of this.providerAccelerationCooldowns?.values() ?? []) for (const r of cooldown.heldRequests) add(r);
-    for (const hold of this.budgetHolds?.values() ?? []) for (const r of hold.heldRequests) add(r);
     for (const r of this.parkedContinuations ?? []) add(r);
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) for (const r of requests) add(r);
     return agents;
@@ -10093,21 +9953,14 @@ export class AgentFramework {
     return this.activeTurnTokens.has(agentName) || this.pendingContinuationAgents().has(agentName);
   }
 
-  /** The provider or budget hold keeping `agentName`'s turn for its retry
-   *  (TURN_RETRY), in words naming its end and its reason, and whether a
-   *  stated wait holds it; undefined when no hold keeps one. */
+  /** The provider hold keeping `agentName`'s turn for its retry (TURN_RETRY),
+   *  in words naming its end and its reason, and whether a stated wait holds
+   *  it; undefined when no hold keeps one. */
   private heldTurnRetry(agentName: string): { says: string; statedWait: boolean } | undefined {
     // Optional, as pendingContinuationAgents reads it: a framework built from
     // its prototype, as some suites build one, has no map of holds.
     const hold = this.providerAccelerationCooldowns?.get(agentName);
-    if (!hold?.heldRequests.some(isTurnRetry)) {
-      const budget = this.budgetHolds?.get(agentName);
-      if (!budget?.heldRequests.some(isTurnRetry)) return undefined;
-      return {
-        says: `a budget hold keeps its turn to start again once its context fits: ${budget.reason}`,
-        statedWait: false,
-      };
-    }
+    if (!hold?.heldRequests.some(isTurnRetry)) return undefined;
     // A deadline past what a Date can name (an infinite wait, or a stated
     // one too long for an instant) is one only a release ends.
     const end = new Date(hold.until);
@@ -10135,8 +9988,8 @@ export class AgentFramework {
         ...this.pendingRequests,
         ...[...this.passRequests].flatMap((pass) => [...pass.values()].flat()),
         ...[...this.providerAccelerationCooldowns.values()].flatMap((c) => c.heldRequests),
-        ...[...(this.budgetHolds?.values() ?? [])].flatMap((h) => h.heldRequests),
-      ].flatMap((r) => mergedBatch(r) ?? [r]).filter((r) => !passesQuiesce(r)).length,
+      ].flatMap((r) => mergedBatch(r) ?? [r]).filter((r) => !passesQuiesce(r)).length
+        + [...(this.budgetHolds?.values() ?? [])].reduce((n, h) => n + (h.state === 'holding' && h.turn ? 1 : 0) + h.wakes.length, 0),
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
       // Deprecated (#291): no queue is kept. What a live surgery's hold
       // keeps in memory, to land at its release, and what waits in memory
@@ -10158,12 +10011,7 @@ export class AgentFramework {
    * MCPL data planes, and wait for in-flight turns to settle (turn-alive is
    * a turn token, which spans dequeue → settled teardown, a continuation of
    * the turn on its way to its start, or the turn's retry, which a provider
-   * hold or a budget hold keeps or which waits to start: turnHolders). A
-   * budget hold keeps its turn, with no time limit, until a check finds the
-   * context fits or fails for another reason, or compression has nothing
-   * left to do, so a quiesce made while one holds a turn drains only if the
-   * turn ends within the window: released and finished, or ended by
-   * `abortInference()`. `abandon: true` ends it. Idempotent. While
+   * hold keeps or which waits to start: turnHolders). Idempotent. While
    * quiesced a write is stored at once, as always, unless a surgery's hold
    * or a context manager refusing its work keeps it in memory, and the
    * presentation index presents no agent another's row until resume
@@ -10514,6 +10362,7 @@ export class AgentFramework {
       // window of each agent with no turn alive now; a draining turn's is
       // presented at its own points.
       for (const agent of [...this.agents.values()]) this.presentAtEndOf(agent);
+      this.releaseBudgetHolds();
       this.persistHostMode(null);
       this.hostModeRecordMayBeQuiesced = false;
     } finally {
@@ -13269,7 +13118,7 @@ export class AgentFramework {
     this.closingConversationAgents.delete(name);
     // A continuation of its turn still on its way goes with it.
     this.dropContinuations(name, { kind: 'dropped', why });
-    this.dropBudgetHold(name);
+    this.dropBudgetHold(name, { kind: 'dropped', why });
     // A batch its guard still holds is settled as `aborted`: the stream's
     // own finally does neither once the agent has gone.
     if (agent.toolResultGuard.hasPending) {
@@ -16342,6 +16191,10 @@ export class AgentFramework {
     // A turn alive (its start, its stream, its tools, a continuation or a
     // provider hold's retry on its way) holds the window: its next rows
     // would land on what the undo took out.
+    if (this.heldContinuation(agentName) && !this.hasTurn(agentName) && !this.turnAlive(agent)
+      && this.getTurnCheckpoints(agentName).length > 0) {
+      this.dropHeldContinuation(agentName, 'an undo took out what its held turn stood on');
+    }
     if (this.logicalTurnAlive(agent)) {
       throw new OperatorActionError('agent-busy', `Cannot undo: a turn of ${agentName}'s is alive`);
     }
@@ -16866,8 +16719,8 @@ export class AgentFramework {
     for (const [name, a] of this.agents) {
       if (a.state.status !== 'idle') { busy.push(`${name} is ${a.state.status}`); continue; }
       if (!this.hasTurn(name)) continue;
-      // A provider or budget hold keeping the turn's retry is named: a
-      // quiesce alone doesn't end that turn.
+      // A provider hold keeping the turn's retry is named: a quiesce alone
+      // doesn't end that turn.
       const held = this.heldTurnRetry(name);
       if (held) {
         heldTurns = true;
@@ -16927,6 +16780,7 @@ export class AgentFramework {
       // turn's end (a rollback's returned arrivals wait: holdUntilStart).
       this.releaseSurgeryHeldWrites();
       for (const name of reserved.keys()) this.presentAtEndOf(this.agents.get(name));
+      this.checkBudgetHoldsAfterSurgery();
     };
   }
 
@@ -21021,7 +20875,7 @@ export class AgentFramework {
       this.thinkingLossIncidents.forget(agentName);
       // A continuation of its turn still on its way goes with it.
       this.dropContinuations(agentName, { kind: 'dropped', why: 'its agent was disposed' });
-      this.dropBudgetHold(agentName);
+      this.dropBudgetHold(agentName, { kind: 'dropped', why: 'its agent was disposed' });
       this.turnRouting.delete(agentName);
       this.proseSpeechChains.delete(agentName);
       this.openLogical.delete(agentName);
@@ -21141,7 +20995,8 @@ export class AgentFramework {
       if (
         !this.hasTurn(agentName) &&
         !this.activeStreams.has(agentName) &&
-        !this.pendingRequests.some((r) => r.agentName === agentName)
+        !this.pendingRequests.some((r) => r.agentName === agentName) &&
+        this.budgetHolds?.get(agentName)?.state !== 'holding'
       ) {
         this.disposeConversationAgent(agentName, 'idle-ttl');
       }
@@ -22170,7 +22025,7 @@ export class AgentFramework {
     };
     for (const r of this.pendingRequests) unrecord(r);
     for (const cooldown of this.providerAccelerationCooldowns.values()) cooldown.heldRequests.forEach(unrecord);
-    for (const hold of this.budgetHolds?.values() ?? []) hold.heldRequests.forEach(unrecord);
+    for (const hold of this.budgetHolds?.values() ?? []) hold.wakes.forEach(unrecord);
     for (const r of this.parkedContinuations ?? []) unrecord(r);
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
     const withdrawn = (r: InferenceRequest): boolean => r.coalescingSubject === subject || emptied.has(r);
@@ -22180,8 +22035,10 @@ export class AgentFramework {
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => !withdrawn(r));
       if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedBy = 'withdrawal';
     }
-    for (const hold of this.budgetHolds?.values() ?? []) {
-      hold.heldRequests = hold.heldRequests.filter((r) => !withdrawn(r));
+    for (const [agentName, hold] of [...(this.budgetHolds?.entries() ?? [])]) {
+      if (hold.state !== 'holding') continue;
+      hold.wakes = hold.wakes.filter((r) => !withdrawn(r));
+      if (!hold.turn && hold.wakes.length === 0) this.finishBudgetHold(agentName, hold, 'removed');
     }
     for (const pass of this.passRequests ?? []) {
       for (const requests of pass.values()) {
@@ -22756,7 +22613,7 @@ export class AgentFramework {
 
       const budgetHold = this.budgetHolds?.get(agentName);
       if (budgetHold?.state === 'holding') {
-        for (const req of requests) this.holdRequest(budgetHold.heldRequests, req);
+        for (const req of requests) this.holdRequest(budgetHold.wakes, req);
         continue;
       }
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
@@ -22782,7 +22639,6 @@ export class AgentFramework {
         }
         const recovery = this.providerAccelerationRecoveries.get(agentName);
         if (recovery) recovery.releasedAt = now;
-        this.noteProviderTookRelease(agentName, providerCooldown.heldRequests);
         requests = [...providerCooldown.heldRequests, ...requests];
       }
       // A start that came back before it took its
@@ -24903,7 +24759,7 @@ export class AgentFramework {
    * and no undo or redo is made.
    */
   private logicalTurnAlive(agent: Agent): boolean {
-    return this.hasTurn(agent.name) || this.turnAlive(agent);
+    return this.hasTurn(agent.name) || this.turnAlive(agent) || this.heldContinuation(agent.name);
   }
 
   /** Whether `agent` has a turn alive: starting, streaming or waiting on its tools. */
@@ -27469,7 +27325,7 @@ export class AgentFramework {
       // gate event buffers, for every agent. A newer start holding the token
       // owns the window now, so it's left alone.
       if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
-      this.settleBudgetHold(agent.name);
+      this.endReleasedBudgetHold(agent.name, 'failed', boundFailureText(error instanceof Error ? String(error.message) : failureDescription(error)));
       throw error;
     } finally {
       // This start's checks are behind it, whether it handed its turn to a
@@ -27493,11 +27349,10 @@ export class AgentFramework {
   /**
    * Drop every continuation of `agentName`'s turn still on its way, wherever
    * it waits: the queue, a provider hold (which, left empty, then releases
-   * with nothing to run), a budget hold (which ends with it), a park on
-   * admission (whose admission it gives back), or a scheduler pass's hands
-   * (which then never reach it). If one was there, the turn ends
-   * (endContinuedTurn), unless `drop` is null: the caller has ended the turn
-   * already.
+   * with nothing to run), a park on admission (whose admission it gives
+   * back), or a scheduler pass's hands (which then never reach it). If one
+   * was there, the turn ends (endContinuedTurn), unless `drop` is null: the
+   * caller has ended the turn already.
    */
   private dropContinuations(agentName: string, drop: ContinuationDrop | null): void {
     const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && continuesTurn(r);
@@ -27526,12 +27381,6 @@ export class AgentFramework {
       hold.heldRequests = take(hold.heldRequests);
       if (held > 0 && hold.heldRequests.length === 0) hold.emptiedBy = 'drop';
     }
-    const budgetHold = this.budgetHolds?.get(agentName)?.heldRequests.some(isContinuation)
-      ? this.takeBudgetHold(agentName) : undefined;
-    if (budgetHold) {
-      const wakes = take(budgetHold.requests);
-      if (putsBack) for (const wake of wakes) back.push(wake);
-    }
     for (const parked of [...this.parkedContinuations]) {
       if (!isContinuation(parked)) continue;
       this.parkedContinuations.delete(parked);
@@ -27546,19 +27395,14 @@ export class AgentFramework {
       requests.length = 0;
       requests.push(...left);
     }
-    for (const request of back) this.pendingRequests.push(request);
-    const reportHold = (): void => budgetHold?.report(putsBack ? 'put back in the queue' : 'dropped with it');
-    if (!dropped || !drop) return reportHold();
+    this.pendingRequests.push(...back);
+    if (!dropped || !drop) return;
     // A primary a provider hold left pending for what it released won't run
     // now, when nothing else of the agent's waits (endPendingPrimary).
-    try {
-      if (!this.pendingRequests.some((r) => r.agentName === agentName) && !this.providerAccelerationCooldowns.get(agentName)?.heldRequests.length) {
-        this.endPendingPrimary(agentName);
-      }
-      this.endContinuedTurn(agentName, drop);
-    } finally {
-      reportHold();
+    if (!this.pendingRequests.some((r) => r.agentName === agentName) && !this.providerAccelerationCooldowns.get(agentName)?.heldRequests.length) {
+      this.endPendingPrimary(agentName);
     }
+    this.endContinuedTurn(agentName, drop);
   }
 
   /**
@@ -27573,19 +27417,19 @@ export class AgentFramework {
    * ends on its own and settles nothing. What was stored for the agent
    * meanwhile is presented now (presentAtEndOf), or at that frame's end.
    */
-  private endContinuedTurn(agentName: string, drop: ContinuationDrop): void {
+  private endContinuedTurn(agentName: string, drop: ContinuationDrop, opensTurn = false): void {
     console.error(`[turn-continuation] ${agentName}: its turn ends without its continuation: ${drop.why}`);
-    this.settleBudgetHold(agentName);
+    this.endReleasedBudgetHold(agentName, 'stopped');
     const agent = this.agents.get(agentName);
     const startedAt = this.lastInferenceAt.get(agentName)?.startedAt ?? Date.now();
     if (agent && drop.kind !== 'dropped') {
       const routing = this.openLogical.get(agentName) ?? this.routingOf(agentName);
       this.endStoppedStart(agent, drop.kind === 'caller' ? { kind: 'caller', reason: drop.reason } : { kind: drop.kind },
-        routing, startedAt, undefined, false);
+        routing, startedAt, undefined, opensTurn);
     } else {
       const owner = this.activeTurnTokens.get(agentName);
       this.abortDroppedTurn(agentName, owner ?? -1,
-        drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt);
+        drop.kind === 'dropped' ? (drop.reason ?? CONTINUATION_DROPPED) : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt);
       this.channelRegistry?.stopTyping();
       if (agent) {
         agent.toolResultGuard.recovering = false;
@@ -27819,7 +27663,7 @@ export class AgentFramework {
     } else {
       this.settleFrameworkCancel({ ...common, kind: stop.kind });
     }
-    this.settleBudgetHold(agent.name);
+    this.endReleasedBudgetHold(agent.name, 'stopped');
     const last = this.lastInferenceAt.get(agent.name);
     if (last?.startedAt === turnStartedAt) this.lastInferenceAt.set(agent.name, { ...last, endedAt: Date.now() });
   }
@@ -27839,6 +27683,7 @@ export class AgentFramework {
      *  operator's abandon. */
     checkWindow: CheckWindow,
   ): Promise<boolean> {
+    if (attempt === 0 && this.releasedTurnRemoved(agent, trigger)) return false;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
@@ -28002,14 +27847,9 @@ export class AgentFramework {
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
     let checkpoint: RecordedTurnCheckpoint | undefined;
+    let holdNote: ContextInjection | undefined;
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
-      const hold = this.budgetHolds?.get(agent.name);
-      if (hold === undefined || hold.state === 'holding') {
-        checkpoint = this.recordTurnCheckpoint(agent.name);
-      } else if (hold.checkpoint !== undefined) {
-        this.dropTurnCheckpoint(agent.name, hold.checkpoint);
-        checkpoint = this.recordTurnCheckpoint(agent.name);
-      }
+      checkpoint = this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 
@@ -28063,6 +27903,8 @@ export class AgentFramework {
     if (opensTurn) {
       const head = agent.branchHead();
       if (head) routing.start = head;
+      const firstRow = this.activeTurnTriggers.get(agent.name)?.readsRow;
+      if (firstRow !== undefined) routing.firstRow = firstRow;
       // A silent start, and an agent whose configuration turns the pin off
       // (turnInputsPin: false), pin nothing, and a pin of the name left from
       // before goes.
@@ -28203,7 +28045,7 @@ export class AgentFramework {
             ? 'at your budget restart'
             : isTurnContinuation(trigger?.reason ?? '')
               ? 'before this re-inference on your tool results'
-              : this.releasedByBudgetHold(agent.name)
+              : this.budgetHolds?.get(agent.name)?.state === 'released'
                 ? 'while your turn waited for compression'
                 : 'while your turn waited on a provider hold';
         this.noticeAddressedArrivals(agent, routing, arrivals, when);
@@ -28312,19 +28154,6 @@ export class AgentFramework {
         }
       }
 
-      const heldTurn = this.budgetHolds?.get(agent.name);
-      const holdNote = heldTurn && heldTurn.state !== 'holding'
-        ? heldTurn.note ?? undefined
-        : undefined;
-      if (holdNote !== undefined) {
-        const noteInjection: ContextInjection = {
-          namespace: BUDGET_HOLD_NOTE_NAMESPACE,
-          position: 'afterUser',
-          content: [{ type: 'text', text: holdNote }],
-        };
-        injections = injections ? [...injections, noteInjection] : [noteInjection];
-      }
-
       // An ephemeral watchdog may dispose this Agent while hooks/compile await,
       // and stop() may close provider admission. Do not create a provider
       // stream after its generation lost ownership, or once admission closed,
@@ -28373,6 +28202,8 @@ export class AgentFramework {
       // before the compile takes its read mark (one whose presentation fails
       // here is traced, and the compile goes on without it).
       if (this.presents(agent)) this.presentation!.presentAtStart(agent, 'compile');
+      holdNote = this.budgetHoldNoteFor(agent);
+      if (holdNote) injections = injections ? [...injections, holdNote] : [holdNote];
 
       if (carry && this.heardSince(agent, routing, carry.read)) carry = undefined;
       const streamCarry: TurnCarry = { silence: carry?.silence ?? null, sends: carry?.sends ?? null, read: lastHeardAt };
@@ -28487,7 +28318,7 @@ export class AgentFramework {
         else this.turnPrompts.delete(frameTrigger);
       }
 
-      this.settleBudgetHold(agent.name);
+      this.budgetHoldCompiled(agent, holdNote);
       // The turn has a live stream from here, which carries a stop: this
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
@@ -28521,7 +28352,7 @@ export class AgentFramework {
       // a hook/compile/stream-setup failure must not leave "typing…" stuck.
       // (Retries below restart it; stopTyping is idempotent.)
       this.channelRegistry?.stopTyping();
-      const err = this.afterBudgetHold(agent.name, error instanceof Error ? error : new Error(String(error)));
+      const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -28558,9 +28389,17 @@ export class AgentFramework {
 
       const retry = trigger && withTurnCarry(trigger, carry);
       const asTransient = this.takeAsTransient(agent.name, err, trigger);
-      if (this.holdForBudgetRefusal(agent, err, retry, checkpoint,
-        () => this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing))) {
+      const budgetHeld = this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, holdNote !== undefined,
+        () => this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing));
+      if (budgetHeld === 'held') return false;
+      if (budgetHeld === 'noteless') {
+        if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+        await this.startAgentStream(agent, retry && asTurnRetry(retry), attempt + 1);
         return false;
+      }
+      const { errorType: failedAs } = this.classifyInferenceError(err);
+      if (failedAs !== 'over_budget' && failedAs !== 'context_refusal') {
+        this.endReleasedBudgetHold(agent.name, 'failed', boundFailureText(String(err.message)));
       }
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
@@ -28640,7 +28479,6 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
-        this.settleBudgetHold(agent.name);
         if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
@@ -31276,9 +31114,8 @@ export class AgentFramework {
     }
     if (agent.state.status !== 'idle' || this.hasTurn(agentName)) {
       const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
-      // A turn a provider or budget hold keeps for its retry has no stream:
-      // the refusal names the hold, and how to go on sooner, as surgery's
-      // does.
+      // A turn a provider hold keeps for its retry has no stream: the refusal
+      // names the hold, and how to go on sooner, as surgery's does.
       const held = agent.state.status === 'idle' ? this.heldTurnRetry(agentName) : undefined;
       throw new Error(held
         ? `puppet refused: agent ${agentName} is idle+turn-alive (${held.says}; requires idle); ` +
@@ -35404,9 +35241,8 @@ export class AgentFramework {
           const readiness = this.contextReadiness(agent.getContextManager());
           return {
             since: hold.startedAt,
-            compressionChangedAt: hold.compressionChangedAt,
             pending: 'pending' in readiness && readiness.pending ? boundFailureText(readiness.pending) : null,
-            heldRequests: hold.heldRequests.length,
+            heldRequests: (hold.turn ? 1 : 0) + hold.wakes.length,
             errorType: hold.errorType,
             ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
             ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
@@ -35439,15 +35275,11 @@ export class AgentFramework {
 
   /**
    * Ops alert — the one escalation path for "a human should hear about this":
-   * (1) durable failures.log record (unless the caller already wrote one,
-   *     or the alert reports a state, as the budget hold's do, with none),
+   * (1) durable failures.log record (unless the caller already wrote one),
    * (2) an `ops:alert` trace so authorized observers get it on the wire,
    * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
    *     (agent, kind) per cooldown window — a persistent failure re-posts
    *     every ~15 min instead of flooding the channel on every occurrence.
-   *     The budget hold's state alerts, `context-hold` and its clear, post at
-   *     every transition instead: sent start then clear, each a post of its
-   *     own, which a webhook may receive out of order.
    * See connectome docs/observability.md.
    */
   /**
@@ -35598,7 +35430,6 @@ export class AgentFramework {
       /** Tells this alert apart from others of its agent and kind for the
        *  webhook's cooldown, such as the batch a retirement names. */
       key?: string;
-      everyTime?: boolean;
     },
   ): void {
     // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
@@ -35623,12 +35454,10 @@ export class AgentFramework {
     const hook = process.env.CONNECTOME_OPS_WEBHOOK;
     if (!hook) return;
     const key = opts?.key === undefined ? `${agentName}:${kind}` : `${agentName}:${kind}:${opts.key}`;
-    if (!opts?.everyTime) {
-      const now = Date.now();
-      if (now - (this.opsAlertLastSent.get(key) ?? 0) < this.opsAlertCooldownMs) return;
-      // Stamp BEFORE the async post so a burst can't race past the cooldown.
-      this.opsAlertLastSent.set(key, now);
-    }
+    const now = Date.now();
+    if (now - (this.opsAlertLastSent.get(key) ?? 0) < this.opsAlertCooldownMs) return;
+    // Stamp BEFORE the async post so a burst can't race past the cooldown.
+    this.opsAlertLastSent.set(key, now);
     fetch(hook, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
