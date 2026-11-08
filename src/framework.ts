@@ -35302,12 +35302,18 @@ export class AgentFramework {
     failure: { errorType?: string; httpStatus?: number },
   ): void {
     const name = agent.name;
+    const cm = agent.getContextManager();
     let historyMoved = false;
-    const detach = agent.getContextManager().onMessage(() => { historyMoved = true; });
+    const detach = cm.onMessage(() => { historyMoved = true; });
+    // The rows a shed would act on (shedNewestTurn's selector): a window move,
+    // such as an undo's retractRows, writes no message the listener hears.
+    const rowsOf = (): string => (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages())
+      .map((m) => m.id).join('\n');
     const sent = {
       streak: this.consecutiveInferenceFailures.get(name),
       turn: this.activeTurnTokens.get(name),
       branch: this.store.currentBranch().name,
+      rows: rowsOf(),
     };
     const abort = new AbortController();
     const settled = this.ownAuxiliaryMembraneFor(agent).complete(withoutHistory(request), { retry: false, signal: abort.signal }).then(
@@ -35321,7 +35327,7 @@ export class AgentFramework {
         || this.consecutiveInferenceFailures.get(name) !== sent.streak
         || (turn !== undefined && turn !== sent.turn)
         || this.store.currentBranch().name !== sent.branch
-        || historyMoved) {
+        || historyMoved || rowsOf() !== sent.rows) {
         console.error(`[inference-rewind] agent=${name}: its probe's answer is set aside, since the agent, its history or the ` +
           'framework changed while it was out; the next failure decides.');
         return;
