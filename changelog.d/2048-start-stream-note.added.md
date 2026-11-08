@@ -1,0 +1,1 @@
+- `StartStreamResult.noteThinkingDropped`: tells the context manager which stored bodies' thinking the provider dropped from a call of the stream, naming the compile the stream was built from. Present only where `noteRequestSent` is.

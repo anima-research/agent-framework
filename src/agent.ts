@@ -114,8 +114,8 @@ export interface StartStreamResult {
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
   /** Tells the context manager which stored bodies' thinking the provider dropped from a call of this stream, by the
    *  ids `placeDrops` gives for a `reply` drop, with the compile the stream was built from (context-manager's
-   *  `noteThinkingDropped`), so its record leaves them without their thinking from the next compile on. Present only
-   *  where `noteRequestSent` is. */
+   *  `noteThinkingDropped`), so, once the context manager takes the note, its record leaves them without their
+   *  thinking from the next compile on. Present only where `noteRequestSent` is. */
   noteThinkingDropped?: (messageIds: readonly MessageId[]) => boolean;
   /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
    *  Absent when the compile reports no provenance. */
