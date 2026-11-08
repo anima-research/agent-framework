@@ -556,6 +556,27 @@ describe('locked prose routing', () => {
     }
   });
 
+  it("a closed-channel invitation in a locked agent's private turn says its speech goes to no channel, and offers no prose_locus move", async () => {
+    const framework = await createFramework({ proseLock: '#main' });
+    stubChannelRegistry(framework);
+    const internals = framework as unknown as {
+      channelRegistry: Record<string, unknown>;
+      openLogical: Map<string, unknown>;
+      buildClosedChannelInvitation(opts: Record<string, unknown>): { block: { text: string } } | null;
+    };
+    internals.channelRegistry.isChannelOpen = () => false;
+    internals.openLogical.set('assistant', { turnId: 1, locked: true, private: true, wasIn: [], engaged: new Set() });
+    const invitation = internals.buildClosedChannelInvitation({
+      serverId: 'stub', channelId: 'discord:g:ops', messageId: 'm1', authorName: 'Ann', tags: ['chat:addressed'],
+    });
+    const text = invitation!.block.text;
+    assert.match(text, /1\. Reply — your plain speech goes to no channel this turn, not here\./);
+    assert.ok(!text.includes('held as drafts'), text);
+    assert.ok(!text.includes('point prose_locus here'), text);
+    internals.openLogical.delete('assistant');
+    await framework.stop();
+  });
+
   it("a locked agent's ephemeral run routes as disabled, its conversation fork as locus mode, and neither is offered prose_locus", async () => {
     const framework = await createFramework({ proseLock: '#main' });
     stubChannelRegistry(framework);
