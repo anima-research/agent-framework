@@ -31,11 +31,13 @@
     start that stored a context injection after the message.
   - **A surgery or an undo:** a waiting turn whose trigger's row a rollback,
     suppression or branch switch removed is dropped, and so is a turn under
-    way whose own rows one removed, each ending with `inference:aborted`. An
-    undo of the agent ends a waiting turn under way first, then runs. A
-    trigger with no row of its own, such as console input, a heartbeat or a
-    merged wake whose messages read different rows, can't be checked, and
-    runs on what the surgery left, as a waiting wake does.
+    way whose opening message, where its trigger read one, or own rows one
+    removed, each ending with `inference:aborted`. An undo of the agent ends
+    a waiting turn under way first, then runs. A waiting turn whose trigger
+    has no row of its own, such as console input, a heartbeat or a merged
+    wake whose messages read different rows, is checked only by the rows it
+    has written, and one with none yet can't be checked and runs on what the
+    surgery left, as a waiting wake does.
   - **When it ends without running:** if compression has nothing left to do
     and the context still doesn't fit, the start runs once more without the
     note, and a refusal then takes the error policy's path. `abortInference()`,
