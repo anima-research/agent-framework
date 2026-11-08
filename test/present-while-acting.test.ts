@@ -1201,13 +1201,13 @@ describe('present while acting', () => {
       stubChannelRegistry(framework);
       framework.start();
       const internals = framework as unknown as Held & {
-        budgetHolds: Map<string, { state: string }>;
+        budgetHolds: Map<string, unknown>;
         releaseBudgetHold(agentName: string): void;
         holdProviderAcceleration(agent: unknown, error: Error): boolean;
       };
       trigger(framework);
       await framework.runUntilIdle();
-      assert.equal(internals.budgetHolds.get('assistant')?.state, 'holding', 'the first start waits for compression');
+      assert.ok(internals.budgetHolds.has('assistant'), 'the first start waits for compression');
       internals.holdProviderAcceleration(framework.getAgent('assistant')!, accelerationLimit({ messages: [] } as unknown as NormalizedRequest));
       refusing = false;
       internals.releaseBudgetHold('assistant');

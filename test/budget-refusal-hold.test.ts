@@ -3,14 +3,14 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AutobiographicalStrategy, ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, type ContextInjection } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, ContextManager, PassthroughStrategy, WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import { MembraneError, type ContentBlock, type NormalizedRequest, type NormalizedResponse, type YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
-const NOTE = /\[budget-hold\] Your context didn't fit its budget \(100,201 tokens against 48,568\)\. This turn waited \d+ (s|min)\./;
+const NOTE = /\[budget-hold\] Your context didn't fit its budget \(100,201 tokens against 48,568\) when a turn came to start\. That turn waited \d+ (s|min)\./;
 
 async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
@@ -29,21 +29,20 @@ const overBudget = () => Object.assign(
 interface Compression {
   ticks: number; compiles: number; refusals: number; refusing: boolean;
   fitAt: number; readyAt: number; refuseFrom: number;
-  noteTips: boolean; calls: boolean;
+  calls: boolean;
   progress: number; stalled: boolean; snapshot: boolean;
   onRefusal?: () => void;
   snapshotThrows?: boolean;
   snapshotOther?: boolean;
   snapshotBigInt?: boolean;
   failNext?: Error;
-  injections: string[][];
 }
 type Patchable = Record<'compile' | 'tick' | 'isReady' | 'getPendingWork', (...args: unknown[]) => unknown>;
 async function withCompression<T>(state: Partial<Compression>, run: (c: Compression) => Promise<T>): Promise<T> {
   const c: Compression = {
     ticks: 0, compiles: 0, refusals: 0, refusing: false,
     fitAt: Infinity, readyAt: state.readyAt ?? state.fitAt ?? Infinity, refuseFrom: 1,
-    noteTips: false, calls: false, progress: 0, stalled: !state.calls, snapshot: true, injections: [], ...state,
+    calls: false, progress: 0, stalled: !state.calls, snapshot: true, ...state,
   };
   const progressPatched = new Map<object, unknown>();
   for (const strategy of [AutobiographicalStrategy.prototype, PassthroughStrategy.prototype, WindowedPassthroughStrategy.prototype] as Array<{ getProgressSnapshot?: unknown }>) {
@@ -63,15 +62,12 @@ async function withCompression<T>(state: Partial<Compression>, run: (c: Compress
   proto.compile = async function (this: unknown, ...args: unknown[]) {
     if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun === true) return original.compile.apply(this, args);
     c.compiles++;
-    const injections = ((args[1] ?? []) as ContextInjection[]).map((i) => String(i.namespace));
-    c.injections.push(injections);
     if (c.failNext) {
       const error = c.failNext;
       c.failNext = undefined;
       throw error;
     }
-    const withNote = injections.includes('framework:budget-hold');
-    if (c.compiles >= c.refuseFrom && (c.ticks < c.fitAt || (c.noteTips && withNote))) {
+    if (c.compiles >= c.refuseFrom && c.ticks < c.fitAt) {
       c.refusing = true;
       c.refusals++;
       c.onRefusal?.();
@@ -157,7 +153,7 @@ class SequentialStreamMembrane extends MockMembrane {
 
 interface Internal {
   budgetHoldRecheckMs: number;
-  budgetHolds: Map<string, { state: string; turn?: unknown; startedAt: number }>;
+  budgetHolds: Map<string, { turn?: unknown; startedAt: number; waitSince: number }>;
   quiesced: boolean;
   activeTurnTokens: Map<string, number>;
   pendingRequests: Array<Record<string, unknown>>;
@@ -188,6 +184,12 @@ const symbolNamed = (o: object, name: string): symbol => {
   return found;
 };
 const stringKeys = (o: object): Record<string, unknown> => Object.fromEntries(Object.entries(o));
+const errorStream = (error: Error): YieldingStream => ({
+  isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+  provideToolResults() { throw new Error('not waiting'); },
+  cancel() {},
+  async *[Symbol.asyncIterator]() { yield { type: 'error', error }; },
+} as unknown as YieldingStream);
 const providerLimit = () => new MembraneError({
   type: 'rate_limit', retryable: true, httpStatus: 429,
   message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
@@ -220,9 +222,9 @@ function watchReleases(framework: unknown, ready: () => boolean): { whileNotRead
   const release = internal.releaseBudgetHold.bind(framework);
   const seen = { whileNotReady: 0, all: 0 };
   internal.releaseBudgetHold = (agentName: string) => {
-    const before = internal.budgetHolds.get(agentName)?.state;
+    const before = internal.budgetHolds.has(agentName);
     release(agentName);
-    if (before === 'holding' && internal.budgetHolds.get(agentName)?.state === 'released') {
+    if (before && !internal.budgetHolds.has(agentName)) {
       seen.all++;
       if (!ready()) seen.whileNotReady++;
     }
@@ -303,6 +305,7 @@ async function resident(options: {
 type Resident = Awaited<ReturnType<typeof resident>>;
 const requestText = (request: NormalizedRequest | undefined) => JSON.stringify(request?.messages ?? null);
 const notesStored = (t: Resident) => t.rows().filter((r) => JSON.stringify(r.content).includes('[budget-hold]')).length;
+const notesInWindow = (t: Resident) => t.windowText().split('[budget-hold]').length - 1;
 
 async function withWebhook<T>(run: (posts: string[]) => Promise<T>): Promise<T> {
   const env = process.env.CONNECTOME_OPS_WEBHOOK;
@@ -333,10 +336,11 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')), 'the turn ran once there was room, with no new message to wake it');
         assert.ok(await pollUntil(() => t.of('inference:completed').length === 1));
         assert.equal(t.of('inference:held').length, 1);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
         assert.deepEqual(t.of('inference:exhausted'), [], 'the turn never failed');
         assert.equal(t.turnCalls().length, 1, 'one request reached the provider');
         assert.match(requestText(t.turnCalls()[0]), NOTE);
+        assert.equal(notesStored(t), 1, 'the note is stored once');
         assert.equal(t.alerts('context-refusal').length, 1, 'the wait is announced once');
         assert.deepEqual(t.alerts('context-refusal-clear'), [], 'a turn that runs needs no clear');
       } finally {
@@ -379,45 +383,13 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it('a noteless rerun held again drops its first attempt\'s checkpoint, so an undo while it waits takes the last completed turn', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const refused = c.refusals;
-        c.onRefusal = () => {
-          if (c.refusals === refused + 2) c.readyAt = Infinity;
-        };
-        c.readyAt = c.ticks;
-        t.internal.releaseBudgetHold('prime');
-        assert.ok(await pollUntil(() => c.refusals === refused + 2 && t.internal.budgetHolds.get('prime')?.state === 'holding'),
-          'the noted start was refused with nothing pending, and its noteless rerun was held again');
-        assert.equal(t.framework.undoLastTurn('prime').undone, true);
-        assert.ok(!t.windowText().includes('Hi'), 'the undo took the last completed turn');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('an undo while a noteless rerun waits again, on an agent with no turn to undo, returns undone: false', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 1 }, async (c) => {
+  it('an undo while a turn waits, on an agent with no turn to undo, returns undone: false, and the turn still waits', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 1 }, async () => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered go'] });
       t.internal.budgetHoldRecheckMs = 60_000;
       try {
         t.send('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const refused = c.refusals;
-        c.onRefusal = () => {
-          if (c.refusals === refused + 2) c.readyAt = Infinity;
-        };
-        c.readyAt = c.ticks;
-        t.internal.releaseBudgetHold('prime');
-        assert.ok(await pollUntil(() => c.refusals === refused + 2 && t.internal.budgetHolds.get('prime')?.state === 'holding'));
         assert.deepEqual(t.internal.getTurnCheckpoints('prime'), [], 'no turn to undo');
         assert.deepEqual(t.framework.undoLastTurn('prime'), { undone: false });
         assert.notEqual(t.hold(), null, 'the turn still waits');
@@ -514,32 +486,11 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         c.snapshotThrows = false;
         t.internal.releaseBudgetHoldsOnEvidence();
-        assert.equal(t.internal.budgetHolds.get('prime')?.state, 'holding', 'a snapshot that reads is no progress by itself');
+        assert.ok(t.internal.budgetHolds.has('prime'), 'a snapshot that reads is no progress by itself');
         c.progress++;
         c.fitAt = c.ticks;
         t.internal.releaseBudgetHoldsOnEvidence();
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'the summary released it');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("another continuation's end leaves a released first start's wait alone", async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')!;
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
-        t.internal.endContinuedTurn('prime', { kind: 'dropped', why: 'zz another continuation' });
-        assert.equal(t.internal.budgetHolds.get('prime'), hold, 'the wait is still there');
-        hold.state = 'holding';
       } finally {
         await t.close();
       }
@@ -602,59 +553,142 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it('waits again quietly when a released start is refused while compression is still pending, with no failure marker and no hard-down', async () => {
+  it('waits again in a new hold when a released start is refused while compression is still pending, its note counting from the first, with one alert, no failure marker and no hard-down', async () => {
     await withCompression({ fitAt: Infinity, stalled: false }, async (c) => {
       const t = await resident();
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => c.refusals >= 4), 'released starts were refused again');
+        assert.ok(await pollUntil(() => c.refusals >= 3 && t.internal.budgetHolds.has('prime')), 'released starts were refused again');
+        const hold = t.internal.budgetHolds.get('prime')!;
+        const wait = (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!;
+        wait.since -= 180_000;
+        hold.waitSince -= 180_000;
+        const refused = c.refusals;
+        assert.ok(await pollUntil(() => c.refusals >= refused + 2), 'and again, each hold taking the first one\'s start from its request');
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
-        assert.equal(t.of('inference:held').length, 1, 'one hold');
-        assert.equal(t.alerts('context-refusal').length, 1, 'one alert');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.equal(t.of('inference:hold_ended')[0]!.waitedMs as number >= 0, true);
+        const held = t.of('inference:held').length;
+        assert.ok(held >= 3, `a new hold for each refusal: ${held}`);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), Array(held).fill('released'));
+        assert.equal(t.alerts('context-refusal').length, 1, "one alert, every hold keyed by the wait's start");
         assert.ok(!t.stored().includes('[inference-failed]'), 'no failure marker');
         assert.deepEqual(t.alerts('hard-down'), [], 'no hard-down');
-        assert.equal(notesStored(t), 1, 'refused releases stored no note');
+        assert.equal(notesInWindow(t), 1, "each refused release's note left the window at its next hold");
+        assert.match(requestText(t.turnCalls().at(-1)), /That turn waited 3 min\./, 'the figure runs from the first hold');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('runs once without the note when a released start that carried it is refused with nothing pending, whatever the error policy says', async () => {
-    await withCompression({ fitAt: 2, readyAt: 2, noteTips: true }, async (c) => {
-      const t = await resident({ policyRetries: 0 });
+  it("a released request that fits leaves its wait behind: a provider-held retry of the turn refused for budget waits in a hold of its own, its note counting from it", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
-        assert.deepEqual(c.injections.slice(-2).map((i) => i.includes('framework:budget-hold')), [true, false], 'the note, then a run without it');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.equal(notesStored(t), 0);
-        assert.doesNotMatch(requestText(t.turnCalls()[0]), NOTE);
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const hold = t.internal.budgetHolds.get('prime')!;
+        (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!.since -= 180_000;
+        hold.waitSince -= 180_000;
+        const stream = t.membrane.streamYielding.bind(t.membrane);
+        let limited = false;
+        t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
+          if (limited) return stream(request, options);
+          limited = true;
+          c.fitAt = Infinity;
+          c.readyAt = Infinity;
+          t.membrane.calls.push(request);
+          return errorStream(providerLimit());
+        };
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => (t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) > 0),
+          'the released request fit, met a provider hold, and its retry waits there');
+        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2), 'the retry was refused for budget, and waits');
+        assert.ok(t.internal.budgetHolds.get('prime')!.waitSince > hold.waitSince + 120_000, 'in a wait of its own');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
+        const notes = requestText(t.turnCalls().at(-1)).match(/That turn waited \d+ (s|min)\./g) ?? [];
+        assert.deepEqual(notes.slice(0, -1), ['That turn waited 3 min.'], 'the first release\'s note, which a request carried, stays');
+        assert.doesNotMatch(notes.at(-1)!, /3 min/, 'and the new hold\'s note counts from that hold');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('when compression has nothing left and the context still does not fit, clears the wait, and the failure reaches the webhook and the trace', async () => {
+  it("a released turn merged with a newer wake leaves its wait behind once that start fits: a provider-held retry refused for budget waits in a hold of its own", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const hold = t.internal.budgetHolds.get('prime')!;
+        (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!.since -= 180_000;
+        hold.waitSince -= 180_000;
+        const stream = t.membrane.streamYielding.bind(t.membrane);
+        let limited = false;
+        t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
+          if (limited) return stream(request, options);
+          limited = true;
+          c.fitAt = Infinity;
+          c.readyAt = Infinity;
+          t.membrane.calls.push(request);
+          return errorStream(providerLimit());
+        };
+        const starts: object[] = [];
+        const start = t.internal.startAgentStream;
+        t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>) {
+          starts.push(trigger);
+          return start.call(this, agent, trigger);
+        };
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-newer', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => (t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) > 0),
+          'the merged start fit, met a provider hold, and its retry waits there');
+        const marks = (o: object) => Object.getOwnPropertySymbols(o).map((x) => x.description);
+        assert.ok(marks(starts[0]!).includes('merged-batch') && marks(starts[0]!).includes('budget-wait'), `the start merged the two, the wait with them: ${marks(starts[0]!)}`);
+        const kept = t.internal.providerAccelerationCooldowns.get('prime')!.heldRequests[0] as object;
+        assert.deepEqual(marks(kept).filter((m) => m === 'merged-batch' || m === 'budget-wait'), [], 'its retry carries neither the batch nor the wait');
+        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2), 'the retry was refused for budget, and waits');
+        assert.ok(t.internal.budgetHolds.get('prime')!.waitSince > hold.waitSince + 120_000, 'in a wait of its own');
+        assert.equal(t.alerts('context-refusal').length, 2, 'with its own open alert');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('when compression has nothing left and the context still does not fit, releases the wait, and the refusal takes the error policy\'s path with the note in place', async () => {
     await withWebhook(async (posts) => {
       await withCompression({ fitAt: Infinity, readyAt: 2 }, async () => {
         const t = await resident();
         try {
           t.send('Are you there?');
           assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1));
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
-          const clears = t.alerts('context-refusal-clear');
-          assert.equal(clears.length, 1);
-          assert.match(String(clears[0]!.message), /compression had nothing left to do.*its budget refusal now goes to the error policy, as it would without the wait/);
+          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
+          assert.deepEqual(t.alerts('context-refusal-clear'), []);
+          assert.equal(notesInWindow(t), 1, 'the note stays where it was stored');
           assert.deepEqual(t.of('ops:alert').map((e) => e.kind).filter((k) => String(k).startsWith('context-refusal')),
-            ['context-refusal', 'context-refusal-clear', 'context-refusal'], "the wait's open, its clear, then the failure's own");
-          assert.ok(await pollUntil(() => posts.length === 3));
-          assert.deepEqual(posts, ['context-refusal', 'context-refusal-clear', 'context-refusal']);
+            ['context-refusal', 'context-refusal'], "the wait's open, then the failure's own");
+          assert.ok(await pollUntil(() => posts.length === 2));
+          assert.deepEqual(posts, ['context-refusal', 'context-refusal']);
         } finally {
           await t.close();
         }
@@ -699,7 +733,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
         assert.deepEqual(t.of('inference:aborted').map((e) => e.reason), ['zz-stop']);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /was stopped or declined after .*, so it doesn't run/);
+        assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /was stopped after .*, so it doesn't run/);
         assert.ok(await pollUntil(() => t.stored().includes('Answered the second')), 'the wake that joined runs as its own turn');
       } finally {
         await t.close();
@@ -740,7 +774,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.internal.releaseBudgetHoldsOnEvidence();
         await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 0, 'nothing runs while quiesced');
-        assert.equal(t.internal.budgetHolds.get('prime')?.state, 'holding', 'a release that comes due while quiesced waits');
+        assert.ok(t.internal.budgetHolds.has('prime'), 'a release that comes due while quiesced waits');
         await t.framework.resume();
         assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')));
       } finally {
@@ -782,13 +816,13 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         const refused = c.refusals;
         await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('Hi').id] });
-        assert.equal(t.of('inference:hold_ended').length, 0, 'a suppression of another row leaves the held start');
-        assert.ok(await pollUntil(() => c.refusals > refused && t.internal.budgetHolds.get('prime')?.state === 'holding'),
-          'the surgery released it, and its start was refused again');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released'], 'a suppression of another row releases the held start, not drops it');
+        assert.ok(await pollUntil(() => c.refusals > refused && t.internal.budgetHolds.has('prime')),
+          'its start was refused again, and waits again');
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed'], 'the rollback dropped it as it ended');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed'], 'the rollback dropped it as it ended');
         assert.equal(t.of('inference:aborted').length, 1, 'the held turn ends');
         assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /was removed or taken out of its window after .*, so it doesn't run/);
         await t.framework.runUntilIdle();
@@ -812,7 +846,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         const before = store.currentBranch().name;
         const waitingAgain = async () => {
           const refused = c.refusals;
-          assert.ok(await pollUntil(() => c.refusals > refused && t.internal.budgetHolds.get('prime')?.state === 'holding'),
+          assert.ok(await pollUntil(() => c.refusals > refused && t.internal.budgetHolds.has('prime')),
             'released by the change, and refused again');
         };
         let next = waitingAgain();
@@ -828,7 +862,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.equal(t.framework.undoLastTurn('prime').undone, true, 'the undo was admitted');
         await next;
         assert.notEqual(t.hold(), null, 'the start still waits');
-        assert.deepEqual(t.of('inference:hold_ended'), []);
+        assert.ok(t.of('inference:hold_ended').every((e) => e.outcome === 'released'), 'each change released it, and none dropped it');
       } finally {
         await t.close();
       }
@@ -848,9 +882,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
         await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1), 'dropped as it starts');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
-        assert.equal(t.of('inference:aborted').length, 1);
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'dropped as it starts');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
         await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 1, 'the queued start never ran');
       } finally {
@@ -874,8 +907,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
         await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'dropped as it starts');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), 'the wake merged with it runs as a turn of its own');
         const last = t.turnCalls().at(-1);
         assert.ok(requestText(last).includes('second') && !requestText(last).includes('"go"'));
@@ -921,8 +954,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
           cooldown.until = Date.now();
           t.internal.releaseProviderAccelerationCooldown('prime');
         }
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1), 'dropped as it starts');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'dropped as it starts');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
         await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 1, 'the start the provider wait kept never ran');
       } finally {
@@ -955,7 +988,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.fitAt = c.ticks;
         failing = false;
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'a call that landed and made progress released it');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
       } finally {
         await t.close();
       }
@@ -1005,7 +1038,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
       } finally {
         await t.close();
       }
@@ -1024,7 +1057,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
           c.progress++;
         };
         t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        assert.ok(await pollUntil(() => t.of('inference:held').length >= 1));
         assert.ok(await pollUntil(() => releases.all >= 1), 'what compression wrote during the compile released the turn');
       } finally {
         await t.close();
@@ -1154,7 +1187,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it('ends a released first start the inference policy drops, after its inference:aborted, and a later wake gets no note', async () => {
+  it("a released start the inference policy drops leaves its note in the window, true for whichever turn reads it, and the agent's next hold counts from its own start", async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       let refuse = false;
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered later'], policy: { shouldInfer: () => !refuse } });
@@ -1164,378 +1197,94 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.stored().includes('Hi')));
         t.sendForPrime('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const hold = t.internal.budgetHolds.get('prime')!;
+        (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!.since -= 180_000;
+        hold.waitSince -= 180_000;
         refuse = true;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
-        const logged: string[] = [];
-        const error = console.error;
-        console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); error(...args); };
-        try {
-          t.internal.releaseBudgetHold('prime');
-          await t.framework.runUntilIdle();
-        } finally {
-          console.error = error;
-        }
-        assert.ok(logged.some((l) => l.startsWith('[turn-continuation] prime: its waiting start ends: ')), 'the log names a waiting start, not a continuation');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.of('inference:aborted').length, 1, 'its turn ends');
-        const order = t.traces.map((e) => e.type).filter((type) => type === 'inference:aborted' || type === 'inference:hold_ended');
-        assert.deepEqual(order, ['inference:aborted', 'inference:hold_ended'], 'the hold ends after its turn');
-        assert.equal(t.internal.budgetHolds.size, 0);
+        t.internal.releaseBudgetHold('prime');
+        await t.framework.runUntilIdle();
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
+        assert.equal(t.turnCalls().length, 1, 'the policy dropped the released start');
+        assert.match(t.windowText(), /when a turn came to start\. That turn waited 3 min\./, 'its note stays in the window');
         refuse = false;
-        t.send('later');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered later')));
-        assert.equal(notesStored(t), 0, 'the later wake gets no note');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('a released held turn merged behind a wake queued before it still gets its note and its fit, and later wakes run', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go', 'Answered later'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() });
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
-        t.internal.releaseBudgetHold('prime');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.equal(notesStored(t), 1, 'the merged start had the note');
-        assert.equal(t.internal.budgetHolds.size, 0);
-        t.send('later');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered later')), 'a later message runs');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('a merged start that comes back before its token, its held turn not leading, runs as the held turn', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const internal = t.internal as unknown as { startAgentStream: (...a: unknown[]) => Promise<void> };
-        const orig = internal.startAgentStream;
-        let captured: Record<string, unknown> | undefined;
-        internal.startAgentStream = async function (this: unknown, ...args: unknown[]) {
-          if (!captured) {
-            captured = args[1] as Record<string, unknown>;
-            return;
-          }
-          return orig.apply(this, args);
-        };
-        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() });
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
-        t.internal.releaseBudgetHold('prime');
-        await t.framework.runUntilIdle();
-        assert.ok(captured, 'the merged start came back before its token');
-        internal.startAgentStream = orig;
-        t.internal.pendingRequests.push(captured);
-        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('a provider hold that already keeps an equal request without the mark keeps the held turn\'s mark on it', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const held = t.internal.budgetHolds.get('prime')!.turn as Record<string, unknown>;
-        const limit = new MembraneError({
-          type: 'rate_limit', retryable: true, httpStatus: 429,
-          message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
-          rawError: { status: 429 },
-        } as ConstructorParameters<typeof MembraneError>[0]);
-        assert.ok(t.internal.holdProviderAcceleration(t.framework.getAgent('prime'), limit), 'a provider hold parks the agent');
-        t.internal.pendingRequests.push(Object.fromEntries(Object.entries(held)));
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
-        t.internal.releaseBudgetHold('prime');
-        await t.framework.runUntilIdle();
-        assert.equal(t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length, 1, 'the provider hold kept one request for both');
-        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
-        t.internal.releaseProviderAccelerationCooldown('prime');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'the request it kept ran as the held turn');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('a waiting turn folded into an equal merged start a provider hold keeps runs as the held turn, and later wakes run', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go', 'Answered later'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        const orig = t.internal.startAgentStream;
-        let merged: Record<string, unknown> | undefined;
-        t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>) {
-          if (!merged && Object.getOwnPropertySymbols(trigger).some((x) => x.description === 'merged-batch')) merged = trigger;
-          return orig.call(this, agent, trigger);
-        };
-        t.cm().addMessage('user', [text('hello')]);
-        t.internal.pendingRequests.push(
-          { agentName: 'prime', reason: 'zz-a', source: 'test', timestamp: Date.now() },
-          { agentName: 'prime', reason: 'zz-b', source: 'test', timestamp: Date.now() },
-        );
-        await t.internal.processInferenceRequests();
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.internal.startAgentStream = orig;
-        assert.ok(merged, 'a merged start, for its mark');
-        const MERGED = symbolNamed(merged, 'merged-batch');
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const held = t.internal.budgetHolds.get('prime')!.turn as Record<string, unknown>;
-        const wrapper = Object.assign(stringKeys(held), {
-          [MERGED]: [stringKeys(held), { agentName: 'prime', reason: 'zz-merged', source: 'test', timestamp: Date.now() }],
-        });
-        const limit = new MembraneError({
-          type: 'rate_limit', retryable: true, httpStatus: 429,
-          message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
-          rawError: { status: 429 },
-        } as ConstructorParameters<typeof MembraneError>[0]);
-        assert.ok(t.internal.holdProviderAcceleration(t.framework.getAgent('prime'), limit), 'a provider hold parks the agent');
-        t.internal.providerAccelerationCooldowns.get('prime')!.heldRequests.push(wrapper);
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
-        t.internal.releaseBudgetHold('prime');
-        await t.framework.runUntilIdle();
-        assert.equal(t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length, 1, 'the waiting turn folded into the merged start');
-        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
-        t.internal.releaseProviderAccelerationCooldown('prime');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        t.send('later');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered later')), 'a later message runs');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("a quiesce drops a released wait's own auto-continue request with its wait, and later wakes run", async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered later'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')!;
-        const HELD = symbolNamed(hold.turn as object, 'budget-held');
-        await t.framework.quiesce({ timeoutMs: 2_000 });
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
-        t.internal.pendingRequests.push(
-          Object.assign(stringKeys(hold.turn as object), { reason: 'auto-continue', [HELD]: hold }),
-          { agentName: 'prime', reason: 'zz-continue', source: 'test', timestamp: Date.now(), autoContinueRun: { stop: 'zz' } },
-        );
-        await t.internal.processInferenceRequests();
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.internal.budgetHolds.size, 0);
-        await t.framework.resume();
-        c.fitAt = c.ticks;
-        t.send('later');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered later')), 'a later message runs');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("a quiesce's coalescing keeps a request with an ended wait's mark apart from the live wait's", async () => {
-    await withCompression({ stalled: true }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered one', 'Answered two'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('one');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const ended = t.internal.budgetHolds.get('prime')!;
-        const HELD = symbolNamed(ended.turn as object, 'budget-held');
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
-        t.internal.releaseBudgetHold('prime');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered one')));
         c.fitAt = Infinity;
         c.readyAt = Infinity;
-        t.send('two');
+        t.send('later');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 2));
-        const live = t.internal.budgetHolds.get('prime')!;
-        await t.framework.quiesce({ timeoutMs: 2_000 });
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        live.state = 'released';
-        const turn = live.turn as Record<string, unknown>;
-        t.internal.pendingRequests.push(turn, Object.assign(stringKeys(turn), { timestamp: Number(turn.timestamp) + 1, [HELD]: ended }));
-        await t.internal.processInferenceRequests();
+        assert.ok(t.internal.budgetHolds.get('prime')!.waitSince > hold.waitSince + 120_000, 'the new hold starts its own wait');
+        assert.equal(notesInWindow(t), 0, "the dropped start's note, which no request carried, left the window at the new hold");
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
-        await t.framework.resume();
-        assert.ok(await pollUntil(() => t.stored().includes('Answered two')), 'the live wait ran');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit', 'fit']);
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered later')));
+        const last = requestText(t.turnCalls().at(-1));
+        assert.match(last, NOTE);
+        assert.doesNotMatch(last, /waited 3 min/, "the new hold's figure starts at its own start");
       } finally {
         await t.close();
       }
     });
   });
 
-  it("drops a released wait's request whose row is gone with its wait, and later wakes run", async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered later'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')!;
-        const HELD = symbolNamed(hold.turn as object, 'budget-held');
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
-        t.internal.pendingRequests.push(Object.assign(stringKeys(hold.turn as object), { readsRow: 'zz-a-row-that-is-gone', [HELD]: hold }));
-        await t.internal.processInferenceRequests();
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        c.fitAt = c.ticks;
-        t.send('later');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered later')), 'a later message runs');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("a stop of a released first start's retry, parked by a provider hold, ends its wait, and later wakes run", async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered later'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')!;
-        const HELD = symbolNamed(hold.turn as object, 'budget-held');
-        assert.ok(t.internal.holdProviderAcceleration(t.framework.getAgent('prime'), providerLimit()), 'a provider hold parks the agent');
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
-        t.internal.providerAccelerationCooldowns.get('prime')!.heldRequests.push(
-          Object.assign(stringKeys(hold.turn as object), { reason: 'context_budget_restart', [HELD]: hold }));
-        const aborted = t.of('inference:aborted').length;
-        assert.equal(t.framework.abortInference('prime'), true);
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.of('inference:aborted').length, aborted + 1);
-        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
-        t.internal.releaseProviderAccelerationCooldown('prime');
-        c.fitAt = c.ticks;
-        t.send('later');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered later')), 'a later message runs');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("stop() ends a released first start's parked retry once, with its wait", async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')!;
-        const HELD = symbolNamed(hold.turn as object, 'budget-held');
-        assert.ok(t.internal.holdProviderAcceleration(t.framework.getAgent('prime'), providerLimit()));
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
-        t.internal.providerAccelerationCooldowns.get('prime')!.heldRequests.push(
-          Object.assign(stringKeys(hold.turn as object), { reason: 'context_budget_restart', [HELD]: hold }));
-        const aborted = t.of('inference:aborted').length;
-        await t.framework.stop();
-        assert.equal(t.of('inference:aborted').length, aborted + 1, 'one inference:aborted for the turn');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it("the inference policy's drop of a released first start's retry ends its wait, and later wakes run", async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      let refuse = false;
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered later'], policy: { shouldInfer: () => !refuse } });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')!;
-        const HELD = symbolNamed(hold.turn as object, 'budget-held');
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
-        t.internal.pendingRequests.push(Object.assign(stringKeys(hold.turn as object), { reason: 'context_budget_restart', [HELD]: hold }));
-        refuse = true;
-        await t.internal.processInferenceRequests();
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        refuse = false;
-        c.fitAt = c.ticks;
-        t.send('later');
-        assert.ok(await pollUntil(() => t.stored().includes('Answered later')), 'a later message runs');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('a marked merged start with no member equal to it puts the folded request back in its own place, so a member read before keeps nothing from it', async () => {
+  it("a provider hold that already keeps an equal request without the wait takes the wait onto it, so a surgery that removes its row drops it", async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const held = t.internal.budgetHolds.get('prime')!.turn as Record<string, unknown>;
+        assert.ok(t.internal.holdProviderAcceleration(t.framework.getAgent('prime'), providerLimit()), 'a provider hold parks the agent');
+        t.internal.pendingRequests.push(stringKeys(held));
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        await t.framework.runUntilIdle();
+        const kept = t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests ?? [];
+        assert.equal(kept.length, 1, 'the provider hold kept one request for both');
+        assert.ok(Object.getOwnPropertySymbols(kept[0]!).some((x) => x.description === 'budget-wait'), 'with the wait on it');
+        await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
+        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'dropped as it starts');
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 1, 'the request it kept never ran');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a merged start carrying a wait that no member of its batch carries puts the folded request back in its own place, so a member read before takes none of it', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered other'] });
       t.internal.budgetHoldRecheckMs = 60_000;
       try {
         const MERGED = await mergedBatchMark(t);
         assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.send('go');
+        t.sendForPrime('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')!;
-        const HELD = symbolNamed(hold.turn as object, 'budget-held');
+        const held = t.internal.budgetHolds.get('prime')!.turn as object;
+        const WAIT = symbolNamed(held, 'budget-wait');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
         t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
-        t.internal.pendingRequests.push(Object.assign(stringKeys(hold.turn as object), {
-          [HELD]: hold,
+        t.internal.pendingRequests.push(Object.assign(stringKeys(held), {
+          [WAIT]: (held as Record<symbol, unknown>)[WAIT],
           [MERGED]: [
             { agentName: 'prime', reason: 'zz-read', source: 'test', timestamp: Date.now(), readsRow: 'zz-a-row-that-is-gone' },
             { agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() },
           ],
         }));
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
         await t.internal.processInferenceRequests();
-        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'the start carrying the wait was dropped, its row gone');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered other')), 'the wake merged with it runs as its own turn');
       } finally {
         await t.close();
       }
@@ -1552,14 +1301,14 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.send('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the start reached its compile and waits');
         t.internal.releaseBudgetHoldsOnEvidence();
-        assert.equal(t.internal.budgetHolds.get('prime')?.state, 'holding');
+        assert.ok(t.internal.budgetHolds.has('prime'));
       } finally {
         await t.close();
       }
     });
   });
 
-  it('a withdrawal takes a wake out of a released hold too', async () => {
+  it('a withdrawal takes a wake out of a hold', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
       t.internal.budgetHoldRecheckMs = 60_000;
@@ -1568,83 +1317,18 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.stored().includes('Hi')));
         t.send('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')! as unknown as { state: string; turn: Record<string, unknown>; wakes: Array<Record<string, unknown>> };
-        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
-        hold.state = 'released';
+        const hold = t.internal.budgetHolds.get('prime')! as unknown as { turn: Record<string, unknown>; wakes: Array<Record<string, unknown>> };
         hold.wakes.push({ agentName: 'prime', reason: 'zz-coalesced', source: 'test', timestamp: Date.now(), coalescingSubject: 'zz-subject' });
         t.internal.cancelCoalescedWakes('zz-subject');
-        assert.deepEqual(hold.wakes, [], 'the withdrawn wake is gone from the released hold');
-        hold.state = 'holding';
+        assert.deepEqual(hold.wakes, [], 'the withdrawn wake is gone from the hold');
+        assert.ok(t.internal.budgetHolds.has('prime'), 'and the held turn still waits');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('holds the agent\'s other wakes while its held turn is out, and gives the wait and its fit only to the start that carries the held turn', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go', 'Answered other'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.sendForPrime('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
-        const held = t.internal.budgetHolds.get('prime')!.turn;
-        t.internal.releaseBudgetHold('prime');
-        const at = t.internal.pendingRequests.indexOf(held as Record<string, unknown>);
-        assert.ok(at >= 0, 'released into the queue');
-        t.internal.pendingRequests.splice(at, 1);
-        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() });
-        await t.framework.runUntilIdle();
-        assert.equal(t.turnCalls().length, 1, 'no other turn starts while the held turn is out');
-        assert.deepEqual(t.of('inference:hold_ended'), []);
-        assert.equal(t.internal.budgetHolds.get('prime')?.state, 'released');
-        t.internal.pendingRequests.push(held as Record<string, unknown>);
-        assert.ok(await pollUntil(() => t.stored().includes('Answered other')), 'the other wake runs after it');
-        const calls = t.turnCalls();
-        assert.ok(requestText(calls.at(-2)).includes('"go"'), 'the held turn ran first');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-        assert.equal(notesStored(t), 1, 'and only it had the note');
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('a refused start that is not the held turn joins the wait while the held turn is released, and runs after it', async () => {
-    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go', 'Answered other'] });
-      t.internal.budgetHoldRecheckMs = 60_000;
-      try {
-        t.send('hello');
-        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-        t.sendForPrime('go');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const held = t.internal.budgetHolds.get('prime')!.turn;
-        const refused = c.refusals;
-        t.internal.releaseBudgetHold('prime');
-        t.internal.pendingRequests.splice(t.internal.pendingRequests.indexOf(held as Record<string, unknown>), 1);
-        await t.internal.startAgentStream(t.framework.getAgent('prime')!, { agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() });
-        assert.equal(c.refusals, refused + 1, 'the other start, which no pass held, was refused');
-        assert.equal(t.internal.budgetHolds.get('prime')?.state, 'released', 'the held turn is still out');
-        assert.equal(t.of('inference:held').length, 1, 'no second wait');
-        assert.ok(!t.stored().includes('[inference-failed]'), 'and no failure');
-        c.fitAt = c.ticks;
-        c.readyAt = c.ticks;
-        t.internal.pendingRequests.push(held as Record<string, unknown>);
-        assert.ok(await pollUntil(() => t.stored().includes('Answered other')), 'the other runs after the held turn');
-        assert.ok(t.stored().includes('Answered go'));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('abortInference() stops a released first start before it begins', async () => {
+  it('abortInference() between a release and its start leaves the released first start to run, as a queued wake does', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
       t.internal.budgetHoldRecheckMs = 60_000;
@@ -1656,43 +1340,15 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
-        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
-        await t.framework.runUntilIdle();
-        assert.equal(t.turnCalls().length, 1, 'the released start never ran');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.deepEqual(t.of('inference:aborted').map((e) => e.reason), ['zz-stop']);
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), false, 'nothing is in flight to stop');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'the released start runs');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
+        assert.deepEqual(t.of('inference:aborted'), []);
       } finally {
         await t.close();
       }
     });
   });
-
-  for (const [label, end] of [
-    ['stop()', (t: Resident) => t.framework.stop()],
-    ["its agent's end", (t: Resident) => t.internal.releaseAgentRuntime(t.framework.getAgent('prime'), undefined, 'zz its agent ended')],
-  ] as const) {
-    it(`${label} ends a released first start before it begins, with inference:aborted`, async () => {
-      await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-        const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
-        t.internal.budgetHoldRecheckMs = 60_000;
-        try {
-          t.send('hello');
-          assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-          t.sendForPrime('go');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-          c.fitAt = c.ticks;
-          c.readyAt = c.ticks;
-          t.internal.releaseBudgetHold('prime');
-          await end(t);
-          assert.equal(t.of('inference:aborted').length, 1, 'its turn ends with inference:aborted');
-          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-          assert.equal(t.turnCalls().length, 1, 'the released start never ran');
-        } finally {
-          await t.close();
-        }
-      });
-    });
-  }
 
   it('a surgery that drops a held turn ends its hold, and a wake that joined it runs as a turn of its own with no note', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
@@ -1736,7 +1392,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(t.internal.pendingRequests.includes(held as Record<string, unknown>), 'the newer wake did not absorb it');
         await t.framework.resume();
         assert.ok(await pollUntil(() => t.stored().includes('Answered both')));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
       } finally {
         await t.close();
       }
@@ -1818,7 +1474,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it('ends a hold whose released start fails for another reason as failed, and the turn takes that error\'s path', async () => {
+  it('a released start that fails for another reason takes that error\'s path, as a start with no wait does', async () => {
     await withCompression({ fitAt: 2 }, async (c) => {
       const t = await resident();
       try {
@@ -1827,10 +1483,9 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.failNext = new Error('zz store unavailable');
         c.fitAt = 0;
         c.readyAt = 0;
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['failed']);
-        assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /failed for another reason after .*the error policy's or a provider hold's: zz store unavailable/);
         assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')), "the error policy's retry runs it");
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
+        assert.deepEqual(t.alerts('context-refusal-clear'), []);
       } finally {
         await t.close();
       }
@@ -1859,11 +1514,11 @@ describe('a turn refused for budget while compression is pending waits idle, and
   });
 });
 
-describe("the hold's note sits where the released turn read it", () => {
+describe("the hold's note is stored at its release, where every later request reads it", () => {
   const thinking = (answer: string) => createMockResponse([
     { type: 'thinking', thinking: `reasoning for ${answer}`, signature: `sig-${answer}` } as ContentBlock, text(answer)]);
 
-  it('stores the note once, where it was placed, so the next start keeps the prefix and the reply its thinking', async () => {
+  it('stores the note once, after the message, so the next start keeps the prefix and the reply its thinking', async () => {
     await withCompression({ fitAt: 3 }, async () => {
       const t = await resident({ binds: true, replies: [thinking('reply one'), thinking('reply two')] });
       try {
@@ -1884,7 +1539,7 @@ describe("the hold's note sits where the released turn read it", () => {
     });
   });
 
-  it('gives no note to a released wake whose window ends on the agent\'s own reply, and the next start keeps the prefix', async () => {
+  it('gives the note to a released wake whose window ends on the agent\'s own reply, and the next start keeps the prefix', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       const t = await resident({ replies: ['Hi', 'Woke', 'Answered three'] });
       try {
@@ -1895,17 +1550,15 @@ describe("the hold's note sits where the released turn read it", () => {
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         assert.ok(await pollUntil(() => t.stored().includes('Woke')));
-        assert.equal(notesStored(t), 0);
+        assert.equal(notesStored(t), 1);
         c.refuseFrom = Infinity;
         t.send('three');
         assert.ok(await pollUntil(() => t.stored().includes('Answered three')));
         const calls = t.turnCalls();
         const released = calls[1]!;
         const next = calls[2]!;
-        assert.doesNotMatch(requestText(released), /budget-hold/);
-        assert.equal(JSON.stringify(released.messages.at(-1)), JSON.stringify({ participant: 'user', content: [text('[Continue]')] }),
-          'a wake with nothing new ends its request on [Continue], which a later request leaves out before a plain reply like this one');
-        const read = released.messages.slice(0, -1);
+        assert.match(requestText(released), NOTE);
+        const read = released.messages.filter((m) => JSON.stringify(m) !== JSON.stringify({ participant: 'user', content: [text('[Continue]')] }));
         assert.deepEqual(next.messages.slice(0, read.length), read, 'the next request starts with what the released one read, byte for byte');
       } finally {
         await t.close();
@@ -1913,7 +1566,7 @@ describe("the hold's note sits where the released turn read it", () => {
     });
   });
 
-  it("gives no note to a person's held message whose refused start stored an injection after it, and the next start keeps the prefix", async () => {
+  it("gives the note to a person's held message whose refused start stored an injection after it, and the next start keeps the prefix", async () => {
     let n = 0;
     await withCompression({ fitAt: Infinity }, async (c) => {
       const t = await resident({ context: () => `status ${++n}`, replies: ['Answered one', 'Answered two'] });
@@ -1923,11 +1576,11 @@ describe("the hold's note sits where the released turn read it", () => {
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         assert.ok(await pollUntil(() => t.stored().includes('Answered one')));
-        assert.equal(notesStored(t), 0);
+        assert.equal(notesStored(t), 1);
         t.send('two');
         assert.ok(await pollUntil(() => t.stored().includes('Answered two')));
         const [released, next] = t.turnCalls();
-        assert.doesNotMatch(requestText(released), /budget-hold/);
+        assert.match(requestText(released), NOTE);
         assert.deepEqual(next!.messages.slice(0, released!.messages.length), released!.messages);
       } finally {
         await t.close();
@@ -1942,20 +1595,20 @@ describe("the hold's note sits where the released turn read it", () => {
       try {
         t.send('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-        const hold = t.internal.budgetHolds.get('prime')! as { turn?: unknown; startedAt: number; releasedAt?: number };
+        const hold = t.internal.budgetHolds.get('prime')!;
         const held = hold.turn!;
-        hold.startedAt = Date.now() - 3_000;
+        hold.waitSince = Date.now() - 3_000;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
+        const releasedAt = Date.now();
         t.internal.pendingRequests.splice(t.internal.pendingRequests.indexOf(held as Record<string, unknown>), 1);
         await new Promise((r) => setTimeout(r, 2_500));
         t.internal.pendingRequests.push(held as Record<string, unknown>);
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
         const note = t.rows().map((r) => JSON.stringify(r.content)).find((b) => b.includes('[budget-hold]'));
-        const waited = Number(/This turn waited (\d+) s\./.exec(String(note))?.[1]);
-        assert.equal(waited, Math.round((hold.releasedAt! - hold.startedAt) / 1000), `the figure is the wait to the release: ${note}`);
-        assert.ok(hold.releasedAt! - hold.startedAt < 4_500, "and the 2.5 s after the release isn't in it");
+        const waited = Number(/That turn waited (\d+) s\./.exec(String(note))?.[1]);
+        assert.equal(waited, Math.round((releasedAt - hold.waitSince) / 1000), `the figure is the wait to the release, not the 2.5 s after it: ${note}`);
       } finally {
         await t.close();
       }
@@ -1969,18 +1622,41 @@ describe("the hold's note sits where the released turn read it", () => {
         t.send('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         await t.framework.quiesce({ timeoutMs: 2_000 });
-        const hold = t.internal.budgetHolds.get('prime')! as { state: string; startedAt: number; releasedAt?: number };
-        hold.startedAt = Date.now() - 3_000;
+        const hold = t.internal.budgetHolds.get('prime')!;
+        hold.waitSince = Date.now() - 3_000;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         await new Promise((r) => setTimeout(r, 2_500));
-        assert.equal(hold.state, 'holding', 'the release waits for resume()');
+        assert.equal(t.internal.budgetHolds.get('prime'), hold, 'the release waits for resume()');
         await t.framework.resume();
+        const releasedAt = Date.now();
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
         const note = t.rows().map((r) => JSON.stringify(r.content)).find((b) => b.includes('[budget-hold]'));
-        const waited = Number(/This turn waited (\d+) s\./.exec(String(note))?.[1]);
-        assert.equal(waited, Math.round((hold.releasedAt! - hold.startedAt) / 1000), `the figure is the wait to the release: ${note}`);
-        assert.ok(hold.releasedAt! - hold.startedAt >= 5_500, 'the quiesce is in it');
+        const waited = Number(/That turn waited (\d+) s\./.exec(String(note))?.[1]);
+        assert.ok(waited >= 5 && waited <= Math.round((releasedAt - hold.waitSince) / 1000), `the figure runs to the release at resume(), the quiesce in it: ${note}`);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('an undo of the released turn leaves the note, whose words stay true for the turn that reads it next', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
+        assert.ok(await pollUntil(() => !t.internal.hasTurn('prime')), 'the turn has ended');
+        assert.equal(t.framework.undoLastTurn('prime').undone, true);
+        assert.ok(!t.windowText().includes('Answered go'), 'the undo took the reply');
+        assert.match(t.windowText(), /when a turn came to start\. That turn waited \d+ (s|min)\./, 'and left the note, stored before the turn began');
       } finally {
         await t.close();
       }
@@ -2017,12 +1693,11 @@ describe("the hold's note sits where the released turn read it", () => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered one', 'Answered two'] });
       t.internal.budgetHoldRecheckMs = 60_000;
       const releaseAfter = (waitedMs: number) => {
-        const hold = t.internal.budgetHolds.get('prime')! as { startedAt: number; releasedAt?: number };
-        hold.startedAt = Date.now() - waitedMs;
+        const hold = t.internal.budgetHolds.get('prime')!;
+        hold.waitSince = Date.now() - waitedMs;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
-        hold.releasedAt = hold.startedAt + waitedMs;
       };
       try {
         t.send('one');
@@ -2104,7 +1779,8 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
       const t = await heldContinuation(c, { replies: ['Done after the restart', 'Read the arrival'] });
       try {
         await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('hello').id] });
-        assert.equal(t.of('inference:hold_ended').length, 0, 'kept');
+        assert.ok(t.of('inference:hold_ended').every((e) => e.outcome === 'released'), 'released, not dropped');
+        assert.ok(await pollUntil(() => t.internal.budgetHolds.has('prime')), 'and refused again, it waits again');
         t.send('MID');
         assert.ok(await pollUntil(() => t.stored().includes('MID')));
         assert.ok(!t.windowText().includes('MID'), 'the arrival waits outside the window');
@@ -2130,22 +1806,6 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
         fit(c, t);
         await t.framework.runUntilIdle();
         assert.ok(!t.stored().includes('Done after the restart'));
-      } finally {
-        await t.close();
-      }
-    });
-  });
-
-  it('a released continuation the inference policy drops ends its hold after its inference:aborted', async () => {
-    await withCompression({}, async (c) => {
-      let refuse = false;
-      const t = await heldContinuation(c, { policy: { shouldInfer: () => !refuse } });
-      try {
-        refuse = true;
-        fit(c, t);
-        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
-        const order = t.traces.map((e) => e.type).filter((type) => type === 'inference:aborted' || type === 'inference:hold_ended');
-        assert.deepEqual(order, ['inference:aborted', 'inference:hold_ended'], 'the hold ends after its turn');
       } finally {
         await t.close();
       }
@@ -2213,7 +1873,7 @@ describe("the wait on context-manager's own autobiographical compression", () =>
       assert.ok(await pollUntil(() => traces.some((e) => e.type === 'inference:held')), 'the refused turn waits');
       const stored = () => (cm.getAllMessages() as unknown as Array<{ content: Array<{ text?: string }> }>).some((m) => m.content.some((b) => b.text === 'Answered go'));
       assert.ok(await pollUntil(stored, 10_000), 'it ran once the strategy was ready');
-      assert.deepEqual(traces.filter((e) => e.type === 'inference:hold_ended').map((e) => (e as { outcome?: string }).outcome), ['fit']);
+      assert.ok(traces.filter((e) => e.type === 'inference:hold_ended').every((e) => (e as { outcome?: string }).outcome === 'released'));
       assert.ok(summaries > 0, 'compression wrote summaries');
       assert.ok(refused >= 1);
       assert.ok(releases.whileNotReady >= 1, `released by progress while the strategy was still not ready: ${JSON.stringify(releases)}`);

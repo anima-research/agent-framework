@@ -1625,12 +1625,9 @@ export class Agent {
   unsentInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
     let newest: { contentHash: string; parts: number; held: Set<number> } | undefined;
     try {
-      const branch = branchKey(this.contextManager.currentBranchRef());
-      const since = this.unsentSince.get(branch);
+      const since = this.unsentSince.get(branchKey(this.contextManager.currentBranchRef()));
       if (since === undefined) {
-        const count = this.contextManager.getMessageCount();
-        const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-        this.unsentSince.set(branch, top);
+        this.markUnsentPoint();
         return undefined;
       }
       scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
@@ -1664,6 +1661,17 @@ export class Agent {
       if (!newest) return undefined;
     }
     return newest && { contentHash: newest.contentHash, whole: newest.held.size === newest.parts };
+  }
+
+  /** Set the unsent point where it isn't set, as a start's plan does: a row
+   *  stored after it counts as in no request until a compile built to send.
+   *  @internal For the framework's budget holds; not a host API. */
+  markUnsentPoint(): void {
+    const branch = branchKey(this.contextManager.currentBranchRef());
+    if (this.unsentSince.has(branch)) return;
+    const count = this.contextManager.getMessageCount();
+    const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
+    this.unsentSince.set(branch, top);
   }
 
   /** The ids of this agent's stored injections, of every namespace, stored

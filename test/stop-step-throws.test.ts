@@ -170,8 +170,8 @@ const ROWS: Row[] = [
     step: "a budget hold's drop",
     inject: (fw, e) => {
       const holds = internals(fw).budgetHolds as Map<string, unknown>;
-      holds.set('first', { state: 'released', startedAt: Date.now(), turn: undefined, standsOn: [], wakes: [] });
-      holds.set('second', { state: 'released', startedAt: Date.now(), turn: undefined, standsOn: [], wakes: [] });
+      holds.set('first', { startedAt: Date.now(), waitSince: Date.now(), turn: { agentName: 'first', reason: 'zz-held', source: 'test', timestamp: Date.now() }, standsOn: [], wakes: [] });
+      holds.set('second', { startedAt: Date.now(), waitSince: Date.now(), turn: { agentName: 'second', reason: 'zz-held', source: 'test', timestamp: Date.now() }, standsOn: [], wakes: [] });
       const owner = fw as unknown as Record<string, unknown>;
       const usual = (owner.dropBudgetHold as (...args: unknown[]) => void).bind(fw);
       owner.dropBudgetHold = (...args: unknown[]) => {

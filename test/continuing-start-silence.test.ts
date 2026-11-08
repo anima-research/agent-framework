@@ -207,7 +207,7 @@ async function turn(options: {
     activeTurnTokens: Map<string, unknown>;
     pendingRequests: InferenceRequest[];
     providerAccelerationCooldowns: Map<string, { until: number }>;
-    budgetHolds: Map<string, { state: string }>;
+    budgetHolds: Map<string, unknown>;
     releaseBudgetHold(agentName: string): void;
     openLogical: Map<string, unknown>;
     releaseProviderAccelerationCooldown(agentName: string): void;
@@ -268,7 +268,7 @@ async function turn(options: {
     }
     if (options.beforeEnd) await options.beforeEnd(h);
     if (options.budgetHold) {
-      await until(() => internals.budgetHolds?.get('scout')?.state === 'holding', 'the budget hold');
+      await until(() => internals.budgetHolds?.has('scout'), 'the budget hold');
       await options.budgetHold.during(h, framework);
       options.budgetHold.fit();
       internals.releaseBudgetHold('scout');
@@ -344,7 +344,7 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
       assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
     });
 
-    it(`${proseRouting}: a context-budget restart a budget hold kept through a suppression of a row it doesn't stand on keeps the line its stream writes held`, async () => {
+    it(`${proseRouting}: a context-budget restart that waits for compression through a suppression of a row it doesn't stand on keeps the line its stream writes held`, async () => {
       const proto = ContextManager.prototype as unknown as Record<'compile' | 'isReady', (...args: unknown[]) => unknown>;
       const original = { compile: proto.compile, isReady: proto.isReady };
       let compiles = 0;
