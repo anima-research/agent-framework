@@ -954,12 +954,12 @@ describe('held prose drafts, end to end', () => {
     const h = await harness({ sendTool: true });
     await h.sendMode('no-channel');
     try {
-      await h.turn([createMockResponse([text('a held segment'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
+      await h.turn([createMockResponse([text('quokka zebra'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
       const [held] = h.drafts();
-      assert.equal(held?.text, 'a held segment', 'premise: the segment is held');
+      assert.equal(held?.text, 'quokka zebra', 'premise: the segment is held');
       const notice = h.texts().find((t) => t.startsWith('[drafts] scout: '));
-      assert.ok(notice?.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${held!.id} (14 chars) — because`), notice);
-      assert.ok(!notice!.includes('held segment'), `no words of the draft: ${notice}`);
+      assert.ok(notice?.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${held!.id} (12 chars) — because`), notice);
+      assert.ok(!/quokka|zebra/.test(notice!), `no words of the draft: ${notice}`);
 
       await h.turn([createMockResponse([text('x'), unplacedSend('s2')], 'tool_use'), createMockResponse([])]);
       const lone = h.drafts().find((d) => d.text === 'x');
@@ -1084,7 +1084,7 @@ describe('held prose drafts, end to end', () => {
         const [draft] = h.drafts();
         assert.ok(draft, 'the words are held');
         assert.equal(draft!.text, 'refused words');
-        assert.ok(h.texts().some((t) => t.startsWith('[prose-routing]') && t.includes(`It is held as draft ${draft!.id}`)), 'the bounce notice names it');
+        assert.ok(h.texts().some((t) => t.startsWith('[prose-routing]') && t.includes(`It is held as draft ${draft!.id} (13 chars); nothing is lost`)), 'the bounce notice names it with its length');
         assert.deepEqual(h.texts().filter((t) => t.startsWith('[discord-send-failed]')), [], 'no second notice for the same failure');
       } finally {
         await h.close();
@@ -1411,7 +1411,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([text('words with nowhere to go')])]);
       const [bounced] = h.drafts();
       assert.equal(bounced?.reason, 'bounced');
-      assert.ok(h.texts().some((t) => t.includes(`It is held as draft ${bounced!.id}`)));
+      assert.ok(h.texts().some((t) => t.includes(`It is held as draft ${bounced!.id} (24 chars); nothing is lost`)));
       await h.restart();
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
       assert.deepEqual(h.publishes().map((p) => p.text), ['words with nowhere to go']);
@@ -1465,7 +1465,7 @@ describe('held prose drafts, end to end', () => {
       assert.equal(copy.text, 'risky words and more');
       // No attempt is out, so the notice gives the copy's condition and no wait.
       const notice = h.texts().find((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${risky!.id}`))!;
-      assert.ok(notice.endsWith(`Your message is held as draft ${copy.id}, with {{unsent}} written out; since it includes ` +
+      assert.ok(notice.endsWith(`Your message is held as draft ${copy.id} (${copy.text.length} chars), with {{unsent}} written out; since it includes ` +
         `${risky!.id}'s words, it can be resent only with confirmDuplicate: true.`), notice);
     } finally {
       await h.close();
@@ -2603,7 +2603,7 @@ describe('drafts resend ownership', () => {
       assert.equal(fresh.text, 'bounced words and a postscript');
       const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
       assert.ok(words.includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which is queued in a resend in progress. Nothing was sent; ` +
-        `wait for that result. Your message is held as draft ${fresh.id}, with {{unsent}} written out; since it includes ` +
+        `wait for that result. Your message is held as draft ${fresh.id} (${fresh.text.length} chars), with {{unsent}} written out; since it includes ` +
         `${bounce!.id}'s words, it can be resent only with confirmDuplicate: true, once that result is in.`), words.join('\n'));
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
       await t.untilPublishing();
@@ -2965,8 +2965,27 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const fresh = h.drafts().find((d) => d.text === 'P.S. too');
       assert.ok(fresh, 'premise: the P.S. is held this turn');
       const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!;
-      assert.ok(receipt.includes(`${fresh!.id} (8 chars)`) && receipt.includes(`${bounce!.id} (10 chars)`), receipt);
+      const listed = receipt.match(/held as drafts (.*?) \(not sent — /)?.[1];
+      assert.ok(
+        [`${fresh!.id} (8 chars) and ${bounce!.id} (10 chars)`, `${bounce!.id} (10 chars) and ${fresh!.id} (8 chars)`].includes(listed ?? ''),
+        receipt,
+      );
       assert.ok(!receipt.includes('in the order you wrote them'), receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('hybrid: a bounce whose {{unsent}} expands names the held draft by its own length, not the words as written', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('>>>#nowhere lost')])]);
+      assert.equal(h.drafts()[0]?.text, 'lost', 'premise: the first bounce is held');
+      await h.turn([createMockResponse([text('>>>#nowhere {{unsent}} and more')])]);
+      const expanded = h.drafts().find((d) => d.text === 'lost and more');
+      assert.ok(expanded, 'premise: the second bounce holds {{unsent}} written out');
+      const notice = h.texts().filter((t) => t.startsWith('[prose-routing]')).at(-1)!;
+      assert.ok(notice.includes(`It is held as draft ${expanded!.id} (13 chars); nothing is lost`), notice);
     } finally {
       await h.close();
     }
@@ -3046,7 +3065,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         createMockResponse([]),
       ]);
       assert.match(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!, new RegExp(
-        `^\\[delivered\\] nothing confirmed — draft ${ids[3]} is unconfirmed: ${ids[3]}'s attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .+ ` +
+        `^\\[delivered\\] nothing confirmed — draft ${ids[3]} \\(15 chars\\) is unconfirmed: ${ids[3]}'s attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .+ ` +
         'may already have been posted: .+ — sending it again could post it twice \\(resend needs confirmDuplicate: true\\)$'));
 
       // Dismissed knowingly after an unknown resend: the dismissal sets it
@@ -4727,7 +4746,7 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
       assert.equal(calls, 1, 'the heartbeat turn alone: no bounce wake');
       const [bounced] = h.drafts();
       assert.equal(bounced?.reason, 'bounced');
-      assert.ok(h.texts().some((t) => t.includes(`It is held as draft ${bounced!.id}`)), 'the bounce is noticed');
+      assert.ok(h.texts().some((t) => t.includes(`It is held as draft ${bounced!.id} (34 chars); nothing is lost`)), 'the bounce is noticed');
       assert.deepEqual(h.publishes(), []);
     } finally {
       await h.close();

@@ -23691,7 +23691,7 @@ export class AgentFramework {
     }
     const unconfirmed = inState('unconfirmed');
     for (const d of unconfirmed) {
-      notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — sending it again could post it twice (resend needs confirmDuplicate: true)`);
+      notes.push(`draft ${d.id} (${AgentFramework.draftLength(d)}) is unconfirmed: ${this.riskText(d)} — sending it again could post it twice (resend needs confirmDuplicate: true)`);
     }
     // A dismissal sets a draft aside; it doesn't unsay that the draft's own
     // attempt may already have been posted.
@@ -26005,7 +26005,7 @@ export class AgentFramework {
     const kept = 'draft' in words
       ? ''
       : held
-        ? ` Your message is held as draft ${held.id}, with {{unsent}} written out; since it includes ${draft.id}'s words, it ` +
+        ? ` Your message is held as draft ${held.id} (${AgentFramework.draftLength(held)}), with {{unsent}} written out; since it includes ${draft.id}'s words, it ` +
           `can be resent only with confirmDuplicate: true${afterResult}.`
         : ' Your message could not be held as a draft; its words remain in your history.';
     const text = `[${NOTICE_TAG.proseRouting}] {{unsent}} is draft ${draft.id}, ${why.startsWith('which') ? why : `and ${why}`}. ` +
@@ -26516,11 +26516,11 @@ export class AgentFramework {
     const kept = !draft
       ? 'It could not be held as a draft; the words remain in your history.'
       : byToken
-        ? `It is held as draft ${draft.id}; nothing is lost. To deliver it unchanged, reply with a destination plus the ` +
+        ? `It is held as draft ${draft.id} (${AgentFramework.draftLength(draft)}); nothing is lost. To deliver it unchanged, reply with a destination plus the ` +
           `token {{unsent}}, e.g. "${prefix}${example} {{unsent}}" or "${prefix}${NO_PERSON_EXAMPLE} {{unsent}}", or use ` +
           `drafts(action: "resend", draftIds: ["${draft.id}"], destination: ${quotedValue(example)}). ` +
           `"${prefix}skip_reply {{unsent}}" sets it aside.`
-        : `It is held as draft ${draft.id}; nothing is lost. To deliver it unchanged, use ` +
+        : `It is held as draft ${draft.id} (${AgentFramework.draftLength(draft)}); nothing is lost. To deliver it unchanged, use ` +
           `drafts(action: "resend", draftIds: ["${draft.id}"], destination: ${quotedValue(example)}` +
           `${inherited || ownRisk ? ', confirmDuplicate: true' : ''}); ` +
           `drafts(action: "dismiss", draftIds: ["${draft.id}"]) sets it aside.`;
