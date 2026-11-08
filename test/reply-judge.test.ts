@@ -573,7 +573,7 @@ describe('reply judge: the document', () => {
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
   });
 
-  it("says first that the agent's last turn failed, then what runs it again, by the kinds of wake the list holds: a certain queued wake, else a certain provider hold, else nothing", async () => {
+  it("says first that the agent's last turn failed, then what runs it again, by the kinds of wake the list holds: a certain queued wake, else the first certain provider hold in the list's order, with its time when it has one, else nothing", async () => {
     const now = 1_000_000;
     const failed: FailedLastTurn = { at: now - 30_000 };
     const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
@@ -584,7 +584,9 @@ describe('reply judge: the document', () => {
       [[], nothing],
       [[queued], 'A wake for Scout is already queued.'],
       [[held], 'A wake for Scout is held, due to be let go in 3 min.'],
-      [[{ when: 'when the hold on it is released', certain: true, kind: 'provider-hold', what: 'a wake held by the host' }], 'A wake for Scout is held, and is let go when the hold on it is released.'],
+      [[{ when: 'once the operator approves the retry', certain: true, kind: 'provider-hold', what: 'a wake held by the host' }], 'A wake for Scout is held.'],
+      [[{ ...held, at: now + 7_200_000 }, { ...held, at: now + 60_000 }], 'A wake for Scout is held, due to be let go in 60 s.'],
+      [[{ when: 'once the operator approves the retry', certain: true, kind: 'provider-hold', what: 'a wake held by the host' }, held], 'A wake for Scout is held, due to be let go in 3 min.'],
       [[held, queued], 'A wake for Scout is already queued.'],
       [[{ ...queued, certain: false }], nothing],
       [[{ ...held, certain: false }], nothing],

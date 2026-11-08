@@ -841,7 +841,7 @@ describe('judge rules: timing', () => {
   const dueOf = (gate: EventGate, name: string) => (gate as unknown as { debounceTimers: Map<string, { dueAt: number }> }).debounceTimers.get(name)!.dueAt;
   const listed = (gate: EventGate) => gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]);
 
-  it("under onError 'wake', while a refusal's stated wait lasts, the wake list gives each judge rule's batch as going to the judge, a maybe, though it's delivered without the judge unless a turn or the host's quiesce holds it past the wait's end", async () => {
+  it("under onError 'wake', while a refusal's stated wait lasts, the wake list gives each judge rule's batch as going to the judge, a maybe, though one due before the wait's end is delivered without the judge unless a turn or the host's quiesce holds it past that end", async () => {
     {
       const { gate } = await refusedOnce('wake', 'refused-wake-listed.json', { config: twoRules({ name: 'later', debounceMs: 120_000 }) });
       gate.evaluate(chat('second'));
@@ -1365,9 +1365,7 @@ describe('judge rules: timing', () => {
     });
     assert.ok(logged.some((l) => l.includes("is held while the judge's calls are refused")), JSON.stringify(logged));
     assert.ok(gate.getStatus().errors.some((e) => e.startsWith("A reply judge call was refused (scout's provider calls are held) until ")), JSON.stringify(gate.getStatus().errors));
-    await advance(1_900);
-    assert.strictEqual(judge.requests.length, 2, 'not asked again before the stated end');
-    await advance(200);
+    await lastMillisecond(refusalEnd(gate), () => assert.strictEqual(judge.requests.length, 2, 'not asked again before the stated end'));
     await until(() => judge.waiting() === 1, "first's batch asked again at the stated end");
     assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['hello']);
     judge.answer({ reply: false, reason: 'chatter' });

@@ -259,13 +259,16 @@ function inWhile(at: number | undefined, now: number): string {
   return `in ${h} h${m % 60 ? ` ${m % 60} min` : ''}`;
 }
 
+function soonestFirst(wakes: readonly UpcomingWake[], now: number): UpcomingWake[] {
+  const due = (w: UpcomingWake): number => (w.when !== undefined ? Infinity : w.at ?? now);
+  return [...wakes].sort((a, b) => (due(a) === due(b) ? 0 : due(a) - due(b)));
+}
+
 export function failedTurnLine(failed: FailedLastTurn, wakes: readonly UpcomingWake[], agentName: string, now: number): string {
   const opening = `${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`;
   if (wakes.some((w) => w.kind === 'queued' && w.certain)) return `${opening} A wake for ${agentName} is already queued.`;
-  const held = wakes.find((w) => w.kind === 'provider-hold' && w.certain);
-  if (held) {
-    return `${opening} A wake for ${agentName} is held, ${held.at !== undefined ? `due to be let go ${inWhile(held.at, now)}` : 'and is let go when the hold on it is released'}.`;
-  }
+  const held = soonestFirst(wakes, now).find((w) => w.kind === 'provider-hold' && w.certain);
+  if (held) return `${opening} A wake for ${agentName} is held${held.at !== undefined ? `, due to be let go ${inWhile(held.at, now)}` : ''}.`;
   return `${opening} Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes ${agentName}.`;
 }
 
@@ -276,8 +279,7 @@ export function failedTurnLine(failed: FailedLastTurn, wakes: readonly UpcomingW
  * where the host was told of them, so the empty case says so.
  */
 export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number, failed?: FailedLastTurn): string {
-  const due = (w: UpcomingWake): number => (w.when !== undefined ? Infinity : w.at ?? now);
-  const sorted = [...wakes].sort((a, b) => (due(a) === due(b) ? 0 : due(a) - due(b)));
+  const sorted = soonestFirst(wakes, now);
   const listed = sorted.slice(0, 8).map((w) => `- ${w.when !== undefined ? field(w.when) : inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${field(w.what)}`);
   const rest = sorted.slice(8);
   const maybe = rest.filter((w) => !w.certain).length;
