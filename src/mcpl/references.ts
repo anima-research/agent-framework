@@ -715,9 +715,9 @@ const MAX_RECORDS = 2000;
  * Host-private store of received references. Raw URIs live here and in stubs
  * never (under `never`) or by policy only (`ref`/absent). Ids are stable and
  * never reused within the process (vector 20). Past MAX_RECORDS the record
- * registered least recently is evicted (registering a uri the registry holds
- * makes its record the newest), and a stale lookup returns undefined — a
- * defined miss, never a different record.
+ * registered least recently that no fetch holds (pin) is evicted
+ * (registering a uri the registry holds makes its record the newest), and a
+ * stale lookup returns undefined — a defined miss, never a different record.
  *
  * Process-wide singleton by design: ids are host-local *names*, not
  * capabilities, and the record carries the servers that delivered it for the
@@ -745,6 +745,20 @@ export class ReferenceRegistry {
   private counter = 0;
   /** Each open journal's copies (openJournal), by uri. */
   private journals = new Set<Map<string, ReferenceRecord | null>>();
+  /** How many fetches hold each record (pin), by refId. */
+  private pins = new Map<string, number>();
+
+  /** Hold a record while a fetch of it runs, so eviction passes it over and
+   *  a `never` for its uri, in whatever shape it comes, finds the record the
+   *  fetch reads its mark from. Call the release once the fetch ends. */
+  pin(refId: string): () => void {
+    this.pins.set(refId, (this.pins.get(refId) ?? 0) + 1);
+    return () => {
+      const held = (this.pins.get(refId) ?? 0) - 1;
+      if (held > 0) this.pins.set(refId, held);
+      else this.pins.delete(refId);
+    };
+  }
 
   markNever(uri: string, serverId: string): void {
     // The record of the uri as sent, and the record of the text it shows,
@@ -868,14 +882,12 @@ export class ReferenceRegistry {
     }
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
-    if (this.records.size > MAX_RECORDS) {
-      const oldest = this.records.keys().next().value;
-      if (oldest !== undefined) {
-        const old = this.records.get(oldest);
-        if (old) this.keepFirst(old.testimony.uri);
-        this.records.delete(oldest);
-        if (old) this.byKey.delete(old.testimony.uri);
-      }
+    for (const [oldest, old] of this.records) {
+      if (this.records.size <= MAX_RECORDS) break;
+      if (this.pins.has(oldest) || oldest === refId) continue;
+      this.keepFirst(old.testimony.uri);
+      this.records.delete(oldest);
+      this.byKey.delete(old.testimony.uri);
     }
     return record;
   }

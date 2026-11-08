@@ -574,26 +574,70 @@ describe('a fetcher built to withhold', () => {
     assert.deepEqual([saved, removed, record.fetchedPath], [[], [], undefined]);
   });
 
-  it("saves nothing and names no path for a fetch whose record is evicted and its uri delivered again as `never` while it runs", async () => {
+  /** 2,000 registrations, as many as the registry keeps. */
+  const crowd = () => {
+    for (let i = 0; i < 2000; i++) referenceRegistry.register(testimonyOf({ type: 'resource', uri: `https://zz-never.example/evict/${randomUUID()}` }), 'srv');
+  };
+
+  for (const [shape, never] of [
+    ['a reference', (uri: string) => ({ type: 'resource', uri, disposition: 'never' })],
+    ['inline data', inlineNever],
+    ['an embedded resource', (uri: string) => ({ type: 'resource', disposition: 'never', resource: { uri, text: 'the payload', mimeType: 'text/plain' } })],
+  ] as const) {
+    it(`saves nothing and names no path for a fetch whose uri ${shape} marks \`never\` while it runs, past 2,000 later registrations`, async () => {
+      const saved: string[] = [];
+      const removed: string[] = [];
+      const f = fetcher({ saved, removed });
+      const uri = `${ORIGIN}/hold?crowded-${randomUUID()}`;
+      const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
+      const arrived = new Promise<void>((resolve) => { heard = resolve; });
+      const running = f.fetch(record);
+      await within('the request reaching the server', arrived);
+      const response = held.shift()!;
+      try {
+        crowd();
+        await quietly(() => convertBlocks([never(uri)] as McplContentBlock[], 'attachment on push event', 'srv'));
+      } finally {
+        response.end();
+      }
+      assert.deepEqual(await within('the crowded download', running), NEVER_FAILURE);
+      assert.deepEqual([saved, removed, record.fetchedPath], [[], [], undefined]);
+    });
+  }
+
+  it('keeps a record its fetch holds past 2,000 later registrations, so a `never` marks that record, and lets it go once the fetch ends', async () => {
     const saved: string[] = [];
-    const removed: string[] = [];
-    const f = fetcher({ saved, removed });
-    const uri = `${ORIGIN}/hold?evicted-${randomUUID()}`;
+    const f = fetcher({ saved });
+    const uri = `${ORIGIN}/hold?pinned-${randomUUID()}`;
     const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
     const arrived = new Promise<void>((resolve) => { heard = resolve; });
     const running = f.fetch(record);
     await within('the request reaching the server', arrived);
     const response = held.shift()!;
     try {
-      for (let i = 0; i < 2000; i++) referenceRegistry.register(testimonyOf({ type: 'resource', uri: `https://zz-never.example/evict/${randomUUID()}` }), 'srv');
-      assert.equal(referenceRegistry.findByUri(uri), undefined, 'the record is evicted');
-      const again = (await quietly(() => referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'srv'))).value;
-      assert.equal(again.payloadNever, true);
+      crowd();
+      assert.equal(referenceRegistry.findByUri(uri), record, 'kept while its fetch runs');
+      await quietly(() => convertBlocks([inlineNever(uri)] as McplContentBlock[], 'attachment on push event', 'srv'));
+      assert.equal(record.payloadNever, true, 'the record the fetch holds is the one marked');
     } finally {
       response.end();
     }
-    assert.deepEqual(await within('the evicted download', running), NEVER_FAILURE);
-    assert.deepEqual([saved, removed, record.fetchedPath], [[], [], undefined]);
+    assert.deepEqual(await within('the pinned download', running), NEVER_FAILURE);
+    assert.deepEqual([saved, record.fetchedPath], [[], undefined]);
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri: `https://zz-never.example/evict/${randomUUID()}` }), 'srv');
+    assert.equal(referenceRegistry.findByUri(uri), undefined, 'evicted once its fetch has ended');
+  });
+
+  it('keeps every record fetches hold, and the one just registered, past 2,000, and evicts down to 2,000 once they are let go', () => {
+    const reg = new ReferenceRegistry();
+    const uris = Array.from({ length: 2000 }, () => uniq('held.bin'));
+    const releases = uris.map((uri) => reg.register(testimonyOf({ type: 'resource', uri }), 'srv')).map((record) => reg.pin(record.refId));
+    const newest = uniq('newest.bin');
+    reg.register(testimonyOf({ type: 'resource', uri: newest }), 'srv');
+    assert.deepEqual([reg.findByUri(uris[0]!) !== undefined, reg.findByUri(newest) !== undefined], [true, true], 'nothing held is evicted, nor the record just registered');
+    for (const release of releases) release();
+    reg.register(testimonyOf({ type: 'resource', uri: uniq('after.bin') }), 'srv');
+    assert.deepEqual([uris[0], uris[1], uris[2]].map((uri) => reg.findByUri(uri!) !== undefined), [false, false, true], 'the two oldest go, back to 2,000');
   });
 
   it('removes a copy whose payload a `never` marks while it is saved, and refuses', async () => {
