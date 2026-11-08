@@ -1484,7 +1484,7 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("a direct-API round's re-inference takes no private mark from the framework's last turn, so the turn it opens reads its own window", async () => {
+  it("a direct-API round's re-inference takes no private mark from the framework's last turn", async () => {
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
     const agent = framework.getAgent('assistant')!;
@@ -2312,6 +2312,7 @@ describe('explicit prose routing', () => {
     const help = decoded.join(' ').replace(/\s+/g, ' ');
     for (const clause of [
       'A destination applies to the rest of that turn, until another is named.',
+      "In a private turn it applies only to its own envelope's words.",
       'A name that matches no channel, or several, bounces and leaves it as it was.',
       'A channel its server declared inbound-only is refused, and clears it.',
       'Where two servers register one channel id, the server goes first: >>server:service:guild:id … (a bounce lists each such name).',

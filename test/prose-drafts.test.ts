@@ -3652,7 +3652,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     }
 
     for (const [mode, named] of [['locus', false], ['explicit', true]] as const) {
-      it(`a private turn in ${mode} mode ${named ? 'still names' : 'names no'} unposted speech after a failure past its round, ${named ? "since an envelope's words would have posted" : 'since its words had nowhere to post'}`, async () => {
+      it(`a private turn in ${mode} mode ${named ? 'still names unposted speech after a failure past its round, as main does' : 'names no unposted speech after a failure past its round, since its words had nowhere to post'}`, async () => {
         const h = await harness({ xml: true, roundPreamble: true, retries: 0, agents: [{ name: 'scout', proseRouting: mode }], modules: [new SurfaceModule()] });
         try {
           breakAfterToolRound(h.membrane, 'error');

@@ -105,7 +105,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
 });
 
 for (const isPrivate of [true, false]) {
-  test(`the rewind's retry of a ${isPrivate ? 'private' : 'public'} turn ${isPrivate ? 'carries' : "doesn't carry"} the private mark, so the turn it opens is ${isPrivate ? 'private' : 'read from the window'}`, () => {
+  test(`the rewind's retry of a ${isPrivate ? 'private' : 'public'} turn ${isPrivate ? 'carries' : "doesn't carry"} the private mark`, () => {
     const { fw, restore } = makeHarness();
     fw.turnRouting = new Map([['cairn', isPrivate ? { private: true } : {}]]);
     try {
