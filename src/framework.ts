@@ -3095,6 +3095,13 @@ interface BudgetHold {
   drainKicked?: boolean;
   outcome?: Exclude<BudgetHoldOutcome, 'stopped'>;
   note?: string | null;
+  /** The ops alerts treat a hold, its release and a re-hold of the same
+   *  turn as one episode: `alerted` while its `context-hold` is out with no
+   *  clear, and `clear` the released turn's `context-hold-clear`, sent when
+   *  the episode ends: its start gets past its compile, it ends, the error
+   *  policy takes its refusal, or a provider hold takes it. */
+  alerted?: boolean;
+  clear?: () => void;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -7406,6 +7413,7 @@ export class AgentFramework {
     hold.state = 'holding';
     hold.phase++;
     delete hold.providerTook;
+    delete hold.clear;
     hold.checkpoint = checkpoint;
     hold.heldRequests = [own];
     hold.errorType = errorType;
@@ -7421,8 +7429,10 @@ export class AgentFramework {
     this.budgetHolds.set(agent.name, hold);
     endStart();
     hold.announcing = [];
+    const opens = hold.alerted !== true;
+    hold.alerted = true;
     try {
-      this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
+      if (opens) this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
         skipLog: true,
         everyTime: true,
         data: {
@@ -7513,6 +7523,9 @@ export class AgentFramework {
       }
       if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding' || hold.phase !== phase) return;
       if (this.agents.get(agentName) !== agent) return;
+      // A refusal seen before a change could keep the turn held wrongly, so it
+      // waits for the next look; a fit seen before one releases the turn, whose
+      // start then compiles against the change.
       if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
     } else if (verdict === 'fit') {
       note = this.budgetHoldNoteWhereItFits(agent, hold, preview?.plan);
@@ -7723,6 +7736,11 @@ export class AgentFramework {
       : outcome === 'nothing_pending' ? `compression had nothing left to do after ${after}: the turn compiles again, and a refusal now takes the error policy's path`
         : outcome === 'check_failed' ? `the hold's check failed after ${after}: the turn compiles again`
           : `the held turn was ended after ${after}`;
+    const clear = (): void => this.opsAlert('context-hold-clear', agentName, cause !== undefined ? `${words} (${cause})` : words, {
+      skipLog: true,
+      everyTime: true,
+      data: { outcome, waitedMs, ...(cause !== undefined ? { cause } : {}) },
+    });
     const report = (): void => {
       this.emitTrace({
         type: 'inference:hold_ended',
@@ -7731,11 +7749,11 @@ export class AgentFramework {
         waitedMs,
         heldRequests,
       });
-      this.opsAlert('context-hold-clear', agentName, cause !== undefined ? `${words} (${cause})` : words, {
-        skipLog: true,
-        everyTime: true,
-        data: { outcome, waitedMs, ...(cause !== undefined ? { cause } : {}) },
-      });
+      if (hold.state === 'released' && this.budgetHolds?.get(agentName) === hold) hold.clear = clear;
+      else {
+        hold.alerted = false;
+        clear();
+      }
     };
     if (hold.announcing) hold.announcing.push(report);
     else report();
@@ -7763,7 +7781,10 @@ export class AgentFramework {
     const hold = this.budgetHolds?.get(agentName);
     if (!hold) return undefined;
     this.budgetHolds.delete(agentName);
-    if (hold.state !== 'holding') return undefined;
+    if (hold.state !== 'holding') {
+      this.sendBudgetHoldClear(hold);
+      return undefined;
+    }
     this.clearBudgetHoldRecheck(hold);
     const waitedMs = Date.now() - hold.startedAt;
     const requests = hold.heldRequests;
@@ -7787,11 +7808,25 @@ export class AgentFramework {
     const hold = this.budgetHolds?.get(agentName);
     if (hold === undefined || hold.state === 'holding') return;
     const releasedBy = (request: InferenceRequest) => (request as MarkedRequest)[BUDGET_RELEASED] === hold;
-    if (requests.some((request) => releasedBy(request) || (mergedBatch(request) ?? []).some(releasedBy))) hold.providerTook = true;
+    if (requests.some((request) => releasedBy(request) || (mergedBatch(request) ?? []).some(releasedBy))) {
+      hold.providerTook = true;
+      this.sendBudgetHoldClear(hold);
+    }
   }
 
   private settleBudgetHold(agentName: string): void {
-    if (this.budgetHolds?.get(agentName)?.state !== 'holding') this.budgetHolds?.delete(agentName);
+    const hold = this.budgetHolds?.get(agentName);
+    if (hold === undefined || hold.state === 'holding') return;
+    this.budgetHolds.delete(agentName);
+    this.sendBudgetHoldClear(hold);
+  }
+
+  private sendBudgetHoldClear(hold: BudgetHold): void {
+    const clear = hold.clear;
+    if (clear === undefined) return;
+    delete hold.clear;
+    hold.alerted = false;
+    clear();
   }
 
   private clearBudgetHoldRecheck(hold: BudgetHold): void {
@@ -7808,6 +7843,7 @@ export class AgentFramework {
       if (agent && !this.compressionPending(agent)) hold.state = 'spent';
     }
     if (hold?.state !== 'spent') return error;
+    this.sendBudgetHoldClear(hold);
     error.message = `${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ` +
       (hold.outcome === 'fit'
         ? "its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do)"

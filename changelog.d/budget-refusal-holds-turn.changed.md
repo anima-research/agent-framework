@@ -19,7 +19,9 @@
     wait makes it hasn't been measured. The refused attempt emits
     `inference:failed`, as an attempt a provider hold keeps does, and then the
     new trace `inference:held`; `inference:hold_ended` follows when the hold
-    ends, and the turn's next start emits `inference:started` again. A
+    ends, for a release once the turn's requests are queued again, and the
+    released turn's next start emits `inference:started` again, unless a
+    listener of `inference:hold_ended` stops the turn first. A
     listener of the hold's `context-hold` alert that ends the turn at once
     puts its `inference:aborted` before `inference:held`.
     `healthSnapshot()` gives each agent's `budgetHold` (or null): since when
@@ -32,7 +34,8 @@
     description of its pending work now (`pending`, bounded to 2,000
     characters, or null), the held count, and the refusal's type and figures.
   - A held turn raises `context-hold` (under Added) rather than
-    `context-refusal`, since it goes on. Before, the refused compile's
+    `context-refusal`, since it goes on: once, however often it's released
+    and held again, unless a provider hold takes it between. Before, the refused compile's
     exhaustion raised `context-refusal`; a hold that ends because compression
     had nothing left to do, and whose turn's compile is refused again, still
     does. After a hold whose check failed, a refusal while compression is

@@ -163,11 +163,13 @@ export type TraceEvent =
        * refused attempt's `inference:failed`, as a provider hold does. Its
        * logical turn stays open, unless a listener of the hold's
        * `context-hold` alert ended it, whose `inference:aborted` then comes
-       * first; `inference:hold_ended` follows, and then, unless the turn was
-       * stopped while held, its fresh compile. After a hold that ended
-       * because compression had nothing left to do, a refusal of that compile
-       * takes the error policy's path; after one whose check failed, a
-       * refusal while compression is pending holds the turn again.
+       * first; `inference:hold_ended` follows, for a release once the turn's
+       * requests are queued again, and then its fresh compile, unless the turn
+       * was stopped while held or a listener of `inference:hold_ended` stops
+       * it. After a hold that ended because compression had nothing left to
+       * do, a refusal of that compile takes the error policy's path; after one
+       * whose check failed, a refusal while compression is pending holds the
+       * turn again.
        */
       type: 'inference:held';
       agentName: string;
@@ -1101,8 +1103,11 @@ export type TraceEvent =
       type: 'ops:alert';
       /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' |
        *  'context-hold' | … A kind ending in `-clear` ends the alert of the
-       *  kind before it: 'context-hold-clear' is raised at every end of a
-       *  budget hold, each start of which raised 'context-hold'. */
+       *  kind before it: 'context-hold-clear' is raised when a turn's budget
+       *  hold episode ends, which raised one 'context-hold' however often the
+       *  turn was released and held again; a provider hold that takes the
+       *  released turn ends the episode, so a budget hold after that raises
+       *  another. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;

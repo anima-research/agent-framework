@@ -479,6 +479,7 @@ async function residentTurn(options: {
   storePath?: string;
   failFirstStream?: () => void;
   policyErrors?: Error[];
+  policyAsked?: () => void;
   clock?: { intervalSeconds: number };
 }) {
   const tempDir = options.storePath === undefined ? mkdtempSync(join(tmpdir(), 'budget-hold-')) : undefined;
@@ -511,6 +512,7 @@ async function residentTurn(options: {
     ...(options.inferencePolicy ? { inferencePolicy: options.inferencePolicy } : {}),
     errorPolicy: { maxRetries: 3, onInferenceError: (error, _agent, attempt) => {
       options.policyErrors?.push(error);
+      options.policyAsked?.();
       return attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false };
     } },
   });
@@ -973,12 +975,39 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         i.releaseBudgetHold('prime', 'fit', null);
         const released = i.pendingRequests.at(-1)!;
         assert.equal(holdOf(t)?.state, 'released', 'premise: the release pushed its start');
+        const clears = () => t.of('ops:alert').filter((e) => e.kind === 'context-hold-clear').length;
+        assert.equal(clears(), 0, 'the release keeps its clear until the turn leaves the hold');
         i.providerAccelerationCooldowns.set('prime', providerHold([{ agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() }]));
         i.releaseProviderAccelerationCooldown('prime');
         assert.equal(marked(), false, 'a provider hold letting other requests go leaves the release unmarked');
+        assert.equal(clears(), 0);
         i.providerAccelerationCooldowns.set('prime', providerHold([{ ...released }]));
         i.releaseProviderAccelerationCooldown('prime');
         assert.equal(marked(), true, 'one letting the released start go, as a copy of it, marks it');
+        assert.equal(clears(), 1, 'and the provider hold taking the turn ends its budget hold\'s episode');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('sends a released turn\'s clear when its hold is dropped before the start it released runs', async () => {
+    await withBacklog({ stalled: true }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const i = t.framework as unknown as {
+        releaseBudgetHold(name: string, outcome: string, note: string | null): void;
+        dropBudgetHold(name: string): void;
+      };
+      const clears = () => t.of('ops:alert').filter((e) => e.kind === 'context-hold-clear').length;
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        i.releaseBudgetHold('prime', 'fit', null);
+        assert.equal(holdOf(t)?.state, 'released', 'premise: released, its start not yet run');
+        assert.equal(clears(), 0);
+        i.dropBudgetHold('prime');
+        assert.equal(holdOf(t), undefined);
+        assert.equal(clears(), 1);
       } finally {
         await t.close();
       }
@@ -1025,6 +1054,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
         assert.ok(notice, `the start announces the arrival: ${JSON.stringify(notices)}`);
         assert.ok(notice!.includes('while your turn waited for compression'), `and says what the turn waited on last: ${notice}`);
+        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
+          ['context-hold', 'context-hold-clear', 'context-hold', 'context-hold-clear'], 'the provider hold taking the released turn ended its episode, so the hold after it opened another');
       } finally {
         await t.close();
       }
@@ -2570,18 +2601,22 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('raises context-hold again for a released turn held again, after the first clear, so starts and clears pair one to one', async () => {
-    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 2 }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        assert.equal(t.of('inference:held').length, 2, 'premise: held, then held again');
-        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
-          ['context-hold', 'context-hold-clear', 'context-hold', 'context-hold-clear']);
-      } finally {
-        await t.close();
-      }
+  it('raises one context-hold and one clear for a turn released and held again, the clear once the turn runs, on the trace and to the webhook', async () => {
+    await withWebhook(async (posts) => {
+      await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 2 }, async () => {
+        const t = await residentTurn({ maintenanceIntervalMs: 50 });
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+          assert.equal(t.of('inference:held').length, 2, 'premise: held, then held again');
+          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit', 'fit'], 'the trace marks each hold');
+          assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
+            ['context-hold', 'context-hold-clear']);
+          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold', 'context-hold-clear']);
+        } finally {
+          await t.close();
+        }
+      });
     });
   });
 
@@ -2619,7 +2654,30 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('posts every context-hold and its clear to the ops webhook, so the last it sends for a turn held again is the start', async () => {
+  it('raises one clear for a turn released, held again and then ended with nothing left for compression to do, before its exhaustion\'s context-refusal', async () => {
+    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 2 }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      let held = 0;
+      t.framework.onTrace((event) => {
+        if (event.type === 'inference:held' && ++held === 2) {
+          backlog.fit = false;
+          backlog.alwaysPending = false;
+          backlog.readyAt = 0;
+        }
+      });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit', 'nothing_pending'], 'premise: released, held again, then nothing left to do');
+        assert.deepEqual(t.of('ops:alert').filter((e) => ['context-hold', 'context-hold-clear', 'context-refusal'].includes(String(e.kind))).map((e) => e.kind),
+          ['context-hold', 'context-hold-clear', 'context-refusal']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('posts no clear and no second context-hold to the ops webhook for a turn released and held again, so the last it sends while the turn is held is the start', async () => {
     await withWebhook(async (posts) => {
       await withBacklog({ stalled: true }, async (backlog) => {
         const t = await residentTurn({ maintenanceIntervalMs: 50 });
@@ -2634,9 +2692,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'premise: released, then held again within the cooldown');
           await new Promise((resolve) => setTimeout(resolve, 200));
           assert.equal(holdOf(t)?.state, 'holding', 'premise: the turn is held');
-          assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
-            ['context-hold', 'context-hold-clear', 'context-hold'], 'premise: the trace has both starts');
-          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold', 'context-hold-clear', 'context-hold']);
+          assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind), ['context-hold']);
+          assert.deepEqual(posts.filter((kind) => kind.startsWith('context-hold')), ['context-hold']);
         } finally {
           await t.close();
         }
@@ -2910,7 +2967,11 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     let let2: () => void = () => {};
     const until = new Promise<void>((resolve) => { let2 = resolve; });
     await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, compileGate: { nth: 2, until } }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const clearsWhenAsked: number[] = [];
+      const t: Awaited<ReturnType<typeof residentTurn>> = await residentTurn({
+        maintenanceIntervalMs: 50,
+        policyAsked: () => clearsWhenAsked.push(t.of('ops:alert').filter((e) => e.kind === 'context-hold-clear').length),
+      });
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => backlog.compiles === 2, 5_000), 'released, and its compile has begun');
@@ -2920,6 +2981,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.equal(t.of('inference:held').length, 1, 'not held again');
         assert.match(String(t.of('inference:exhausted')[0]!.error),
           /the turn was first held \d+ s ago; its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do\)$/);
+        assert.deepEqual(t.of('ops:alert').filter((e) => ['context-hold', 'context-hold-clear', 'context-refusal'].includes(String(e.kind))).map((e) => e.kind),
+          ['context-hold', 'context-hold-clear', 'context-refusal']);
+        assert.equal(clearsWhenAsked[0], 1, 'the clear is out when the error policy is first asked about the refusal, not at the exhaustion');
       } finally {
         let2();
         await t.close();
