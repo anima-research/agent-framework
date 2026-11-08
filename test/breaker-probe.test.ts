@@ -141,6 +141,10 @@ async function resident(t: TestContext, membrane: StandIn, strategy?: Passthroug
   const history = () => fw.getAgent('resident')!.getContextManager().getAllMessages()
     .filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
     .flatMap((m) => m.content.map((b) => (b as { text?: string }).text ?? '')).filter((x) => x.startsWith('zz-'));
+  // The rows the agent is sent: on a presented window a shed takes its rows out of the window and the
+  // record keeps them (#291), so what was shed is read here.
+  const window = () => fw.getAgent('resident')!.getContextManager().getPresentedMessages()
+    .flatMap((m) => m.content.map((b) => (b as { text?: string }).text ?? '')).filter((x) => x.startsWith('zz-'));
   const rewindMarkers = () => fw.getAgent('resident')!.getContextManager().getAllMessages()
     .filter((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === 'refusal-rewind').length;
   const alerts = (kind: string) => traces.filter((tr) => tr.type === 'ops:alert' && tr.kind === kind);
@@ -148,7 +152,7 @@ async function resident(t: TestContext, membrane: StandIn, strategy?: Passthroug
   await until(() => count('inference:completed') === 1, 'q1 to be answered');
   say('zz-q2');
   await until(() => count('inference:completed') === 2, 'q2 to be answered');
-  return { fw, traces, count, say, wake, history, rewindMarkers, alerts, until, quiet };
+  return { fw, traces, count, say, wake, history, window, rewindMarkers, alerts, until, quiet };
 }
 
 const failsFromThird = (error: () => Error) => (_request: NormalizedRequest, send: number) => (send >= 3 ? error() : undefined);
@@ -221,7 +225,7 @@ test('a row the provider refuses is still shed, its probe answered a minute late
   answer('answered');
   await r.until(() => r.count('inference:completed') === 3, 'the retry without the row to be answered');
   assert.equal(membrane.probes.length, 1, 'the retry went without another probe');
-  assert.deepEqual(r.history().filter((x) => !x.startsWith('zz-answer-')), ['zz-q1', 'zz-q2']);
+  assert.deepEqual(r.window().filter((x) => !x.startsWith('zz-answer-')), ['zz-q1', 'zz-q2']);
   assert.equal(r.rewindMarkers(), 1);
   assert.ok(!membrane.sends.at(-1)!.includes('zz-poison'), 'the retry went without the row');
 });
@@ -284,6 +288,32 @@ test('a message that arrives while the probe is out sets its answer aside: an an
   await r.until(() => r.count('inference:completed') === 3, "q4's turn to be answered once the probe is back");
   await r.quiet(60_000);
   assert.deepEqual(r.history().filter((x) => !x.startsWith('zz-answer-')), ['zz-q1', 'zz-q2', 'zz-q3', 'zz-q4']);
+  assert.equal(r.rewindMarkers(), 0);
+});
+
+test("an undo of the agent's turns while the probe is out sets the answer aside too: an answered probe then sheds nothing", async (t) => {
+  let answer!: (value: 'answered') => void;
+  const held = new Promise<'answered'>((resolve) => { answer = resolve; });
+  const poisoned = (request: NormalizedRequest) => (texts(request).includes('zz-poison')
+    ? providerError('invalid_request', 400, 'tool_use ids must have a corresponding tool_result') : undefined);
+  const membrane = new StandIn(poisoned, () => held);
+  const r = await resident(t, membrane);
+  r.say('zz-poison');
+  await r.until(() => r.count('inference:exhausted') === 1, 'the poisoned turn to fail');
+  r.wake();
+  await r.until(() => r.count('inference:exhausted') === 2, 'the first wake to fail');
+  r.wake();
+  await r.until(() => membrane.probes.length === 1, 'the probe to go out');
+  // An undo takes rows out of the window, which the store's message listeners don't hear.
+  for (let i = 0; i < 4 && r.window().includes('zz-poison'); i++) {
+    if (!r.fw.undoLastTurn('resident').undone) break;
+  }
+  assert.deepEqual(r.window(), ['zz-q1', 'zz-answer-1', 'zz-q2'], 'the undos left the window at q2');
+  const seen = stderr.length;
+  answer('answered');
+  await r.until(() => stderr.slice(seen).some((line) => line.includes("its probe's answer is set aside")), 'the answer to be set aside');
+  await r.quiet(60_000);
+  assert.deepEqual(r.window(), ['zz-q1', 'zz-answer-1', 'zz-q2'], 'nothing was shed from the window');
   assert.equal(r.rewindMarkers(), 0);
 });
 
