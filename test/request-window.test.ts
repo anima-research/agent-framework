@@ -4,12 +4,18 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
-import { defaultTokenEstimator } from '@animalabs/context-manager';
+import { defaultTokenEstimator, jsonTokenEstimator } from '@animalabs/context-manager';
 import type { EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { CONTINUE_ROW, SILENT_HEARTBEAT_SEPARATOR } from '../src/silent-heartbeat.js';
+import { isDeepStrictEqual } from 'node:util';
 
 const WINDOW = 8_000;
+/** A tool result of about 1,000 tokens at context-manager's rate for tool text. */
+const RESULT_DATA = `{"rows":[${'{"id":"r","value":"a row of output"},'.repeat(50)}{}]}`;
+/** The trailing turn a stream start may end on, which context-manager is given to price. */
+const CONTINUE: ContentBlock[] = [{ type: 'text', text: CONTINUE_ROW }];
 const REPLY = 1_000;
 const SYSTEM = `You are prime. ${'Keep to the facts. '.repeat(30)}`;
 
@@ -34,21 +40,38 @@ class ToolsModule implements Module {
   }
 }
 
-const textOf = (block: ContentBlock) => (block.type === 'text' ? (block as { text: string }).text : JSON.stringify(block));
+/** A block as context-manager's estimator prices it: a tool result's text at the dense rate, anything else by its text or JSON. */
+const blockTokens = (block: ContentBlock) => {
+  if (block.type === 'text') return defaultTokenEstimator((block as { text: string }).text);
+  const content = (block as { content?: unknown }).content;
+  if (block.type === 'tool_result' && typeof content === 'string') return jsonTokenEstimator(content);
+  if (block.type === 'tool_use') return jsonTokenEstimator(JSON.stringify((block as { input?: unknown }).input)) + 20;
+  return defaultTokenEstimator(JSON.stringify(block));
+};
 
 /** The request as context-manager's estimator prices it: system, messages, tools and the reply's max_tokens. */
 function requestTokens(request: NormalizedRequest): number {
   const system = typeof request.system === 'string' ? defaultTokenEstimator(request.system) : 0;
-  const messages = request.messages.reduce((n, m) => n + m.content.reduce((k, b) => k + defaultTokenEstimator(textOf(b)), 0), 0);
+  const messages = request.messages.reduce((n, m) => n + m.content.reduce((k, b) => k + blockTokens(b), 0), 0);
   const tools = request.tools && request.tools.length > 0 ? defaultTokenEstimator(JSON.stringify(request.tools)) : 0;
   return system + messages + tools + (request.config?.maxTokens ?? 0);
 }
 
 type Compiled = { budget: unknown; opts: Record<string, unknown> | undefined };
 
-async function open(physicalWindowTokens: number | undefined, config: { maxTokens?: number; contextBudgetTokens?: number | null } = {}) {
+type Config = {
+  maxTokens?: number;
+  contextBudgetTokens?: number | null;
+  toolResultGuard?: boolean;
+  prefillUserMessage?: string;
+  /** The first reply calls a tool, for the direct API's tool round. */
+  callsTool?: boolean;
+};
+
+async function open(physicalWindowTokens: number | undefined, config: Config = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'request-window-'));
   const membrane = new MockMembrane();
+  if (config.callsTool) membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'tu1', name: 'act_0', input: { channel: 'mill' } } as never], 'tool_use'));
   for (let i = 0; i < 4; i++) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Noted.' }]));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'),
@@ -61,6 +84,8 @@ async function open(physicalWindowTokens: number | undefined, config: { maxToken
       maxTokens: config.maxTokens ?? REPLY,
       ...(config.contextBudgetTokens === null ? {} : { contextBudgetTokens: config.contextBudgetTokens ?? 100_000 }),
       ...(physicalWindowTokens !== undefined ? { physicalWindowTokens } : {}),
+      ...(config.toolResultGuard ? { toolResultGuard: true } : {}),
+      ...(config.prefillUserMessage !== undefined ? { prefillUserMessage: config.prefillUserMessage } : {}),
     }],
     modules: [new ToolsModule()],
     syncIntervalMs: 0,
@@ -116,12 +141,12 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
     }
   });
 
-  it('a stream\'s compile is given the request\'s overhead as sent and the window', async () => {
+  it('a stream\'s compile is given the request\'s system prompt and tools as sent, the trailing turn it may end on, and the window', async () => {
     const t = await open(WINDOW);
     try {
       const request = await turn(t.framework, t.membrane);
       const sent = t.compiled.find((c) => c.opts?.dryRun !== true)!;
-      assert.deepStrictEqual(sent.opts?.requestOverhead, { system: request.system, tools: request.tools });
+      assert.deepStrictEqual(sent.opts?.requestOverhead, { system: request.system, tools: request.tools, messages: [CONTINUE] });
       assert.equal(sent.opts?.requestLimitTokens, WINDOW);
     } finally {
       await t.close();
@@ -148,7 +173,7 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
       const preview = await t.framework.previewActivation('prime');
       const dry = t.compiled.find((c) => c.opts?.dryRun === true)!;
       assert.ok(dry, 'premise: the preview compiled dry');
-      assert.deepStrictEqual(dry.opts?.requestOverhead, { system: (preview as NormalizedRequest).system, tools: (preview as NormalizedRequest).tools });
+      assert.deepStrictEqual(dry.opts?.requestOverhead, { system: (preview as NormalizedRequest).system, tools: (preview as NormalizedRequest).tools, messages: [CONTINUE] });
       assert.equal(dry.opts?.requestLimitTokens, WINDOW);
     } finally {
       await t.close();
@@ -162,6 +187,71 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
       const sent = t.compiled.find((c) => c.opts?.dryRun !== true)!;
       assert.deepStrictEqual(sent.opts?.requestOverhead, { system: request.system, tools: request.tools });
       assert.ok(!('requestLimitTokens' in (sent.opts ?? {})), 'no limit');
+    } finally {
+      await t.close();
+    }
+  });
+
+  for (const guard of [false, true]) {
+    it(`the direct API prices a pending tool result beside the window, as the request sends it, and keeps the request within the window (guard ${guard ? 'on' : 'off'})`, async () => {
+      const t = await open(WINDOW, { callsTool: true, toolResultGuard: guard });
+      try {
+        const tools = t.framework.getAllTools();
+        const first = await t.agent.runInference(tools);
+        assert.equal(first.toolCalls.length, 1, 'premise: one tool call');
+        t.agent.provideToolResult('tu1' as never, { success: true, data: RESULT_DATA } as never);
+        await t.agent.runInference(tools);
+        const request = t.membrane.calls[t.membrane.calls.length - 1]!;
+        const result = request.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === 'tu1');
+        assert.ok(result && blockTokens(result) > 800, `premise: the request carries the result, ${result ? blockTokens(result) : 0} tokens`);
+        assert.ok(requestTokens(request) <= WINDOW, `the request after the result is ${requestTokens(request)} tokens, the window ${WINDOW}`);
+        const sent = t.compiled[t.compiled.length - 1]!;
+        const beside = (sent.opts?.requestOverhead as { messages?: ContentBlock[][] } | undefined)?.messages ?? [];
+        assert.ok(beside.some((m) => m.some((b) => isDeepStrictEqual(b, result))), 'the compile was given the result as the request sends it');
+        assert.equal((sent.budget as { reserveForResponse: number }).reserveForResponse, REPLY, 'only the reply is reserved');
+      } finally {
+        await t.close();
+      }
+    });
+  }
+
+  it('without a window, the guard\'s pending results keep their reserve and nothing is priced beside the window', async () => {
+    const t = await open(undefined, { callsTool: true, toolResultGuard: true });
+    try {
+      const tools = t.framework.getAllTools();
+      await t.agent.runInference(tools);
+      t.agent.provideToolResult('tu1' as never, { success: true, data: RESULT_DATA } as never);
+      await t.agent.runInference(tools);
+      const sent = t.compiled[t.compiled.length - 1]!;
+      const request = t.membrane.calls[t.membrane.calls.length - 1]!;
+      assert.deepStrictEqual(sent.opts?.requestOverhead, { system: request.system, tools: request.tools });
+      assert.ok((sent.budget as { reserveForResponse: number }).reserveForResponse > REPLY, 'the guard\'s reserve is added to the reply\'s');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a prefill message the request may send is priced beside the window', async () => {
+    const prefill = 'The conversation so far, as the house keeps it.';
+    const t = await open(WINDOW, { prefillUserMessage: prefill });
+    try {
+      await turn(t.framework, t.membrane);
+      const sent = t.compiled.find((c) => c.opts?.dryRun !== true)!;
+      const beside = (sent.opts?.requestOverhead as { messages?: ContentBlock[][] }).messages ?? [];
+      assert.ok(beside.some((m) => isDeepStrictEqual(m, [{ type: 'text', text: prefill }])), JSON.stringify(beside));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a silent tick\'s start prices its separator, not [Continue], as the trailing turn', async () => {
+    const t = await open(WINDOW);
+    try {
+      const tools = t.framework.getAllTools();
+      await t.agent.buildActivationRequest(tools, undefined, undefined, tools, { dryRun: true, silentHeartbeat: { eventId: 'tick-1', serverId: 'clock' } });
+      const dry = t.compiled[t.compiled.length - 1]!;
+      const beside = (dry.opts?.requestOverhead as { messages?: ContentBlock[][] }).messages ?? [];
+      assert.deepStrictEqual(beside, [[{ type: 'text', text: SILENT_HEARTBEAT_SEPARATOR }]]);
     } finally {
       await t.close();
     }
