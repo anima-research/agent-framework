@@ -478,13 +478,13 @@ describe('server text in an agent\'s context, end to end', () => {
     const notice = (framework as unknown as {
       draftsHeldNotice(agent: string, held: unknown[], reason: string, because: undefined, target: ChannelRef, own: ChannelRef[]): string;
     });
-    const spacedHeld = notice.draftsHeldNotice('scout', [{ id: 'd-1', attempts: [] }], 'bounced', undefined, spaced, []);
+    const spacedHeld = notice.draftsHeldNotice('scout', [{ id: 'd-1', text: 'words', attempts: [] }], 'bounced', undefined, spaced, []);
     assert.match(spacedHeld, /destination: "#<channel>"\)/, 'no name the resend reads reaches it, so the generic example');
     registry().ensureChannelRegistered('discord', 'discord:g1:placeholder', '<channel>');
     for (const example of ['#<channel>', ' @<person> ']) {
       assert.match((registry().resolveProseTarget(example) as { error?: string }).error ?? '', /placeholder/, `${example} reaches no channel, even one labelled so`);
     }
-    const plainHeld = notice.draftsHeldNotice('scout', [{ id: 'd-1', attempts: [] }], 'bounced', undefined, plain, []);
+    const plainHeld = notice.draftsHeldNotice('scout', [{ id: 'd-1', text: 'words', attempts: [] }], 'bounced', undefined, plain, []);
     const destination = JSON.parse(/destination: ("(?:[^"\\]|\\.)*")/.exec(plainHeld)?.[1] ?? 'null');
     assert.equal((registry().resolveProseTarget(destination) as { channelId?: string }).channelId, plain.channelId, plainHeld);
   });

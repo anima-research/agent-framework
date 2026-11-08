@@ -607,7 +607,7 @@ describe('held prose drafts, end to end', () => {
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
-      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
+      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids[0]} (25 chars), ${ids[1]} (39 chars) and ${ids[2]} (22 chars), in the order you wrote them (not sent — drafts can resend them unchanged, or dismiss them)`);
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
@@ -681,7 +681,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
       assert.equal(
         h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held[0]!.id} (25 chars), ${held[1]!.id} (13 chars) and ${held[2]!.id} (22 chars), in the order you wrote them (not sent — drafts can resend them unchanged, or dismiss them)`,
       );
     } finally {
       await h.close();
@@ -766,7 +766,7 @@ describe('held prose drafts, end to end', () => {
       const held = h.drafts();
       assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (16 chars) (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
@@ -945,6 +945,47 @@ describe('held prose drafts, end to end', () => {
       const held = h.texts('scout').find((t) => t.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${mine.id}`));
       assert.ok(held);
       assert.ok(!held!.includes('scout words'), `the held-draft notice quotes none of the draft's words: ${held}`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the held-draft notice names a draft by its length, and quotes none of its words', async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([createMockResponse([text('a held segment'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
+      const [held] = h.drafts();
+      assert.equal(held?.text, 'a held segment', 'premise: the segment is held');
+      const notice = h.texts().find((t) => t.startsWith('[drafts] scout: '));
+      assert.ok(notice?.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${held!.id} (14 chars) — because`), notice);
+      assert.ok(!notice!.includes('held segment'), `no words of the draft: ${notice}`);
+
+      await h.turn([createMockResponse([text('x'), unplacedSend('s2')], 'tool_use'), createMockResponse([])]);
+      const lone = h.drafts().find((d) => d.text === 'x');
+      assert.ok(lone, 'premise: the one-character segment is held');
+      assert.ok(
+        h.texts().some((t) => t.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${lone!.id} (1 chars) — because`)),
+        h.texts().join(' | '),
+      );
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the held-draft notice counts a draft as drafts read does, a character outside the BMP included', async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([createMockResponse([text('hi \u{1F642}'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
+      const [held] = h.drafts();
+      assert.equal(held?.text, 'hi \u{1F642}', 'premise: the segment is held');
+      await h.turn([createMockResponse([drafts('r1', { action: 'read', draftIds: [held!.id] })], 'tool_use'), createMockResponse([])]);
+      const read = h.toolResults().at(-1)!;
+      const readCount = /Text \((\d+) chars, exactly as a resend publishes it\)/.exec(read)?.[1];
+      assert.ok(readCount, `premise: drafts read gives a count: ${read}`);
+      const notice = h.texts().find((t) => t.startsWith('[drafts] scout: '))!;
+      assert.equal(new RegExp(`${held!.id} \\((\\d+) chars\\)`).exec(notice)?.[1], readCount, `${notice} | ${read}`);
     } finally {
       await h.close();
     }
@@ -1245,8 +1286,8 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
       assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice in your context names: /);
-      assert.match(notice, /d-[a-z2-9]{7} \(held \(not sent\); explicit send in its turn\)/);
-      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in its turn\\)`));
+      assert.match(notice, /d-[a-z2-9]{7} \(14 chars; held \(not sent\); explicit send in its turn\)/);
+      assert.match(notice, new RegExp(`${midSend.id} \\(15 chars; UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in its turn\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
       assert.ok(!notice.includes('orphaned words') && !notice.includes('half-sent words'), `the notice quotes no draft's words: ${notice}`);
       await h.turn([createMockResponse([])]);
@@ -1265,7 +1306,7 @@ describe('held prose drafts, end to end', () => {
       assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice in your context names: /);
       // Newest first: the eight newest with their state, then the two oldest
       // by id alone. No draft's words appear.
-      const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(held \(not sent\); explicit send in its turn\)/g)].map((m) => m[1]);
+      const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(8 chars; held \(not sent\); explicit send in its turn\)/g)].map((m) => m[1]);
       assert.deepEqual(named, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => held[i]!.id));
       assert.ok(notice.includes(` · and 2 more: ${held[1]!.id}, ${held[0]!.id}.`), notice);
       assert.ok(!/orphan \d/.test(notice), `the notice quotes no draft's words: ${notice}`);
@@ -1295,7 +1336,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice in your context names: ${draft!.id} \\(held \\(not sent\\); explicit send in its turn\\)`));
+      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice in your context names: ${draft!.id} \\(22 chars; held \\(not sent\\); explicit send in its turn\\)`));
       assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');
@@ -2126,7 +2167,7 @@ describe('draft notices and turn-end settlement', () => {
       const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
         .filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
         .find((text) => text.startsWith('[delivered]'))!;
-      const held = receipt.match(/held as drafts? ([^(]+)\(not sent/)?.[1] ?? '';
+      const held = receipt.match(/held as drafts? (.+?) \(not sent/)?.[1] ?? '';
       assert.ok(held.includes(newer.id), `the draft still held is reported as held: ${receipt}`);
       assert.ok(!held.includes(old.id), `the let-go draft is not offered as held: ${receipt}`);
       assert.ok(receipt.includes(`draft ${old.id} held this turn and since let go by retention (no longer held, so not resendable)`), receipt);
@@ -2929,7 +2970,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       await h.turn(rounds([text(`>>>${ROOM} {{unsent}}`), explicitSend('s2')]));
       assert.equal(h.drafts().length, count, 'a bare {{unsent}} mints no copy');
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (not sent — drafts can resend them unchanged, or dismiss them)`);
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (10 chars) (not sent — drafts can resend them unchanged, or dismiss them)`);
 
       // Once the bounce may have been posted, held words copied from it carry its risk.
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -2978,7 +3019,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'resend me']);
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
         `[delivered] plain speech → #room (Guild One) (${ROOM}) (draft ${ids[0]}, by your resend) · ` +
-        `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged, or dismiss them) · ` +
+        `1 plain-speech segment(s) held as draft ${ids[2]} (7 chars) (not sent — drafts can resend them unchanged, or dismiss them) · ` +
         `draft ${ids[1]} dismissed by you`);
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -3053,7 +3094,10 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const notice = h.messages().find((m) => (m.metadata as { kind?: string; draftIds?: string[] } | undefined)?.kind === 'prose-drafts'
         && (m.metadata as { draftIds?: string[] }).draftIds?.includes(copy.id))!;
       const words = notice.content.map((b) => (b as { text?: string }).text ?? '').join('');
-      assert.ok(words.startsWith(`[drafts] scout: 2 plain-speech segments held as drafts ${free.id}, ${copy.id} — `), `no "not sent" over words that may be out: ${words}`);
+      assert.ok(
+        words.startsWith(`[drafts] scout: 2 plain-speech segments held as drafts ${free.id} (11 chars) and ${copy.id} (28 chars), in the order you wrote them — `),
+        `no "not sent" over words that may be out, and each draft by its length in writing order: ${words}`,
+      );
       assert.ok(words.includes(`drafts(action: "resend", draftIds: ["${free.id}"], destination: "#room") delivers it unchanged`), words);
       assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
       assert.ok(words.includes(`so resending ${copy.id} could post it twice (to send it anyway: drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#room", confirmDuplicate: true))`), words);

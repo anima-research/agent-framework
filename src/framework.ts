@@ -22890,7 +22890,6 @@ export class AgentFramework {
   private draftsHeldNotice(
     agentName: string, held: Draft[], reason: DraftReason, because?: string, target?: ChannelRef, own: readonly ChannelRef[] = [],
   ): string {
-    const ids = held.map((d) => d.id);
     const many = held.length > 1;
     const quoted = (ds: Draft[]): string => ds.map((d) => `"${d.id}"`).join(', ');
     const registry = this.channelRegistry;
@@ -22920,9 +22919,19 @@ export class AgentFramework {
     return (
       `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
       `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
-      `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${because ? `because ${because}` : AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
+      `held as draft${many ? 's' : ''} ${AgentFramework.draftsNamed(held)} — ${because ? `because ${because}` : AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
       `${resend.join('; ')}; drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
     );
+  }
+
+  private static draftLength(d: Draft): string {
+    return `${d.text.length} chars`;
+  }
+
+  private static draftsNamed(ds: readonly Draft[]): string {
+    const named = ds.map((d) => `${d.id} (${AgentFramework.draftLength(d)})`);
+    if (named.length < 2) return named.join('');
+    return `${named.slice(0, -1).join(', ')} and ${named.at(-1)}, in the order you wrote them`;
   }
 
   /** Compact local time for draft listings. */
@@ -23037,7 +23046,7 @@ export class AgentFramework {
     const pending = unnoticed.filter((d) => !named.has(d.id));
     if (pending.length === 0) return;
     const shown = pending.slice(0, 8).map((d) =>
-      `${d.id} (${this.draftStateText(d)}; ${AgentFramework.DRAFT_REASON_SHORT[d.reason]})`);
+      `${d.id} (${AgentFramework.draftLength(d)}; ${this.draftStateText(d)}; ${AgentFramework.DRAFT_REASON_SHORT[d.reason]})`);
     const rest = pending.slice(shown.length).map((d) => d.id);
     const more = rest.length > 0 ? ` · and ${rest.length} more: ${rest.join(', ')}` : '';
     const text =
@@ -23670,7 +23679,7 @@ export class AgentFramework {
     const held = inState('held');
     if (held.length > 0) {
       notes.push(
-        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
+        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${AgentFramework.draftsNamed(held)} ` +
         '(not sent — drafts can resend them unchanged, or dismiss them)',
       );
     }
