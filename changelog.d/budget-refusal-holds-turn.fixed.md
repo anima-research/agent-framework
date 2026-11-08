@@ -14,7 +14,8 @@
     as they arrive, and the released start answers them all. For a turn
     already under way (a budget restart's continuation, or a retry), they
     stay out of its request and run as a turn of their own after it.
-  - **When it runs:** the waiting requests are queued again once something
+  - **When it runs:** while no surgery holds the store and the host isn't
+    quiesced, the waiting requests are queued again once something
     the refused compile depends on has changed: compression has made
     progress (a summary written since the wait began, or, for a strategy
     with no progress snapshot, a call that landed), compression has nothing
@@ -45,11 +46,14 @@
     context didn't fit its budget (100,201 tokens against 48,568) when a
     turn came to start. That turn waited 7 min." in the agent's window, as
     the agent's own stored context injection, counting from the first wait's
-    start to the release. The released start and every later request read
-    it where it was stored, so the next request starts with the same
-    messages and a reply keeps its thinking. A failed write is logged, and
-    the turn runs without the note. An undo of the released turn leaves the
-    note, stored before that turn began.
+    start to the release. The released start reads it where it was stored,
+    so the next request starts with the same messages and a reply keeps its
+    thinking, and later requests read it as history, which the strategy
+    folds like any row. A failed write is logged, and the turn runs without
+    the note. An undo of the released turn leaves the note, unless the turn
+    was a budget restart's continuation or a tool-result guard's retry,
+    which present it after the turn's checkpoint, so the undo takes it with
+    the reply.
   - **A surgery or an undo:** a waiting turn whose trigger's row a rollback,
     suppression or branch switch removed, or an undo took out of the
     agent's window, is dropped, as is a released one whose row did so

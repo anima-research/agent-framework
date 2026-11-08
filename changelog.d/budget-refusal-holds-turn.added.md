@@ -8,12 +8,14 @@
   context injections no request carried, which leave the agent's window as
   a turn starts waiting.
 - **Hosts and operators:** a waiting turn raises a `context-refusal` ops
-  alert as it starts waiting, saying it waits for compression, once however
-  often it waits again, unless a listener of `inference:held` has ended the
-  wait first, and `context-refusal-clear` if it is stopped or removed while
-  it waits, so the waiting start doesn't run, worded for which. It's the framework's first
-  `-clear` kind. Both carry the wait's start as their webhook cooldown key,
-  so each wait's pair reaches the webhook within the 15-minute cooldown,
-  and neither writes failures.log. A refusal after the release goes to the
-  error policy, and if the turn then exhausts, it raises its own
-  `context-refusal`, as an exhausted turn's did before.
+  alert, saying it waits for compression, once however often it waits
+  again: as it starts waiting, or, where a listener of `inference:held`
+  ended that hold first, as it next waits. It raises
+  `context-refusal-clear` if it is stopped or removed while it waits, so
+  the waiting start doesn't run, worded for which. It's the framework's
+  first `-clear` kind. Both carry the wait's start as their webhook
+  cooldown key, so each wait's pair reaches the webhook within the
+  15-minute cooldown, and neither writes failures.log. A refusal after the
+  release waits again while compression is pending; with nothing pending
+  it goes to the error policy, and if the turn then exhausts, it raises its
+  own `context-refusal`, as an exhausted turn's did before.

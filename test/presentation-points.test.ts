@@ -696,17 +696,17 @@ describe('presentation points (#291)', () => {
     }
   });
 
-  it('the fallback reaper leaves a closing fork while a budget hold of its agent exists, a released one included', async () => {
+  it('the fallback reaper leaves a closing fork while a budget hold of its agent exists', async () => {
     const h = await boot({ forks: true });
     await h.fork('fork-room');
     const real = h.internals.conversationRouter;
     h.internals.conversationRouter = { expired: () => [], unbind: () => {}, getBinding: () => undefined, closurePrompt: 'the conversation is closing' };
     h.internals.closingConversationAgents.add('fork-room');
-    h.internals.budgetHolds.set('fork-room', { state: 'released', startedAt: Date.now(), turn: undefined, standsOn: [], wakes: [] });
+    h.internals.budgetHolds.set('fork-room', { startedAt: Date.now(), waitSince: Date.now(), turn: { agentName: 'fork-room', reason: 'conversation:closure', source: 'test', timestamp: Date.now() }, standsOn: [], wakes: [] });
     try {
       h.internals.lastConversationSweep = 0;
       h.internals.sweepExpiredConversations();
-      assert.ok(h.framework.getAgent('fork-room'), 'kept while its released hold exists');
+      assert.ok(h.framework.getAgent('fork-room'), 'kept while its hold exists');
       h.internals.budgetHolds.delete('fork-room');
       h.internals.lastConversationSweep = 0;
       h.internals.sweepExpiredConversations();

@@ -1300,6 +1300,7 @@ const BUDGET_WAIT: unique symbol = Symbol('budget-wait');
 interface BudgetWait {
   since: number;
   row?: string;
+  alerted?: true;
 }
 interface TurnCarry {
   silence: TurnSilence | null;
@@ -7405,17 +7406,29 @@ export class AgentFramework {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return false;
     if (!this.budgetHolds || !this.running || this.providerAdmissionClosed) return false;
-    if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent) return false;
+    if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent || this.budgetHolds.has(agent.name)) return false;
     if (!this.compressionPending(agent)) return false;
-    if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
+    if (checkpoint !== undefined) {
+      try {
+        this.dropTurnCheckpoint(agent.name, checkpoint);
+      } catch (error) {
+        console.error(`[budget-hold] agent=${agent.name}: its refused start's checkpoint could not be dropped, so the refusal takes the error policy's path:`, error);
+        return false;
+      }
+    }
     this.retractUnsentInjections(agent);
+    if (!this.running || this.providerAdmissionClosed || this.agents.get(agent.name) !== agent) return false;
     const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
     const standsOn = !continuesTurn(turn) && carried
       ? (carried.row !== undefined ? [carried.row] : [])
       : this.rowsTurnStandsOn(agent, turn, routing);
-    const wait: BudgetWait = { since: carried?.since ?? startedAt, ...(!continuesTurn(turn) && standsOn[0] !== undefined ? { row: standsOn[0] } : {}) };
+    const wait: BudgetWait = {
+      since: carried?.since ?? startedAt,
+      ...(!continuesTurn(turn) && standsOn[0] !== undefined ? { row: standsOn[0] } : {}),
+      ...(carried?.alerted ? { alerted: true } : {}),
+    };
     (turn as MarkedRequest)[BUDGET_WAIT] = wait;
     const figures = error as Error & { budget?: unknown; actual?: unknown };
     const hold: BudgetHold = {
@@ -7448,16 +7461,19 @@ export class AgentFramework {
     });
     if (this.budgetHolds.get(agent.name) !== hold) return true;
     hold.alerted = true;
-    if (!carried) this.opsAlert('context-refusal', agent.name, this.budgetHoldOpenText(hold), {
-      skipLog: true,
-      key: String(hold.waitSince),
-      data: {
-        errorType,
-        since: hold.waitSince,
-        ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
-        ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
-      },
-    });
+    if (!wait.alerted) {
+      wait.alerted = true;
+      this.opsAlert('context-refusal', agent.name, this.budgetHoldOpenText(hold), {
+        skipLog: true,
+        key: String(hold.waitSince),
+        data: {
+          errorType,
+          since: hold.waitSince,
+          ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
+          ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
+        },
+      });
+    }
     if (this.budgetHolds.get(agent.name) !== hold) return true;
     const readiness = this.contextReadiness(agent.getContextManager());
     const compression = 'pending' in readiness && readiness.pending ? ` Compression: ${boundFailureText(readiness.pending)}` : '';
@@ -7548,9 +7564,11 @@ export class AgentFramework {
 
   private compressionProgressOf(agent: Agent): string | undefined {
     const progress = this.contextProgress(agent.getContextManager());
-    if (!progress || (progress.chunksCompressed === undefined && progress.summaryCounts === undefined)) return undefined;
+    if (!progress) return undefined;
     try {
-      return JSON.stringify([progress.chunksCompressed, progress.summaryCounts]);
+      const { chunksCompressed, summaryCounts } = progress;
+      if (chunksCompressed === undefined && summaryCounts === undefined) return undefined;
+      return JSON.stringify([chunksCompressed, summaryCounts]);
     } catch (error) {
       console.error(`[budget-hold] agent=${agent.name}: could not read its compression progress, so it reads as none:`, error);
       return undefined;
@@ -7567,18 +7585,22 @@ export class AgentFramework {
 
   private releaseBudgetHold(agentName: string): void {
     const hold = this.budgetHolds?.get(agentName);
-    if (!hold || this.quiesced) return;
+    const agent = this.agents.get(agentName);
+    if (!hold || !agent || this.quiesced || this.surgeryHold) return;
     const requests = [hold.turn, ...hold.wakes];
     hold.wakes = [];
+    this.budgetHolds!.delete(agentName);
+    clearInterval(hold.recheck);
+    hold.recheck = undefined;
     this.pendingRequests.push(...requests);
     console.error(`[budget-hold] agent=${agentName} released after ${Date.now() - hold.startedAt}ms: ` +
       `${requests.length} request(s) queued, and the start's own compile is the check`);
+    const note = this.storeBudgetHoldNote(agent, hold);
+    if (note !== undefined) this.emitTrace({ type: 'message:added', messageId: note, source: `context-injection:${BUDGET_HOLD_NOTE_NAMESPACE}` });
     this.finishBudgetHold(agentName, hold, 'released');
-    const agent = this.agents.get(agentName);
-    if (agent) this.storeBudgetHoldNote(agent, hold);
   }
 
-  private storeBudgetHoldNote(agent: Agent, hold: BudgetHold): void {
+  private storeBudgetHoldNote(agent: Agent, hold: BudgetHold): MessageId | undefined {
     const size = hold.budget !== undefined && hold.actual !== undefined
       ? ` (${hold.actual.toLocaleString('en-US')} tokens against ${hold.budget.toLocaleString('en-US')})`
       : '';
@@ -7588,12 +7610,12 @@ export class AgentFramework {
     const mark: StoredInjectionMark = { agent: agent.name, namespace: row.namespace, contentHash: unitHash([row]), part: 0, parts: 1 };
     try {
       agent.markUnsentPoint();
-      const id = storeOwnRow(agent, row.participant, row.content, {
+      return storeOwnRow(agent, row.participant, row.content, {
         system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: mark,
       } as MessageMetadata, undefined, !this.logicalTurnAlive(agent));
-      this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.namespace}` });
     } catch (error) {
       console.error(`[budget-hold] agent=${agent.name}: the note for its released turn could not be stored:`, error);
+      return undefined;
     }
   }
 
@@ -7608,8 +7630,8 @@ export class AgentFramework {
     const waitedFor = Date.now() - hold.waitSince;
     const after = describeWait(waitedFor);
     const words = outcome === 'removed'
-      ? `what the waiting turn was for was removed or taken out of its window after ${after}, so it doesn't run`
-      : `the waiting turn was stopped after ${after}, so it doesn't run`;
+      ? `what the waiting turn was for was removed or taken out of its window after ${after}, so its waiting start doesn't run`
+      : `the waiting turn was stopped after ${after}, so its waiting start doesn't run`;
     this.opsAlert('context-refusal-clear', agentName, words, {
       skipLog: true,
       key: String(hold.waitSince),
@@ -7706,7 +7728,7 @@ export class AgentFramework {
     return true;
   }
 
-  private checkBudgetHoldsAfterWindowChange(only?: string): void {
+  private checkBudgetHoldsAfterWindowChange(only?: string, release = true): void {
     for (const [agentName, hold] of [...(this.budgetHolds?.entries() ?? [])]) {
       const agent = this.agents.get(agentName);
       if (!agent || (only !== undefined && agentName !== only)) continue;
@@ -7717,7 +7739,7 @@ export class AgentFramework {
       hold.wakes = wakes;
       if (hold.standsOn.some((row) => this.rowLeftWindow(agent, row))) {
         this.dropHeldTurn(agentName, hold, 'a surgery or an undo removed what its held turn stood on');
-      } else {
+      } else if (release) {
         this.releaseBudgetHold(agentName);
       }
     }
@@ -16272,7 +16294,7 @@ export class AgentFramework {
       // Cut short with rows out: the entry stays for a redo, the checkpoint
       // for another undo, which takes out what is still in the window past it.
       entry.window.lengthAfterUndo = cm.indexLength();
-      this.checkBudgetHoldsAfterWindowChange(agentName);
+      this.checkBudgetHoldsAfterWindowChange(agentName, false);
       const reason = error instanceof Error ? error.message : String(error);
       this.emitTrace({ type: 'window:undone', agentName, retracted: left });
       record({ retracted: left, represented: 0 }, reason);
@@ -22042,11 +22064,6 @@ export class AgentFramework {
     for (const r of this.parkedContinuations ?? []) unrecord(r);
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
     const withdrawn = (r: InferenceRequest): boolean => r.coalescingSubject === subject || emptied.has(r);
-    const waiting = [
-      ...this.pendingRequests,
-      ...[...this.providerAccelerationCooldowns.values()].flatMap((c) => c.heldRequests),
-      ...[...(this.passRequests ?? [])].flatMap((pass) => [...pass.values()].flat()),
-    ];
     this.pendingRequests = this.pendingRequests.filter((r) => !withdrawn(r));
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
       const held = cooldown.heldRequests.length;
