@@ -152,7 +152,6 @@ import {
   isContentArray,
   resultClaimsOrThrow,
   scriptViewClaims,
-  scriptViewReferences,
   shownToScript,
   shownToScriptFromServer,
   toolResultDataToHistoryString,
@@ -209,19 +208,6 @@ function neverClaims(content: unknown[]): ResultClaims | undefined {
   } catch {
     return undefined;
   }
-}
-
-function neverReferences(content: unknown[]): ReferenceTestimony[] {
-  let found: ReferenceTestimony[];
-  try {
-    found = scriptViewReferences(content, true);
-  } catch {
-    found = content.flatMap((block) => {
-      const c = classifyBlock(block);
-      return c.kind === 'reference' ? [c.testimony] : [];
-    });
-  }
-  return found.filter((t) => t.disposition === 'never');
 }
 
 /** An MCPL tool call refused because its server isn't in the registry: one
@@ -8044,9 +8030,6 @@ export class AgentFramework {
     const read = claims ?? neverClaims(content);
     const nevers = read ?? contentClaims(content);
     referenceRegistry.markNevers(nevers, serverId);
-    if (read !== undefined) {
-      for (const t of neverReferences(content)) referenceRegistry.register(t, serverId, nevers);
-    }
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
@@ -27595,9 +27578,7 @@ export class AgentFramework {
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
         if (server && server.capabilities !== null && Array.isArray(result.content)) {
-          const nevers = neverClaims(result.content) ?? contentClaims(result.content);
-          referenceRegistry.markNevers(nevers, serverId);
-          for (const t of neverReferences(result.content)) referenceRegistry.register(t, serverId, nevers);
+          referenceRegistry.markNevers(neverClaims(result.content) ?? contentClaims(result.content), serverId);
         }
         const { data: blocks, ...failure } = direct;
         let shown: ToolResult = failure;
@@ -27613,10 +27594,10 @@ export class AgentFramework {
       // and an eager fetch would spend the server's fetch budget, which the
       // agent's own fetch_reference needs, on bytes nobody asked for. A
       // failure keeps only its text, so no stub is made of its references,
-      // and only its `never` references are registered, marked. Only an MCPL
-      // peer's blocks are references; a modern server's and an MCP-only
-      // peer's are standard. An MCPL peer's content is marked as content
-      // (dataIsContent), as on the model's path.
+      // and only the uris its `never`s name are marked, a record made for
+      // each that has none. Only an MCPL peer's blocks are references; a
+      // modern server's and an MCP-only peer's are standard. An MCPL peer's
+      // content is marked as content (dataIsContent), as on the model's path.
       if (server && server.capabilities !== null) {
         await this.autoFetchReferences(result.content, serverId, 'register')
           .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));

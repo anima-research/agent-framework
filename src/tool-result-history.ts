@@ -521,11 +521,6 @@ function claimsInHistory(data: unknown): ResultClaims | null {
 
 /** claimsInHistory's walk, which throws what stops it. */
 function claimsInHistoryOrThrow(data: unknown): ResultClaims {
-  const { testimonies, nevers } = referencesInHistoryOrThrow(data);
-  return resultClaims(testimonies, nevers);
-}
-
-function referencesInHistoryOrThrow(data: unknown): { testimonies: ReferenceTestimony[]; nevers: string[] } {
   const testimonies: ReferenceTestimony[] = [];
   // Inline data's never, which walkedInHistory withholds before it asks
   // `read`, and an embedded resource's, which `read` notes (inlineNeverUri).
@@ -557,7 +552,7 @@ function referencesInHistoryOrThrow(data: unknown): { testimonies: ReferenceTest
       return typeof walked === 'string' ? 0 : walked;
     });
   }
-  return { testimonies, nevers };
+  return resultClaims(testimonies, nevers);
 }
 
 /**
@@ -608,10 +603,6 @@ export function shownToScript(value: unknown, claims?: ResultClaims, line?: Scri
  */
 export function scriptViewClaims(content: readonly unknown[], fromServer: boolean): ResultClaims {
   return claimsInHistoryOrThrow(fromServer ? content.filter((block) => classifyBlock(block).kind !== 'invalid') : content);
-}
-
-export function scriptViewReferences(content: readonly unknown[], fromServer: boolean): ReferenceTestimony[] {
-  return referencesInHistoryOrThrow(fromServer ? content.filter((block) => classifyBlock(block).kind !== 'invalid') : content).testimonies;
 }
 
 /**

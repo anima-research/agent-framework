@@ -98,8 +98,8 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
 
     case 'resource': {
       // MCP's embedded resource shows as the block its contents make would
-      // show here (RFC-005 §8.1), its uri never, unless a `never` names its
-      // uri.
+      // show here (RFC-005 §8.1), its uri never, or, where a `never` names
+      // its uri, as the notice that its content is withheld.
       const c = classifyBlock(block);
       if (c.kind === 'embedded' && embeddedWithheld(block, claims)) return { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
       if (c.kind === 'embedded' && c.contents.kind === 'block') {

@@ -56,7 +56,8 @@ export interface ReferenceTestimony {
   rejectedFields: string[];
   /** Set when the testimony is an MCP resource_link's, which claims no
    *  digest, expiry or disposition. A link is registered but never fetched
-   *  on the side, and its testimony never replaces a record's (register). */
+   *  on the side, and its testimony replaces a record's only as a server's
+   *  first word for the record (register). */
   fromLink?: true;
 }
 
@@ -748,11 +749,12 @@ export class ReferenceRegistry {
 
   /** Mark a uri's payload never for a server's content: the record the uri
    *  has, or, where it has none, a record made for it, marked and bound to
-   *  that server, which a later delivery of the uri then finds. */
+   *  that server, which a later delivery of the uri then finds. A uri
+   *  longer than a reference's (REFERENCE_LIMITS) gets no record. */
   markNever(uri: string, serverId: string): void {
     const record = this.findByUri(uri);
     if (!record) {
-      this.register({ uri, disposition: 'never', rejectedFields: [] }, serverId);
+      if (uri.length <= REFERENCE_LIMITS.uri) this.register({ uri, disposition: 'never', rejectedFields: [] }, serverId);
       return;
     }
     if (record.payloadNever) return;
@@ -826,7 +828,7 @@ export class ReferenceRegistry {
     if (existingId !== undefined) {
       const existing = this.records.get(existingId);
       if (existing) {
-        const firstServer = serverId !== undefined && existing.serverIds.length === 0;
+        const unbound = existing.serverIds.length === 0;
         if (serverId !== undefined && !existing.serverIds.includes(serverId)) {
           existing.serverIds.push(serverId);
         }
@@ -835,10 +837,11 @@ export class ReferenceRegistry {
         // digest/expiry supersedes the stale claims. Once fetched, the record
         // describes verified bytes on disk and keeps the testimony they were
         // verified against. A link claims no digest, expiry or disposition,
-        // so its testimony replaces a record's claims only where no server
-        // had spoken for the record yet, and a registration that knows no
-        // server replaces none, since it isn't a server's word.
-        if (serverId !== undefined && !existing.fetchedPath && (!testimony.fromLink || firstServer)) existing.testimony = testimony;
+        // so its testimony replaces a record's claims only as a server's
+        // first word for the record, and a registration that knows no server
+        // replaces them only where no server has spoken for the record,
+        // since it isn't a server's word.
+        if (!existing.fetchedPath && (testimony.fromLink ? serverId !== undefined && unbound : serverId !== undefined || unbound)) existing.testimony = testimony;
         // Newest again, so a uri just mentioned is the last to be evicted.
         this.records.delete(existingId);
         this.records.set(existingId, existing);
@@ -1160,7 +1163,9 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * inline data to reach context. A tool result's link line (buildReferenceStub,
  * unfetchedLinkUri) and a script's object for the link
  * (referenceBlockForScript) both ask this, so the model and a script, whose
- * output comes back to the model, see a link's uri alike.
+ * output comes back to the model, see a link's uri alike, except that a
+ * script's view also reads a `never` nested in the result's data, which can
+ * withhold from it a link the model's line shows.
  *
  * The credential check reads the uri as it would be shown, with what
  * sanitizeLabel strips gone, so a uri split by a control character is read

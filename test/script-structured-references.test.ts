@@ -742,7 +742,8 @@ test("a nested never decides over a plain reference to its uri at the top, for a
       const fromModule = await exit({ success: true, data: content('module', where), structured: {} }, 'fwd--whole', false);
       for (const out of [fromPeer, fromModule]) {
         assert.ok(!out.includes('elsewhere.example.invalid'), `${where}: ${out}`);
-        // The view was written, each block in it, the link as its object.
+        // The view was written, each block in it, the link as its object, or,
+        // where only the module's result says never, as that notice.
         const object = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
         assert.equal(object.isError, false, out);
         assert.equal(object.content.length, 3, out);
