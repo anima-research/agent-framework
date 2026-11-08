@@ -4590,7 +4590,7 @@ export class EventGate {
     const dropped = this.droppedJudgeEvents - dropsBefore;
     const n = state.events.length;
     const behind = state.queued.length;
-    const went = wakes ? 'goes to delivery without the judge' : this.judgeHeldForRefusal(now) ? "is held while the judge's calls are refused" : 'goes back to the judge';
+    const went = wakes ? 'goes to delivery without the judge' : "is held while the judge's calls are refused";
     console.error(
       `[gate] Rule ${quotedValue(policyName)}: the reply judge's call was refused (${hold}), so its batch of ${n} `
       + `${n === 1 ? 'event' : 'events'}${behind > 0 ? `, with ${behind} more queued behind the call,` : ''} ${went}`
