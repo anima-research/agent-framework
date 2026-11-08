@@ -422,14 +422,10 @@ export class ReferenceFetcher {
   }
 
   private start(record: ReferenceRecord, ceiling: number, deadline: number, timeoutMs: number): Flight {
-    const release = referenceRegistry.pin(record);
     const flight: Flight = {
       ceiling,
       timeoutMs,
-      ended: this.doFetch(record, ceiling, deadline, timeoutMs).finally(() => {
-        this.inFlight.delete(record.refId);
-        release();
-      }),
+      ended: this.doFetch(record, ceiling, deadline, timeoutMs).finally(() => this.inFlight.delete(record.refId)),
     };
     this.inFlight.set(record.refId, flight);
     return flight;

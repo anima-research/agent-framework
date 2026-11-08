@@ -714,11 +714,10 @@ const MAX_RECORDS = 2000;
 /**
  * Host-private store of received references. Raw URIs live here and in stubs
  * never (under `never`) or by policy only (`ref`/absent). Ids are stable and
- * never reused within the process (vector 20). Past MAX_RECORDS the records
- * registered least recently whose uri no fetch holds (pin) are evicted, down
- * to MAX_RECORDS (registering a uri the registry holds makes its record the
- * newest), and a stale lookup returns undefined — a defined miss, never a
- * different record.
+ * never reused within the process (vector 20). Past MAX_RECORDS the record
+ * registered least recently is evicted (registering a uri the registry holds
+ * makes its record the newest), and a stale lookup returns undefined — a
+ * defined miss, never a different record.
  *
  * Process-wide singleton by design: ids are host-local *names*, not
  * capabilities, and the record carries the servers that delivered it for the
@@ -746,44 +745,19 @@ export class ReferenceRegistry {
   private counter = 0;
   /** Each open journal's copies (openJournal), by uri. */
   private journals = new Set<Map<string, ReferenceRecord | null>>();
-  /** How many fetches hold each uri (pin). */
-  private pins = new Map<string, number>();
 
-  /** Hold a fetch's uri, and the text it shows where that differs, while
-   *  the fetch runs. Eviction passes over any record whose uri is held,
-   *  whenever it came to be, so no record withholds() could read for the
-   *  fetch (markedAs reads those two) is evicted while it runs, and a
-   *  `never` for either uri, in whatever shape it comes, finds the record it
-   *  would mark. Where no record holds the uri, the fetch's own goes back
-   *  as the newest. The release, once the fetch ends, lets go of both. */
-  pin(record: ReferenceRecord): () => void {
-    const uri = record.testimony.uri;
-    if (this.findByUri(uri) === undefined) {
-      this.keepFirst(uri);
-      this.records.set(record.refId, record);
-      this.byKey.set(uri, record.refId);
-    }
-    const uris = [...new Set([uri, shownUri(uri)])];
-    for (const held of uris) this.pins.set(held, (this.pins.get(held) ?? 0) + 1);
-    this.evict(record.refId);
-    return () => {
-      for (const held of uris) {
-        const left = (this.pins.get(held) ?? 0) - 1;
-        if (left > 0) this.pins.set(held, left);
-        else this.pins.delete(held);
-      }
-    };
-  }
-
+  /** Mark a uri's payload never for a server's content: the record the uri
+   *  has, or, where it has none, a record made for it, marked and bound to
+   *  that server, which a later delivery of the uri then finds. */
   markNever(uri: string, serverId: string): void {
-    // The record of the uri as sent, and the record of the text it shows,
-    // where each exists: a mark only ever restricts.
-    for (const key of new Set([uri, shownUri(uri)])) {
-      const record = this.findByUri(key);
-      if (!record || record.payloadNever) continue;
-      this.keepFirst(key);
-      this.markPayload(record, serverId);
+    const record = this.findByUri(uri);
+    if (!record) {
+      this.register({ uri, disposition: 'never', rejectedFields: [] }, serverId);
+      return;
     }
+    if (record.payloadNever) return;
+    this.keepFirst(uri);
+    this.markPayload(record, serverId);
   }
 
   markNevers(claims: ResultClaims, serverId: string): void {
@@ -791,15 +765,7 @@ export class ReferenceRegistry {
   }
 
   private markPayload(record: ReferenceRecord, serverId: string): void {
-    this.markRecord(record, `[refs] the "${shownServerId(serverId)}" server marked ${record.refId}'s payload never (RFC-005); the record is bound to ${record.serverIds.map((id) => `"${shownServerId(id)}"`).join(', ') || 'no server'}`);
-  }
-
-  /** Mark a record whose uri shows as the text of a marked record's uri. */
-  private markAs(record: ReferenceRecord, marked: ReferenceRecord): void {
-    this.markRecord(record, `[refs] ${record.refId}'s payload is never (RFC-005), as ${marked.refId}'s is: its uri shows as the same text`);
-  }
-
-  private markRecord(record: ReferenceRecord, marked: string): void {
+    const marked = `[refs] the "${shownServerId(serverId)}" server marked ${record.refId}'s payload never (RFC-005); the record is bound to ${record.serverIds.map((id) => `"${shownServerId(id)}"`).join(', ') || 'no server'}`;
     record.payloadNever = true;
     const path = record.fetchedPath;
     if (path === undefined) {
@@ -855,7 +821,7 @@ export class ReferenceRegistry {
 
   register(testimony: ReferenceTestimony, serverId?: string, claims?: ResultClaims): ReferenceRecord {
     this.keepFirst(testimony.uri);
-    const markedBy = testimony.disposition === 'never' || (claims !== undefined && claimedNeverUri(testimony.uri, claims)) ? serverId : undefined;
+    const markedBy = testimony.disposition === 'never' || claims?.get(testimony.uri)?.never === true ? serverId : undefined;
     const existingId = this.byKey.get(testimony.uri);
     if (existingId !== undefined) {
       const existing = this.records.get(existingId);
@@ -865,10 +831,6 @@ export class ReferenceRegistry {
           existing.serverIds.push(serverId);
         }
         if (markedBy !== undefined && !existing.payloadNever) this.markPayload(existing, markedBy);
-        else if (!existing.payloadNever) {
-          const marked = this.markedAs(testimony.uri);
-          if (marked) this.markAs(existing, marked);
-        }
         // Refresh testimony while unfetched: a re-issued reference with a new
         // digest/expiry supersedes the stale claims. Once fetched, the record
         // describes verified bytes on disk and keeps the testimony they were
@@ -884,33 +846,20 @@ export class ReferenceRegistry {
       }
     }
     const refId = `${NOTICE_TAG.referenceId}_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 2 + REF_ID_SUFFIX_CHARS)}`;
-    const record: ReferenceRecord = {
-      refId, serverIds: serverId === undefined ? [] : [serverId], testimony, receivedAt: Date.now(),
-    };
+    const record: ReferenceRecord = { refId, serverIds: serverId === undefined ? [] : [serverId], testimony, receivedAt: Date.now() };
     if (markedBy !== undefined) this.markPayload(record, markedBy);
-    else {
-      // A mark only ever restricts, so it follows the uri as it shows: a new
-      // record whose uri shows as the text of a marked record's is born
-      // marked, whatever its own spelling.
-      const marked = this.markedAs(testimony.uri);
-      if (marked) this.markAs(record, marked);
-    }
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
-    this.evict(refId);
-    return record;
-  }
-
-  /** Past MAX_RECORDS, evict the records registered least recently whose
-   *  uri no fetch holds, sparing `newest`, the record just added. */
-  private evict(newest: string): void {
-    for (const [oldest, old] of this.records) {
-      if (this.records.size <= MAX_RECORDS) break;
-      if (this.pins.has(old.testimony.uri) || oldest === newest) continue;
-      this.keepFirst(old.testimony.uri);
-      this.records.delete(oldest);
-      this.byKey.delete(old.testimony.uri);
+    if (this.records.size > MAX_RECORDS) {
+      const oldest = this.records.keys().next().value;
+      if (oldest !== undefined) {
+        const old = this.records.get(oldest);
+        if (old) this.keepFirst(old.testimony.uri);
+        this.records.delete(oldest);
+        if (old) this.byKey.delete(old.testimony.uri);
+      }
     }
+    return record;
   }
 
   get(refId: string): ReferenceRecord | undefined {
@@ -949,14 +898,10 @@ export class ReferenceRegistry {
     return this.addresses.get(serverId)?.at(-1)?.address;
   }
 
-  /** The marked record of a uri, or of the text it shows (shownUri), if
-   *  either is marked. */
+  /** The record of a uri, where it's marked. */
   markedAs(uri: string): ReferenceRecord | undefined {
     const own = this.findByUri(uri);
-    if (own?.payloadNever) return own;
-    const shown = shownUri(uri);
-    const same = shown === uri ? undefined : this.findByUri(shown);
-    return same?.payloadNever ? same : undefined;
+    return own?.payloadNever ? own : undefined;
   }
 
   /** Find the record for a uri. */
@@ -1168,16 +1113,9 @@ export function embeddedWithheld(block: unknown, claims?: ResultClaims): boolean
 }
 
 /** Whether a uri's payload is withheld where only its uri is read: a mark on
- *  its record or on the record of the text it shows, or a `never` its
- *  result's claims give for a uri that shows as the same text. */
+ *  its record, or a `never` its result's claims give for it. */
 export function uriWithheld(uri: string, claims?: ResultClaims): boolean {
-  return referenceRegistry.markedAs(uri) !== undefined || (claims !== undefined && claimedNeverUri(uri, claims));
-}
-
-/** Whether a result's claims call a uri `never`, by its own spelling or by
- *  the text it shows. */
-function claimedNeverUri(uri: string, claims: ResultClaims): boolean {
-  return claims.get(uri)?.never === true || neverShown(claims).has(shownUri(uri));
+  return referenceRegistry.markedAs(uri) !== undefined || claims?.get(uri)?.never === true;
 }
 
 /** The claims a decision about a record reads: its result's for its uri,
