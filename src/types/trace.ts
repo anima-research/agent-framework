@@ -167,7 +167,8 @@ export type TraceEvent =
        * requests are queued, and their start's own compile is the check:
        * refused again while compression is pending, they wait again, with no
        * new `inference:held`.
-       * `inference:hold_ended` follows, once.
+       * `inference:hold_ended` follows, once. An ephemeral run's start, and
+       * one before the framework's `start()`, never waits.
        */
       type: 'inference:held';
       agentName: string;
@@ -195,8 +196,9 @@ export type TraceEvent =
        * failure takes its own path. 'stopped': the held turn was ended by
        * `abortInference()`, `stop()` or its agent's end, or its released start
        * was declined by the inference policy or withdrawn with its wake, each
-       * reported after its `inference:aborted`, or a released start was
-       * stopped before its compile went through. 'removed': a surgery or an
+       * reported after its `inference:aborted`, but for a released start that
+       * has begun when `stop()` or its agent's end reaches it, whose
+       * `inference:aborted` comes after. 'removed': a surgery or an
        * undo removed what the held turn stood on, reported after its
        * `inference:aborted`, and the wakes that joined it go back to the
        * queue.
@@ -1095,7 +1097,7 @@ export type TraceEvent =
       /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | …
        *  A kind ending in `-clear` ends the alert of the kind before it:
        *  'context-refusal-clear' is raised when a budget hold's wait ends
-       *  without its turn running. */
+       *  without the waiting start running. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;

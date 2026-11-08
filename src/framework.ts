@@ -7416,7 +7416,7 @@ export class AgentFramework {
       return undefined;
     }
     const carried = ours ? existing?.notelessCheckpoint : undefined;
-    if (existing) delete existing.notelessCheckpoint;
+    if (ours) delete existing!.notelessCheckpoint;
     for (const cp of [checkpoint, carried]) if (cp !== undefined) this.dropTurnCheckpoint(agent.name, cp);
     this.retractUnsentInjections(agent);
     const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
@@ -7567,8 +7567,6 @@ export class AgentFramework {
     if (!this.compressionPending(agent) || agent.contextSettingsChanges() !== hold.settingsAtHold) return true;
     const progress = this.compressionProgressOf(agent);
     if (progress !== undefined && hold.progressAtHold !== undefined) return progress !== hold.progressAtHold;
-    // The first snapshot that reads, after one that didn't, is the baseline
-    // from here on.
     if (progress !== undefined) hold.progressAtHold = progress;
     return hold.managerCalls !== hold.callsAtHold;
   }
@@ -7576,7 +7574,12 @@ export class AgentFramework {
   private compressionProgressOf(agent: Agent): string | undefined {
     const progress = this.contextProgress(agent.getContextManager());
     if (!progress || (progress.chunksCompressed === undefined && progress.summaryCounts === undefined)) return undefined;
-    return JSON.stringify([progress.chunksCompressed, progress.summaryCounts]);
+    try {
+      return JSON.stringify([progress.chunksCompressed, progress.summaryCounts]);
+    } catch (error) {
+      console.error(`[budget-hold] agent=${agent.name}: could not read its compression progress, so it reads as none:`, error);
+      return undefined;
+    }
   }
 
   private closureWaits(agentName: string): boolean {
@@ -7685,8 +7688,8 @@ export class AgentFramework {
       : outcome === 'failed'
         ? `the waiting turn's start failed for another reason after ${after}, so that failure now takes the path it would without the wait, the error policy's or a provider hold's: ${cause ?? 'unknown'}`
         : outcome === 'removed'
-          ? `what the waiting turn was for was removed after ${after}, so it doesn't run`
-          : `the waiting turn was stopped after ${after}`;
+          ? `what the waiting turn was for was removed or taken out of its window after ${after}, so it doesn't run`
+          : `the waiting turn was stopped or declined after ${after}, so it doesn't run`;
     this.opsAlert('context-refusal-clear', agentName, words, {
       skipLog: true,
       key: String(hold.startedAt),
@@ -7808,11 +7811,17 @@ export class AgentFramework {
     return true;
   }
 
+  private carriesLiveHold(agentName: string, requests: InferenceRequest[]): boolean {
+    const hold = this.budgetHolds?.get(agentName);
+    if (!hold) return false;
+    const marked = (request: InferenceRequest): boolean => (request as MarkedRequest)[BUDGET_HELD] === hold;
+    return requests.some((r) => marked(r) || mergedBatch(r)?.some(marked));
+  }
+
   private dropReleasedHeldStart(agentName: string, requests: InferenceRequest[], why: string): void {
     const hold = this.budgetHolds?.get(agentName);
     if (hold?.state !== 'released' || !hold.turn) return;
-    const marked = (request: InferenceRequest): boolean => (request as MarkedRequest)[BUDGET_HELD] === hold;
-    if (!requests.some((r) => marked(r) || mergedBatch(r)?.some(marked))) return;
+    if (!this.carriesLiveHold(agentName, requests)) return;
     const turn = hold.turn;
     this.budgetHolds.delete(agentName);
     hold.turn = undefined;
@@ -22798,7 +22807,11 @@ export class AgentFramework {
           const batch = mergedBatch(r);
           if (!batch) return [r];
           if (!live || (r as MarkedRequest)[BUDGET_HELD] !== live || batch.some((m) => (m as MarkedRequest)[BUDGET_HELD] === live)) return batch;
-          const at = Math.max(0, batch.findIndex((m) => this.sameInferenceRequest(m, r)));
+          const at = batch.findIndex((m) => this.sameInferenceRequest(m, r));
+          if (at < 0) {
+            const { [MERGED_BATCH]: _batch, ...folded } = r as MarkedRequest;
+            return [...batch, folded];
+          }
           return batch.map((m, i) => (i === at ? { ...m, [BUDGET_HELD]: live } as MarkedRequest : m));
         });
       }
@@ -23012,7 +23025,7 @@ export class AgentFramework {
         // logical turn. If policy drops it, no driveStream remains to end them,
         // so its turn ends here (endContinuedTurn).
         if (requests.some(continuesTurn)) {
-          this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
+          this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' }, false, this.carriesLiveHold(agentName, requests));
         } else {
           this.dropReleasedHeldStart(agentName, requests, 'the inference policy dropped its start');
         }
@@ -27521,12 +27534,14 @@ export class AgentFramework {
     const putsBack = drop?.kind === 'caller' || drop?.kind === 'quiesce_abandoned';
     const back: InferenceRequest[] = [];
     let dropped = false;
+    let carriesHold = false;
     const take = (requests: InferenceRequest[]): InferenceRequest[] => {
       const left: InferenceRequest[] = [];
       for (const r of requests) {
         if (!isContinuation(r)) left.push(r);
         else {
           dropped = true;
+          carriesHold ||= this.carriesLiveHold(agentName, [r]);
           if (putsBack) back.push(...mergedWakes(r));
         }
       }
@@ -27544,6 +27559,7 @@ export class AgentFramework {
       this.parkedContinuations.delete(parked);
       this.releasePrimaryProviderGate(agentName);
       dropped = true;
+      carriesHold ||= this.carriesLiveHold(agentName, [parked]);
       if (putsBack) back.push(...mergedWakes(parked));
     }
     for (const pass of this.passRequests) {
@@ -27560,7 +27576,7 @@ export class AgentFramework {
     if (!this.pendingRequests.some((r) => r.agentName === agentName) && !this.providerAccelerationCooldowns.get(agentName)?.heldRequests.length) {
       this.endPendingPrimary(agentName);
     }
-    this.endContinuedTurn(agentName, drop);
+    this.endContinuedTurn(agentName, drop, false, carriesHold);
   }
 
   /**
@@ -27575,7 +27591,7 @@ export class AgentFramework {
    * ends on its own and settles nothing. What was stored for the agent
    * meanwhile is presented now (presentAtEndOf), or at that frame's end.
    */
-  private endContinuedTurn(agentName: string, drop: ContinuationDrop, opensTurn = false): void {
+  private endContinuedTurn(agentName: string, drop: ContinuationDrop, opensTurn = false, carriesHold = false): void {
     const ends = opensTurn ? 'its waiting start ends' : 'its turn ends without its continuation';
     console.error(`[turn-continuation] ${agentName}: ${ends}: ${drop.why}`);
     const agent = this.agents.get(agentName);
@@ -27608,7 +27624,7 @@ export class AgentFramework {
       this.settleAgent(agentName, { stopReason: 'exhausted', speech: '', error: `${agentName}'s ${opensTurn ? 'waiting start ended' : 'turn ended without its continuation'}: ${drop.why}` }, undefined);
     }
     const hold = this.budgetHolds?.get(agentName);
-    if (hold?.turn && continuesTurn(hold.turn)) this.endReleasedBudgetHold(agentName, 'stopped');
+    if (hold?.turn && (carriesHold || continuesTurn(hold.turn))) this.endReleasedBudgetHold(agentName, 'stopped');
     // The turn's end; a frame that still holds its token presents at its
     // own end instead.
     this.presentAtEndOf(this.agents.get(agentName));

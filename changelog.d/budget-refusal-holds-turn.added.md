@@ -10,10 +10,10 @@
 - **Hosts and operators:** a waiting turn raises a `context-refusal` ops
   alert as it starts waiting, saying it waits for compression, unless a
   listener of `inference:held` has ended the wait first, and
-  `context-refusal-clear` if the wait ends without the turn running, worded
+  `context-refusal-clear` if the wait ends without the waiting start running, worded
   for how it ended. It's the framework's first `-clear` kind. Both carry the
   wait's start as their webhook cooldown key, so each wait's pair reaches
   the webhook within the 15-minute cooldown, and neither writes
-  failures.log. After a `nothing_pending` end, the refusal the error policy
-  then takes raises its own `context-refusal`, as an exhausted turn's did
-  before.
+  failures.log. After a `nothing_pending` end, the refusal goes to the error
+  policy, and if the turn then exhausts, it raises its own
+  `context-refusal`, as an exhausted turn's did before.

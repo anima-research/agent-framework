@@ -29,11 +29,12 @@
     it drives it again every 5 seconds. A compression
     call that fails in a tick it drives is reported as one in a maintenance
     pass is.
-  - **What the refused start stored:** for an agent whose window is
-    presented, the context injections it stored leave the window as its
-    turn starts waiting, since no request carried them, and the released
-    start stores them as it would without the wait. A routing notice it stored stays, so its arrivals stay
-    announced, and an undo of the released turn leaves it.
+  - **What no request carried:** for an agent whose window is presented,
+    its own stored context injections that no request has carried leave
+    the window as a turn starts waiting, whichever attempt stored them, and
+    the released start stores them as it would without the wait. A routing
+    notice the refused start stored stays, so its arrivals stay announced,
+    and an undo of the released turn leaves it.
   - **No time limit:** a turn can wait as long as compression stays
     pending.
     A waiting turn lives in memory, so a restart drops it, and the agent
