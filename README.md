@@ -420,25 +420,18 @@ the answer.
 and its `family` stays `modern`. On a 2025 revision:
 - List changes arrive on the session's standalone stream, which is kept
   open while the session lives, whether or not the server issues a session
-  id. Its first open is tried again after a 408, 409, 429, a 5xx other than
-  501 and 505, or a network error, each reported as the connection's
-  `error`, and once it opens, also on the SDK's own retry after a
-  credential refresh, a server that announces list changes is relisted.
-  Any other refusal goes to the SDK, which opens no stream: it takes a 405
-  quietly, tries a 401 once more after the credential's refresh, and reports
-  the rest as an `error`. A stream that drops is reopened: the first try
-  waits the server's `retry` hint when it sent one, and the base interval
-  otherwise, and a try after a failed one waits the longer of the hint and
-  the doubling backoff. A reopen that carries `Last-Event-ID` has what it
-  missed replayed by the server. One that can't, because the server's events
-  had no ids, the stream that dropped had carried none, or the server
-  refused the id with 400, opens without it and relists the tools of a
-  server that announces list changes.
+  id. A failure to open it that may pass is reported as the connection's
+  `error` and tried again, and a stream that drops is reopened, after the
+  server's `retry` hint or the connection's backoff. A reopen that missed
+  what came meanwhile relists the tools of a server that announces list
+  changes.
 - A request's stream that the server closes after a priming event is
   resumed for as long as the request lives. Its cancellation at the
   deadline stops the resume too. A stream cut again before it carried a
-  new event id is resumed with the last id its call's resumes carried,
-  which the SDK would leave out (modelcontextprotocol/typescript-sdk#2499).
+  new event id can't be resumed: the SDK sends its resume without the id
+  (modelcontextprotocol/typescript-sdk#2499), which the server can't match
+  to the call's stream, so the call doesn't get its answer, and fails as
+  `no-response`, at the latest at its deadline.
   A call whose stream ends unanswered with nothing to resume from fails
   then, as `no-response`, not at its deadline.
 - The server ends the session by answering 404 to a request that carried
