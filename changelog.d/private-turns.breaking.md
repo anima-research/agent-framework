@@ -24,4 +24,8 @@
   message names no channel, so the turn it wakes is private, and its answer
   goes to no channel unless the agent names one. Before, it went wherever
   plain speech went, such as a focused or locked channel. `message.send` has
-  no way to name a channel.
+  no way to name a channel, and it's the API's only command that delivers a
+  message, so there's no unchanged route through the API.
+  - **Migration:** an integration whose answer belongs in a channel delivers
+    its message as that channel's, through a module or an MCPL server that
+    names the channel, or leaves it to the agent to name the channel.

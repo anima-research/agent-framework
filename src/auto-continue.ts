@@ -36,7 +36,7 @@ export function autoContinueNotice(opts: {
   stop: string;
   last: boolean;
   heldAfterSend?: boolean;
-  /** The run began with a heartbeat's turn, whose plain speech is held as drafts. */
+  /** The run began with a heartbeat's turn, whose plain speech is held as drafts unless the turn is private. */
   heartbeat?: boolean;
   /** The continuation's turn is private (docs/dendrite.md, "Private turns"), so its plain speech goes to no channel. */
   private?: boolean;

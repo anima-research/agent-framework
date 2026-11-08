@@ -802,6 +802,7 @@ const PROSE_ROUTING_HELP =
   '  One message may hold several sections: each line starting with ">>" begins\n' +
   '  a new envelope, routed to its own destination independently.\n' +
   '  A destination applies to the rest of that turn, until another is named.\n' +
+  '  In a private turn it applies only to its own envelope\'s words.\n' +
   '  A name that matches no channel, or several, bounces and leaves it as it\n' +
   '  was. A channel its server declared inbound-only is refused, and clears it.\n' +
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
@@ -840,7 +841,7 @@ const PROSE_LOCUS_TOOL: import('./types/index.js').ToolDefinition = {
     'plain speech there; "drafts" holds it as drafts instead, posted nowhere unless you resend them with the drafts ' +
     'tool. A change applies from your next round; what you wrote beside the call goes where your speech went before. ' +
     'Where a turn\'s words are sent only when it ends, a change applies from your next turn and holds this turn\'s ' +
-    'plain speech as drafts; the result says which. Send tools are unaffected.',
+    'plain speech as drafts, but for a private turn\'s; the result says which. Send tools are unaffected.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -23625,9 +23626,9 @@ export class AgentFramework {
 
   /**
    * Locus mode's delivery of plain speech to the turn's frozen locus. A
-   * heartbeat's turn with no locus of its own (TurnRouting.heartbeat) holds
-   * the words as a draft instead of failing the delivery: nobody was waiting
-   * for them, and the agent may send them where it chooses.
+   * heartbeat's turn with no locus of its own (TurnRouting.heartbeat), unless
+   * it's private, holds the words as a draft instead of failing the delivery:
+   * nobody was waiting for them, and the agent may send them where it chooses.
    */
   private async routeLocusSpeech(
     agent: Agent,
@@ -26430,6 +26431,9 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky) {
+        const unprefixedReason = routing.private
+          ? "no destination prefix, and this turn has no destination now: it's private, so a destination applies only to its own envelope's words"
+          : 'no destination prefix, and this turn has no destination now';
         if (round.draftsRound) {
           console.error(`[prose] ${name}: unprefixed — ${rawText.length} chars held with no notice (a drafts round, no destination)`);
           const words = this.unsentWords(agent, rawText);
@@ -26441,12 +26445,12 @@ export class AgentFramework {
               { ...round, notice: 'later' },
             );
             if (held.length === 0 && words.text.trim().length > 0) {
-              this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round, { unprefixed: true });
+              this.bounceProse(agent, rawText, unprefixedReason, undefined, '>>', round, { unprefixed: true });
             }
           }
           return;
         }
-        this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round, { unprefixed: true });
+        this.bounceProse(agent, rawText, unprefixedReason, undefined, '>>', round, { unprefixed: true });
         return;
       }
       targetChannel = sticky;
@@ -27577,7 +27581,8 @@ export class AgentFramework {
       if (unresolvedTrigger) routing.noChannel = true;
       else delete routing.noChannel;
       // A heartbeat's turn has no channel, and takes no fallback: its plain
-      // speech is held as a draft (TurnRouting.heartbeat).
+      // speech is held as a draft unless the turn is private
+      // (TurnRouting.heartbeat).
       if (isHeartbeatWake(trigger)) routing.heartbeat = true;
       else delete routing.heartbeat;
       // Resolve the turn's outbound locus now: the home channel for forks,
@@ -27792,10 +27797,6 @@ export class AgentFramework {
         this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn);
         return false;
       }
-      if (!this.presents(agent) && !routing.private) {
-        const surface = privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata));
-        if (surface !== undefined) this.makeTurnPrivate(agent, routing, routing.silent ? undefined : surface);
-      }
       this.nameUnpostedSpeech(agent, routing);
 
       // The subconscious's standing dispositions ride a fixed system-position
@@ -27940,6 +27941,10 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+      if (!this.presents(agent) && !routing.private) {
+        const surface = privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata));
+        if (surface !== undefined) this.makeTurnPrivate(agent, routing, routing.silent ? undefined : surface);
+      }
       const handle = this.driveStream(
         agent,
         stream,
