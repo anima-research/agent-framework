@@ -48,7 +48,6 @@ function coordinatorOn(
   opts: {
     failDump?: boolean;
     durable?: () => boolean;
-    queued?: Array<Row & { writeId: string }>;
     reports?: string[];
     inferences?: string[];
     failWake?: boolean;
@@ -76,10 +75,9 @@ function coordinatorOn(
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => window,
-    getDeferredMessages: () => opts.queued ?? [],
     emitTrace: (e: { type: string }) => { opts.traces?.push(e.type); },
     currentSequence: () => 1,
-    setSubconsciousAnchor: (sequence: number) => { opts.anchors?.push(sequence); },
+    setSubconsciousAnchor: (start: { sequence: number }) => { opts.anchors?.push(start.sequence); },
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
@@ -239,22 +237,31 @@ test('a cancel retried in the same process after its dump failed shows each held
   });
 });
 
-test('a message queued at a dump whose end record failed, which lands before the retry, is not dumped again', () => {
+// No write is queued behind a turn here (#291), but a version that queued
+// them wrote release records naming a queued row by its write id, and the
+// boot's import stores that row with it (deferredWriteId). A cancel retried
+// after such a version's dump, its end record having failed, finds the row
+// covered.
+test("a row an earlier version's dump named by its queued write's id, stored by the boot's import, is not dumped again", () => {
   withStore((store) => {
     const window = windowWith(1, 2);
-    const queued: Array<Row & { writeId: string }> = [{ ...heldRow(3), id: 'q', writeId: 'w3' }];
+    window.push({
+      id: 'dump-earlier',
+      participant: 'user',
+      content: [text('[Tune-out: earlier dump]')],
+      metadata: {
+        system: true, kind: 'tune-out-cancel', channelId: CHANNEL, epochId: 'eA',
+        released: { ids: ['h1', 'h2'], writeIds: ['w3'], total: 3, truncated: 0, report: { ids: [], writeIds: [] } },
+      },
+    });
+    window.push({ ...heldRow(3), id: 'h3-imported', metadata: { ...heldRow(3).metadata, deferredWriteId: 'w3' } });
     const registry = registryOn(store);
     registry.enterTuneOut('disc', CHANNEL, PARAMS, 'agent-tool');
-    failingEnd(registry);
-    const coordinator = coordinatorOn(registry, window, { queued });
-    assert.throws(() => coordinator.cancel('disc', CHANNEL, 'agent-tool', 'test'), /the lifecycle write failed/);
-    assert.equal(dumpsIn(window).length, 1, 'the dump was written before the end record failed');
-    const landed = queued.shift()!;
-    window.push({ id: 'h3-stored', participant: landed.participant, content: landed.content, metadata: { ...landed.metadata, deferredWriteId: landed.writeId } });
+    const coordinator = coordinatorOn(registry, window);
     assert.deepEqual(coordinator.cancel('disc', CHANNEL, 'agent-tool', 'test'), { ok: true });
     coordinator.stop();
     assert.equal(dumpsIn(window).length, 1, 'the retry writes no second dump');
-    assert.deepEqual(timesShown(window, ['held 1', 'held 2', 'held 3']), once(['held 1', 'held 2', 'held 3']));
+    assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
   });
 });
 
