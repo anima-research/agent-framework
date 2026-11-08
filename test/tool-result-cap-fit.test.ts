@@ -71,6 +71,8 @@ async function withResidents(
     storedAll: string[];
     shownTo: (name: string) => Promise<string | null>;
     shownAllTo: (name: string) => Promise<string[]>;
+    /** The workspace, when the test has a mount. */
+    workspace: WorkspaceModule | null;
   }) => Promise<void>,
 ): Promise<void> {
   const tempDir = mkdtempSync(join(tmpdir(), 'tool-result-cap-fit-'));
@@ -122,6 +124,7 @@ async function withResidents(
       storedAll: toolResultTexts(framework.getAgent(producer)!.getContextManager().queryMessages({}).messages),
       shownTo: async (name) => toolResultText((await framework.previewActivation(name)).messages),
       shownAllTo: async (name) => toolResultTexts((await framework.previewActivation(name)).messages),
+      workspace,
     });
   } finally {
     await framework.stop();
@@ -165,7 +168,7 @@ test("a resident's own bound clamps its cap, and the stored copy, notice include
   });
 });
 
-test("a resident's cap is the smallest bound among the shared slot's readers, so each of them is shown where the rest is", async () => {
+test("a resident's cap is the smallest bound among its shared slot's readers, whichever of them a row reaches: scout's own round is cut to ward's bound, though ward isn't shown it", async () => {
   // scout's own bound (40000) leaves the 24000 default; ward's is 4000.
   await withResidents({ agents: [{ name: 'scout', maxMessageTokens: 10_000 }, { name: 'ward', maxMessageTokens: 1000 }], mount: 'files' }, async ({ framework, stored, shownTo }) => {
     const cap = capProvenance(framework, 'scout');
@@ -174,8 +177,11 @@ test("a resident's cap is the smallest bound among the shared slot's readers, so
     assert.equal(capProvenance(framework, 'ward').tool_result_inline_max_chars_clamped_by, 'strategy-bound');
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
     assert.match(stored, /full content: workspace file files\/tool-results\//);
-    assert.equal(await shownTo('ward'), stored, 'ward is shown the stored copy whole, its notice included');
-    assert.equal(await shownTo('scout'), stored);
+    // Since #291 scout's round is its own row, in no window but scout's, so
+    // ward is never shown it; the cap still takes the bound of every reader
+    // of the slot. This test once had ward shown the stored copy whole.
+    assert.equal(await shownTo('ward'), null, "ward isn't shown scout's own round");
+    assert.equal(await shownTo('scout'), stored, 'scout is shown the stored copy whole, its notice included');
   });
 });
 
@@ -208,7 +214,8 @@ test('without a writable workspace, the stored copy fits the smallest reader\'s 
   await withResidents({ agents: [{ name: 'scout', maxMessageTokens: 10_000 }, { name: 'ward', maxMessageTokens: 1000 }] }, async ({ stored, shownTo }) => {
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
     assert.match(stored, /\n\n\[truncated — original was \d+ chars; no writable workspace mount without an include, full content not retained\]$/);
-    assert.equal(await shownTo('ward'), stored);
+    // scout's own round, shown to scout alone (#291; once ward was shown it).
+    assert.equal(await shownTo('scout'), stored);
   });
 });
 
@@ -231,7 +238,8 @@ test("a resident with no bound of its own takes another reader's, so its cut res
     assert.equal(cap.tool_result_inline_max_chars_clamped_by, 'reader-bound');
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
     assert.match(stored, /full content: workspace file files\/tool-results\//);
-    assert.equal(await shownTo('ward'), stored);
+    // scout's own round, shown to scout alone (#291; once ward was shown it).
+    assert.equal(await shownTo('scout'), stored);
   });
 });
 
@@ -370,7 +378,7 @@ test('without a writable workspace, a result no longer than the notice saying no
   const payloads = [...Array.from({ length: 19 }, () => 'a'.repeat(110)), 'l'.repeat(113), 'j'.repeat(130), 'k'.repeat(130), ...Array.from({ length: 17 }, () => 'e'.repeat(5)), PAYLOAD];
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], payloads }, async ({ storedAll, shownAllTo }) => {
     assert.equal(storedAll.length, 40);
-    assert.equal('\n\n[truncated — original was 113 chars; no writable workspace mount without an include, full content not retained]'.length, 113);
+    assert.equal(storedAll[20]!.length, 113, 'premise: the notice is as long as the 113-character result');
     assert.deepEqual(storedAll.slice(0, 20), payloads.slice(0, 20));
     for (const text of storedAll.slice(20, 22)) {
       assert.equal(text, '\n\n[truncated — original was 130 chars; no writable workspace mount without an include, full content not retained]');
@@ -411,10 +419,11 @@ test('a result alone in its turn past a bound smaller than its notice is still s
   // that replaces it, but a reader cuts anything past 200, so only the file
   // keeps the rest. Keeping a result no longer than its notice whole is for a
   // share of a turn's bound, not a reader's own.
-  const writes: string[] = [];
-  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 50 }], mount: 'f', payload: 'm'.repeat(250), beforeStart: countWrites(writes) }, async ({ stored }) => {
-    assert.match(stored, /^\n\n\[truncated — showing 0 of 250 chars; full content: workspace file f\/tool-results\/\S+\.txt\. /);
-    assert.equal(writes.length, 1);
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 50 }], mount: 'f', payload: 'm'.repeat(250) }, async ({ stored, workspace }) => {
+    const notice = /^\n\n\[truncated — showing 0 of 250 chars; full content: workspace file (f\/tool-results\/\S+\.txt)\. /.exec(stored);
+    assert.ok(notice, stored);
+    const file = await workspace!.readBinary(notice[1]!);
+    assert.equal((file as { data: Buffer }).data.toString('utf8'), 'm'.repeat(250), 'the file it names holds the whole result');
   });
 });
 

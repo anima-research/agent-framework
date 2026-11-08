@@ -13,12 +13,13 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, appendFileSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework, conversationForkSpec } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { appendInTwoParts } from './helpers/command-file.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
@@ -99,8 +100,7 @@ describe('tune-out end to end', () => {
   }
 
   function statusEvents(): Array<{ event: string; intent?: string; messageId?: string }> {
-    if (!existsSync(statusPath)) return [];
-    return readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    return jsonLines(statusPath);
   }
 
   it('runs the full divert → wake → auto-cancel arc', async () => {
@@ -146,11 +146,6 @@ describe('tune-out end to end', () => {
       'diverted messages never enter the resident\'s compiled view',
     );
     const sub = i.agents.get('Subconscious')!.getContextManager();
-    const subCompiled = await sub.compile();
-    assert.ok(
-      subCompiled.messages.some((m) => textOf(m).includes('release chatter one')),
-      'the subconscious\'s merged view includes the diverted backlog',
-    );
 
     // ---- addressed message: ack + coalesced subconscious wake ------------
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Noted — nothing urgent yet.' }]));
@@ -161,6 +156,14 @@ describe('tune-out end to end', () => {
       'deterministic suppressed-mention acknowledge',
     );
     await waitFor(() => membrane.calls.length >= 1, 'subconscious wake turn (coalesced)', 20_000);
+    // Checked at the wake's request, what the subconscious is sent, rather
+    // than at a bare compile: with the presentation index (#291) its window
+    // takes the backlog at its points, and the wake's request carries it
+    // either way.
+    const wakeRequest = JSON.stringify(membrane.calls[0]!.messages);
+    for (const chatter of ['release chatter one', 'release chatter two', 'release chatter three']) {
+      assert.ok(wakeRequest.includes(chatter), `the subconscious's wake request carries the diverted backlog: ${chatter}`);
+    }
     await waitFor(
       () => (i.channelRegistry!.getTuneOutState('disc', CHANNEL)?.wakeCount ?? -1) === 1,
       'durable wake count = 1',

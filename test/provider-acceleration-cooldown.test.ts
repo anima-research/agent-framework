@@ -423,13 +423,14 @@ test('providerHold returning nothing, or throwing, leaves the ordinary retry pat
       modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
       providerHold: () => { asked++; return hook(); },
     });
-    const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
     try {
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
       await framework.runUntilIdle();
       assert.equal(asked, 1, `the hook was asked about the failure, ${how}`);
       assert.equal(membrane.calls.length, 2, `ordinary policy retry happened, with the hook ${how}`);
-      assert.equal(internal.providerAccelerationCooldowns.size, 0, `nothing held, with the hook ${how}`);
+      const admission = (framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownReason: string | null } }> })
+        .agents.find((agent) => agent.name === 'resident')!.providerAdmission;
+      assert.equal(admission.cooldownReason, null, `nothing held, with the hook ${how}`);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -493,7 +494,6 @@ test('providerHold is consulted before the built-in acceleration classification'
   });
   const internal = framework as unknown as {
     holdProviderAcceleration(agent: unknown, error: Error): boolean;
-    providerAccelerationCooldowns: Map<string, { reason: string; hostHoldError?: Error }>;
     healthSnapshot(): { agents: Array<{ providerAdmission: { cooldownReason: string | null; hostHold: boolean } }> };
   };
   try {
@@ -502,7 +502,6 @@ test('providerHold is consulted before the built-in acceleration classification'
       message: "This request would exceed your organization's maximum usage increase rate.", rawError: { status: 429 },
     });
     assert.equal(internal.holdProviderAcceleration(framework.getAgent('resident'), acceleration), true);
-    assert.equal(internal.providerAccelerationCooldowns.get('resident')?.reason, 'weekly quota spent');
     const admission = internal.healthSnapshot().agents[0]!.providerAdmission;
     assert.equal(admission.cooldownReason, 'weekly quota spent');
     assert.equal(admission.hostHold, true);

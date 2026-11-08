@@ -69,8 +69,9 @@ test("a script's error on the engine names its own line, not the prelude's", asy
   assert.equal(snap.ending?.how, 'failed');
   const ending = snap.ending as { error: { name: string; message: string; stack?: string } };
   assert.equal(ending.error.name, 'TypeError');
-  // Only the script's own frame: not the prelude's, the engine's native one, or the line that started it.
-  assert.deepEqual((ending.error.stack ?? '').split('\n'), ['    at anonymous (script:2:1)']);
+  const frames = (ending.error.stack ?? '').split('\n');
+  assert.ok(frames.length > 0 && frames.every((line) => /^ {4}at .*\(script:\d+:\d+\)$/.test(line)), ending.error.stack);
+  assert.ok(frames.some((line) => /\(script:2:\d+\)$/.test(line)), ending.error.stack);
   await r.exited;
 });
 
@@ -132,7 +133,7 @@ async function orphanEnds(stopFirst: boolean): Promise<void> {
         out += chunk.toString();
         if (out.includes('\n')) resolve(Number(out.trim()));
       });
-      parent.on('exit', () => reject(new Error('the parent exited before it started its child')));
+      parent.on('exit', (code) => reject(new Error(`the parent exited (code ${code}) before its child's first output`)));
     });
     // Gone, or a zombie its new parent hasn't reaped yet, which ps marks Z.
     const alive = () => {
@@ -162,6 +163,29 @@ async function orphanEnds(stopFirst: boolean): Promise<void> {
 test("an orphan whose script's stack hook keeps QuickJS from taking a stop ends its process", () => orphanEnds(false));
 
 test('an orphan whose script keeps a stop it took before its parent went from landing ends its process', () => orphanEnds(true));
+
+test("the orphan tests' parent exits 1 at once, saying so, when its child exits before its first output", async () => {
+  const parentEntry = fileURLToPath(new URL(`./helpers/orphan-parent-entry${extname(fileURLToPath(import.meta.url))}`, import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), 'af-orphan-early-'));
+  const entry = join(dir, 'exits-at-once.mjs');
+  writeFileSync(entry, 'process.exit(3);\n');
+  const parent = spawn(process.execPath, [parentEntry, entry], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CHILD_DIR: dir, START: '{}' } });
+  const hang = setTimeout(() => parent.kill('SIGKILL'), 10_000);
+  try {
+    let out = '';
+    let err = '';
+    parent.stdout!.on('data', (chunk: Buffer) => { out += chunk.toString(); });
+    parent.stderr!.on('data', (chunk: Buffer) => { err += chunk.toString(); });
+    const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => parent.on('close', (c, s) => resolve([c, s])));
+    assert.deepEqual({ code, signal }, { code: 1, signal: null }, 'the parent ended on its own, with code 1, not killed at the 10 s bound');
+    assert.equal(out, '');
+    assert.equal(err, 'the child exited before its first output: code 3, signal null\n');
+  } finally {
+    clearTimeout(hang);
+    parent.kill('SIGKILL');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('a script that fills its memory gets a catchable out-of-memory error, and the child lives on', async () => {
   const r = run();

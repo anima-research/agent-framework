@@ -7,6 +7,7 @@ import { ensureStateRegistered } from './module-registry.js';
 import { classifyBlock } from './mcpl/references.js';
 import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
+import { asOwnRow, presentLandedThenRethrow } from './dendrite/audience.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
 export type WithheldNoticeKind = 'ran' | 'refused' | 'error';
@@ -195,6 +196,16 @@ export class ToolResultGuard {
 
   get enabled(): boolean { return this.override ?? this.configured; }
   setHost(host: WithheldHost | undefined): void { this.host = host; }
+
+  /** Where the results message is told of once stored (the agent's own-row sink, Agent.setOwnRowSink). */
+  private ownRowSink?: (ids: readonly MessageId[]) => void;
+  /**
+   * Install where storeResults tells of the results message it stores, once
+   * the add has returned (the presentation index presents it in the agent's
+   * window then, #291), or take it off with undefined. An idempotent retry
+   * of a batch already staged stores nothing and tells nothing.
+   */
+  setOwnRowSink(sink: ((ids: readonly MessageId[]) => void) | undefined): void { this.ownRowSink = sink; }
   /** Settles once every annotation started so far has finished: each of
    *  those stubs has been edited to say where its original is, or its edit
    *  failed and waits in the storage queue, retried in order until it lands
@@ -305,7 +316,7 @@ export class ToolResultGuard {
     // A retry must not undo an operator's later edit/removal/rollback.
     // Reapplying our own payload is safe if an earlier edit wrote the
     // message and then failed while propagating to context entries.
-    // Chronicle normalizes object-key order and drops undefined fields.
+    // Chronicle drops undefined fields.
     if (!sameBranch || !current ||
       (!isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(expected)))
         && !isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(content))))) {
@@ -343,7 +354,9 @@ export class ToolResultGuard {
 
   /** `keptCap` is where what a stub keeps of a withheld result is cut: the
    *  cap the caller stored `content` under, less the stub's notice room where
-   *  its message's bound sets it (toolResultShare, tool-image-ledger.ts). */
+   *  its message's bound sets it (toolResultShare, tool-image-ledger.ts).
+   *  The results are the agent's own row, stamped so (asOwnRow) on top of
+   *  the caller's `metadata`, guarded or not. */
   storeResults(
     content: ContentBlock[],
     wireResults: ToolResult[],
@@ -352,7 +365,17 @@ export class ToolResultGuard {
     /** Where what a stub keeps is cut. */
     keptCap: number | undefined,
   ): MessageId {
-    if (!this.enabled) return this.cm.addMessage('user', content, metadata);
+    metadata = asOwnRow(metadata, this.agentName);
+    if (!this.enabled) {
+      let id: MessageId;
+      try {
+        id = this.cm.addMessage('user', content, metadata);
+      } catch (error) {
+        presentLandedThenRethrow(error, this.agentName, this.ownRowSink, (row) => this.cm.getMessage(row) !== null);
+      }
+      this.ownRowSink?.([id]);
+      return id;
+    }
     if (this.pending) {
       // Idempotent for the same not-yet-submitted batch: a caller that
       // retries after a failure between staging and submission (e.g. a
@@ -392,9 +415,19 @@ export class ToolResultGuard {
     // chunk is ever summarized from the placeholder; released after the
     // settlement edit. Holds are in-memory only — a reopened manager has none,
     // which is correct since a reopened guard has no pending batch.
-    const messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
+    // A write that throws with rows of it stored presents them, as one that
+    // returned would be, and throws on with no batch pending, as before.
+    let messageId: MessageId;
+    try {
+      messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
+    } catch (error) {
+      presentLandedThenRethrow(error, this.agentName, this.ownRowSink, (row) => this.cm.getMessage(row) !== null);
+    }
     this.pending = { id, messageId, content, withheld, wireResults,
       branch: this.cm.currentBranch().name, submitted: false, durable: false, kept, notices };
+    // Told before the durability barrier below, so the sync that makes the
+    // audit durable carries the row's presentation too.
+    this.ownRowSink?.([messageId]);
     // Durability barrier: the audit must reach Chronicle's chain heads before
     // the originals can go to a provider. On a failed sync the batch fails
     // CLOSED: the placeholders go on the wire instead (the turn continues,
@@ -575,8 +608,9 @@ export class ToolResultGuard {
         let deadlineSpent = false;
         for (const [index, block] of pending.content.entries()) {
           if (block.type !== 'tool_result') continue;
-          // Once the store has left the batch's branch (a rollback, an undo, a
-          // host's switch), write no more. This result and every later one is
+          // Once the store has left the batch's branch (a rollback, a
+          // suppression, a host's switch; an undo moves no branch), write no
+          // more. This result and every later one is
           // skipped, and its original stays in the audit record. Nothing
           // yields from here to the edit's own branch check, so while the
           // store is away the stub stays as it is. A write already under way
@@ -606,8 +640,8 @@ export class ToolResultGuard {
           // Declined where it would have committed, since the workspace had
           // left the batch's branch. Nothing was written, and no more are, as
           // for the results the branch check above stops. If the branch is
-          // back by the edit, as after an undo and a redo, the stubs of this
-          // result and the later ones name the audit record.
+          // back by the edit, as after a host's switch away and back, the stubs
+          // of this result and the later ones name the audit record.
           if (spill && 'skipped' in spill && spill.skipped === 'branch_changed') branchLeft = true;
           // A batch that used its deadline is said once, here, where the
           // batch is known; the host returns the skip without a line.

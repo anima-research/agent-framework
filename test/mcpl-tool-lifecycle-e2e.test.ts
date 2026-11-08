@@ -17,7 +17,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
@@ -32,6 +32,7 @@ import type {
 } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tool-lifecycle-mcpl-server.mjs');
 
@@ -65,8 +66,7 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
 }
 
 type Logged = { event: string; params?: Record<string, unknown>; [k: string]: unknown };
-const readLog = (path: string): Logged[] =>
-  existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+const readLog = (path: string): Logged[] => jsonLines<Logged>(path);
 
 describe('tool lifecycle end to end (RFC-007)', () => {
   let tempDir: string;

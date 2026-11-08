@@ -7,10 +7,10 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { CHANNEL, rig, skip, publishCall, speakCall, toolNames } from './helpers/reader-fork-rig.js';
+import { CHANNEL, rig, publishCall, speakCall, toolNames } from './helpers/reader-fork-rig.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 
-describe('reader forks with channel speech off', { skip }, () => {
+describe('reader forks with channel speech off', () => {
   const r = rig('speech-off', false);
 
   it("the resident's tools stay in the fork's block and are refused at dispatch; nothing is published", async () => {

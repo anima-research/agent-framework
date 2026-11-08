@@ -12,7 +12,7 @@
 //    "content"? (content blocks, instead of text; [] included)}
 //   {"op":"rename","channelId":…,"label":…}             (channels/changed)
 //   {"op":"publish-mode","mode":"delivered"|"not-delivered"|"no-receipt"|"error"|"hang"}
-//   {"op":"send-mode","mode":"delivered"|"no-channel"|"error"|"hang","answers"?:channelId}  (SEND_TOOL=1)
+//   {"op":"send-mode","mode":"delivered"|"no-channel"|"error"|"hang","answers"?:channelId}  (SEND_TOOL=1; SEND_TOOL_NAME names the tool, send_message by default)
 //   {"op":"history","channelId":…,"history":[ChannelIncomingMessage…]}
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL ({event:'publish', channelId, text, messageId}).
@@ -22,6 +22,7 @@ import { createInterface } from 'node:readline';
 
 const statusPath = process.env.STATUS_PATH;
 const commandPath = process.env.COMMAND_PATH;
+const sendToolName = process.env.SEND_TOOL_NAME ?? 'send_message';
 const CHANNELS = process.env.CHANNELS
   ? JSON.parse(process.env.CHANNELS)
   : [
@@ -234,7 +235,7 @@ rl.on('line', (line) => {
     reply(msg.id, {
       tools: process.env.SEND_TOOL === '1'
         ? [{
-            name: 'send_message',
+            name: sendToolName,
             description: 'Send a message to a channel.',
             inputSchema: { type: 'object', properties: { channelId: { type: 'string' }, text: { type: 'string' } }, required: ['channelId', 'text'] },
           }]
@@ -242,7 +243,7 @@ rl.on('line', (line) => {
     });
     return;
   }
-  if (msg.method === 'tools/call' && msg.params?.name === 'send_message' && process.env.SEND_TOOL === '1') {
+  if (msg.method === 'tools/call' && msg.params?.name === sendToolName && process.env.SEND_TOOL === '1') {
     const args = msg.params?.arguments ?? {};
     log('send', { channelId: args.channelId, text: args.text, mode: sendMode });
     if (sendMode === 'hang') return;

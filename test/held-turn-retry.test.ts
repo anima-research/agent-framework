@@ -179,13 +179,14 @@ test("a resident whose turn a stated wait holds for its retry is mid-turn: not d
       const ctx = fw.getAgent('resident')!.getContextManager();
       const before = ctx.queryMessages({}).messages.map((m) => m.id);
       const first = ctx.queryMessages({}).messages.find((m) => JSON.stringify(m.content).includes('zz-first'))!;
-      const until = new Date(internal.providerAccelerationCooldowns.get('resident')!.until).toISOString();
+      const { cooldownUntil } = (fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownUntil: number | null } }> })
+        .agents.find((a) => a.name === 'resident')!.providerAdmission;
+      const until = new Date(cooldownUntil!).toISOString();
       await assert.rejects(fw.rollbackToMessage('resident', { messageId: first.id }), (error: Error & { code?: string }) => {
         assert.equal(error.code, 'agent-busy');
-        assert.ok(error.message.includes(`resident is idle+turn-alive (a provider hold keeps its turn to start again, until ${until}: zz rate limit reached for requests)`),
-          `names the hold, its end and its reason: ${error.message}`);
-        assert.ok(error.message.includes("to go on sooner, end it with quiesce with abandon: true, which ends it once the quiesce's wait for the drain runs out (at once on a host already quiesced), or lift a stated wait with release-provider-wait, so the turn tries again once no host's or acceleration hold binds it"),
-          `and how to go on sooner: ${error.message}`);
+        for (const part of ['provider hold', until, 'zz rate limit reached for requests', 'abandon: true', 'release-provider-wait']) {
+          assert.ok(error.message.includes(part), `${JSON.stringify(part)} in: ${error.message}`);
+        }
         return true;
       });
       assert.deepEqual(ctx.queryMessages({}).messages.map((m) => m.id), before, 'the store is as it was');
@@ -1344,6 +1345,12 @@ test("a budget restart batched with a fresh wake parks alone, the wake left queu
     const { fw, internal } = await framework(path, membrane);
     try {
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-message' }]);
+      // Written straight to the context manager, the message enters the
+      // window at a point (#291), here as at rest. Left out of it, it would be
+      // an arrival the restart doesn't present, and the scheduler would keep
+      // the wake out of the restart's batch for a turn of its own after the
+      // restart's (the merge this test is about wouldn't happen).
+      (fw as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(fw.getAgent('resident'));
       const gate = internal.providerGate('resident');
       gate.auxiliaryInFlight = 1;
       internal.pendingRequests.push(

@@ -219,7 +219,7 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
 }
 
 test("a send into a channel the agent closed says so, what still reaches the agent, and how to open it, until they turn the note off", async () => {
-  const { registry, framework, reply, state } = await harness();
+  const { registry, framework, reply } = await harness();
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
 
@@ -234,7 +234,6 @@ test("a send into a channel the agent closed says so, what still reaches the age
   const settings = framework.closedChannelNoteSettingsExtension();
   assert.deepEqual(settings.get('sol'), { closed_channel_note: true });
   assert.deepEqual(settings.update('sol', { closed_channel_note: false }), { closed_channel_note: false });
-  assert.deepEqual(state()?.closedChannelNotes, { sol: false });
   assert.ok(!(await reply()).data.includes('[closed channel]'), 'no note once turned off');
   assert.throws(() => settings.update('sol', { closed_channel_note: 'off' }), /closed_channel_note must be true or false, not "off"/);
 
@@ -598,6 +597,8 @@ test('a reply_message into a channel decided open whose open failed opens it aga
 
 test('a send into a tuned-out channel leaves the tune-out in place, and its answer says so', async () => {
   const { registry, framework, opens, windowMessages, reply } = await harness();
+  // A persistent reader the host named Muse.
+  framework.subconsciousAgentName = 'Muse';
   // Tuned out: the transport stays open, and the decision is the tune-out.
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   registry.enterTuneOut('discord', channelId, {
@@ -605,7 +606,7 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   }, 'agent-tool');
   const opensBefore = opens.length;
   const tunedOutNote = `[tuned out] #upkeep (${channelId}) stays tuned out: your words there don't end the tune-out, ` +
-    'so its traffic still goes to your subconscious until the tune-out ends. ' +
+    'so its traffic is still held from you, and read by Muse, until the tune-out ends. ' +
     `Call tune_out with channelId "${channelId}" and mode "cancel" for it to resume normal attention; cancelling ` +
     'delivers the diverted backlog. To stop this note, set closed_channel_note to false with agent_settings.';
 
@@ -626,6 +627,10 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   framework.agents.set('sol', agentStub({ canUseTool: (tool: string) => tool !== 'tune_out' }));
   assert.ok((await reply()).data.endsWith('until the tune-out ends. To stop this note, set closed_channel_note to false with agent_settings.'));
   framework.agents.set('sol', agentStub());
+  // Reader forks: the note names them as forks of the agent's context.
+  framework.subconsciousAgentName = null;
+  framework.readerForks = true;
+  assert.ok((await reply()).data.includes('so its traffic is still held from you, and read by forks of your context, until the tune-out ends. '));
   // A conversation agent gets none.
   framework.registry.homes.set('sol', { serverId: 'discord', channelId });
   assert.ok(!(await reply()).data.includes('[tuned out]'));

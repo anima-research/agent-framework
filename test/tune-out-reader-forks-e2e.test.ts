@@ -23,20 +23,6 @@ import type { TraceEvent } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import type { NormalizedResponse } from '@animalabs/membrane';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
-import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
-
-// Reader forks are derived agents: they need the branch-bound store handles
-// and ContextManager.derive the Dendrite branches of chronicle and
-// context-manager carry. Against registry builds that lack them the fork is
-// never derived, and the 20 s waits below would fail instead of skipping
-// (the guard dendrite-derive.test.ts has; Weft, 2026-10-17).
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-const skip = supported
-  ? false
-  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
@@ -99,7 +85,7 @@ const textOf = (m: Msg | { content: Array<{ type: string; text?: string }> }): s
 const stripCache = (value: unknown): string =>
   JSON.stringify(value, (key, inner) => (key === 'cacheBreakpoint' || key === 'cache_control' ? undefined : inner));
 
-describe('tune-out with reader forks', { skip }, () => {
+describe('tune-out with reader forks', () => {
   let tempDir: string;
   let membrane: RoutedMembrane;
   let framework: AgentFramework;
@@ -307,7 +293,11 @@ describe('tune-out reader forks: configuration', () => {
           subconscious: { enabled: true, reader: 'forks', voice: 'read' } as never,
           modules: [],
         }),
-        /`model` must say whose weights run it — "test-model" for a copy of the resident, or another model/,
+        // The mechanism, not a copy of the resident: a reader fork of it, on its model or another.
+        {
+          message: 'subconscious.reader "forks": a reader fork of "scout" holds its whole prefix, so `model` must say ' +
+            'whose weights run it — "test-model", the model "scout" runs, or another model by name. It is not defaulted',
+        },
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -349,5 +339,67 @@ describe('tune-out reader forks: configuration', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('tune-out reader forks: a loss notice for a fork whose context manager refuses its work (AF #844 review 4, #106)', () => {
+  it("the coordinator's writesHeld says writes for that fork are held, by its refusing manager or a write waiting for its recovery", () => {
+    // A framework built from its prototype, with only what the hook reads.
+    const fw = Object.create(AgentFramework.prototype) as {
+      heldForRecovery: Map<string, unknown[]>;
+      makeTuneOutCoordinator(): unknown;
+    };
+    const refusing = {};
+    Object.assign(fw, {
+      surgeryHold: null,
+      replayingHeld: false,
+      primaryAgentName: 'scout',
+      subconsciousAgentName: null,
+      readerForks: true,
+      agents: new Map([
+        ['scout', { getContextManager: () => ({}) }],
+        ['scout-reader-1', { getContextManager: () => refusing }],
+        ['scout-reader-2', { getContextManager: () => ({}) }],
+      ]),
+      managersRefusingWork: new WeakMap([[refusing, 'a failed re-initialization (test)']]),
+      heldForRecovery: new Map(),
+      channelRegistry: {},
+      mcplServerRegistry: {},
+    });
+    const coordinator = fw.makeTuneOutCoordinator() as { hooks: { writesHeld(forAgent?: string): boolean } };
+    assert.equal(coordinator.hooks.writesHeld(), false, 'with no agent named, the primary and the subconscious: neither held');
+    assert.equal(coordinator.hooks.writesHeld('scout-reader-1'), true, "the fork's context manager refuses its work");
+    assert.equal(coordinator.hooks.writesHeld('scout'), false);
+    assert.equal(coordinator.hooks.writesHeld('scout-reader-2'), false, 'another fork, its manager working');
+    fw.heldForRecovery.set('scout-reader-2', [{}]);
+    assert.equal(coordinator.hooks.writesHeld('scout-reader-2'), true, 'a write for it waits for its recovery');
+    // The primary's manager waits for its recovery: the release's writes are held, but not a fork's (AF #844 review 5, #53).
+    fw.heldForRecovery.delete('scout-reader-2');
+    fw.heldForRecovery.set('scout', [{}]);
+    assert.equal(coordinator.hooks.writesHeld(), true, "the primary's writes wait for its recovery");
+    assert.equal(coordinator.hooks.writesHeld('scout-reader-2'), false, "a fork's writes don't wait for the primary's");
+  });
+
+  // AF #844 review 5, #74: the coordinator asks where a branch was forked
+  // from (branchOrigin), read from the store's branches: its parent's name
+  // and the parent's head at the fork. A branch with no parent, or none of
+  // that name, has no origin.
+  it("the coordinator's branchOrigin reads a branch's parent and branch point from the store", () => {
+    const fw = Object.create(AgentFramework.prototype) as { makeTuneOutCoordinator(): unknown };
+    Object.assign(fw, {
+      surgeryHold: null, replayingHeld: false, primaryAgentName: 'scout', subconsciousAgentName: null, readerForks: true,
+      agents: new Map([['scout', { getContextManager: () => ({}) }]]),
+      managersRefusingWork: new WeakMap(), heldForRecovery: new Map(), channelRegistry: {}, mcplServerRegistry: {},
+      store: {
+        listBranches: () => [
+          { id: 'b-main', name: 'main', head: 40, created: 0 },
+          { id: 'b-side', name: 'side', head: 45, parentId: 'b-main', branchPoint: 31, created: 1 },
+        ],
+      },
+    });
+    const coordinator = fw.makeTuneOutCoordinator() as { hooks: { branchOrigin?: (name: string) => unknown } };
+    assert.deepEqual(coordinator.hooks.branchOrigin?.('side'), { parent: 'main', branchPoint: 31 });
+    assert.equal(coordinator.hooks.branchOrigin?.('main'), undefined, 'the root has no parent');
+    assert.equal(coordinator.hooks.branchOrigin?.('gone'), undefined);
   });
 });

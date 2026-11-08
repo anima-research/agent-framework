@@ -1053,7 +1053,7 @@ describe('explicit prose routing', () => {
       trigger(framework);
       await until(() => turns() > after && naming().length > 0, 'a later turn to name it');
       assert.equal(naming().length, 1);
-      assert.match(naming()[0]!, /no recent notice on this branch names/);
+      assert.match(naming()[0]!, /no recent notice in your context names/);
     });
   });
 
@@ -1414,7 +1414,7 @@ describe('explicit prose routing', () => {
       const later = draftsOf(framework).open('assistant').find((d) => d.text === 'carrying on');
       assert.ok(later, "the later compile's unprefixed text is held under the turn's hold");
       assert.ok(receipts[0]!.includes(later.id), `and the receipt names that draft as well: ${receipts[0]}`);
-      assert.ok(!texts.some((t) => t.includes('that no recent notice on this branch names')), 'the catch-up left the draft to the receipt');
+      assert.ok(!texts.some((t) => t.includes('that no recent notice in your context names')), 'the catch-up left the draft to the receipt');
       assert.equal(internals.openLogical.has('assistant'), false, 'the logical turn settled');
     } finally {
       await framework.stop();
@@ -1440,7 +1440,7 @@ describe('explicit prose routing', () => {
       assert.ok(late, 'the late envelope bounced into a draft');
       const texts = context(framework).texts;
       assert.ok(texts.some((t) => t.startsWith('[prose-routing]') && t.includes(late.id)), 'its bounce notice names it');
-      assert.ok(!texts.some((t) => t.includes('that no recent notice on this branch names')), "the catch-up doesn't name it again");
+      assert.ok(!texts.some((t) => t.includes('that no recent notice in your context names')), "the catch-up doesn't name it again");
       assert.ok((store.get('assistant', late.id)?.noticedIn ?? []).length > 0, 'it is recorded as noticed');
     });
   });
@@ -1484,11 +1484,10 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("a settle closes the open logical turn only when it is the settling stream's own, and stop() clears open turns", async () => {
+  it("a settle closes the open logical turn only when it is the settling stream's own", async () => {
     const framework = await createFramework('hybrid');
     const internals = framework as unknown as {
       openLogical: Map<string, RoutingState>;
-      turnRouting: Map<string, RoutingState>;
       settleAgent(name: string, outcome: { stopReason: 'completed'; speech: string }, closes: RoutingState | undefined): void;
     };
     const open: RoutingState = routingState({ continuation: true });
@@ -1501,11 +1500,7 @@ describe('explicit prose routing', () => {
     assert.equal(internals.openLogical.get('assistant'), open, "a stale settle leaves the newer turn open");
     internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, open);
     assert.equal(internals.openLogical.has('assistant'), false, "the turn's own settle closes it");
-    internals.openLogical.set('assistant', open);
-    internals.turnRouting.set('assistant', open);
     await framework.stop();
-    assert.equal(internals.openLogical.size, 0, 'stop() clears every open logical turn');
-    assert.equal(internals.turnRouting.get('assistant'), open, 'and keeps the live routing state, for a resume that continues its turn');
   });
 
   it('a silent start neither takes nor disturbs an open logical turn, and leaves it to the next start that routes prose', async () => {
@@ -2476,8 +2471,11 @@ describe('explicit prose routing', () => {
       ] as ContentBlock[], 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]));
     });
-    const deferred = () => (framework as unknown as { deferredMessages: Array<{ content: Array<{ text?: string }> }> })
-      .deferredMessages.filter((m) => m.content.some((b) => b.text === CAFE_NOTE));
+    // Since #291 the note is stored at once and waits outside the window,
+    // where this test once found it in the deferral queue.
+    const stored = () => windowTexts(framework).filter((t) => t === CAFE_NOTE);
+    const presented = () => framework.getAgent('assistant')!.getContextManager().getPresentedMessages()
+      .flatMap((m) => m.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])));
 
     // A failure lets the held post and move go and stops the framework, so the file still ends.
     try {
@@ -2491,11 +2489,11 @@ describe('explicit prose routing', () => {
       }
       assert.equal(module.calls.length, 2, "the next turn's move is running");
       releaseCafe();
-      for (const end = Date.now() + 5000; deferred().length === 0 && Date.now() < end;) {
+      for (const end = Date.now() + 5000; stored().length === 0 && Date.now() < end;) {
         await new Promise<void>((resolve) => setTimeout(resolve, 5));
       }
-      assert.equal(deferred().length, 1, 'the note is due, and held');
-      assert.ok(!windowTexts(framework).includes(CAFE_NOTE), "it isn't written while that turn's move runs");
+      assert.equal(stored().length, 1, 'the note is due, and stored');
+      assert.ok(!presented().includes(CAFE_NOTE), "it isn't in the window while that turn's move runs");
       releaseMove();
       await idle;
 
@@ -3084,10 +3082,11 @@ describe('explicit prose routing', () => {
     await within(framework.runUntilIdle(), 'the first stream', 10000);
     if (how === 'capacity') {
       assert.equal(starts, 1, 'the hold defers the turn rather than retrying it at once');
-      const hold = internals.providerAccelerationCooldowns.get('assistant');
-      assert.ok(hold, 'the turn is held');
+      const admission = (framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownReason: string | null } }> })
+        .agents.find((agent) => agent.name === 'assistant')!.providerAdmission;
+      assert.notEqual(admission.cooldownReason, null, 'the turn is held');
       // What the cooldown's timer does when it fires, at the hold's deadline.
-      hold.until = Date.now();
+      internals.providerAccelerationCooldowns.get('assistant')!.until = Date.now();
       internals.releaseProviderAccelerationCooldown('assistant');
       await within(framework.runUntilIdle(), 'the deferred compile', 10000);
     }

@@ -26,7 +26,6 @@ for (const field of fields) {
       const { block, testimony } = reference(type, { [field]: 'x'.repeat(REFERENCE_LIMITS[field] + 1) });
       assert.equal(testimony[field], undefined, 'invalid optional metadata is absent, not repaired');
       assert.deepEqual(testimony.rejectedFields, [field]);
-      assert.deepEqual(testimony.truncatedFields, []);
       assert.equal(testimony.uri, block.uri);
       assert.equal(testimony.disposition, 'never');
       assert.ok(referenceStubOrNull(block)?.startsWith('[ref_'));
@@ -39,7 +38,6 @@ for (const field of fields) {
       const { testimony } = reference('resource', { [field]: value });
       assert.equal(testimony[field], value);
       assert.deepEqual(testimony.rejectedFields, []);
-      assert.deepEqual(testimony.truncatedFields, []);
     }
     const { testimony } = reference('resource', { [field]: '🪶'.repeat(REFERENCE_LIMITS[field]) + 'x' });
     assert.equal(testimony[field], undefined);
