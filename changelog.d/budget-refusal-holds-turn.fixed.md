@@ -58,6 +58,7 @@
     its start begins included, with `inference:aborted`. So does the
     inference policy declining a released turn's start, or the withdrawal
     of its wake.
-- A closing conversation fork is no longer disposed when a turn of its that
-  was alive at its expiry ends while its closure wake waits: the closure
-  turn runs, and the fork is disposed after it.
+- A closing conversation fork is no longer disposed while its closure wake
+  waits, either when a turn of its that was alive at its expiry ends or by
+  the fallback sweep, which also leaves it while a budget hold of its agent
+  exists: the closure turn runs, and the fork is disposed after it.
