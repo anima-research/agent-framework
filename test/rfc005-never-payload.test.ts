@@ -12,7 +12,7 @@ import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import * as references from '../src/mcpl/references.js';
 import {
   ReferenceRegistry, buildReferenceStub, classifyBlock, contentClaims, referenceBlockForScript,
-  referenceRegistry, shownLinkUri, unfetchableReason,
+  referenceRegistry, shownLinkUri, shownUri, unfetchableReason,
 } from '../src/mcpl/references.js';
 import type { ReferenceRecord, ReferenceTestimony } from '../src/mcpl/references.js';
 import type { McplContentBlock } from '../src/mcpl/types.js';
@@ -656,6 +656,35 @@ describe('a fetcher built to withhold', () => {
     assert.equal(referenceRegistry.findByUri(uri), undefined, 'the record the fetch kept goes once it has ended');
   });
 
+  for (const [when, crowded] of [
+    ['registered before the fetch, with 2,000 registrations during it', true],
+    ['registered before the fetch', false],
+    ['registered while it runs, with 2,000 registrations after', 'late'],
+  ] as const) {
+    it(`refuses a fetch when a \`never\` marks the record of the text its uri shows, ${when}`, async () => {
+      const saved: string[] = [];
+      const f = fetcher({ saved });
+      const uri = `${ORIGIN}/hold?shown-${randomUUID()}\u200E`;
+      const shown = shownUri(uri);
+      assert.notEqual(shown, uri);
+      const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
+      if (crowded !== 'late') referenceRegistry.register(testimonyOf({ type: 'resource', uri: shown }), 'srv');
+      const arrived = new Promise<void>((resolve) => { heard = resolve; });
+      const running = f.fetch(record);
+      await within('the request reaching the server', arrived);
+      const response = held.shift()!;
+      try {
+        if (crowded === 'late') referenceRegistry.register(testimonyOf({ type: 'resource', uri: shown }), 'srv');
+        if (crowded) crowd();
+        await quietly(() => convertBlocks([inlineNever(shown)] as McplContentBlock[], 'attachment on push event', 'srv'));
+      } finally {
+        response.end();
+      }
+      assert.deepEqual(await within('the download', running), NEVER_FAILURE);
+      assert.deepEqual([saved, record.fetchedPath], [[], undefined]);
+    });
+  }
+
   it('keeps a record its fetch holds past 2,000 later registrations, so a `never` marks that record, and lets it go once the fetch ends', async () => {
     const saved: string[] = [];
     const f = fetcher({ saved });
@@ -677,6 +706,23 @@ describe('a fetcher built to withhold', () => {
     assert.deepEqual([saved, record.fetchedPath], [[], undefined]);
     referenceRegistry.register(testimonyOf({ type: 'resource', uri: `https://zz-never.example/evict/${randomUUID()}` }), 'srv');
     assert.equal(referenceRegistry.findByUri(uri), undefined, 'evicted once its fetch has ended');
+  });
+
+  it("holds a fetch's uri, and the text it shows, until every fetch holding them has ended", () => {
+    const reg = new ReferenceRegistry();
+    const uri = `${ORIGIN}/hold?counted-${randomUUID()}\u200E`;
+    const record = reg.register(testimonyOf({ type: 'resource', uri }), 'srv');
+    const shownRecord = reg.register(testimonyOf({ type: 'resource', uri: shownUri(uri) }), 'srv');
+    const fill = () => {
+      for (let i = 0; i < 2000; i++) reg.register(testimonyOf({ type: 'resource', uri: uniq('fill.bin') }), 'srv');
+    };
+    const [first, second] = [reg.pin(record), reg.pin(record)];
+    first();
+    fill();
+    assert.deepEqual([reg.findByUri(uri), reg.findByUri(shownUri(uri))], [record, shownRecord], 'held while the second fetch runs');
+    second();
+    fill();
+    assert.deepEqual([reg.findByUri(uri), reg.findByUri(shownUri(uri))], [undefined, undefined], 'let go once both have ended');
   });
 
   it('keeps every record fetches hold, and the one just registered, past 2,000, and evicts down to 2,000 once they are let go', () => {
