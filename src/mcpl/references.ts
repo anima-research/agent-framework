@@ -748,9 +748,10 @@ export class ReferenceRegistry {
   private journals = new Set<Map<string, ReferenceRecord | null>>();
 
   /** Mark a uri's payload never for a server's content: the record the uri
-   *  has, or, where it has none, a record made for it, marked and bound to
-   *  that server, which a later delivery of the uri then finds. A uri
-   *  longer than a reference's (REFERENCE_LIMITS) gets no record. */
+   *  has, bound to that server where no server had bound it, or, where it
+   *  has none, a record made for it, marked and bound to that server, which
+   *  a later delivery of the uri then finds. A uri longer than a
+   *  reference's (REFERENCE_LIMITS) gets no record. */
   markNever(uri: string, serverId: string): void {
     const record = this.findByUri(uri);
     if (!record) {
@@ -759,6 +760,7 @@ export class ReferenceRegistry {
     }
     if (record.payloadNever) return;
     this.keepFirst(uri);
+    if (record.serverIds.length === 0) record.serverIds.push(serverId);
     this.markPayload(record, serverId);
   }
 
@@ -1164,8 +1166,9 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * unfetchedLinkUri) and a script's object for the link
  * (referenceBlockForScript) both ask this, so the model and a script, whose
  * output comes back to the model, see a link's uri alike, except that a
- * script's view also reads a `never` nested in the result's data, which can
- * withhold from it a link the model's line shows.
+ * script's view also reads a `never` nested in the result's data, which,
+ * where no mark has reached the uri, can withhold from it a link the
+ * model's line shows.
  *
  * The credential check reads the uri as it would be shown, with what
  * sanitizeLabel strips gone, so a uri split by a control character is read

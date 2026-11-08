@@ -13,6 +13,8 @@ import {
   IMAGE_NO_DATA_TEXT,
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
+  REFERENCE_LIMITS,
+  REFERENCE_LINK_TOO_LONG_TEXT,
   classifyBlock,
   contentClaims,
   embeddedWithheld,
@@ -53,6 +55,8 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
+      // RFC-005 §8: a block whose uri violates the schema is rejected whole.
+      if (isFilledString(block.uri) && block.uri.length > REFERENCE_LIMITS.uri) return { type: 'text', text: REFERENCE_LINK_TOO_LONG_TEXT };
       if (isFilledString(block.uri) && block.disposition !== undefined) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it. Any disposition given
@@ -82,6 +86,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
+      if (isFilledString(block.uri) && block.uri.length > REFERENCE_LIMITS.uri) return { type: 'text', text: REFERENCE_LINK_TOO_LONG_TEXT };
       if (isFilledString(block.uri) && block.disposition !== undefined) {
         // RFC-005 uri-form media with a disposition claim, a falsy one
         // included, as for an image (above): stub, do not hand the URI to

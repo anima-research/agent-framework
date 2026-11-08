@@ -746,7 +746,7 @@ describe("the framework's fetches", () => {
     assert.deepEqual([eagerRecord.payloadNever, moduleRecord.payloadNever], [true, true]);
     assert.equal(logged, [
       `[refs] the "srv" server marked ${eagerRecord.refId}'s payload never (RFC-005); the record is bound to "zz-never-dialed"`,
-      `[refs] the "srv" server marked ${moduleRecord.refId}'s payload never (RFC-005); the record is bound to no server`,
+      `[refs] the "srv" server marked ${moduleRecord.refId}'s payload never (RFC-005); the record is bound to "srv"`,
     ].join('\n'), 'the marks, and no failure');
   });
 
