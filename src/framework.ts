@@ -30095,10 +30095,13 @@ export class AgentFramework {
             // carries what the stream appended, so once a call has dropped
             // blocks, none of the stream's later calls is given either. A
             // compile whose first call dropped blocks gives no sample, and the
-            // calibration keeps its value. If the provider drops an earlier
-            // model's blocks after a model switch (`model_binding_mismatch`),
-            // they drop on every call until they leave the context, and the
-            // calibration takes up the new model's tokenizer only after that.
+            // calibration keeps its value. Without `binds`, if the provider
+            // drops an earlier model's blocks after a model switch
+            // (`model_binding_mismatch`), they drop on every call until they
+            // leave the context, and the calibration takes up the new model's
+            // tokenizer only after that. With `binds`, the switch changes the
+            // request's identity, so the compile leaves the replies' thinking
+            // out itself, and a drop that does come is noted below.
             const thinkingReport = event.round?.thinking;
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             if (thinkingDropped) thinkingDroppedInStream = true;
