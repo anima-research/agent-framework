@@ -5,4 +5,5 @@
   many wakes threw as it released them, and a judge rule's quiet period that
   gathered that many events threw when its batch met one already held for a
   running turn or one with the judge. Every call that spread a list that
-  can grow that long now passes it without a spread.
+  can grow that long with what an agent holds or does now passes it
+  without a spread.
