@@ -100,15 +100,17 @@ export interface AgentConfig {
    * and restarts the stream through a fresh compile instead of dispatching a
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
-   * stream has reported its prompt. Before that, from a turn's first request
-   * on, each compile that builds a request is kept within the window: the
-   * compile is given it as context-manager's `requestLimitTokens`, beside the
-   * request's system prompt and tools as `requestOverhead`, so the compiled
-   * context, its message injections, the system prompt, the tools and
-   * maxTokens for the reply fit it, and a window the system prompt and tools
-   * leave no room in refuses the compile as over budget. Unset → no
-   * projection and no limit on the compile; only the maxStreamTokens restart
-   * applies. A value is converted to a number as a
+   * stream has reported its prompt. And every compile that builds a request,
+   * from a turn's first on, is kept within the window as context-manager
+   * prices it: the compile is given the window as context-manager's
+   * `requestLimitTokens`, beside the request's system prompt and tools as
+   * `requestOverhead`, so the compiled context, its message injections, the
+   * system prompt, the tools and the reply's reserve (the agent's maxTokens,
+   * unless a caller passes its own budget) come within it, and a window the
+   * system prompt and tools leave no room in refuses the compile as over
+   * budget.
+   * Unset → no projection and no limit on the compile; only the
+   * maxStreamTokens restart applies. A value is converted to a number as a
    * comparison converts it, so a string such as "200000" reads as its number;
    * one whose number isn't finite, such as null, reads as unset.
    */
