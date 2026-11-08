@@ -184,7 +184,7 @@ describe('explicit prose routing', () => {
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: { channelId: 'world:commons' },
     } as unknown as ProcessEvent);
   }
 
