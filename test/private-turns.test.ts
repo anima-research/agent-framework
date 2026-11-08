@@ -136,6 +136,50 @@ describe('private turns: when a turn is private (part 1)', () => {
     } finally { await f.close(); }
   });
 
+  it("a conversation's closure prompt, written after an operator's message was answered, isn't a channel's message, so the next turn is private", async () => {
+    const { f } = await make({ rule: 'latest-inbound' });
+    try {
+      script(f, [say('zz-room')], [say('zz-private answer')], [say('zz-after the prompt')]);
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => sent(f, 'zz-room').length > 0, 'premise: the room turn spoke in its channel');
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      assert.ok(has(f, 'zz-private answer'), 'premise: the private turn answered');
+      const agent = f.framework.getAgent('agent')!;
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'zz-closing: wrap up' }], { channelId: 'work', conversationClosure: true } as never);
+      (f.framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(agent);
+      assert.ok(agent.getContextManager().getPresentedMessages().some((m) => JSON.stringify(m.content).includes('zz-closing')), "premise: the prompt is in the agent's window");
+      wake(f);
+      await f.framework.runUntilIdle();
+      assert.ok(has(f, 'zz-after the prompt'), "premise: the nudge's turn spoke");
+      script(f, [say('zz-sentinel')]);
+      await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
+      await f.framework.runUntilIdle();
+      await sentinel(f);
+      assert.deepEqual(sent(f, 'zz-after the prompt'), [], 'the turn after the prompt spoke in no channel');
+    } finally { await f.close(); }
+  });
+
+  it("a provider hold keeps a private turn's wake beside an unmarked wake equal to it in every other field, in either order", async () => {
+    const { f } = await make({ wakes: false });
+    try {
+      const fw = f.framework as unknown as { holdRequest(held: Array<Record<string, unknown>>, request: Record<string, unknown>): void };
+      const at = Date.now();
+      const unmarked = { agentName: 'agent', reason: 'nudge', source: 'framework', timestamp: at };
+      const marked = { ...unmarked, privateCaller: true };
+      for (const order of [[unmarked, marked], [marked, unmarked]]) {
+        const held: Array<Record<string, unknown>> = [];
+        for (const request of order) fw.holdRequest(held, { ...request });
+        assert.equal(held.filter((r) => r.privateCaller === true).length, 1, `the private turn's wake is kept: ${JSON.stringify(held)}`);
+      }
+      const held: Array<Record<string, unknown>> = [];
+      fw.holdRequest(held, { ...unmarked });
+      fw.holdRequest(held, { ...unmarked });
+      assert.equal(held.length, 1, 'premise: two equal unmarked wakes are kept once');
+    } finally { await f.close(); }
+  });
+
   it("a private message's wake merged with a room's gives one turn, and it's private", async () => {
     const { f } = await make({ rule: 'delivery', wakes: false });
     try {
@@ -144,10 +188,19 @@ describe('private turns: when a turn is private (part 1)', () => {
       (f.framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(f.framework.getAgent('agent'));
       script(f, [say('zz-merged answer')]);
       const calls = f.membrane.calls.length;
+      const starts: Array<{ channelId?: string; addressed?: boolean }> = [];
+      const fw = f.framework as unknown as { startAgentStream(agent: unknown, request: { channelId?: string; addressed?: boolean }): Promise<unknown> };
+      const startAgentStream = fw.startAgentStream.bind(fw);
+      fw.startAgentStream = (agent, request) => {
+        starts.push(request);
+        return startAgentStream(agent, request);
+      };
       wake(f, { reason: 'external-message', source: 'tui' });
       wake(f, { reason: 'mcpl:channel-incoming', source: 'editor', channelId: 'work', channelServerId: 'editor', addressed: true });
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length - calls, 1, 'premise: one turn read both');
+      assert.equal(starts.length, 1, 'premise: one start');
+      assert.ok(starts[0]!.channelId === 'work' && starts[0]!.addressed === true, `premise: the start carried the room's wake: ${JSON.stringify(starts[0])}`);
       assert.ok(has(f, 'zz-merged answer'), 'premise: it spoke');
       script(f, [say('zz-sentinel')]);
       await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
@@ -382,6 +435,73 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       await f.framework.runUntilIdle();
       await sentinel(f);
       assert.deepEqual(sent(f, 'zz-restarted'), [], 'what the restarted turn said went to no channel');
+    } finally { await f.close(); }
+  });
+
+  it("on a host whose window for the agent couldn't be written down, an operator's message stored while a module's context hook waits at the error policy's retry makes the room turn private", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'private-legacy-hook-'));
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    store.registerState({ id: 'agents/agent/window', strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 100 });
+    store.appendToStateJson('agents/agent/window', { v: 99 });
+    store.close();
+    let gathered = 0;
+    let atRetry: (() => Promise<void>) | undefined;
+    const hook = {
+      name: 'hook',
+      async start() {},
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: false, error: 'no tools' }; },
+      async onProcess() { return {}; },
+      async gatherContext(agentName: string) {
+        if (agentName === 'agent' && ++gathered === 2) await atRetry?.();
+        return [];
+      },
+    };
+    const { f } = await make({ rule: 'delivery', wakes: false, fixture: { dir }, modules: [hook], framework: {
+      errorPolicy: { maxRetries: 1, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 10 } : { retry: false }) },
+    } });
+    try {
+      assert.equal(f.framework.getAgent('agent')!.getContextManager().windowMode(), 'legacy', "premise: the agent's window is the record");
+      atRetry = async () => {
+        await (f.framework as unknown as { handleProcessEvent(event: unknown): Promise<void> }).handleProcessEvent(surfaceMessage(SECRET));
+        assert.equal(storedText(f, SECRET).length, 1, "premise: the message is stored while the retry's hook waits");
+      };
+      script(f, [say('zz-retried')]);
+      const scripted = f.membrane.streamYielding.bind(f.membrane);
+      let failed = false;
+      const requests: string[] = [];
+      f.membrane.streamYielding = (request, options) => {
+        requests.push(JSON.stringify(request));
+        if (failed) return scripted(request, options);
+        failed = true;
+        return new (class extends MockYieldingStream {
+          override provideToolResults(results: unknown[], options?: Parameters<MockYieldingStream['provideToolResults']>[1]): void {
+            super.provideToolResults(results, options);
+            const self = this as unknown as { events: StreamEvent[]; _done: boolean; pendingResolve: (() => void) | null };
+            self._done = false;
+            self.events.push({ type: 'error', error: new Error('the provider failed') } as unknown as StreamEvent);
+            self.pendingResolve?.();
+          }
+        })([act('a1')], true);
+      };
+      const live: unknown[] = [];
+      const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') live.push(hidden(f).turnRouting.get('agent')); });
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => has(f, 'zz-retried'), 'premise: the retry spoke');
+      await f.framework.runUntilIdle();
+      off();
+      assert.equal(live.length, 2, 'premise: the room turn and its retry each started a stream');
+      assert.equal(live[1], live[0], 'premise: the retry continued the room turn');
+      assert.ok(!requests[0]?.includes(SECRET) && requests[1]?.includes(SECRET), "premise: only the retry's compile held the operator's message");
+      assert.equal(storedText(f, 'so your plain speech goes to no channel for the rest of this turn').length, 1, 'the flip writes its notice');
+      assert.ok(requests[1]?.includes('so your plain speech goes to no channel for the rest of this turn'), "the retry's request holds the notice");
+      script(f, [say('zz-sentinel')]);
+      await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
+      await f.framework.runUntilIdle();
+      await sentinel(f);
+      assert.deepEqual(sent(f, 'zz-retried'), [], 'what the retried turn said went to no channel');
     } finally { await f.close(); }
   });
 

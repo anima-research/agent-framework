@@ -1484,7 +1484,7 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("the non-streaming fallback's re-inference of a private turn carries the turn's privacy", async () => {
+  it("a direct-API round's re-inference takes no private mark from the framework's last turn, so the turn it opens reads its own window", async () => {
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
     const agent = framework.getAgent('assistant')!;
@@ -1494,9 +1494,8 @@ describe('explicit prose routing', () => {
       pendingRequests: InferenceRequest[];
       handleProcessEvent(event: ProcessEvent): Promise<void>;
     };
-    const origin = internals.routingOf('assistant');
-    origin.private = true;
-    internals.openLogical.set('assistant', origin);
+    internals.routingOf('assistant').private = true;
+    assert.equal(internals.openLogical.has('assistant'), false, 'premise: no framework turn is open');
     const response = createMockResponse([
       { type: 'tool_use', id: 'unstreamed-private', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use');
@@ -1510,8 +1509,8 @@ describe('explicit prose routing', () => {
         result: { success: true, data: { ok: true } },
       } as ProcessEvent);
       const ready = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
-      assert.ok(ready, 'premise: the fallback scheduled the re-inference');
-      assert.equal(ready.privateCaller, true, "the re-inference carries the turn's privacy");
+      assert.ok(ready, 'premise: the direct round scheduled the re-inference');
+      assert.equal(ready.privateCaller, undefined, "the re-inference carries no private mark from the framework's last turn");
     } finally {
       await framework.stop();
     }
