@@ -119,7 +119,7 @@ test('strict connection refused is connection-failed', async () => {
 });
 
 for (const mode of ['TLS failure', 'open timeout', 'abort while connecting'] as const) {
-  test(`direct strict ${mode} is connection-failed`, { timeout: 5000 }, async () => {
+  test(`direct strict ${mode} is connection-failed`, { timeout: 5000 }, async t => {
     const sockets = new Set<net.Socket>();
     const server = net.createServer(socket => {
       sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.resume();
@@ -135,6 +135,7 @@ for (const mode of ['TLS failure', 'open timeout', 'abort while connecting'] as 
         if (ms === 15_000) { ms = 50; shortened++; }
         return set(fn, ms, ...args);
       }) as typeof setTimeout;
+      t.after(() => { globalThis.setTimeout = set; });
     }
     try {
       const accepted = once(server, 'connection');
@@ -143,7 +144,7 @@ for (const mode of ['TLS failure', 'open timeout', 'abort while connecting'] as 
       await assert.rejects(dial, { message: 'MCPL server "codes": connection-failed' });
       if (mode === 'open timeout') assert.equal(shortened, 1);
       await accepted; await closed(sockets); assert.equal(sockets.size, 0);
-    } finally { globalThis.setTimeout = set; for (const s of sockets) s.destroy(); await new Promise<void>(r => server.close(() => r())); }
+    } finally { for (const s of sockets) s.destroy(); await new Promise<void>(r => server.close(() => r())); }
   });
 }
 
