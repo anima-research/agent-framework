@@ -1131,6 +1131,31 @@ describe("the hold's note sits where the released turn read it", () => {
     });
   });
 
+  it("gives the note the wait for compression, which ends at the release, not the start's time after it", async () => {
+    await withCompression({ stalled: true }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const hold = t.internal.budgetHolds.get('prime')!;
+        const held = hold.turn!;
+        hold.startedAt = Date.now() - 3_000;
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        t.internal.pendingRequests.splice(t.internal.pendingRequests.indexOf(held as Record<string, unknown>), 1);
+        await new Promise((r) => setTimeout(r, 2_500));
+        t.internal.pendingRequests.push(held as Record<string, unknown>);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
+        const note = t.rows().map((r) => JSON.stringify(r.content)).find((b) => b.includes('[budget-hold]'));
+        assert.ok(note?.includes('this turn waited 3 s for compression'), String(note));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('stores a row for each of two holds whose notes read the same', async () => {
     await withCompression({ stalled: true }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered one', 'Answered two'] });

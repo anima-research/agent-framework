@@ -2521,13 +2521,15 @@ export interface HostModeStatus {
   /** Inference requests waiting to start: queued (parked by the quiesce wake
    * gate while quiesced, or, while serving, until the scheduler's next pass
    * takes them), in a scheduler pass's hands, or held by a provider hold (an
-   * acceleration or host hold, or a provider's stated wait) or a budget hold.
-   * There, a start merged from several requests counts as those it took in. A
-   * start parked on provider admission behind an auxiliary call counts once in
-   * `parkedAdmissions` instead, however many wakes are merged into it.
+   * acceleration or host hold, or a provider's stated wait). There, a start
+   * merged from several requests counts as those it took in. A start parked on
+   * provider admission behind an auxiliary call counts once in
+   * `parkedAdmissions` instead, however many wakes are merged into it. A turn
+   * a budget hold holds counts once, since the wakes merged into its start are
+   * the turn's, and each wake that joined it while it waited counts too.
    * Continuations of a turn (budget restart, tool results) and a held turn's
    * retry, which a quiesce lets through, are never counted, but for those a
-   * budget hold holds, which every request it holds is counted with. */
+   * budget hold holds. */
   gatedRequests: number;
   /** code_execution scripts still running that no call is waiting on: left
    * running after a yield, outside any turn. Quiesce does NOT stop them —
@@ -3085,6 +3087,7 @@ interface BudgetHoldBaseline {
 interface BudgetHold {
   state: 'holding' | 'released';
   startedAt: number;
+  releasedAt?: number;
   turn: InferenceRequest | undefined;
   standsOn: string[];
   wakes: InferenceRequest[];
@@ -7582,6 +7585,7 @@ export class AgentFramework {
     const hold = this.budgetHolds?.get(agentName);
     if (hold?.state !== 'holding' || this.quiesced) return;
     hold.state = 'released';
+    hold.releasedAt = Date.now();
     clearInterval(hold.recheck);
     hold.recheck = undefined;
     const requests = [...(hold.turn ? [hold.turn] : []), ...hold.wakes];
@@ -7596,7 +7600,7 @@ export class AgentFramework {
       ? ` (${hold.actual.toLocaleString('en-US')} tokens against ${hold.budget.toLocaleString('en-US')})`
       : '';
     return `[budget-hold] Your context didn't fit its budget${size}, so this turn waited ` +
-      `${describeWait(Date.now() - hold.startedAt)} for compression to make room.`;
+      `${describeWait((hold.releasedAt ?? Date.now()) - hold.startedAt)} for compression to make room.`;
   }
 
   private budgetHoldNoteFor(agent: Agent, trigger: InferenceRequest | undefined): ContextInjection | undefined {
@@ -28164,7 +28168,7 @@ export class AgentFramework {
             : isTurnContinuation(trigger?.reason ?? '')
               ? 'before this re-inference on your tool results'
               : this.heldStart(agent.name, trigger)
-                ? 'while your turn waited for compression'
+                ? 'while your turn waited'
                 : 'while your turn waited on a provider hold';
         this.noticeAddressedArrivals(agent, routing, arrivals, when);
       }

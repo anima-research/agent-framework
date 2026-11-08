@@ -39,7 +39,7 @@ import type {
   ToolResult,
   InferenceRequest,
 } from '../src/index.js';
-import type { ContextInjection } from '@animalabs/context-manager';
+import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -1182,6 +1182,52 @@ describe('present while acting', () => {
     assert.ok(notice!.includes('while your turn waited on a provider hold'), `which boundary it reports: ${notice}`);
 
     await framework.stop();
+  });
+
+  it('a first start that waited for compression, then on a provider hold, announces an arrival from the provider wait as one while its turn waited', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered.' }] as ContentBlock[]));
+    const proto = ContextManager.prototype as unknown as Record<string, unknown>;
+    const was = { compile: proto.compile, isReady: proto.isReady };
+    let refusing = true;
+    proto.compile = async function (this: unknown, ...args: unknown[]) {
+      if (refusing) throw Object.assign(new Error('Compile plan would exceed hard budget'), { name: 'OverBudgetError', budget: 1_000, actual: 2_000 });
+      return (was.compile as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    proto.isReady = function (this: unknown, ...args: unknown[]) {
+      return refusing ? false : (was.isReady as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    const framework = await createFramework();
+    try {
+      stubChannelRegistry(framework);
+      framework.start();
+      const internals = framework as unknown as Held & {
+        budgetHolds: Map<string, { state: string }>;
+        releaseBudgetHold(agentName: string): void;
+        holdProviderAcceleration(agent: unknown, error: Error): boolean;
+      };
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.equal(internals.budgetHolds.get('assistant')?.state, 'holding', 'the first start waits for compression');
+      internals.holdProviderAcceleration(framework.getAgent('assistant')!, accelerationLimit({ messages: [] } as unknown as NormalizedRequest));
+      refusing = false;
+      internals.releaseBudgetHold('assistant');
+      await framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 0, 'the released start waits on the provider hold');
+      await say(framework, 'a message during the provider wait', addressed('discord:dm:antra'));
+      await release(framework);
+      assert.equal(membrane.calls.length, 1, 'the turn ran once');
+      const notices = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice')
+        .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+      const notice = notices.find((t) => t.includes('addressed you from discord:dm:antra'));
+      assert.ok(notice, 'the arrival is announced');
+      assert.ok(notice!.includes('while your turn waited'), notice);
+      assert.ok(!notice!.includes('for compression') && !notice!.includes('on a provider hold'), `it names neither wait alone: ${notice}`);
+    } finally {
+      proto.compile = was.compile;
+      proto.isReady = was.isReady;
+      await framework.stop();
+    }
   });
 
   it('under the default rule, a re-inference on unstreamed tool results moves nothing and announces an addressed arrival, naming the re-inference', async () => {
