@@ -912,6 +912,23 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
     } finally { await f.close(); }
   });
 
+  it("a room turn that turned private at a tool boundary is re-run by its refusal rewind as a private turn, once the shed has taken the operator's message out of its window", async () => {
+    const speaker = new SpeechProbe();
+    const { f, probe } = await make({ rule: 'delivery', modules: [speaker], agent: { refusalHandling: { autoRewind: true, maxRewinds: 3 } } });
+    try {
+      probe.acts.push(async () => { f.framework.pushEvent(surfaceMessage(SECRET)); });
+      script(f, [act('a1', 'zz-before the message'), createMockResponse([], 'refusal')], [say('zz-after the rewind')]);
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      assert.ok(storedText(f, 'so your plain speech goes to no channel for the rest of this turn').length > 0, 'premise: the room turn turned private');
+      const presented = (f.framework.getAgent('agent')!.getContextManager() as unknown as { getPresentedMessages(): Array<{ content: unknown }> }).getPresentedMessages();
+      assert.ok(!presented.some((m) => JSON.stringify(m.content).includes(SECRET)), "premise: the shed took the operator's message out of the agent's window");
+      const after = speaker.heard.find((h) => h.text.includes('zz-after the rewind'));
+      assert.ok(after, `premise: the rewind's retry ran: ${JSON.stringify(speaker.heard)}`);
+      assert.equal(after.private, true, "the rewind's retry was private");
+    } finally { await f.close(); }
+  });
+
   it("a private turn's own tool_results_ready, batched with another wake while the turn is open, starts with the batch", async () => {
     const { f } = await make();
     try {
