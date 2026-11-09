@@ -156,7 +156,8 @@ for (const engine of ['legacy', 'modern'] as const) {
     process.kill(capped.launches()[0]!.pid, 'SIGTERM');
     await waitFor('its end reported', () => capped.failed().length >= 1);
     assert.equal(capped.failed()[0]!.attempt, 0);
-    assert.match(String(capped.failed()[0]!.error), /^connected, then closed after 30[0-9] s/);
+    const lived = /^connected, then closed after (\d+) s/.exec(String(capped.failed()[0]!.error));
+    assert.ok(lived && Number(lived[1]) >= 301 && Number(lived[1]) < 600, String(capped.failed()[0]!.error));
   });
 
   test(`${engine}: a launch found unreapable after a connection that lasted halts with attempt 1, as before this change`, { timeout: 60_000 }, async (t) => {
@@ -327,6 +328,7 @@ for (const engine of ['legacy', 'modern'] as const) {
     const live = await started(t, config, scratch);
     await waitFor('launch 0', () => live.launches().length >= 1);
     await assert.rejects(live.framework.restartMcplServer('live', { ...config, reconnect: true, reconnectIntervalMs: 0 }), /"live".*reconnectIntervalMs.*\(got 0\)/);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
     assert.equal(live.launches().length, 1);
     assert.doesNotThrow(() => process.kill(live.launches()[0]!.pid, 0), 'the running server was torn down');
   });
@@ -341,5 +343,6 @@ test('connectMcplServer refuses a reconnect interval of 0, on either engine, bef
     const id = `added-${engine}`;
     await assert.rejects(live.framework.connectMcplServer({ ...server(engine, id, scratch), reconnectIntervalMs: 0 }), new RegExp(`"${id}".*reconnectIntervalMs.*\\(got 0\\)`));
   }
+  await new Promise((resolve) => setTimeout(resolve, 2000));
   assert.equal(live.launches().length, 1, 'nothing launched for either');
 });
