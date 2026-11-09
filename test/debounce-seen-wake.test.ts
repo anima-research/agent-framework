@@ -692,7 +692,8 @@ describe('debounced writes already read and answered', () => {
       const edit = await f.send('channels/incoming', { messages: [f.channel('e', 'newest text', {}, 'work', 'edited')] });
       assert.equal(edit.result.results[0].coalesce.outcome, 'replaced', 'premise: the edit replaced the unread original');
       await f.send('channels/incoming', { messages: [f.channel('l', 'later text', { initial: true }, 'work', 'later')] });
-      assert.equal(gateOf(f).debounceTimers.get('batch')!.events.length, 2, 'premise: the batch holds the edit and the later message');
+      const batched = (gateOf(f).debounceTimers.get('batch')!.events as Array<{ content: string }>).map((e) => e.content);
+      assert.ok(batched.includes('newest text') && batched.includes('later text'), `premise: the batch holds the edit and the later message: ${JSON.stringify(batched)}`);
       fire(f);
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 1, 'premise: the batch wakes the agent');

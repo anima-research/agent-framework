@@ -21,4 +21,6 @@
   write whose placement names no stored message (still unfilled, or held in
   memory with no id yet) keeps the wake plain too. A host that handles
   `requestInference` itself and wants a batched wake dropped once the agent
-  has answered it reads `provenance.writes`.
+  has answered it reads `provenance.writes`. Unchanged: when the gate
+  requests a wake, and a wake that isn't a batch's, which still carries
+  `readsRow` where 0.33.0 gave it one.

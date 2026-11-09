@@ -41,13 +41,13 @@
   start only for a batch of one message still the newest entry when it fired;
   now any batch's start does, and only where something follows its messages.
 - The reply judge, and `healthSnapshot()`'s `upcomingWakes`, are told that a
-  pending debounced batch whose every event has a message of its own written
-  to that agent's window only may wake it (`certain: false`), and so may the
-  requests queued or held for it when each reads rows (`readsRow`,
-  `readsRows`), since such a wake starts no turn once the agent has answered
-  them. A batch with an event that has no message of its own, or one written
-  to another agent's window, stays certain, and so does a request that reads
-  no row.
+  pending debounced batch only may wake an agent (`certain: false`) where
+  every event delivery gives that agent has a message of its own written to
+  its window, and so may the requests queued or held for it when each reads
+  rows (`readsRow`, `readsRows`), since such a wake starts no turn once the
+  agent has answered them. A batch that gives an agent an event with no
+  message of its own, or one written to another agent's window, stays
+  certain, and so does a request that reads no row.
 - `gate:judge-verdict`'s `woke` still says whether the gate goes on to deliver
   the batch to wake the agent, and such a delivery may now start no turn.
 - Wake onboarding's offer describes a suggested `debounce` rule as

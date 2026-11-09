@@ -418,8 +418,9 @@ function withoutWrite(event: PendingEvent): PendingEvent {
  * The rows a batched wake's line can name, on the provenance of every wake
  * the batch requests: the line the gate wrote for its quoted events, and each
  * event with a message of its own whose placement the host gave, whether or
- * not the wake carries that event's write. The framework's own wiring reads
- * it; it isn't part of WakeProvenance.
+ * not the wake carries that event's write. It is empty where the batch has
+ * nothing to name, so a merged turn can tell a batch's wake from another.
+ * The framework's own wiring reads it; it isn't part of WakeProvenance.
  */
 export const BATCH_LINE_ROWS: unique symbol = Symbol('batch-line-rows');
 export type MarkedProvenance = WakeProvenance & { [BATCH_LINE_ROWS]?: WritePlacement[] };
@@ -2488,7 +2489,8 @@ export class EventGate {
      *  was given it) has answered a request that carried it, its answer's
      *  publication not required: `false` only when the host knows it hasn't.
      *  Asked when a reply judge answers reply, for each event of the batch it
-     *  judged that has a write: an event answered before the judge answered
+     *  judged whose write names a stored message (its agent and message id):
+     *  an event answered before the judge answered
      *  loses its write, so the batch's wake carries no writes and starts its
      *  turn. Absent, or an answer other than `false` (a throw included): the
      *  event counts as answered then. */
@@ -4262,9 +4264,7 @@ export class EventGate {
     // channel last saw any traffic. Ambient-only batches set no locus, and
     // name the channels they came from (`batchChannels`).
     const chosen = wakeProvenance(events);
-    const provenance: MarkedProvenance | undefined = writes || lineRows.length > 0
-      ? { ...chosen, ...(writes ? { writes } : {}), ...(lineRows.length > 0 ? { [BATCH_LINE_ROWS]: lineRows } : {}) }
-      : chosen;
+    const provenance: MarkedProvenance = { ...chosen, ...(writes ? { writes } : {}), [BATCH_LINE_ROWS]: lineRows };
     for (const agentName of woken) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
       woke?.push(agentName);
@@ -4412,7 +4412,10 @@ export class EventGate {
         ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
         : {
             at: state.dueAt,
-            certain: !state.events.every(({ inContext, after }) => inContext && isWrite(after) && agentNames.every((agent) => after.agent === agent)),
+            certain: agentNames.some((agent) => {
+              const seen = state.events.filter((e) => e.recipients === undefined || e.recipients.includes(agent));
+              return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent);
+            }),
             kind: 'debounce',
             what: `rule ${quotedValue(name)}'s debounced batch of ${batch}`,
           });

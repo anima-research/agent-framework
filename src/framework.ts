@@ -1304,8 +1304,9 @@ const REARMED: unique symbol = Symbol('rearmed');
  * the wake of every agent the batch wakes: a fresh start of the turn it
  * starts writes one `[Gate: …]` line naming those of them in the agent's
  * window, as its own row, where a row a reply could be meant for follows
- * them there (placeBatchLine). Internal: a mark the framework's own gate wiring sets,
- * exported for tests.
+ * them there (placeBatchLine). It is empty for a batch with nothing to name,
+ * so a merge still takes the wake as a batch's (mergedBatchRows). Internal:
+ * a mark the framework's own gate wiring sets, exported for tests.
  */
 export const BATCH_ROWS: unique symbol = Symbol('batch-rows');
 const UNPROMPTED: unique symbol = Symbol('unprompted');
@@ -5616,8 +5617,8 @@ export class AgentFramework {
             // The rows the batch's line can name, on every agent's wake: each
             // one's start decides its own line by its own window (placeBatchLine).
             ...((): Partial<MarkedRequest> => {
-              const rows = ((provenance as MarkedProvenance | undefined)?.[BATCH_LINE_ROWS] ?? []).flatMap((placed) => (placed.messageId ? [placed.messageId] : []));
-              return rows.length > 0 ? { [BATCH_ROWS]: rows } : {};
+              const placed = (provenance as MarkedProvenance | undefined)?.[BATCH_LINE_ROWS];
+              return placed ? { [BATCH_ROWS]: placed.flatMap((p) => (p.messageId ? [p.messageId] : [])) } : {};
             })(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
             // as TELEMETRY fields — the host's stamp reads them.
@@ -19529,6 +19530,7 @@ export class AgentFramework {
     const eventServer = (event as { serverId?: unknown }).serverId;
     const stampSource = typeof eventServer === 'string' && eventServer !== '' ? eventServer : source;
     let added: WritePlacement | undefined;
+    let wakeAfter: WritePlacement | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
@@ -19544,7 +19546,10 @@ export class AgentFramework {
           placement, ...(audience ? { audience } : {}),
           ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source: stampSource } } : {}),
         });
-        if (id && response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined && !audience && !heldFromResidents(metadata)) added = placement;
+        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) {
+          wakeAfter = placement;
+          if (id && !audience && !heldFromResidents(metadata)) added = placement;
+        }
         // A write kept in memory (a surgery's hold, or the wait for its
         // agent's recovery) has no id yet: it is traced once, as it is
         // stored ('surgery-release').
@@ -19608,7 +19613,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            ...this.readsRowFor(added, agentName),
+            ...this.readsRowFor(wakeAfter, agentName),
           });
         }
       }
@@ -34400,39 +34405,46 @@ export class AgentFramework {
    *   where the rows are the newest; either way the line stays undecided, for
    *   a later fresh start of the same wake (a provider hold's release).
    * - Once written for the agent, by the rows' identity, no later start of
-   *   the wake writes it again. A write that fails doesn't fail the start: the
-   *   line stays undecided; one that landed though it threw counts as written.
+   *   the wake writes it again. A read or write that fails doesn't fail the
+   *   start: the line stays undecided; one that landed though it threw counts
+   *   as written.
    */
   private placeBatchLine(agent: Agent, rows: readonly string[]): void {
     const slot = this.deliveryAgent();
     if (!slot || (agent !== slot && !this.presents(agent))) return;
     if (this.quiesced || this.batchRowsPlaced(rows, agent.name)) return;
-    const cm = agent.getContextManager();
-    const held = rows
-      .filter((id) => this.windowHolds(agent, id))
-      .map((id) => cm.getMessage(id as MessageId))
-      .filter((m): m is StoredMessage => m != null && !isGateLine(m));
-    if (held.length === 0 || this.batchIsNewest(agent, rows)) return;
-    const now = Date.now();
-    const byChannel = new Map<string, { name: string | undefined; count: number; oldest: number }>();
-    for (const m of held) {
-      const md = (m.metadata ?? {}) as { serverId?: unknown; channelId?: unknown; channelName?: unknown };
-      const serverId = typeof md.serverId === 'string' ? md.serverId : undefined;
-      const channelId = typeof md.channelId === 'string' && md.channelId !== '' ? md.channelId : undefined;
-      const label = typeof md.channelName === 'string' && md.channelName !== '' ? md.channelName : undefined;
-      const name = channelId === undefined ? undefined
-        : serverId === undefined ? suppliedValue(channelId)
-        : label !== undefined ? this.labelledChannel({ serverId, channelId, label: label.startsWith('#') ? label : `#${label}` })
-        : this.channelShown({ serverId, channelId });
-      const at = m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp);
-      const key = JSON.stringify([serverId ?? null, channelId ?? null]);
-      const entry = byChannel.get(key) ?? { name, count: 0, oldest: Number.isFinite(at) ? at : now };
-      entry.count += 1;
-      if (Number.isFinite(at)) entry.oldest = Math.min(entry.oldest, at);
-      byChannel.set(key, entry);
+    let text: string;
+    try {
+      const cm = agent.getContextManager();
+      const held = rows
+        .filter((id) => this.windowHolds(agent, id))
+        .map((id) => cm.getMessage(id as MessageId))
+        .filter((m): m is StoredMessage => m != null && !isGateLine(m));
+      if (held.length === 0 || this.batchIsNewest(agent, rows)) return;
+      const now = Date.now();
+      const byChannel = new Map<string, { name: string | undefined; count: number; oldest: number }>();
+      for (const m of held) {
+        const md = (m.metadata ?? {}) as { serverId?: unknown; channelId?: unknown; channelName?: unknown };
+        const serverId = typeof md.serverId === 'string' ? md.serverId : undefined;
+        const channelId = typeof md.channelId === 'string' && md.channelId !== '' ? md.channelId : undefined;
+        const label = typeof md.channelName === 'string' && md.channelName !== '' ? md.channelName : undefined;
+        const name = channelId === undefined ? undefined
+          : serverId === undefined ? suppliedValue(channelId)
+          : label !== undefined ? this.labelledChannel({ serverId, channelId, label: label.startsWith('#') ? label : `#${label}` })
+          : this.channelShown({ serverId, channelId });
+        const at = m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp);
+        const key = JSON.stringify([serverId ?? null, channelId ?? null]);
+        const entry = byChannel.get(key) ?? { name, count: 0, oldest: Number.isFinite(at) ? at : now };
+        entry.count += 1;
+        if (Number.isFinite(at)) entry.oldest = Math.min(entry.oldest, at);
+        byChannel.set(key, entry);
+      }
+      const lines = [...byChannel.values()].map(({ name, count, oldest }) => batchReferenceLine(count, name, oldest, now));
+      text = `[${NOTICE_TAG.gate}: ${held.length} event${held.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    } catch (err) {
+      console.error(`[gate] ${agent.name}: a batched wake's line couldn't be decided, since reading the window failed; the turn goes on without it, and a later fresh start of the wake decides it again:`, err);
+      return;
     }
-    const lines = [...byChannel.values()].map(({ name, count, oldest }) => batchReferenceLine(count, name, oldest, now));
-    const text = `[${NOTICE_TAG.gate}: ${held.length} event${held.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const metadata = { source: 'gate:debounce' } as MessageMetadata;
     const before = this.storedCountOf(agent);
     let id: MessageId;

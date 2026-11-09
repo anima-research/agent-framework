@@ -283,7 +283,7 @@ describe('judge rules: verdicts', () => {
 
     judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1234 });
     await until(() => wakes.length === 1, 'the wake');
-    assert.deepStrictEqual(wakes, [{ agentName: 'agent', reason: 'gate:debounce' }]);
+    assert.deepStrictEqual(wakes, [{ agentName: 'agent', reason: 'gate:debounce', lineRows: [] }], 'a batch wake, whose line has nothing to name');
     assert.strictEqual(messages.length, 0, 'events stored at arrival get no line');
     const verdict = traces.find((t) => t.type === 'gate:judge-verdict');
     assert.ok(verdict);
