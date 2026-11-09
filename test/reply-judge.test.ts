@@ -659,10 +659,43 @@ describe('reply judge: the document', () => {
       ...Array.from({ length: 9 }, (_, i) => ({ at: now + 2_000 + i, certain: i < 7, what: `wake ${i}` })),
     ];
     const text = ifYouWait(wakes, 'Scout', now);
-    assert.ok(text.includes('- in 1 s: a wake already queued (nudge from Ann &lt;mod&gt; &#91;x&#93;)'), text);
+    assert.ok(text.includes('- in 1 s: a wake already queued (nudge from Ann &lt;mod&gt; \\[x\\])'), text);
     assert.ok(text.includes('- and 2 more, each only maybe'), text);
     const some = Array.from({ length: 11 }, (_, i) => ({ at: now + 1_000 + i, certain: i !== 9, what: `wake ${i}` }));
     assert.ok(ifYouWait(some, 'Scout', now).includes('- and 3 more, 1 of them only maybe'));
+  });
+
+  it("asks the framework whether it would refuse the call, on the judge's model, before reading the agent's context: a refused call reads none and sends nothing", async () => {
+    let previews = 0;
+    const asked: Array<[string, string]> = [];
+    const refused = Object.assign(new Error('held'), { providerAdmission: 'deferred' as const });
+    let answer: Error | undefined = refused;
+    const { membrane, requests } = fakeMembrane();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0], options: { model: 'judge-model' },
+      preview: async () => { previews++; return { messages: conversation(2), config: { model: 'x', maxTokens: 1 } }; },
+      refusal: (agentName, model) => { asked.push([agentName, model]); return answer; },
+    });
+    await assert.rejects(judge.judge(judgeRequest()), (err: unknown) => err === refused);
+    assert.deepStrictEqual(asked, [['Scout', 'judge-model']]);
+    assert.strictEqual(previews, 0, 'a refused call reads no context');
+    assert.strictEqual(requests.length, 0, 'and sends no request');
+    answer = undefined;
+    await judge.judge(judgeRequest());
+    assert.strictEqual(previews, 1, 'a call the framework would admit reads the context');
+    assert.strictEqual(requests.length, 1);
+  });
+
+  it("built with deps that give no refusal answer, reads the agent's context and leaves the refusal to the call", async () => {
+    let previews = 0;
+    const refused = Object.assign(new Error('held'), { providerAdmission: 'deferred' as const });
+    const membrane = { complete: async () => { throw refused; } } as unknown as Membrane;
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => { previews++; return { messages: conversation(2), config: { model: 'x', maxTokens: 1 } }; },
+    });
+    await assert.rejects(judge.judge(judgeRequest()), (err: unknown) => err === refused);
+    assert.strictEqual(previews, 1);
   });
 
   it("shows no failed-turn line when it isn't given a failed turn, and a provider that throws counts as none", async () => {
@@ -682,7 +715,8 @@ describe('reply judge: the document', () => {
   it("shows a message's text and an event's over several lines, indented under the message's name or inside the event's item, escaped, with names, channels and authors each on one line", () => {
     const text = renderMessage(msg('Ann', 'the beds need:\r\n- compost\n- <b>water</b> & mulch'));
     assert.strictEqual(text, '[Ann] the beds need:\n  - compost\n  - &lt;b&gt;water&lt;/b&gt; &amp; mulch');
-    assert.strictEqual(renderMessage(msg('Ann [mod]\nB', 'hi')), '[Ann &#91;mod&#93; B] hi');
+    assert.strictEqual(renderMessage(msg('Ann [mod]\nB', 'hi')), '[Ann \\[mod\\] B] hi');
+    assert.strictEqual(renderMessage(msg('Ann\\ [x]', 'hi')), '[Ann\\\\ \\[x\\]] hi', "a backslash in a participant's name is escaped, as in a tool's");
     const question = judgeQuestion({
       events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden\nbeds', authorId: 'u1', addressed: false, content: 'the beds need:\n- compost\n- a < b', at: 1_000_000 }],
     }, 'Scout', 1_000_000);
@@ -745,6 +779,13 @@ describe('reply judge: the document', () => {
         { type: 'tool_result', toolUseId: 't1', toolName: 42, content: 'ok' },
       ],
     } as unknown as NormalizedMessage), '[Scout] [calls 42] {}\n  [42 returned] ok', "a name that isn't a string is shown as its text, as 0.32.0 showed it");
+    assert.strictEqual(renderMessage({
+      participant: 'Scout',
+      content: [
+        { type: 'tool_use', id: 't1', name: 'a<b>&c', input: {} },
+        { type: 'tool_result', toolUseId: 't1', toolName: 'a<b>&c', content: 'ok' },
+      ],
+    } as unknown as NormalizedMessage), '[Scout] [calls a&lt;b&gt;&amp;c] {}\n  [a&lt;b&gt;&amp;c returned] ok', "a tool's name gets the entities once, from the message's quoting, where it's called and where it returns");
     assert.strictEqual(renderMessage({
       participant: 'Scout',
       content: [
@@ -827,7 +868,11 @@ describe('reply judge: the document', () => {
     const question = judgeQuestion({
       events: [{ eventType: 'mcpl:channel-incoming', channel: '#r&d <beds> [b]', authorId: 'u<1>\n[x]', addressed: false, content: 'hi', at: 1_000_000 }],
     }, 'Scout', 1_000_000);
-    assert.ok(question.includes('- 0s ago in "#r&amp;d &lt;beds&gt; &#91;b&#93;" from "u&lt;1&gt; &#91;x&#93;": hi'), question);
+    assert.ok(question.includes('- 0s ago in "#r&amp;d &lt;beds&gt; [b]" from "u&lt;1&gt; [x]": hi'), question);
+    const slashed = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#a\\b', authorId: 'u1', addressed: false, content: 'hi', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(slashed.includes('- 0s ago in "#a\\\\b" from "u1": hi'), `a channel's one backslash reads as JSON's two: ${slashed}`);
     const named = judgeQuestion({
       events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: 'u1 in #admin', addressed: false, content: 'hi', at: 1_000_000 }],
     }, 'Scout', 1_000_000);

@@ -2,7 +2,8 @@
  * ReplyJudge — the small model a `judge` wake rule asks whether now is a good
  * time for the agent to reply (JudgeConfig).
  *
- * Per batch it takes the agent's context as a dry run of the request it would
+ * Per batch, unless the framework says it would refuse the call
+ * (`ReplyJudgeDeps.refusal`), it takes the agent's context as a dry run of the request it would
  * send if woken now (the framework's previewActivation, which commits
  * nothing), without what modules' gatherContext and MCPL servers'
  * beforeInference would inject, since gathering those has side effects. It
@@ -91,6 +92,12 @@ export interface ReplyJudgeDeps {
    *  judge as it binds compression, refusing a call rather than waiting under
    *  a hold, and never waits on the agent's turn. */
   membraneFor: (agentName: string) => Membrane;
+  /** Whether the framework would refuse the judge's call on `model` for the
+   *  agent now, as `membraneFor`'s call would: the refusal to throw, or
+   *  undefined. Asked before the agent's context is read, so a refused call
+   *  reads nothing; the membrane's call still refuses one whose hold began
+   *  since. Left out, the context is read and the call alone refuses. */
+  refusal?: (agentName: string, model: string) => Error | undefined;
   options?: ReplyJudgeOptions;
   /** Which of the batch's agents the judge reads the context of. */
   chooseAgent: (agentNames: string[]) => string | undefined;
@@ -129,7 +136,7 @@ function quoted(text: string): string {
 }
 
 function field(text: string): string {
-  return escapeText(oneLine(text)).replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+  return escapeText(labelName(text));
 }
 
 /** A message as the document shows it: its participant, and each block as
@@ -351,8 +358,8 @@ export function judgeQuestion(
   let i = request.events.length;
   while (i > 0) {
     const e: JudgeEventSummary = request.events[i - 1]!;
-    const where = e.channel ? ` in ${field(JSON.stringify(oneLine(e.channel)))}` : '';
-    const who = e.authorId ? ` from ${field(JSON.stringify(oneLine(e.authorId)))}` : '';
+    const where = e.channel ? ` in ${escapeText(JSON.stringify(oneLine(e.channel)))}` : '';
+    const who = e.authorId ? ` from ${escapeText(JSON.stringify(oneLine(e.authorId)))}` : '';
     const addressed = e.addressed ? ' (addresses the agent)' : '';
     const line = `- ${ago(e.at, now)}${addressed}${where}${who}: ${quoted(unlabelled(e.content))}`;
     if (lines.length > 0 && used + line.length > maxEventChars) break;
@@ -376,6 +383,7 @@ export function judgeQuestion(
 
 export class ReplyJudge {
   private readonly membraneFor: ReplyJudgeDeps['membraneFor'];
+  private readonly refusal: ReplyJudgeDeps['refusal'];
   private readonly cacheTtl: '5m' | '1h';
   private readonly model: string;
   private readonly maxInputTokens: number;
@@ -391,6 +399,7 @@ export class ReplyJudge {
 
   constructor(deps: ReplyJudgeDeps) {
     this.membraneFor = deps.membraneFor;
+    this.refusal = deps.refusal;
     this.cacheTtl = deps.options?.cacheTtl === '1h' ? '1h' : '5m';
     this.model = deps.options?.model || DEFAULT_JUDGE_MODEL;
     const max = deps.options?.maxInputTokens;
@@ -429,14 +438,13 @@ export class ReplyJudge {
    * agent's preview and the wakes waiting for it have been read.
    */
   async buildRequest(request: JudgeRequest, now?: number): Promise<{ request: NormalizedRequest; agentName: string; chars: number }> {
-    const { request: built, agentName, chars } = await this.build(request, now);
+    const { request: built, agentName, chars } = await this.build(request, this.chooseAgent(request.agentNames), now);
     return { request: built, agentName, chars };
   }
 
   private async build(
-    request: JudgeRequest, now: number | undefined, atRatio?: number, fresh = false,
+    request: JudgeRequest, agentName: string | undefined, now: number | undefined, atRatio?: number, fresh = false,
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
-    const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
     const preview = await this.preview(agentName);
@@ -603,7 +611,10 @@ export class ReplyJudge {
   }
 
   private async decide(request: JudgeRequest): Promise<JudgeVerdict> {
-    let built = await this.build(request, undefined);
+    const agentName = this.chooseAgent(request.agentNames);
+    const refused = agentName === undefined ? undefined : this.refusal?.(agentName, this.model);
+    if (refused) throw refused;
+    let built = await this.build(request, agentName, undefined);
     let response: NormalizedResponse;
     try {
       response = await this.ask(built, request.signal);
@@ -611,7 +622,7 @@ export class ReplyJudge {
       if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= MIN_CHARS_PER_TOKEN) throw err;
       this.anchors.delete(built.agentName);
       const refused = built;
-      built = await this.build(request, undefined, MIN_CHARS_PER_TOKEN, true);
+      built = await this.build(request, agentName, undefined, MIN_CHARS_PER_TOKEN, true);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request on rule ${quotedValue(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `

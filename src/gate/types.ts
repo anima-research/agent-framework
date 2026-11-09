@@ -73,7 +73,7 @@ export interface PassiveSampleConfig {
  * times out wakes the agent (fail open),
  * unless the host set its `onError` to `"skip"`. A call whose request the
  * framework refuses to send isn't a failure, and `onError` decides it as well: under
- * `"skip"` its batch is held while the judge's calls are refused
+ * `"skip"` its batch is held to the refusal's stated end or a release
  * (ReplyJudgeOptions.onError).
  */
 export interface JudgeConfig {
@@ -359,24 +359,21 @@ export interface ReplyJudgeOptions {
    * never silences the agent); `"skip"` doesn't. It decides a call whose
    * request the framework refuses to send too (a hold on the agent's provider
    * calls or on the judge's model, a surgery's hold on the store, or a
-   * stopping framework), which isn't counted as a failure. Under `"wake"`,
-   * the refused call's batch is delivered, and while a refusal's stated
-   * wait lasts each judge rule's batch is delivered without the judge being
-   * asked, unless a turn that changes what the judge reads, or the host's
-   * quiesce, holds the batch past the wait's end, or it waits behind a call
-   * of its rule that the judge answers WAIT, when it goes to the judge.
-   * Under `"skip"`, the batch is held in memory while the judge's
-   * calls are refused. While a refusal's
-   * stated wait lasts, batches that arrive are held with it, a rule keeping
-   * its newest 100 events as it does while a turn holds them, and they go
-   * back to the judge once the wait ends or the hold is released, and no turn that
-   * changes what the judge reads runs and the host isn't quiesced. A REPLY or
-   * WAIT on a call already in flight also ends the refusal, and they go back to
-   * the judge then, once no turn or quiesce holds them. A refusal that states no end, or no time left, keeps them held until the next refusal
-   * takes its place, a judge call gets a REPLY or WAIT (a later batch's call takes in its own rule's held batch), or the gate is
-   * told the hold ended or was released (`EventGate.providerCallsReleased`).
-   * A later call that fails lets its batch go, with the held events it took
-   * in, as a failed call's batch goes under `"skip"`.
+   * stopping framework), which isn't counted as a failure. Each batch is
+   * asked about. Under `"wake"`, a refused call's batch is delivered, and
+   * since nothing is held, gate_status's notices name no refusal: the rule's
+   * `judgeState.last` shows it. Under
+   * `"skip"`, it's held in memory, its rule keeping its newest 100 events as
+   * it does while a turn holds them. It goes back to the judge at the
+   * refusal's stated end, or once the gate is told the hold ended or was
+   * released (`EventGate.providerCallsReleased`), when no turn that changes
+   * what the judge reads runs and the host isn't quiesced. A refusal that
+   * states no end, or no time left, waits for that release. A batch its rule
+   * fires meanwhile takes the held events in and is asked about. Refused
+   * too, the whole is held to the new refusal's end. A held batch's first
+   * refusal is logged and traced, and so is its first after a release or
+   * after a turn stops a call that took it in; the rest are only counted. A later call that fails lets its batch go, with
+   * the held events it took in, as a failed call's batch goes under `"skip"`.
    */
   onError?: 'wake' | 'skip';
   /** The judge's effort (`output_config.effort`). Default `"low"`: a short

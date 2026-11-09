@@ -612,8 +612,9 @@ export type TraceEvent =
        *  provider refused its first request as too long is its second;
        *  `woke` is whether the batch then woke the agent (an error or a
        *  refusal does by the host's onError: under "skip" a refused batch is
-       *  held while the judge's calls are refused, and goes back to the judge
-       *  once they aren't).
+       *  held to the refusal's stated end or a release, then goes back to the
+       *  judge, and not every refusal of a held batch is traced, as
+       *  `ReplyJudgeOptions.onError` says).
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';

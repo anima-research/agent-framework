@@ -5529,6 +5529,7 @@ export class AgentFramework {
       const judgeOptions = config.gate.judge ?? undefined;
       const judge = judgeOptions?.enabled === false ? undefined : new ReplyJudge({
         membraneFor: (agentName) => framework.judgeMembraneFor(agentName),
+        refusal: (agentName, model) => framework.judgeRefusalFor(agentName, model),
         options: judgeOptions,
         recordUsage: (agentName, usage) => {
           framework.usageTracker.onInferenceCompleted(agentName, usage, usage.estimatedCost
@@ -6945,29 +6946,36 @@ export class AgentFramework {
    */
   private judgeMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting(async (run, model) => {
-      try {
-        this.withdrawMaintenanceUnderSurgery();
-        this.withdrawMaintenanceWhenStopping(agentName);
-      } catch (withdrawn) {
-        throw Object.assign(withdrawn as Error, { providerAdmission: 'deferred' as const });
-      }
-      this.refuseHeldProviderModel(agentName, model);
-      if (this.cooldownBlocksAuxiliary(agentName)) {
-        const cooldown = this.providerAccelerationCooldowns.get(agentName)!;
-        throw Object.assign(new MembraneError({
-          type: 'rate_limit',
-          retryable: true,
-          retryAfterMs: Math.max(0, cooldown.until - Date.now()),
-          message: `${agentName}'s provider calls are held (${cooldown.reason}), so the reply judge makes none`,
-          rawError: undefined,
-        }), { providerAdmission: 'deferred' as const });
-      }
+      const refused = this.judgeRefusalFor(agentName, model);
+      if (refused) throw refused;
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
         throw error;
       }
     });
+  }
+  private judgeRefusalFor(agentName: string, model: string | undefined): Error | undefined {
+    try {
+      this.withdrawMaintenanceUnderSurgery();
+      this.withdrawMaintenanceWhenStopping(agentName);
+    } catch (withdrawn) {
+      return Object.assign(withdrawn as Error, { providerAdmission: 'deferred' as const });
+    }
+    try {
+      this.refuseHeldProviderModel(agentName, model);
+    } catch (held) {
+      return held as Error;
+    }
+    if (!this.cooldownBlocksAuxiliary(agentName)) return undefined;
+    const cooldown = this.providerAccelerationCooldowns.get(agentName)!;
+    return Object.assign(new MembraneError({
+      type: 'rate_limit',
+      retryable: true,
+      retryAfterMs: Math.max(0, cooldown.until - Date.now()),
+      message: `${agentName}'s provider calls are held (${cooldown.reason}), so the reply judge makes none`,
+      rawError: undefined,
+    }), { providerAdmission: 'deferred' as const });
   }
   /**
    * A conversation agent's auxiliary calls (its context manager's
@@ -13304,6 +13312,20 @@ export class AgentFramework {
     if (!pin) return;
     routing.inputsPin = undefined;
     pin.agent.unpinTurnInputs(pin.id);
+  }
+
+  /** End a turn exhausted: settle it, mark it the agent's failed last turn
+   *  for the reply judge (lastStartFailed), and trace it. A silent start that
+   *  throws before its stream marks it without settling, since it has no part
+   *  in an open turn. */
+  private failTurn(
+    agent: Agent,
+    settle: { failure: { error: string; statedWaitMs?: number }; closes: TurnRouting | undefined; stream?: TurnRouting } | undefined,
+    trace?: Omit<Extract<TraceEventInput, { type: 'inference:exhausted' }>, 'type' | 'agentName'>,
+  ): void {
+    if (settle) this.settleAgent(agent.name, { stopReason: 'exhausted', speech: '', ...settle.failure }, settle.closes, settle.stream);
+    this.lastStartFailed.set(agent, Date.now());
+    if (trace) this.emitTrace({ type: 'inference:exhausted', agentName: agent.name, ...trace });
   }
 
   /** A logical turn's end, for every agent: it closes the agent's open
@@ -26815,12 +26837,9 @@ export class AgentFramework {
       // the next start opens a turn of its own rather than continuing this
       // one's routing, and an ephemeral run fails with the error rather than
       // waiting out its watchdog. A silent start has no part in an open turn.
-      this.lastStartFailed.set(agent, Date.now());
-      if (!trigger?.suppressProse) {
-        this.settleAgent(agent.name, {
-          stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
-        }, this.openLogical.get(agent.name));
-      }
+      this.failTurn(agent, trigger?.suppressProse ? undefined : {
+        failure: { error: error instanceof Error ? error.message : String(error) }, closes: this.openLogical.get(agent.name),
+      });
       this.endStatedWaitRun(agent.name);
       // The agent's window at the event gate ends here too, while this start
       // still holds the turn token, as at the provider-wait hold above. A
@@ -27956,16 +27975,11 @@ export class AgentFramework {
         }
         // This start's own logical turn: a failure before its stream exists
         // settles it, and no other start's.
-        this.settleAgent(agent.name, {
-          stopReason: 'exhausted',
-          speech: '',
-          ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
-        }, routing);
         if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-        this.lastStartFailed.set(agent, Date.now());
-        this.emitTrace({
-          type: 'inference:exhausted',
-          agentName: agent.name,
+        this.failTurn(agent, {
+          failure: statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message },
+          closes: routing,
+        }, {
           error: err.message,
           // Drives the poison-history breaker (shedMayHelp: an
           // `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
@@ -29903,16 +29917,12 @@ export class AgentFramework {
               }
             } else {
               this.noteFailedTurnEnd(agent, streamRouting);
-              this.settleAgent(agent.name, {
-                stopReason: 'exhausted',
-                speech: '',
-                ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
-              }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-              this.lastStartFailed.set(agent, Date.now());
-              this.emitTrace({
-                type: 'inference:exhausted',
-                agentName: agent.name,
+              this.failTurn(agent, {
+                failure: statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message },
+                closes: this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined,
+                stream: streamRouting,
+              }, {
                 error: err.message,
                 // Drives the poison-history breaker. `retryable` is kept for
                 // observability, but the breaker gates on
@@ -29992,17 +30002,7 @@ export class AgentFramework {
                 this.abandonAgentScripts(agent.name, `stream aborted (${reason})`, streamRouting);
                 agent.reset();
                 this.noteFailedTurnEnd(agent, streamRouting);
-                this.settleAgent(agent.name, {
-                  stopReason: 'exhausted',
-                  speech: '',
-                  error: terminal,
-                }, streamRouting);
-                this.lastStartFailed.set(agent, Date.now());
-                this.emitTrace({
-                  type: 'inference:exhausted',
-                  agentName: agent.name,
-                  error: terminal,
-                });
+                this.failTurn(agent, { failure: { error: terminal }, closes: streamRouting }, { error: terminal });
                 this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
                 // inference log so future investigations can attribute the
@@ -30288,19 +30288,11 @@ export class AgentFramework {
         return;
       }
       this.noteFailedTurnEnd(agent, streamRouting);
-      this.settleAgent(agent.name, {
-        stopReason: 'exhausted',
-        speech: '',
-        ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
-      }, streamRouting);
       if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-      this.lastStartFailed.set(agent, Date.now());
-      this.emitTrace({
-        type: 'inference:exhausted',
-        agentName: agent.name,
-        error: err.message,
-        ...this.classifyInferenceError(err),
-      });
+      this.failTurn(agent, {
+        failure: statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message },
+        closes: streamRouting,
+      }, { error: err.message, ...this.classifyInferenceError(err) });
       this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
