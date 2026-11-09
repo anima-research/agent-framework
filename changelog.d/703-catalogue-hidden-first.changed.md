@@ -2,8 +2,9 @@
   available tools hidden from it right after its header and any
   diagnostics, before the index: one line each, with its source, the
   first line of the description it would show (its own override, else the
-  configured default, else the installed one), cut at 200 characters and
-  marked `…`, and the offset and limit of its full definition. Deciding
+  configured default, else the installed one), quoted as JSON and, past
+  200 characters, cut and followed by its length, and the offset and
+  limit of its full definition. Deciding
   whether to show one again takes one read, where it took a read per
   hidden tool at its own offset, or a read through every visible tool's
   description first. The header says which line the index starts on.

@@ -64,9 +64,9 @@ const characters = (text: string): number => [...text].length;
 /** A text's first `n` characters, never splitting a code point. */
 const firstCharacters = (text: string, n: number): string => [...text].slice(0, n).join('');
 
-/** A name as a message quotes it: whole up to 60 characters, and past that cut, with its length, since a file can hold a key of any size. */
-function quoted(name: string): string {
-  return characters(name) <= 60 ? JSON.stringify(name) : `${JSON.stringify(firstCharacters(name, 57))}... (${count(characters(name))} characters)`;
+/** A text as a message quotes it: whole up to `limit` characters, and past that cut, with its length, since a file can hold a key, and a tool a description, of any size. */
+function quoted(name: string, limit = 60): string {
+  return characters(name) <= limit ? JSON.stringify(name) : `${JSON.stringify(firstCharacters(name, limit - 3))}... (${count(characters(name))} characters)`;
 }
 
 /** A file's problem as a message quotes it: its own clauses whole, and anything else bounded, since nobody wrote that text for its reader. */
@@ -349,13 +349,10 @@ export class ToolPresentation {
     return name;
   }
 }
-/** The longest a hidden tool's line shows of its description, in characters. */
 const SUMMARY_CHARACTERS = 200;
-/** A description's first line with text, cut at SUMMARY_CHARACTERS and marked …, for the hidden section. */
 function summaryOf(description: string): string {
   const first = description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).find(line => line.trim() !== '');
-  if (first === undefined) return '';
-  return `: ${characters(first) <= SUMMARY_CHARACTERS ? first : `${firstCharacters(first, SUMMARY_CHARACTERS - 1)}…`}`;
+  return first === undefined ? '' : `: ${quoted(first, SUMMARY_CHARACTERS)}`;
 }
 export function renderCatalogue(snapshot: PresentationSnapshot): string {
   const groups = new Map<string, PresentationSnapshot['entries']>();
