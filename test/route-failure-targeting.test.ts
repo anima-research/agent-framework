@@ -368,7 +368,7 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(archived.some((m) => m.participant === 'worker' && JSON.stringify(m.content).includes(speech)), 'the run\'s reply is archived');
       assert.equal(count(archived, UNDELIVERABLE), 0, 'no no-locus notice in its own window');
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
-      assert.equal(count(messages, `${UNDELIVERABLE} Your plain speech`), 0, 'the primary did not write that reply');
+      assert.equal(count(messages, UNDELIVERABLE) + count(messages, SEND_FAILED), 0, 'the primary was told nothing of that reply');
       assert.equal(count(messages, 'A reply by worker'), 0);
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)));
       assert.ok(!errors.some((e) => e.includes('[route-failure] worker')), 'no route failure is logged');
