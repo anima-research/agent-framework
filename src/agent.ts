@@ -121,6 +121,10 @@ export interface StartStreamResult {
   /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
    *  Absent when the compile reports no provenance. */
   carriedBodies?: ReadonlySet<MessageId>;
+  /** What the compile priced beside its window (`requestOverhead`): the request's system prompt and tools, and with a
+   *  window the messages it may send besides the compiled context. The stream's calibration sample is given it, so
+   *  the provider's count is read against what the compile priced. Optional, so a stand-in needn't supply it. */
+  requestOverhead?: RequestOverhead;
 }
 import type {
   ContextManager,
@@ -1967,12 +1971,18 @@ export class Agent {
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content);
     const binding = this.bindingCompileOptions(tools, prospectiveSystemInjections);
+    // What each compile priced beside its window, for the calibration sample its call gives (doInference).
+    const priced = new WeakMap<NormalizedRequest, RequestOverhead>();
     const assemble = async (): Promise<NormalizedRequest> => {
+      let bounds: ReturnType<Agent['requestBounds']> | undefined;
       const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections, {
-          ...(binding.thinkingBinding ? binding : {}),
-          ...this.requestBounds(tools, prospectiveSystemInjections, readyResults, budget),
-        }));
+        () => {
+          bounds = this.requestBounds(tools, prospectiveSystemInjections, readyResults, budget);
+          return this.compileWithInjections(budget, injections, {
+            ...(binding.thinkingBinding ? binding : {}),
+            ...bounds,
+          });
+        });
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
@@ -1985,13 +1995,15 @@ export class Agent {
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
       appendAll(messages, unguardedResults);
-      return {
+      const assembled: NormalizedRequest = {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
         tools: tools.length > 0 ? tools : undefined,
         ...this.requestSettings(),
         assistantParticipant: this.presentAs,
       };
+      if (bounds) priced.set(assembled, bounds.requestOverhead);
+      return assembled;
     };
     const request = await assemble();
 
@@ -2006,7 +2018,7 @@ export class Agent {
 
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
-    const inferencePromise = this.doInference(request, abortController.signal, assemble);
+    const inferencePromise = this.doInference(request, abortController.signal, assemble, (sent) => priced.get(sent));
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -2120,7 +2132,10 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions }> {
+  ): Promise<{
+    request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions;
+    requestOverhead: RequestOverhead;
+  }> {
     // Unstored, so they leave for the request here (text-as-stored.ts), the
     // layout hash below included.
     injections = injectionsAsStored(injections);
@@ -2150,12 +2165,14 @@ export class Agent {
         })
       : undefined;
     const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
+    // The turn the request may end on is priced before the compile can know whether it's sent: the safe side.
+    const trailing = options.silentHeartbeat !== undefined ? silentHeartbeatSeparatorTurn().content : continueTurn().content;
+    const bounds = this.requestBounds(availableTools, prospectiveSystemInjections, [trailing], budget);
     const compiledResult = await this.compileWithInjections(budget, injections, {
       ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
       ...(options.dryRun ? { dryRun: true } : {}),
       ...binding,
-      ...this.requestBounds(availableTools, prospectiveSystemInjections,
-        [options.silentHeartbeat !== undefined ? silentHeartbeatSeparatorTurn().content : continueTurn().content], budget),
+      ...bounds,
     });
     let { messages } = compiledResult;
     const { systemInjections } = compiledResult;
@@ -2253,8 +2270,10 @@ export class Agent {
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
     let continuePrompt: RequestOnlyPrompt | undefined;
+    let endedOn: NormalizedMessage | undefined;
     if (openingTick) {
-      messages = [...messages, silentHeartbeatSeparatorTurn()];
+      endedOn = silentHeartbeatSeparatorTurn();
+      messages = [...messages, endedOn];
     } else if (endsOnOwnMessage(messages, this.presentAs, injectionTail)) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
@@ -2264,7 +2283,8 @@ export class Agent {
       // them, so the cue stays last: the block isn't taken for what woke
       // the agent. Its reply's promptedBy puts it there in later compiles too,
       // where they can recognise the reply (renderRequestOnlyRows).
-      messages = [...messages, continueTurn()];
+      endedOn = continueTurn();
+      messages = [...messages, endedOn];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
     } else {
       // What the request ends on apart from the stored injections after it,
@@ -2280,7 +2300,12 @@ export class Agent {
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
-    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
+    // What the request sent beside its window: what the compile priced, with the turn it ended on as it went, and
+    // none where it went without one. The provider's count, which the stream's sample is read against, has only that.
+    const { messages: beside = [], ...rest } = bounds.requestOverhead;
+    const sentBeside = [...(endedOn ? [endedOn.content] : []), ...beside.filter((message) => message !== trailing)];
+    const requestOverhead: RequestOverhead = sentBeside.length > 0 ? { ...rest, messages: sentBeside } : rest;
+    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding, requestOverhead };
   }
 
   /**
@@ -2516,7 +2541,7 @@ export class Agent {
     // Compiled only once each withheld stub's annotation has finished,
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
-    const { request, continuePrompt, compiled, binding } = await this.toolResultGuard.afterAnnotations(
+    const { request, continuePrompt, compiled, binding, requestOverhead } = await this.toolResultGuard.afterAnnotations(
       () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
@@ -2573,6 +2598,7 @@ export class Agent {
     return {
       stream,
       request,
+      requestOverhead,
       ...(continuePrompt ? { continuePrompt } : {}),
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
@@ -2831,15 +2857,36 @@ export class Agent {
     return false;
   }
 
+  /** A call's usage as its compile's calibration sample (context-manager's `reportRealInputTokens`), read against what
+   *  the compile priced beside its window. The direct API's call has no report of thinking the provider dropped, so
+   *  unlike a stream's, its sample can't be withheld for one. Best-effort, as calibration is. */
+  private reportCompileSample(
+    usage: { inputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number } | undefined,
+    overhead: RequestOverhead | undefined,
+  ): void {
+    if (!usage) return;
+    const total = usage.inputTokens + (usage.cacheCreationTokens ?? 0) + (usage.cacheReadTokens ?? 0);
+    const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown }).getStrategy?.() as
+      | { reportRealInputTokens?: (n: number, overhead?: RequestOverhead) => void }
+      | undefined;
+    try {
+      strategy?.reportRealInputTokens?.(total, overhead);
+    } catch { /* calibration is best-effort */ }
+  }
+
   private async doInference(
     request: NormalizedRequest,
     signal: AbortSignal | undefined,
     /** Compiles the context into a request again, for the guard's retry. */
     reassemble: () => Promise<NormalizedRequest>,
+    /** What a request's compile priced beside its window, for its call's calibration sample. */
+    pricedOverhead: (request: NormalizedRequest) => RequestOverhead | undefined = () => undefined,
   ): Promise<InferenceResult> {
     let response = signal?.aborted
       ? { aborted: true as const, reason: 'user' as const }
       : await this.membrane.stream(request, { signal });
+    // Each compile's one call is its sample, as a stream's first call is.
+    if (!isAbortedResponse(response)) this.reportCompileSample(response.usage, pricedOverhead(request));
     // Usage of a refused attempt abandoned by the guard; it was billed and
     // is added to the retry's usage below rather than overwritten.
     let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
@@ -2857,6 +2904,7 @@ export class Agent {
         response = signal?.aborted
           ? { aborted: true, reason: 'user', partialUsage: response.usage }
           : await this.membrane.stream(retry, { signal });
+        if (!isAbortedResponse(response)) this.reportCompileSample(response.usage, pricedOverhead(retry));
       }
     }
 

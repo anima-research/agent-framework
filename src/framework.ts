@@ -1004,7 +1004,7 @@ import type {
   ChannelsChangedParams,
   ChannelsIncomingParams,
 } from './mcpl/types.js';
-import type { ContextInjection, ContextStrategy, ThinkingBinding } from '@animalabs/context-manager';
+import type { ContextInjection, ContextStrategy, RequestOverhead, ThinkingBinding } from '@animalabs/context-manager';
 import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
 import { CLOCK_ROW_KIND, clockStampOf, planClock, takesClockBefore } from './clock-rows.js';
 import { firstFreeBranchName } from './branch-names.js';
@@ -27796,6 +27796,7 @@ export class AgentFramework {
         noteRequestSent,
         noteThinkingDropped,
         carriedBodies,
+        requestOverhead,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
@@ -27920,6 +27921,7 @@ export class AgentFramework {
             }
           : undefined,
         streamCarry,
+        requestOverhead,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -28091,6 +28093,8 @@ export class AgentFramework {
      *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
     thinkingDrops?: StreamThinkingDrops,
     carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
+    /** What the stream's compile priced beside its window (StartStreamResult's `requestOverhead`), which its sample is given. */
+    requestOverhead?: RequestOverhead,
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
     const startTime = Date.now();
@@ -30174,10 +30178,7 @@ export class AgentFramework {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
               | {
-                  reportRealInputTokens?: (
-                    n: number,
-                    overhead?: Pick<NormalizedRequest, 'system' | 'tools'>,
-                  ) => void;
+                  reportRealInputTokens?: (n: number, overhead?: RequestOverhead) => void;
                   reportKvUnifiedAccepted?: (args: {
                     submissionId: string;
                     acceptedAt?: number;
@@ -30233,9 +30234,11 @@ export class AgentFramework {
             }
             try {
               if (!thinkingDroppedInStream) {
+                // What the compile priced beside its window: with a window, the messages the request sent besides
+                // the compiled context too, which the provider's count includes.
                 strat?.reportRealInputTokens?.(
                   realTotal,
-                  compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined,
+                  requestOverhead ?? (compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined),
                 );
               }
             } catch { /* calibration is best-effort */ }
