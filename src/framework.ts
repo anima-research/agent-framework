@@ -24267,24 +24267,6 @@ export class AgentFramework {
     }
   }
 
-  private readAnnouncedLocus(agentName: string): boolean {
-    if (!this.lastAnnouncedLocus.has(agentName)) {
-      try {
-        const stored = (this.store.getStateJson(FRAMEWORK_STATE_ID) as { announcedLoci?: Record<string, ChannelRef | null> } | null)?.announcedLoci;
-        if (stored && Object.hasOwn(stored, agentName)) this.lastAnnouncedLocus.set(agentName, stored[agentName] ?? null);
-      } catch (err) {
-        console.error(`[routing] ${agentName}: the announced locus couldn't be read back, so this turn compares with none:`, err);
-      }
-    }
-    return this.lastAnnouncedLocus.has(agentName);
-  }
-
-  private announcedLocusDiffers(agentName: string, locus: ChannelRef | null): boolean {
-    return this.readAnnouncedLocus(agentName)
-      ? !sameChannel(this.lastAnnouncedLocus.get(agentName) ?? null, locus)
-      : locus !== null;
-  }
-
   /**
    * Announce-on-change locus notice (turn-frozen routing). Appends a durable
    * `[routing]` window message when the turn's effective outbound locus
@@ -24297,9 +24279,17 @@ export class AgentFramework {
    * inference; never locus-eligible itself (system + no channel metadata).
    */
   private announceLocusIfChanged(agentName: string, locus: ChannelRef | null, locked = false, always = false): void {
-    const hasBaseline = this.readAnnouncedLocus(agentName);
+    if (!this.lastAnnouncedLocus.has(agentName)) {
+      try {
+        const stored = (this.store.getStateJson(FRAMEWORK_STATE_ID) as { announcedLoci?: Record<string, ChannelRef | null> } | null)?.announcedLoci;
+        if (stored && Object.hasOwn(stored, agentName)) this.lastAnnouncedLocus.set(agentName, stored[agentName] ?? null);
+      } catch (err) {
+        console.error(`[routing] ${agentName}: the announced locus couldn't be read back, so this turn compares with none:`, err);
+      }
+    }
+    const hasBaseline = this.lastAnnouncedLocus.has(agentName);
     const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
-    if (!always && !this.announcedLocusDiffers(agentName, locus)) {
+    if (!always && (hasBaseline ? sameChannel(prev, locus) : locus === null)) {
       if (!hasBaseline) this.lastAnnouncedLocus.set(agentName, locus);
       return;
     }
@@ -27651,11 +27641,11 @@ export class AgentFramework {
       } else if (routing.private) {
         if (turnProseRouting === 'locked') routing.locked = true;
         if (attempt === 0 && turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
-          // Where a public turn's open would tell the agent where its plain speech goes (a channel, or a heartbeat's
-          // drafts), a private turn's says it goes to no channel.
+          // Where a public turn's open would have a channel to speak in, or a heartbeat's drafts, a private turn's
+          // says its plain speech goes to no channel.
           const heartbeat = turnProseRouting !== 'locked' && routing.heartbeat === true;
           const lost = turnProseRouting === 'locked' ? this.proseLockLocus(agent) : heartbeat ? null : this.publicLocusAtOpen(agent.name, routing);
-          const tells = heartbeat ? !continuesHeartbeat : lost !== null && this.announcedLocusDiffers(agent.name, lost);
+          const tells = heartbeat ? !continuesHeartbeat : lost !== null;
           const surface = tells
             ? privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata))
             : undefined;

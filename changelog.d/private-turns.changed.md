@@ -22,10 +22,9 @@
   private message at a tool boundary, or is presented one at a start that
   continues it, is private for the rest of it and, unless it's silent or ends
   there, is told so by a `[routing]` notice. In locus, hybrid and locked
-  mode, a turn private from its open whose open would otherwise tell the
-  agent where its plain speech goes, because the channel it would announce
-  differs from the last one the agent was told of or, outside locked mode,
-  because a heartbeat woke it, is told so: by the same notice where its
+  mode, a turn private from its open whose open would otherwise have a
+  channel to speak in or, outside locked mode, that a heartbeat woke, is
+  told so: by the same notice where its
   window alone, without a wake's mark, would make it private, and otherwise
   by the notice that its plain speech currently has no channel. A private
   turn's delivery receipt there names the plain speech it kept for being
