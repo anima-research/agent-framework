@@ -775,7 +775,7 @@ function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled', hel
 }
 
 const OPERATOR_PENDING =
-  "a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or is the newest message there, or on a turn that continues one where that held";
+  "a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered, or no channel's message there is newer, or on a turn that continues one where that held";
 
 /**
  * Locked mode's one-time primer. Event-shaped and short, as the others are
@@ -834,8 +834,8 @@ const PROSE_LOCUS_TOOL: import('./types/index.js').ToolDefinition = {
   description:
     'Where your plain speech (text you write without a send tool) goes. It stays there, on this turn and later ones, ' +
     'until you change it here: the channel a message comes from, a heartbeat and channel_open never move it. ' +
-    'While a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or ' +
-    'is the newest message there, or on a turn that continues one where that held, your plain speech goes to no ' +
+    'While a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered, ' +
+    'or no channel\'s message there is newer, or on a turn that continues one where that held, your plain speech goes to no ' +
     'channel wherever this points; a change made then is kept for later turns. ' +
     'Leave `to` out (or null) to see where it goes now. `to`: "#channel", "@person" or a channel id posts your ' +
     'plain speech there; "drafts" holds it as drafts instead, posted nowhere unless you resend them with the drafts ' +
@@ -2249,8 +2249,8 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
       'channel, tries the open again if it isn\'t open. ' +
       'scope "all-except" holds EVERY channel (DMs and new channels included) except channelId, for ' +
       'durationSeconds (required); your plain speech lands in that channel meanwhile, except while a message from a ' +
-      'surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or is the newest message ' +
-      `there, or on a turn that continues one where that held: then it goes to no channel; ${who} pauses rather than ` +
+      'surface with no channel (such as a console, the TUI or an API call) in your context is unanswered, or no channel\'s ' +
+      `message there is newer, or on a turn that continues one where that held: then it goes to no channel; ${who} pauses rather than ` +
       'cancels when its wake budget is spent. ' +
       'mode "check" reports what is held without releasing it (`peek` shows one channel\'s newest held lines).',
     inputSchema: {
@@ -13752,7 +13752,7 @@ export class AgentFramework {
       'and channels that appear later included — is held and stops waking ' +
       'you; your plain speech lands in the focused channel, except while a ' +
       'message from a surface with no channel (such as a console, the TUI or ' +
-      'an API call) in your context is unanswered or is the newest message there, or on ' +
+      'an API call) in your context is unanswered, or no channel\'s message there is newer, or on ' +
       'a turn that continues one where that held: then it goes to no channel. The ' +
       'same hold as ' +
       'tune_out with scope "all-except". mode "cancel" releases the held ' +
