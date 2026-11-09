@@ -1120,7 +1120,7 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
 });
 
 const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-  'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
+  'coalescingBatchSubjects', 'readsRow', 'wakeLines'];
 
 function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<string | symbol, unknown>): symbol {
   const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
@@ -1244,7 +1244,7 @@ test("a wake the hold folds into a held merged start keeps its opening messages 
       const start = held[0] as unknown as Record<string, unknown>;
       const wake: Record<string, unknown> = { openingMessages: ['zz-folded'] };
       for (const key of ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-        'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines']) {
+        'coalescingBatchSubjects', 'readsRow', 'wakeLines']) {
         if (start[key] !== undefined) wake[key] = start[key];
       }
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
@@ -1349,7 +1349,7 @@ test("a held merged start's release gives its first member none of the other mem
       assert.equal(first[retryKey], true, "premise: the batch's first member is the turn's retry");
       first.openingMessages = ['zz-kept'];
       other.openingMessages = ['zz-dropped'];
-      other.readsStoredMessage = 'zz-no-such-message';
+      other.readsRow = 'zz-no-such-message';
       start.openingMessages = ['zz-kept', 'zz-dropped'];
       go();
       await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
