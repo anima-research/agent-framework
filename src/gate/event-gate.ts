@@ -4685,11 +4685,13 @@ export class EventGate {
   /**
    * Host quiesce suppression (issue #122). While set, debounce firings buffer
    * instead of writing gate messages into context; clearing it flushes the
-   * buffer through the same path a turn's end uses. Self-wake and sleep-expiry
-   * timers deliberately do NOT route through this — their inference requests
-   * are per-agent targeted pushes that the framework's quiesce wake gate parks
-   * and releases at resume, whereas the buffer's deliverEvents wakes every
-   * agent a batch is for.
+   * buffer through the same path a turn's end uses. A self-wake or a sleep
+   * that falls due meanwhile doesn't go through this buffer either: its
+   * timer fires and finds the gate quiesced, and the intent stays, in memory
+   * and in the wake journal, until the host's resume() calls
+   * admitOverdueWakeIntents(), which wakes the agent then (a per-agent
+   * request, unlike the buffer's deliverEvents, which wakes every agent a
+   * batch is for). Clearing the flag alone admits nothing.
    */
   setQuiesced(quiesced: boolean): void {
     if (this.quiesced === quiesced) return;
