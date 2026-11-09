@@ -87,12 +87,18 @@ async function waitFor(what: string, predicate: () => boolean, ms = 20_000): Pro
   }
 }
 
-function connectionOf(framework: AgentFramework, engine: Engine, id: string): { connectedAt: number } {
+function connectionOf(framework: AgentFramework, engine: Engine, id: string): object {
   const internals = framework as unknown as {
-    mcplServerRegistry: { getServer(id: string): { connectedAt: number } };
-    modernMcpConnections: Map<string, { connectedAt: number }>;
+    mcplServerRegistry: { getServer(id: string): object };
+    modernMcpConnections: Map<string, object>;
   };
   return engine === 'legacy' ? internals.mcplServerRegistry.getServer(id) : internals.modernMcpConnections.get(id)!;
+}
+
+function backdate(framework: AgentFramework, engine: Engine, id: string, ms: number): void {
+  const connection = connectionOf(framework, engine, id) as { connectedAt: number; adoptedAt: number };
+  if (engine === 'legacy') connection.connectedAt -= ms;
+  else connection.adoptedAt -= ms;
 }
 
 async function endConnection(server: Awaited<ReturnType<typeof started>>, index: number, reportsBefore: number): Promise<void> {
@@ -139,7 +145,7 @@ for (const engine of ['legacy', 'modern'] as const) {
     await endConnection(lasts, 1, 1);
     await waitFor('reconnect 2', () => lasts.reconnected().length >= 2);
     await waitFor('launch 2', () => lasts.launches().length > 2);
-    connectionOf(lasts.framework, engine, 'lasts').connectedAt -= 301_000;
+    backdate(lasts.framework, engine, 'lasts', 301_000);
     process.kill(lasts.launches()[2]!.pid, 'SIGTERM');
     await waitFor('reconnect 3', () => lasts.reconnected().length >= 3);
     assert.equal(lasts.failed().length, 2, 'a connection that lasted is no failure');
@@ -152,7 +158,7 @@ for (const engine of ['legacy', 'modern'] as const) {
     const scratch = scratchDir('capped');
     const capped = await started(t, { ...server(engine, 'capped', scratch), reconnectMaxIntervalMs: 600_000 }, scratch);
     await waitFor('the first launch', () => capped.launches().length === 1);
-    connectionOf(capped.framework, engine, 'capped').connectedAt -= 301_000;
+    backdate(capped.framework, engine, 'capped', 301_000);
     process.kill(capped.launches()[0]!.pid, 'SIGTERM');
     await waitFor('its end reported', () => capped.failed().length >= 1);
     assert.equal(capped.failed()[0]!.attempt, 0);
@@ -167,12 +173,11 @@ for (const engine of ['legacy', 'modern'] as const) {
     await endConnection(halted, 1, 1);
     await waitFor('reconnect 2', () => halted.reconnected().length >= 2);
     const connection = connectionOf(halted.framework, engine, 'halted') as unknown as {
-      connectedAt: number;
       transport: { emit(event: 'unreaped', failure: Error): void };
       session: { generation: number };
       handleLost(generation: number, reason: string, unreaped?: Error): void;
     };
-    connection.connectedAt -= 301_000;
+    backdate(halted.framework, engine, 'halted', 301_000);
     if (engine === 'legacy') connection.transport.emit('unreaped', new Error('it outlived SIGKILL'));
     else connection.handleLost(connection.session.generation, 'its stdio pipe failed', new Error('it outlived SIGKILL'));
     await waitFor('the halt', () => halted.failed().some((event) => event.willRetry === false));
