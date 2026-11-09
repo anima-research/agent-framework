@@ -3068,6 +3068,11 @@ const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
   '(e.g. drop an oversized attachment or an unsupported setting).';
 const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
+/** What a window_full turn tells the agent, in place of the refusal's figures and FAILURE_ADVICE: nothing in its own
+ *  hands makes room, and who can. */
+const WINDOW_FULL_NOTICE = 'The reply\'s maxTokens, the system prompt, the tools and what the turn sends beside your ' +
+  'history leave the model\'s window no room for the conversation. Trying again won\'t make room; whoever configures ' +
+  'you can, by lowering maxTokens, the system prompt or the tools, or by checking physicalWindowTokens.';
 const MADE_AGAIN = 'The call was made again, and it timed out again.';
 const OVERLOADED_TURN_TRIES = 13;
 const DEADLINE_TURN_TRIES = 2;
@@ -35237,7 +35242,7 @@ export class AgentFramework {
                 : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
                   `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
                   `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''} Reason: `) +
-              `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
+              `${errorType === 'window_full' ? WINDOW_FULL_NOTICE : `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
@@ -35336,12 +35341,11 @@ export class AgentFramework {
       this.opsAlert(
         'context-refusal',
         agentName,
-        `compile refused (window_full): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
-        'no drain kicked, since no history or budget makes room: as context-manager prices them, the reply\'s maxTokens, ' +
-        'the system prompt, the tools, the messages the turn sends beside its history and the message injections leave ' +
-        'physicalWindowTokens no room for the conversation, by the figures the reason gives. Lower maxTokens, the system ' +
-        'prompt, the tools, the message injections or what the turn sends beside its history, or check physicalWindowTokens ' +
-        'against the model\'s window.',
+        'compile refused (window_full). Lower maxTokens, the system prompt, the tools, the message injections or what ' +
+        'the turn sends beside its history, or check physicalWindowTokens against the model\'s window: as ' +
+        'context-manager prices them, those leave physicalWindowTokens no room for the conversation, by the figures the ' +
+        'reason gives. No history or budget makes room there, so no drain kicked. ' +
+        `Reason: ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)}`,
         { skipLog: true },
       );
     }

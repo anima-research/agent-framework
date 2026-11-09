@@ -261,10 +261,12 @@ export class ToolResultGuard {
   /** Extra input tokens the pending batch costs on the wire beyond the
    * placeholder the strategy selected against (chars/4 + flat per image,
    * the same heuristic as the physical-window projection). Compilation
-   * reserves this so substituting originals cannot exceed the budget. */
+   * reserves this so substituting originals cannot exceed the budget: none
+   * while the batch's audit isn't durable, when the placeholders go. */
   get pendingWireReserveTokens(): number {
     const pending = this.pending;
-    if (!pending) return 0;
+    // While its audit isn't durable, the placeholders go, which the compile already prices.
+    if (!pending?.durable) return 0;
     let chars = 0;
     let images = 0;
     for (const result of pending.wireResults) {

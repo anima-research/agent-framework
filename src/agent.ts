@@ -135,6 +135,7 @@ import type {
   RequestOverhead,
   ThinkingStrip,
 } from '@animalabs/context-manager';
+import { OverBudgetError } from '@animalabs/context-manager';
 import type {
   AgentConfig,
   AutoContinueConfig,
@@ -684,17 +685,25 @@ export class Agent {
    * else the ContextManager default. */
   private resolveBudget(budget?: TokenBudget): TokenBudget | undefined {
     if (budget) return budget;
-    if (this.contextBudgetTokens === undefined) {
-      if (this.physicalWindowTokens === undefined) return undefined;
-      const room = CONTEXT_MANAGER_DEFAULT_BUDGET.maxTokens - CONTEXT_MANAGER_DEFAULT_BUDGET.reserveForResponse;
-      return { maxTokens: room + this.maxTokens, reserveForResponse: this.maxTokens };
-    }
-    return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
+    if (this.contextBudgetTokens === undefined && this.physicalWindowTokens === undefined) return undefined;
+    return { maxTokens: this.liveBudgetTokens, reserveForResponse: this.maxTokens };
+  }
+
+  /** The budget compiles plan at when none is passed: the live one, else the default, which with a window is
+   * context-manager's default room with the reply's maxTokens on top, as resolveBudget compiles at. */
+  private get liveBudgetTokens(): number {
+    return this.contextBudgetTokens ?? this.defaultBudgetTokens;
+  }
+
+  private get defaultBudgetTokens(): number {
+    if (this.physicalWindowTokens === undefined) return DEFAULT_CONTEXT_BUDGET_TOKENS;
+    return CONTEXT_MANAGER_DEFAULT_BUDGET.maxTokens - CONTEXT_MANAGER_DEFAULT_BUDGET.reserveForResponse + this.maxTokens;
   }
 
   /** Compile budget with the tool-result guard's reservation applied. While
    * a batch is pending the strategy selects against short placeholders, but
-   * prepareRequest substitutes the originals on the wire; reserve their real
+   * once its audit is durable prepareRequest substitutes the originals on
+   * the wire; reserve their real
    * cost so the final request still fits (a budget restart that recompiles
    * small must not re-inflate past the same window). Without a physical
    * window the reserve is added to `reserveForResponse`. With one it comes
@@ -746,9 +755,8 @@ export class Agent {
       contextBudgetTokens:
         this.runtimeSettingsOverrides.contextBudgetTokens ??
         this.contextBudgetTargetTokens ??
-        this.contextBudgetTokens ??
-        DEFAULT_CONTEXT_BUDGET_TOKENS,
-      effectiveContextBudgetTokens: this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS,
+        this.liveBudgetTokens,
+      effectiveContextBudgetTokens: this.liveBudgetTokens,
       ...(hot ? { tailTokens: hot.tailTokens } : {}),
       ...(hot?.transitionPaceTokens !== undefined
         ? { transitionPaceTokens: hot.transitionPaceTokens }
@@ -850,7 +858,7 @@ export class Agent {
   private async compileAtLiveBudgetNoting(compile: () => Promise<CompileResult>, started: number): Promise<CompileResult> {
     // The budget this compile plans at, and the descent under way when it
     // started: a change of either while it runs is no part of what it shows.
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const live = this.liveBudgetTokens;
     const epoch = this.liveBudgetEpoch;
     const descent = this.descentEpoch;
     let result: CompileResult;
@@ -920,7 +928,7 @@ export class Agent {
     path: 'immediate' | 'paced' | 'none';
     transition: 'stable' | 'converging';
   } {
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const live = this.liveBudgetTokens;
     const budget = patch?.contextBudgetTokens;
     return {
       liveBudgetTokens: live,
@@ -1054,7 +1062,7 @@ export class Agent {
     }
 
     if (patch.contextBudgetTokens !== undefined) {
-      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      const live = this.liveBudgetTokens;
       if (patch.contextBudgetTokens >= live || patch.immediate) {
         // Increases are always immediate. Decreases take this path only with
         // the explicit `immediate` flag: the next compile plans straight at
@@ -1112,8 +1120,8 @@ export class Agent {
     } = {};
 
     if (reset.has('contextBudgetTokens')) {
-      const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      const configured = this.configuredContextBudgetTokens ?? this.defaultBudgetTokens;
+      const live = this.liveBudgetTokens;
       if (configured < live) {
         const hot = this.getHotContextSettings();
         if (!hot) throw new Error('The active context strategy cannot prepare a smaller window live');
@@ -1158,8 +1166,8 @@ export class Agent {
     if (this.contextBudgetTargetTokens !== undefined) {
       this.updateHotContextSettings({ preparedWindowTokens: null });
       this.setContextBudget(this.contextBudgetTokens, undefined);
-      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      if (live === (this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS)) {
+      const live = this.liveBudgetTokens;
+      if (live === (this.configuredContextBudgetTokens ?? this.defaultBudgetTokens)) {
         delete this.runtimeSettingsOverrides.contextBudgetTokens;
       } else {
         this.runtimeSettingsOverrides.contextBudgetTokens = live;
@@ -1183,7 +1191,7 @@ export class Agent {
     opts?: { provenBudget?: number },
   ): AgentRuntimeSettingsSnapshot {
     if (Object.keys(settings).length === 0) return this.getRuntimeSettings();
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const live = this.liveBudgetTokens;
     const snapshot = this.updateRuntimeSettings(settings);
     if (opts?.provenBudget !== undefined) {
       this.lastCompiledBudget = { budget: opts.provenBudget, fit: true, epoch: this.liveBudgetEpoch };
@@ -2353,12 +2361,31 @@ export class Agent {
       ...(pending.length > 0 ? [pending] : []),
       ...(this.prefillUserMessage ? [[{ type: 'text', text: this.prefillUserMessage } as ContentBlock]] : []),
     ];
-    // Every request asks for the agent's maxTokens (requestSettings). Where a caller's budget reserves less for the
-    // reply, the limit is lowered by the difference, so it counts the reply the request asks for.
+    // Every request asks for the agent's maxTokens (requestSettings), and context-manager takes the budget's reply
+    // reserve off the limit. So the limit is moved by the difference, either way: the prompt's room is the window less
+    // the reply the request asks for, whatever the caller reserves.
     const reserve = this.resolveBudget(budget)?.reserveForResponse ?? this.maxTokens;
+    const requestLimitTokens = this.physicalWindowTokens - this.maxTokens + reserve;
+    // A reply that fills the window by itself leaves no room, whatever the budget reserves. It's refused here, as
+    // context-manager words a refusal no history makes room for, so context-manager is never given a limit it would
+    // refuse as malformed, where a small reserve makes it zero or less.
+    if (this.maxTokens >= this.physicalWindowTokens) {
+      const error = new OverBudgetError({
+        budget: requestLimitTokens,
+        actual: this.maxTokens,
+        stage: 'Request limit',
+        diagnostics: {
+          headTokens: 0, tailTokens: 0, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0, deepestLevelKind: 'unplanned',
+          requestLimitTokens, requestAllowanceTokens: requestLimitTokens - reserve,
+        },
+      });
+      error.message = `The reply of ${this.maxTokens} tokens the request asks for (maxTokens) leaves physicalWindowTokens ` +
+        `of ${this.physicalWindowTokens} no room for anything else`;
+      throw error;
+    }
     return {
       requestOverhead: messages.length > 0 ? { ...requestOverhead, messages } : requestOverhead,
-      requestLimitTokens: this.physicalWindowTokens - Math.max(0, this.maxTokens - reserve),
+      requestLimitTokens,
     };
   }
 

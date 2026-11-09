@@ -9,6 +9,8 @@ import type { EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult } 
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 import { CONTINUE_ROW, SILENT_HEARTBEAT_SEPARATOR } from '../src/silent-heartbeat.js';
+import { leavesNoRoomInWindow } from '../src/agent.js';
+import { TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
 import { isDeepStrictEqual } from 'node:util';
 
 const WINDOW = 8_000;
@@ -293,6 +295,11 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
   it('a window the system prompt and tools fill by themselves sends nothing, kicks no drain, and says what would make room', async () => {
     const window = REPLY + 500;
     const t = await open(window);
+    // A drain the exhaustion handler kicks is marked in flight first.
+    const inFlight = (t.framework as unknown as { overBudgetDrainInFlight: Set<string> }).overBudgetDrainInFlight;
+    const add = inFlight.add.bind(inFlight);
+    let kicks = 0;
+    inFlight.add = (name: string) => { kicks++; return add(name); };
     try {
       t.framework.start();
       t.framework.pushEvent({
@@ -305,8 +312,23 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
       assert.equal(failed.errorType, 'window_full', String(failed.error));
       const alert = String(t.traces.find((event) => event.type === 'ops:alert' && event.kind === 'context-refusal')!.message);
       assert.match(alert, /no drain kicked/, alert);
-      assert.match(alert, /maxTokens/, alert);
+      // Every cause the alert names comes with its remedy, before the reason, which a cut ends first. Read apart from
+      // the reason, whose own words (context-manager's) name some of the same parts.
+      assert.ok(alert.includes('Reason:'), alert);
+      const remedies = alert.slice(0, alert.indexOf('Reason:'));
+      for (const cause of [/Lower maxTokens/, /the system prompt/, /the tools/, /the message injections/, /what the turn sends beside its history/, /check physicalWindowTokens against the model's window/]) {
+        assert.match(remedies, cause, alert);
+      }
       assert.doesNotMatch(alert, /raise contextBudgetTokens/, alert);
+      assert.equal(kicks, 0, 'no compression drain was kicked');
+      // The agent is told nothing it can change makes room, and who can, without context-manager's figures or the advice to change approach.
+      const marker = t.agent.getContextManager().getAllMessages()
+        .flatMap((m) => m.content).filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map((b) => b.text).find((text) => text.startsWith('[inference-failed]'));
+      assert.ok(marker, 'premise: the agent was told its turn failed');
+      assert.match(marker!, /Trying again won't make room/, marker);
+      assert.match(marker!, /whoever configures you/, marker);
+      assert.doesNotMatch(marker!, /The request limit of|change approach/, marker);
       assert.equal(t.membrane.calls.length, 0, 'no request went to the provider');
     } finally {
       await t.close();
@@ -391,12 +413,93 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
       t.agent.provideToolResult('tu1' as never, { success: true, data: RESULT_DATA } as never);
       await t.agent.runInference(tools);
       const request = t.membrane.calls[t.membrane.calls.length - 1]!;
-      assert.ok(!JSON.stringify(request.messages).includes('a row of output'), 'premise: the request sends the placeholder, not the original');
+      assert.ok(!JSON.stringify(request.messages).includes('a row of output'), 'premise: the request doesn\'t send the original');
+      assert.ok(JSON.stringify(request.messages).includes(TOOL_RESULT_GUARD_NOTICE), 'the request sends the placeholder');
       const sent = t.compiled[t.compiled.length - 1]!;
       const beside = (sent.opts?.requestOverhead as { messages?: ContentBlock[][] } | undefined)?.messages ?? [];
       assert.ok(!JSON.stringify(beside).includes('a row of output'), 'the original isn\'t priced beside the window');
+      assert.deepStrictEqual(sent.budget, { maxTokens: 100_000, reserveForResponse: REPLY }, 'nor taken off the budget');
     } finally {
       store.sync = sync;
+      await t.close();
+    }
+  });
+
+  it('with a window and no budget set, the runtime settings read the budget compiles plan at: context-manager\'s default room, with maxTokens on top', async () => {
+    const t = await open(200_000, { contextBudgetTokens: null, maxTokens: 16_000 });
+    try {
+      assert.equal(t.agent.getRuntimeSettings().effectiveContextBudgetTokens, 112_000);
+      assert.equal(t.agent.runtimeBudgetPath({ contextBudgetTokens: 105_000 }).path, 'paced', 'a budget under 112,000 lowers it');
+      assert.equal(t.agent.runtimeBudgetPath({ contextBudgetTokens: 120_000 }).path, 'immediate');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a caller\'s budget that reserves more than the agent\'s maxTokens leaves the prompt the room the request leaves it', async () => {
+    const window = 6_000;
+    const t = await open(window);
+    try {
+      const tools = t.framework.getAllTools();
+      const request = await t.agent.buildActivationRequest(tools, undefined, { maxTokens: 100_000, reserveForResponse: 8_000 }, tools, { dryRun: true });
+      const sent = t.compiled[t.compiled.length - 1]!;
+      assert.equal(sent.opts?.requestLimitTokens, window - REPLY + 8_000, 'context-manager takes the reserve off the limit, so the limit adds back what it reserves past maxTokens');
+      assert.ok(requestTokens(request) <= window, `the request is ${requestTokens(request)} tokens, the window ${window}`);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a reply that leaves the window no room by itself is refused as window_full, not as a malformed limit, at both request sites', async () => {
+    const t = await open(16_000, { maxTokens: 16_384 });
+    try {
+      const tools = t.framework.getAllTools();
+      const budget = { maxTokens: 100_000, reserveForResponse: 0 };
+      for (const [site, attempt] of [
+        ['a stream\'s compile', () => t.agent.buildActivationRequest(tools, undefined, budget, tools, { dryRun: true })],
+        ['the direct API', () => t.agent.runInference(tools, budget)],
+        ['a stream\'s compile at the default budget', () => t.agent.buildActivationRequest(tools, undefined, undefined, tools, { dryRun: true })],
+        ['the direct API at the default budget', () => t.agent.runInference(tools)],
+      ] as const) {
+        const error = await (attempt as () => Promise<unknown>)().then(() => undefined, (e: unknown) => e);
+        assert.ok(error instanceof Error, `${site}: refused`);
+        assert.ok(leavesNoRoomInWindow(error), `${site}: ${(error as Error).name}: ${(error as Error).message}`);
+        assert.match((error as Error).message, /16384 tokens the request asks for \(maxTokens\)/, `${site}: the refusal names the reply it asks for`);
+        assert.match((error as Error).message, /16000/, `${site}: and the window`);
+      }
+      assert.equal(t.membrane.calls.length, 0, 'nothing went to the provider');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a caller\'s budget reaches the direct API\'s limit', async () => {
+    const window = 20_000;
+    const t = await open(window, { maxTokens: 11_000 });
+    try {
+      await t.agent.runInference(t.framework.getAllTools(), { maxTokens: 100_000, reserveForResponse: 500 });
+      const sent = t.compiled[t.compiled.length - 1]!;
+      assert.equal(sent.opts?.requestLimitTokens, window - 11_000 + 500);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a system-position injection is priced as the request sends it, at both request sites', async () => {
+    const t = await open(WINDOW);
+    const injection = { namespace: 'note', position: 'system', content: [{ type: 'text', text: 'SYSTEM-NOTE: the mill closes at dusk.' }] } as never;
+    try {
+      const tools = t.framework.getAllTools();
+      const stream = await t.agent.buildActivationRequest(tools, [injection], undefined, tools, { dryRun: true });
+      const streamCompile = t.compiled[t.compiled.length - 1]!;
+      assert.ok(String(stream.system).includes('SYSTEM-NOTE'), 'premise: the stream request sends the injection in its system prompt');
+      assert.equal((streamCompile.opts?.requestOverhead as { system?: unknown }).system, stream.system);
+      await t.agent.runInferenceWithInjections(tools, [injection]);
+      const direct = t.membrane.calls[t.membrane.calls.length - 1]!;
+      const directCompile = t.compiled[t.compiled.length - 1]!;
+      assert.ok(String(direct.system).includes('SYSTEM-NOTE'), 'premise: the direct request sends the injection in its system prompt');
+      assert.equal((directCompile.opts?.requestOverhead as { system?: unknown }).system, direct.system);
+    } finally {
       await t.close();
     }
   });

@@ -106,16 +106,19 @@ export interface AgentConfig {
    * `requestLimitTokens`, beside the request's system prompt and tools as
    * `requestOverhead`, with what the request may send besides the compiled
    * context as its `messages`: the direct API's tool results ready before
-   * its compile, the tool-result guard's pending originals (priced whenever a batch is
-   * pending, beside the placeholders the compile also prices, which can only
-   * leave more room than needed), a `prefillUserMessage`, and the turn a
+   * its compile, the tool-result guard's pending originals (priced while a
+   * pending batch's audit is durable, the only time the request sends them,
+   * beside the placeholders the compile also prices, which can only leave
+   * more room than needed), a `prefillUserMessage`, and the turn a
    * stream's start may end its request on (a silent tick's separator, or
    * `[Continue]`). So the compiled context, its message injections, those
    * messages, the system prompt, the tools and the reply the request asks
-   * for (the agent's maxTokens, which a caller's budget that reserves less
-   * lowers the limit by) come within it, and a window they leave no room in
-   * refuses the compile as over budget: the turn ends as `window_full`, with
-   * no compression drain, since no history or budget makes room there.
+   * for (the agent's maxTokens, whatever a caller's budget reserves: the
+   * limit moves by the difference) come within it, and a window they leave
+   * no room in refuses the compile as over budget: the turn ends as
+   * `window_full`, with no compression drain, since no history or budget
+   * makes room there. So does a reply that leaves the window no room by
+   * itself, refused before the compile.
    * Some of what a request sends is outside that price, and reaches
    * context-manager only as its calibration takes it in from the provider's
    * count: the request-only turns rendered again before earlier replies (a
