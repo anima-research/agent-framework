@@ -1240,7 +1240,7 @@ describe('present while acting', () => {
     };
     const open: Routing = {
       locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set([destinationKey(stub('discord:guild:portables'))]), wasIn: [],
-      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: {}, arrivals: [],
       addressedElsewhere: new Set(), turnId: 1,
     };
     internals.turnRouting.set('assistant', open);
@@ -1692,7 +1692,7 @@ describe('present while acting', () => {
       // fallback's re-inference. Messages arrive before that starts.
       const open: Routing = {
         locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set([destinationKey(stub('discord:guild:portables'))]), wasIn: [],
-        continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+        continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: {}, arrivals: [],
       };
       internals.turnRouting.set('assistant', open);
       internals.openLogical.set('assistant', open);
@@ -1730,7 +1730,7 @@ describe('present while acting', () => {
       };
       const open: Routing = {
         locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set(), wasIn: [],
-        continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+        continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: {}, arrivals: [],
       };
       internals.turnRouting.set('assistant', open);
       internals.openLogical.set('assistant', open);
@@ -1886,7 +1886,7 @@ describe('present while acting', () => {
     // retried.
     const turn: Routing = {
       locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set(), wasIn: [],
-      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: {}, arrivals: [],
     };
     internals.turnRouting.set('assistant', turn);
     internals.pendingRequests.push({
