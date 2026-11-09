@@ -14,18 +14,21 @@
   and alerts as one that never connects does.
   A host's own recycle (`reconnectAfterFailure()`) of a connection that
   hadn't lasted counts the same way, as "connected, then closed by this host
-  after N s".
+  after N s". A connection that ends on its own with a launch that can't be
+  reaped still halts instead, with one permanent `reconnect-failed` in place
+  of the short-end report and its line.
 - With reconnect on, trace consumers now meet an
   `mcpl:server-connect-failed` for each connection that ended before it
-  lasted, numbered as above (#375). So its `attempt: 0`, which earlier
-  releases sent only when the first connect failed, can now follow a first
-  handshake that succeeded. A server that keeps dying that way reaches
-  attempt 5, and from then on each of its failed attempts also emits an
-  `ops:alert` trace of kind `mcpl-down`, which the webhook's throttle doesn't
-  hold back, while each reconnect still emits `mcpl:server-reconnected`. A
-  consumer that posts a status line for `mcpl-down` and clears it when the
-  server reconnects posts one of each per cycle, where before it posted
-  neither.
+  lasted, as above (#375). So its `attempt: 0`, which earlier releases sent
+  only when the first connect failed, can now follow a first handshake that
+  succeeded. A server that keeps dying that way reaches attempt 5, and from
+  then on each of its failed attempts also emits an `ops:alert` trace of kind
+  `mcpl-down`, which the webhook's throttle doesn't hold back. A reconnect
+  still emits `mcpl:server-reconnected`, on the legacy engine only once its
+  policy exchange has settled with the server still connected. So a consumer
+  that posts a status line for `mcpl-down` and clears it when the server
+  reconnects posts one of each per cycle in which the server lives that long,
+  where before it posted neither.
 - With reconnect on, both engines now print a failed attempt's line for a
   connection that ended before it lasted: "initial connect failed, will
   retry: …" for the first connection, "reconnect failed: …" for a later one

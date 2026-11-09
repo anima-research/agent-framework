@@ -39,6 +39,10 @@ test('a short end says how long the connection lived, and how it closed as its t
   assert.equal(endedTooSoon(1_000, { transport: 'stdio', code: null, signal: null, byHost: true }), 'connected, then closed by this host after 1.0 s');
 });
 
+test('a short end\'s whole seconds are the seconds it lived, rounded down, so one just under the threshold never reads as reaching it', () => {
+  assert.equal(endedTooSoon(299_700), 'connected, then closed after 299 s');
+});
+
 test('the backoff doubles from the base, is capped before its jitter, and never asks a timer to wait past its limit', () => {
   const at = (failures: number, base: number, cap: number, random: number) => reconnectDelay(failures, base, cap, () => random);
   assert.equal(at(0, 1000, 300_000, 0.5), 1000);

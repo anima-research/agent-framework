@@ -76,7 +76,7 @@ export interface ConnectionEnd {
 }
 
 export function endedTooSoon(livedMs: number, ended: ConnectionEnd = {}): string {
-  const seconds = livedMs < 10_000 ? (livedMs / 1000).toFixed(1) : String(Math.round(livedMs / 1000));
+  const seconds = livedMs < 10_000 ? (livedMs / 1000).toFixed(1) : String(Math.floor(livedMs / 1000));
   const how = ended.signal
     ? ` (signal ${ended.signal})`
     : typeof ended.code === 'number'

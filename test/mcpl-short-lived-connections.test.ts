@@ -1,6 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -280,6 +280,24 @@ test('where the timings are used, a timing read as 0, below 0 or not a number is
   const problems = serverConfigProblems({ id: 'timed', ...writes(join(dir, 'never')), reconnect: true, reconnectIntervalMs: 0 });
   assert.equal(problems.length, 1, problems.join(' | '));
   assert.match(problems[0]!, /^MCP server "timed": reconnectIntervalMs .*\(got 0\)/);
+});
+
+test('legacy: a connection that ends while its reconnect\'s policy exchange is pending still reports that attempt\'s failure, and that reconnect announces nothing', { timeout: 60_000 }, async (t) => {
+  const scratch = scratchDir('policy');
+  const pending = join(scratch, 'policy-pending');
+  const release = join(scratch, 'policy-release');
+  writeFileSync(release, '');
+  const held = await started(t, server('legacy', 'held', scratch, { POLICY_PENDING_PATH: pending, POLICY_RELEASE_PATH: release }), scratch);
+  await waitFor('the first policy exchange', () => existsSync(pending));
+  rmSync(pending);
+  rmSync(release);
+  await endConnection(held, 0, 0);
+  await waitFor('reconnect 1\'s policy exchange, held', () => existsSync(pending) && held.launches().length === 2);
+  process.kill(held.launches()[1]!.pid, 'SIGTERM');
+  await waitFor('the end of connection 1', () => held.failed().length > 1);
+  assert.deepEqual(held.failed().map((event) => event.attempt), [0, 1]);
+  assert.match(String(held.failed()[1]!.error), /^connected, then closed after \d+(\.\d)? s \(signal SIGTERM\)$/);
+  assert.equal(held.reconnected().length, 0);
 });
 
 test('legacy: a WebSocket connection that a server closes before it lasted is that attempt\'s failure, worded with its close code', { timeout: 30_000 }, async (t) => {
