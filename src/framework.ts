@@ -19557,6 +19557,9 @@ export class AgentFramework {
           ? this.registry.untargetedRecipients()
           : response.requestInference;
       const triggered = targetAgents.filter((name) => this.agents.get(name)?.canBeTriggeredBy(source) === true);
+      // A response that stores a message held from the residents names no
+      // recipient: a batch's line would quote what the message holds back.
+      const holds = response.addMessages?.some((msg) => heldFromResidents(msg.metadata)) === true;
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
@@ -19566,7 +19569,7 @@ export class AgentFramework {
           serverId: source,
           channelId: '',
           ...(suppressionAsked ? { suppressionAsked: true } : {}),
-          ...(response.requestInference !== true ? { recipients: triggered.filter((name) => requested?.includes(name) === true) } : {}),
+          ...(response.requestInference !== true ? { recipients: holds ? [] : triggered.filter((name) => requested?.includes(name) === true) } : {}),
         });
         if (!decision.trigger) return;
       }

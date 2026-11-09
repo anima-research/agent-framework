@@ -507,11 +507,26 @@ export interface GateEventInfo {
   paths?: string[];
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
-  /** The agents admission delivered a targeted event to (its targetAgents).
-   *  A debounced batch wakes each agent with the events it may see, those
-   *  naming it and those naming no agent, and agents that may see the same
-   *  events share one line. Absent for an untargeted event, whose batch wakes
-   *  every agent getAgentNames lists. */
+  /** Whom the event is for, which decides whom a batch holding it shows it
+   *  to and wakes. Admission sets it for a targeted MCPL event (its
+   *  targetAgents that are registered). The framework sets it for a module's
+   *  response asking inference for named agents: those its source can
+   *  trigger that read the slot its messages land in, and none when the
+   *  response stores a message held from the residents.
+   *  - Untargeted (absent): shown to every agent getAgentNames lists, and
+   *    wakes them. A batch of untargeted events alone stores its line as a
+   *    write that names no agent.
+   *  - Named (a non-empty list): shown to the agents it names, and wakes
+   *    them, whether getAgentNames lists them or not.
+   *  - An empty list: for no one. It joins no batch, so it wakes no one, and
+   *    it neither restarts a batch's quiet period nor takes room in it.
+   *  In a batch holding named events, each agent the batch wakes is shown the
+   *  untargeted events if getAgentNames lists it, and the named events that
+   *  name it. Agents shown the same events share one line, stored for them.
+   *  An agent's upcoming wakes count a batch only when the batch would wake
+   *  that agent. A judge rule's batch is judged as a whole, for the agents
+   *  getAgentNames lists, and a batch queued while the judge decides rides
+   *  its verdict. */
   recipients?: readonly string[];
   /**
    * Set when the framework asked whether the event is suppressed before it

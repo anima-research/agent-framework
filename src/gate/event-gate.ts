@@ -404,11 +404,6 @@ export function wakeLineText(line: WakeLine, now: number): string {
   return `[${NOTICE_TAG.gate}: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
 }
 
-/** A batch's events less those whose list of recipients is empty, which are for no one: no line or judge is shown them. */
-function shownOf(events: readonly PendingEvent[]): PendingEvent[] {
-  return events.filter((e) => e.recipients === undefined || e.recipients.length > 0);
-}
-
 /** The event's own stored entry, as the framework is asked about it. */
 function entryRef(event: PendingEvent): GateEntryRef {
   return {
@@ -3574,7 +3569,9 @@ export class EventGate {
 
     if (typeof policy.behavior === 'object') {
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
-        this.handleDebounce(policy, info);
+        // An event whose list of recipients is empty is for no one, so it
+        // joins no batch (GateEventInfo.recipients).
+        if (info.recipients === undefined || info.recipients.length > 0) this.handleDebounce(policy, info);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
       }
       if ('rate_limit' in policy.behavior) {
@@ -4192,22 +4189,20 @@ export class EventGate {
     // delivery in part (PartialDelivery), the batch dropped only for those
     // it didn't wake.
     const woke: string[] = [];
-    const shown = shownOf(events);
-    if (shown.length === 0) return;
-    if (shown.every((e) => e.recipients === undefined)) {
+    if (events.every((e) => e.recipients === undefined)) {
       const names = this.getAgentNamesFn();
-      deliveredTracking(woke, names, () => this.deliverBatch(shown, names, undefined, woke));
+      deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
       return;
     }
     // An untargeted event, one with no list of recipients, is for the gate's
     // recipients alone, as in a batch of such events; one that names its
     // recipients, for them.
     const recipients = new Set(this.getAgentNamesFn());
-    const woken = this.wokenBy(shown);
+    const woken = this.wokenBy(events);
     const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
     for (const agentName of woken) {
-      const seen = shown.filter((e) => (e.recipients === undefined ? recipients.has(agentName) : e.recipients.includes(agentName)));
-      const key = seen.map((e) => shown.indexOf(e)).join(',');
+      const seen = events.filter((e) => (e.recipients === undefined ? recipients.has(agentName) : e.recipients.includes(agentName)));
+      const key = seen.map((e) => events.indexOf(e)).join(',');
       const group = groups.get(key) ?? { agents: [], events: seen };
       group.agents.push(agentName);
       groups.set(key, group);
