@@ -14,16 +14,17 @@ class M extends GateModule {
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
-type Pending = { agentName: string; source?: string; suppressProse?: boolean; silentHeartbeat?: { eventId: string; serverId: string }; wakeLines?: unknown[] };
+type Pending = { agentName: string; reason?: string; source?: string; suppressProse?: boolean; silentHeartbeat?: { eventId: string; serverId: string }; wakeLines?: Array<{ entry?: { eventId?: string } }> };
 type Internals = {
   eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>; fireDebounce(name: string): void };
   pendingRequests: Pending[];
   deliverHeartbeat(wake: unknown): void;
+  addMessage(participant: string, content: unknown[], metadata: Record<string, unknown>): unknown;
   registry: { register(spec: ReturnType<typeof conversationForkSpec>): unknown; end(name: string, reason: 'stopped'): unknown };
   agents: Map<string, unknown>;
 };
 const internals = (f: Fixture) => f.framework as unknown as Internals;
-const tick = (f: Fixture) => internals(f).deliverHeartbeat({ kind: 'heartbeat', reason: 'schedule', silent: true, text: 'tick prompt', eventId: 'tick' });
+const tick = (f: Fixture, eventId = 'tick') => internals(f).deliverHeartbeat({ kind: 'heartbeat', reason: 'schedule', silent: true, text: 'tick prompt', eventId });
 const reminder = (f: Fixture) => internals(f).deliverHeartbeat({ kind: 'reminder', reminderId: 'r1', recurring: false, text: 'water the plants', eventId: 'rem' });
 const separator = SILENT_HEARTBEAT_SEPARATOR.slice(0, 40);
 
@@ -85,8 +86,8 @@ async function batchedTurn(alongside: (f: Fixture) => Promise<void> | void) {
 describe('a silent tick batched by a gate rule', () => {
   it('alone, wakes as the tick: prose suppressed, its separator sent, and no [Gate:] line naming a message it never stored', async () => {
     const { woken, request, routed } = await batchedTurn(() => {});
-    assert.deepEqual(woken.map((r) => [r.agentName, r.suppressProse, r.silentHeartbeat]),
-      [['agent', true, { eventId: 'tick', serverId: 'heartbeat' }]]);
+    assert.deepEqual(woken.map((r) => [r.agentName, r.reason, r.source, r.suppressProse, r.silentHeartbeat]),
+      [['agent', 'heartbeat', 'heartbeat', true, { eventId: 'tick', serverId: 'heartbeat' }]]);
     assert.ok(request.includes(separator), 'the tick separator is in the request');
     assert.ok(!request.includes('[Gate: '), 'no [Gate:] line');
     assert.deepEqual(routed, [], 'its prose is not routed as speech');
@@ -97,7 +98,7 @@ describe('a silent tick batched by a gate rule', () => {
     assert.ok(woken.every((r) => r.suppressProse !== true && r.silentHeartbeat === undefined), 'an ordinary wake');
     assert.ok(!request.includes(separator), 'no tick separator');
     assert.ok(!request.includes('(unknown channel)'), 'the tick is not counted as a message');
-    assert.ok(!request.includes('[Gate: 2 events matched]'));
+    assert.ok(request.includes('[Gate: 1 event matched]') && request.includes('1 message in work'), "the message's own line");
     assert.deepEqual(routed, ['mcpl:speech-routed'], 'its reply goes to the channel');
   });
 
@@ -121,10 +122,47 @@ describe('a silent tick batched by a gate rule', () => {
       const woken = internals(f).pendingRequests;
       assert.ok(woken.length > 0, 'premise: the batch wakes the agent');
       assert.ok(woken.every((r) => r.suppressProse !== true && r.silentHeartbeat === undefined), 'an ordinary wake');
-      assert.ok(woken.some((r) => (r.wakeLines?.length ?? 0) > 0) || f.context().includes('[Gate: 1 event matched]'),
-        'its [Gate:] line, written now or handed to the wake');
+      const handed = woken.flatMap((r) => r.wakeLines ?? []).map((line) => line.entry?.eventId);
+      assert.ok(handed.includes('p1') || f.context().includes('[Gate: 1 event matched]'),
+        'its own [Gate:] line, handed to the wake for its event or written now');
     } finally {
       internals(f).pendingRequests.splice(0);
+      await f.close();
+    }
+  });
+
+  it('of two ticks batched alone, wakes as the newer', async () => {
+    const { f } = await batching();
+    try {
+      tick(f, 'older');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      tick(f, 'newer');
+      fire(f);
+      assert.deepEqual(internals(f).pendingRequests.map((r) => [r.agentName, r.silentHeartbeat?.eventId]), [['agent', 'newer']]);
+    } finally {
+      internals(f).pendingRequests.splice(0);
+      await f.close();
+    }
+  });
+
+  it('beside an untargeted reminder, with a fork present, leaves the resident one line for the reminder', async () => {
+    const { f } = await batching();
+    const fw = internals(f);
+    fw.registry.register(conversationForkSpec('agent-conv-1', { template: 'agent', homeChannel: { serverId: 'editor', channelId: 'work' }, idleTtlMs: 60_000 }));
+    fw.agents.set('agent-conv-1', fw.agents.get('agent'));
+    try {
+      tick(f);
+      reminder(f);
+      // A later entry, so the batch's line is written, not handed to a wake.
+      fw.addMessage('user', [{ type: 'text', text: 'a later note' }], { source: 'test' });
+      fire(f);
+      const lines = f.context().split('[Gate: ').length - 1;
+      assert.equal(lines, 1, 'one [Gate:] line in the resident\'s window');
+      assert.ok(fw.pendingRequests.every((r) => r.suppressProse !== true), 'the resident, with the reminder, wakes ordinary');
+    } finally {
+      fw.pendingRequests.splice(0);
+      fw.registry.end('agent-conv-1', 'stopped');
+      fw.agents.delete('agent-conv-1');
       await f.close();
     }
   });
