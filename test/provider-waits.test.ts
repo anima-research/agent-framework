@@ -1712,6 +1712,13 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
         assert.deepEqual(fw.providerWaitSnapshot('resident').map((stated) => stated.model), ['zz-model'], 'the wait is recorded');
         await drive(fw);
         assert.deepEqual(exhausted, [], 'a held turn is not settled as exhausted');
+        const failed = fw.queryInferenceLogs({ limit: 20 }).entries.map((e) => e.summary ?? e.entry).filter((e) => !e.success);
+        if (site !== 'setup') {
+          assert.equal(failed.length, 1, JSON.stringify(failed));
+          assert.equal(failed[0]!.error, 'zz rate limit reached for requests', 'a retryable failure thrown from the stream is taken as its error event');
+          assert.equal(failed[0]!.errorWords, 'the model call failed (rate_limit, HTTP 429)');
+        }
+        for (const entry of failed) assert.ok(!String(entry.errorWords).includes('zz rate limit'), JSON.stringify(entry));
 
         // Real time passes the wait, as on a loaded host, and the turn stays held.
         await clock.outlast(wait);
@@ -2011,13 +2018,16 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
   test(`an ephemeral run whose stated wait is past the framework cap ends at once (${site}), saying why, and is never retried`, async () => {
     await withStoreDir(async (path) => {
       const log = silence();
-      const membrane = new FailingAt(1, site, () => rateLimited(20 * 60_000));
+      const failure = rateLimited(20 * 60_000);
+      const membrane = new FailingAt(1, site, () => failure);
       const { fw } = await framework(path, membrane);
       try {
         const outcome = await ephemeralRun(fw, `zz-ephemeral-long-${site}`);
         assert.ok('error' in outcome, 'the run ends with an error');
-        assert.match(outcome.error.message, /zz rate limit reached/);
-        assert.match(outcome.error.message, /the provider asked to wait 1200 s; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now/);
+        assert.equal(outcome.error.message, "the model call failed (rate_limit, HTTP 429) (the provider asked to wait 1200 s; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now)");
+        const cause = outcome.error.cause as Error & Record<string, unknown>;
+        assert.deepEqual({ name: cause.name, message: cause.message, type: cause.type, httpStatus: cause.httpStatus, retryAfterMs: cause.retryAfterMs },
+          { name: 'MembraneError', message: failure.message, type: 'rate_limit', httpStatus: 429, retryAfterMs: 20 * 60_000 }, "a copy of the provider's error is its cause");
         // Marked, so a host needn't read the words.
         assert.ok(outcome.error instanceof ProviderWaitNotSleptError, 'the rejection is a ProviderWaitNotSleptError');
         assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
@@ -2074,8 +2084,8 @@ for (const [label, failure] of [
         try {
           const outcome = await ephemeralRun(fw, `zz-ephemeral-refused-${site}`);
           assert.ok('error' in outcome, 'the run ends with an error');
-          assert.match(outcome.error.message, /zz the request was refused/);
-          assert.doesNotMatch(outcome.error.message, /stated wait/);
+          assert.equal(outcome.error.message, 'the model call failed (invalid_request, HTTP 400)');
+          assert.equal((outcome.error.cause as Error | undefined)?.message, 'zz the request was refused');
           assert.ok(!(outcome.error instanceof ProviderWaitNotSleptError), 'a plain error');
           assert.equal(outcome.error.name, 'Error');
         } finally { await fw.stop(); log.restore(); }

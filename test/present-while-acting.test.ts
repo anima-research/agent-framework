@@ -1814,7 +1814,11 @@ describe('present while acting', () => {
       // ends the run before its start's error does.
       const run = framework.runEphemeralToCompletion(agent, contextManager);
       framework.start();
-      await assert.rejects(run, /checkpoint store unavailable/, "the run fails with its start's error");
+      await assert.rejects(run, (rejection: Error) => {
+        assert.equal(rejection.message, 'the turn failed');
+        assert.equal((rejection.cause as Error | undefined)?.message, 'checkpoint store unavailable', "the run fails with its start's error as its cause");
+        return true;
+      });
     } finally {
       console.error = error;
       await framework.stop();
