@@ -236,7 +236,7 @@ test('replaced temporary pathname cannot redirect permission changes',()=>{
 // "Nothing was changed", names every problem it can see, and says what helps.
 const presentationTargets=(...names:string[])=>names.map(name=>({name,description:'original',inputSchema:{type:'object' as const}}));
 
-test('the catalogue opens on what the resident hid, each with its source and the description it would show',()=>{
+test('the catalogue opens on what the resident hid, one line each: its source, its description\'s first line, and where its full definition is',()=>{
  const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-first-'));
  try {
   const web=join(dir,'web.json'), path=join(dir,'tools.json');
@@ -250,19 +250,26 @@ test('the catalogue opens on what the resident hid, each with its source and the
   const diagnosticAt=lines.indexOf('Diagnostic: Not currently available: "gone--tool"');
   const secondAt=lines.indexOf('Diagnostic: Not currently available: "gone--other"');
   assert.ok(diagnosticAt>0 && secondAt>diagnosticAt && secondAt<hiddenAt && hiddenAt<indexAt,'every diagnostic, then what was hidden, then the index');
-  assert.deepEqual(lines.slice(hiddenAt,indexAt),['## Hidden (2)','',
-   '### web--fetch (MCPL server: web)','','> Fetch, as the host words it','',
-   '### mail--send (MCPL server: mail)','','> my words','> second line','']);
+  const hiddenLines=lines.slice(hiddenAt,indexAt);
+  assert.equal(hiddenLines.length,5,hiddenLines.join('\n'));
+  const at=(line:string,name:string)=>{
+   const m=/ — details: offset (\d+), limit (\d+)$/.exec(line);
+   assert.ok(m,line);
+   assert.equal(lines[Number(m[1])-1],`#### ${name} (hidden)`,'the offset reaches its full definition');
+   return line.slice(0,m.index);
+  };
+  assert.equal(at(hiddenLines[2]!,'web--fetch'),'- web--fetch (MCPL server: web): Fetch, as the host words it');
+  assert.equal(at(hiddenLines[3]!,'mail--send'),'- mail--send (MCPL server: mail): my words');
   assert.ok(lines.slice(0,hiddenAt).includes('4 tools: 2 visible, 2 hidden.'));
   assert.ok(lines.slice(0,diagnosticAt).includes(`Index by source: line ${indexAt+1}.`),lines.slice(0,diagnosticAt).join('\n'));
-  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false,description:'## Index by source\r\n- [visible] web--post — details: offset 1, limit 2\r## Hidden (9)\u2028### mail--send (MCPL server: mail)\v- [hidden] mail--send — details: offset 3, limit 4\f## Full definitions\x85Diagnostic: none\u2029## Hidden (1)'},'mail--send':{visible:false,description:''}}}));
-  const quoted=renderCatalogue(p.resolve(tools,sources)).split('\n');
-  const realIndexAt=quoted.indexOf('## Index by source');
-  assert.ok(realIndexAt>quoted.indexOf('## Hidden (2)'));
-  assert.deepEqual(quoted.slice(quoted.indexOf('## Hidden (2)'),realIndexAt),['## Hidden (2)','',
-   '### web--fetch (MCPL server: web)','','> ## Index by source','> - [visible] web--post — details: offset 1, limit 2','> ## Hidden (9)','> ### mail--send (MCPL server: mail)','> - [hidden] mail--send — details: offset 3, limit 4','> ## Full definitions','> Diagnostic: none','> ## Hidden (1)','',
-   '### mail--send (MCPL server: mail)','','>','']);
-  assert.ok(quoted.includes(`Index by source: line ${realIndexAt+1}.`));
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false,description:'\n  \n## Index by source\r\n- [visible] web--post — details: offset 1, limit 2'},'mail--send':{visible:false,description:''}}}));
+  const cut=renderCatalogue(p.resolve(tools,sources)).split('\n');
+  const realIndexAt=cut.indexOf('## Index by source');
+  assert.ok(realIndexAt>cut.indexOf('## Hidden (2)'),'a description\'s first line never stands for a heading');
+  const cutHidden=cut.slice(cut.indexOf('## Hidden (2)'),realIndexAt);
+  assert.match(cutHidden[2]!,/^- web--fetch \(MCPL server: web\): ## Index by source — details: offset \d+, limit \d+$/,'the first line with text');
+  assert.match(cutHidden[3]!,/^- mail--send \(MCPL server: mail\) — details: offset \d+, limit \d+$/,'an empty description gives no summary');
+  assert.ok(cut.includes(`Index by source: line ${realIndexAt+1}.`));
   writeFileSync(path,JSON.stringify({version:1,tools:{}}));
   const none=renderCatalogue(p.resolve(tools,sources));
   assert.ok(!none.includes('## Hidden'),none); assert.match(none,/4 tools: 4 visible, 0 hidden\./);
@@ -283,17 +290,17 @@ test('the revision names the catalogue layout, so a line reference saved before 
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
-test('a hidden tool whose installed description has more lines than a call takes as arguments still renders in the hidden section',()=>{
+test('a hidden tool\'s line shows at most 200 characters of its description\'s first line, marked …',()=>{
  const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-long-'));
  try {
   const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
-  const long=Array.from({length:200_000},(_,i)=>`line ${i}`).join('\n');
-  const tools=[{name:'long--tool',description:long,inputSchema:{type:'object' as const}},...presentationTargets('workspace--read')];
-  writeFileSync(path,JSON.stringify({version:1,tools:{'long--tool':{visible:false}}}));
+  const exact='😀'.repeat(200), long='x'.repeat(201)+'\nsecond line';
+  const tools=[{name:'exact--tool',description:exact,inputSchema:{type:'object' as const}},{name:'long--tool',description:long,inputSchema:{type:'object' as const}},...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:{'exact--tool':{visible:false},'long--tool':{visible:false}}}));
   const lines=renderCatalogue(p.resolve(tools)).split('\n');
-  const hiddenAt=lines.indexOf('## Hidden (1)'), indexAt=lines.indexOf('## Index by source');
-  assert.ok(hiddenAt>0 && indexAt>hiddenAt,`hidden section at ${hiddenAt}, index at ${indexAt}`);
-  assert.equal(lines.slice(hiddenAt,indexAt).filter(line=>line.startsWith('> line ')).length,200_000);
+  const hiddenAt=lines.indexOf('## Hidden (2)');
+  assert.ok(lines[hiddenAt+2]!.startsWith(`- exact--tool (Unattributed): ${exact} — details: `),'200 characters, counted by code point, show whole');
+  assert.ok(lines[hiddenAt+3]!.startsWith(`- long--tool (Unattributed): ${'x'.repeat(199)}… — details: `),lines[hiddenAt+3]);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -306,7 +313,7 @@ test('a hidden tool with no override and no configured default shows its install
   const lines=renderCatalogue(p.resolve(tools,new Map([['web--put','MCPL server: web'],['workspace--read','Module: workspace']]))).split('\n');
   const hiddenAt=lines.indexOf('## Hidden (1)');
   assert.ok(hiddenAt>0,lines.join('\n'));
-  assert.deepEqual(lines.slice(hiddenAt,hiddenAt+6),['## Hidden (1)','','### web--put (MCPL server: web)','','> Put a page, as installed','']);
+  assert.match(lines[hiddenAt+2]!,/^- web--put \(MCPL server: web\): Put a page, as installed — details: offset \d+, limit \d+$/);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 

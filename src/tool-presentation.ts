@@ -349,6 +349,14 @@ export class ToolPresentation {
     return name;
   }
 }
+/** The longest a hidden tool's line shows of its description, in characters. */
+const SUMMARY_CHARACTERS = 200;
+/** A description's first line with text, cut at SUMMARY_CHARACTERS and marked …, for the hidden section. */
+function summaryOf(description: string): string {
+  const first = description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).find(line => line.trim() !== '');
+  if (first === undefined) return '';
+  return `: ${characters(first) <= SUMMARY_CHARACTERS ? first : `${firstCharacters(first, SUMMARY_CHARACTERS - 1)}…`}`;
+}
 export function renderCatalogue(snapshot: PresentationSnapshot): string {
   const groups = new Map<string, PresentationSnapshot['entries']>();
   for (const entry of snapshot.entries) {
@@ -372,13 +380,11 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
   // One line each: a quoted parse error can hold the file's own line breaks.
   for (const diagnostic of snapshot.diagnostics) lines.push('Diagnostic: '+diagnostic.replace(/\r\n|\r|\n/g, '\\n'));
   const hidden = snapshot.entries.filter(e => !e.visible);
+  const hiddenAt = new Map<string, number>();
   if (hidden.length) {
     lines.push(`## Hidden (${hidden.length})`, '');
-    for (const entry of hidden) {
-      lines.push(`### ${entry.name} (${entry.source})`, '');
-      appendAll(lines, entry.description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).map(line => line ? `> ${line}` : '>'));
-      lines.push('');
-    }
+    for (const entry of hidden) {hiddenAt.set(entry.name, lines.length); lines.push('');}
+    lines.push('');
   }
   lines[indexLineAt] = `Index by source: line ${lines.length + 1}.`;
   lines.push('## Index by source', '');
@@ -401,7 +407,10 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
         appendAll(lines, entry.originalDescription.split('\n'));
       }
       lines.push('');
-      lines[index.get(entry.name)!] = `- [${entry.visible?'visible':'hidden'}] ${entry.name} — details: offset ${start}, limit ${lines.length-start+1}`;
+      const details = `details: offset ${start}, limit ${lines.length-start+1}`;
+      lines[index.get(entry.name)!] = `- [${entry.visible?'visible':'hidden'}] ${entry.name} — ${details}`;
+      const at = hiddenAt.get(entry.name);
+      if (at !== undefined) lines[at] = `- ${entry.name} (${entry.source})${summaryOf(entry.description)} — ${details}`;
     }
   }
   return lines.join('\n');
