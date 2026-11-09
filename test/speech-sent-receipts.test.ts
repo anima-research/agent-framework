@@ -2224,27 +2224,31 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(surface.asked.filter((a) => a.agent === 'second').at(-1)?.context.openedBy?.messages, ['m-first', 'm-second']);
   });
 
-  it('two equal wakes a provider hold keeps as one name both their messages at its release', async () => {
+  it("a provider hold that keeps a silent push carrying messages and folds an equal plain push into it keeps both pushes' messages", async () => {
     const surface = new Surface();
     const membrane = new MockMembrane();
     const f = await host([surface], membrane);
     const now = Date.now();
     const timer = setTimeout(() => {}, 60_000);
     const cooldowns = internals(f).providerAccelerationCooldowns;
-    cooldowns.set('resident', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'test hold', failures: 1 });
-    const pending = internals(f).pendingRequests;
-    pending.push({ agentName: 'resident', reason: 'external-message', source: 'console', timestamp: now, openingMessages: ['m-first'] });
-    pending.push({ agentName: 'resident', reason: 'external-message', source: 'console', timestamp: now, openingMessages: ['m-second'] });
-    await f.runUntilIdle();
-    const held = cooldowns.get('resident')!.heldRequests as Array<{ openingMessages?: string[] }>;
-    assert.equal(held.length, 1, 'premise: the hold keeps one');
-    clearTimeout(timer);
-    cooldowns.get('resident')!.until = Date.now();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
-    (f as unknown as { releaseProviderAccelerationCooldown(agent: string): void }).releaseProviderAccelerationCooldown('resident');
-    await f.runUntilIdle();
-    assert.equal(surface.asked.length, 1, 'premise: the released turn ran');
-    assert.deepEqual(surface.asked[0]!.context.openedBy?.messages, ['m-first', 'm-second']);
+    try {
+      cooldowns.set('resident', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'test hold', failures: 1 });
+      // The silent push's messages stand for those a quiesce's park writes
+      // onto a silent push that absorbed a plain one.
+      const push = (message: string, silent: boolean) => ({
+        agentName: 'resident', reason: 'mcpl:push-event', source: 'discord', timestamp: now, addressed: false,
+        ...(silent ? { suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } } : {}),
+        openingMessages: [message],
+      });
+      internals(f).pendingRequests.push(push('m-first', true), push('m-second', false));
+      await f.runUntilIdle();
+      const held = cooldowns.get('resident')!.heldRequests as Array<{ openingMessages?: string[]; suppressProse?: unknown }>;
+      assert.equal(held.length, 1, 'premise: the hold keeps one of the two equal pushes');
+      assert.equal(held[0]!.suppressProse, true, 'premise: the hold keeps the silent push it held first');
+      assert.deepEqual(held[0]!.openingMessages, ['m-first', 'm-second']);
+    } finally {
+      clearTimeout(timer);
+    }
   });
 
   it("a bounce's wake carries the messages that started the turn", async () => {
