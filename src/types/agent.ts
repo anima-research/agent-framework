@@ -221,11 +221,15 @@ export interface AgentConfig {
      * counts it. After a fold, each block after the stretch it rewrote is
      * bound to a conversation the request no longer holds. Where the context
      * strategy still sends such a block, the provider drops it on every call
-     * until a later fold takes it out of the context, and while such blocks
-     * are sent, no stream gives a sample and the calibration keeps the value
-     * it had. A strategy that leaves that thinking out at the fold sends none
-     * to drop. The direct API carries the control too, but reads no report: it
-     * traces no usage and feeds no calibration.
+     * until a later fold takes it out of the context, or, with `binds` set
+     * too, until the next compile after a note lands: the stream tells the
+     * context manager which stored reply's thinking was dropped
+     * (`noteThinkingDropped`), and once a note lands, the next compile sends
+     * that reply without it. While such blocks are sent,
+     * no stream gives a sample and the calibration keeps the value it had. A
+     * strategy that leaves that thinking out at the fold sends none to drop.
+     * The direct API carries the control too, but reads no report: it traces
+     * no usage, feeds no calibration and notes nothing.
      *
      * Default false: nothing is sent, and the account's default applies.
      */
@@ -249,6 +253,11 @@ export interface AgentConfig {
      *   thinking is kept at the next compile. The direct API
      *   (`runInference`) notes nothing, so each of its replies' thinking is
      *   left out at the compile after it's stored;
+     * - with `dropBlock` set too, each framework stream tells the context
+     *   manager which stored replies' thinking the provider reports dropping
+     *   (`noteThinkingDropped`), naming the compile it was built from, so
+     *   once a note lands, the next compile sends those replies without their
+     *   thinking;
      * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
      *   starts a new stream mid-turn, since the new stream's compile can take
      *   the turn's earlier reasoning out of the request;

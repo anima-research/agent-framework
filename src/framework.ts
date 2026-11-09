@@ -4841,11 +4841,11 @@ export class AgentFramework {
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
   private readonly resumesPending = new Map<string, Agent | undefined>();
-  // context-manager 0.23.1: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:2897),
+  // context-manager 0.25.1: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3156),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
-  // (context-manager.ts:2343-2359). So such a released manager is collected
+  // (context-manager.ts:4602-4621). So such a released manager is collected
   // only once nothing of its work can still read the store, and stop()
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
@@ -5143,13 +5143,16 @@ export class AgentFramework {
     assertAgentNamesUnique(config.agents);
     assertObservedAgentsConfigured(config.agents);
     // The presentation index (#291) needs a context-manager that keeps a
-    // window index per agent (presentRows): 0.25.0 on, since 0.23.x and
-    // 0.24.0 were published without one. It needs no store, so it is
-    // checked before one is opened.
-    if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
+    // window index per agent (presentRows), which 0.23.x and 0.24.x were
+    // published without, and a stream tells it of dropped thinking
+    // (noteThinkingDropped), which 0.25.0 was published without. It needs no
+    // store, so it is checked before one is opened.
+    const contextManagerProto = ContextManager.prototype as { presentRows?: unknown; noteThinkingDropped?: unknown };
+    if (typeof contextManagerProto.presentRows !== 'function' || typeof contextManagerProto.noteThinkingDropped !== 'function') {
       throw new Error(
-        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
-          'Install @animalabs/context-manager ^0.25.0, which this package declares (0.23.x and 0.24.0 have no window index)',
+        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
+          "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
+          'Install @animalabs/context-manager ^0.25.1, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
@@ -27753,6 +27756,7 @@ export class AgentFramework {
         thinkingRecordedAfter,
         thinkingBranch,
         noteRequestSent,
+        noteThinkingDropped,
         carriedBodies,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
@@ -27874,6 +27878,7 @@ export class AgentFramework {
               place: placeDrops,
               ...(thinkingRecordedAfter !== undefined ? { recordedAfter: thinkingRecordedAfter } : {}),
               ...(thinkingBranch !== undefined ? { branch: thinkingBranch } : {}),
+              ...(noteThinkingDropped ? { noteDropped: noteThinkingDropped } : {}),
             }
           : undefined,
         streamCarry,
@@ -30158,16 +30163,33 @@ export class AgentFramework {
             // carries what the stream appended, so once a call has dropped
             // blocks, none of the stream's later calls is given either. A
             // compile whose first call dropped blocks gives no sample, and the
-            // calibration keeps its value. If the provider drops an earlier
-            // model's blocks after a model switch (`model_binding_mismatch`),
-            // they drop on every call until they leave the context, and the
-            // calibration takes up the new model's tokenizer only after that.
+            // calibration keeps its value. Without `binds`, if the provider
+            // drops an earlier model's blocks after a model switch
+            // (`model_binding_mismatch`), they drop on every call until they
+            // leave the context, and the calibration takes up the new model's
+            // tokenizer only after that. With `binds`, the switch changes the
+            // request's identity, so the compile leaves the replies' thinking
+            // out itself, and a drop that does come is noted below.
             const thinkingReport = event.round?.thinking;
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             if (thinkingDropped) thinkingDroppedInStream = true;
             // Against the branch's binding record, when the context manager keeps one: a drop it can't account
             // for tells the operators (noteThinkingLoss), and a call with no report shows no such drop.
             const placedDrops = thinkingDrops && thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [];
+            // The stored replies' bodies among them, as placed, go to the record, so the next compile sends them
+            // without their thinking and the provider drops none of them again.
+            const droppedBodies = placedDrops.flatMap((drop) => drop.kind === 'reply' ? drop.bodies.map((body) => body.messageId) : []);
+            if (droppedBodies.length > 0 && thinkingDrops?.noteDropped) {
+              try {
+                thinkingDrops.noteDropped(droppedBodies);
+              } catch (error) {
+                console.error(
+                  `[thinking-binding] ${agent.name}: couldn't note the stored replies whose thinking the provider dropped, ` +
+                    'so the next compile still sends them with it:',
+                  error,
+                );
+              }
+            }
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, placedDrops, thinkingDrops.recordedAfter);
             }
