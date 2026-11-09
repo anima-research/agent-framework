@@ -102,7 +102,7 @@ describe('HealthModule snapshot error text', () => {
     const entries = [
       { sequence: 0, entry: { timestamp: 1751900000000, agentName: 'a', requestId: 'r0', success: false, error: 'Bad request: zz-provider-words-7f3a', errorWords: 'the model call failed (invalid_request, HTTP 400)', request: {}, durationMs: 1 } },
       { sequence: 1, entry: { timestamp: 1751900000000, agentName: 'a', requestId: 'r1', success: false, error: 'Bad request: zz-provider-words-7f3a', request: {}, durationMs: 1 } },
-    ];
+    ].map((e) => ({ ...e, summary: { timestamp: e.entry.timestamp, agentName: e.entry.agentName, requestId: e.entry.requestId, success: e.entry.success, error: e.entry.error, errorWords: (e.entry as { errorWords?: string }).errorWords, durationMs: e.entry.durationMs, requestIsBlob: false, responseIsBlob: false } }));
     const health = new HealthModule({ timeZone: 'UTC' });
     health.bind(frameworkStub(entries), {} as JsStore);
 

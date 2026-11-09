@@ -981,6 +981,16 @@ test('a ~1 MB plain Error (no classification) is bounded the same way', async ()
   assert.ok(longest < 4_500, `longest stderr line is ${longest} chars`);
 });
 
+test("a ~1 MB reason the framework would show is bounded in the inference log's words as in its error", async () => {
+  const { inferenceLogs } = await runFailingTurn('stream throws', () => Object.assign(new Error(`Renderer dropped: ${echo()}`), { name: 'UncoveredDropError' }));
+  const entries = inferenceLogs.map(({ entry }) => entry).filter((e) => e.success === false);
+  assert.ok(entries.length > 0, 'the failed inference is logged');
+  for (const entry of entries) {
+    assert.ok(typeof entry.errorWords === 'string' && entry.errorWords.includes('Renderer dropped: '), String(entry.errorWords).slice(0, 80));
+    assert.ok(entry.errorWords.length <= 2_000, `inference log errorWords is ${entry.errorWords.length} chars`);
+  }
+});
+
 test('an oversized provider code is bounded in the trace, the marker and failures.log', async () => {
   const { markers, traces, failuresLog } = await runFailingTurn('stream error event', () => new MembraneError({
     type: 'invalid_request', retryable: false, httpStatus: 400, providerErrorCode: `zz${'C'.repeat(MEGA)}`,

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { MembraneError } from '@animalabs/membrane';
 import { EventGate } from '../src/gate/event-gate.js';
+import { JudgeFailure } from '../src/gate/reply-judge.js';
 import type { GateConfig, GateEventInfo, JudgeFn, JudgeRequest, JudgeVerdict } from '../src/gate/types.js';
 import type { ToolDefinition } from '../src/types/index.js';
 
@@ -494,6 +495,50 @@ describe('judge rules: timing', () => {
       console.error = original;
     }
     assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
+    gate.dispose();
+  });
+
+  it("a judge whose answer held no verdict is shown in the framework's words, and stderr keeps what the answer said", async () => {
+    const SENTINEL = 'zz-judge-words-7f3a';
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('no-verdict-words.json', JUDGED), { judge: judge.fn });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        gate.evaluate(chat(`m${i}`));
+        await until(() => judge.waiting() === 1, 'the judge is asked');
+        judge.fail(new JudgeFailure("the judge's answer held no verdict", `stop: refusal, text: "${SENTINEL}"`));
+        await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === i + 1, 'the failure counted');
+      }
+    } finally {
+      console.error = original;
+    }
+    const status = gate.getStatus();
+    assert.strictEqual(status.policies[0]!.judgeState!.last!.reason, "the judge's answer held no verdict");
+    assert.ok(status.errors.some((e) => e.includes("(the newest: the judge's answer held no verdict)")), JSON.stringify(status.errors));
+    assert.ok(!JSON.stringify(status).includes(SENTINEL) && !JSON.stringify(status).includes('refusal'), JSON.stringify(status));
+    assert.ok(logged.some((line) => line.includes(SENTINEL)), 'stderr keeps what the answer said');
+    gate.dispose();
+  });
+
+  it("a judge that rejects as soon as it's stopped still shows the gate's timeout, in gate_status and on stderr", async () => {
+    const fn: JudgeFn = (request) => new Promise<JudgeVerdict>((_, reject) => {
+      request.signal.addEventListener('abort', () => reject(new DOMException('This operation was aborted', 'AbortError')));
+    });
+    const { gate, wakes } = makeGate(writeConfig('abort-aware-timeout.json', JUDGED), { judge: fn, judgeTimeoutMs: 50 });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      gate.evaluate(chat('hello'));
+      await until(() => wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
+    assert.ok(logged.some((line) => line.includes('the reply judge failed (the judge took more than 50 ms)')), JSON.stringify(logged));
     gate.dispose();
   });
 

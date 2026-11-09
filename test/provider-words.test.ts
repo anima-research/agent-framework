@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MembraneError } from '@animalabs/membrane';
 import type { MembraneErrorType, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
-import { OverBudgetError } from '@animalabs/context-manager';
+import { OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { ErrorPolicy, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
@@ -89,6 +89,7 @@ function assertCopyOf(cause: unknown, error: Error): void {
     return { name, message, type, retryable, httpStatus, providerErrorCode, retryAfterMs };
   };
   assert.deepEqual(fields(cause), fields(error));
+  assert.equal(cause.stack, error.stack, "the copy keeps the error's own stack");
   assert.ok(!('rawError' in cause) && !('rawRequest' in cause), 'with no raw error or request');
 }
 
@@ -166,10 +167,15 @@ describe("a provider's words stay out of what an agent reads", () => {
       assert.ok(turn.stderr.some((line) => line.startsWith('[inference-failed]') && line.includes(SENTINEL)), 'stderr keeps the provider\'s words');
     });
 
-    it(`health--snapshot lists a turn that failed on a provider's error (${site}) in the framework's words, and the inference log keeps the provider's`, async () => {
-      const { shown, logged } = await healthAfterTurn(new FailingFirst(site, providerError()));
+    it(site === 'start'
+      ? "health--snapshot lists no error for a turn whose model call fails before its stream exists, since the inference log has no entry for it"
+      : `health--snapshot lists a turn that failed on a provider's error (${site}) in the framework's words, and the inference log keeps the provider's`, async () => {
+      const membrane = new FailingFirst(site, providerError());
+      const { shown, logged } = await healthAfterTurn(membrane);
       if (site === 'start') {
-        assert.deepEqual(shown, [], 'a call that fails before its stream exists writes no inference-log entry');
+        assert.equal(membrane.sent, 1, 'the model call was made, and failed before its stream existed');
+        assert.deepEqual(shown, []);
+        assert.deepEqual(logged, []);
         return;
       }
       assert.ok(shown.length >= 1, JSON.stringify(shown));
@@ -234,6 +240,14 @@ describe("a provider's words stay out of what an agent reads", () => {
     assert.equal(turn.markers.length, 1, JSON.stringify(turn.texts));
     assert.match(turn.markers[0]!, /so nothing was sent\. Reason: Stream aborted: error\. If this recurs/);
     assert.ok(!turn.texts.some((text) => text.includes(SENTINEL)), JSON.stringify(turn.texts));
+  });
+
+  it("a compile refusal whose words end a sentence is told with one full stop after them", async () => {
+    const refusal = new UncoveredDropError({ droppedIds: ['m1'] as never, site: 'test', diagnostics: { budget: 100, totalTokens: 250 } as never });
+    assert.ok(refusal.message.endsWith('.'), refusal.message);
+    const turn = await residentTurn(new FailingFirst('start', refusal));
+    assert.equal(turn.markers.length, 1, JSON.stringify(turn.texts));
+    assert.ok(turn.markers[0]!.includes(`Reason: ${refusal.message} If this recurs`), turn.markers[0]);
   });
 
   it("context-manager's refusal of a compile is told in context-manager's own words", async () => {
