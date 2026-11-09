@@ -95,7 +95,7 @@ test("channel_publish's refusal of a channelId written as a number carries isErr
   assert.equal(
     (res as { error?: unknown }).error,
     "Nothing changed: channel_publish's channelId must be a string, and this call gave a number. "
-      + 'Give it in quotes: a number can lose its last digits before it reaches the server.',
+      + 'Give it in quotes: a number can lose its last digits as the call is read.',
   );
 });
 
@@ -120,9 +120,11 @@ const NOT_STRINGS: Array<[written: string, gave: string]> = [
 ];
 
 for (const [tool, field, rest] of STRING_PARAMETERS) {
-  test(`${tool} refuses a ${field} that isn't a string, and sends nothing`, async () => {
+  test(`${tool} refuses a ${field} that isn't a string, and changes and sends nothing`, async () => {
     for (const [written, gave] of NOT_STRINGS) {
       const { registry, sent } = await makeRegistry();
+      const state = registry.getDesiredState('discord', 'invited');
+      const closed = registry.closedByAgent(invited);
       const input = { ...rest, ...(call(`{"${field}":${written}}`) as object) };
       const res = await registry.handleChannelToolCall(tool, input, origin);
       const error = String((res as { error?: unknown }).error);
@@ -131,6 +133,8 @@ for (const [tool, field, rest] of STRING_PARAMETERS) {
       assert.equal(error.startsWith(`Nothing changed: ${tool}'s ${field} must be a string, and this call gave ${gave}. Give it in quotes`), true, error);
       assert.equal(error.includes('can lose its last digits'), gave === 'a number', `the digits clause only for a number: ${error}`);
       assert.deepEqual(sent, [], `${field} ${written}: nothing was sent`);
+      assert.equal(registry.getDesiredState('discord', 'invited'), state, `${field} ${written}: the channel's desired state is as it was`);
+      assert.equal(registry.closedByAgent(invited), closed, `${field} ${written}: no decision was recorded`);
     }
   });
 }
