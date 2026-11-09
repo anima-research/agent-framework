@@ -116,6 +116,18 @@ for (const isPrivate of [true, false]) {
   });
 }
 
+test("the breaker's retry of a turn its batch gave no channel keeps the batch's channels", () => {
+  const { fw, restore } = makeHarness();
+  const channels = [{ serverId: 'discord', channelId: 'discord:g:room' }];
+  fw.turnRouting = new Map([['cairn', { wakeChannels: channels }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
+  assert.deepEqual(fw.pendingRequests[0].wakeChannels, channels);
+});
+
 test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
   const { fw, messages, added, restore } = makeHarness({ messages: [
     { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },

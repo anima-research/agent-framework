@@ -1516,6 +1516,43 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it("the non-streaming fallback's re-inference carries a batch turn's channels", async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      routingOf(name: string): RoutingState;
+      openLogical: Map<string, unknown>;
+      pendingRequests: InferenceRequest[];
+      handleProcessEvent(event: ProcessEvent): Promise<void>;
+    };
+    const origin = internals.routingOf('assistant');
+    origin.continuation = true;
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    (origin as unknown as { wakeChannels?: unknown }).wakeChannels = [room];
+    internals.openLogical.set('assistant', origin);
+    const response = createMockResponse([
+      { type: 'tool_use', id: 'unstreamed-one', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    try {
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'Take the direct inference path.' }]);
+      await agent.runInference(framework.getAllTools());
+      assert.equal(agent.state.status, 'waiting_for_tools');
+      assert.equal((agent.state as { stream?: unknown }).stream, undefined, 'the direct API has no yielding stream');
+      agent.addAssistantResponse(response.content);
+      await internals.handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'unstreamed-one',
+        result: { success: true, data: { ok: true } },
+      } as ProcessEvent);
+      const reinference = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
+      assert.ok(reinference, 'premise: the fallback scheduled the re-inference');
+      assert.deepEqual(reinference.wakeChannels, [room]);
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("a settle closes the open logical turn only when it is the settling stream's own", async () => {
     const framework = await createFramework('hybrid');
     const internals = framework as unknown as {

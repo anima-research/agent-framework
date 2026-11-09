@@ -34,6 +34,8 @@ export interface StreamThinkingDrops {
   place: (entries: readonly ThinkingBindingEntry[]) => PlacedDrop[];
   recordedAfter?: number;
   branch?: string;
+  /** `StartStreamResult`'s `noteThinkingDropped`. */
+  noteDropped?: (messageIds: readonly MessageId[]) => boolean;
 }
 
 /** A signed block's identity on the wire: a thinking block's signature, a redacted block's data. */

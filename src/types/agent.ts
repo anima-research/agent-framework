@@ -221,11 +221,15 @@ export interface AgentConfig {
      * counts it. After a fold, each block after the stretch it rewrote is
      * bound to a conversation the request no longer holds. Where the context
      * strategy still sends such a block, the provider drops it on every call
-     * until a later fold takes it out of the context, and while such blocks
-     * are sent, no stream gives a sample and the calibration keeps the value
-     * it had. A strategy that leaves that thinking out at the fold sends none
-     * to drop. The direct API carries the control too, but reads no report: it
-     * traces no usage and feeds no calibration.
+     * until a later fold takes it out of the context, or, with `binds` set
+     * too, until the next compile after a note lands: the stream tells the
+     * context manager which stored reply's thinking was dropped
+     * (`noteThinkingDropped`), and once a note lands, the next compile sends
+     * that reply without it. While such blocks are sent,
+     * no stream gives a sample and the calibration keeps the value it had. A
+     * strategy that leaves that thinking out at the fold sends none to drop.
+     * The direct API carries the control too, but reads no report: it traces
+     * no usage, feeds no calibration and notes nothing.
      *
      * Default false: nothing is sent, and the account's default applies.
      */
@@ -249,6 +253,11 @@ export interface AgentConfig {
      *   thinking is kept at the next compile. The direct API
      *   (`runInference`) notes nothing, so each of its replies' thinking is
      *   left out at the compile after it's stored;
+     * - with `dropBlock` set too, each framework stream tells the context
+     *   manager which stored replies' thinking the provider reports dropping
+     *   (`noteThinkingDropped`), naming the compile it was built from, so
+     *   once a note lands, the next compile sends those replies without their
+     *   thinking;
      * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
      *   starts a new stream mid-turn, since the new stream's compile can take
      *   the turn's earlier reasoning out of the request;
@@ -773,6 +782,28 @@ export interface InferenceRequest {
    * channel (ambient-only batches leave it unset).
    */
   wakeChannelId?: string;
+  /**
+   * Framework-set on a gate wake whose batch held no message that addressed
+   * the agent, and which so took no route: the channels its messages came
+   * from (a `chat:system` notice names none, unless it's a coalesced
+   * render's latest occurrence), each once. A start merged from several
+   * requests carries every one's channels, or, when any of them comes from
+   * outside the framework, isn't a silent heartbeat tick and brought
+   * channels, only those requests' channels. A request a quiesce keeps in
+   * another's place, and one a provider hold takes another into, carry both
+   * requests' channels.
+   * The framework's own wakes that continue a
+   * turn (a restart, a re-inference, a continuation, a retry, a bounce, a
+   * re-arm), unless its own wake named a channel that resolves to none,
+   * carry the channels the turn's starts gathered, whether or not the turn
+   * had a locus, so a turn's trigger can name channels from several batches,
+   * and a turn they open with no locus can name them too.
+   * When such a turn's plain speech, or a sleep's announcement, is routed
+   * with no locus, the agent is told these channels, unless the turn's own
+   * wake named a channel that resolves to none, or the turn is an ephemeral
+   * run's, which is told nothing.
+   */
+  wakeChannels?: Array<{ serverId: string; channelId: string }>;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
   /** Batched-wake lines the gate handed to this wake rather than wrote

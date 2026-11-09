@@ -1093,6 +1093,9 @@ interface ChannelRegistryOptions {
     outcome?: 'failed' | 'unknown';
     /** Bounded display of the connector's structured error data, when present. */
     detail?: string;
+    /** Set when the turn had no channel and the reason names the channels
+     *  its batch came from. */
+    byDesign?: true;
   }) => void;
   /**
    * Announces either a durable subscription-policy admission (before its
@@ -1135,15 +1138,29 @@ interface ChannelRegistryOptions {
    * message across ALL channels (markers aside) and misroutes a reply to
    * whichever channel last spoke under concurrency (item-3 redux). The
    * framework keeps both on the live turn's routing state and exposes them
-   * here. For a heartbeat / no-trigger turn it resolves to undefined until the
-   * turn's locus is resolved, so that
-   * resolution takes the global fallback, which the turn then keeps.
-   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
-   * `defaultPublishChannel`. Null where the turn deliberately has no channel,
-   * as one woken for a channel id two servers register, given without its
-   * server: that takes no fallback either.
+   * here. For a no-trigger turn it resolves to undefined until the turn's
+   * locus is resolved, so that resolution takes the global fallback, which the
+   * turn then keeps. Consulted AFTER `homeChannelResolver` (a fork's home
+   * always wins), BEFORE the global fallback. Null where the turn deliberately
+   * has no channel, as a heartbeat's turn, or one woken for a channel id two
+   * servers register, given without its server: that takes no fallback
+   * either.
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
+  /**
+   * FrameworkConfig.unpromptedChannel: where a turn that takes it
+   * (takesUnpromptedChannel) and has no home and no channel of its own is
+   * placed, within the process-global fallback, after an all-except hold's
+   * channel (sharedFallback). A name, as entriesNamed reads one.
+   */
+  unpromptedChannel?: string;
+  /**
+   * Whether the conversation's current turn takes `unpromptedChannel` where it
+   * has no channel of its own: the framework answers true only for a turn
+   * the agent's own timer started, as FrameworkConfig.unpromptedChannel
+   * says. Absent, every turn does.
+   */
+  takesUnpromptedChannel?: (conversationId: string) => boolean;
   /**
    * Whether the agent's current turn has no channel of its own — a
    * heartbeat's, or one woken for a channel that names none — so it replies
@@ -1282,6 +1299,9 @@ export class ChannelRegistry {
   private channellessTurn?: (agentName: string) => boolean;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
+  private unpromptedChannel?: string;
+  private unpromptedChannelWarned = false;
+  private takesUnpromptedChannel?: (conversationId: string) => boolean;
   private store?: JsStore;
 
   /**
@@ -1483,6 +1503,11 @@ export class ChannelRegistry {
     return new ChannelLifecycleError(`this host isn't permitted to open or close the "${serverId}" server's channels`, 'not-permitted');
   }
 
+  private publishingServer(serverId: string): McplServerConnection | undefined {
+    const server = this.serverRegistry.getServer(serverId);
+    return server && CapabilityGrant.of(server).has('channels.publish') ? server : undefined;
+  }
+
   /**
    * Why a send to this server's channels is refused before anything goes
    * out, as one clause with what works from there, for a caller that found
@@ -1677,6 +1702,17 @@ export class ChannelRegistry {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
     this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
+      if (tool.name === 'channel_publish') {
+        if (options?.unpromptedChannel === undefined || options.eventGatePresent !== true) return tool;
+        return {
+          ...tool,
+          description: tool.description
+            .replace(
+              'otherwise, while a focus holds, the channel it keeps.',
+              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn\'t routed), the channel this host names for such turns.',
+            ),
+        };
+      }
       if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
       const schema = tool.inputSchema as {
         type: 'object';
@@ -1709,6 +1745,8 @@ export class ChannelRegistry {
     this.activeChannelResolver = options?.activeChannelResolver;
     this.channellessTurn = options?.channellessTurn;
     this.takesGlobalFallback = options?.takesGlobalFallback;
+    this.unpromptedChannel = options?.unpromptedChannel;
+    this.takesUnpromptedChannel = options?.takesUnpromptedChannel;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
     this.initializeLifecycleStore();
@@ -2627,7 +2665,9 @@ export class ChannelRegistry {
     // declared it inbound-only, since speech isn't posted there): a conversation
     // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
-    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none).
+    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none), with
+    // the configured unprompted channel in it where the turn takes it: the
+    // channel channel_publish naming none publishes to, in every prose mode.
     // Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
@@ -2638,9 +2678,11 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): not the
     // all-except hold's channel, not the latest inbound message's channel as
     // its outgoing one, nor that message as the one it is replying to.
-    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback();
+    const fallback = (): ChannelRef | null => agentName !== undefined
+      ? this.globalFallbackFor(agentName, () => this.configuredUnprompted(agentName))
+      : this.sharedFallback();
     // A turn that deliberately has no channel (null) takes no fallback.
-    const outgoing = home ?? (active !== undefined ? active : fallback);
+    const outgoing = home ?? (active !== undefined ? active : fallback());
 
     const context: ChannelContext = {};
 
@@ -6022,7 +6064,8 @@ export class ChannelRegistry {
   }
 
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default), with its server. Public so a multi-segment
+   *  process-global default, with the configured unprompted channel in it
+   *  where the turn takes it), with its server. Public so a multi-segment
    *  caller can snapshot it ONCE and pin every segment to it via
    *  routeSpeech's locus. */
   resolveLocus(conversationId: string): ChannelRef | null {
@@ -6030,7 +6073,33 @@ export class ChannelRegistry {
     if (home) return home;
     // A turn that deliberately has no channel (null) takes no fallback.
     const active = this.activeChannelResolver?.(conversationId);
-    return active !== undefined ? active : this.globalFallbackFor(conversationId);
+    return active !== undefined
+      ? active
+      : this.globalFallbackFor(conversationId, () => this.configuredUnprompted(conversationId));
+  }
+
+  private configuredUnprompted(conversationId: string | undefined): ChannelRef | null {
+    if (!this.unpromptedChannel) return null;
+    if (conversationId !== undefined && this.takesUnpromptedChannel?.(conversationId) === false) return null;
+    const named = this.entriesNamed(this.unpromptedChannel);
+    if (named.length === 1 && !isInboundOnly(named[0]!)) {
+      this.unpromptedChannelWarned = false;
+      return refOf(named[0]!);
+    }
+    if (!this.unpromptedChannelWarned) {
+      this.unpromptedChannelWarned = true;
+      const why = named.length === 0
+        ? 'names no registered channel'
+        : named.length === 1
+          ? 'names a channel its server declared inbound-only'
+          : `names ${named.length} registered channels (name one with its server, as "serverId:channelId")`;
+      console.error(
+        `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn the agent's own timer starts `
+          + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. '
+          + 'Not logged again until a turn has used it.',
+      );
+    }
+    return null;
   }
 
   /**
@@ -6039,19 +6108,21 @@ export class ChannelRegistry {
    * result, so neither the all-except hold's channel nor the latest inbound
    * message's is ever its destination.
    */
-  private globalFallbackFor(conversationId: string): ChannelRef | null {
-    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback();
+  private globalFallbackFor(conversationId: string, unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback(unprompted);
   }
 
   /**
    * What every conversation that takes the global fallback falls back to when
    * neither a home channel nor its own delivery names one: the all-except
-   * hold's channel while one is open, else the latest delivered inbound
-   * channel under the legacy locus rule, else none — the prose stays private
-   * (architecture channel §3 carve-out, 2026-10-06).
+   * hold's channel while one is open, else, for a turn's locus, the
+   * configured unprompted channel where the turn takes it (resolveLocus),
+   * else the latest delivered inbound channel under the legacy locus rule,
+   * else none — the prose stays private (architecture channel §3 carve-out,
+   * 2026-10-06).
    */
-  private sharedFallback(): ChannelRef | null {
-    return this.focusChannelResolver?.() ?? this.fallbackLocus();
+  private sharedFallback(unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.focusChannelResolver?.() ?? unprompted?.() ?? this.fallbackLocus();
   }
 
   private fallbackLocus(): ChannelRef | null {
@@ -6204,12 +6275,12 @@ export class ChannelRegistry {
     if (isInboundOnly(entry)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(entry), at: at() };
     }
-    const server = this.serverRegistry.getServer(entry.serverId);
+    const server = this.publishingServer(entry.serverId);
     // §14.1: channels/publish requires channels.publish in the grant. The
     // host not sending is the enforcement, here and at the last check, and
     // the server's state words the refusal (sendRefusal).
     const ungranted = (): PublishOutcome => ({ status: 'failed', destination, reason: this.sendRefusal(entry.serverId), at: at() });
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+    if (!server) return ungranted();
 
     const prevented = (err: unknown): PublishOutcome => ({
       status: 'failed', destination, reason: lifecycleClause(err) + refusalRemedy(err), at: at(),
@@ -6372,12 +6443,15 @@ export class ChannelRegistry {
     locus: ChannelRef | null,
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
-     *  An `unknown` outcome still gets its marker. */
-    opts?: { heldOnFailure?: boolean },
+     *  An `unknown` outcome still gets its marker. `cameFrom`: with no
+     *  locus, the channels the turn's batch came from, each with how the
+     *  agent is shown it; the failure's reason names them, and how to reply
+     *  in those registered that take speech. */
+    opts?: { heldOnFailure?: boolean; cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<PublishOutcome> {
     // `logged` is what the log line and the trace say, where it isn't the
-    // agent's reason (the two no-locus reasons below).
-    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason): PublishOutcome => {
+    // agent's reason (the three no-locus reasons below).
+    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason, byDesign = false): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
       const channelId = channel?.channelId ?? null;
       const detail = outcome.detail !== undefined ? connectorText(outcome.detail) : undefined;
@@ -6397,17 +6471,19 @@ export class ChannelRegistry {
         this.onRouteFailure?.({
           conversationId, channelId, ...(channel ? { serverId: channel.serverId } : {}),
           reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}),
+          ...(byDesign ? { byDesign: true as const } : {}),
         });
       }
       return outcome;
     };
 
-    // These two reasons are the only ones whose log line and trace keep the
+    // These three reasons are the only ones whose log line and trace keep the
     // operator's words rather than the agent's: connectome-host's
     // connectome-doctor reads the last [routeSpeech] line for "no locus". Keep
-    // "no locus" in both logged texts. Each names no tool: whether one the
+    // "no locus" in each logged text. Each names no tool: whether one the
     // agent may call could post the words isn't known here, and the notice
-    // calls it a routing or configuration situation.
+    // calls it a routing or configuration situation, or for a turn whose
+    // batch named the channels it came from a routing one (byDesign).
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
@@ -6427,6 +6503,32 @@ export class ChannelRegistry {
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
+      const from = opts?.cameFrom ?? [];
+      if (from.length > 0) {
+        const list = (names: readonly string[]) =>
+          names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+        const closed: string[] = [];
+        const open: Array<{ channel: ChannelRef; shown: string }> = [];
+        for (const came of from) {
+          const entry = this.entryAt(came.channel);
+          if (!entry) closed.push(`${came.shown} isn't registered with this host now, so this host has no channel there to send to`);
+          else if (isInboundOnly(entry)) closed.push(`${came.shown} is ${inboundOnlyReason(entry)}`);
+          else if (!this.publishingServer(entry.serverId)) {
+            const reach = this.serverReach(entry.serverId);
+            closed.push(reach === 'connecting' || reach === 'down'
+              ? `${came.shown} can't take a send: ${unreachableClause(entry.serverId, reach)}, so to reply there, send your reply to that channel explicitly once it's back`
+              : `${came.shown} can't take a send: ${this.sendRefusal(entry.serverId)}`);
+          } else open.push(came);
+        }
+        const reply = open.length === 0 ? ''
+          : open.length === from.length
+            ? `; to reply ${from.length === 1 ? 'there' : 'in one of them'}, send your reply to that channel explicitly`
+            : `; to reply in ${open.length === 1 ? open[0].shown : `one of ${list(open.map((c) => c.shown))}`}, send your reply to that channel explicitly`;
+        const reason = `this turn came from ${list(from.map((c) => c.shown))}, and no channel was chosen for its reply` +
+          `${reply}${closed.map((c) => `; ${c}`).join('')}`;
+        return fail(null, reason, { status: 'failed', reason, at: Date.now() },
+          "turn has no locus (no channel was chosen for its batch's reply)", true);
+      }
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';
       return fail(null, reason, { status: 'failed', reason, at: Date.now() },
@@ -6461,8 +6563,9 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locus: ChannelRef | null,
+    opts?: { cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
-    const outcome = await this.deliverSpeech(conversationId, text, locus);
+    const outcome = await this.deliverSpeech(conversationId, text, locus, opts);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,
@@ -6621,8 +6724,8 @@ export class ChannelRegistry {
 
     // The same refusal, in the same words, as plain speech's (sendRefusal),
     // whose server state is the reason's: nothing awaits between the two.
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) {
+    const server = this.publishingServer(entry.serverId);
+    if (!server) {
       if (seen) {
         const reach = this.serverReach(entry.serverId);
         seen.refusal = reach === 'up' ? 'not-permitted' : `server-${reach}`;
