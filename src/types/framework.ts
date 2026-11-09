@@ -336,24 +336,46 @@ export interface FrameworkConfig {
    * each request it assembles for that agent, giving a level, or `undefined`
    * for none. Derived agents and conversation forks are asked too.
    *
-   * A request's top-level effort is the agent's base: the level the agent was
-   * first sent at on its model, kept per agent in `framework/state`, so it
-   * survives a restart and moves with a branch switch. It's kept only for the
-   * model of the agent's latest turn, so going back to an earlier model starts
-   * a new base there at the live level. A different level travels as one
-   * effort-only `system_change` row, stored under the participant `'system'`
-   * directly after the new user input whose reply it governs, so the prompt
-   * cache before it still holds. A level that changes where the request
-   * doesn't end on new user input (tool results, the agent's own message)
-   * waits for the next. `undefined` sends no top-level effort and
-   * leaves effort rows out of the request. It starts a base of none, and a
-   * level after it travels as a row. A derived agent on its parent's model
-   * starts from the parent's base.
+   * A request's top-level effort is the agent's base. A turn sets it as it
+   * assembles the agent's first request on its model, at the live level. The
+   * direct API sets none. The base is kept per agent in `framework/state`, so
+   * it survives a restart and moves with a branch switch. It's kept only for
+   * the model of the agent's latest turn, so going back to an earlier model
+   * starts a new base there at the live level. It's kept only while the agent
+   * is live: an agent's end drops it. So an agent resumed after its end, or a
+   * new one under its name, starts a new base at the live level, and its first
+   * request writes the prompt cache again. A derived agent on its parent's
+   * model starts from the parent's base.
+   *
+   * A different level travels as one effort-only `system_change` row, stored
+   * under the participant `'system'` at the start of the turn that answers new
+   * user input. It goes after that input, and after any context injections the
+   * start stores. So the prompt cache before it still holds. A level that
+   * changes where the request doesn't end on new user input (tool results, the
+   * agent's own message) waits for the next. The agent's own effort row
+   * doesn't end its input. So if the level changes again before a reply
+   * follows a row, the next start writes another after it, and the newest
+   * governs.
+   *
+   * An agent's requests carry only the effort rows the framework wrote for it,
+   * or for a voice it inherits, such as a shared derivation's parent. Another
+   * agent's rows, an observed resident's among them, and a host's own effort
+   * rows are left out, at a tool boundary too. They never count as in force. A
+   * copy derivation takes the parent's own rows as its own, beside the parent's
+   * base. A conversation fork's seed, which takes no base, leaves the
+   * template's effort rows out.
+   *
+   * `undefined` sends no top-level effort and leaves effort rows out of the
+   * request. It starts a base of none, and a level after it travels as a row.
+   * When a level comes back, the agent's last row counts again from where it
+   * sits, before the requests that went without effort. The requests from then
+   * on carry it there, which changes the prompt from that row on, once.
    *
    * When membrane refuses an agent's request that carries an effort row, with
    * `systemChangeRefused`, the request is sent again at once with no effort
-   * rows and the live level as its top-level effort. That agent's requests go
-   * that way until the process ends.
+   * rows and the live level as its top-level effort. Neither a provider hold
+   * nor a stated wait takes it first. That agent's requests go that way until
+   * the agent ends or the process does.
    *
    * A preview shows the row a start would write, unstored. The direct API
    * (`Agent.runInference`) sends what a turn's request would carry and writes
@@ -371,7 +393,9 @@ export interface FrameworkConfig {
    * older copy, installed beside it, leaves effort rows out unsent, so a change
    * of level never reaches the model.
    *
-   * Unset, effort is the host's, through `providerParams`, as before.
+   * Unset, effort is the host's, through `providerParams`, as before. The
+   * framework's own effort rows from when it was set are left out of every
+   * request, and a host's own effort row goes as stored.
    */
   effort?: EffortLevel | ((agent: { name: string; model: string }) => EffortLevel | undefined);
 

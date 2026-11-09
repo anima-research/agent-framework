@@ -1,9 +1,10 @@
 - `FrameworkConfig.effort` sets each agent's effort (Anthropic's `output_config.effort`): a level for every agent, or a function of an agent's name and model, asked at each request. A change of level no longer starts the prompt cache over.
-  - A request's top-level effort is the agent's base: the level it was first sent at on its model, kept per agent in `framework/state`, only for the model of the agent's latest turn, so going back to an earlier model starts a new base there. A derived agent starts from its parent's.
-  - A different level goes as one effort-only `system_change` row, stored under `'system'` directly after the new user input whose reply it governs. Where a request doesn't end on new user input, the change waits for the next.
+  - A request's top-level effort is the agent's base: the level a turn first assembled the agent's request at on its model, kept per agent in `framework/state`. It's kept only for the model of the agent's latest turn, so going back to an earlier model starts a new base there. It's kept only while the agent is live, so an agent resumed after its end starts a new base, at one prompt-cache write. A derived agent starts from its parent's.
+  - A different level goes as one effort-only `system_change` row, stored under `'system'` at the start of the turn that answers new user input, after that input and any context injections the start stores. Where a request doesn't end on new user input, the change waits for the next.
+  - An agent's requests carry only the effort rows the framework wrote for it, or for a voice it inherits. Another agent's rows and a host's own effort rows are left out.
   - `undefined` sends no top-level effort and leaves effort rows out of the request. It starts a base of none, and a level after it goes as a row.
-  - When membrane refuses a request's effort rows (`systemChangeRefused`), the request goes again at once, with no rows and the live level on top, and that agent's requests go so until the process ends.
+  - When membrane refuses a request's effort rows (`systemChangeRefused`), the request goes again at once, with no rows and the live level on top, and that agent's requests go so until it ends or the process does.
   - Rows need membrane 0.10.0, which exports `SYSTEM_CHANGE_EFFORT`. With membrane 0.8 or 0.9 installed, every request goes that way from the start, so a change of level costs the prompt cache as it did through `providerParams`.
   - A preview shows the row a start would write, and the direct API sends what a turn would, writing no row.
-  - While it's set, an agent whose `providerParams` sets `output_config.effort` is refused where it's created.
-- The history tool shows an effort row as `[effort: <level> from here]`.
+  - While it's set, an agent whose `providerParams` sets `output_config.effort` is refused where it's created. Unset, the framework's own effort rows are left out of every request, and a host's own goes as stored.
+- The history tool shows an effort row as `[effort: <level> from here]`, and its search matches that text where it matched `[system_change]`.

@@ -12,7 +12,7 @@ import { carriedBlock, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
-import { EFFORT_ROW_PARTICIPANT, effortChange, effortOf, withTopLevelEffort, type EffortPlan, type EffortPlanner } from './effort.js';
+import { EFFORT_ROW_KEY, EFFORT_ROW_PARTICIPANT, effortChange, effortMarksOf, effortOf, effortRowOf, keepsEffortRow, withTopLevelEffort, type EffortPlan, type EffortPlanner } from './effort.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
@@ -1822,6 +1822,26 @@ export class Agent {
       && source.bodies.every((b) => this.storedMarkOf(b.messageId)?.agent === this.name);
   }
 
+  /**
+   * Which of `result`'s compiled messages this agent's request carries, as far
+   * as effort rows go (effort.ts keepsEffortRow, under `plan`, with each effort
+   * row's marks read by effortMarksOf). A row the store can't read just now is
+   * logged, and counts as no row of the framework's.
+   */
+  private effortRowsKept(result: CompileResult, plan: EffortPlan | undefined): boolean[] {
+    const marks = effortMarksOf(this.contextManager, result, (id, err) => {
+      console.error(`[effort] ${this.name}: could not read stored row ${id}, so it counts as no effort row of the framework's:`, err);
+    });
+    return result.messages.map((message, i) =>
+      effortOf(message.content) === undefined || keepsEffortRow(plan, marks(i), (participant) => this.isOwnParticipant(participant)));
+  }
+
+  /** @internal Whether a stored row this agent's tool boundary would inject goes in its requests, as far as effort rows go. */
+  sendsAtBoundary(row: { content: ContentBlock[]; metadata?: MessageMetadata }): boolean {
+    if (effortOf(row.content) === undefined) return true;
+    return keepsEffortRow(this.effortPlanner?.('preview'), [effortRowOf(row.metadata)], (participant) => this.isOwnParticipant(participant));
+  }
+
   /** A stored row's injection mark, or undefined for any other row, and for
    *  one the store can't read just now, which is logged: a start doesn't fail
    *  on it (the row then counts as no stored injection). */
@@ -1975,8 +1995,9 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
+      const kept = this.effortRowsKept(compiled, effort);
       const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(
-        effort?.rows === false ? compiled.messages.filter((m) => effortOf(m.content) === undefined) : compiled.messages)));
+        compiled.messages.filter((_, i) => kept[i]))));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -2175,8 +2196,8 @@ export class Agent {
     // Each message's place in the compile, or a preview's stand-in (null),
     // for the count of stored rows the request ends on, below.
     let origin: Array<number | null> = messages.map((_, i) => i);
-    if (options.effort?.rows === false) {
-      const kept = messages.map((m) => effortOf(m.content) === undefined);
+    const kept = this.effortRowsKept(compiledResult, options.effort);
+    if (kept.includes(false)) {
       messages = messages.filter((_, i) => kept[i]);
       origin = origin.filter((_, i) => kept[i]);
     }
@@ -2190,8 +2211,8 @@ export class Agent {
       // places the injections it's given at the end, after the window.
       const sources = compiledResult.provenance?.messages;
       let at = messages.length;
-      if (sources && !messages.some((m, i) => sources[i]?.kind !== 'injection' && m.participant.toLowerCase() === 'user')) {
-        while (at > 0 && sources[at - 1]?.kind === 'injection') at--;
+      if (sources && !messages.some((m, i) => sources[origin[i]!]?.kind !== 'injection' && m.participant.toLowerCase() === 'user')) {
+        while (at > 0 && sources[origin[at - 1]!]?.kind === 'injection') at--;
       }
       origin = [...origin.slice(0, at), ...appended.map(() => null), ...origin.slice(at)];
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
@@ -2452,7 +2473,7 @@ export class Agent {
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
     const effort = this.effortPlanner?.('turn');
-    if (effort?.change) storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)]);
+    if (effort?.change) storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)], { [EFFORT_ROW_KEY]: this.name } as MessageMetadata);
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,

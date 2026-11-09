@@ -229,7 +229,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { effortOf, MEMBRANE_SENDS_EFFORT_ROWS, type EffortPlan } from './effort.js';
+import { EFFORT_ROW_KEY, effortMarksOf, effortOf, effortRowOf, isEffortLevel, MEMBRANE_SENDS_EFFORT_ROWS, type EffortPlan } from './effort.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, suppressedRow, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -2400,6 +2400,7 @@ function logSeedOmissions(
   fork: string,
   template: string,
   injections: number,
+  effortRows: number,
   compiled: readonly { content: ContentBlock[] }[],
   withoutReasoning: readonly { content: ContentBlock[] }[],
   withoutNotices: readonly { content: ContentBlock[] }[],
@@ -2411,9 +2412,10 @@ function logSeedOmissions(
   const notices = count(withoutReasoning, (b) => b.type === 'text') - count(withoutNotices, (b) => b.type === 'text');
   const calls = count(withoutNotices, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
   const results = count(withoutNotices, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
-  if (injections + thinking + notices + calls + results === 0) return;
+  if (injections + effortRows + thinking + notices + calls + results === 0) return;
   console.log(
     `[conversation] ${fork}: seeded from ${template} without ${injections} stored context injection(s), ` +
+    `${effortRows} effort row(s), ` +
     `${thinking} thinking block(s), ` +
     `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
   );
@@ -4259,6 +4261,8 @@ function endsOnNewInput(agent: Agent, rows: readonly StoredMessage[]): boolean {
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i]!;
     if (storedInjectionMarkOf(row.metadata)?.agent === agent.name) continue;
+    // An effort row is the agent's own, which doesn't end its input, or one its requests leave out.
+    if (effortOf(row.content) !== undefined) continue;
     return !agent.isOwnParticipant(row.participant)
       && !row.content.some((block) => block.type === 'tool_result' || block.type === 'system_change');
   }
@@ -9719,7 +9723,7 @@ export class AgentFramework {
     if (setting === undefined) return undefined;
     const live = typeof setting === 'function' ? setting({ name: agent.name, model: agent.model }) : setting;
     if (!MEMBRANE_SENDS_EFFORT_ROWS || this.effortRowsRefused.has(agent.name)) return { rows: false, ...(live !== undefined ? { topLevel: live } : {}) };
-    const record = this.readEffortBase(agent.name);
+    const record = this.readEffortBase(agent.name, use === 'turn');
     const kept = record?.model === agent.model ? record.effort : undefined;
     const base = live === undefined ? 'none' : kept ?? live;
     if (use === 'turn' && kept !== base) this.writeEffortBase(agent.name, { model: agent.model, effort: base });
@@ -9731,7 +9735,8 @@ export class AgentFramework {
     let inForce: string | undefined = base === 'none' ? undefined : base;
     for (let i = rows.length - 1; i >= 0; i--) {
       const level = effortOf(rows[i]!.content);
-      if (level !== undefined) {
+      const of = effortRowOf(rows[i]!.metadata);
+      if (level !== undefined && of !== undefined && agent.isOwnParticipant(of)) {
         inForce = level;
         break;
       }
@@ -9740,24 +9745,63 @@ export class AgentFramework {
     return plan;
   }
 
-  private readEffortBase(agentName: string): { model: string; effort: EffortLevel | 'none' } | undefined {
+  /**
+   * The base stored for `agentName` (framework/state's effortBases), or undefined where none is. The bases are a
+   * list of records, each naming its agent, since a name the store drops as an object's key (`__proto__`) is an agent
+   * name too. A list or record of another shape reads as none. Where `report` is set, as a turn's planning sets it,
+   * that's said on one log line: the turn then stores a sound record in its place, so the line comes once.
+   */
+  private readEffortBase(agentName: string, report = false): { model: string; effort: EffortLevel | 'none' } | undefined {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const bases = data && typeof data === 'object' ? (data as Record<string, unknown>).effortBases : undefined;
-    if (!bases || typeof bases !== 'object' || !Object.prototype.hasOwnProperty.call(bases, agentName)) return undefined;
-    const record = (bases as Record<string, unknown>)[agentName] as { model?: unknown; effort?: unknown } | null;
-    return record && typeof record.model === 'string' && typeof record.effort === 'string'
-      ? { model: record.model, effort: record.effort as EffortLevel | 'none' }
-      : undefined;
+    if (bases === undefined) return undefined;
+    const unsound = (what: string): undefined => {
+      if (report) {
+        console.error(`[effort] ${agentName}: ${FRAMEWORK_STATE_ID}'s effortBases ${what}, so it reads as no base. This turn stores the agent's base afresh.`);
+      }
+      return undefined;
+    };
+    if (!Array.isArray(bases)) return unsound('isn\'t a list of records');
+    const record = (bases as unknown[]).find((entry) => !!entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName) as
+      { model?: unknown; effort?: unknown } | undefined;
+    if (!record) return undefined;
+    if (typeof record.model !== 'string' || !(record.effort === 'none' || isEffortLevel(record.effort))) {
+      return unsound('holds a record for it that isn\'t a model and a level');
+    }
+    return { model: record.model, effort: record.effort };
   }
 
+  /** Store `agentName`'s base, in place of any record it has. */
   private writeEffortBase(agentName: string, record: { model: string; effort: EffortLevel | 'none' }): void {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-    const bases = state.effortBases && typeof state.effortBases === 'object' && !Array.isArray(state.effortBases)
-      ? { ...(state.effortBases as Record<string, unknown>) } : {};
-    bases[agentName] = record;
-    state.effortBases = bases;
+    const others = Array.isArray(state.effortBases)
+      ? (state.effortBases as unknown[]).filter((entry) => !(entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName))
+      : [];
+    state.effortBases = [...others, { agent: agentName, ...record }];
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+  }
+
+  /**
+   * Keep only the bases of the agents `keep` names. A base keeps the top level steady while a cached prefix may still
+   * be warm, so it's kept for a live agent alone: an agent's end drops it (settleEndedAgent), and so does the boot
+   * once its configured agents are live again (reconcileAgentRegistry). A store that can't take the write just now
+   * is logged, and the bases stay until the next end or boot.
+   */
+  private keepEffortBases(keep: (agentName: string) => boolean): void {
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const bases = data && typeof data === 'object' ? (data as Record<string, unknown>).effortBases : undefined;
+      if (!Array.isArray(bases)) return;
+      const kept = (bases as unknown[]).filter((entry) => {
+        const agent = entry && typeof entry === 'object' ? (entry as { agent?: unknown }).agent : undefined;
+        return typeof agent === 'string' && keep(agent);
+      });
+      if (kept.length === bases.length) return;
+      this.store.setStateJson(FRAMEWORK_STATE_ID, { ...(data as Record<string, unknown>), effortBases: kept });
+    } catch (err) {
+      console.error('[effort] the effort bases of agents that have ended could not be dropped; they stay until the next end or boot:', err);
+    }
   }
 
   private copyEffortBase(from: string, to: string): void {
@@ -12315,12 +12359,25 @@ export class AgentFramework {
         // The copies, and the framing below, are the child's own rows: its
         // inheritance and what it is told it is, stored for it, whoever they
         // name as their participant.
-        const { messages } = await parent.getContextManager().compile();
-        for (const message of messages) {
+        // An effort row the framework wrote for the parent's own voice is the
+        // child's too, re-marked as its turns are renamed, so the copy keeps
+        // the parent's level in force beside the parent's base, and the
+        // parent's cached prefix. One written for another agent keeps its mark.
+        const parentCm = parent.getContextManager();
+        const { messages, provenance } = await parentCm.compile();
+        const marks = effortMarksOf(parentCm, { provenance }, (id, err) => {
+          console.error(`[derive] ${options.name}: could not read the parent's row ${id}, so the copy takes it as no effort row:`, err);
+        });
+        for (const [i, message] of messages.entries()) {
+          const of = marks(i);
+          const mark = of.length > 0 && of.every((agent) => agent !== undefined)
+            ? (of.every((agent) => parent.isOwnParticipant(agent!)) ? options.name : of[0]!)
+            : undefined;
           storeOwnRow(
             created.agent,
             parent.isOwnParticipant(message.participant) ? options.name : message.participant,
             message.content,
+            mark !== undefined ? { [EFFORT_ROW_KEY]: mark } : undefined,
           );
         }
         created.agent.markContextConsumed();
@@ -13449,6 +13506,9 @@ export class AgentFramework {
    */
   private settleEndedAgent(outcome: EndOutcome | null): void {
     if (!outcome) return;
+    const ended = new Set([...outcome.cascaded, outcome.ended].map((record) => record.name));
+    for (const name of ended) this.effortRowsRefused.delete(name);
+    this.keepEffortBases((name) => !ended.has(name));
     for (const record of [...outcome.cascaded, outcome.ended]) {
       this.emitTrace({
         type: 'dendrite:agent-ended',
@@ -13767,6 +13827,8 @@ export class AgentFramework {
    */
   private reconcileAgentRegistry(interrupted: AgentRecord[], unpassed: readonly AgentRecord[]): void {
     for (const outcome of this.registry.reconcile().unconfigured) this.settleEndedAgent(outcome);
+    // Every configured agent is live again by now, so a base of any other name goes (keepEffortBases).
+    this.keepEffortBases((name) => this.registry.has(name));
 
     const byRecipient = new Map<string, AgentRecord[]>();
     // Those whose recipient's store couldn't be read for their result: left
@@ -19660,6 +19722,8 @@ export class AgentFramework {
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
             if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
+              // An effort row its requests leave out is presented, never sent (effort.ts keepsEffortRow).
+              if (!agent.sendsAtBoundary(h)) return;
               midTurnInjections.push({
                 participant: h.participant,
                 content: agent.injectedAsSent(h.participant, asSent(i + first, h.content)),
@@ -20955,15 +21019,27 @@ export class AgentFramework {
         // stored rows are all marked as injections, by the compile's own
         // account of where each message came from.
         const injectionRows = new Set(templateRows.filter((m) => storedInjectionMarkOf(m.metadata)).map((m) => m.id));
-        const compiled = compiledWhole.filter((_, i) => {
+        const onlyInjections = (i: number) => {
           const source = provenance?.messages[i];
-          return !(source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId)));
+          return source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId));
+        };
+        // The framework's effort rows (effort.ts) are the template's, or the agents' it observes: the fork, which
+        // takes no base of the template's, starts without them.
+        const marks = effortMarksOf(template.getContextManager(), { provenance }, (id, err) => {
+          console.error(`[conversation] ${name}: could not read the template's row ${id}, so the seed takes it as no effort row:`, err);
         });
+        const frameworkEffortRow = (i: number) => {
+          const of = marks(i);
+          return of.length > 0 && of.every((agent) => agent !== undefined);
+        };
+        const withoutInjections = compiledWhole.filter((_, i) => !onlyInjections(i));
+        const compiled = compiledWhole.filter((_, i) => !onlyInjections(i) && !frameworkEffortRow(i));
         const withoutReasoning = withoutThinking(compiled);
         const withoutNotices = withoutPrimaryNotices(
           withoutReasoning, primaryNoticeTexts(templateRows));
         const seed = stripUnpairedToolBlocks(withoutNotices);
-        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
+        logSeedOmissions(name, template.name, compiledWhole.length - withoutInjections.length, withoutInjections.length - compiled.length,
+          compiled, withoutReasoning, withoutNotices, seed);
         // The fork's own rows: its inheritance, stored for it, and presented
         // to it when it is taken on at its registration below.
         const fork = { name, getContextManager: () => contextManager };
@@ -30689,14 +30765,18 @@ export class AgentFramework {
             const retry = retryOf(trigger);
             const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
+            // A marked refusal of a request carrying an effort row is sent
+            // again at once without rows, so neither a hold nor a stated wait
+            // takes it.
+            const effortRetry = this.refuseEffortRows(agent, err, compiledRequest);
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
-            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
+            if (!effortRetry && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
-            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
+            const statedWait = ownsProviderGate || effortRetry ? undefined : this.nonOwningProviderWait(agent, err, retry);
             if (statedWait === 'held') {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -30706,7 +30786,6 @@ export class AgentFramework {
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
             // The earlier failures the policy counts, which the wait's nextTry follows.
             const policyAttempt = cuts ?? attempt;
-            const effortRetry = this.refuseEffortRows(agent, err, compiledRequest);
             const action: ErrorAction = effortRetry ? { retry: true, delayMs: 0 }
               : statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
               ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
