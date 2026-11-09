@@ -13,7 +13,7 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
+import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetryClass, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { boundFailureText, compileRefusalType, failureWords, FAILURE_TEXT_MAX_CHARS, houseReason, isMembraneError, PROVIDER_ERROR_CODE_MAX_CHARS } from './failure-text.js';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
@@ -2965,14 +2965,15 @@ export class DefaultErrorPolicy implements ErrorPolicy {
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
     if (isDeadlineExpiry(error)) {
-      const decision = retryDecision(this.settings.deadline ? 'deadline' : 'retryable', attempt + 1, undefined, this.settings);
-      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+      const cls = this.settings.deadline ? 'deadline' : 'retryable';
+      const decision = retryDecision(cls, attempt + 1, undefined, this.settings);
+      return decision.retry ? this.retryAction(cls, decision.delayMs) : { retry: false };
     }
     if (!isMembraneError(error)) {
       // Not a provider failure membrane classified: retried as any other
       // retryable failure, on the base schedule.
       const decision = retryDecision('retryable', attempt + 1, undefined, this.settings);
-      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+      return decision.retry ? this.retryAction('retryable', decision.delayMs) : { retry: false };
     }
     if (error.retryable === false) return { retry: false };
     // The facts membrane classifies by, read off the error itself (from either
@@ -2982,8 +2983,47 @@ export class DefaultErrorPolicy implements ErrorPolicy {
     const cls = classifyFailure({ retryable: facts.retryable !== false, type: facts.type, httpStatus: facts.httpStatus, message: facts.message });
     // `attempt` counts this turn's earlier failures; membrane counts tries.
     const decision = retryDecision(cls, attempt + 1, error.retryAfterMs, this.settings);
-    return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+    return decision.retry ? this.retryAction(cls, decision.delayMs) : { retry: false };
   }
+
+  /** A retry, with the class it was decided as and the tries that class's
+   *  schedule allows (membrane's choice of schedule: an `overloaded` failure
+   *  with no schedule of its own takes `retryable`'s). */
+  private retryAction(cls: RetryClass, delayMs: number): ErrorAction {
+    const schedule = cls === 'overloaded' ? this.settings.overloaded ?? this.settings.retryable : this.settings[cls];
+    const maxTries = schedule?.maxAttempts;
+    return { retry: true, delayMs, retryClass: cls, ...(typeof maxTries === 'number' ? { maxTries } : {}) };
+  }
+}
+
+/**
+ * A turn waiting out its error policy's delay before its next try, as
+ * healthSnapshot() reports it. While it waits, the agent's state is `idle`:
+ * the failed call reset it, and no call is out. The turn is alive all the
+ * same, and a wake arriving meanwhile is buffered until the turn ends.
+ */
+interface TurnRetryWait {
+  /** When the wait began (epoch ms). */
+  since: number;
+  /** When it is due to end (epoch ms), as `inference:waiting` says it.
+   *  Absent for a wait too long for a date. */
+  until?: number;
+  /** The try the wait leads to, as the error policy counts tries (against
+   *  `maxTries`): each failed start counts, whether or not it reached the
+   *  provider; a provider hold that queues the turn again starts the count
+   *  over; a deadline's retries count that call's expiries. So it is the
+   *  policy's place in its schedule, not a count of sends. Absent only from a
+   *  wait started without it. */
+  nextTry?: number;
+  /** The most tries the policy allows (ErrorAction.maxTries), when it says
+   *  so as a positive whole number. A turn re-armed after it ran out of tries
+   *  ends at its second deadline expiry with no completed round, transient
+   *  failure or message said to it between them, whatever this says. */
+  maxTries?: number;
+  /** What the policy retries the failure as (ErrorAction.retryClass), such as
+   *  `overloaded`, when it says. A longer one than 128 characters is shown
+   *  as its start and end around a note of how much was left out. */
+  retryClass?: string;
 }
 
 /** How many upcoming wakes healthSnapshot lists per agent: an agent can hold any number of reminders. */
@@ -4396,6 +4436,11 @@ export class AgentFramework {
   private providerWaits: ProviderWaits | undefined;
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
   private retryWaitWakers = new Set<() => void>();
+  /** Each agent's error-policy retry wait in progress, for healthSnapshot():
+   *  while it lasts the agent's state reads `idle` though its turn is alive.
+   *  Keyed by the Agent, not its name: an agent registered under a removed
+   *  one's name doesn't inherit its wait. */
+  private turnRetryWaits = new WeakMap<Agent, TurnRetryWait>();
   private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   private providerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
@@ -4918,11 +4963,11 @@ export class AgentFramework {
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
   private readonly resumesPending = new Map<string, Agent | undefined>();
-  // context-manager 0.25.1: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3156),
+  // context-manager 0.27.0: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3150),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
-  // (context-manager.ts:4602-4621). So such a released manager is collected
+  // (context-manager.ts:4626-4645). So such a released manager is collected
   // only once nothing of its work can still read the store, and stop()
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
@@ -5231,7 +5276,7 @@ export class AgentFramework {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
           "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
-          'Install @animalabs/context-manager ^0.25.1, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
+          'Install @animalabs/context-manager ^0.27.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
@@ -7977,12 +8022,29 @@ export class AgentFramework {
    * (checkWindow) carries a waker that ends the whole wait: a stop
    * abortInference() records, or an operator's abandon, wakes it.
    */
-  private async waitForRetry(ms: number, checkWindow: CheckWindow, agent: Agent): Promise<void> {
+  private async waitForRetry(
+    ms: number,
+    checkWindow: CheckWindow,
+    agent: Agent,
+    about?: { nextTry: number; action: ErrorAction },
+  ): Promise<void> {
     // An infinite delay waits until stop(), like any wait too long to end; a
     // delay that isn't a number, or is 0 or less, waits none.
     let remaining = ms > 0 ? ms : 0;
     if (!(remaining > 0)) return;
-    const until = Date.now() + remaining;
+    const since = Date.now();
+    const until = since + remaining;
+    // What healthSnapshot() and inference:waiting say of the wait: the try it
+    // leads to, and what the policy said of the retry, when it said.
+    // (Every caller in the framework passes them; the wait still runs without.)
+    const action = about?.action;
+    const shown = {
+      ...(about ? { nextTry: about.nextTry } : {}),
+      ...(action?.retry && Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? { maxTries: action.maxTries } : {}),
+      ...(action?.retry && typeof action.retryClass === 'string' ? { retryClass: boundFailureText(action.retryClass, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
+    };
+    const record: TurnRetryWait = { since, ...(until <= MAX_DATE_MS ? { until } : {}), ...shown };
+    this.turnRetryWaits.set(agent, record);
     // stop() wakes this step through retryWaitWakers and ends the rest by
     // closing admission; the window's waker ends the rest itself.
     let ended = false;
@@ -8000,7 +8062,7 @@ export class AgentFramework {
         if (sinceSaid >= every) {
           sinceSaid = 0;
           if (this.agents.get(agent.name) === agent) {
-            this.emitTrace({ type: 'inference:waiting', agentName: agent.name, ...(until <= MAX_DATE_MS ? { until } : {}) });
+            this.emitTrace({ type: 'inference:waiting', agentName: agent.name, ...(until <= MAX_DATE_MS ? { until } : {}), ...shown });
           }
           if (over()) return;
         }
@@ -8015,6 +8077,7 @@ export class AgentFramework {
       }
     } finally {
       wakers.delete(wake);
+      if (this.turnRetryWaits.get(agent) === record) this.turnRetryWaits.delete(agent);
     }
   }
 
@@ -10066,7 +10129,9 @@ export class AgentFramework {
   }
 
   private hasTurn(agentName: string): boolean {
-    return this.activeTurnTokens.has(agentName) || this.pendingContinuationAgents().has(agentName);
+    // Read defensively, as pendingContinuationAgents reads its fields: healthSnapshot()
+    // calls this, and the operator tests build a framework from the prototype.
+    return (this.activeTurnTokens?.has(agentName) ?? false) || this.pendingContinuationAgents().has(agentName);
   }
 
   /** The provider hold keeping `agentName`'s turn for its retry (TURN_RETRY),
@@ -28629,14 +28694,16 @@ export class AgentFramework {
       }
 
       const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+      // The earlier failures the policy counts, which the wait's nextTry follows.
+      const policyAttempt = cuts ?? attempt;
       const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(routing) || (isDeadlineExpiry(err) && !asTransient)))
-        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
       if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
       else this.deadlineCuts.delete(agent.name);
       if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
-        await this.waitForRetry(action.delayMs, checkWindow, agent);
+        await this.waitForRetry(action.delayMs, checkWindow, agent, { nextTry: policyAttempt + 2, action });
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
           // it, and a stop kept for the turn goes with it. The turn ends as
@@ -30580,8 +30647,10 @@ export class AgentFramework {
             }
 
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+            // The earlier failures the policy counts, which the wait's nextTry follows.
+            const policyAttempt = cuts ?? attempt;
             const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
-              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
@@ -30593,7 +30662,7 @@ export class AgentFramework {
               const retryWindow: CheckWindow = { abandoned: false };
               this.checkAhead.set(agent, retryWindow);
               // A policy's delay can be a provider's retry-after: wait all of it.
-              await this.waitForRetry(action.delayMs, retryWindow, agent);
+              await this.waitForRetry(action.delayMs, retryWindow, agent, { nextTry: policyAttempt + 2, action });
               if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
@@ -35457,7 +35526,19 @@ export class AgentFramework {
       activeStreams: [...this.activeStreams.keys()],
       agents: [...this.agents.entries()].map(([name, agent]) => ({
         name,
+        // The agent's state machine, as before. It reads `idle` between a
+        // failed call and its retry, and while a turn's teardown is pending:
+        // `turnAlive` and `retrying` say what it doesn't.
         status: agent.state.status,
+        /** A turn of the agent's is alive (it holds its token, or its continuation or retry is on its way, as the scheduler reads it), whatever `status` says. */
+        turnAlive: this.hasTurn(name),
+        /** The turn's wait for its error policy's next try, or null: see TurnRetryWait. A retry a provider hold
+         *  keeps (a stated wait, an acceleration limit or a host's hold) reads null here, and
+         *  `providerAdmission` shows the hold: `cooldownUntil`, `cooldownReason` and `hostHold`. */
+        retrying: (() => {
+          const wait = this.turnRetryWaits?.get(agent);
+          return wait ? { ...wait } : null;
+        })(),
         consecutiveInferenceFailures: this.consecutiveInferenceFailures.get(name) ?? 0,
         providerAdmission: (() => {
           const gate = this.providerGates?.get(name);
