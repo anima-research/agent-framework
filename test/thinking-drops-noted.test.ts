@@ -2,8 +2,8 @@
  * Telling the context manager which stored replies' thinking the provider dropped. A call whose report names a
  * dropped block of a stored reply hands that reply's bodies, as the stream start's `placeDrops` gives them, to
  * the context manager's `noteThinkingDropped` with the id of the compile the stream was built from, so its
- * thinking-binding record leaves them without their thinking from the next compile on. A note that throws doesn't
- * end the stream.
+ * thinking-binding record leaves them without their thinking from the next compile on. A note that throws is logged
+ * and doesn't end the stream.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -78,6 +78,12 @@ async function stream(opts: {
   });
   const failed: TraceEvent[] = [];
   framework.onTrace((event) => { if (event.type === 'inference:failed') failed.push(event); });
+  const logged: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' '));
+    consoleError(...args);
+  };
   framework.start();
   try {
     const { agent, contextManager } = await framework.createEphemeralAgent({
@@ -102,8 +108,10 @@ async function stream(opts: {
       return result;
     }) as typeof compile;
     await framework.runEphemeralToCompletion(agent, contextManager);
-    return { noted, compileIds, earlier, calls: membrane.calls.length, failed };
+    const notLogged = logged.filter((line) => line.startsWith('[thinking-binding] worker: couldn\'t note the stored replies'));
+    return { noted, compileIds, earlier, calls: membrane.calls.length, failed, notLogged };
   } finally {
+    console.error = consoleError;
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -115,7 +123,7 @@ describe('a call\'s dropped stored-reply thinking, noted to the context manager'
   it('hands each call\'s reply drops\' bodies to noteThinkingDropped, with the stream\'s compile id, and no other kind\'s', async () => {
     // Call 1 drops the stored reply's block twice over (two entries naming it), a block of the stream's own first
     // round, and one it can't place; call 2 drops the stored reply's again; call 3 drops nothing.
-    const { noted, compileIds, earlier, calls } = await stream({
+    const { noted, compileIds, earlier, calls, notLogged } = await stream({
       note: 'return',
       drops: (at) => [[dropped(at), dropped(at), entry({ message: 3, block: 0, round: 0 }), entry({ message: 0, block: 0 })], [dropped(at)], []],
     });
@@ -126,13 +134,16 @@ describe('a call\'s dropped stored-reply thinking, noted to the context manager'
       { messageIds: [earlier], compileId: compileIds[0] },
       { messageIds: [earlier], compileId: compileIds[0] },
     ], 'the reply\'s body at each call that dropped it, and nothing for the round\'s or the unplaced one');
+    assert.deepEqual(notLogged, [], 'a note that returns logs nothing');
   });
 
-  it('keeps the stream going when the note throws, and notes again at the next call that drops', async () => {
-    const { noted, calls, failed } = await stream({ note: 'throw', drops: (at) => [[dropped(at)], [dropped(at)], []] });
+  it('logs a note that throws, naming the agent and the error, keeps the stream going, and notes again at the next call that drops', async () => {
+    const { noted, calls, failed, notLogged } = await stream({ note: 'throw', drops: (at) => [[dropped(at)], [dropped(at)], []] });
     assert.equal(calls, 1);
     assert.equal(noted.length, 2, 'each call that dropped the reply\'s block still noted it');
     assert.deepEqual(failed, [], 'no inference failed');
+    assert.equal(notLogged.length, 2, 'each thrown note is logged');
+    for (const line of notLogged) assert.ok(line.includes('the store is gone'), line);
   });
 });
 

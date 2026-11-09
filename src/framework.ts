@@ -5130,13 +5130,16 @@ export class AgentFramework {
     assertAgentNamesUnique(config.agents);
     assertObservedAgentsConfigured(config.agents);
     // The presentation index (#291) needs a context-manager that keeps a
-    // window index per agent (presentRows): 0.25.0 on, since 0.23.x and
-    // 0.24.0 were published without one. It needs no store, so it is
-    // checked before one is opened.
-    if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
+    // window index per agent (presentRows), which 0.23.x and 0.24.x were
+    // published without, and a stream tells it of dropped thinking
+    // (noteThinkingDropped), which 0.25.0 was published without. It needs no
+    // store, so it is checked before one is opened.
+    const contextManagerProto = ContextManager.prototype as { presentRows?: unknown; noteThinkingDropped?: unknown };
+    if (typeof contextManagerProto.presentRows !== 'function' || typeof contextManagerProto.noteThinkingDropped !== 'function') {
       throw new Error(
-        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
-          'Install @animalabs/context-manager ^0.25.1, which this package declares (0.23.x and 0.24.x have no window index)',
+        'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
+          "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
+          'Install @animalabs/context-manager ^0.25.1, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
@@ -30112,7 +30115,15 @@ export class AgentFramework {
             // without their thinking and the provider drops none of them again.
             const droppedBodies = placedDrops.flatMap((drop) => drop.kind === 'reply' ? drop.bodies.map((body) => body.messageId) : []);
             if (droppedBodies.length > 0 && thinkingDrops?.noteDropped) {
-              try { thinkingDrops.noteDropped(droppedBodies); } catch { /* noting is best-effort, as the sample is */ }
+              try {
+                thinkingDrops.noteDropped(droppedBodies);
+              } catch (error) {
+                console.error(
+                  `[thinking-binding] ${agent.name}: couldn't note the stored replies whose thinking the provider dropped, ` +
+                    'so the next compile still sends them with it:',
+                  error,
+                );
+              }
             }
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, placedDrops, thinkingDrops.recordedAfter);
