@@ -382,7 +382,7 @@ export function toolResultHeadTail(text: string, cap: number): { headEnd: number
   let headEnd = toolResultCutAt(text, headChars);
   if (text[headEnd] !== '\n') {
     const lastNewline = text.lastIndexOf('\n', headEnd - 1);
-    if (lastNewline > headChars / 2) headEnd = lastNewline + 1;
+    if (lastNewline !== -1 && headEnd - (lastNewline + 1) < headChars / 2) headEnd = lastNewline + 1;
   }
   if (tailChars <= 0) return { headEnd, tailStart: text.length };
   let tailStart = text.length - tailChars;

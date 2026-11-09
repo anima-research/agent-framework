@@ -2590,7 +2590,7 @@ describe('ToolImageLedger', () => {
     assert.strictEqual(giant.head, text.slice(0, start + REFERENCE_STUB_MAX_CHARS + 1));
     assert.deepStrictEqual(parseImagePlaceholders(`${giant.head}\n\n[truncated]`), []);
     // A line begins where the parser begins one, after a carriage return too.
-    const cr = `intro\nnote\r[ref_9_ab3d] cam.png — image/png, 1KB claimed — from tool result — fetch with fetch_reference\nafter`;
+    const cr = `intro\nnote${'.'.repeat(100)}\r[ref_9_ab3d] cam.png — image/png, 1KB claimed — from tool result — fetch with fetch_reference\nafter${'.'.repeat(300)}`;
     assert.strictEqual(parseImagePlaceholders(cr).length, 1);
     assert.strictEqual(cutStoredToolResult(cr, capForHead(cr.indexOf('1KB')), null).head, cr.slice(0, cr.indexOf('[ref_9')));
   });
