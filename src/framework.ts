@@ -23642,7 +23642,7 @@ export class AgentFramework {
   }
 
   private wakeChannelsMark(routing: TurnRouting | undefined): { wakeChannels?: ChannelRef[] } {
-    return routing && !routing.locus && !routing.noChannel && routing.wakeChannels ? { wakeChannels: routing.wakeChannels } : {};
+    return routing && !routing.noChannel && routing.wakeChannels ? { wakeChannels: routing.wakeChannels } : {};
   }
 
   private turnRetryOf(trigger: InferenceRequest, routing: TurnRouting | undefined): InferenceRequest {

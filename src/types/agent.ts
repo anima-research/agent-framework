@@ -764,10 +764,11 @@ export interface InferenceRequest {
    * another's place, and one a provider hold takes another into, carry both
    * requests' channels.
    * The framework's own wakes that continue a
-   * turn with no locus (a restart, a re-inference, a continuation, a retry,
-   * a bounce, a re-arm), unless its own wake named a channel that resolves
-   * to none, carry the channels the turn's starts gathered, so a turn's
-   * trigger can name channels from several batches.
+   * turn (a restart, a re-inference, a continuation, a retry, a bounce, a
+   * re-arm), unless its own wake named a channel that resolves to none,
+   * carry the channels the turn's starts gathered, whether or not the turn
+   * had a locus, so a turn's trigger can name channels from several batches,
+   * and a turn they open with no locus can name them too.
    * When such a turn's plain speech, or a sleep's announcement, is routed
    * with no locus, the agent is told these channels, unless the turn's own
    * wake named a channel that resolves to none, or the turn is an ephemeral

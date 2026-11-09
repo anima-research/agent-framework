@@ -1604,7 +1604,9 @@ test("a merged start held where an equal request is already held keeps its wakes
   });
 });
 
-for (const routing of ["holds a later batch's channels in its routing", 'has no channel'] as const) test(`an exhausted turn's re-arm, of a turn with no locus that ${routing}, carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its last start's"}`, async (t) => {
+for (const routing of ["holds a later batch's channels in its routing", 'has no channel', 'has a locus'] as const) test(routing === 'has a locus'
+  ? "an exhausted turn's re-arm, of a turn a channel_open gave a locus whose routing holds its batches' channels, carries every channel its routing holds"
+  : `an exhausted turn's re-arm, of a turn with no locus that ${routing}, carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its last start's"}`, async (t) => {
   await withStoreDir(async (path) => {
     holdClock(t);
     const log = silence();
@@ -1615,7 +1617,10 @@ for (const routing of ["holds a later batch's channels in its routing", 'has no 
       const later = { serverId: 'discord', channelId: 'discord:g:later' };
       const trigger = { agentName: 'resident', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [later],
         ...(routing === 'has no channel' ? { channelId: 'zz-own', channelServerId: 'zz-srv' } : {}) };
-      const turn = routing === 'has no channel' ? { noChannel: true, wakeChannels: [later] } : { wakeChannels: [first, later] };
+      const opened = { serverId: 'discord', channelId: 'discord:g:opened' };
+      const turn = routing === 'has no channel' ? { noChannel: true, wakeChannels: [later] }
+        : routing === 'has a locus' ? { locus: opened, wakeChannels: [first, later] }
+          : { wakeChannels: [first, later] };
       (internal as unknown as { rearmExhaustedTurn(...args: unknown[]): void })
         .rearmExhaustedTurn(fw.getAgent('resident'), new Error('zz-exhausted'), trigger, true, turn, true);
       const held = (internal.providerAccelerationCooldowns.get('resident')?.heldRequests ?? []) as unknown as Array<Record<string | symbol, unknown>>;
@@ -1623,7 +1628,7 @@ for (const routing of ["holds a later batch's channels in its routing", 'has no 
       assert.ok(rearm, 'premise: the turn is re-armed into a hold');
       assert.deepEqual(rearm.wakeChannels, routing === 'has no channel' ? undefined : [first, later]);
       const retry = (internal as unknown as { turnRetryOf(trigger: unknown, routing: unknown): { wakeChannels?: unknown } }).turnRetryOf(trigger, { ...turn, locus: first });
-      assert.equal(retry.wakeChannels, undefined, "the retry of a turn with a locus carries neither its routing's channels nor its trigger's");
+      assert.deepEqual(retry.wakeChannels, routing === 'has no channel' ? undefined : [first, later], "the retry of a turn with a locus carries its routing's channels, not its trigger's");
     } finally { await fw.stop(); log.restore(); }
   });
 });

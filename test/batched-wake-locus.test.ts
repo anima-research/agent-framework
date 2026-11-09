@@ -310,6 +310,32 @@ describe("batched wake routing with proseRouting 'hybrid'", () => {
   it("an ambient batch from two channels has no locus, and the resident's notice names them", async () => {
     await ambientBatchHasNoLocus(rig, [ROOM, GENERAL], ['room', 'general']);
   });
+
+  it("a ' !' continuation of a turn that a channel_open gave a locus has none of its own, and its notice names the batch's channel", async () => {
+    const fw = rig.framework();
+    rig.membrane().pushResponse(createMockResponse([{ type: 'tool_use', id: 'o1', name: 'channel_open', input: { channelId: GENERAL } }], 'tool_use'));
+    rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: '>>>#general ! step one' }]));
+    // A stream takes every response queued when it starts, so the
+    // continuation's is queued once the opening turn's stream has ended.
+    let queued = false;
+    fw.onTrace((e) => {
+      if (queued || (e as { type: string }).type !== 'inference:completed') return;
+      queued = true;
+      rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'still thinking' }]));
+    });
+    rig.incoming(ROOM, 'ambient', 'message 1');
+    await waitFor(() => rig.membrane().calls.length >= 2, 'the continuation started');
+    await fw.runUntilIdle();
+    assert.deepEqual(rig.publishes(), [GENERAL], "premise: the opened channel took the turn's explicit send");
+    const texts = fw.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+    assert.deepEqual(texts.filter((t) => t.startsWith('[routing]')),
+      ['[routing] Your plain speech currently has no channel — it stays in your archive. Use an explicit send tool to reach a channel.'],
+      'premise: the continuation opened with no locus, after the channel_open had moved the turn to #general');
+    const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
+    assert.equal(notices.length, 1, JSON.stringify(texts));
+    assertNamesBatchChannels(notices[0]!, ['room'], 'still thinking'.length);
+  });
 });
 
 describe('batched wake routing with conversation forks', () => {
