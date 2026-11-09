@@ -35,6 +35,10 @@ const declared = () => {
   const ranges = new Map();
   for (const section of ["dependencies", "optionalDependencies", "peerDependencies"])
     for (const [name, range] of Object.entries(manifest[section] ?? {})) {
+      if (/[:/]/.test(range)) {
+        console.error(`${name} is declared as ${range}, which isn't a registry range, so this job has no floor to test for it`);
+        process.exit(1);
+      }
       if (ranges.has(name) && ranges.get(name) !== range) {
         console.error(`${name} is declared as ${ranges.get(name)} and as ${range}: give it one range`);
         process.exit(1);

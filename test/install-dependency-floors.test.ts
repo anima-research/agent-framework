@@ -146,6 +146,16 @@ test('plan fails, naming it, on a range or a || member that no published release
   assert.equal(member.legs, undefined);
 });
 
+test('plan refuses, naming it, a dependency whose spec is a git, file or other non-registry spec, before npm is asked anything', () => {
+  for (const [name, spec] of [['ws', 'github:websockets/ws'], ['x', 'file:./sub']]) {
+    const run = floors('plan', { dependencies: { [name]: spec } }, { 'ws@github:websockets/ws': '8.22.2', 'x@file:./sub': '1.2.3' });
+    assert.equal(run.status, 1, spec);
+    assert.ok(run.stderr.includes(`${name} is declared as ${spec}, which isn't a registry range`), run.stderr);
+    assert.deepEqual(run.calls, [], spec);
+    assert.equal(run.legs, undefined);
+  }
+});
+
 test('plan refuses one name declared with two different ranges', () => {
   const run = floors('plan', { dependencies: { ws: '^8.18.0' }, peerDependencies: { ws: '^8.0.0' } }, {});
   assert.equal(run.status, 1);
