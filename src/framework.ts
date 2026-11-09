@@ -7650,7 +7650,7 @@ export class AgentFramework {
     this.budgetHolds!.delete(agentName);
     clearInterval(hold.recheck);
     hold.recheck = undefined;
-    this.pendingRequests.push(...requests);
+    appendAll(this.pendingRequests, requests);
     console.error(`[budget-hold] agent=${agentName} released after ${Date.now() - hold.startedAt}ms: ` +
       `${requests.length} request(s) queued, and the start's own compile is the check`);
     const note = this.storeBudgetHoldNote(agent, hold);
@@ -7725,7 +7725,7 @@ export class AgentFramework {
     this.budgetHolds.delete(agentName);
     clearInterval(hold.recheck);
     hold.recheck = undefined;
-    if (wakes === 'back') this.pendingRequests.push(...hold.wakes);
+    if (wakes === 'back') appendAll(this.pendingRequests, hold.wakes);
     hold.wakes = [];
     try {
       this.endHeldTurn(agentName, hold.turn, drop);
@@ -7754,7 +7754,7 @@ export class AgentFramework {
 
   /** End a turn detachBudgetHold took out of its wait: its wakes back in the queue, then its end traced. */
   private endDetachedHold(agentName: string, hold: BudgetHold, why: string): void {
-    this.pendingRequests.push(...hold.wakes);
+    appendAll(this.pendingRequests, hold.wakes);
     hold.wakes = [];
     try {
       this.endHeldTurn(agentName, hold.turn, { kind: 'dropped', why, reason: BUDGET_HELD_TURN_REMOVED });
@@ -7787,7 +7787,7 @@ export class AgentFramework {
     const row = budgetWaitOf(trigger)?.row;
     if (row === undefined || !this.rowLeftWindow(agent, row)) return false;
     const batch = mergedBatch(trigger!);
-    if (batch) this.pendingRequests.push(...batch.filter((r) => budgetWaitOf(r) === undefined));
+    if (batch) appendAll(this.pendingRequests, batch.filter((r) => budgetWaitOf(r) === undefined));
     this.endContinuedTurn(agent.name, { kind: 'dropped', why: 'what its held turn stood on was removed', reason: BUDGET_HELD_TURN_REMOVED }, true);
     return true;
   }
@@ -18514,8 +18514,7 @@ export class AgentFramework {
     const checkpoints = this.getTurnCheckpoints(agentName);
     if (checkpoints.at(-1)?.turnIndex !== recorded.turnIndex) return;
     checkpoints.pop();
-    checkpoints.unshift(...recorded.evicted);
-    this.saveTurnCheckpoints(agentName, checkpoints);
+    this.saveTurnCheckpoints(agentName, recorded.evicted.concat(checkpoints));
     this.turnCounters.set(agentName, recorded.turnIndex);
   }
 
