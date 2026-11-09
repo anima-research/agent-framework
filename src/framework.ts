@@ -33096,10 +33096,10 @@ export class AgentFramework {
             console.error(armed
               ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
                 + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
-                + (durable ? '' : '; NOT journaled, so a restart loses it')
+                + (durable === false ? '; NOT journaled, so a restart loses it' : '')
               : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
             // The confirmation says when a wake armed didn't reach the journal.
-            this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake, armed && !durable ? false : undefined);
+            this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake, armed && durable === false ? false : undefined);
             return;
           }
         }
@@ -41396,7 +41396,7 @@ export class AgentFramework {
     }
 
     console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`
-      + (durable ? '' : '; NOT journaled, so a restart loses it'));
+      + (durable === false ? '; NOT journaled, so a restart loses it' : ''));
     // endTurn: the agent stops here and goes idle for the duration.
     finish({
       success: true,
@@ -41407,7 +41407,7 @@ export class AgentFramework {
         timeZone: this.timeZone,
         // The journal keeps the sleep across a host restart; one its write
         // failed to reach is this process's alone, and the agent is told.
-        ...(durable ? {} : { note: 'This sleep could not be journaled: a host restart before it ends would lose its wake.' }),
+        ...(durable === false ? { note: 'This sleep could not be journaled: a host restart before it ends would lose its wake.' } : {}),
       },
       endTurn: true,
     });
