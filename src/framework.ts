@@ -28409,6 +28409,9 @@ export class AgentFramework {
     // Those of them the turn was silenced at as they ended: their prose is
     // counted as kept private, as holdSilencedProse counts it natively.
     const silencedPrivateThinkRounds = new Set<number>();
+    // Those kept back only because their script hadn't returned, so may yet
+    // have called think: the turn-end log says so rather than "beside think()".
+    const unreturnedScriptRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -28996,7 +28999,10 @@ export class AgentFramework {
                   turnSends = mergeSends(turnSends, reached);
                   // Its script may yet have called think, so where the turn's
                   // end would route its prose, that prose stays back.
-                  if (requestSnapshot.sameRoundThinkTextPolicy === 'private') privateThinkRounds.add(toolRound);
+                  if (requestSnapshot.sameRoundThinkTextPolicy === 'private') {
+                    privateThinkRounds.add(toolRound);
+                    unreturnedScriptRounds.add(toolRound);
+                  }
                   if (roundSegments.length === 0) return;
                   console.error(
                     `[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) withheld: ${why}`,
@@ -29741,8 +29747,11 @@ export class AgentFramework {
               // the round ended, a count explicit routing never reads; otherwise
               // only logged.
               if (privateThinkWithheld > 0) {
+                const besideWhat = [...privateThinkRounds].some((r) => unreturnedScriptRounds.has(r))
+                  ? 'beside think() or a script that had not returned'
+                  : 'beside think()';
                 console.error(
-                  `[routing] ${agent.name}: ${privateThinkWithheld} prose segment(s) beside think() NOT routed (same_round_think_text_policy=private)`,
+                  `[routing] ${agent.name}: ${privateThinkWithheld} prose segment(s) ${besideWhat} NOT routed (same_round_think_text_policy=private)`,
                 );
                 if (turnProseRouting === 'disabled') {
                   this.recordProseSuppression(streamRouting, privateThinkWithheld);
