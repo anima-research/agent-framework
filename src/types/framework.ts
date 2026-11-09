@@ -334,7 +334,10 @@ export interface FrameworkConfig {
    * Each agent's effort (Anthropic's `output_config.effort`): a level for every
    * agent, or a function the framework asks with an agent's name and model at
    * each request it assembles for that agent, giving a level, or `undefined`
-   * for none. Derived agents and conversation forks are asked too.
+   * for none. Derived agents and conversation forks are asked too. A value
+   * that isn't a level or a function is refused at create. A function's
+   * answer that isn't a level or `undefined`, or a throw, counts as
+   * `undefined`, and is logged once per agent.
    *
    * A request's top-level effort is the agent's base. A turn sets it as it
    * assembles the agent's first request on its model, at the live level. The
@@ -372,10 +375,12 @@ export interface FrameworkConfig {
    * on carry it there, which changes the prompt from that row on, once.
    *
    * When membrane refuses an agent's request that carries an effort row, with
-   * `systemChangeRefused`, the request is sent again at once with no effort
-   * rows and the live level as its top-level effort. Neither a provider hold
-   * nor a stated wait takes it first. That agent's requests go that way until
-   * the agent ends or the process does.
+   * `systemChangeRefused`, before the stream's first tool round, the request
+   * is sent again at once. The retry carries no effort rows, and the live
+   * level as its top-level effort. Neither a provider hold nor a stated wait
+   * takes it first. The agent's requests go without effort rows from then
+   * on, until the agent ends or the process does. A refusal after a tool
+   * round goes to the error policy, whose retry starts the turn's next stream.
    *
    * A preview shows the row a start would write, unstored. The direct API
    * (`Agent.runInference`) sends what a turn's request would carry and writes
@@ -396,6 +401,14 @@ export interface FrameworkConfig {
    * Unset, effort is the host's, through `providerParams`, as before. The
    * framework's own effort rows from when it was set are left out of every
    * request, and a host's own effort row goes as stored.
+   *
+   * For an agent with `thinkingBinding.binds`, the identity of a request's
+   * head covers whether the request leaves out the effort rows the framework
+   * wrote for the agent. A request that starts or stops leaving them out has
+   * a changed head, as a change of model does. Its compile then leaves the
+   * stored replies' thinking out. That happens when a function's answer goes
+   * from a level to `undefined`, when membrane refuses the agent's rows, and
+   * when a restart unsets this or sets it again.
    */
   effort?: EffortLevel | ((agent: { name: string; model: string }) => EffortLevel | undefined);
 

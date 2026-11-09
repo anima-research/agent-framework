@@ -246,7 +246,9 @@ export interface AgentConfig {
      *   of what the request carries ahead of its messages (`identity`: the
      *   system text with its system-position injections, the tools in the
      *   order sent, the model, and the thinking config, `maxTokens`,
-     *   `providerParams` and `prefillUserMessage`);
+     *   `providerParams` and `prefillUserMessage`, and whether the request
+     *   leaves out effort rows the framework wrote for the agent
+     *   (`FrameworkConfig.effort`));
      * - each framework stream tells the context manager which stored rows
      *   its later rounds and its last reply carried as stored
      *   (`noteRequestSent`), naming the compile it was built from, so their

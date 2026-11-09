@@ -4246,8 +4246,17 @@ function readerModelFields(cfg: SubconsciousConfig): Pick<AgentConfig, (typeof S
   };
 }
 
+/** FrameworkConfig.effort: a level, a function, or left out (null counts as left out). */
+function assertEffortSetting(effort: unknown): void {
+  if (effort == null || typeof effort === 'function' || isEffortLevel(effort)) return;
+  throw new Error(
+    `FrameworkConfig.effort is ${JSON.stringify(effort)}, which isn't an effort level. Give low, medium, high, xhigh or max, ` +
+      'or a function that gives one of them, or undefined, for each agent.',
+  );
+}
+
 function assertEffortSource(config: AgentConfig, effort: FrameworkConfig['effort']): void {
-  if (effort === undefined) return;
+  if (effort == null) return;
   const outputConfig = (config.providerParams as { output_config?: unknown } | undefined)?.output_config;
   if (outputConfig !== null && typeof outputConfig === 'object' && (outputConfig as { effort?: unknown }).effort !== undefined) {
     throw new Error(
@@ -4927,6 +4936,8 @@ export class AgentFramework {
   /** The host's say over each derivation, ephemeral spawn and resume (config.dendrite.beforeDerive). */
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
   private effortSetting: FrameworkConfig['effort'];
+  /** Agents whose FrameworkConfig.effort answer was logged as unusable (liveEffort). */
+  private readonly effortAnswersLogged = new Set<string>();
   private readonly effortRowsRefused = new Set<string>();
   /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
   private derivationNoticeHook?: (record: AgentRecord, from: string, defaultText: string) => string | null;
@@ -5256,6 +5267,7 @@ export class AgentFramework {
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     resolveInferenceBounds(config.inferenceBounds);
     assertFrameworkSwitches(config);
+    assertEffortSetting(config.effort);
     for (const agentConfig of config.agents) {
       assertAgentSwitches(agentConfig);
       assertEffortSource(agentConfig, config.effort);
@@ -5533,7 +5545,7 @@ export class AgentFramework {
     framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
     framework.collapseDerivationNoticesAfter = Math.max(0, Math.floor(config.dendrite?.collapseDerivationNoticesAfter ?? 10));
     framework.beforeDerive = config.dendrite?.beforeDerive;
-    framework.effortSetting = config.effort;
+    framework.effortSetting = config.effort ?? undefined;
     framework.derivationNoticeHook = config.dendrite?.derivationNotice;
     framework.speechLocus = config.speech?.locus ?? 'delivery';
     framework.tuneOutOffered = !!config.subconscious?.enabled;
@@ -9718,10 +9730,38 @@ export class AgentFramework {
     if (this.effortSetting !== undefined) agent.setEffortPlanner((use) => this.planEffort(agent, use));
   }
 
+  /**
+   * The live level FrameworkConfig.effort gives `agent`. A function's answer
+   * that isn't a level or undefined, or a throw, reads as undefined, and is
+   * logged once per agent while the process runs.
+   */
+  private liveEffort(agent: Agent, setting: NonNullable<FrameworkConfig['effort']>): EffortLevel | undefined {
+    if (typeof setting !== 'function') return setting;
+    let answer: unknown;
+    try {
+      answer = setting({ name: agent.name, model: agent.model });
+    } catch (error) {
+      if (!this.effortAnswersLogged.has(agent.name)) {
+        this.effortAnswersLogged.add(agent.name);
+        console.error(`[effort] ${agent.name}: FrameworkConfig.effort threw, so its requests go as if it gave undefined:`, error);
+      }
+      return undefined;
+    }
+    if (answer === undefined || isEffortLevel(answer)) return answer;
+    if (!this.effortAnswersLogged.has(agent.name)) {
+      this.effortAnswersLogged.add(agent.name);
+      console.error(
+        `[effort] ${agent.name}: FrameworkConfig.effort gave ${JSON.stringify(answer)}, which isn't an effort level, ` +
+          'so its requests go as if it gave undefined.',
+      );
+    }
+    return undefined;
+  }
+
   private planEffort(agent: Agent, use: 'turn' | 'preview' | 'direct'): EffortPlan | undefined {
     const setting = this.effortSetting;
     if (setting === undefined) return undefined;
-    const live = typeof setting === 'function' ? setting({ name: agent.name, model: agent.model }) : setting;
+    const live = this.liveEffort(agent, setting);
     if (!MEMBRANE_SENDS_EFFORT_ROWS || this.effortRowsRefused.has(agent.name)) return { rows: false, ...(live !== undefined ? { topLevel: live } : {}) };
     const record = this.readEffortBase(agent.name, use === 'turn');
     const kept = record?.model === agent.model ? record.effort : undefined;
@@ -30765,10 +30805,13 @@ export class AgentFramework {
             const retry = retryOf(trigger);
             const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
-            // A marked refusal of a request carrying an effort row is sent
-            // again at once without rows, so neither a hold nor a stated wait
-            // takes it.
-            const effortRetry = this.refuseEffortRows(agent, err, compiledRequest);
+            // A marked refusal of a request carrying an effort row, before the
+            // stream's first tool round, is sent again at once without rows,
+            // so neither a hold nor a stated wait takes it. One after a tool
+            // round goes to the error policy, whose retry starts the turn's
+            // next stream: no tool has run when that start's first request is
+            // refused.
+            const effortRetry = !hadToolCalls && this.refuseEffortRows(agent, err, compiledRequest);
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
             if (!effortRetry && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {

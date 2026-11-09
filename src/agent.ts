@@ -1985,11 +1985,12 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const binding = this.bindingCompileOptions(tools, (injections ?? [])
-      .filter((injection) => injection.position === 'system')
-      .flatMap((injection) => injection.content));
     const assemble = async (): Promise<NormalizedRequest> => {
+      // Each assembly plans effort afresh, and its binding reads that plan.
       const effort = this.effortPlanner?.('direct');
+      const binding = this.bindingCompileOptions(tools, (injections ?? [])
+        .filter((injection) => injection.position === 'system')
+        .flatMap((injection) => injection.content), effort);
       const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
       // What it holds of the stored injections is what the agent last saw.
@@ -2170,7 +2171,7 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
-    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
+    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections, options.effort);
     const compiledResult = await this.compileWithInjections(
       budget,
       injections,
@@ -2380,6 +2381,20 @@ export class Agent {
   }
 
   /**
+   * Whether this agent's requests leave out an effort row the framework wrote for one of its own participants, among
+   * the rows its store holds. Unset (no plan), every such row is left out. Set without rows, every effort row is. Set
+   * with rows, the agent's own are sent.
+   */
+  private ownEffortRowsLeftOut(plan: EffortPlan | undefined): boolean {
+    if (plan?.rows === true) return false;
+    return this.contextManager.getAllMessages().some((message) => {
+      if (effortOf(message.content) === undefined) return false;
+      const of = effortRowOf(message.metadata);
+      return of !== undefined && this.isOwnParticipant(of);
+    });
+  }
+
+  /**
    * What a compile the agent sends tells the context manager when the model binds its thinking
    * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
    * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of
@@ -2388,9 +2403,12 @@ export class Agent {
    * injections given to the compile as the kv-unified prefix hash builds it; the tools are the ones it will carry, in
    * their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
    * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
-   * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
+   * of a conversation that would begin with the assistant. `request` also covers whether the request leaves out
+   * effort rows the framework wrote for the agent (`ownEffortRowsLeftOut`). The request leaves them out after the
+   * compile, where the context manager can't see it, so a change in that has to change the head. Nothing without
+   * `binds`: the compile is as it was.
    */
-  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
+  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[], effort: EffortPlan | undefined): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
     if (!thinkingBinding) return {};
     const { config, providerParams, prefillUserMessage } = this.requestSettings();
@@ -2403,6 +2421,7 @@ export class Agent {
         request: wireDigest({
           thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
           prefillUserMessage: prefillUserMessage ?? null,
+          ...(this.ownEffortRowsLeftOut(effort) ? { ownEffortRowsLeftOut: true } : {}),
         }),
       },
     };
