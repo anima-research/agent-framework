@@ -367,6 +367,18 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     }
   });
 
+  it("a deadline expiry membrane throws ends its turn with a note that says the call timed out again and gives no reason, since the message is membrane's", async () => {
+    const t = await turn(['silent-after-start'], {
+      inferenceBounds: { ...SHORT, progressBounds: { ...SHORT.progressBounds, beforeContentMs: 5_000, betweenEventsMs: 5_000 } },
+      membrane: (stand) => new WatchdogsAt200ms(adapterFor(stand)),
+    });
+    assert.equal(t.markers.length, 1);
+    assert.equal(t.markers[0], '[inference-failed] Your previous turn did not complete: the model call timed out and produced no response, so nothing was sent. ' +
+      'The call was made again, and it timed out again. If a reply is still owed from that turn, you can give it now.');
+    assert.equal(t.errors.length, 2);
+    for (const thrown of t.errors) assert.ok(thrown.message.length > 0 && !t.markers[0]!.includes(thrown.message), thrown.message);
+  });
+
   it('flatMinimumMs sets the flat bound\'s least', async () => {
     const t = await turn(['openai-comments'], { openai: true, inferenceBounds: { ...SHORT, flatMinimumMs: 2_000 } });
     assert.equal(t.requests, 2);
@@ -486,7 +498,7 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     const t = await turn(['error408']);
     assert.equal(t.requests, 3);
     assert.equal(t.markers.length, 1);
-    assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call timed out \(timeout, HTTP 408\) and produced no response, so nothing was sent\. Reason: /);
+    assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call timed out \(timeout, HTTP 408\) and produced no response, so nothing was sent\. If a reply/);
     assert.doesNotMatch(t.markers[0]!, /made again/);
     assert.match(t.markers[0]!, /\. If a reply is still owed from that turn, you can give it now\.$/);
   });

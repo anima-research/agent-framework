@@ -1,0 +1,315 @@
+/**
+ * The audience stamp (#291): who a stored row is for, written on the row
+ * when it is stored, in its metadata.
+ *
+ * A row's target used to live only in the write that stored it: the
+ * `forAgent` option, or which agent's context manager a writer called. In
+ * the residents' shared slot, rows meant for different agents then look
+ * alike in the store, and nothing read later can tell whose a row is. #291's
+ * presentation index decides from the row which agents it is presented to,
+ * and at boot which rows an agent has to be presented that it wasn't, so the
+ * framework now writes that on every row it stores:
+ *
+ * - `metadata.audience` lists the agents the row is meant for, computed when
+ *   it is written: the agent a write names (`forAgent`); for an admitted
+ *   inbound message, the recipients admission delivered it to; for a
+ *   module's process response whose inference request names agents, those
+ *   of them registered that read the slot it lands in. A write that names
+ *   no agent (a module's write, a process response that asks every agent
+ *   or none to read, or only agents that don't read that slot) is for the
+ *   agents that take untargeted inbound and own the slot it lands in: on a
+ *   residents' host every resident, as each reads the shared slot; with one
+ *   resident that resident alone, as before. It falls back to the agent the
+ *   write is delivered to when there are none.
+ *   This is the rule #291's presentation index presents an untargeted row
+ *   in the shared slot by, applied when the row is written, so the record
+ *   tells an untargeted row from one written for the primary. A message a
+ *   tune-out holds is meant for none of them, so its list is empty, unless
+ *   the write names an agent whose own view keeps held traffic (the
+ *   persistent subconscious), which it is for.
+ *   Observers of a slot (the subconscious watching the residents' slot) are
+ *   a relationship in the registry, not part of the list. An inbound
+ *   message's target is stamped as named even where it doesn't read the
+ *   slot the row lands in (a worker or a conversation fork, stored in the
+ *   residents' slot): how such a row is presented is left to the
+ *   presentation index. A process response's messages and the gate's
+ *   batched line are stamped for the agents they name that read that slot,
+ *   and as a write that names no agent when none of them does, so they
+ *   reach the windows that read the slot, as on main. The wake-onboarding
+ *   notice is stamped for its recipients that read that slot; one that
+ *   doesn't (a conversation fork) gets its own copy where it reads, stamped
+ *   for it, and the notice for an event with no recipients is for the
+ *   agents that take untargeted inbound.
+ * - `metadata.ownRowOf` names the agent whose own row it is: one stored by
+ *   that agent's turn or act (its rounds, its tool results, a puppeted
+ *   call), or by the framework for that agent's own turn (a clock row, a
+ *   `[continue]` row, a batched wake's line, a notice about its own speech
+ *   or failure, a derived agent's inheritance and framing). Its audience is
+ *   that agent alone. "Own" goes by who stored the row, never by its
+ *   participant: a shared fork presents its parent's name as its own voice,
+ *   but mail its parent sends it is the parent's, meant for the fork, and
+ *   isn't the fork's own row.
+ *
+ * Both keys are the framework's. A write through the framework's
+ * `addMessage` is stamped there and a stamp its metadata carried (a copy of
+ * a stored row's, say) is replaced, as `deferredWriteId` is, but on an
+ * imported write, which keeps the stamp it was queued with. The compile
+ * (context-manager's) doesn't read the stamp, so a window compiles as the
+ * same rows unstamped do; the presentation index does, so another
+ * resident's own rows no longer enter a resident's window unless it
+ * observes that resident (AgentConfig.observes). Rows stored before the
+ * stamp existed carry none; `audienceOf` says so by returning undefined. A
+ * write an earlier version left in its deferred queue is stamped when the
+ * importer stores it at boot, as any write through `addMessage` is, unless
+ * it was queued stamped, so it isn't stored unstamped after the upgrade.
+ */
+import type { ContentBlock } from '@animalabs/membrane';
+import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
+import { WriteLandedError, WriteOutcomeUnknownError } from '../context-manager-errors.js';
+import { suppressionRecordOf } from '../gate/suppression-stats.js';
+import { isAnotherAgentsInjection } from '../stored-injections.js';
+import type { AgentName, ObserveEdge } from './types.js';
+
+/** The metadata key listing who a row is for. */
+export const AUDIENCE_KEY = 'audience';
+/** The metadata key naming whose own row a row is. */
+export const OWN_ROW_KEY = 'ownRowOf';
+
+/** A row's audience stamp, as `audienceOf` reads it. */
+export interface AudienceStamp {
+  /** The agents the row is meant for, as computed when it was written. */
+  audience: AgentName[];
+  /** Set when the row is that agent's own (see the module comment). */
+  ownRowOf?: AgentName;
+}
+
+/**
+ * `metadata` stamped as a row meant for `audience`, and as nobody's own
+ * row: a stamp it carried is replaced. A new object; `metadata` is unchanged.
+ */
+export function withAudience(metadata: MessageMetadata | undefined, audience: readonly AgentName[]): MessageMetadata {
+  const { [OWN_ROW_KEY]: _replaced, ...rest } = (metadata ?? {}) as MessageMetadata;
+  return { ...rest, [AUDIENCE_KEY]: [...audience] } as MessageMetadata;
+}
+
+/**
+ * `metadata` stamped as `owner`'s own row, meant for `owner` alone: a stamp
+ * it carried is replaced. A new object; `metadata` is unchanged.
+ */
+export function asOwnRow(metadata: MessageMetadata | undefined, owner: AgentName): MessageMetadata {
+  return { ...(metadata ?? {}), [AUDIENCE_KEY]: [owner], [OWN_ROW_KEY]: owner } as MessageMetadata;
+}
+
+/**
+ * The audience stamp a row's metadata carries, or undefined when it carries
+ * none (a row stored before the stamp existed) or carries one that isn't a
+ * list of names.
+ */
+export function audienceOf(metadata: unknown): AudienceStamp | undefined {
+  if (!metadata || typeof metadata !== 'object') return undefined;
+  const audience = (metadata as Record<string, unknown>)[AUDIENCE_KEY];
+  if (!Array.isArray(audience) || !audience.every((name) => typeof name === 'string')) return undefined;
+  const own = (metadata as Record<string, unknown>)[OWN_ROW_KEY];
+  return { audience: [...audience], ...(typeof own === 'string' ? { ownRowOf: own } : {}) };
+}
+
+/** Whether a row's metadata stamps it as `agent`'s own row. */
+export function isOwnRowOf(metadata: unknown, agent: AgentName): boolean {
+  return audienceOf(metadata)?.ownRowOf === agent;
+}
+
+/**
+ * The admission record on a stored message: it was held from the residents
+ * by a policy epoch (`metadata.tuneOut = { epochId }`). ONE predicate for
+ * "held from the resident", read by the compiled-view filter, the mid-turn
+ * injection and the presentation index (#291) alike (#232 H1), so the window
+ * and the wire agree. Such a row is stamped for nobody (an empty audience),
+ * whatever store it lands in, unless its write names an agent whose own
+ * view keeps held traffic, such as the persistent subconscious, which it is
+ * for.
+ */
+export const heldFromResidents = (metadata: Record<string, unknown> | undefined): boolean =>
+  !!(metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+
+/**
+ * The suppression record on a stored message: a suppress rule took it as it
+ * arrived (`metadata.suppressed = { rule, eventType }`, stamped by addMessage
+ * from the gate's suppressionFor). ONE predicate for "never rendered", read
+ * by every view filter the framework sets (the residents', the
+ * subconscious's, and through them every derived view's, context-options.ts)
+ * and so by agentSees too: the compile, a tool boundary's injection and the
+ * arrival and unread checks agree. The presentation index (#291) presents
+ * such a row to nobody (bearingOf, observedRowFor), the reader of held
+ * traffic included, and addMessage stamps it for nobody (an empty
+ * audience). The stamp never changes, so the view stays deterministic per
+ * row, as context-manager's viewFilter requires.
+ */
+export const suppressedRow = (metadata: Record<string, unknown> | undefined): boolean =>
+  suppressionRecordOf(metadata) !== undefined;
+
+/**
+ * Whether a row of a slot an agent observes is for that agent (#291,
+ * decision 1): what an observe edge shows of the slot it reads. `observer`
+ * is the agent the edge is on, and `owners` are the agents whose own slot it
+ * reads (the registry's `slotOwners`).
+ *
+ * - Another agent's stored context injection: no. It is that agent's
+ *   context, not conversation, as every view of the framework's leaves out.
+ * - A row stored under the observer's own name: no. It is the observer's
+ *   delivery into the slot (the subconscious's summary or note into the
+ *   residents' slot), which its own round already holds.
+ * - A row a suppress rule hid (suppressedRow): no. It renders for no
+ *   reader, the reader of held traffic included.
+ * - A row a tune-out holds: only through an edge that shows held traffic
+ *   (`includeHeld`, the subconscious's).
+ * - A row with no audience stamp (stored before the stamp, or by a host's
+ *   writer that doesn't stamp): yes, as the merged view showed it.
+ * - An owner's own row (its rounds, results, clock rows, notices about its
+ *   own turn), and a row whose audience names an owner (channel traffic,
+ *   mail, module rows): yes.
+ * - A row whose audience names the observer itself, and that is nobody's
+ *   own row (an operator's message or a module's write addressed to the
+ *   subconscious alone, which lands in the residents' slot it watches):
+ *   yes. The edge is how the observer reads that slot, and the merged view
+ *   showed the row before the presentation index, so no window would hold
+ *   it otherwise (#291).
+ * - Anything else, such as the own row of an agent that doesn't own the
+ *   slot (the observer's own included), a row stamped only for an agent
+ *   that neither owns nor observes the slot, or one for a derived agent on
+ *   another branch: no.
+ */
+export function observedRowFor(
+  edge: Pick<ObserveEdge, 'includeHeld'>,
+  row: { participant: string; metadata?: unknown },
+  context: { observer: AgentName; owners: readonly AgentName[] },
+): boolean {
+  if (isAnotherAgentsInjection(row.metadata, context.observer)) return false;
+  if (row.participant === context.observer) return false;
+  if (suppressedRow(row.metadata as Record<string, unknown> | undefined)) return false;
+  if (heldFromResidents(row.metadata as Record<string, unknown> | undefined)) return edge.includeHeld === true;
+  const stamp = audienceOf(row.metadata);
+  if (!stamp) return true;
+  if (stamp.ownRowOf !== undefined) return context.owners.includes(stamp.ownRowOf);
+  return stamp.audience.some((name) => name === context.observer || context.owners.includes(name));
+}
+
+/** What `storeOwnRow` writes through: an agent, or anything that names one and holds its context. */
+export interface OwnRowWriter {
+  readonly name: AgentName;
+  /** With `getMessage`, a write whose outcome the store can't tell presents
+   *  the rows it may have stored that the store reads as held
+   *  (presentLandedThenRethrow); without it, only those it knows landed. */
+  getContextManager(): Pick<ContextManager, 'addMessage'> & Partial<Pick<ContextManager, 'getMessage'>>;
+  /**
+   * Told the ids of the agent's own rows once they are stored (the
+   * presentation index's own-row sink, #291), each once its write has
+   * returned. A writer without it is told nothing.
+   */
+  ownRowsStored?(ids: readonly MessageId[]): void;
+}
+
+/**
+ * Store a row in `agent`'s own context, stamped as its own row (asOwnRow).
+ * Every writer that stores into an agent's context directly, past the
+ * framework's `addMessage`, stores the agent's own rows through this, but
+ * the tool-result guard, which stamps the results it writes itself
+ * (asOwnRow, ToolResultGuard.storeResults) and tells its own-row sink of
+ * them, so none of them goes unstamped.
+ *
+ * With `present` (the default), the writer is told of the row once the add
+ * has returned (`ownRowsStored`), never from inside it, where a sharded body
+ * may still be storing its shards: under the presentation index (#291) that
+ * presents the row in the agent's window at once. That is right for a row
+ * the agent's stream carries (its round, its results, a notice injected at
+ * its boundary), one written before its next compile or after its stream's
+ * last request, and one written while the agent has no turn alive. A row
+ * written at another moment, where a turn the row isn't part of may be
+ * alive, passes `present: false`: it stays stored and out of the window,
+ * and the index's own-row sweep at the agent's next presentation point
+ * presents it there.
+ */
+export function storeOwnRow(
+  agent: OwnRowWriter,
+  participant: string,
+  content: ContentBlock[],
+  metadata?: MessageMetadata,
+  options?: AddMessageOptions,
+  present = true,
+): MessageId {
+  const cm = agent.getContextManager();
+  let id: MessageId;
+  try {
+    id = cm.addMessage(participant, content, asOwnRow(metadata, agent.name), undefined, options);
+  } catch (error) {
+    presentLandedThenRethrow(
+      error,
+      agent.name,
+      present && agent.ownRowsStored ? (ids) => agent.ownRowsStored!(ids) : undefined,
+      cm.getMessage ? (row) => cm.getMessage!(row) !== null : undefined,
+    );
+  }
+  if (present) agent.ownRowsStored?.([id]);
+  return id;
+}
+
+/**
+ * The catch of a write of an agent's own row whose add threw (storeOwnRow,
+ * and the tool-result guard's two writes of the results row): the rows of
+ * the write the store holds are told to `told`, the own-row sink, as the
+ * write's id would have been, then the add's error is thrown on. The write
+ * is answered by that error, as before the presentation index: what its
+ * caller does on it is the caller's. A row of it that is stored is out of
+ * the window until presented, like any stored row, and presented here so
+ * that an own row written after it can't enter the window ahead of it.
+ *
+ * - WriteLandedError: its `landed` rows, in store order.
+ * - WriteOutcomeUnknownError: its `landed` rows, then those its `unknown`
+ *   names (the store holds all of these or none) that `holds` reads as
+ *   stored, as addMessage presents such a write's rows (presentedThoughUnknown
+ *   in framework.ts, whose afterStore reads the rows too). Where that read
+ *   throws, every row `unknown` names, as presentedThoughUnknown gives them:
+ *   the sink keeps a row it can't present and presents it ahead of the next
+ *   own row, dropping one the store doesn't hold (presentOwn), so a landed
+ *   row isn't put behind an own row written after it. Without `holds`, its
+ *   `landed` rows only.
+ * - Any other error: none of the write is stored, so nothing is told.
+ *
+ * Without `told` (a writer that holds its row back, storeOwnRow's
+ * `present: false`, or one with no sink) nothing is told. A sink that
+ * throws is logged; the add's error is the one thrown.
+ */
+export function presentLandedThenRethrow(
+  error: unknown,
+  agentName: string,
+  told: ((ids: readonly MessageId[]) => void) | undefined,
+  holds?: (id: MessageId) => boolean,
+): never {
+  const stored = told ? storedOfThrownWrite(error, holds) : [];
+  if (stored.length > 0) {
+    try {
+      told!(stored);
+    } catch (presentError) {
+      console.error(
+        `[store] agent=${agentName}: a write's add threw with ${stored.length === 1 ? `its row ${stored[0]}` : `rows ${stored.join(', ')}`} ` +
+          'stored, and telling its own-row sink of them threw too:',
+        presentError,
+      );
+    }
+  }
+  throw error;
+}
+
+/** The rows of a write whose add threw that the store holds, by its error (presentLandedThenRethrow). */
+function storedOfThrownWrite(error: unknown, holds: ((id: MessageId) => boolean) | undefined): MessageId[] {
+  if (error instanceof WriteLandedError) return [...error.landed];
+  if (!(error instanceof WriteOutcomeUnknownError)) return [];
+  let unknown: MessageId[] = [];
+  if (holds && error.unknown.length > 0) {
+    try {
+      unknown = error.unknown.filter((id) => holds(id));
+    } catch {
+      unknown = [...error.unknown];
+    }
+  }
+  return [...error.landed, ...unknown];
+}

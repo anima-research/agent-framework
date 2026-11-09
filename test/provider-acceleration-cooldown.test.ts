@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
-import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { EventResponse, InferenceRequest, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
@@ -147,6 +147,44 @@ test('organization acceleration 429 defers one fresh compile, includes arrivals,
     assert.equal(recovery.stopReason, 'end_turn');
   } finally {
     t.mock.timers.reset();
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+class ThrowingQuotaMembrane extends MockMembrane {
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    const error = new MembraneError({
+      type: 'rate_limit', retryable: false, httpStatus: 429,
+      message: 'zz weekly quota spent: zz-provider-words-7f3a', rawError: { status: 429 }, rawRequest: request,
+    });
+    const stream = new ErrorStream(error);
+    Object.defineProperty(stream, Symbol.asyncIterator, { value: async function* () { throw error; } });
+    return stream;
+  }
+}
+
+test("a failure thrown from the stream that the host holds is logged in the framework's words beside the provider's", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-host-hold-'));
+  const membrane = new ThrowingQuotaMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    providerHold: () => ({ holdMs: 60_000, reason: 'weekly quota spent' }),
+  });
+  const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1);
+    assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the turn is held');
+    const failed = framework.queryInferenceLogs({ limit: 10 }).entries.map((e) => e.summary ?? e.entry).filter((e) => !e.success);
+    assert.equal(failed.length, 1, JSON.stringify(failed));
+    assert.equal(failed[0]!.error, 'Provider acceleration cooldown: zz weekly quota spent: zz-provider-words-7f3a');
+    assert.equal(failed[0]!.errorWords, 'Provider acceleration cooldown: the model call failed (rate_limit, HTTP 429)');
+  } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -506,6 +544,49 @@ test('providerHold is consulted before the built-in acceleration classification'
     assert.equal(admission.cooldownReason, 'weekly quota spent');
     assert.equal(admission.hostHold, true);
   } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// About twice the most a spread can pass as call arguments on Node 24.22.2
+// (between 124,887 and 125,498 elements).
+const HELD_PAST_A_SPREAD = 250_000;
+
+test("a provider hold releases a held list longer than a spread can pass: one turn starts, with the newest held wake's line, and none is left waiting", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-cooldown-'));
+  const membrane = new AccelerationThenSuccessMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  const internal = framework as unknown as {
+    providerAccelerationDefaultCooldownMs: number;
+    providerAccelerationJitterMs: number;
+    providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[] }>;
+  };
+  internal.providerAccelerationDefaultCooldownMs = 1_000;
+  internal.providerAccelerationJitterMs = 0;
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
+    await framework.runUntilIdle();
+    const held = internal.providerAccelerationCooldowns.get('resident')?.heldRequests;
+    assert.ok(held && held.length === 1, 'premise: the hold holds the turn the provider refused');
+    const since = held[0]!.timestamp;
+    for (let i = 1; i <= HELD_PAST_A_SPREAD; i++) held.push({ agentName: 'resident', reason: 'external-message', source: 'test', timestamp: since + i });
+    held.at(-1)!.wakeLines = [{ entry: { eventType: 'external-message', messageId: 'newest' }, policyNames: ['test'], shown: '#held-newest', at: since }];
+    assert.equal(framework.getHostModeStatus().gatedRequests, HELD_PAST_A_SPREAD, 'premise: every held wake waits');
+
+    t.mock.timers.tick(1_000);
+    await waitFor(framework, () => membrane.calls.length >= 2, 'the turn the release starts');
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 2, 'the release starts one turn');
+    assert.ok(JSON.stringify(membrane.calls[1]).includes('in #held-newest '), "the newest held wake's line reaches the turn");
+    assert.equal(framework.getHostModeStatus().gatedRequests, 0, 'no held wake is left waiting');
+  } finally {
+    t.mock.timers.reset();
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }

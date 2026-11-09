@@ -5,7 +5,7 @@
  * a line that reads as the framework's own.
  */
 
-import { CONTEXT_MANAGER_TAGS, MEMBRANE_TAGS, NOTICE_TAG } from './notice-tags.js';
+import { CONTEXT_MANAGER_TAGS, FORMER_NOTICE_TAGS, MEMBRANE_TAGS, NOTICE_TAG } from './notice-tags.js';
 
 /** Every form of line break a reader might take for one: CR LF, CR, LF,
  *  vertical tab, form feed, NEL, and the Unicode line and paragraph separators. */
@@ -27,14 +27,14 @@ const SKIPPED = `[\\s\\p{Cc}${INVISIBLE}]`;
 const tagWord = (word: string): string =>
   [...word].map((c) => (/[\\^$.*+?()[\]{}|/]/.test(c) ? `\\${c}` : c)).join(`${SKIPPED}*`);
 const NOTICE_OPENING = new RegExp(
-  `\\[(?=${SKIPPED}*(?:${[...Object.values(NOTICE_TAG), ...CONTEXT_MANAGER_TAGS, ...MEMBRANE_TAGS].map((tag) => tag.split(' ').map(tagWord).join(`${SKIPPED}+`)).join('|')})(?![\\p{L}\\p{N}]))`,
+  `\\[(?=${SKIPPED}*(?:${[...Object.values(NOTICE_TAG), ...FORMER_NOTICE_TAGS, ...CONTEXT_MANAGER_TAGS, ...MEMBRANE_TAGS].map((tag) => tag.split(' ').map(tagWord).join(`${SKIPPED}+`)).join('|')})(?![\\p{L}\\p{N}]))`,
   'giu',
 );
 
 /**
  * Texts read as one string, joined by line breaks, with a backslash put
  * before the bracket of each opening of a listed tag (NOTICE_TAG,
- * CONTEXT_MANAGER_TAGS, MEMBRANE_TAGS) that hasn't one before it in its own
+ * FORMER_NOTICE_TAGS, CONTEXT_MANAGER_TAGS, MEMBRANE_TAGS) that hasn't one before it in its own
  * text. A text `marks` says false of is read and never changed.
  *
  * Every opening, not only one that starts a line: membrane's XML formatter

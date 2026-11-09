@@ -157,20 +157,27 @@ const UNSUPPORTED_PROTOCOL_VERSION_CODE = -32022;
 const MAX_TOOL_LIST_PAGES = 100;
 
 /**
- * The server and this engine have no protocol revision in common, so the
- * connection was never established. This is a protocol-negotiation fact, not
- * a request outcome. Retrying cannot change it: each engine offers one
- * revision, and only configuration can fix the mismatch. A connection that
- * gets this error does not schedule reconnects. The legacy engine and the
- * modern one (ModernMcpConnection, whose pinned revision the server refused)
- * both throw it, so its readers treat them alike.
+ * This engine and the server could not negotiate a protocol revision, so the
+ * connect that throws it established no connection. Usually they share none. Over HTTP it
+ * can also be the SDK's own refusal: after a -32022 whose list names a
+ * revision from 2026-07-28 on that this client doesn't speak, the SDK
+ * negotiates no further, even when the list also names a 2025 revision both
+ * speak. This is a protocol-negotiation fact, not a request outcome.
+ * Retrying cannot change it: each engine offers the same revisions every
+ * time (`offeredRevisions`), and only configuration, or the server's
+ * operator, can fix the mismatch. A connection that gets this error does not
+ * schedule reconnects. The legacy engine and the modern one
+ * (ModernMcpConnection) both throw it, so its readers treat them alike.
  *
- * - `rejected`: the server refused the offered revision: the legacy engine's
- *   `initialize` answered with error -32022, or a modern server's discovery
- *   or error naming no common revision. `supported` is the server's own list,
- *   when it gave one.
- * - `mismatch`: the server answered the legacy engine's `initialize` with a
- *   revision other than 2024-11-05, or with none.
+ * - `rejected`: the server refused the revision offered. The legacy
+ *   engine's `initialize` was answered with error -32022. A modern server's
+ *   discovery or -32022 error named no revision in common (over HTTP, a
+ *   discovery's list counts once the server has refused the `initialize`
+ *   tried after it too), or, over HTTP, named one this client doesn't speak,
+ *   as above. `supported` is the server's own list, when it gave one.
+ * - `mismatch`: the server answered `initialize` with a revision that
+ *   handshake doesn't accept, or with none: the legacy engine's, or a modern
+ *   connection's 2025 handshake over HTTP.
  */
 export class McplProtocolVersionError extends Error {
   constructor(
@@ -185,9 +192,15 @@ export class McplProtocolVersionError extends Error {
      *  redacted (`rejected`). */
     readonly code?: number,
     readonly data?: unknown,
-    /** The revision this client offered: the legacy engine's, unless a
-     *  modern connection's. */
+    /** The revision this client offered first, in its order of preference:
+     *  the legacy engine's (2024-11-05), a modern connection's over stdio
+     *  (2026-07-28), or over HTTP 2026-07-28, the first of
+     *  `offeredRevisions`. */
     readonly offered: string = MCP_PROTOCOL_VERSION,
+    /** Every revision this client offered, in its order of preference: the
+     *  legacy engine's one, a modern connection's one over stdio, or its
+     *  list over HTTP. */
+    readonly offeredRevisions: readonly string[] = [offered],
   ) {
     super(message);
     this.name = 'McplProtocolVersionError';
@@ -1782,8 +1795,9 @@ export class McplServerConnection extends EventEmitter {
    * following `nextCursor` across pages (2024-11-05 pagination). Cursors are
    * opaque strings, `''` included: only an absent or null `nextCursor` ends
    * the inventory (a null one is how some servers say "no more", and main
-   * read it as a complete page). A page that isn't well formed (no `tools` array, a cursor
-   * that isn't a string), or cursors that don't terminate (a repeat, or more
+   * read it as a complete page). A page that isn't well formed (no `tools` array, an entry
+   * that isn't an object with a string `name`, a cursor that isn't a string), or cursors
+   * that don't terminate (a repeat, or more
    * than {@link MAX_TOOL_LIST_PAGES} pages), are errors, never a partial or
    * empty inventory published as complete. The read tap (RFC-014) is handed
    * the complete inventory once, with the last page's `_meta`, as the last
@@ -1798,9 +1812,12 @@ export class McplServerConnection extends EventEmitter {
     let first: Record<string, unknown> | undefined;
     const read: McpToolDefinition[] = [];
     const revs = new Set<unknown>();
+    const isTool = (entry: unknown): boolean =>
+      !!entry && typeof entry === 'object' && typeof (entry as { name?: unknown }).name === 'string';
     const onRead = (result: unknown) => {
       if (!result || typeof result !== 'object' || !Array.isArray((result as { tools?: unknown }).tools)) return;
       const r = result as { tools: McpToolDefinition[]; nextCursor?: unknown; _meta?: unknown };
+      if (!r.tools.every(isTool)) return;
       for (const t of r.tools) read.push(t);
       const rev = (r._meta as Record<string, unknown> | undefined)?.['mcpl/rev'];
       if (typeof rev === 'number') revs.add(rev);
@@ -1817,6 +1834,8 @@ export class McplServerConnection extends EventEmitter {
       if (!result || typeof result !== 'object' || !Array.isArray(result.tools)) {
         throw malformed('no tools array');
       }
+      const unreadable = (result.tools as unknown[]).findIndex((entry) => !isTool(entry));
+      if (unreadable !== -1) throw malformed(`entry ${unreadable + 1} isn't an object with a string name`);
       first ??= result;
       for (const t of result.tools as McpToolDefinition[]) tools.push(t);
       if (result.nextCursor === undefined || result.nextCursor === null) {
