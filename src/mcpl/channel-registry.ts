@@ -1245,6 +1245,10 @@ export type ChannelToolOrigin =
      *  wake due before it, when there is one, which its confirmation names
      *  (skipReplyNote). */
     earlierWake?: SkipReplyEarlierWake;
+    /** For a skip_reply whose self-wake the framework armed: false when the
+     *  wake didn't reach the gate's wake journal, so the confirmation says a
+     *  restart would lose it. Absent otherwise. */
+    wakeDurable?: boolean;
     /** Made inside one of the agent's turns (the framework's callingTurnOf):
      *  a channel_publish naming no channel arrives with that turn's default
      *  already applied, so it takes no other. */
@@ -2604,6 +2608,7 @@ export class ChannelRegistry {
         return this.handleToolSkipReply(
           input as { reason?: string; wake_in_seconds?: unknown },
           origin?.kind === 'agent' ? origin.earlierWake : undefined,
+          origin?.kind === 'agent' ? origin.wakeDurable : undefined,
         );
 
       default:
@@ -5955,7 +5960,7 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }, earlierWake?: SkipReplyEarlierWake): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }, earlierWake?: SkipReplyEarlierWake, wakeDurable?: boolean): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
     // EventGate) BEFORE its dispatch reaches this handler, from the same
     // reading, and the framework refuses a wake the host can't set before
@@ -5978,7 +5983,10 @@ export class ChannelRegistry {
       // on Fable: ~60% of skip_reply result bytes were verbatim input echo).
       data: {
         skipped: true,
-        note: skipReplyNote(selfWake, selfWake !== undefined ? earlierWake : undefined),
+        note: skipReplyNote(selfWake, selfWake !== undefined ? earlierWake : undefined)
+          + (selfWake !== undefined && wakeDurable === false
+            ? ' This wake could not be journaled: a host restart before it fires would lose it.'
+            : ''),
       },
     };
   }

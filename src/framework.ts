@@ -5684,6 +5684,12 @@ export class AgentFramework {
           return undefined;
         },
       });
+      // The sleep and self-wakes the previous process had set, from the
+      // gate's wake journal: the sleep suppresses from here on, before any
+      // input flows. Their timers, and the wakes of those already due, wait
+      // for the end of create() (admitOverdueWakeIntents), once a wake can
+      // be served, or for the resume when the host boots quiesced.
+      framework.eventGate.restoreWakeIntents();
       // Wake onboarding: the agent's decisions about servers' suggested
       // treatment, beside gate.json (gate/wake-onboarding.ts).
       if (config.gate.onboarding !== false) {
@@ -5812,8 +5818,10 @@ export class AgentFramework {
           `since ${hostMode.since ? new Date(hostMode.since).toISOString() : 'unknown'}).\n` +
           `[host-mode] No wakes will start turns and MCPL data planes stay paused\n` +
           `[host-mode] until resume() — via host/command, the API server, or the\n` +
-          `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
-          `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
+          `[host-mode] framework API. The sleep and self-wakes the agents had set are\n` +
+          `[host-mode] restored from the gate's wake journal and served at resume(); other wakes\n` +
+          `[host-mode] parked before the restart were in memory and are gone, and recurring\n` +
+          `[host-mode] sources re-deliver on their own cadence.\n` +
           `[host-mode] ${imported.imported} context write(s) an earlier version left queued were stored at boot;\n` +
           `[host-mode] they enter the agents' windows at resume().\n` +
           `[host-mode] ============================================================`,
@@ -5930,6 +5938,11 @@ export class AgentFramework {
     // refreshes re-check patterns still undecided.
     framework.toolPatternChecksArmed = true;
     framework.checkToolPatterns();
+
+    // Everything a wake needs is in place: arm the restored sleep and
+    // self-wakes still ahead, and serve those whose time passed while the
+    // host was down. A quiesced boot keeps them for its resume().
+    framework.eventGate?.admitOverdueWakeIntents();
 
     return framework;
   }
@@ -6286,6 +6299,10 @@ export class AgentFramework {
     this.providerAdmissionClosed = true;
     for (const wake of [...this.retryWaitWakers]) step(wake);
     this.guardSpillsClosed = false;
+    // Before the queue closes: a sleep or self-wake due in the gap would be
+    // requested of a closed queue and leave the gate's wake journal, lost
+    // to the restart. The intents stay for the next start.
+    step(() => this.eventGate?.stopWakeTimers());
     step(() => this.queue.close());
     let inferences: Array<{ label: string; promise: Promise<void> }> = [];
     step(() => { inferences = this.inferenceRouter?.stopAll() ?? []; });
@@ -9928,6 +9945,10 @@ export class AgentFramework {
       for (const agent of [...this.agents.values()]) this.presentAtEndOf(agent);
       this.persistHostMode(null);
       this.hostModeRecordMayBeQuiesced = false;
+      // The sleep and self-wakes whose time passed during the quiesce, or
+      // while the host was down before a quiesced boot, wake their agents
+      // now (the gate kept them rather than park their wakes in memory).
+      this.eventGate?.admitOverdueWakeIntents();
     } finally {
       // Reopen MCPL data planes (quiesced is already false). In `finally`
       // so that nothing above can leave the host un-quiesced with every data
@@ -9941,7 +9962,9 @@ export class AgentFramework {
       });
       // NOTE: parked wakes and gate buffers are in-memory only — a restart
       // mid-quiesce boots quiesced but with these queues empty (sources like
-      // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
+      // heartbeats re-deliver on their own cadence). The agents' sleep and
+      // self-wakes are the exception: the gate's wake journal keeps them,
+      // and the resume above serves them.
       // Context WRITES made while quiesced are in the store, and survive,
       // unless a surgery's hold or a context manager refusing its work keeps
       // one in memory, which a restart loses.
@@ -33065,7 +33088,7 @@ export class AgentFramework {
           const wake = readSkipReplyWake(enrichedCall.input);
           if (wake.kind === 'wake' && this.eventGate) {
             const armedAt = Date.now();
-            const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+            const { inMs, armed, durable } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
             // The heartbeat's tick or reminder due before the timer: if it wakes
             // the agent, its turn cancels the timer, so the confirmation names
             // it and the time the self-wake would have left.
@@ -33073,8 +33096,10 @@ export class AgentFramework {
             console.error(armed
               ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
                 + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
+                + (durable ? '' : '; NOT journaled, so a restart loses it')
               : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
-            this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
+            // The confirmation says when a wake armed didn't reach the journal.
+            this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake, armed && !durable ? false : undefined);
             return;
           }
         }
@@ -40023,7 +40048,7 @@ export class AgentFramework {
   /**
    * Dispatch a synthesized channel tool call.
    */
-  private dispatchChannelToolCall(agentName: string, call: ToolCall, earlierWake?: SkipReplyEarlierWake): void {
+  private dispatchChannelToolCall(agentName: string, call: ToolCall, earlierWake?: SkipReplyEarlierWake, wakeDurable?: boolean): void {
     // Conversation forks act only on their home channel. channel_publish and
     // channel_close default a missing channelId to home and reject foreign
     // ones; channel_open is rejected outright — opening channels mutates
@@ -40140,6 +40165,7 @@ export class AgentFramework {
       : call.input;
     this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
       kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(callingTurn ? { inTurn: true } : {}), ...(earlierWake ? { earlierWake } : {}),
+      ...(wakeDurable !== undefined ? { wakeDurable } : {}),
     }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
@@ -41286,7 +41312,7 @@ export class AgentFramework {
       return;
     }
 
-    const { until } = gate.setSleep(seconds, input.message, agentName);
+    const { until, durable } = gate.setSleep(seconds, input.message, agentName);
     const announce = input.announce !== false; // default true
     const human =
       seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`
@@ -41369,7 +41395,8 @@ export class AgentFramework {
       }
     }
 
-    console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
+    console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`
+      + (durable ? '' : '; NOT journaled, so a restart loses it'));
     // endTurn: the agent stops here and goes idle for the duration.
     finish({
       success: true,
@@ -41378,6 +41405,9 @@ export class AgentFramework {
         until,
         untilLocal: formatZonedDateTime(until, this.timeZone),
         timeZone: this.timeZone,
+        // The journal keeps the sleep across a host restart; one its write
+        // failed to reach is this process's alone, and the agent is told.
+        ...(durable ? {} : { note: 'This sleep could not be journaled: a host restart before it ends would lose its wake.' }),
       },
       endTurn: true,
     });

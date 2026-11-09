@@ -1,4 +1,1 @@
-- `sleep` and `skip_reply(wake_in_seconds)` persist their armed wake intent so
-  process restarts re-arm future deadlines or visibly reconcile overdue wakes at most once while journal writes succeed, including across graceful restarts.
-- Sleep timers re-arm after backward wall-clock steps instead of silently
-  consuming the only wake callback before the promised deadline.
+- An agent's `sleep` and its `skip_reply(wake_in_seconds)` self-wake survive a host restart (#627, #194). The gate keeps both in a wake journal beside `gate.json` (`<gate stem>.wake-intents.json`): a start restores the sleep before any input flows, arms the wakes still ahead once the framework can serve one, and wakes the agent for those whose time passed while the host was down, with the self-wake's notice saying when it was due. A wake that falls due while the host is quiesced is kept for the resume rather than parked in memory, and the host's stop silences the wake timers before it closes its queue, so a wake due during the stop isn't lost. A sleep or self-wake the journal couldn't take is still armed in the running process, and the tool result says a restart would lose it.
