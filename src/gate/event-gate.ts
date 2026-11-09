@@ -4442,7 +4442,8 @@ export class EventGate {
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
    * when it fires; a judge rule's goes to the judge, so it only may). A batch
    * counts for the agents it would wake (wokenBy); a sleep with no agent
-   * named reaches the gate's recipients alone.
+   * named reaches the gate's recipients alone. Each wake names, in `agents`,
+   * those of `agentNames` it would wake.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4450,23 +4451,24 @@ export class EventGate {
     for (const name of agentNames) {
       const due = this.selfWakeDue.get(name);
       if (due && this.selfWakeTimers.has(name)) {
-        wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
+        wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer`, agents: [name] });
       }
     }
     const recipients = this.getAgentNamesFn();
-    const recipient = agentNames.some((name) => recipients.includes(name));
-    if (this.sleepUntil > now && (this.sleepAgent === undefined ? recipient : agentNames.includes(this.sleepAgent))) {
-      wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep' });
+    const sleepers = agentNames.filter((name) => (this.sleepAgent === undefined ? recipients.includes(name) : name === this.sleepAgent));
+    if (this.sleepUntil > now && sleepers.length > 0) {
+      wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep', agents: sleepers });
     }
     for (const [name, state] of this.debounceTimers) {
       if (name === exceptPolicy || state.events.length === 0) continue;
       const woken = this.wokenBy(state.events);
-      if (!agentNames.some((agentName) => woken.has(agentName))) continue;
+      const agents = agentNames.filter((agentName) => woken.has(agentName));
+      if (agents.length === 0) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge`, agents }
+        : { at: state.dueAt, certain: true, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}`, agents });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }

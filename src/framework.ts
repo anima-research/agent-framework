@@ -2712,6 +2712,50 @@ interface FrameworkWriteOptions {
   suppressedBy?: { rule: string; eventType: string; source?: string };
 }
 
+/**
+ * The metadata a write through addMessage is stored with: the marks only
+ * the framework sets dropped from what its caller gave, and a suppress
+ * rule's record stamped where its lane names one. The wake check of a
+ * module's response (applyProcessResponse) reads each write's metadata
+ * through it too, so it judges what's stored.
+ */
+function metadataAsStored(metadata: MessageMetadata | undefined, opts?: FrameworkWriteOptions): MessageMetadata | undefined {
+  // `deferredWriteId` is the framework's: a write an earlier release left
+  // queued is stored under its own (the importer's `imported`), and a later
+  // boot's dedup and a module's `held:` handle (landedRow) find the write
+  // by it. Any other write through here drops one its metadata carries,
+  // such as one a module or a process answer copied from a stored row. The
+  // channel writes that go straight to a conversation fork's store keep
+  // their metadata as given: no handle reads a fork's store, which is
+  // isolated.
+  if (!opts?.imported && metadata && 'deferredWriteId' in metadata) {
+    const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
+    metadata = rest as MessageMetadata;
+  }
+  // So is the mark of a module's write for a run or a fork
+  // (PRIMARY_IF_UNREAD_KEY), which only addModuleMessage sets: a module's
+  // process response, or an event an API module passes on, can't send a
+  // write to the primary by carrying it.
+  if (!opts?.imported && !opts?.markedForRun && metadata && PRIMARY_IF_UNREAD_KEY in metadata) {
+    const { [PRIMARY_IF_UNREAD_KEY]: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
+    metadata = rest as MessageMetadata;
+  }
+  // And so is the suppression record: an imported write (one an earlier
+  // release left queued) keeps the one stamped when it first came there;
+  // any other write carries one only when its lane says a suppress rule
+  // took it, as a module's response that copied a stored row's metadata
+  // mustn't hide its write by carrying one.
+  if (!opts?.imported && metadata && 'suppressed' in metadata) {
+    const { suppressed: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
+    metadata = rest as MessageMetadata;
+  }
+  if (!opts?.imported && opts?.suppressedBy) {
+    const { rule, eventType, source } = opts.suppressedBy;
+    metadata = { ...metadata, suppressed: { rule, eventType, ...(source ? { source } : {}) } } as MessageMetadata;
+  }
+  return metadata;
+}
+
 /** A body of an agent's window, by the row that names it (AgentFramework.windowBodiesFrom). */
 interface WindowBody {
   /** The id of the body's first shard, which names the body. */
@@ -19498,6 +19542,8 @@ export class AgentFramework {
     const eventServer = (event as { serverId?: unknown }).serverId;
     const stampSource = typeof eventServer === 'string' && eventServer !== '' ? eventServer : source;
     let added: WritePlacement | undefined;
+    // Each write's metadata as handed to addMessage, for whose view shows it.
+    const written: Array<MessageMetadata | undefined> = [];
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
@@ -19507,6 +19553,7 @@ export class AgentFramework {
           metadata = rest;
         }
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
+        written.push(metadata);
         const placement: WritePlacement = {};
         const audience = requested && suppressedRule === null && !heldFromResidents(metadata) ? requested : undefined;
         const id = this.addMessage(msg.participant, localInput ? markNoticeOpenings(msg.content) : msg.content, metadata, {
@@ -19561,12 +19608,14 @@ export class AgentFramework {
       // its view shows: a message held from the residents is out of a
       // resident's view and in a subconscious's, so a resident it alone was
       // for would wake to nothing new, and a batch's line would quote it.
-      const stored = response.addMessages ?? [];
+      // Each is read as addMessage stores it (metadataAsStored): with no
+      // suppress rule's record here, and none a response's message carried.
+      const asStored = written.map((metadata) => metadataAsStored(metadata));
       const sees = (name: string): boolean => {
         const agent = this.agents.get(name);
-        return agent !== undefined && stored.some((msg) => this.agentSees(agent, msg.metadata));
+        return agent !== undefined && asStored.some((metadata) => this.agentSees(agent, metadata));
       };
-      const woken = response.requestInference === true || stored.length === 0 ? triggered : triggered.filter(sees);
+      const woken = response.requestInference === true || asStored.length === 0 ? triggered : triggered.filter(sees);
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
@@ -33243,39 +33292,7 @@ export class AgentFramework {
     // What the caller gave, for a write a surgery's hold keeps (below),
     // which its release replays as it came.
     const given = metadata;
-    // `deferredWriteId` is the framework's: a write an earlier release left
-    // queued is stored under its own (the importer's `imported`), and a later
-    // boot's dedup and a module's `held:` handle (landedRow) find the write
-    // by it. Any other write through here drops one its metadata carries,
-    // such as one a module or a process answer copied from a stored row. The
-    // channel writes that go straight to a conversation fork's store keep
-    // their metadata as given: no handle reads a fork's store, which is
-    // isolated.
-    if (!opts?.imported && metadata && 'deferredWriteId' in metadata) {
-      const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
-      metadata = rest as MessageMetadata;
-    }
-    // So is the mark of a module's write for a run or a fork
-    // (PRIMARY_IF_UNREAD_KEY), which only addModuleMessage sets: a module's
-    // process response, or an event an API module passes on, can't send a
-    // write to the primary by carrying it.
-    if (!opts?.imported && !opts?.markedForRun && metadata && PRIMARY_IF_UNREAD_KEY in metadata) {
-      const { [PRIMARY_IF_UNREAD_KEY]: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
-      metadata = rest as MessageMetadata;
-    }
-    // And so is the suppression record: an imported write (one an earlier
-    // release left queued) keeps the one stamped when it first came there;
-    // any other write carries one only when its lane says a suppress rule
-    // took it, as a module's response that copied a stored row's metadata
-    // mustn't hide its write by carrying one.
-    if (!opts?.imported && metadata && 'suppressed' in metadata) {
-      const { suppressed: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
-      metadata = rest as MessageMetadata;
-    }
-    if (!opts?.imported && opts?.suppressedBy) {
-      const { rule, eventType, source } = opts.suppressedBy;
-      metadata = { ...metadata, suppressed: { rule, eventType, ...(source ? { source } : {}) } } as MessageMetadata;
-    }
+    metadata = metadataAsStored(metadata, opts);
     // Content context-manager won't store is refused here, as the store's own
     // write refuses it, whether this write is stored now or held by a
     // surgery: the writer learns at once. Content the store mends, such as a

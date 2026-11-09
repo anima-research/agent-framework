@@ -396,6 +396,10 @@ export interface UpcomingWake {
   /** What it is, in a word that quotes nothing, for healthSnapshot: `what` can
    *  quote a reminder or a queue reason. The judge isn't told it. */
   kind?: UpcomingWakeKind;
+  /** The agents it would wake, of those its asker named. A judge reading one
+   *  agent's context is told only the wakes that name that agent, and those
+   *  that name none: a wake with no list is for the agent it was asked for. */
+  agents?: string[];
 }
 
 /** What the gate asks the reply judge for one batch. */
@@ -527,7 +531,8 @@ export interface GateEventInfo {
    *    nor takes room in it. A rule that doesn't batch decides on it as on
    *    any event, and whom the caller then wakes is the caller's: the
    *    framework wakes a named agent that reads no slot of the residents',
-   *    such as an isolated job, as it does any named agent.
+   *    such as an isolated job, as it does any named agent, when its view
+   *    shows a message the response stores, where it stores any.
    *  In a batch holding named events, each agent the batch wakes is shown the
    *  untargeted events if getAgentNames lists it, and the named events that
    *  name it. Agents shown the same events share one line, stored for them.
