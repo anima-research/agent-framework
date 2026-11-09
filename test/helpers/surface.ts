@@ -66,6 +66,9 @@ export class SpeechProbe implements Module {
     if (type === 'reaction:message') {
       return { addMessages: [{ participant: 'Ann', content: [{ type: 'text', text }], metadata: { channelId: 'room-1', tags: ['chat:reaction'] } }], requestInference: true };
     }
+    if (type === 'edit:message') {
+      return { addMessages: [{ participant: 'Ann', content: [{ type: 'text', text }], metadata: { channelId: 'room-1', tags: ['chat:edited'], firstView: true } }], requestInference: true };
+    }
     if (type === 'note:message') {
       return {
         addMessages: [{ participant: 'Muse', content: [{ type: 'text', text }], metadata: { kind: 'subconscious-note', channelId: 'room-1', serverId: 'room', epochId: 'e1' } }],

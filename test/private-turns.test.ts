@@ -681,11 +681,13 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       let waits = 0;
       let storedInWait: number | undefined;
       let stopTaken = false;
+      let hookDone = false;
       guard.afterAnnotations = async (read) => {
         if (++waits === 2) {
           await (f.framework as unknown as { handleProcessEvent(event: unknown): Promise<void> }).handleProcessEvent(surfaceMessage(SECRET));
           storedInWait = storedText(f, SECRET).length;
           stopTaken = f.framework.abortInference('agent', 'test stop');
+          hookDone = true;
         }
         return afterAnnotations(read);
       };
@@ -707,7 +709,7 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       };
       await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
       await f.framework.runUntilIdle();
-      await eventually(() => waits >= 2, "premise: the retry reached the guard's annotation wait");
+      await eventually(() => hookDone, "premise: the retry reached the guard's annotation wait, and the hook's stop was made");
       assert.equal(storedInWait, 1, "premise: the message is stored while the guard's annotation wait holds the retry");
       assert.ok(stopTaken, 'premise: the stop was taken');
       await eventually(() => !hidden(f).openLogical.has('agent'), 'premise: the stop ended the turn');
@@ -929,6 +931,23 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
       assert.ok(mine && after, `premise: the handler heard both turns: ${JSON.stringify(speaker.heard)}`);
       assert.equal(mine.private, true, "premise: the operator's turn was private");
       assert.equal(after.private, true, "the reaction didn't make the next turn public");
+    } finally { await f.close(); }
+  });
+
+  it("a module's row for an edit delivered as the agent's first view of its message is a channel's message, so the next turn is public", async () => {
+    const speaker = new SpeechProbe();
+    const { f } = await make({ rule: 'delivery', modules: [speaker] });
+    try {
+      script(f, [say('zz-private answer')], [say('zz-after the edit')]);
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      f.framework.pushEvent({ type: 'edit:message', content: 'zz-edited, first seen' } as never);
+      await f.framework.runUntilIdle();
+      const mine = speaker.heard.find((h) => h.text.includes('zz-private answer'));
+      const after = speaker.heard.find((h) => h.text.includes('zz-after the edit'));
+      assert.ok(mine && after, `premise: the handler heard both turns: ${JSON.stringify(speaker.heard)}`);
+      assert.equal(mine.private, true, "premise: the operator's turn was private");
+      assert.equal(after.private, undefined, "the edit, the agent's first view of its message, made the next turn public");
     } finally { await f.close(); }
   });
 
