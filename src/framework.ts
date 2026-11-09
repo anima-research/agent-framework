@@ -1302,6 +1302,8 @@ interface TurnCarry {
   sends: SendsReached | null;
   read: number;
 }
+type FollowOnMarks = { openingMessages?: string[]; wakeChannels?: ChannelRef[] };
+
 type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true };
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
@@ -1646,6 +1648,12 @@ function notFinal(round: ProseRound): ProseRound {
 function mergedOpeningMessages(requests: readonly ({ openingMessages?: string[] } | undefined)[]): string[] | undefined {
   const opening = [...new Set(requests.flatMap((r) => r?.openingMessages ?? []))];
   return opening.length > 0 ? opening : undefined;
+}
+
+function mergedMarks(requests: readonly (FollowOnMarks | undefined)[]): FollowOnMarks {
+  const openingMessages = mergedOpeningMessages(requests);
+  const wakeChannels = wakeChannelsOf(requests);
+  return { ...(openingMessages ? { openingMessages } : {}), ...(wakeChannels ? { wakeChannels } : {}) };
 }
 
 function freshTurnRouting(): TurnRouting {
@@ -7180,10 +7188,7 @@ export class AgentFramework {
     if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
     else delete (same as MarkedRequest)[TURN_CARRY];
     if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
-    const opening = mergedOpeningMessages([same, request]);
-    if (opening) same.openingMessages = opening;
-    const channels = wakeChannelsOf([same, request]);
-    if (channels) same.wakeChannels = channels;
+    Object.assign(same, mergedMarks([same, request]));
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
@@ -7308,10 +7313,7 @@ export class AgentFramework {
     const request: MarkedRequest = { ...trigger, [REARMED]: true };
     delete request[TURN_RETRY];
     delete request[MERGED_BATCH];
-    const opening = mergedOpeningMessages([request, routing]);
-    if (opening) request.openingMessages = opening;
-    delete request.wakeChannels;
-    Object.assign(request, this.wakeChannelsMark(routing));
+    this.markFollowOn(request, routing, 'new turn');
     if (continuation) {
       request.reason = REARM_REASON;
       delete request.counterparty;
@@ -19188,15 +19190,14 @@ export class AgentFramework {
             // boundary's usage report and the restart's trace, so a listener
             // that stops or quiesces the host on either finds the turn waiting
             // for its continuation, with nothing left of the stream to end.
-            const continuation = withTurnCarry({
+            const continuation = withTurnCarry(this.markFollowOn({
               agentName: agent.name,
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-              ...this.wakeChannelsMark(this.turnRouting.get(agent.name)),
-            }, currentState.stream ? this.streamCarries.get(currentState.stream)?.() : undefined);
+            }, this.turnRouting.get(agent.name), 'same turn'), currentState.stream ? this.streamCarries.get(currentState.stream)?.() : undefined);
             this.pendingRequests.push(continuation);
             // Context budget exceeded: break the stream, let compile() compress.
             // Mark the cancel as framework-initiated BEFORE cancelling: the
@@ -19326,15 +19327,14 @@ export class AgentFramework {
             // Non-streaming fallback: schedule re-inference, which continues
             // this stream's logical turn (openLogical), so it carries the
             // turn's properties, as the budget restart does.
-            this.pendingRequests.push({
+            this.pendingRequests.push(this.markFollowOn({
               agentName: agent.name,
               reason: 'tool_results_ready',
               source: 'framework',
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-              ...this.wakeChannelsMark(this.turnRouting.get(agent.name)),
-            });
+            }, this.turnRouting.get(agent.name), 'same turn'));
           }
         }
       }
@@ -22223,12 +22223,12 @@ export class AgentFramework {
         requests = requests.flatMap((r) => {
           const batch = mergedBatch(r);
           if (!batch?.length) return [r];
-          const ownMessages = r.openingMessages?.filter((id) => !batch.some((m) => m.openingMessages?.includes(id)));
-          const opening = ownMessages?.length ? mergedOpeningMessages([batch[0], { openingMessages: ownMessages }]) : undefined;
-          const ownChannels = r.wakeChannels?.filter((c) => !batch.some((m) => m.wakeChannels?.some((x) => sameChannel(x, c))));
-          const channels = ownChannels?.length ? wakeChannelsOf([batch[0], { wakeChannels: ownChannels }]) : undefined;
-          return opening || channels
-            ? [{ ...batch[0]!, ...(opening ? { openingMessages: opening } : {}), ...(channels ? { wakeChannels: channels } : {}) }, ...batch.slice(1)]
+          const own: FollowOnMarks = {
+            openingMessages: r.openingMessages?.filter((id) => !batch.some((m) => m.openingMessages?.includes(id))),
+            wakeChannels: r.wakeChannels?.filter((c) => !batch.some((m) => m.wakeChannels?.some((x) => sameChannel(x, c)))),
+          };
+          return own.openingMessages?.length || own.wakeChannels?.length
+            ? [{ ...batch[0]!, ...mergedMarks([batch[0], own]) }, ...batch.slice(1)]
             : batch;
         });
       }
@@ -22306,11 +22306,7 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
-          const opening = prev ? mergedOpeningMessages([prev, request]) : undefined;
-          if (opening) kept.openingMessages = opening;
-          const pair = prev ? [prev, request] : undefined;
-          const channels = pair ? wakeChannelsOf(pair) : undefined;
-          if (channels) kept.wakeChannels = channels;
+          if (prev) Object.assign(kept, mergedMarks([prev, request]));
           newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
@@ -23761,14 +23757,18 @@ export class AgentFramework {
     return routing.heartbeat && (!routing.locus || routing.locked) ? { heartbeatTurn: true } : {};
   }
 
-  private wakeChannelsMark(routing: TurnRouting | undefined): { wakeChannels?: ChannelRef[] } {
-    return routing && !routing.noChannel && routing.wakeChannels ? { wakeChannels: routing.wakeChannels } : {};
+  private markFollowOn<R extends InferenceRequest>(request: R, routing: TurnRouting | undefined, kind: 'new turn' | 'same turn'): R {
+    if (kind === 'new turn') {
+      delete request.openingMessages;
+      if (routing?.openingMessages) request.openingMessages = [...routing.openingMessages];
+    }
+    delete request.wakeChannels;
+    if (routing && !routing.noChannel && routing.wakeChannels) request.wakeChannels = routing.wakeChannels;
+    return request;
   }
 
   private turnRetryOf(trigger: InferenceRequest, routing: TurnRouting | undefined): InferenceRequest {
-    const retry: MarkedRequest = asTurnRetry(trigger);
-    delete retry.wakeChannels;
-    return Object.assign(retry, this.wakeChannelsMark(routing));
+    return this.markFollowOn(asTurnRetry(trigger), routing, 'same turn');
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
@@ -25810,15 +25810,13 @@ export class AgentFramework {
       return;
     }
     console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
-    this.pendingRequests.push({
+    this.pendingRequests.push(this.markFollowOn({
       agentName: agent.name,
       reason: 'prose-continuation',
       source: 'framework',
       timestamp: Date.now(),
-      ...(routing.openingMessages ? { openingMessages: [...routing.openingMessages] } : {}),
       ...this.heartbeatTurnMark(routing),
-      ...this.wakeChannelsMark(routing),
-    });
+    }, routing, 'new turn'));
   }
 
   /**
@@ -25906,17 +25904,15 @@ export class AgentFramework {
       : routing.noChannel && trigger?.channelId
         ? { channelId: trigger.channelId, ...(trigger.channelServerId ? { channelServerId: trigger.channelServerId } : {}) }
         : {};
-    this.pendingRequests.push({
+    this.pendingRequests.push(this.markFollowOn({
       agentName: name,
       reason: AUTO_CONTINUE_REASON,
       source: 'framework',
       timestamp: Date.now(),
       ...channel,
-      ...(routing.openingMessages ? { openingMessages: [...routing.openingMessages] } : {}),
       autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
       ...this.heartbeatTurnMark(routing),
-      ...this.wakeChannelsMark(routing),
-    });
+    }, routing, 'new turn'));
   }
 
   /** How an autoContinue agent stops a run, as its `[continue]` row says it,
@@ -26758,15 +26754,13 @@ export class AgentFramework {
     if (!capped && !quiet && target) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
-      this.pendingRequests.push({
+      this.pendingRequests.push(this.markFollowOn({
         agentName: name,
         reason: 'prose-bounce',
         source: 'framework',
         timestamp: Date.now(),
-        ...(round.routing.openingMessages ? { openingMessages: [...round.routing.openingMessages] } : {}),
         ...this.heartbeatTurnMark(round.routing),
-        ...this.wakeChannelsMark(round.routing),
-      });
+      }, round.routing, 'new turn'));
     }
   }
 
@@ -29211,8 +29205,7 @@ export class AgentFramework {
                   ...trigger, agentName: agent.name, reason: 'tool_result_guard_retry',
                   source: trigger?.source ?? 'framework', timestamp: Date.now(),
                 };
-                delete retried.wakeChannels;
-                await this.startAgentStream(agent, withTurnCarry({ ...retried, ...this.wakeChannelsMark(streamRouting) }, { silence, sends: turnSends, read: carry.read }), attempt);
+                await this.startAgentStream(agent, withTurnCarry(this.markFollowOn(retried, streamRouting, 'same turn'), { silence, sends: turnSends, read: carry.read }), attempt);
                 return;
               }
               const lastResult = response.content.reduce((last, block, index) =>
@@ -29612,14 +29605,12 @@ export class AgentFramework {
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
                 if (forced) forced.removed.push(rec);
-                this.pendingRequests.push({
+                this.pendingRequests.push(this.markFollowOn({
                   agentName: agent.name,
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
                   source: 'framework',
                   timestamp: Date.now(),
-                  ...(streamRouting.openingMessages ? { openingMessages: [...streamRouting.openingMessages] } : {}),
-                  ...this.wakeChannelsMark(streamRouting),
-                });
+                }, streamRouting, 'new turn'));
                 handledByRewind = true;
               };
 
@@ -35518,15 +35509,12 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    const opening = this.turnRouting?.get(agent.name)?.openingMessages;
-    this.pendingRequests.push({
+    this.pendingRequests.push(this.markFollowOn({
       agentName: agent.name,
       reason: 'inference-failure-rewind-retry',
       source: 'framework',
       timestamp: Date.now(),
-      ...(opening ? { openingMessages: [...opening] } : {}),
-      ...this.wakeChannelsMark(this.turnRouting?.get(agent.name)),
-    });
+    }, this.turnRouting?.get(agent.name), 'new turn'));
   }
 
   // ==========================================================================

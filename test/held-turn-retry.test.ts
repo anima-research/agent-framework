@@ -1292,6 +1292,37 @@ test("a held wake that an equal merged start folds into keeps its opening messag
   });
 });
 
+test("a held turn's retry released with a wake of its own cause, before any of the turn's rounds ran, keeps the turn's opening messages beside the wake's", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await waitFor(fw, () => membrane.primary >= 1, 'the first turn');
+      await fw.runUntilIdle();
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'zz-turn', source: 'test', timestamp: Date.now(), openingMessages: ['zz-turn opening'] } as unknown as Request);
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 2, 'premise: the turn was sent and refused');
+      assert.ok(internal.providerAccelerationCooldowns.has('resident'), 'premise: the turn is held');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      assert.equal(held.length, 1, "premise: the hold keeps the turn's retry");
+      clock.advance(1);
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'zz-wake', source: 'test', timestamp: Date.now(), openingMessages: ['zz-wake opening'] } as unknown as Request);
+      await fw.runUntilIdle();
+      assert.equal(held.length, 2, 'premise: the hold keeps the retry and the wake apart');
+      clock.pass(wait);
+      internal.releaseProviderAccelerationCooldown('resident');
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      assert.equal(membrane.primary, 3, 'premise: the retry and the wake went as one start');
+      const routing = (internal as unknown as { turnRouting: Map<string, { openingMessages?: string[] }> }).turnRouting.get('resident');
+      assert.deepEqual([...(routing?.openingMessages ?? [])].sort(), ['zz-turn opening', 'zz-wake opening']);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a start merged from an autoContinue wake carrying its turn's opening message and a heartbeat names that message, since the heartbeat brought none", async (t) => {
   await withStoreDir(async (path) => {
     const log = silence();
