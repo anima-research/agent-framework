@@ -395,7 +395,7 @@ describe('a withheld result\'s kept fields keep head and tail (keptWhenWithheld)
   it('keeps the marked fields\' end, within the cap, and never an unmarked field\'s value', () => {
     const whole = keptWhenWithheld(result, undefined)!;
     assert.ok(!whole.includes(SENTINEL));
-    for (const cap of [1, 2, 10, 50, 200, 1000, whole.length - 1]) {
+    for (let cap = 1; cap < whole.length; cap++) {
       const kept = keptWhenWithheld(result, cap)!;
       assert.ok(!kept.includes(SENTINEL), `cap ${cap}: ${kept}`);
       const at = elided(kept);

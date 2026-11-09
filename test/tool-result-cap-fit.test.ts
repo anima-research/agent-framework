@@ -163,6 +163,10 @@ test("a resident's own bound clamps its cap, and the stored copy, notice include
     assert.equal(cap.tool_result_inline_max_chars_clamped_by, 'strategy-bound');
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
     assert.match(stored, /^"?line 00 [^]*\n\n\[truncated — chars \d+ to \d+ of \d+ elided here; full content: workspace file files\/tool-results\//);
+    const at = /chars (\d+) to (\d+) of (\d+) elided here/.exec(stored)!;
+    const kept = Number(at[1]) + Number(at[3]) - Number(at[2]);
+    const room = 4000 - TOOL_RESULT_NOTICE_ROOM - 1;
+    assert.ok(kept <= room && kept > room - 2 * LAST_LINE.length - 2, `it keeps ${kept} of the ${room} beside the notice, each end at a line break`);
     assert.ok(stored.endsWith(LAST_LINE), stored.slice(-200));
     // The bound holds the cap down, so raising it can't show more.
     assert.doesNotMatch(stored, /raise the inline cap/);

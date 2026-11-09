@@ -256,9 +256,10 @@ export interface ToolResult {
    * tool-result guard withholds this result, these fields stay in its stub,
    * so the agent still sees what the tool did; the result as stored goes
    * where every withheld original goes (agent-framework #277). Past the
-   * inline cap they're cut, in this order, so a later field can be cut away
-   * entirely; put the short, telling ones first. Only data's own fields can
-   * be kept, and a failed result (success false) keeps nothing.
+   * inline cap, their serialization, in this order, keeps its start and its
+   * end, so a field between them can be cut away entirely; put the short,
+   * telling ones first or last. Only data's own fields can be kept, and a
+   * failed result (success false) keeps nothing.
    */
   keepWhenWithheld?: string[];
 }
