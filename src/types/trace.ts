@@ -136,6 +136,23 @@ export type TraceEvent =
        *  timers, so a stalled event loop can end it later. Absent for a wait
        *  too long for a date. */
       until?: number;
+      /** The try the wait leads to, as the error policy counts tries
+       *  against `maxTries`: each failed start counts, sent or not, the count
+       *  starts over when a provider hold queues the turn again, and a
+       *  deadline's retries count that call's expiries. The policy's place in
+       *  its schedule, not a count of sends. Absent from a framework before
+       *  this field. */
+      nextTry?: number;
+      /** The most tries the error policy allows (ErrorAction.maxTries), when it
+       *  says so as a positive whole number. A turn re-armed after it ran out of
+       *  tries ends at its second deadline expiry with no completed round,
+       *  transient failure or message said to it between them, whatever this
+       *  says. */
+      maxTries?: number;
+      /** What the error policy retries the failure as (ErrorAction.retryClass),
+       *  such as `overloaded`, when it says. A longer one than 128 characters
+       *  is shown as its start and end around a note of how much was left out. */
+      retryClass?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
