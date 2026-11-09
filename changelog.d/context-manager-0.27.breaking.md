@@ -20,7 +20,8 @@
   - A tool call's integer past `Number.MAX_SAFE_INTEGER` written as plain
     digits, such as a Discord id a model writes unquoted, reaches the tool
     from membrane 0.10.1 as those digits, a string, on the streamed paths
-    the framework takes, where it could be rounded to another number.
+    the framework takes, where it could be rounded to another number, and
+    the stored call carries them into later requests.
   - membrane 0.10.0's floating cache marker passes over whitespace-only
     text and media with no source, which the Anthropic and Bedrock builders
     drop, to the block before it, where before it went on the dropped block
