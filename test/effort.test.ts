@@ -933,6 +933,27 @@ describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () =>
     } finally { await cleanup(); }
   });
 
+  it('logs a bad answer again for an ended agent that is resumed', async () => {
+    try {
+      const { framework, provider } = await resident({ effort: (agent: { name: string }) => (agent.name === 'job' ? 'High' : 'high') });
+      const config = { model: 'claude-opus-5-5', systemPrompt: 'test', proseRouting: 'disabled' };
+      const logged: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        const job = await framework.createEphemeralAgent({ name: 'job', ...config } as never);
+        job.contextManager.addMessage('user', [{ type: 'text', text: 'Job one.' }]);
+        await framework.runEphemeralToCompletion(job.agent, job.contextManager);
+        const resumed = await framework.resumeAgent('job', config as never);
+        resumed.contextManager.addMessage('user', [{ type: 'text', text: 'Job two.' }]);
+        await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+      } finally { console.error = error; }
+      assert.ok(provider.carrying('Job one.').length > 0, 'premise: the job sent a request');
+      assert.ok(provider.carrying('Job two.').length > 0, 'premise: the resumed job sent one');
+      assert.equal(logged.filter((line) => line.includes('[effort] job: FrameworkConfig.effort gave')).length, 2, 'one line for the run, and one for the resumed run');
+    } finally { await cleanup(); }
+  });
+
   it('drops at boot the base of any agent that isn\'t live once the configured agents are, and keeps theirs', async () => {
     try {
       const dir = mkdtempSync(join(tmpdir(), 'af-effort-boot-'));
