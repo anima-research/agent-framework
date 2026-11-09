@@ -7677,7 +7677,7 @@ export class AgentFramework {
     if (this.budgetHolds?.get(agentName) === hold) this.budgetHolds.delete(agentName);
     clearInterval(hold.recheck);
     hold.recheck = undefined;
-    this.eventGate?.providerCallsReleased();
+    this.eventGate?.judgeRefusalsMayHaveLifted();
     const waitedMs = Date.now() - hold.startedAt;
     console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms`);
     this.emitTrace({ type: 'inference:hold_ended', agentName, outcome, waitedMs });
@@ -7920,7 +7920,7 @@ export class AgentFramework {
     }
     if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
-    this.eventGate?.providerCallsReleased();
+    this.eventGate?.judgeRefusalsMayHaveLifted();
     if (cooldown.waitModel !== undefined) {
       const model = this.agents.get(agentName)?.model;
       console.error(`[provider-wait] agent=${agentName} model=${cooldown.waitModel} ` +
@@ -8182,7 +8182,7 @@ export class AgentFramework {
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
     }
-    this.eventGate?.providerCallsReleased();
+    this.eventGate?.judgeRefusalsMayHaveLifted();
     // The agent's context strategy may pace its own provider calls by the same
     // stated wait. From context-manager 0.17, its compression lane exposes
     // releaseCompressionPause. The release is the operator's word on that
@@ -13284,7 +13284,7 @@ export class AgentFramework {
         `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
         `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
     }
-    this.eventGate?.providerCallsReleased();
+    this.eventGate?.judgeRefusalsMayHaveLifted();
     // main's per-name turn state goes too (#846's re-arm count and run of
     // stated waits, #840's exhausted turn), so a name bound again (a
     // channel's next conversation, a resume) starts afresh; a run of stated
@@ -16915,7 +16915,7 @@ export class AgentFramework {
       settle();
       if (this.surgeryHold === hold) this.surgeryHold = null;
       resolveHold();
-      this.eventGate?.providerCallsReleased();
+      this.eventGate?.judgeRefusalsMayHaveLifted();
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
@@ -22781,7 +22781,7 @@ export class AgentFramework {
         // the held causes into this one current compile.
         clearTimeout(providerCooldown.timer);
         this.providerAccelerationCooldowns.delete(agentName);
-        this.eventGate?.providerCallsReleased();
+        this.eventGate?.judgeRefusalsMayHaveLifted();
         if (providerCooldown.rearm) {
           console.error(`[inference-rearm] agent=${agentName} turn queued again with a wake ` +
             `(${providerCooldown.rearm.number} of ${providerCooldown.rearm.of})`);

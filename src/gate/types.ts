@@ -367,7 +367,7 @@ export interface ReplyJudgeOptions {
    * `"skip"`, it's held in memory, its rule keeping its newest 100 events as
    * it does while a turn holds them. It goes back to the judge at the
    * refusal's stated end, or once the gate is told the hold ended or was
-   * released (`EventGate.providerCallsReleased`), when no turn that changes
+   * released (`EventGate.judgeRefusalsMayHaveLifted`), when no turn that changes
    * what the judge reads runs and the host isn't quiesced. A refusal that
    * states no end, or no time left, waits for that release. A batch its rule
    * fires meanwhile takes the held events in and is asked about, once no

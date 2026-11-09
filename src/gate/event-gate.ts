@@ -4709,17 +4709,18 @@ export class EventGate {
   }
 
   /**
-   * The framework let the agent's provider calls go again: a hold on them
-   * ended, an operator released a provider wait, a turn waiting for
-   * compression stopped waiting, or a surgery let go of the store. (Under
+   * A hold that refused the judge's calls may have lifted: a hold on the
+   * agent's provider calls ended, an operator released a provider wait, a
+   * turn waiting for compression stopped waiting, a surgery let go of the
+   * store, or an agent ended, so the judge may read another agent. (Under
    * "skip", a refusal that stated time left is asked about again at its end,
    * by the refusal's timer, and a hold its host extended then refuses again
-   * with its new end; one that stated no time left, or no end,
-   * waits for this. Under "wake" nothing is held for it.)
+   * with its new end; one that stated no time left, or no end, waits for
+   * this. Under "wake" nothing is held for it.)
    * Batches held for a refused judge call go back to the judge now, unless a turn or the
    * host's quiesce still holds them; one refused again is held again.
    */
-  providerCallsReleased(): void {
+  judgeRefusalsMayHaveLifted(): void {
     if (this.disposed) return;
     for (const [policyName, held] of this.judgeHeld) {
       delete held.refusal;
