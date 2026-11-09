@@ -2181,12 +2181,12 @@ export function formatShadowWarning(w: ShadowWarning): string {
     + `A scope on ${later} naming the event types it's for clears this note.`;
 }
 
-/** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
 function judgeFailureWords(err: unknown): string {
   if (err instanceof JudgeFailure) return err.message;
   return err instanceof Error ? failureWords(err, 'the call failed') : 'the call failed';
 }
 
+/** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
 function errorText(err: unknown): string {
   try {
     return err instanceof Error ? err.message : String(err);

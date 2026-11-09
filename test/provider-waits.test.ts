@@ -1712,6 +1712,13 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
         assert.deepEqual(fw.providerWaitSnapshot('resident').map((stated) => stated.model), ['zz-model'], 'the wait is recorded');
         await drive(fw);
         assert.deepEqual(exhausted, [], 'a held turn is not settled as exhausted');
+        const failed = fw.queryInferenceLogs({ limit: 20 }).entries.map((e) => e.summary ?? e.entry).filter((e) => !e.success);
+        if (site !== 'setup') {
+          assert.equal(failed.length, 1, JSON.stringify(failed));
+          assert.equal(failed[0]!.error, 'zz rate limit reached for requests', 'a retryable failure thrown from the stream is taken as its error event');
+          assert.equal(failed[0]!.errorWords, 'the model call failed (rate_limit, HTTP 429)');
+        }
+        for (const entry of failed) assert.ok(!String(entry.errorWords).includes('zz rate limit'), JSON.stringify(entry));
 
         // Real time passes the wait, as on a loaded host, and the turn stays held.
         await clock.outlast(wait);
