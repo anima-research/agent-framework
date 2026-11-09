@@ -22,6 +22,8 @@ import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, rec
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
+import { failureWords } from '../failure-text.js';
+import { JudgeFailure } from './reply-judge.js';
 import { isSystemNotice } from '../mcpl/tags.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -2180,6 +2182,11 @@ export function formatShadowWarning(w: ShadowWarning): string {
 }
 
 /** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
+function judgeFailureWords(err: unknown): string {
+  if (err instanceof JudgeFailure) return err.message;
+  return err instanceof Error ? failureWords(err, 'the call failed') : 'the call failed';
+}
+
 function errorText(err: unknown): string {
   try {
     return err instanceof Error ? err.message : String(err);
@@ -4343,7 +4350,7 @@ export class EventGate {
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
         abort.abort();
-        reject(new Error(`the judge took more than ${this.judgeTimeoutMs} ms`));
+        reject(new JudgeFailure(`the judge took more than ${this.judgeTimeoutMs} ms`));
       }, this.judgeTimeoutMs);
       // Never keep the process alive on the judge's account.
       state.timer.unref?.();
@@ -4502,7 +4509,7 @@ export class EventGate {
     }
     const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
     const reason = failed
-      ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
+      ? (err !== undefined ? judgeFailureWords(err) : 'the judge gave no verdict')
       : typeof verdict.reason === 'string' ? verdict.reason : '';
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0 } };
     record.verdicts[outcome]++;
@@ -4524,7 +4531,7 @@ export class EventGate {
     const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
     if (failed) {
       console.error(
-        `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${reason}), so its batch of ${state.events.length} `
+        `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${err !== undefined ? errorText(err) : reason}), so its batch of ${state.events.length} `
         + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
     }

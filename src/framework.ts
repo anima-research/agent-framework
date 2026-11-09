@@ -12,8 +12,9 @@ import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
-import { deadlineCut, isDeadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
+import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
+import { boundFailureText, compileRefusalType, failureWords, FAILURE_TEXT_MAX_CHARS, houseReason, isMembraneError, PROVIDER_ERROR_CODE_MAX_CHARS } from './failure-text.js';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 // Not named imports from context-manager: 0.24.0 has neither, and a named
 // import of either would fail this package's load there before create()
 // could name the release it needs.
@@ -3097,17 +3098,6 @@ const WAITING_TRACE_EVERY_MS = 60_000;
  *  endStatedWaitRun). */
 const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
 /**
- * A MembraneError, from this framework's copy of membrane or from another: the
- * host supplies the Membrane instance (config.membrane), so with two copies
- * installed its errors are instances of a class this framework's `instanceof`
- * doesn't match. Recognised by name as well, as context-manager's errors are;
- * its fields are the same, so callers still check each one's type.
- */
-function isMembraneError(error: unknown): error is MembraneError {
-  return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
-}
-
-/**
  * agent-framework#734. Membrane's own streams send a retryable failure as an
  * `error` event and send nothing after their terminal event. A stream of
  * another make can throw one from its iterator, or send or throw after its
@@ -3614,17 +3604,6 @@ const SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES = Buffer.byteLength(
 const scriptResultMaxChars = (memoryMaxBytes: number): number =>
   Math.max(0, Math.floor((Math.min(maxResultBytes(memoryMaxBytes), bufferConstants.MAX_STRING_LENGTH) - SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES) / 6));
 
-/**
- * Longest failure text the inference-failure pipeline writes to one sink: the
- * reason in the exhaustion stderr line, a field of a logs/failures.log record,
- * an ops alert's message, the inference log's `error`, and a trace event's
- * `error` and `stack`. A failure's text is whatever its source put in
- * `Error.message`, and a provider can echo the entire rejected request there
- * (one OpenAI-compatible 400 echoed ~1.7 MB). The sinks with shorter bounds
- * name them below, and every cut goes through boundFailureText. This bound
- * doesn't depend on membrane bounding its own errors.
- */
-const FAILURE_TEXT_MAX_CHARS = 2_000;
 /** Longest failure reason in the `[inference-failed]` marker: the reason its
  *  text gives, and the excerpt its metadata keeps. */
 const FAILURE_MARKER_REASON_MAX_CHARS = 600;
@@ -3635,21 +3614,6 @@ const REWIND_MARKER_REASON_MAX_CHARS = 160;
 const FAILURE_SUMMARY_MAX_CHARS = 300;
 /** Longest alert message posted to the ops webhook. */
 const OPS_WEBHOOK_MESSAGE_MAX_CHARS = 500;
-/** Longest provider error code recorded verbatim; real codes are short tokens.
- *  A failure's name and type are bounded the same way. */
-const PROVIDER_ERROR_CODE_MAX_CHARS = 128;
-
-const isHighSurrogate = (text: string, index: number): boolean => {
-  const code = text.charCodeAt(index);
-  return code >= 0xd800 && code <= 0xdbff;
-};
-const isLowSurrogate = (text: string, index: number): boolean => {
-  const code = text.charCodeAt(index);
-  return code >= 0xdc00 && code <= 0xdfff;
-};
-/** Whether a cut before `index` would separate the halves of a surrogate pair. */
-const splitsPair = (text: string, index: number): boolean =>
-  index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
 
 /**
  * Whether an MCPL server's child ended the way a server ends when it's asked
@@ -3674,26 +3638,6 @@ function endedAsAsked(ended: { code?: number | null; signal?: string | null; pip
 function closeWords(reason: string | null | undefined, code: number | null | undefined, signal: string | null | undefined): string {
   const how = [reason ?? null, code != null ? `code ${code}` : null, signal ? `signal ${signal}` : null].filter((part) => part !== null);
   return how.length > 0 ? ` (${how.join(', ')})` : '';
-}
-
-/**
- * `text` when it fits within `max` characters; otherwise its head and tail
- * around a marker stating how many of how many characters were omitted, the
- * whole within `max`. A cut that would separate a surrogate pair moves toward
- * omission, so the result never holds half of a pair the text held whole, and
- * bounding bounded text returns it as is. Each sink cuts the whole text, so
- * its marker states the whole length.
- */
-function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): string {
-  if (text.length <= max) return text;
-  const markerLength = ` …[${text.length} of ${text.length} characters omitted]… `.length;
-  const budget = Math.max(0, max - markerLength);
-  const tailLength = Math.floor(budget / 4);
-  let headEnd = budget - tailLength;
-  if (splitsPair(text, headEnd)) headEnd--;
-  let tailStart = text.length - tailLength;
-  if (splitsPair(text, tailStart)) tailStart++;
-  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
 }
 
 export function opsWebhookText(message: string): string {
@@ -3768,18 +3712,8 @@ function failureShown(text: string): string {
   return text === UNDESCRIBED_FAILURE ? text : suppliedValue(text);
 }
 
-function compileRefusalType(err: Error): 'over_budget' | 'context_refusal' | undefined {
-  if (err instanceof OverBudgetError || err.name === 'OverBudgetError') return 'over_budget';
-  // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
-  // 2026-07-26): a compile REFUSES rather than shipping a context with
-  // silently-dropped messages. Recovery is identical to over_budget — kick
-  // the compression drain so summaries cover the un-represented span.
-  if (err instanceof UncoveredDropError || err.name === 'UncoveredDropError') return 'context_refusal';
-  return undefined;
-}
-
-function houseReason(err: Error): string | undefined {
-  return isDeadlineCut(err) || compileRefusalType(err) !== undefined ? String(err.message) : undefined;
+function failedEntry(prefix: string, err: Error): { error: string; errorWords: string } {
+  return { error: `${prefix}${err.message}`, errorWords: `${prefix}${failureWords(err)}` };
 }
 
 function shownReasonOf(err: Error): { shownReason?: string } {
@@ -3803,18 +3737,6 @@ function boundedCause(err: Error): Error {
     });
   }
   return cause;
-}
-
-function failureWords(err: Error): string {
-  const own = houseReason(err);
-  if (own !== undefined) return own;
-  if (!isMembraneError(err)) return 'the turn failed';
-  if (err.type === 'safety') return "the request couldn't be completed";
-  const status = typeof err.httpStatus === 'number' ? `HTTP ${err.httpStatus}` : undefined;
-  if (err.type === 'timeout') return `the model call timed out${status ? ` (${status})` : ''}`;
-  const type = typeof err.type === 'string' ? boundFailureText(err.type, PROVIDER_ERROR_CODE_MAX_CHARS) : undefined;
-  const parts = [type, status].filter((part): part is string => part !== undefined);
-  return `the model call failed${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
 }
 
 /**
@@ -8466,6 +8388,7 @@ export class AgentFramework {
       log({
         success: false,
         error: `Stream cancelled (${reason})`,
+        errorWords: `Stream cancelled (${reason})`,
         request: compiledRequest ?? { note: 'streaming request aborted' },
         durationMs,
       });
@@ -8546,6 +8469,7 @@ export class AgentFramework {
       log({
         success: false,
         error: `Stream aborted: ${kind}`,
+        errorWords: `Stream aborted: ${kind}`,
         request: compiledRequest ?? { note: `streaming request aborted by ${kind}` },
         durationMs,
       });
@@ -15328,6 +15252,7 @@ export class AgentFramework {
             requestId: entry.requestId,
             success: entry.success,
             error: entry.error,
+            errorWords: entry.errorWords,
             durationMs: entry.durationMs,
             tokenUsage: entry.tokenUsage,
             stopReason: entry.stopReason,
@@ -29094,7 +29019,7 @@ export class AgentFramework {
                 this.noteRefusal(agent.name, category, tokenUsage);
                 countUsage(abandoned);
                 logStream({
-                  success: false, error: 'Tool output withheld by the guard',
+                  success: false, error: 'Tool output withheld by the guard', errorWords: 'Tool output withheld by the guard',
                   request: compiledRequest ?? {}, response, durationMs, tokenUsage, stopReason: 'refusal',
                 });
                 console.error(`[tool-result-guard] agent=${agent.name} withheld ${withheld.length} result(s); retrying inference`);
@@ -29956,7 +29881,7 @@ export class AgentFramework {
 
             logStream({
               success: false,
-              error: err.message,
+              ...failedEntry('', err),
               request: compiledRequest ?? { note: 'streaming request failed' },
               durationMs,
             });
@@ -30148,6 +30073,7 @@ export class AgentFramework {
                 logStream({
                   success: false,
                   error: terminal,
+                  errorWords: terminal,
                   request: compiledRequest ?? { note: 'streaming request aborted' },
                   durationMs,
                 });
@@ -30421,7 +30347,7 @@ export class AgentFramework {
         // ends here (endFailureAtStop).
         this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
         logStream({ success: false,
-          error: `Provider acceleration cooldown: ${err.message}`,
+          ...failedEntry('Provider acceleration cooldown: ', err),
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abandonAgentScripts(agent.name, 'provider acceleration cooldown', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -30435,7 +30361,7 @@ export class AgentFramework {
       if (statedWait === 'held') {
         this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
         logStream({ success: false,
-          error: `Provider wait: ${err.message}`,
+          ...failedEntry('Provider wait: ', err),
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abandonAgentScripts(agent.name, 'provider wait', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -30462,7 +30388,7 @@ export class AgentFramework {
       // Persist to inference log for forensic attribution.
       logStream({
         success: false,
-        error: `Stream threw: ${err.message}`,
+        ...failedEntry('Stream threw: ', err),
         request: compiledRequest ?? { note: 'streaming request threw' },
         durationMs,
       });
@@ -30486,13 +30412,15 @@ export class AgentFramework {
         if (countedUsage && !usageLogged) {
           const replaced = this.agents.get(agent.name) !== agent;
           const superseded = generationLost || agent.streamId !== myStreamId;
+          const ended = replaced
+            ? 'Stream abandoned: its agent was disposed or replaced'
+            : superseded
+              ? 'Stream superseded: a newer stream of the agent took over'
+              : 'Stream ended without a final response';
           logStream({
             success: false,
-            error: replaced
-              ? 'Stream abandoned: its agent was disposed or replaced'
-              : superseded
-                ? 'Stream superseded: a newer stream of the agent took over'
-                : 'Stream ended without a final response',
+            error: ended,
+            errorWords: ended,
             request: compiledRequest ?? { note: 'streaming request' },
             durationMs: Date.now() - startTime,
             tokenUsage: tokenUsageOf(countedUsage),
@@ -34781,6 +34709,7 @@ export class AgentFramework {
     const bounded = traceEvent as unknown as Record<string, unknown>;
     if (typeof bounded.error === 'string') bounded.error = boundFailureText(bounded.error);
     if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
+    if (typeof bounded.shownReason === 'string') bounded.shownReason = boundFailureText(bounded.shownReason);
 
     if (this.earlyTraces) {
       if (this.earlyTraces.length < 1000) this.earlyTraces.push(traceEvent);

@@ -29,6 +29,13 @@ import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
+export class JudgeFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JudgeFailure';
+  }
+}
+
 /** The judge's model when the host names none. */
 export const DEFAULT_JUDGE_MODEL = 'claude-haiku-5-5';
 /** The judge's input budget when the host names none: under Haiku 5.5's 100K price line, with margin. */
@@ -334,9 +341,9 @@ export class ReplyJudge {
   /** Build the judge's request for one batch: the system prompt, the document in chunks, the question. */
   async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string; chars: number }> {
     const agentName = this.chooseAgent(request.agentNames);
-    if (!agentName) throw new Error('no agent to judge for');
+    if (!agentName) throw new JudgeFailure('no agent to judge for');
     const preview = await this.preview(agentName);
-    if (request.signal.aborted) throw new Error('the judge was stopped before its request');
+    if (request.signal.aborted) throw new JudgeFailure('the judge was stopped before its request');
 
     let extra: UpcomingWake[] = [];
     try {
@@ -499,7 +506,7 @@ export class ReplyJudge {
     const verdict = parseVerdict(text);
     if (!verdict) {
       const stop = response.stopReason;
-      throw new Error(`the judge's answer held no verdict (stop: ${stop}${text ? `, text: ${JSON.stringify(cut(text, 120))}` : ''})`);
+      throw new JudgeFailure(`the judge's answer held no verdict (stop: ${stop}${text ? `, text: ${JSON.stringify(cut(text, 120))}` : ''})`);
     }
     return {
       ...verdict,
