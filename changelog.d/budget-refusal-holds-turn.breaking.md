@@ -1,0 +1,3 @@
+- **Hosts with a table or `switch` that must cover every `TraceEvent['type']` or `PresentationRetractReason`:** `TraceEvent` names 2 more types, `inference:held` and `inference:hold_ended`, and `PresentationRetractReason` one more, `unsent-injection` (under Added), so a `Record<…>` keyed on either, or a `switch` checked exhaustively with `never`, needs an entry for each.
+  - **Migration:** add an entry for each of the three.
+  - **Unchanged:** every other trace type and retract reason, and their fields. No sibling package needs a new version.
