@@ -259,6 +259,7 @@ async function resident(options: {
   gate?: boolean;
   policyRetries?: number;
   policyDelayMs?: number;
+  policyErrors?: Error[];
   secondAgent?: boolean;
   policy?: { shouldInfer(agentName: string, requests: Array<Record<string, unknown>>): boolean };
   strategy?: unknown;
@@ -286,7 +287,13 @@ async function resident(options: {
     modules: [options.restart ? new BlobToolModule() : inbox, ...(options.modules ?? [])],
     syncIntervalMs: 0,
     maintenanceIntervalMs: options.maintenanceIntervalMs ?? 50,
-    errorPolicy: { maxRetries: options.policyRetries ?? 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < (options.policyRetries ?? 3) ? { retry: true, delayMs: options.policyDelayMs ?? 0 } : { retry: false }) },
+    errorPolicy: {
+      maxRetries: options.policyRetries ?? 3,
+      onInferenceError: (error: Error, _agent: string, attempt: number) => {
+        options.policyErrors?.push(error);
+        return attempt < (options.policyRetries ?? 3) ? { retry: true, delayMs: options.policyDelayMs ?? 0 } : { retry: false };
+      },
+    },
     ...(options.gate ? { gate: { config: { policies: [], default: 'always' } } } : {}),
     ...(options.policy ? { inferencePolicy: options.policy } : {}),
   } as Parameters<typeof AgentFramework.create>[0]);
@@ -956,7 +963,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
 
   it("a policy retry refused while a module's restart event already waits takes the error policy's path, and the wait stays whole", async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
-      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'], policyDelayMs: 1_500, modules: [new RestartEventModule()] });
+      const policyErrors: Error[] = [];
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'], policyDelayMs: 1_500, policyErrors, modules: [new RestartEventModule()] });
       t.internal.budgetHoldRecheckMs = 60_000;
       const stream = t.membrane.streamYielding.bind(t.membrane);
       let failed = false;
@@ -974,9 +982,10 @@ describe('a turn refused for budget while compression is pending waits idle, and
         const waiting = t.internal.budgetHolds.get('prime')!;
         assert.equal((waiting as { turn?: { reason?: string } }).turn?.reason, 'context_budget_restart');
         assert.equal(c.refusals, 1);
-        const failedBefore = t.of('inference:failed').length;
+        assert.deepEqual(policyErrors.map((e) => e.message), ['zz the stream failed'], "only the stream's failure has reached the error policy");
         assert.ok(await pollUntil(() => c.refusals >= 2, 5_000), 'the policy retry woke, and its compile was refused');
-        assert.ok(await pollUntil(() => t.of('inference:failed').length > failedBefore), "the retry's refusal took the error policy's path");
+        assert.ok(await pollUntil(() => policyErrors.length === 2), "the retry's refusal reached the error policy");
+        assert.match(policyErrors[1]!.message, /exceed hard budget/, 'with the refusal as its error');
         assert.equal(t.internal.budgetHolds.get('prime'), waiting, 'the wait is the one that was there');
         assert.equal(t.of('inference:held').length, 1, 'the retry opened no wait of its own');
       } finally {
