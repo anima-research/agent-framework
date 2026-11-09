@@ -19549,6 +19549,15 @@ export class AgentFramework {
     if (response.requestInference && suppressedRule === null) {
       step.at = 'its inference request';
 
+      // A broadcast request reaches the agents whose role says they take
+      // untargeted inbound; channel-bound and bounded-job agents are driven
+      // by their own channel or task, not by framework-wide events.
+      const targetAgents =
+        response.requestInference === true
+          ? this.registry.untargetedRecipients()
+          : response.requestInference;
+      const triggered = targetAgents.filter((name) => this.agents.get(name)?.canBeTriggeredBy(source) === true);
+
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
         const decision = this.eventGate.evaluate({
@@ -19557,29 +19566,20 @@ export class AgentFramework {
           serverId: source,
           channelId: '',
           ...(suppressionAsked ? { suppressionAsked: true } : {}),
+          // anima-research/agent-framework#243, its module-event row for named agents.
+          ...(response.requestInference !== true ? { recipients: triggered.filter((name) => requested?.includes(name) === true) } : {}),
         });
         if (!decision.trigger) return;
       }
 
-      // A broadcast request reaches the agents whose role says they take
-      // untargeted inbound; channel-bound and bounded-job agents are driven
-      // by their own channel or task, not by framework-wide events.
-      const targetAgents =
-        response.requestInference === true
-          ? this.registry.untargetedRecipients()
-          : response.requestInference;
-
-      for (const agentName of targetAgents) {
-        const agent = this.agents.get(agentName);
-        if (agent && agent.canBeTriggeredBy(source)) {
-          this.pendingRequests.push({
-            agentName,
-            reason: event.type,
-            source,
-            timestamp: Date.now(),
-            ...this.readsRowFor(added, agentName),
-          });
-        }
+      for (const agentName of triggered) {
+        this.pendingRequests.push({
+          agentName,
+          reason: event.type,
+          source,
+          timestamp: Date.now(),
+          ...this.readsRowFor(added, agentName),
+        });
       }
     }
   }
