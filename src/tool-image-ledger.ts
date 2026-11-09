@@ -367,9 +367,10 @@ function toolResultCutAt(text: string, cap: number): number {
  * moves to a line break when one lies within half its share: the head back
  * to just after the last, the tail forward to just after the first. An end
  * that falls at a line break keeps its whole line. The tail never starts on
- * the second half of a surrogate pair, nor inside an image slot, which it
- * moves past, so a slot lies wholly in the head, the elided middle or the
- * tail. A text within the cap is all head; a cap of 0 or less keeps nothing.
+ * the second half of a surrogate pair, nor inside an image slot or a
+ * reference stub of any type, which it moves past, so a slot or a stub lies
+ * wholly in the head, the elided middle or the tail. A text within the cap
+ * is all head; a cap of 0 or less keeps nothing.
  */
 export function toolResultHeadTail(text: string, cap: number): { headEnd: number; tailStart: number } {
   if (text.length <= cap) return { headEnd: text.length, tailStart: text.length };
@@ -390,9 +391,13 @@ export function toolResultHeadTail(text: string, cap: number): { headEnd: number
   if (firstNewline !== -1 && firstNewline - tailStart < tailChars / 2) return { headEnd, tailStart: firstNewline + 1 };
   const lineStart = text.lastIndexOf('\n', tailStart - 1) + 1;
   const line = text.slice(lineStart, firstNewline === -1 ? text.length : firstNewline);
-  for (const slot of parseImagePlaceholders(line)) {
-    const start = lineStart + slot.offset;
-    if (start < tailStart && start + slot.text.length > tailStart) tailStart = start + slot.text.length;
+  for (const m of line.matchAll(PLACEHOLDER_RE)) {
+    const start = lineStart + (m.index ?? 0);
+    if (start < tailStart && start + m[0].length > tailStart) tailStart = start + m[0].length;
+  }
+  for (const m of line.matchAll(REFERENCE_STUB_RE)) {
+    const start = lineStart + (m.index ?? 0);
+    if (m[0].length <= REFERENCE_STUB_MAX_CHARS && start < tailStart && start + m[0].length > tailStart) tailStart = start + m[0].length;
   }
   return { headEnd, tailStart };
 }
