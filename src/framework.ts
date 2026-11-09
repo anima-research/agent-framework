@@ -7051,6 +7051,10 @@ export class AgentFramework {
     } catch (held) {
       return held as Error;
     }
+    if (this.budgetHolds?.has(agentName)) {
+      return Object.assign(new Error(`${agentName}'s turn waits for compression to make room for it, so the reply judge makes no call`),
+        { providerAdmission: 'deferred' as const });
+    }
     if (!this.cooldownBlocksAuxiliary(agentName)) return undefined;
     const cooldown = this.providerAccelerationCooldowns.get(agentName)!;
     return Object.assign(new MembraneError({
@@ -7673,6 +7677,7 @@ export class AgentFramework {
     if (this.budgetHolds?.get(agentName) === hold) this.budgetHolds.delete(agentName);
     clearInterval(hold.recheck);
     hold.recheck = undefined;
+    this.eventGate?.providerCallsReleased();
     const waitedMs = Date.now() - hold.startedAt;
     console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms`);
     this.emitTrace({ type: 'inference:hold_ended', agentName, outcome, waitedMs });

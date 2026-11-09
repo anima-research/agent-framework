@@ -664,8 +664,9 @@ export type TraceEvent =
        *  `reply` or `wait` as the judge answered, `error` when it failed,
        *  timed out or answered nothing usable, `refused` when the framework
        *  refused to send the call's request (a hold on the agent's provider
-       *  calls or on the judge's model, a surgery's hold on the store, or a
-       *  stopping framework), which for a call asked once more after the
+       *  calls or on the judge's model, a turn of the agent's waiting for
+       *  compression, a surgery's hold on the store, or a stopping
+       *  framework), which for a call asked once more after the
        *  provider refused its first request as too long is its second;
        *  `woke` is whether the batch then woke the agent (an error or a
        *  refusal does by the host's onError: under "skip" a refused batch is

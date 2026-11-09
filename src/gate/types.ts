@@ -358,8 +358,9 @@ export interface ReplyJudgeOptions {
    * wakes the agent as a debounce would (the default, so a judge outage
    * never silences the agent); `"skip"` doesn't. It decides a call whose
    * request the framework refuses to send too (a hold on the agent's provider
-   * calls or on the judge's model, a surgery's hold on the store, or a
-   * stopping framework), which isn't counted as a failure. Each batch is
+   * calls or on the judge's model, a turn of the agent's waiting for
+   * compression, a surgery's hold on the store, or a stopping framework),
+   * which isn't counted as a failure. Each batch is
    * asked about. Under `"wake"`, a refused call's batch is delivered, and
    * since nothing is held, gate_status's notices name no refusal: the rule's
    * `judgeState.last` shows it. Under
