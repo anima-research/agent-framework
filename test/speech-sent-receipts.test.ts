@@ -336,6 +336,19 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(lines, ['[routeSpeech] resident: turn has no channel; 9 chars shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", routing posted it to no channel']);
   });
 
+  it("a piece held as a draft that a module showed is logged with its place as it's named, as a piece with no channel is", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane, { proseRouting: 'locked', proseLock: 'drafts' });
+    await turn(f);
+    assert.match(receipt(f) ?? '', /held as draft d-/, 'premise: the speech was held as a draft');
+    const lines = errors.filter((e) => e.startsWith('[speechRouted]'));
+    assert.deepEqual(lines, ['[speechRouted] resident: 9 chars shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", held as a draft']);
+  });
+
   it("a place a module names is logged as a field, its invisible characters escaped, and kept readable in the receipt", async (t) => {
     const errors: string[] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
@@ -1308,19 +1321,19 @@ describe('plain speech a module says it showed', () => {
 
   it("a module whose hook returns a promise names no place, and routing doesn't wait for it", async () => {
     const surface = new Surface();
-    let settled = false;
+    let settle: (answer: SpeechSent) => void = () => {};
     surface.onSpeechRouted = (agent, text, context) => {
       surface.asked.push({ agent, text, context });
-      return new Promise((resolve) => setTimeout(() => { settled = true; resolve({ sentTo: SENT_TO }); }, 200));
+      return new Promise<SpeechSent>((resolve) => { settle = resolve; });
     };
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
     const f = await host([surface], membrane);
     await turn(f);
     assert.equal(surface.asked.length, 1, 'premise: it was asked');
-    assert.equal(settled, false, "premise: the turn ended before the module's promise settled");
     assert.equal(notices(f).length, 1, texts(f).join('\n'));
     assert.equal(receipt(f), undefined);
+    settle({ sentTo: SENT_TO });
   });
 
   it("a turn whose channel post has an unknown outcome names the place in its receipt without saying its routing posted it to no channel", async (t) => {

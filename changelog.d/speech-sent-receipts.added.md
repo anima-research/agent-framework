@@ -17,9 +17,10 @@
   turn's `inference:completed` trace and before the agent's next
   `inference:started`. Private envelopes and words kept private, explicit
   sends (prefixed envelopes included) and their own words held as drafts,
-  turns under explicit routing, which write no receipt, and an ephemeral
-  run's speech with no channel that it doesn't try to hold as a draft, which
-  is its caller's result, are never asked about.
+  turns under explicit routing, which write no receipt, an ephemeral run's
+  speech with no channel that it doesn't try to hold as a draft, which is its
+  caller's result, and speech an agent routes or holds once another agent has
+  taken its name are never asked about.
 - `SpeechRoutedContext`: `final` (the turn's final reply: its speech after
   its last tool call, a refused XML attempt or a call cut off unrun being
   none), `turnId`, and

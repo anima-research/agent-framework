@@ -16,10 +16,13 @@
   <places>, routing posted it to no channel` and emits no
   `mcpl:speech-route-failed` trace, where it emitted one; a routed piece no
   module showed emits it as before, except an ephemeral run's, which emits
-  none, as before. `ChannelRegistry`'s `onRouteFailure` info now
-  carries `text`, the words routed, so a host that logs that info logs the
-  agent's speech. `text` is optional in the info's type: the registry sets
-  it on every failure it reports, and a no-channel notice for an info
+  none, as before. A piece whose agent was replaced while its modules were
+  asked logs that instead, with no places and no trace. A piece held as a
+  draft that a module says it showed logs `[speechRouted] <agent>: <n> chars
+  shown by <places>, held as a draft`. `ChannelRegistry`'s `onRouteFailure`
+  info now carries `text`, the words routed, so a host that logs that info
+  logs the agent's speech. `text` is optional in the info's type: the registry
+  sets it on every failure it reports, and a no-channel notice for an info
   without it, or for speech that's only whitespace, names the speech by its
   length alone.
 - **Hosts:** a turn's receipt that can't be recorded logs `[delivered]

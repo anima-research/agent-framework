@@ -22993,7 +22993,12 @@ export class AgentFramework {
         const plain = typeof t === 'string' ? t : t.deliberate ? '' : t.text;
         const final = typeof t === 'string' ? opts.final : t.final ?? opts.final;
         const round: ProseRound = { routing: opts.routing, notice: opts.notice, ...(final ? { final: true } : {}) };
-        if (plain.trim()) this.noteSpeechPlaces(opts.routing, this.askSpeechRouted(agent, round, plain));
+        if (!plain.trim()) continue;
+        const places = this.askSpeechRouted(agent, round, plain);
+        this.noteSpeechPlaces(opts.routing, places);
+        if (places.length > 0) {
+          console.error(`[speechRouted] ${agent.name}: ${plain.length} chars shown by ${places.map(logValue).join(' · ')}, held as a draft`);
+        }
       }
     }
     const { held, notHeld } = this.proseDrafts.hold(

@@ -226,8 +226,9 @@ export interface Module {
    * with a channel registry. Never called with private envelopes or words
    * kept private, explicit sends (prefixed envelopes included) or their own
    * words held as drafts, a turn under explicit routing, which writes no
-   * receipt, or an ephemeral run's unheld speech with no channel, which is
-   * its caller's result.
+   * receipt, an ephemeral run's unheld speech with no channel, which is its
+   * caller's result, or speech an agent routes or holds once another agent
+   * has taken its name.
    *
    * The call is synchronous, and routing goes on when it returns, so showing
    * a piece has to be a write that doesn't wait, such as a socket write that
