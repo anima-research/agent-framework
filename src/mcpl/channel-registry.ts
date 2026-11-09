@@ -2525,7 +2525,7 @@ export class ChannelRegistry {
       return {
         success: false,
         error: `Nothing changed: ${toolName}'s ${field} must be a string, and this call gave ${jsonKind(value)}. Give it in quotes`
-          + (typeof value === 'number' ? ': a number can lose its last digits before it reaches the server.' : '.'),
+          + (typeof value === 'number' ? ': a number can lose its last digits as the call is read.' : '.'),
         isError: true,
       };
     }
