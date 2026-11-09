@@ -22617,7 +22617,7 @@ export class AgentFramework {
    */
   private publishInputWithTurnLocus(input: unknown, agentName: string, callingTurn: TurnRouting | undefined): unknown {
     const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
-    if (typeof given === 'string') return input;
+    if (given !== undefined && given !== null) return input;
     // A locked turn's default is its lock, or none: never what the registry
     // resolves now, which reads the agent's latest routing (a silent start's).
     const locus = callingTurn
@@ -32785,19 +32785,21 @@ export class AgentFramework {
 
   /**
    * Why this host refuses a skip_reply call, as the model will read it, or
-   * undefined when it doesn't (skipReplyWakeRefusal): without an EventGate,
-   * any wake_in_seconds; with one, a wake_in_seconds that isn't a number of
-   * seconds. Only when the channel registry handles skip_reply. The dispatch
-   * that refuses the call reads it here, and so does the turn's bookkeeping of
-   * a refused round (roundCallOf), for the model's calls and a script's calls
-   * that reach the host while a call of the round watches it: the silence
-   * before it, which comes back after its round, and in XML mode which round's
-   * prose stays private. A skip_reply round's own prose stays private by the
-   * tool's name, refused or not.
+   * undefined when it doesn't: a reason that isn't a string
+   * (ChannelRegistry.nonStringRefusal), or (skipReplyWakeRefusal) without an
+   * EventGate, any wake_in_seconds, and with one, a wake_in_seconds that isn't
+   * a number of seconds. Only when the channel registry handles skip_reply.
+   * The dispatch that refuses the call reads it here, and so does the turn's
+   * bookkeeping of a refused round (roundCallOf), for the model's calls and a
+   * script's calls that reach the host while a call of the round watches it:
+   * the silence before it, which comes back after its round, and in XML mode
+   * which round's prose stays private. A skip_reply round's own prose stays
+   * private by the tool's name, refused or not.
    */
   private skipReplyRefusal(call: { name?: string; input?: unknown }): string | undefined {
     if (call.name !== 'skip_reply' || !this.channelRegistry) return undefined;
-    return skipReplyWakeRefusal(readSkipReplyWake(call.input), !!this.eventGate);
+    return this.channelRegistry.nonStringRefusal('skip_reply', call.input)?.error
+      ?? skipReplyWakeRefusal(readSkipReplyWake(call.input), !!this.eventGate);
   }
 
   private refusesSelfWake(call: { name?: string; input?: unknown }): boolean {
@@ -32808,8 +32810,8 @@ export class AgentFramework {
    * A call as its round's routing counts it, made directly, or by a script
    * and reaching the host while a run or wait call of the round watches it
    * (ScriptRound). A skip_reply refused, because the agent's allowedTools
-   * doesn't name it, because its arguments are refused (markedInputRefusal)
-   * or because this host can't set the wake it asks for, is
+   * doesn't name it, because its arguments are refused (markedInputRefusal),
+   * or because this host refuses its arguments (skipReplyRefusal), is
    * marked refused: it keeps its own round private and silences nothing after
    * it. A refusal withholds the call's effect, not the model's choice to keep
    * its words private. Any other call the list refuses posted nothing, so it
@@ -33060,7 +33062,7 @@ export class AgentFramework {
           const error = this.skipReplyRefusal(enrichedCall);
           if (error !== undefined) {
             const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
-            console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
+            console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(error)}`);
             const result = this.refusedResult(agentName, enrichedCall.id, error);
             this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
             this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
@@ -40073,6 +40075,11 @@ export class AgentFramework {
         return;
       }
       if (call.name === 'channel_publish' || call.name === 'channel_close') {
+        const refusal = this.channelRegistry?.nonStringRefusal(call.name, call.input);
+        if (refusal) {
+          reject(refusal.error!);
+          return;
+        }
         const input = (call.input ?? {}) as { channelId?: string; serverId?: string };
         // An empty serverId is read as none given, as the channel tools and
         // channelNamed read it.
