@@ -333,6 +333,21 @@ describe('the copies with no file keep head and tail (truncateForHistory)', () =
     assert.ok(inStub > 100 && inId > 0, `premise: the tail's share starts inside the stub, its id included (${inStub}, ${inId})`);
   });
 
+  it('starts no tail on a stub-shaped line that a stub quoted mid-line would make', () => {
+    const quoted = '[ref_1_ab3d] cam.png — image/png, 1.2KB claimed — from tool result';
+    const text = 'a'.repeat(2000) + '\nseen earlier: ' + quoted + '\n' + 'z'.repeat(10);
+    const at = text.indexOf(quoted);
+    assert.equal(parseImagePlaceholders(text).length, 0, 'premise: the quoted stub is no slot in the whole');
+    let onIt = 0;
+    for (let cap = 20; cap <= 600; cap++) {
+      if (text.length - (cap - Math.floor(cap * 0.6)) === at) onIt++;
+      const cut = truncateForHistory(text, cap);
+      headMarkerTail(cut, text);
+      assert.equal(parseImagePlaceholders(cut).length, 0, `cap ${cap}: the copy shows no slot the whole doesn't`);
+    }
+    assert.ok(onIt > 0, "premise: some cap's tail share starts exactly on the quoted stub");
+  });
+
   it('keeps an over-cap error text\'s last line on the history path', () => {
     const error = lines(1000, 'err');
     const text = nonErrorResultText({ error }, 2000);
