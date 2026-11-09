@@ -105,14 +105,14 @@ test('string data: a lone surrogate reads as U+FFFD, and a pair is kept', () => 
 test('string data: maxChars truncates the text itself with a marker', () => {
   const out = toolResultDataToHistoryString('line\n'.repeat(100), 50);
   assert.ok(out.startsWith('line\nline\n'), 'truncation keeps real newlines');
-  assert.match(out, /\[truncated — original was 500 chars\]/);
+  assert.match(out, /\[truncated — chars \d+ to \d+ of 500 elided here\]\nline\n/);
 });
 
 test('maxChars truncates the resulting string with a marker', () => {
   const data = [{ type: 'text', text: 'a'.repeat(1000) }];
   const out = toolResultDataToHistoryString(data, 100);
   assert.ok(out.length < 1000);
-  assert.match(out, /\[truncated — original was \d+ chars\]/);
+  assert.match(out, /\[truncated — chars \d+ to \d+ of 1000 elided here\]\na+$/);
 });
 
 test('maxChars does NOT truncate the placeholder itself (image is summarized, not chopped)', () => {

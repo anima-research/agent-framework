@@ -2556,7 +2556,8 @@ describe('present while acting', () => {
 
     const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
     assert.ok(results.includes('backscroll line 0'), 'control: the result reached the model');
-    assert.equal(results.includes('backscroll line 399'), false, 'control: the result was cut for its length');
+    assert.match(results, /\[truncated — chars \d+ to \d+ of \d+ elided here/, 'control: the result was cut for its length');
+    assert.equal(results.includes('backscroll line 200 '), false, 'control: its middle was elided');
     assert.ok(results.includes('plain speech now lands in this channel'), 'the routing word survived the cut');
 
     await framework.stop();

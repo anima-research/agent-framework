@@ -31,7 +31,7 @@ test('normal data is still stringified and truncated by the cap', () => {
   const fw = makeFw();
   const result = fw.toMembraneToolResult('call-3', { success: true, data: { v: 'y'.repeat(500) } }, 100);
   assert.equal(typeof result.content, 'string');
-  assert.match(result.content, /\[truncated — original was \d+ chars\]/);
+  assert.match(result.content, /\[truncated — chars \d+ to \d+ of \d+ elided here\]/);
 });
 
 test('error results pass through unchanged', () => {

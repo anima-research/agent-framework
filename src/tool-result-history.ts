@@ -40,7 +40,7 @@ import {
   type ResultClaims,
   type ScriptLine,
 } from './mcpl/references.js';
-import { formatToolImagePlaceholder, toolResultCutAt } from './tool-image-ledger.js';
+import { formatToolImagePlaceholder, toolResultHeadTail } from './tool-image-ledger.js';
 
 /** Where one block of a content array sits in its history text, and what
  *  kind of block it was: text, an inline image (its placeholder), an RFC-005
@@ -59,8 +59,8 @@ export interface HistoryBlockSpan {
  * together. Past that, the live copy is the stored text, cut at the cap, so
  * no number of links and markers carries a result past it. A reference's
  * stub and a withheld line go whole beside an image whatever their length,
- * and past its cut the stored copy keeps the newest 64 image slots the live
- * copy showed (#403). Text blocks don't count either: the native copy cuts
+ * and from its elided middle the stored copy keeps the newest 64 image slots
+ * the live copy showed (#403). Text blocks don't count either: the native copy cuts
  * each at the cap on its own. Both copies decide by this, from each block's
  * kind and the length of its text.
  */
@@ -358,17 +358,19 @@ function thrownLine(error: unknown): string {
   }
 }
 
-/** Bounded copy of an arbitrary string with the standard truncation notice,
- *  cut at the cap where a tool result's stored copy is cut at that cap
- *  (toolResultCutAt), so it
- *  never ends in part of a slot. Each of its callers' readers sees this
- *  very text, never the images behind a placeholder, so nothing past the cut
- *  is kept for save_recent_image's index (#403). The framework stores a tool
- *  result with spillOrTruncate, which keeps the slots past its cut that the
- *  result's live copy showed. */
+/** Bounded copy of an arbitrary string: its head and tail where a tool
+ *  result's stored copy keeps them at that cap (toolResultHeadTail), with the
+ *  standard truncation notice between them naming the chars it elides, so
+ *  neither end holds part of a slot. Each of its callers' readers sees this
+ *  very text, never the images behind a placeholder, so nothing in the
+ *  elided middle is kept for save_recent_image's index (#403). The framework
+ *  stores a tool result with spillOrTruncate, which keeps the slots in the
+ *  middle that the result's live copy showed. */
 export function truncateForHistory(str: string, maxChars: number): string {
   if (str.length <= maxChars) return str;
-  return str.slice(0, toolResultCutAt(str, maxChars)) + '\n\n[truncated — original was ' + str.length + ' chars]';
+  const { headEnd, tailStart } = toolResultHeadTail(str, maxChars);
+  return `${str.slice(0, headEnd)}\n\n[truncated — chars ${headEnd} to ${tailStart} of ${str.length} elided here]`
+    + (tailStart < str.length ? `\n${str.slice(tailStart)}` : '');
 }
 
 /**

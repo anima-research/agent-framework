@@ -6,7 +6,7 @@ import type { CompletedToolCall } from './types/index.js';
 import { ensureStateRegistered } from './module-registry.js';
 import { classifyBlock } from './mcpl/references.js';
 import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
-import { safeSlice } from './safe-slice.js';
+import { toolResultHeadTail } from './tool-image-ledger.js';
 import { asOwnRow, presentLandedThenRethrow } from './dendrite/audience.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
@@ -102,9 +102,10 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
  * What a withheld result's stub keeps of it: the fields of its data that its
  * tool marked as saying what it acted on (ToolResult.keepWhenWithheld), in
  * the order marked, serialized as a stored result is. Past `maxChars`, the
- * inline cap or less (storeResults' keptCap), they're cut, with a note that
- * says so and where the whole result is, since a later field can then be cut
- * away entirely. Undefined when it keeps nothing, as for a failed result
+ * inline cap or less (storeResults' keptCap), they keep their head and tail
+ * (toolResultHeadTail), with a note between them naming the chars it elides
+ * and saying where the whole result is, since a field in the middle can then
+ * be cut away entirely. Undefined when it keeps nothing, as for a failed result
  * (agent-framework #277), one whose claims can't be read whole
  * (resultClaimsOf), or one whose data is MCP's embedded resource, whose
  * fields can't be kept apart from its contents or its uri. A write's file
@@ -134,11 +135,9 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   if (claims === null) return undefined;
   const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept, undefined, { claims });
   if (!maxChars || whole.length <= maxChars) return whole;
-  // Never half a surrogate pair: the stub goes to the provider as text, so
-  // the cut can be one character short of the cap.
-  const head = safeSlice(whole, 0, maxChars);
-  return `${head} [cut: ${head.length} of these fields' ${whole.length} ` +
-    'characters; the whole result is where this note says]';
+  const { headEnd, tailStart } = toolResultHeadTail(whole, maxChars);
+  return `${whole.slice(0, headEnd)} [cut: chars ${headEnd} to ${tailStart} of these fields' ${whole.length} elided here; ` +
+    'the whole result is where this note says]' + (tailStart < whole.length ? ` ${whole.slice(tailStart)}` : '');
 }
 
 interface PendingBatch {
