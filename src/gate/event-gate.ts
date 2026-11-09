@@ -2189,6 +2189,7 @@ function judgeFailureWords(err: unknown): string {
 /** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
 function errorText(err: unknown): string {
   try {
+    if (err instanceof JudgeFailure && err.detail !== undefined) return `${err.message} (${err.detail})`;
     return err instanceof Error ? err.message : String(err);
   } catch {
     return 'a value that could not be printed';
@@ -4349,8 +4350,8 @@ export class EventGate {
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
-        abort.abort();
         reject(new JudgeFailure(`the judge took more than ${this.judgeTimeoutMs} ms`));
+        abort.abort();
       }, this.judgeTimeoutMs);
       // Never keep the process alive on the judge's account.
       state.timer.unref?.();

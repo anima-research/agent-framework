@@ -32538,6 +32538,7 @@ export class AgentFramework {
     // The failure text is stored inline in every record; the request that
     // produced it is already stored separately as a blob.
     if (typeof entryToStore.error === 'string') entryToStore.error = boundFailureText(entryToStore.error);
+    if (typeof entryToStore.errorWords === 'string') entryToStore.errorWords = boundFailureText(entryToStore.errorWords);
 
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
@@ -35198,8 +35199,9 @@ export class AgentFramework {
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
       const cause = timedOut && causeParts.length === 1 ? '' : causeParts.join(', ');
-      const shown = typeof detail?.shownReason === 'string'
-        ? ` Reason: ${failureShown(boundFailureText(detail.shownReason, FAILURE_MARKER_REASON_MAX_CHARS))}.` : '';
+      const shownText = typeof detail?.shownReason === 'string'
+        ? failureShown(boundFailureText(detail.shownReason, FAILURE_MARKER_REASON_MAX_CHARS)) : undefined;
+      const shown = shownText !== undefined ? ` Reason: ${shownText}${/[.!?]$/.test(shownText) ? '' : '.'}` : '';
       try {
         storeOwnRow(
           agent,

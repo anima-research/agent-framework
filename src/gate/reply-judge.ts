@@ -30,9 +30,11 @@ import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, Normaliz
 import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
 export class JudgeFailure extends Error {
-  constructor(message: string) {
+  readonly detail?: string;
+  constructor(message: string, detail?: string) {
     super(message);
     this.name = 'JudgeFailure';
+    if (detail !== undefined) this.detail = detail;
   }
 }
 
@@ -506,7 +508,7 @@ export class ReplyJudge {
     const verdict = parseVerdict(text);
     if (!verdict) {
       const stop = response.stopReason;
-      throw new JudgeFailure(`the judge's answer held no verdict (stop: ${stop}${text ? `, text: ${JSON.stringify(cut(text, 120))}` : ''})`);
+      throw new JudgeFailure("the judge's answer held no verdict", `stop: ${stop}${text ? `, text: ${JSON.stringify(cut(text, 120))}` : ''}`);
     }
     return {
       ...verdict,
