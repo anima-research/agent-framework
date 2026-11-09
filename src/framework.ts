@@ -4936,7 +4936,7 @@ export class AgentFramework {
   /** The host's say over each derivation, ephemeral spawn and resume (config.dendrite.beforeDerive). */
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
   private effortSetting: FrameworkConfig['effort'];
-  /** Agents whose FrameworkConfig.effort answer was logged as unusable (liveEffort). */
+  /** Agents whose FrameworkConfig.effort answer was logged as unusable (liveEffort), until each ends. */
   private readonly effortAnswersLogged = new Set<string>();
   private readonly effortRowsRefused = new Set<string>();
   /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
@@ -9855,7 +9855,7 @@ export class AgentFramework {
     this.effortRowsRefused.add(agent.name);
     console.error(
       `[effort] ${agent.name}: membrane refused a request carrying an effort row (${error.message}). ` +
-        'Its requests carry the live effort on top and no effort rows from now until the process ends; this one is sent again at once.',
+        'Its requests carry the live effort on top and no effort rows from now until the agent ends or the process does; this one is sent again at once.',
     );
     return true;
   }
@@ -13547,7 +13547,10 @@ export class AgentFramework {
   private settleEndedAgent(outcome: EndOutcome | null): void {
     if (!outcome) return;
     const ended = new Set([...outcome.cascaded, outcome.ended].map((record) => record.name));
-    for (const name of ended) this.effortRowsRefused.delete(name);
+    for (const name of ended) {
+      this.effortRowsRefused.delete(name);
+      this.effortAnswersLogged.delete(name);
+    }
     this.keepEffortBases((name) => !ended.has(name));
     for (const record of [...outcome.cascaded, outcome.ended]) {
       this.emitTrace({

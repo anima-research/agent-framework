@@ -406,9 +406,9 @@ export interface FrameworkConfig {
    * head covers whether the request leaves out the effort rows the framework
    * wrote for the agent. A request that starts or stops leaving them out has
    * a changed head, as a change of model does. Its compile then leaves the
-   * stored replies' thinking out. That happens when a function's answer goes
-   * from a level to `undefined`, when membrane refuses the agent's rows, and
-   * when a restart unsets this or sets it again.
+   * stored replies' thinking out. That happens when a function's answer
+   * moves between a level and `undefined`, when membrane refuses the agent's
+   * rows, and when a restart unsets this or sets it again.
    */
   effort?: EffortLevel | ((agent: { name: string; model: string }) => EffortLevel | undefined);
 
