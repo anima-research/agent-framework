@@ -24267,7 +24267,6 @@ export class AgentFramework {
     }
   }
 
-  /** Read the last locus announced to the agent back from the store, once; whether there is one. */
   private readAnnouncedLocus(agentName: string): boolean {
     if (!this.lastAnnouncedLocus.has(agentName)) {
       try {
@@ -24280,7 +24279,6 @@ export class AgentFramework {
     return this.lastAnnouncedLocus.has(agentName);
   }
 
-  /** Whether announce-on-change would announce `locus`: it differs from the last one announced, or none was and it isn't null. */
   private announcedLocusDiffers(agentName: string, locus: ChannelRef | null): boolean {
     return this.readAnnouncedLocus(agentName)
       ? !sameChannel(this.lastAnnouncedLocus.get(agentName) ?? null, locus)
@@ -27544,6 +27542,7 @@ export class AgentFramework {
       routing.silent = true;
       if (continued?.roundsRan) routing.roundsRan = true;
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
+      if (continued?.private) routing.private = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
