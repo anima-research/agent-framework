@@ -278,10 +278,13 @@ export class ToolResultGuard {
     return Math.max(0, Math.ceil(chars / 4) + images * 1600);
   }
 
+  /** The originals a request carries for the pending batch, as prepareRequest substitutes them: none while its
+   *  audit isn't durable, when the placeholders go instead. */
   get pendingWireBlocks(): ContentBlock[] {
-    return this.pending?.wireResults.map((result) => ({
+    if (!this.pending?.durable) return [];
+    return this.pending.wireResults.map((result) => ({
       type: 'tool_result', toolUseId: result.toolUseId, content: result.content, isError: result.isError,
-    }) as ContentBlock) ?? [];
+    }) as ContentBlock);
   }
 
   /** Ordered storage work, separate from batches awaiting a provider verdict.

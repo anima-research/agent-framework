@@ -111,10 +111,12 @@ export interface AgentConfig {
    * leave more room than needed), a `prefillUserMessage`, and the turn a
    * stream's start may end its request on (a silent tick's separator, or
    * `[Continue]`). So the compiled context, its message injections, those
-   * messages, the system prompt, the tools and the reply's reserve (the
-   * agent's maxTokens, unless a caller passes its own budget) come within
-   * it, and a window they leave no room in refuses the compile as over
-   * budget. Some of what a request sends is outside that price, and reaches
+   * messages, the system prompt, the tools and the reply the request asks
+   * for (the agent's maxTokens, which a caller's budget that reserves less
+   * lowers the limit by) come within it, and a window they leave no room in
+   * refuses the compile as over budget: the turn ends as `window_full`, with
+   * no compression drain, since no history or budget makes room there.
+   * Some of what a request sends is outside that price, and reaches
    * context-manager only as its calibration takes it in from the provider's
    * count: the request-only turns rendered again before earlier replies (a
    * surviving silent tick's separator, 199 characters, 69 tokens by
@@ -134,7 +136,9 @@ export interface AgentConfig {
   physicalWindowTokens?: number;
 
   /** Per-agent context compile budget (input tokens). When unset, the
-   *  ContextManager's built-in default (100k) applies. */
+   *  ContextManager's built-in default (100k, reserving 4,000 for the reply)
+   *  applies. With `physicalWindowTokens` set, unset instead gives that
+   *  default's room of 96,000 with the agent's maxTokens reserved on top. */
   contextBudgetTokens?: number;
 
   /**

@@ -175,6 +175,18 @@ function wireDigest(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 /** ContextManager.compile's own budget when it's given none. */
 const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT_BUDGET_TOKENS, reserveForResponse: 4_000 };
+
+/**
+ * Whether `error` is context-manager's refusal of a compile whose request limit leaves the context no room beside
+ * the reply's reserve and what the request sends besides it (`requestAllowanceTokens` at or below 0). No history and
+ * no budget makes room there: only a smaller reply, system prompt or tool list, or a larger window.
+ */
+export function leavesNoRoomInWindow(error: unknown): boolean {
+  if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') return false;
+  const diagnostics = (error as { diagnostics?: { requestLimitTokens?: unknown; requestAllowanceTokens?: unknown } }).diagnostics;
+  return typeof diagnostics?.requestLimitTokens === 'number' && typeof diagnostics.requestAllowanceTokens === 'number'
+    && diagnostics.requestAllowanceTokens <= 0;
+}
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
@@ -843,7 +855,8 @@ export class Agent {
     try {
       result = await compile();
     } catch (error) {
-      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+      // A refusal for want of room in the window says nothing of the budget, and passes through as it is.
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || leavesNoRoomInWindow(error)) throw error;
       // A refusal shows the budget it planned at doesn't fit, whatever
       // changed while it ran: the record's marker for it is withdrawn, and
       // nothing is credited, unless a compile that started later has already
@@ -1361,7 +1374,7 @@ export class Agent {
     try {
       return await compile();
     } catch (error) {
-      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || !pinned || !this.unpinTurnInputs()) throw error;
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || leavesNoRoomInWindow(error) || !pinned || !this.unpinTurnInputs()) throw error;
       console.error(`[turn-inputs] ${this.name}: the compile refused with the turn's inputs pinned, so they are unpinned and it compiles again`);
       return compile();
     }
@@ -1928,8 +1941,10 @@ export class Agent {
       this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults, undefined,
         DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     }
-    const readyResults = this._state.status === 'ready' && !guardedResults
-      ? this.buildToolResultMessages(this._state.toolResults).map((message) => message.content) : [];
+    // Read once: the compile prices them, and the request sends them.
+    const readyMessages = this._state.status === 'ready' && !guardedResults
+      ? this.buildToolResultMessages(this._state.toolResults) : undefined;
+    const readyResults = readyMessages?.map((message) => message.content) ?? [];
 
     // Compile the context (with optional injections) into a request. The
     // guard's refusal retry is assembled the same way, afresh. It is compiled
@@ -1937,7 +1952,7 @@ export class Agent {
     // that began during the compile, and after a stub edit that failed has
     // been retried; one whose store still fails is compiled as the bare
     // notice.
-    let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
+    let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined = readyMessages;
     const prospectiveSystemInjections = (injections ?? [])
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content);
@@ -1946,7 +1961,7 @@ export class Agent {
       const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections, {
           ...(binding.thinkingBinding ? binding : {}),
-          ...this.requestBounds(tools, prospectiveSystemInjections, readyResults),
+          ...this.requestBounds(tools, prospectiveSystemInjections, readyResults, budget),
         }));
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
@@ -1954,9 +1969,9 @@ export class Agent {
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
       const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
-      // Read once, after the first compile, since results may have become
-      // ready while it ran; the refusal retry, assembled while the agent is
-      // inferring, sends the same ones.
+      // Where none were ready before the compile, read once, after the first
+      // compile, since results may have become ready while it ran; the refusal
+      // retry, assembled while the agent is inferring, sends the same ones.
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
       messages.push(...unguardedResults);
@@ -2130,7 +2145,7 @@ export class Agent {
       ...(options.dryRun ? { dryRun: true } : {}),
       ...binding,
       ...this.requestBounds(availableTools, prospectiveSystemInjections,
-        [options.silentHeartbeat !== undefined ? silentHeartbeatSeparatorTurn().content : continueTurn().content]),
+        [options.silentHeartbeat !== undefined ? silentHeartbeatSeparatorTurn().content : continueTurn().content], budget),
     });
     let { messages } = compiledResult;
     const { systemInjections } = compiledResult;
@@ -2324,7 +2339,7 @@ export class Agent {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
-  private requestBounds(tools: ToolDefinition[], systemInjections: ContentBlock[], beside: ContentBlock[][] = []): {
+  private requestBounds(tools: ToolDefinition[], systemInjections: ContentBlock[], beside: ContentBlock[][], budget: TokenBudget | undefined): {
     requestOverhead: RequestOverhead;
     requestLimitTokens?: number;
   } {
@@ -2336,9 +2351,12 @@ export class Agent {
       ...(pending.length > 0 ? [pending] : []),
       ...(this.prefillUserMessage ? [[{ type: 'text', text: this.prefillUserMessage } as ContentBlock]] : []),
     ];
+    // Every request asks for the agent's maxTokens (requestSettings). Where a caller's budget reserves less for the
+    // reply, the limit is lowered by the difference, so it counts the reply the request asks for.
+    const reserve = this.resolveBudget(budget)?.reserveForResponse ?? this.maxTokens;
     return {
       requestOverhead: messages.length > 0 ? { ...requestOverhead, messages } : requestOverhead,
-      requestLimitTokens: this.physicalWindowTokens,
+      requestLimitTokens: this.physicalWindowTokens - Math.max(0, this.maxTokens - reserve),
     };
   }
 

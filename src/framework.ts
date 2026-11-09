@@ -102,7 +102,7 @@ import { deferredWritesRefusal, isToolBlockEntry, readPersistedDeferredWrites, t
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
+import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, leavesNoRoomInWindow, type RenderStats } from './agent.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -35117,6 +35117,10 @@ export class AgentFramework {
         ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
       };
     }
+    // A refusal no history can fix: the window has no room beside the request's overhead and reply.
+    if (leavesNoRoomInWindow(err)) {
+      return { errorType: 'window_full' };
+    }
     if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
     }
@@ -35321,6 +35325,17 @@ export class AgentFramework {
         `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${drainState}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
+        { skipLog: true },
+      );
+    }
+    // Folding history can't make room in a window the request's overhead and reply fill, so it kicks no drain.
+    if (errorType === 'window_full') {
+      this.opsAlert(
+        'context-refusal',
+        agentName,
+        `compile refused (window_full): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
+        'no drain kicked, since no history or budget makes room: the system prompt, the tools and the reply\'s ' +
+        'maxTokens fill physicalWindowTokens. Lower maxTokens or the tools, or check physicalWindowTokens against the model\'s window.',
         { skipLog: true },
       );
     }
