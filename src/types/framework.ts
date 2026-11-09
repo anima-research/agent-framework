@@ -169,16 +169,14 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * Tune-out without a reader (issue #232 §3.3). The hold machinery always
-   * runs when MCPL channels exist, so a persisted epoch is resumed and
-   * released whatever the configuration; this switch only decides whether
-   * residents are offered `tune_out` when no reader is configured. Without
-   * a reader a tune-out is a silent hold: no cadence, no wake budget,
-   * mentions are acknowledged, the backlog is released on cancel.
+   * Tune-out settings. Residents are offered `tune_out` only with a reader
+   * (`subconscious`), or while a hold a failed release left is still on
+   * record to check or cancel: a hold nothing summarizes would hand the resident an
+   * undated backlog all at once when it ends. `enabled`, which offered one
+   * without a reader, was removed in 0.33.0: `enabled: true` is refused at
+   * `create` (`false` is still accepted, from JavaScript, and does nothing).
    */
   tuneOut?: {
-    /** Offer `tune_out` without a subconscious. Default: only with one. */
-    enabled?: boolean;
     /**
      * Announce the all-except scope in the excepted channel: one bracketed
      * line under the resident's name when it opens (who, for how long) and
@@ -193,16 +191,23 @@ export interface FrameworkConfig {
    * (architecture channel, 2026-10-06: the §3 carve-out accepted by the
    * residents).
    *
-   * - `'delivery'` (default): the locus comes only from the delivery that
-   *   woke the turn, a conversation fork's home channel, or a channel the
-   *   agent opened during the turn. Incoming traffic never moves it — not
-   *   between turns, not mid-turn. A turn with no such locus keeps its
-   *   prose private, and says so in a `[routing]` notice.
+   * - `'delivery'` (default): the locus comes from the delivery that woke
+   *   the turn, a conversation fork's home channel, or a channel the agent
+   *   opened during the turn, and past those only from an open all-except
+   *   hold's channel or `unpromptedChannel` (below), each for the turns that
+   *   take it. Incoming traffic never moves it — not between turns, not
+   *   mid-turn. A turn with no such locus keeps its prose private, and says
+   *   so in a `[routing]` notice.
    * - `'latest-inbound'`: the previous rule. The most recent delivered
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
    *
-   * Held traffic never moves the locus under either rule.
+   * Held traffic never moves the locus under either rule. Under either, a
+   * turn the agent's own timer starts takes `unpromptedChannel` where it's
+   * set, after an all-except hold's channel and before both rules' own
+   * fallbacks. Neither rule applies to an agent under locked prose routing
+   * (AgentConfig.proseRouting 'locked'): its turns speak at its lock,
+   * whatever arrives.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';
@@ -239,9 +244,29 @@ export interface FrameworkConfig {
   hostModePath?: string;
 
   /**
-   * Branch-independent durable queue of context writes deferred while
-   * quiesced. Defaults to `<storePath>/recovery/deferred-writes.json`; same
-   * rationale and fallback as `hostModePath`.
+   * Where a release before #291 kept its durable queue of deferred context
+   * writes. Defaults to `<storePath>/recovery/deferred-writes.json`; without
+   * either, the store's `framework/deferred-writes` slot. This release keeps
+   * no durable queue: a write is stored when it is made, and enters each
+   * agent's window at that agent's presentation points. Two holds keep a
+   * write in memory instead, and a crash loses it: a live operator surgery
+   * (a rollback, a suppression, a branch switch), until its release stores
+   * it, and an agent's context manager refusing its work after a failed
+   * re-initialization, until a branch move (switchBranch, a rollback or a
+   * suppression) re-initializes it.
+   *
+   * create() reads the record once and stores its writes. A write for an
+   * agent no longer registered goes to the primary when it is a failed
+   * reply, a channel notice its reader could act on, or a module's write
+   * for a run or a fork, and is dropped otherwise, logged. It then rewrites
+   * the record with what it left for the next boot: a write it couldn't
+   * store, or couldn't tell had already landed, with that agent's later
+   * writes. A write the store refuses as malformed is dropped, logged, as an
+   * earlier release's flush dropped it. When the store doesn't sync after
+   * the import, the record is left as it was.
+   *
+   * @deprecated Read once at boot by the deferred-write importer; removed in
+   * the next release.
    */
   deferredWritesPath?: string;
 
@@ -481,6 +506,35 @@ export interface FrameworkConfig {
    * `default`) refuses that request the same way, naming the feature set.
    */
   inferenceRouting?: InferenceRoutingPolicy;
+
+  /**
+   * The channel for a turn the agent's own timer starts, which no message
+   * prompted: the wake `skip_reply` schedules, or the end of a `sleep`. Plain
+   * speech in locus or hybrid prose routing goes there, and so does
+   * `channel_publish` naming no channel in any prose routing mode but locked,
+   * which servers are told as the turn's default outgoing channel. An
+   * all-except hold's channel still comes first while one is open, and without
+   * the setting such a turn follows `speech.locus`. A turn the framework opens
+   * to continue such a turn that had no locus of its own, as in explicit or
+   * disabled routing, takes it too: a `!` continuation, autoContinue's next
+   * turn, or a bounced reply's wake. No other turn takes it: not one a message
+   * prompted, from a channel, a module, a person at a console or another agent;
+   * not a heartbeat's or a reminder's (its plain speech is held as drafts); not
+   * a conversation fork's or an ephemeral run's; not a locked agent's, which
+   * speaks at its lock or holds its speech as drafts; and not a start merged
+   * from a timer's wake and any other cause. One value, for every agent on the
+   * framework. A registered channel's id, e.g. `discord:{guildId}:{channelId}`,
+   * or, to pick one server's where two register that id,
+   * `{serverId}:{channelId}`. `create()` refuses a value that is neither a
+   * string nor null, or is blank; null reads as not set. A value that names no
+   * registered channel, several, or one its server declared inbound-only, when
+   * a turn would take it, is logged, and logged again only after a turn has
+   * used it since; the turn takes what it would without the setting.
+   * `channel_publish`'s description adds a default for such turns only on a
+   * framework with an event gate, the only one with such turns; on any other
+   * the description is as it is without the setting.
+   */
+  unpromptedChannel?: string | null;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;

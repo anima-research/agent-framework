@@ -234,6 +234,15 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     assert.deepEqual(h.module.speeches, ['continued']);
     assert.ok(strategy.snapshots.every((s) => !s.includes('original-text-payload') && !s.includes(image)),
       'background strategy ingress must never see withheld payloads');
+    // The check above passes on an empty list, so it means something only if
+    // the hook heard the rows: the results row among them, as the guard's
+    // placeholder (the notice, or the stub it settles to, which begins with
+    // it). context-manager reaches onNewMessage through its presentation
+    // dispatch now, which a change there could stop.
+    assert.ok(strategy.snapshots.length > 0, 'the strategy heard the rows');
+    const heardResults = strategy.snapshots.filter((s) => s.includes('"type":"tool_result"'));
+    assert.ok(heardResults.length > 0, 'it heard the results row');
+    assert.ok(heardResults.every((s) => s.includes(TOOL_RESULT_GUARD_NOTICE)), "and heard it as the guard's placeholder");
 
     const store = h.framework.getStore();
     const audit = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
@@ -412,6 +421,43 @@ test('ephemeral run settles only after recovery and counts each tool once', asyn
     assert.deepEqual(result, { speech: 'continued', toolCallsCount: 1 });
     assert.deepEqual(h.module.calls, ['one']);
     assert.equal(h.membrane.requests.length, 2);
+  } finally { await h.framework.stop(); }
+});
+
+for (const routing of ["holds a later batch's channels in its routing", 'has no channel'] as const) test(`a guard retry of a turn with no locus that ${routing} carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its start's"}`, async (t) => {
+  const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
+  try {
+    const internal = h.framework as unknown as {
+      pendingRequests: unknown[];
+      turnRouting: Map<string, { wakeChannels?: unknown; noChannel?: true }>;
+      startAgentStream(...args: unknown[]): Promise<void>;
+    };
+    const first = { serverId: 'discord', channelId: 'discord:g:first' };
+    const later = { serverId: 'discord', channelId: 'discord:g:later' };
+    const triggers: Array<Record<string, unknown> | undefined> = [];
+    let written = false;
+    const original = internal.startAgentStream.bind(internal);
+    t.mock.method(internal, 'startAgentStream', (agent: unknown, trigger: Record<string, unknown> | undefined, ...rest: unknown[]) => {
+      triggers.push(trigger);
+      return original(agent, trigger, ...rest);
+    });
+    const handle = h.module.handleToolCall.bind(h.module);
+    t.mock.method(h.module, 'handleToolCall', (call: ToolCall) => {
+      const turn = internal.turnRouting.get('assistant');
+      if (turn && !written) {
+        if (routing === 'has no channel') turn.noChannel = true;
+        else turn.wakeChannels = [first, later];
+        written = true;
+      }
+      return handle(call);
+    });
+    h.framework.getAgent('assistant')!.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    internal.pendingRequests.push({ agentName: 'assistant', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [later] });
+    await h.framework.runUntilIdle();
+    assert.ok(written, "premise: the turn's routing was there at its tool call");
+    const retry = triggers.find((r) => r?.reason === 'tool_result_guard_retry');
+    assert.ok(retry, `premise: the guard retried: ${triggers.map((r) => r?.reason).join(', ')}`);
+    assert.deepEqual(retry.wakeChannels, routing === 'has no channel' ? undefined : [first, later]);
   } finally { await h.framework.stop(); }
 });
 
@@ -4262,4 +4308,37 @@ test('an already-aborted direct call never reaches membrane', async () => {
     assert.equal(result.aborted, true);
     assert.equal(calls, 0);
   } finally { await h.framework.stop(); }
+});
+
+test("storeResults tells the own-row sink of the results it stores, guarded or not, and nothing on an idempotent retry", async () => {
+  const { ContextManager } = await import('@animalabs/context-manager');
+  const { ToolResultGuard } = await import('../src/tool-result-guard.js');
+  const dir = mkdtempSync(join(tmpdir(), 'af-guard-sink-')); dirs.push(dir);
+  const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy() });
+  try {
+    const told: string[][] = [];
+    const call = (id: string) => cm.addMessage('Claude', [{ type: 'tool_use', id, name: 'search', input: {} }]);
+    const results = (id: string): ContentBlock[] => [{ type: 'tool_result', toolUseId: id, content: 'found' }];
+    const wire = (id: string) => [{ toolUseId: id, content: 'found' }];
+
+    call('tu-1');
+    const plain = new ToolResultGuard('Claude', cm, false);
+    plain.setOwnRowSink((ids) => { told.push([...ids]); assert.ok(ids.every((id) => cm.getMessage(id) !== null), 'stored when told'); });
+    const unguarded = plain.storeResults(results('tu-1'), wire('tu-1'), [], undefined, undefined);
+    assert.deepEqual(told, [[unguarded]], 'the unguarded arm');
+
+    call('tu-2');
+    const guarded = new ToolResultGuard('Claude', cm, true);
+    guarded.setOwnRowSink((ids) => { told.push([...ids]); });
+    const staged = guarded.storeResults(results('tu-2'), wire('tu-2'), [], undefined, undefined);
+    assert.deepEqual(told, [[unguarded], [staged]], 'the guarded arm, its placeholders');
+    assert.equal(guarded.storeResults(results('tu-2'), wire('tu-2'), [], undefined, undefined), staged, 'the retry returns the staged id');
+    assert.deepEqual(told, [[unguarded], [staged]], 'and tells nothing');
+
+    guarded.settleTurnEnded();
+    guarded.setOwnRowSink(undefined);
+    call('tu-3');
+    guarded.storeResults(results('tu-3'), wire('tu-3'), [], undefined, undefined);
+    assert.equal(told.length, 2, 'with the sink off, nothing is told');
+  } finally { cm.close(); }
 });
