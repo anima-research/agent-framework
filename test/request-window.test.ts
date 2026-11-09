@@ -313,6 +313,38 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
     }
   });
 
+  it('a window the request\'s overhead and reply fill exactly, leaving the context no room at all, ends as window_full too', async () => {
+    const refusalAt = async (window: number) => {
+      const t = await open(window);
+      const cm = t.agent.getContextManager();
+      const compile = cm.compile.bind(cm);
+      const refusals: Array<{ requestLimitTokens?: number; requestAllowanceTokens?: number }> = [];
+      cm.compile = (async (...args: Parameters<typeof cm.compile>) => {
+        try {
+          return await compile(...args);
+        } catch (error) {
+          refusals.push((error as { diagnostics?: { requestLimitTokens?: number; requestAllowanceTokens?: number } }).diagnostics ?? {});
+          throw error;
+        }
+      }) as typeof cm.compile;
+      try {
+        t.framework.start();
+        t.framework.pushEvent({
+          type: 'external-message', source: 'test', content: [{ type: 'text', text: 'Anything?' }], metadata: {}, triggerInference: true,
+        } as unknown as ProcessEvent);
+        await until('the turn to fail', () => t.traces.some((event) => event.type === 'inference:exhausted'));
+        return { refusal: refusals[0]!, failed: t.traces.find((event) => event.type === 'inference:exhausted')! };
+      } finally {
+        await t.close();
+      }
+    };
+    const first = await refusalAt(REPLY + 500);
+    const exact = first.refusal.requestLimitTokens! - first.refusal.requestAllowanceTokens!;
+    const { refusal, failed } = await refusalAt(exact);
+    assert.equal(refusal.requestAllowanceTokens, 0, `premise: a window of ${exact} leaves the context exactly no room`);
+    assert.equal(failed.errorType, 'window_full', String(failed.error));
+  });
+
   it('a caller\'s budget that reserves less than the agent\'s maxTokens is still bounded by the reply the request asks for', async () => {
     const window = 20_000;
     const t = await open(window, { maxTokens: 11_000 });
