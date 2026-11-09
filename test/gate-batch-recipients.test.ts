@@ -12,7 +12,6 @@ afterEach(() => {
   if (existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true, force: true });
 });
 
-/** A gate whose own recipients are `agent` and `other`, with one rule over reminders. */
 function makeGate(file: string, behavior: unknown, judge?: JudgeFn, now?: () => number) {
   const configPath = join(TMP_DIR, file);
   writeFileSync(configPath, JSON.stringify({ policies: [{ name: 'batch', match: { scope: ['clock:reminder'] }, behavior }] }));
@@ -37,7 +36,6 @@ const reminder = (content: string, recipients?: string[]): GateEventInfo => ({
   content, eventType: 'clock:reminder', serverId: 'clock', channelId: '', ...(recipients ? { recipients } : {}),
 });
 
-/** Fires the batch the rule holds. */
 function fire(gate: EventGate): void {
   const held = gate as unknown as { debounceTimers: Map<string, { timer?: ReturnType<typeof setTimeout> }>; fireDebounce(name: string): void };
   assert.equal(held.debounceTimers.size, 1, 'premise: the rule holds the batch');

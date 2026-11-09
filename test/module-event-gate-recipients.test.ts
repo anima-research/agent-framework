@@ -9,8 +9,6 @@ import type { GatePolicy } from '../src/gate/types.js';
 
 type Asked = string[] | true;
 
-/** Answers a `clock:reminder` with one message, with the reminder's metadata or held from the residents,
- *  or a held message beside a visible one, or none, asking inference for the agents the reminder names. */
 class ReminderModule extends GateModule {
   override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'clock:reminder') return {};
@@ -58,7 +56,6 @@ type GateHandle = {
 };
 const gateOf = (f: Fixture) => (f.framework as unknown as { eventGate: GateHandle }).eventGate;
 
-/** The content of each event the gate is asked about, from now on. */
 function gateAsked(f: Fixture): string[] {
   const gate = gateOf(f);
   const evaluate = gate.evaluate.bind(gate);
@@ -67,7 +64,6 @@ function gateAsked(f: Fixture): string[] {
   return asked;
 }
 
-/** Fires the batch the debounce rule holds. */
 function fire(f: Fixture): void {
   const gate = gateOf(f);
   assert.equal(gate.debounceTimers.size, 1, 'premise: the debounce rule holds a batch');
@@ -81,7 +77,6 @@ const rows = (f: Fixture, text: string) => f.framework.getAgent('agent')!.getCon
   .filter((m) => JSON.stringify(m.content).includes(text));
 const audienceOf = (row: { metadata?: unknown }) => (row.metadata as { audience?: unknown } | undefined)?.audience;
 
-/** A copy of `agent` on a slot of its own, blocked in a tool until `done`. */
 async function isolatedJob(f: Fixture, module: ReminderModule) {
   f.framework.start();
   const worker = await f.framework.deriveAgent({
@@ -89,8 +84,6 @@ async function isolatedJob(f: Fixture, module: ReminderModule) {
     framing: [{ participant: 'user', content: [{ type: 'text', text: '[WORKER-FRAMING] count them' }] }],
   });
   const run = f.framework.runEphemeralToCompletion(worker.agent, worker.contextManager);
-  // A test that fails before done() closes the framework under the run: its
-  // rejection then is the close's, not the failure the test reports.
   run.catch(() => {});
   await eventually(() => module.entered.has('g-worker'), 'the worker blocks in its tool');
   return {

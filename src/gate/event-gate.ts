@@ -3569,8 +3569,6 @@ export class EventGate {
 
     if (typeof policy.behavior === 'object') {
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
-        // An event whose list of recipients is empty is for no one, so it
-        // joins no batch, and the rule lets it through (GateEventInfo.recipients).
         if (info.recipients !== undefined && info.recipients.length === 0) {
           return { trigger: true, policyName: policy.name, behavior: policy.behavior };
         }
@@ -3726,8 +3724,6 @@ export class EventGate {
     if (b === 'always') return true;
     if (b === 'defer' || b === 'skip') return false;
     if (typeof b === 'object') {
-      // Batches, so never triggers inline, except for an event no batch is
-      // for, which evaluate lets through.
       if ('debounce' in b || 'judge' in b) return info.recipients !== undefined && info.recipients.length === 0;
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
@@ -4199,9 +4195,6 @@ export class EventGate {
       deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
       return;
     }
-    // An untargeted event, one with no list of recipients, is for the gate's
-    // recipients alone, as in a batch of such events; one that names its
-    // recipients, for them.
     const recipients = new Set(this.getAgentNamesFn());
     const woken = this.wokenBy(events);
     const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
@@ -4217,7 +4210,6 @@ export class EventGate {
     });
   }
 
-  /** The agents a batch of these events wakes: the recipients its events name, and the gate's recipients when any event is untargeted. */
   private wokenBy(events: readonly PendingEvent[]): Set<string> {
     const woken = new Set(events.flatMap((e) => e.recipients ?? []));
     if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);

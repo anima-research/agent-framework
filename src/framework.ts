@@ -2712,13 +2712,6 @@ interface FrameworkWriteOptions {
   suppressedBy?: { rule: string; eventType: string; source?: string };
 }
 
-/**
- * The metadata a write through addMessage is stored with: the marks only
- * the framework sets dropped from what its caller gave, and a suppress
- * rule's record stamped where its lane names one. The wake check of a
- * module's response (applyProcessResponse) reads each write's metadata
- * through it too, so it judges what's stored.
- */
 function metadataAsStored(metadata: MessageMetadata | undefined, opts?: FrameworkWriteOptions): MessageMetadata | undefined {
   // `deferredWriteId` is the framework's: a write an earlier release left
   // queued is stored under its own (the importer's `imported`), and a later
@@ -19603,12 +19596,6 @@ export class AgentFramework {
           ? this.registry.untargetedRecipients()
           : response.requestInference;
       const triggered = targetAgents.filter((name) => this.agents.get(name)?.canBeTriggeredBy(source) === true);
-      // A named agent is woken only if the response stores no message, or one
-      // its view shows: a message held from the residents is out of a
-      // resident's view and in a subconscious's, so a resident it alone was
-      // for would wake to nothing new, and a batch's line would quote it.
-      // Each is read as addMessage stores it (metadataAsStored): with no
-      // suppress rule's record here, and none a response's message carried.
       const asStored = written.map((metadata) => metadataAsStored(metadata));
       const sees = (name: string): boolean => {
         const agent = this.agents.get(name);

@@ -198,7 +198,6 @@ function inWhile(at: number | undefined, now: number): string {
  * of them, so the empty case says so.
  */
 export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number): string {
-  // Only what wakes this agent: a wake that names its agents may be another's.
   const sorted = wakes.filter((w) => w.agents === undefined || w.agents.includes(agentName))
     .sort((a, b) => (a.at ?? now) - (b.at ?? now));
   const lines = sorted.slice(0, 8).map((w) => `- ${inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${w.what}`);
