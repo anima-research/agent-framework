@@ -7,7 +7,7 @@
   answer could go wherever the turn's plain speech went otherwise: a focused
   channel, the latest inbound channel, the lock, or the locus of a room's turn
   that heard the message. A turn is private while such a message is unanswered
-  or is the newest channel or surface message in its window. Only a round of
+  or no channel's message in its window is newer. Only a round of
   the agent's that writes words and calls no tool answers it, so an answer
   given only through a tool, such as a send, leaves it unanswered, and so does
   a row under the agent's name that a module stored from outside

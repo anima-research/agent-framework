@@ -1468,8 +1468,9 @@ interface TurnRouting {
    * are told. Its plain speech with no destination of its own (a `>>` or
    * `>>>` target, a re-pin, the agent's channel_open) is held as a draft the
    * agent can resend, in every routing mode, rather than posted where the
-   * latest inbound message came from; and a bounce of its speech requests no
-   * wake, so a heartbeat can't start a loop of turns.
+   * latest inbound message came from, unless the turn is private: then that
+   * speech goes to no channel and isn't held. And a bounce of its speech
+   * requests no wake, so a heartbeat can't start a loop of turns.
    */
   heartbeat?: true;
   unprompted?: true;
@@ -1479,7 +1480,8 @@ interface TurnRouting {
    * agent's prose lock, taken when the turn opens, and only prose_locus moves
    * it. No incoming message, re-pin, heartbeat or channel_open does. A turn
    * locked to drafts has no locus, takes no fallback (activeChannelResolver's
-   * null), and holds its plain speech as drafts.
+   * null), and holds its plain speech as drafts, unless it's private: then its
+   * plain speech goes to no channel.
    */
   locked?: true;
   /** Locked mode: a stream of the turn routes its prose only at its end (no verbatim round content, membrane's XML tool path). */
@@ -25360,7 +25362,8 @@ export class AgentFramework {
     const key = destinationKey(channel);
     if (sameChannel(channel, pin) || routing.addressedElsewhere.has(key)) return undefined;
     // A locked turn's speech stays where it is past this turn too, so the
-    // notice doesn't say "this turn" of it.
+    // notice doesn't say "this turn" of it, unless the turn is private: a
+    // private turn's goes to no channel for this turn only.
     const where = pin
       ? `still lands in ${this.channelShown(pin)}`
       : routing.locked && !routing.private ? 'is held as drafts' : 'stays in your archive (no channel)';
