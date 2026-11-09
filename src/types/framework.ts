@@ -642,7 +642,9 @@ export type ErrorAction =
       /** What the policy retries the failure as, such as `overloaded` or
        *  `rate_limited` (DefaultErrorPolicy says membrane's class). Shown,
        *  not acted on: the wait reports it in `healthSnapshot()` and on
-       *  `inference:waiting`. A policy that leaves it out is shown without it. */
+       *  `inference:waiting`, a longer one than 128 characters as its start
+       *  and end around a note of how much was left out. A policy that leaves
+       *  it out is shown without it. */
       retryClass?: string;
       /** The most tries that class allows the turn, counted as the wait's
        *  `nextTry` counts them, the first included, and shown beside it when

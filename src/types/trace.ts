@@ -144,10 +144,13 @@ export type TraceEvent =
        *  this field. */
       nextTry?: number;
       /** The most tries the error policy allows (ErrorAction.maxTries), when it
-       *  says so as a positive whole number. */
+       *  says so as a positive whole number. A turn re-armed after it ran out of
+       *  tries ends at its second deadline expiry with no completed round
+       *  between them, whatever this says. */
       maxTries?: number;
       /** What the error policy retries the failure as (ErrorAction.retryClass),
-       *  such as `overloaded`, when it says. */
+       *  such as `overloaded`, when it says. A longer one than 128 characters
+       *  is shown as its start and end around a note of how much was left out. */
       retryClass?: string;
     })
   | (TraceEventBase & {
