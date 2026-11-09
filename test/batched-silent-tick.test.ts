@@ -131,7 +131,7 @@ describe('a silent tick batched by a gate rule', () => {
     }
   });
 
-  it('of two ticks batched alone, wakes as the newer', async () => {
+  it("of two ticks batched alone, wakes as the batch's last", async () => {
     const { f } = await batching();
     try {
       tick(f, 'older');
