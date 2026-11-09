@@ -1214,8 +1214,9 @@ export class TuneOutCoordinator {
    * runDeferredCancels runs them sooner.
    */
   private deferredRetry: ReturnType<typeof setTimeout> | undefined;
-  /** Timer key for the scope's cadence and expiry. */
-  private static readonly SCOPE_KEY = '\0all-except';
+  /** Timer key for the scope's cadence and expiry; never a channel's key,
+   *  which starts with `[`. */
+  private static readonly SCOPE_KEY = 'all-except';
 
   constructor(
     private readonly channelRegistry: ChannelRegistry,
@@ -1223,8 +1224,15 @@ export class TuneOutCoordinator {
     private readonly hooks: TuneOutFrameworkHooks,
   ) {}
 
+  /** A channel's key in the coordinator's maps and its stored last looks.
+   *  The store refuses an object key holding a NUL, so no separator: the
+   *  pair as JSON, which no server or channel id can make ambiguous. */
   private key(serverId: string, channelId: string): string {
-    return `${serverId}\0${channelId}`;
+    return JSON.stringify([serverId, channelId]);
+  }
+
+  private channelOf(key: string): [string, string] {
+    return JSON.parse(key) as [string, string];
   }
 
   /** The readers' hand-off bookkeeping's key: one epoch's reading of one channel. */
@@ -1367,7 +1375,7 @@ export class TuneOutCoordinator {
       if (!held.has(key) && this.holdFor(meta.serverId ?? '', meta.channelId)?.epochId === epochId) held.add(key);
     }
     for (const key of held) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
+      const [serverId, channelId] = this.channelOf(key);
       this.rebuildTally(serverId, channelId);
     }
     this.pruneLooks();
@@ -1481,7 +1489,7 @@ export class TuneOutCoordinator {
   private anchorSubconscious(occasion: 'enter' | 'resume' = 'enter'): void {
     const active = this.activeStarts();
     if (active.length === 0) return;
-    const sequence = Math.min(...active.map((e) => e.sequence));
+    const sequence = active.reduce((min, e) => Math.min(min, e.sequence), Infinity);
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
     const kept = this.ordinalsKept();
     const read = kept ? this.readWindowState() : { starts: {} };
@@ -3186,10 +3194,16 @@ export class TuneOutCoordinator {
    * of the record reads them in first (lossRecordUnread), and writes this
    * run's kept ones there too; where this run keeps any, that write is
    * made here, before the marker, and the last stop's bound is judged by
-   * the destination's record (carriedNeeded). Never throws.
+   * the destination's record (carriedNeeded). The subconscious's last
+   * looks are read again too, so the next look reads the destination's
+   * record (lastLooks), unless `sameBranch` says the store switched to the
+   * branch it was on, as a refusing manager's recovery does: no branch
+   * moved, and the cache keeps any look a refused write held only there.
+   * Never throws.
    */
-  branchMoved(): void {
+  branchMoved(sameBranch = false): void {
     if (this.stopped) return;
+    if (!sameBranch) this.lastLooksCache = undefined;
     try {
       const branch = this.branchNow();
       if (branch !== undefined && this.runStarts.has(branch)) {
@@ -4512,7 +4526,7 @@ export class TuneOutCoordinator {
         // One look per held channel with new traffic since the last look.
         for (const [channelKey, diverted] of this.divertedSinceInvocation) {
           if (diverted <= 0) continue;
-          const [serverId, channelId] = channelKey.split('\0') as [string, string];
+          const [serverId, channelId] = this.channelOf(channelKey);
           if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue; // a per-channel epoch's own cadence
           this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
         }
@@ -4686,7 +4700,7 @@ export class TuneOutCoordinator {
     this.writeScope(null);
     this.clearScopeTimers();
     for (const [key, pending] of this.pendingWakes) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
+      const [serverId, channelId] = this.channelOf(key);
       if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
       clearTimeout(pending.timer);
       this.pendingWakes.delete(key);
@@ -4730,7 +4744,7 @@ export class TuneOutCoordinator {
       }
     }
     for (const key of this.divertedSinceInvocation.keys()) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
+      const [serverId, channelId] = this.channelOf(key);
       if (!this.channelRegistry.getTuneOutState(serverId, channelId)) this.divertedSinceInvocation.delete(key);
     }
     this.dropHandOffs(epochId);
@@ -5149,14 +5163,17 @@ export class TuneOutCoordinator {
     this.writeLooks(rest);
   }
 
-  /** At boot: the last looks of epochs no longer active go. */
   private pruneLooks(): void {
     if (this.hooks.subconsciousName() == null) return;
     const looks = this.lastLooks();
     if (!looks) return;
-    const active = new Set(this.listActive().map((e) => e.params.epochId));
-    const scope = this.getAllExcept();
-    if (scope) active.add(scope.params.epochId);
+    let active: Set<string>;
+    try {
+      active = new Set(this.holdsOnRecord().map((hold) => hold.epochId));
+    } catch (err) {
+      console.error(`[tune-out] the holds on record could not be read, so the subconscious's last looks are all kept: ${thrownReason(err)}`);
+      return;
+    }
     const kept = Object.fromEntries(Object.entries(looks).filter(([epochId]) => active.has(epochId)));
     if (Object.keys(kept).length !== Object.keys(looks).length) this.writeLooks(kept);
   }
@@ -5181,7 +5198,7 @@ export class TuneOutCoordinator {
     if (trigger === 'cadence' && backlog.length === 0) return false;
     // The cursor only moves forward: a returned row handed again can be
     // behind it.
-    const cursor = Math.max(this.readerCursor.get(key) ?? -1, ...backlog.map((m) => m.sequence));
+    const cursor = backlog.reduce((max, m) => Math.max(max, m.sequence), this.readerCursor.get(key) ?? -1);
     if (backlog.length > 0) this.readerCursor.set(key, cursor);
     const returned = this.readerReturned.get(key);
     if (returned) {

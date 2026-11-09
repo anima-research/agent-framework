@@ -48,10 +48,11 @@ test('exhausted inference: stderr line + [inference-failed] chronicle marker', (
   // (1) stderr, with the underlying reason
   assert.ok(errs.some(e => e.includes('[inference-failed]') && e.includes('image exceeds 5 MB')),
     'should log the failure + reason to stderr');
-  // (2) agent-facing chronicle marker carrying the reason, tagged for filtering
+  // (2) agent-facing chronicle marker, tagged for filtering, with the reason in its metadata only
   assert.equal(markers.length, 1);
   assert.match(markers[0].text, /\[inference-failed\]/);
-  assert.match(markers[0].text, /image exceeds 5 MB/);
+  assert.doesNotMatch(markers[0].text, /image exceeds 5 MB/);
+  assert.equal(markers[0].meta.reason, '400 image exceeds 5 MB');
   assert.equal(markers[0].meta.kind, 'inference-failed');
   assert.equal(markers[0].meta.consecutive, 1);
 });
