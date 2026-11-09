@@ -13,7 +13,7 @@ afterEach(() => {
 });
 
 /** A gate whose own recipients are `agent` and `other`, with one rule over reminders. */
-function makeGate(file: string, behavior: unknown, judge?: JudgeFn) {
+function makeGate(file: string, behavior: unknown, judge?: JudgeFn, now?: () => number) {
   const configPath = join(TMP_DIR, file);
   writeFileSync(configPath, JSON.stringify({ policies: [{ name: 'batch', match: { scope: ['clock:reminder'] }, behavior }] }));
   const lines: Array<{ text: string; audience?: readonly string[] }> = [];
@@ -28,6 +28,7 @@ function makeGate(file: string, behavior: unknown, judge?: JudgeFn) {
     requestInference: (agentName) => wakes.push(agentName),
     getAgentNames: () => ['agent', 'other'],
     ...(judge ? { judge } : {}),
+    ...(now ? { now } : {}),
   });
   return { gate, lines, wakes };
 }
@@ -77,7 +78,7 @@ describe('a batch shows each event to the agents it is for', () => {
     gate.dispose();
   });
 
-  it("asks the judge about the agents a batch wakes, shows it no event whose list of recipients is empty, and doesn't ask about a batch that wakes no one", async () => {
+  it("judges a batch as a whole, for the gate's recipients, and never with an event whose list of recipients is empty", () => {
     const requests: JudgeRequest[] = [];
     const judge: JudgeFn = async (request) => {
       requests.push(request);
@@ -88,14 +89,28 @@ describe('a batch shows each event to the agents it is for', () => {
     gate.evaluate(reminder('feed the cat', []));
     fire(gate);
     assert.equal(requests.length, 1);
-    assert.deepEqual(requests[0]!.agentNames, ['other']);
+    assert.deepEqual(requests[0]!.agentNames, ['agent', 'other']);
     assert.deepEqual(requests[0]!.events.map((e) => e.content), ['water the plants']);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    gate.evaluate(reminder('dim the lamps', []));
-    fire(gate);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(requests.length, 1, 'no judge call for a batch that wakes no one');
     assert.deepEqual(wakes, []);
+    gate.dispose();
+  });
+
+  it('an event whose list of recipients is empty joins no batch: alone it holds none, and beside one it neither joins nor restarts its quiet period', () => {
+    let clock = 1_000_000;
+    const { gate, lines, wakes } = makeGate('none.json', { debounce: 60_000 }, undefined, () => clock);
+    const held = gate as unknown as { debounceTimers: Map<string, { events: unknown[]; dueAt: number }> };
+    assert.equal(gate.evaluate(reminder('dim the lamps', [])).trigger, false);
+    assert.equal(held.debounceTimers.size, 0, 'alone, it holds no batch');
+    gate.evaluate(reminder('water the plants', ['agent']));
+    const due = held.debounceTimers.get('batch')!.dueAt;
+    clock += 30_000;
+    assert.equal(gate.evaluate(reminder('feed the cat', [])).trigger, false);
+    assert.equal(held.debounceTimers.get('batch')!.events.length, 1, "it doesn't join the batch");
+    assert.equal(held.debounceTimers.get('batch')!.dueAt, due, "it doesn't restart the batch's quiet period");
+    fire(gate);
+    assert.deepEqual(wakes, ['agent']);
+    assert.equal(lines.length, 1);
+    assert.ok(!lines[0]!.text.includes('feed the cat'));
     gate.dispose();
   });
 

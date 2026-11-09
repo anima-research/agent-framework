@@ -13,9 +13,12 @@ type Asked = string[] | true;
 class ReminderModule extends GateModule {
   override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'clock:reminder') return {};
-    const reminder = event as unknown as { content: string; agents: Asked };
+    const reminder = event as unknown as { content: string; agents: Asked; held?: boolean };
     return {
-      addMessages: [{ participant: 'user', content: [{ type: 'text', text: reminder.content }] }],
+      addMessages: [{
+        participant: 'user', content: [{ type: 'text', text: reminder.content }],
+        ...(reminder.held ? { metadata: { tuneOut: { epochId: 'e1' } } } : {}),
+      }],
       requestInference: reminder.agents,
     };
   }
@@ -40,18 +43,17 @@ async function setup(agents: unknown[], policies: GatePolicy[] = BATCH) {
   return { f, module, turns, off };
 }
 
-const remind = (f: Fixture, content: string, agents: Asked) =>
-  f.framework.pushEvent({ type: 'clock:reminder', source: 'clock', content, agents } as unknown as ProcessEvent);
+const remind = (f: Fixture, content: string, agents: Asked, held = false) =>
+  f.framework.pushEvent({ type: 'clock:reminder', source: 'clock', content, agents, held } as unknown as ProcessEvent);
 
 const gateOf = (f: Fixture) =>
   (f.framework as unknown as { eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>; fireDebounce(name: string): void } }).eventGate;
 
 /** Fires the batch the debounce rule holds. */
-function fire(f: Fixture, events: number): void {
+function fire(f: Fixture): void {
   const gate = gateOf(f);
-  assert.equal(gate.debounceTimers.size, 1, 'premise: the debounce rule holds the reminders');
+  assert.equal(gate.debounceTimers.size, 1, 'premise: the debounce rule holds a batch');
   for (const [name, state] of gate.debounceTimers) {
-    assert.equal(state.events.length, events, 'premise: the batch holds every reminder');
     clearTimeout(state.timer);
     gate.fireDebounce(name);
   }
@@ -87,7 +89,7 @@ describe("a debounced module event wakes the agents its response asked inference
     try {
       remind(f, 'water the plants', ['agent']);
       await f.framework.runUntilIdle();
-      fire(f, 1);
+      fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual(turns, ['agent']);
       assert.ok(JSON.stringify(f.membrane.calls[0]).includes('water the plants'), "the resident it's for is woken with it");
@@ -102,7 +104,7 @@ describe("a debounced module event wakes the agents its response asked inference
     try {
       remind(f, 'water the plants', ['agent', 'other']);
       await f.framework.runUntilIdle();
-      fire(f, 1);
+      fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual(turns, ['agent']);
     } finally { off(); await f.close(); }
@@ -114,7 +116,7 @@ describe("a debounced module event wakes the agents its response asked inference
       remind(f, 'water the plants', []);
       remind(f, 'dim the lamps', ['agent']);
       await f.framework.runUntilIdle();
-      fire(f, 2);
+      fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual(turns, ['agent']);
       const lines = rows(f, '[Gate:');
@@ -130,8 +132,8 @@ describe("a debounced module event wakes the agents its response asked inference
       const job = await isolatedJob(f, module);
       remind(f, 'water the plants', ['worker-1']);
       remind(f, 'dim the lamps', ['agent']);
-      await eventually(() => gateOf(f).debounceTimers.get('batch')?.events.length === 2, 'the debounce rule holds both reminders');
-      fire(f, 2);
+      await eventually(() => rows(f, 'water the plants').length > 0 && rows(f, 'dim the lamps').length > 0, 'both reminders are stored');
+      fire(f);
       await job.done();
       assert.deepEqual(turns, ['worker-1', 'agent']);
       const lines = rows(f, '[Gate:');
@@ -145,12 +147,28 @@ describe("a debounced module event wakes the agents its response asked inference
     }
   });
 
+  it('a request whose message is held from the residents is shown to no one in its batch, beside one for a resident', async () => {
+    const { f, turns, off } = await setup([resident('agent'), resident('other')]);
+    try {
+      remind(f, 'water the plants', ['agent'], true);
+      remind(f, 'dim the lamps', ['agent']);
+      await f.framework.runUntilIdle();
+      fire(f);
+      await f.framework.runUntilIdle();
+      assert.deepEqual(turns, ['agent']);
+      const lines = rows(f, '[Gate:');
+      assert.equal(lines.length, 1);
+      assert.ok(JSON.stringify(lines[0]!.content).includes('dim the lamps'));
+      assert.ok(!JSON.stringify(lines[0]!.content).includes('water the plants'));
+    } finally { off(); await f.close(); }
+  });
+
   it('a request for every agent (true) is batched as before: the batch wakes every resident, and its line is stored as a write that names no agent', async () => {
     const { f, turns, off } = await setup([resident('agent'), resident('other')]);
     try {
       remind(f, 'water the plants', true);
       await f.framework.runUntilIdle();
-      fire(f, 1);
+      fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual([...turns].sort(), ['agent', 'other']);
       const lines = rows(f, '[Gate:');
