@@ -8,8 +8,8 @@
  * framework fails to load on. 0.25.1 is the first with `noteThinkingDropped`,
  * which the framework calls when the provider sets aside a stored reply's
  * thinking. Its floor is 0.27.0, the first release whose membrane range is
- * this package's (`^0.8.0 || ^0.9.0 || ^0.10.0`): 0.25.1 and 0.26.0 refuse
- * membrane 0.10.0, so a host on it would get a second membrane under them. So
+ * this package's (`^0.8.0 || ^0.9.0 || ^0.10.0`): 0.25.1's and 0.26.0's stop at
+ * 0.9, so beside a host's membrane 0.10 npm nests a 0.9.0 under them. So
  * each caret range of its union starts at 0.27.0 or later, and the range
  * admits 0.27.0 itself, the release the changelog names.
  * chronicle's range takes only a release with the identity-stamped batched
@@ -126,7 +126,7 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.throws(() => startsAt('^0.26.0', '0.25.0', 'x'), /admits x 0\.25\.0/);
   });
 
-  it("takes context-manager only at a release with the window APIs, noteThinkingDropped and this package's membrane range: not main's 0.23.0 or 0.24.0, which have no window APIs, 0.25.0, which can't be told of a set-aside reply, or 0.25.1 and 0.26.0, which refuse membrane 0.10.0", (t) => {
+  it("takes context-manager only at a release with the window APIs, noteThinkingDropped and this package's membrane range: not main's 0.23.0 or 0.24.0, which have no window APIs, 0.25.0, which can't be told of a set-aside reply, or 0.25.1 and 0.26.0, whose membrane range stops at 0.9", (t) => {
     const range = ours.dependencies?.['@animalabs/context-manager'];
     assert.ok(range, 'agent-framework depends on context-manager');
     for (const published of ['0.23.0', '0.24.0']) {
@@ -135,7 +135,7 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     }
     assert.equal(admits(range, '0.25.0'), false, `${range} admits context-manager 0.25.0, published without noteThinkingDropped`);
     for (const published of ['0.25.1', '0.26.0']) {
-      assert.equal(admits(range, published), false, `${range} admits context-manager ${published}, whose membrane range refuses 0.10.0`);
+      assert.equal(admits(range, published), false, `${range} admits context-manager ${published}, whose membrane range stops at 0.9`);
     }
     startsAt(range, '0.27.0', 'context-manager');
     const proto = ContextManager.prototype as unknown as Record<string, unknown>;

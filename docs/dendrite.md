@@ -388,7 +388,7 @@ Two costs are not removed:
 |---|---|---|
 | `@animalabs/chronicle` with `JsStore.view` and `createBranchWithStates` | Shared inheritance, live snapshots | `deriveAgent` shared mode and live `inspectAgentContext` throw; everything else works |
 | `@animalabs/context-manager` with `ContextManager.derive` and `reopenDerived` | The same, plus resuming a fork | The same |
-| `@animalabs/context-manager` `^0.27.0`, with `ContextManager.presentRows` and `noteThinkingDropped` | Every agent's window (#291), leaving out thinking the provider dropped, and one membrane shared with a host on membrane 0.10 | `create()` refuses to start on 0.25.0 and earlier: 0.23.x and 0.24.x have no window index, and 0.25.0 has no `noteThinkingDropped`. 0.25.1 and 0.26.0 start, but refuse membrane 0.10, so beside a host's 0.10 an install holds a second membrane |
+| `@animalabs/context-manager` `^0.27.0`, with `ContextManager.presentRows` and `noteThinkingDropped` | Every agent's window (#291), leaving out thinking the provider dropped, and one membrane shared with a host on membrane 0.10 | `create()` refuses to start on 0.25.0 and earlier: 0.23.x and 0.24.x have no window index, and 0.25.0 has no `noteThinkingDropped`. 0.25.1 and 0.26.0 start, but their membrane range stops at 0.9, so beside a host's 0.10 npm nests a 0.9.0 under them |
 | `@animalabs/chronicle` `^0.6.0`, with `JsStore.appendManyToStateJsonWithIdentity` | Each window write of several rows as one record | `create()` refuses the store handle; 0.5.1 and earlier have no batched append |
 
 The framework detects each package's calls at run time. The last two rows are the floors this package declares.
