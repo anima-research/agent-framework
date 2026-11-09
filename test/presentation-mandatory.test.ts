@@ -275,6 +275,33 @@ describe('presentation is mandatory (#291)', () => {
     }
   });
 
+  it("is refused where context-manager can't be told of dropped thinking, as 0.25.0 can't", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-presentation-mandatory-'));
+    dirs.push(dir);
+    const proto = ContextManager.prototype as unknown as { noteThinkingDropped?: unknown };
+    const noteThinkingDropped = proto.noteThinkingDropped;
+    proto.noteThinkingDropped = undefined;
+    try {
+      await assert.rejects(AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+        modules: [],
+      }), (error: Error) => {
+        assert.match(error.message, /ContextManager\.noteThinkingDropped/);
+        const declared = (JSON.parse(readFileSync(join(import.meta.dirname, '../../package.json'), 'utf8')) as {
+          dependencies: Record<string, string>;
+        }).dependencies['@animalabs/context-manager']!;
+        assert.ok(error.message.includes(`Install @animalabs/context-manager ${declared}, which this package declares`), error.message);
+        assert.ok(error.message.includes('0.25.0 has no noteThinkingDropped'), error.message);
+        return true;
+      });
+      assert.ok(!existsSync(join(dir, 'store.chronicle')), 'no store was made');
+    } finally {
+      proto.noteThinkingDropped = noteThinkingDropped;
+    }
+  });
+
   it('loads on context-manager 0.24.0, which has no write-outcome errors, and create() names the release to install', () => {
     // A child process whose context-manager is 0.24.0's exports
     // (helpers/context-manager-0.24.ts). The package is ESM: a named import

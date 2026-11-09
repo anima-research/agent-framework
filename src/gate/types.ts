@@ -530,6 +530,13 @@ export interface GateEventInfo {
    * that lands where no view hides suppressed rows.
    */
   suppressionAsked?: boolean;
+  /**
+   * A coalesced render, which folds its batch's every occurrence while its
+   * `tags` are the latest's (MCPL RFC-006): never taken as a `chat:system`
+   * notice, as the render's own wake isn't, so a message it folds keeps
+   * its channel when a notice came last.
+   */
+  folds?: true;
 }
 
 /** Per-policy runtime statistics (for gate:status). */
