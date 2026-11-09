@@ -172,6 +172,25 @@ test('with a window, a request that ends on the agent\'s own reply sends [Contin
   }
 });
 
+test('without a window, a request that ends on the agent\'s own reply sends [Continue], and its sample carries no messages, since the compile priced none', async () => {
+  const h = await harness();
+  try {
+    const cm = h.framework.getAgent('resident')!.getContextManager();
+    cm.addMessage('User', [{ type: 'text', text: 'hello' }]);
+    cm.addMessage('resident', [{ type: 'text', text: 'An earlier reply.' }]);
+    (h.framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests
+      .push({ agentName: 'resident', timestamp: Date.now(), reason: 'test-wake', source: 'test' });
+    await h.framework.runUntilIdle();
+    const sent = h.membrane.calls[0];
+    assert.ok(sent, 'the turn sent a request');
+    assert.deepEqual(sent.messages.at(-1)?.content, [{ type: 'text', text: CONTINUE_ROW }], 'premise: the request ends on [Continue]');
+    assert.equal(h.samples.length, 1, 'one call, one sample');
+    assert.deepEqual(h.samples[0].overhead, { system: sent.system, tools: sent.tools });
+  } finally {
+    await h.close();
+  }
+});
+
 test('with a window, a request that ends on tool results sends no trailing turn, and its sample carries none', async () => {
   const h = await harness({ physicalWindowTokens: 200_000 });
   try {

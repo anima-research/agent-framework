@@ -566,7 +566,9 @@ export interface AgentRuntimeSettingsSnapshot {
   contextBudgetTokens: number;
   /**
    * The budget compiles plan at now: the live budget, or the default when the
-   * recipe sets none (the context manager's own default is the same). It
+   * recipe sets none: the context manager's own default of 100,000, or with
+   * `physicalWindowTokens`, that default's room of 96,000 with the agent's
+   * `maxTokens` on top, as a compile plans at then. It
    * equals `contextBudgetTokens` except while a lower budget converges, when
    * it is still the budget the descent started from (context-manager #162),
    * and while a budget the agent couldn't apply is kept, when it is the

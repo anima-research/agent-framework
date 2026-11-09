@@ -2303,7 +2303,8 @@ export class Agent {
     // What the request sent beside its window: what the compile priced, with the turn it ended on as it went, and
     // none where it went without one. The provider's count, which the stream's sample is read against, has only that.
     const { messages: beside = [], ...rest } = bounds.requestOverhead;
-    const sentBeside = [...(endedOn ? [endedOn.content] : []), ...beside.filter((message) => message !== trailing)];
+    const pricedTrailing = beside.includes(trailing);
+    const sentBeside = [...(endedOn && pricedTrailing ? [endedOn.content] : []), ...beside.filter((message) => message !== trailing)];
     const requestOverhead: RequestOverhead = sentBeside.length > 0 ? { ...rest, messages: sentBeside } : rest;
     return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding, requestOverhead };
   }
