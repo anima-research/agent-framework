@@ -164,7 +164,7 @@ class SequentialStreamMembrane extends MockMembrane {
 
 interface Internal {
   budgetHoldRecheckMs: number;
-  budgetHolds: Map<string, { turn?: unknown; startedAt: number; waitSince: number; wakes: Array<{ reason?: string }> }>;
+  budgetHolds: Map<string, { turn?: unknown; startedAt: number; wait: { since: number }; wakes: Array<{ reason?: string }> }>;
   quiesced: boolean;
   activeTurnTokens: Map<string, number>;
   pendingRequests: Array<Record<string, unknown>>;
@@ -559,8 +559,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => c.refusals >= 3 && t.internal.budgetHolds.has('prime')), 'released starts were refused again');
         const hold = t.internal.budgetHolds.get('prime')!;
         const wait = (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!;
-        wait.since -= 180_000;
-        hold.waitSince -= 180_000;
+        assert.equal(hold.wait, wait, 'the hold keeps the wait its turn carries');
+        hold.wait.since -= 180_000;
         const refused = c.refusals;
         assert.ok(await pollUntil(() => c.refusals >= refused + 2), 'and again, each hold taking the first one\'s start from its request');
         c.fitAt = c.ticks;
@@ -590,8 +590,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.send('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         const hold = t.internal.budgetHolds.get('prime')!;
-        (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!.since -= 180_000;
-        hold.waitSince -= 180_000;
+        hold.wait.since -= 180_000;
         const stream = t.membrane.streamYielding.bind(t.membrane);
         let limited = false;
         t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
@@ -610,7 +609,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
         t.internal.releaseProviderAccelerationCooldown('prime');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 2), 'the retry was refused for budget, and waits');
-        assert.ok(t.internal.budgetHolds.get('prime')!.waitSince > hold.waitSince + 120_000, 'in a wait of its own');
+        assert.ok(t.internal.budgetHolds.get('prime')!.wait.since > hold.wait.since + 120_000, 'in a wait of its own');
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
@@ -634,8 +633,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.sendForPrime('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         const hold = t.internal.budgetHolds.get('prime')!;
-        (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!.since -= 180_000;
-        hold.waitSince -= 180_000;
+        hold.wait.since -= 180_000;
         const stream = t.membrane.streamYielding.bind(t.membrane);
         let limited = false;
         t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
@@ -665,7 +663,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
         t.internal.releaseProviderAccelerationCooldown('prime');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 2), 'the retry was refused for budget, and waits');
-        assert.ok(t.internal.budgetHolds.get('prime')!.waitSince > hold.waitSince + 120_000, 'in a wait of its own');
+        assert.ok(t.internal.budgetHolds.get('prime')!.wait.since > hold.wait.since + 120_000, 'in a wait of its own');
         assert.equal(t.alerts('context-refusal').length, 2, 'with its own open alert');
       } finally {
         await t.close();
@@ -1861,8 +1859,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.sendForPrime('go');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         const hold = t.internal.budgetHolds.get('prime')!;
-        (hold.turn as Record<symbol, { since: number }>)[symbolNamed(hold.turn as object, 'budget-wait')]!.since -= 180_000;
-        hold.waitSince -= 180_000;
+        hold.wait.since -= 180_000;
         refuse = true;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
@@ -1876,7 +1873,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.readyAt = Infinity;
         t.send('later');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 2));
-        assert.ok(t.internal.budgetHolds.get('prime')!.waitSince > hold.waitSince + 120_000, 'the new hold starts its own wait');
+        assert.ok(t.internal.budgetHolds.get('prime')!.wait.since > hold.wait.since + 120_000, 'the new hold starts its own wait');
         assert.equal(notesInWindow(t), 0, "the dropped start's note, which no request carried, left the window at the new hold");
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
@@ -2268,7 +2265,7 @@ describe("the hold's note is stored at its release, where its turn's request rea
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         const hold = t.internal.budgetHolds.get('prime')!;
         const held = hold.turn!;
-        hold.waitSince = Date.now() - 3_000;
+        hold.wait.since = Date.now() - 3_000;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         const releasing = Date.now();
@@ -2280,7 +2277,7 @@ describe("the hold's note is stored at its release, where its turn's request rea
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
         const note = t.rows().map((r) => JSON.stringify(r.content)).find((b) => b.includes('[budget-hold]'));
         const waited = Number(/That turn waited (\d+) s\./.exec(String(note))?.[1]);
-        assert.ok(waited >= Math.round((releasing - hold.waitSince) / 1000) && waited <= Math.round((releasedAt - hold.waitSince) / 1000),
+        assert.ok(waited >= Math.round((releasing - hold.wait.since) / 1000) && waited <= Math.round((releasedAt - hold.wait.since) / 1000),
           `the figure is the wait to the release, not the 2.5 s after it: ${note}`);
       } finally {
         await t.close();
@@ -2296,7 +2293,7 @@ describe("the hold's note is stored at its release, where its turn's request rea
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         await t.framework.quiesce({ timeoutMs: 2_000 });
         const hold = t.internal.budgetHolds.get('prime')!;
-        hold.waitSince = Date.now() - 3_000;
+        hold.wait.since = Date.now() - 3_000;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         await new Promise((r) => setTimeout(r, 2_500));
@@ -2306,7 +2303,7 @@ describe("the hold's note is stored at its release, where its turn's request rea
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
         const note = t.rows().map((r) => JSON.stringify(r.content)).find((b) => b.includes('[budget-hold]'));
         const waited = Number(/That turn waited (\d+) s\./.exec(String(note))?.[1]);
-        assert.ok(waited >= 5 && waited <= Math.round((releasedAt - hold.waitSince) / 1000), `the figure runs to the release at resume(), the quiesce in it: ${note}`);
+        assert.ok(waited >= 5 && waited <= Math.round((releasedAt - hold.wait.since) / 1000), `the figure runs to the release at resume(), the quiesce in it: ${note}`);
       } finally {
         await t.close();
       }
@@ -2368,12 +2365,12 @@ describe("the hold's note is stored at its release, where its turn's request rea
       const figures: Array<[number, number]> = [];
       const releaseAfter = (waitedMs: number) => {
         const hold = t.internal.budgetHolds.get('prime')!;
-        hold.waitSince = Date.now() - waitedMs;
+        hold.wait.since = Date.now() - waitedMs;
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         const releasing = Date.now();
         t.internal.releaseBudgetHold('prime');
-        figures.push([Math.round((releasing - hold.waitSince) / 1000), Math.round((Date.now() - hold.waitSince) / 1000)]);
+        figures.push([Math.round((releasing - hold.wait.since) / 1000), Math.round((Date.now() - hold.wait.since) / 1000)]);
       };
       try {
         t.send('one');

@@ -3098,7 +3098,7 @@ interface BudgetHoldBaseline {
 
 interface BudgetHold {
   startedAt: number;
-  waitSince: number;
+  wait: BudgetWait;
   turn: InferenceRequest;
   standsOn: string[];
   wakes: InferenceRequest[];
@@ -3108,12 +3108,10 @@ interface BudgetHold {
   actual: number | undefined;
   recheck?: ReturnType<typeof setInterval>;
   managerCalls: number;
-  callsAtHold: number;
   progressAtHold: string | undefined;
   settingsAtHold: number;
   checkQueued?: boolean;
   drainKicked?: boolean;
-  alerted?: true;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -7434,7 +7432,7 @@ export class AgentFramework {
     const figures = error as Error & { budget?: unknown; actual?: unknown };
     const hold: BudgetHold = {
       startedAt,
-      waitSince: wait.since,
+      wait,
       turn,
       standsOn,
       wakes: [],
@@ -7443,8 +7441,6 @@ export class AgentFramework {
       budget: typeof figures.budget === 'number' ? figures.budget : undefined,
       actual: typeof figures.actual === 'number' ? figures.actual : undefined,
       managerCalls: 0,
-      callsAtHold: 0,
-      ...(wait.alerted ? { alerted: true } : {}),
       progressAtHold: baseline ? baseline.progress : this.compressionProgressOf(agent),
       settingsAtHold: baseline ? baseline.settings : agent.contextSettingsChanges(),
     };
@@ -7468,13 +7464,12 @@ export class AgentFramework {
     }
     if (!wait.alerted) {
       wait.alerted = true;
-      hold.alerted = true;
       this.opsAlert('context-refusal', agent.name, this.budgetHoldOpenText(hold), {
         skipLog: true,
-        key: String(hold.waitSince),
+        key: String(hold.wait.since),
         data: {
           errorType,
-          since: hold.waitSince,
+          since: hold.wait.since,
           ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
           ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
         },
@@ -7572,7 +7567,7 @@ export class AgentFramework {
     const progress = this.compressionProgressOf(agent);
     if (progress !== undefined && hold.progressAtHold !== undefined) return progress !== hold.progressAtHold;
     if (progress !== undefined) hold.progressAtHold = progress;
-    return hold.managerCalls !== hold.callsAtHold;
+    return hold.managerCalls !== 0;
   }
 
   private compressionProgressOf(agent: Agent): string | undefined {
@@ -7619,7 +7614,7 @@ export class AgentFramework {
       ? ` (${hold.actual.toLocaleString('en-US')} tokens against ${hold.budget.toLocaleString('en-US')})`
       : '';
     const text = `[budget-hold] Your context didn't fit its budget${size} when a turn came to start. ` +
-      `That turn waited ${describeWait(Date.now() - hold.waitSince)}.`;
+      `That turn waited ${describeWait(Date.now() - hold.wait.since)}.`;
     const row = asStoredRow({ namespace: BUDGET_HOLD_NOTE_NAMESPACE, position: 'afterUser', content: [{ type: 'text', text }] });
     const mark: StoredInjectionMark = { agent: agent.name, namespace: row.namespace, contentHash: unitHash([row]), part: 0, parts: 1 };
     try {
@@ -7640,15 +7635,15 @@ export class AgentFramework {
     const waitedMs = Date.now() - hold.startedAt;
     console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms`);
     this.emitTrace({ type: 'inference:hold_ended', agentName, outcome, waitedMs });
-    if (outcome === 'released' || !hold.alerted) return;
-    const waitedFor = Date.now() - hold.waitSince;
+    if (outcome === 'released' || !hold.wait.alerted) return;
+    const waitedFor = Date.now() - hold.wait.since;
     const after = describeWait(waitedFor);
     const words = outcome === 'removed'
       ? `what the waiting turn was for was removed or taken out of its window after ${after}, so its waiting start doesn't run`
       : `the waiting turn was stopped after ${after}, so its waiting start doesn't run`;
     this.opsAlert('context-refusal-clear', agentName, words, {
       skipLog: true,
-      key: String(hold.waitSince),
+      key: String(hold.wait.since),
       data: { outcome, waitedMs: waitedFor },
     });
   }

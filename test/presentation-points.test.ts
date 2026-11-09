@@ -702,7 +702,7 @@ describe('presentation points (#291)', () => {
     const real = h.internals.conversationRouter;
     h.internals.conversationRouter = { expired: () => [], unbind: () => {}, getBinding: () => undefined, closurePrompt: 'the conversation is closing' };
     h.internals.closingConversationAgents.add('fork-room');
-    h.internals.budgetHolds.set('fork-room', { startedAt: Date.now(), waitSince: Date.now(), turn: { agentName: 'fork-room', reason: 'conversation:closure', source: 'test', timestamp: Date.now() }, standsOn: [], wakes: [] });
+    h.internals.budgetHolds.set('fork-room', { startedAt: Date.now(), wait: { since: Date.now() }, turn: { agentName: 'fork-room', reason: 'conversation:closure', source: 'test', timestamp: Date.now() }, standsOn: [], wakes: [] });
     try {
       h.internals.lastConversationSweep = 0;
       h.internals.sweepExpiredConversations();
