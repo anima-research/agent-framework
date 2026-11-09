@@ -400,8 +400,9 @@ export interface UpcomingWake {
   /** False when it only may wake the agent: a judge rule's batch goes to the
    *  judge then, and a debounced batch whose events delivery gives the agent
    *  each have a message of its own written to its window
-   *  (WakeProvenance.writes), or a queued wake that reads a row, starts no
-   *  turn once the agent has read and answered them. */
+   *  (WakeProvenance.writes), or a queued wake that reads rows, or a start
+   *  merged from wakes that each read rows, starts no turn once the agent
+   *  has read and answered them. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
