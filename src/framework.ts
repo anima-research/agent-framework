@@ -10945,10 +10945,13 @@ export class AgentFramework {
    * and releases. The row is the recipient's when it
    * names that agent as the one it is for (`dendrite.to`); one stored before
    * mail named its recipient counts for an agent its audience names, so a
-   * slot's observer isn't woken for a resident's mail. Mail whose sender
-   * asked for no wake (sendAgentMessage's `wake: false`, recorded on the row
-   * as `dendrite.wake: false`) asks for none; reconcile's redelivery of held
-   * mail doesn't ask, as the registry doesn't record it. Mail an earlier
+   * slot's observer isn't woken for a resident's mail. A held result's
+   * notice (tellResultHeld) stands for its mail, and its wake was asked in
+   * memory too, so an owed one asks again, as `agent-result-held:<sender>`.
+   * Mail whose sender asked for no wake (sendAgentMessage's `wake: false`,
+   * recorded on the row as `dendrite.wake: false`) asks for none;
+   * reconcile's redelivery of held mail doesn't ask, as the registry
+   * doesn't record it. Mail an earlier
    * release left queued records no such ask (that release didn't queue
    * it), so it is woken for whatever its sender asked, where main asked no
    * boot wake for any queued mail.
@@ -10974,7 +10977,13 @@ export class AgentFramework {
         continue;
       }
       for (const row of rows) {
-        const stamp = (row.metadata as { dendrite?: { mailId?: unknown; kind?: unknown; to?: unknown; from?: { agent?: unknown }; wake?: unknown } } | undefined)?.dendrite;
+        const stamp = (row.metadata as { dendrite?: { mailId?: unknown; kind?: unknown; to?: unknown; from?: { agent?: unknown }; wake?: unknown; event?: unknown; agent?: unknown } } | undefined)?.dendrite;
+        if (stamp?.event === 'result-held' && stamp.to === agent.name && typeof stamp.agent === 'string') {
+          const reason = `agent-result-held:${stamp.agent}`;
+          if (this.pendingRequests.some((r) => r.agentName === agent.name && r.reason === reason)) continue;
+          this.pendingRequests.push({ agentName: agent.name, reason, source: 'dendrite', timestamp: Date.now() });
+          continue;
+        }
         if (typeof stamp?.mailId !== 'string' || stamp.wake === false) continue;
         if (stamp.to === undefined ? audienceOf(row.metadata)?.audience.includes(agent.name) === false : stamp.to !== agent.name) continue;
         const reason = `agent-${String(stamp.kind ?? 'message')}:${String(stamp.from?.agent ?? '')}`;
@@ -12994,34 +13003,48 @@ export class AgentFramework {
   /**
    * An ended orphan's result held for a recipient that is gone: its first
    * adoption candidate is told it exists and how it arrives, since nothing
-   * else would surface it (reparentAgent delivers it).
+   * else would surface it (reparentAgent delivers it). The notice wakes the
+   * candidate, as delivered mail wakes its recipient, for the row it wrote:
+   * nothing else wakes an agent at the moment a result is held.
    */
   private tellResultHeld(sender: AgentRecord, mailId: string): void {
     const candidate = sender.orphaned?.candidates[0];
     if (!candidate || !this.announceOrphans) return;
-    this.lifecycleNotice(
+    const placement: WritePlacement = {};
+    const told = this.lifecycleNotice(
       candidate,
       `[${NOTICE_TAG.agentLifecycle}: "${sender.name}" has ended after ${sender.orphaned!.formerParent.agent} did, ` +
         `so its result has nowhere to go. The result is held; reparenting "${sender.name}" to you delivers it.]`,
       // `heldMailId`, not `mailId`: a row carrying dendrite.mailId is read
       // as that mail having landed, which would release it.
       { event: 'result-held', agent: sender.name, heldMailId: mailId, formerParent: sender.orphaned!.formerParent },
+      placement,
     );
+    if (!told) return;
+    this.pendingRequests.push({
+      agentName: candidate,
+      reason: `agent-result-held:${sender.name}`,
+      source: 'dendrite',
+      timestamp: Date.now(),
+      ...this.readsRowFor(placement, candidate),
+    });
   }
 
   /**
    * A host-framed lifecycle fact in an agent's context. Never voiced as
    * anyone. Its `dendrite` detail names the agent it is for (`to`), as mail's
-   * does.
+   * does. Writes nothing, and returns false, for an agent that isn't running;
+   * `placement` learns where the row went.
    */
-  private lifecycleNotice(agentName: string, text: string, detail: Record<string, unknown>): void {
-    if (!this.agents.has(agentName)) return;
+  private lifecycleNotice(agentName: string, text: string, detail: Record<string, unknown>, placement?: WritePlacement): boolean {
+    if (!this.agents.has(agentName)) return false;
     this.addMessage(
       'user',
       [{ type: 'text', text }],
       { system: true, kind: 'agent-lifecycle', dendrite: { ...detail, to: agentName } } as MessageMetadata,
-      { forAgent: agentName },
+      { forAgent: agentName, ...(placement ? { placement } : {}) },
     );
+    return true;
   }
 
   /**
