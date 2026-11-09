@@ -88,7 +88,7 @@ import {
 
 import { HeldStderr, STDERR_END_WAIT_MS, StdioTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr } from './server-connection.js';
-import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_HTTP_PROTOCOL_VERSIONS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, logDroppedLine, maskedError, noteDialSent, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_HTTP_PROTOCOL_VERSIONS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, connectionEnded, describeCredentialError, endedTooSoon, logDroppedLine, maskedError, noteDialSent, reconnectDelay, reconnectTimings, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 import { boundedForLog } from './errors.js';
 import { logDetail, logValue, logValueRedacted, loggedCode } from './log-value.js';
@@ -688,8 +688,7 @@ export class ModernMcpConnection extends EventEmitter {
     }
     this.transportKind = binding.transport === 'http' ? 'http' : 'stdio';
     this.reconnectEnabled = config.reconnect === true;
-    this.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
-    this.reconnectMaxIntervalMs = config.reconnectMaxIntervalMs ?? 300_000;
+    ({ intervalMs: this.reconnectIntervalMs, maxIntervalMs: this.reconnectMaxIntervalMs } = reconnectTimings(config));
     // An 'error' with no listener would throw out of an SDK callback and take
     // the host down; out-of-band errors here are diagnostics, never fatal.
     this.on('error', (error: Error) => {
@@ -1002,7 +1001,6 @@ export class ModernMcpConnection extends EventEmitter {
     this.session = session;
     this.adoptedAt = performance.now();
     this.protocolVersion = session.client.getNegotiatedProtocolVersion() ?? null;
-    if (!session.http || era === 'modern') this.reconnectAttempts = 0;
     // On a 2025 revision list changes arrive unsolicited, on the session's
     // standalone stream: there's no subscription to keep.
     if (era === 'modern') this.keepListening(session, session.client.autoOpenedSubscription);
@@ -1349,6 +1347,9 @@ export class ModernMcpConnection extends EventEmitter {
     // reconnect's does, and is a permanent failure, as that one is: no
     // later attempt will come. The reap starts, and is recorded, before
     // 'close' is emitted, so a listener that throws can't skip it.
+    const lived = performance.now() - this.adoptedAt;
+    const counted = connectionEnded(lived, this.reconnectAttempts, this.reconnectMaxIntervalMs);
+    this.reconnectAttempts = counted.failures;
     const permanent = () => this.emit('reconnect-failed', { error: `${reason}; ${this.unreapedFailure()}`, attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     const done = ModernMcpConnection.closeSession(session).then((failure) => {
       if (this.losing?.session === session) this.losing = null;
@@ -1361,7 +1362,14 @@ export class ModernMcpConnection extends EventEmitter {
       if (failure) {
         this.holdUnreaped(session, failure);
         if (!this.closedByHost) permanent();
-      } else if (this.willReconnect) this.scheduleReconnect();
+      } else if (this.willReconnect) {
+        if (counted.attempt !== undefined) {
+          const error = endedTooSoon(lived, ended ?? {});
+          this.printFailedAttempt(counted.attempt, error);
+          this.emit('reconnect-failed', { error, attempt: counted.attempt });
+        }
+        this.scheduleReconnect();
+      }
     });
     this.losing = { session, done };
     // A launch already known unreaped is held now, before 'close', so the
@@ -1379,13 +1387,15 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
-  /** The legacy engine's backoff: doubling from the base interval, capped,
-   *  with ±25% jitter, and never past the timer limit (a longer delay would
-   *  fire at once, turning the backoff into a tight loop). */
+  private printFailedAttempt(attempt: number, error: string): void {
+    const redacted = this.recorded(error);
+    console.error(attempt === 0
+      ? `MCP server "${this.id}" initial connect failed, will retry: ${redacted}`
+      : `MCP server "${this.id}" reconnect failed: ${redacted}`);
+  }
+
   private backoffDelay(failures: number): number {
-    const exponent = Math.max(0, Math.min(failures - 1, 30));
-    const capped = Math.min(this.reconnectIntervalMs * 2 ** exponent, this.reconnectMaxIntervalMs);
-    return Math.min(capped * (0.75 + Math.random() * 0.5), MAX_TIMER_MS);
+    return reconnectDelay(failures, this.reconnectIntervalMs, this.reconnectMaxIntervalMs);
   }
 
   private scheduleReconnect(): void {
@@ -1399,6 +1409,7 @@ export class ModernMcpConnection extends EventEmitter {
   private async attemptReconnect(restart?: keyof typeof SESSION_END): Promise<void> {
     if (!this.willReconnect || this.session) return;
     const attempt = Math.max(1, this.reconnectAttempts);
+    this.reconnectAttempts = attempt;
     try {
       await this.open();
       if (restart) this.restarting = false;
@@ -1432,6 +1443,7 @@ export class ModernMcpConnection extends EventEmitter {
         failed(error.message, true);
         return;
       }
+      this.printFailedAttempt(attempt, `${(error as Error).message}${withStderr(error, this.recorded)}`);
       failed((error as Error).message);
       this.scheduleReconnect();
     }

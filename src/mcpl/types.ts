@@ -449,20 +449,41 @@ export interface McplServerConfig {
 
   /**
    * Base interval between reconnection attempts in milliseconds.
-   * The actual delay doubles with each consecutive failure (with ±25% jitter)
-   * up to `reconnectMaxIntervalMs`, and resets after a successful handshake
-   * (for a modern server's 2025 session over HTTP, once that session's end
-   * starts a new one at once). Over HTTP the same backoff paces a modern
-   * server's streams: a dropped stream's first try waits the server's
-   * `retry` hint when it sent one above 0, and the backoff's first step
-   * otherwise, and a try after a failed one waits the longer of the hint
-   * and the doubling backoff. Default: 5000 (5 seconds).
+   * The actual delay doubles with each consecutive failed attempt up to
+   * `reconnectMaxIntervalMs`, then takes ±25% jitter. With `reconnect: true`,
+   * a connection that ends before it has lived as long as
+   * `reconnectMaxIntervalMs` (at most about 24.8 days, and never under 5
+   * minutes) is a failed attempt too, reported by `reconnect-failed` with how
+   * long it lived, unless its launch can't be reaped, which is the permanent
+   * failure that halts reconnecting; the count starts afresh only once a
+   * connection lasts that long. A modern server's 2025 session over HTTP
+   * that the server ends starts again at once, with the count afresh, unless
+   * it ended before answering a request, or less than this interval after it
+   * started twice in a row, which is a failed attempt. Over HTTP the same
+   * backoff paces a modern server's streams: a dropped stream's first try
+   * waits the server's `retry` hint when it sent one above 0, and the
+   * backoff's first step otherwise, and a try after a failed one waits the
+   * longer of the hint and the doubling backoff.
+   * The modern engine also backs off reopening a lost tool-list
+   * subscription by it and `reconnectMaxIntervalMs`, whether or not it
+   * reconnects. Default: 5000 (5 seconds). With `reconnect: true`, or on a
+   * server the modern engine runs, a value read as 0, below 0 or not a
+   * number fails that server alone at `create()`, and `connectMcplServer`,
+   * `restartMcplServer` and `serverConfigProblems` refuse it; `null` means
+   * the default.
    */
   reconnectIntervalMs?: number;
 
   /**
-   * Ceiling for the exponential reconnect backoff in milliseconds.
-   * Default: 300000 (5 minutes).
+   * Ceiling for the exponential reconnect backoff in milliseconds, before
+   * jitter, which is also how long a connection must live to count as
+   * lasting (never under 5 minutes, and never over a timer's limit, about
+   * 24.8 days). A ceiling below `reconnectIntervalMs`
+   * holds every wait at the ceiling, give or take the jitter. Waits never
+   * exceed a timer's limit (2³¹−1 ms, about 24.8 days), so Infinity is
+   * accepted; with a ceiling near that limit, a server whose connections each
+   * live days counts each end as a failure.
+   * Default: 300000 (5 minutes). Refused as `reconnectIntervalMs` is.
    */
   reconnectMaxIntervalMs?: number;
 

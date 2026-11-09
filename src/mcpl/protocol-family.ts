@@ -51,6 +51,72 @@ export interface ServerBinding {
 /** The largest delay a Node/Bun timer honors (2³¹−1 ms, about 24.8 days). */
 export const MAX_TIMER_MS = 2_147_483_647;
 
+export function reconnectTimings(config: Pick<McplServerConfig, 'reconnectIntervalMs' | 'reconnectMaxIntervalMs'>): { intervalMs: number; maxIntervalMs: number } {
+  const read = (value: unknown, defaultMs: number) => {
+    if (value === undefined || value === null) return defaultMs;
+    try {
+      return Number(value);
+    } catch {
+      return Number.NaN; // a Symbol, or an object whose conversion throws
+    }
+  };
+  return { intervalMs: read(config.reconnectIntervalMs, 5000), maxIntervalMs: read(config.reconnectMaxIntervalMs, 300_000) };
+}
+
+export const LASTING_FLOOR_MS = 300_000;
+
+export function lastingAfterMs(capMs: number): number {
+  return Math.max(Math.min(capMs, MAX_TIMER_MS), LASTING_FLOOR_MS);
+}
+
+export function connectionEnded(livedMs: number, madeBy: number, capMs: number): { failures: number; attempt?: number } {
+  if (livedMs >= lastingAfterMs(capMs)) return { failures: 0 };
+  return { failures: madeBy + 1, attempt: madeBy };
+}
+
+export interface ConnectionEnd {
+  transport?: 'stdio' | 'websocket' | null;
+  code?: number | null;
+  signal?: string | null;
+  byHost?: boolean;
+}
+
+export function endedTooSoon(livedMs: number, ended: ConnectionEnd = {}): string {
+  const seconds = livedMs < 10_000 ? (livedMs / 1000).toFixed(1) : String(Math.floor(livedMs / 1000));
+  const how = ended.signal
+    ? ` (signal ${ended.signal})`
+    : typeof ended.code === 'number'
+      ? ` (${ended.transport === 'websocket' ? 'close' : 'exit'} code ${ended.code})`
+      : '';
+  return `connected, then closed${ended.byHost ? ' by this host' : ''} after ${seconds} s${how}`;
+}
+
+export function reconnectDelay(failures: number, baseMs: number, capMs: number, random: () => number = Math.random): number {
+  const exponent = Math.max(0, Math.min(failures - 1, 30));
+  const capped = Math.min(baseMs * 2 ** exponent, capMs);
+  // Node and Bun run a timer longer than MAX_TIMER_MS after 1 ms, so an
+  // unclamped wait would retry at once.
+  return Math.min(capped * (0.75 + random() * 0.5), MAX_TIMER_MS);
+}
+
+export function reconnectTimingProblems(config: Pick<McplServerConfig, 'id' | 'reconnect' | 'reconnectIntervalMs' | 'reconnectMaxIntervalMs'> & BindingFields): string[] {
+  let modern = false;
+  try {
+    modern = resolveServerBinding(config).family === 'modern';
+  } catch {}
+  if (config.reconnect !== true && !modern) return [];
+  const read = reconnectTimings(config);
+  const problems: string[] = [];
+  for (const [field, ms] of [['reconnectIntervalMs', read.intervalMs], ['reconnectMaxIntervalMs', read.maxIntervalMs]] as const) {
+    if (ms > 0) continue;
+    const value: unknown = config[field];
+    const got = typeof value === 'number' ? String(value) : kindOf(value);
+    problems.push(
+      `MCP server "${config.id}": ${field} must be a number of milliseconds above 0 (got ${got}); a wait of 0 or less retries at once, every time`,
+    );
+  }
+  return problems;
+}
 
 type BindingFields = Pick<McplServerConfig, 'id' | 'command' | 'url' | 'transport' | 'protocol'>;
 
@@ -691,8 +757,10 @@ export function mcplPolicyGrants(config: McplServerConfig): string[] {
  * Problems with a server configuration's protocol settings, as messages; empty
  * when it is usable. Legacy configurations are checked only for what this
  * design added, so every configuration that worked before still passes but
- * one: `command` and `url` with no `transport`, which was launched as stdio
- * with its url ignored, and is now refused as naming no transport to use.
+ * two: `command` and `url` with no `transport`, which was launched as stdio
+ * with its url ignored, and is now refused as naming no transport to use;
+ * and, on an entry with `reconnect: true`, a reconnect timing read as 0,
+ * below 0 or not a number, which retried at once (#375).
  */
 export function serverConfigProblems(config: McplServerConfig): string[] {
   let binding: ServerBinding;
@@ -701,7 +769,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   } catch (error) {
     return [(error as Error).message];
   }
-  const problems: string[] = credentialRequiredProblems(config);
+  const problems: string[] = [...credentialRequiredProblems(config), ...reconnectTimingProblems(config)];
   if (binding.transport === 'http') {
     // fetch refuses a url with userinfo, and its error quotes the whole url,
     // password included, into the connect failure's log line, trace and
