@@ -15,17 +15,27 @@
   So a debounced reminder whose module stored its text no longer has that text
   quoted again in a line, and under conversation routing the trunk, woken for
   a fork's messages it doesn't hold, no longer gets a line saying they were
-  shown above.
+  shown above. Such a module message is stored in the trunk's slot, so a
+  conversation fork's own window holds neither it nor, as before, a line
+  quoting it.
+- A module event whose one message a surgery's hold or an agent's recovery
+  keeps in memory when the event arrives is quoted in the line, as one with
+  no message is: its message has no stored row yet.
 - Where a row a reply could be meant for follows a batched wake's messages in an
   agent's window when the turn the wake starts begins, such as another
   channel's message stored during the batch's quiet period, that fresh start
-  writes one `[Gate: …]` line naming them by count and channel, as the agent's
-  own row, before the start's own notices. A clock row, a stored context
-  injection, a row the agent's view leaves out and an unobserved co-resident's
-  own round don't count; an observed co-resident's round owed to the agent
-  does. Past the window's 32 newest rows that don't count, the line is
-  written. Each agent the batch wakes decides its own line by its own window,
-  once per wake, and none is written while the host is quiesced. A turn that
+  writes one `[Gate: …]` line naming them by count and channel, or as having
+  none, as the agent's own row, before the start's own notices. A clock row,
+  a stored context injection, a row the agent's view leaves out, the batch's
+  own line quoting its other events and an unobserved co-resident's own round
+  don't count; an observed co-resident's round owed to the agent does, and so
+  does the agent's own row, such as its reply in another channel. Past the
+  window's 32 newest rows that don't count, the line is written. Each agent
+  the batch wakes decides its own line by its own window, once per wake, and
+  none is written while the host is quiesced. A window still in legacy mode
+  reads its slot's shared record, where only the delivery agent's start
+  writes the one line, so a co-resident's turn that starts before it has
+  none. A turn that
   merges batched wakes names all their messages, and one that merges a wake
   that isn't a batch's names none. 0.33.0 wrote such a line at the turn's
   start only for a batch of one message still the newest entry when it fired;

@@ -426,6 +426,80 @@ describe("a batched wake's line is written once per wake", () => {
     } finally { await done(b); }
   });
 
+  it("a batched message whose channel name already starts with '#', chatter after it: the line names it with one '#'", async () => {
+    const b = await bare(['scout']);
+    try {
+      const row = b.internals.addMessage('antra', [{ type: 'text', text: 'in design' }], { serverId: 'discord', channelId: 'discord:g1:design', channelName: '#design', messageId: 'd1' });
+      storeChatter(b);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([row]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      assert.deepEqual(LINE.exec(lines[0]!)?.slice(1), ['1', '1', '#design (discord:g1:design)'], lines[0]);
+    } finally { await done(b); }
+  });
+
+  it('a batched message that names no channel, chatter after it: the line says it has none', async () => {
+    const b = await bare(['scout']);
+    try {
+      const row = b.internals.addMessage('user', [{ type: 'text', text: 'water the plants' }]);
+      storeChatter(b);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([row]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      assert.match(lines[0]!, /^\[Gate: 1 event matched\]\n\n- 1 message with no channel \(oldest ~\d+s ago\) — already shown above at arrival; this is a batched wake, not new content$/);
+    } finally { await done(b); }
+  });
+
+  it("a DM, chatter, then the batch's own gate line: the start's line names the DM", async () => {
+    const b = await bare(['scout']);
+    try {
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      storeChatter(b);
+      const own = b.internals.addMessage('user', [{ type: 'text', text: '[Gate: 1 event matched]\n\n- [batch] (clock:reminder): water the plants' }], { source: 'gate:debounce' });
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm, own]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      assert.deepEqual(LINE.exec(lines[0]!)?.slice(1), ['1', '1', 'discord:dm:1'], lines[0]);
+    } finally { await done(b); }
+  });
+
+  it("a DM, then the batch's own gate line: no line", async () => {
+    const b = await bare(['scout']);
+    try {
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      const own = b.internals.addMessage('user', [{ type: 'text', text: '[Gate: 1 event matched]\n\n- [batch] (clock:reminder): water the plants' }], { source: 'gate:debounce' });
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm, own]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.deepEqual(linesOf(b), []);
+    } finally { await done(b); }
+  });
+
+  it("a DM, then another batch's gate line: the line names the DM", async () => {
+    const b = await bare(['scout']);
+    try {
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      b.internals.addMessage('user', [{ type: 'text', text: '[Gate: 1 event matched]\n\n- [batch] (clock:reminder): water the plants' }], { source: 'gate:debounce' });
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      assert.deepEqual(LINE.exec(lines[0]!)?.slice(1), ['1', '1', 'discord:dm:1'], lines[0]);
+    } finally { await done(b); }
+  });
+
   it("one batched message in one server's general and two in another server's general, chatter after them: one line counting each server's channel apart", async () => {
     const b = await bare(['scout']);
     try {
@@ -696,6 +770,39 @@ describe('through the gate, a debounced batch in alpha', () => {
       const at = retried.findIndex((t) => t.includes('the question'));
       assert.ok(at >= 0 && retried.slice(at).some((t) => t.startsWith('[routing]')), "premise: the first start's routing notice follows the question in the retry's request");
       assert.ok(!retried.some((t) => t.startsWith('[Gate:')), 'no line');
+    } finally { await f.close(); }
+  });
+
+  it("for two residents, then chatter in beta before it fires: each resident's request holds its own line naming the batch, after the chatter", async () => {
+    const f = await fixture({
+      agents: ['scout', 'mira'].map((name) => ({ name, model: 'test', systemPrompt: `You are ${name}.` })),
+      framework: { gate: { config: { policies: [addressedOnly], default: 'skip' }, onboarding: false } },
+    });
+    try {
+      (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+        f.membrane.calls.push(request);
+        return new MockYieldingStream([say(`plain answer ${f.membrane.calls.length}`)]);
+      };
+      await registerOpen(f, 'alpha', 'beta');
+      await incoming(f, 'alpha', 'm1', 'a question for both', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => pending(f) === 1, 'batched');
+      await incoming(f, 'beta', 'm2', 'chatter in beta', AMBIENT);
+      await f.framework.runUntilIdle();
+      fireAll(f);
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 2, 'premise: the batch woke both residents');
+      for (const [i, name] of ['scout', 'mira'].entries()) {
+        const own = f.framework.getAgent(name)!.getContextManager().getAllMessages()
+          .filter((m) => (m.metadata as { ownRowOf?: unknown } | undefined)?.ownRowOf === name)
+          .map(rowText).filter((t) => t.startsWith('[Gate:'));
+        assert.equal(own.length, 1, `${name}'s own line`);
+        assert.deepEqual(LINE.exec(own[0]!)?.slice(1, 3), ['1', '1'], own[0]);
+        const all = requestTexts(f.membrane.calls.find((c) => JSON.stringify(c).includes(`You are ${name}.`)));
+        const chatter = all.findIndex((t) => t.includes('chatter in beta'));
+        assert.ok(chatter >= 0, `premise: ${name}'s request holds the chatter (call ${i})`);
+        assert.ok(all.indexOf(own[0]!) > chatter, `${name}'s request holds the line after the chatter`);
+      }
     } finally { await f.close(); }
   });
 

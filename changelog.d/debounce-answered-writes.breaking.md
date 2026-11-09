@@ -11,10 +11,14 @@
   longer passes `requestInference`'s `after`, where 0.33.0 passed the
   placement of the line it wrote, and its `InferenceRequest` no longer carries
   `readsRow`: the writes it is for, its line's among them, are
-  `provenance.writes`, and its rows are `readsRows` (in `.added`). A batch
+  `provenance.writes`, and its rows are `readsRows` (in `.added`). 0.33.0
+  passed no placement where it handed the line to the wake instead, for a
+  batch of one message still the newest entry (`isNewestEntry`). A batch
   with an event in the window that was given no write of its own (`evaluate`
   without `after`) has no writes, so its wake is plain and starts its turn
-  even once the agent has answered, where 0.33.0 marked it by the line it
-  wrote, so it could drop once that line was answered. A host that handles
+  even once the agent has answered. 0.33.0 marked such a wake by the line it
+  wrote, where it wrote one, so it could drop once that line was answered. A
+  write whose placement names no stored message (still unfilled, or held in
+  memory with no id yet) keeps the wake plain too. A host that handles
   `requestInference` itself and wants a batched wake dropped once the agent
   has answered it reads `provenance.writes`.

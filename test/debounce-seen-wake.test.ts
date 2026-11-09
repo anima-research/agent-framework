@@ -286,6 +286,26 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
+  it("a module's lone message a surgery holds as the event arrives: the gate quotes the event, as it quotes one with no message", async () => {
+    const { f, module } = await setup(60_000);
+    const internal = f.framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null; releaseSurgeryHeldWrites(): void };
+    try {
+      internal.surgeryHold = { verb: 'undo', agentName: 'agent', since: Date.now() };
+      await send(f, 'module', 'water the plants');
+      await f.framework.runUntilIdle();
+      assert.ok(!f.framework.getAgent('agent')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('water the plants')), 'premise: the hold keeps the message out of the store');
+      internal.surgeryHold = null;
+      internal.releaseSurgeryHeldWrites();
+      fire(f);
+      const idle = f.framework.runUntilIdle();
+      await eventually(() => module.entered.has('first'), 'the turn reached its tool');
+      module.release('first');
+      await idle;
+      const request = JSON.stringify(f.membrane.calls[0]);
+      assert.match(request, /\[Gate: 1 event matched\]\\n\\n- \[batch\] \(clock:reminder\): water the plants/, `the gate quotes the event: ${request.slice(request.indexOf('[Gate:'), request.indexOf('[Gate:') + 200)}`);
+    } finally { internal.surgeryHold = null; await f.close(); }
+  });
+
   it("a co-resident whose own turn answered the slot after the event still wakes for a batch written to the delivery agent's window", async () => {
     const { f, module } = await setup(60_000, false, undefined,
       ['agent', 'other'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
@@ -338,7 +358,7 @@ describe('debounced writes already read and answered', () => {
   });
 
   for (const held of ['a mention', 'a module event without a write', 'both'] as const) {
-    it(`batches held for one turn: an event with no write keeps its line and the wake, an answered mention adds no line: ${held}`, async () => {
+    it(`batches held for one turn: an event with no write keeps its line and the wake, an answered mention adds none to the delivery, and the start names it where the answer follows it: ${held}`, async () => {
       const module = new class extends ReminderModule {
         override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
           if (event.type !== 'test:double') return super.onProcess(event, state);
@@ -383,9 +403,10 @@ describe('debounced writes already read and answered', () => {
           held === 'both' ? "the batches held for one turn are delivered as one, routed by its mention, so the second turn speaks there too" : "only the first turn's answer reached the mention's channel");
         if (held === 'a mention') assert.deepEqual(lines, [], 'no line for the answered mention');
         else {
-          assert.equal(lines.length, 1, 'one line, written when the batch was delivered');
+          assert.equal(lines.length, held === 'both' ? 2 : 1, held === 'both' ? "the delivery's line, then the start's" : 'one line, written when the batch was delivered');
           assert.match(lines[0]!, /1 event matched/);
-          assert.doesNotMatch(lines[0]!, /in work/, 'naming the module event, not the answered mention');
+          assert.doesNotMatch(lines[0]!, /in work/, "the delivery's line quotes the module event, not the answered mention");
+          if (held === 'both') assert.match(lines[1]!, /1 message in [^"]*work/, "the start's line names the mention its answer follows");
         }
       } finally { await f.close(); }
     });
@@ -844,7 +865,7 @@ describe('judge rules and the answered-batch drop', () => {
       await f.framework.runUntilIdle();
       assert.deepEqual(wakes, [{ agentName: 'agent' }], 'premise: the answered event keeps the wake, which carries no writes');
       assert.equal(f.membrane.calls.length, 2, "premise: the judge's reply stands");
-      assert.match(JSON.stringify(f.membrane.calls[1]), /\[Gate: 1 event matched\]\\n\\n- 1 message in /, "the start names the event the agent's answer follows");
+      assert.match(JSON.stringify(f.membrane.calls[1]), /\[Gate: 1 event matched\]\\n\\n- 1 message with no channel /, "the start names the event the agent's answer follows");
     } finally { await f.close(); }
   });
 
@@ -960,6 +981,28 @@ describe("the framework's answer to the gate's isAnswered", () => {
       }
     });
   }
+
+  it('a store that throws reading the message: the log names the agent and the error', async (t) => {
+    const { f, answeredMidTurn } = await judged(true, { tool: true });
+    const agent = f.framework.getAgent('agent') as unknown as Ctx['agent'];
+    const getContextManager = agent.getContextManager;
+    const logged: unknown[][] = [];
+    try {
+      await answeredMidTurn();
+      const after = (gateOf(f).debounceTimers.get('batch')!.events[0] as { after: Placement }).after;
+      const isAnswered = (gateOf(f) as unknown as { isAnsweredFn: (after: Placement) => boolean }).isAnsweredFn;
+      t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args); });
+      unreadable({ after, agent });
+      assert.equal(isAnswered(after), true, 'premise: in doubt, so answered');
+      t.mock.restoreAll();
+      assert.ok(logged.some((args) => String(args[0]).startsWith('[gate] agent:')
+        && args.some((a) => a instanceof Error && a.message === 'store unreadable')), JSON.stringify(logged.map((args) => args.map(String))));
+    } finally {
+      t.mock.restoreAll();
+      agent.getContextManager = getContextManager;
+      await f.close();
+    }
+  });
 });
 
 describe("what the judge is told of the framework's queued wakes", () => {

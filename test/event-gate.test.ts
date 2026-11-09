@@ -1390,6 +1390,16 @@ describe('a batched wake writes no line for events with a message of their own',
     assert.strictEqual(writes[1]!.replyTo, undefined, 'an ambient message owes no reply');
   });
 
+  it('a folded render given a placement takes no write, so it carries no reply evidence', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('folded-render.json'));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: 'discord:g:room', content: 'render',
+      metadata: { eventId: 'ev-1', channelId: 'discord:g:room' }, tags: ['chat:system'], folds: true }), { agent: 'scout', messageId: 'row-1' });
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 0, 'premise: a push counts as in the window, so no line');
+    assert.strictEqual(inferenceRequests.length, 1, 'premise: it woke');
+    assert.strictEqual(inferenceRequests[0].writes, undefined);
+  });
+
   it('a push event stored at arrival: no line', () => {
     const { gate, messages, inferenceRequests } = makeGate(config('push-in-window.json'));
     gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm', metadata: { eventId: 'ev-1' } }),

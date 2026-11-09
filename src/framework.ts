@@ -4157,11 +4157,16 @@ function batchRowsKey(request: InferenceRequest | undefined): string {
   return JSON.stringify(batchRowsOf(request) ?? null);
 }
 
+function isGateLine(m: StoredMessage): boolean {
+  return (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce';
+}
+
 /** One channel's entry in a batched wake's line: how many of the wake's
- *  messages are in it, and how long ago the oldest arrived, as of `now`. */
-function batchReferenceLine(count: number, channel: string, oldest: number, now: number): string {
+ *  messages are in it, or name none, and how long ago the oldest arrived,
+ *  as of `now`. */
+function batchReferenceLine(count: number, channel: string | undefined, oldest: number, now: number): string {
   const age = Math.round((now - oldest) / 1000);
-  return `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
+  return `- ${count} message${count > 1 ? 's' : ''} ${channel === undefined ? 'with no channel' : `in ${channel}`} ` +
     `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
     `batched wake, not new content`;
 }
@@ -19558,7 +19563,7 @@ export class AgentFramework {
           placement, ...(audience ? { audience } : {}),
           ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source: stampSource } } : {}),
         });
-        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined && !audience && !heldFromResidents(metadata)) added = placement;
+        if (id && response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined && !audience && !heldFromResidents(metadata)) added = placement;
         // A write kept in memory (a surgery's hold, or the wait for its
         // agent's recovery) has no id yet: it is traced once, as it is
         // stored ('surgery-release').
@@ -34411,17 +34416,16 @@ export class AgentFramework {
     const held = rows
       .filter((id) => this.windowHolds(agent, id))
       .map((id) => cm.getMessage(id as MessageId))
-      .filter((m): m is StoredMessage => m != null
-        && (m.metadata as { source?: unknown } | undefined)?.source !== 'gate:debounce');
+      .filter((m): m is StoredMessage => m != null && !isGateLine(m));
     if (held.length === 0 || this.batchIsNewest(agent, rows)) return;
     const now = Date.now();
-    const byChannel = new Map<string, { name: string; count: number; oldest: number }>();
+    const byChannel = new Map<string, { name: string | undefined; count: number; oldest: number }>();
     for (const m of held) {
       const md = (m.metadata ?? {}) as { serverId?: unknown; channelId?: unknown; channelName?: unknown };
       const serverId = typeof md.serverId === 'string' ? md.serverId : undefined;
       const channelId = typeof md.channelId === 'string' && md.channelId !== '' ? md.channelId : undefined;
       const label = typeof md.channelName === 'string' && md.channelName !== '' ? md.channelName : undefined;
-      const name = channelId === undefined ? '(unknown channel)'
+      const name = channelId === undefined ? undefined
         : serverId === undefined ? suppliedValue(channelId)
         : label !== undefined ? this.labelledChannel({ serverId, channelId, label: label.startsWith('#') ? label : `#${label}` })
         : this.channelShown({ serverId, channelId });
@@ -34441,9 +34445,9 @@ export class AgentFramework {
       id = storeOwnRow(agent, 'user', [{ type: 'text', text }], metadata);
     } catch (err) {
       const landed = before === undefined ? undefined
-        : this.storedSince(agent, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', "a batched wake's line");
+        : this.storedSince(agent, before, isGateLine, 'gate', "a batched wake's line");
       if (!landed || landed.length === 0) {
-        console.error(`[gate] ${agent.name}: a batched wake's line ${landed ? 'was not written' : 'may not have been written (whether it landed is unknown)'}; the turn goes on without it, and a later fresh start of the wake decides it again:`, err);
+        console.error(`[gate] ${agent.name}: a batched wake's line ${landed ? 'was not written; the turn goes on without it' : 'may not have been written (whether it landed is unknown); the turn goes on'}, and a later fresh start of the wake decides it again:`, err);
         return;
       }
       console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
@@ -34455,8 +34459,9 @@ export class AgentFramework {
   }
 
   /** Whether the newest row of `agent`'s window a reply could be meant for
-   *  is one of `rows`, as the start's request will hold it: clock rows and
-   *  stored context injections aside. Past NEWEST_SCAN_ROWS rows, it answers
+   *  is one of `rows`, as the start's request will hold it: clock rows,
+   *  stored context injections and the batch's own gate line, which the
+   *  start's line can't name, aside. Past NEWEST_SCAN_ROWS rows, it answers
    *  no. A presented window is the request's own: the start has presented
    *  what arrived (an observed co-resident's round among it), and what
    *  arrives from here waits for the next request. A window still in legacy
@@ -34469,7 +34474,8 @@ export class AgentFramework {
       ? cm.getPresentedMessages().slice(-AgentFramework.NEWEST_SCAN_ROWS).reverse()
       : cm.queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages;
     const newest = tail.find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND
-      && !storedInjectionMarkOf(m.metadata) && (presented || this.agentSees(agent, m.metadata)));
+      && !storedInjectionMarkOf(m.metadata) && (presented || this.agentSees(agent, m.metadata))
+      && !(isGateLine(m) && rows.includes(m.id)));
     return newest !== undefined && rows.includes(newest.id);
   }
 
@@ -34491,7 +34497,8 @@ export class AgentFramework {
       if (!row) return true;
       const mark = agent.getAnsweredWatermark();
       return mark !== null && covers(mark, cm, row) !== 'not-covered';
-    } catch {
+    } catch (err) {
+      console.error(`[gate] ${agent.name}: whether a batched event's message was answered couldn't be read, so it counts as answered and its wake stays:`, err);
       return true;
     }
   }

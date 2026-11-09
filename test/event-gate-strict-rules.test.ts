@@ -2290,6 +2290,26 @@ test('rules that share a name keep their state through a write that leaves them 
   assert.deepEqual(wakes, ['agent', 'agent'], 'the batch is sent once the rules swap behaviors');
 });
 
+test("a batch whose line quoting an event can't be written is named in the log and dropped, and wakes no one", (t) => {
+  const dir = tempDir(t);
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const configPath = join(dir, 'gate.json');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [{ name: 'quiet', match: {}, behavior: { debounce: 1000 } }] }));
+  const wakes: string[] = [];
+  const gate = new EventGate({
+    configPath, getAgentNames: () => ['agent'], emitTrace: () => {},
+    addMessage: () => { throw new Error('store unavailable'); },
+    requestInference: (agent) => { wakes.push(agent); },
+  });
+  t.after(() => gate.dispose());
+  assert.equal(gate.evaluate(event([], 'clock:reminder')).trigger, false, 'premise: the event waits in the debounce batch');
+  t.mock.timers.tick(1000);
+  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (store unavailable), so the batch is dropped']);
+  assert.deepEqual(wakes, []);
+});
+
 test("a batch whose delivery throws is named in the log and dropped, whether its timer sends it or it was held for an agent's turn", async (t) => {
   const dir = tempDir(t);
   const logged: string[] = [];

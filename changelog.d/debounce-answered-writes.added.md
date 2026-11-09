@@ -8,7 +8,10 @@
   present only when every event with a message of its own was given its
   write. `InferenceRequest.readsRows` marks a wake whose sole cause is those
   rows, and AgentFramework's scheduler drops it once each row is done as a
-  `readsRow` is, judged with its own `replyTo`. EventGate's `isAnswered(after)`
+  `readsRow` is, judged with its own `replyTo`. A write whose placement
+  names no stored message for the woken agent leaves its wake unmarked, so
+  it starts its turn. `evaluate` ignores `after` for a folded render
+  (`GateEventInfo.folds`), which takes no write. EventGate's `isAnswered(after)`
   option says whether the agent has answered a request that carried an
   event's write, `false` only when the host knows it hasn't; the gate asks it
   when a reply judge answers reply, and an event answered then loses its

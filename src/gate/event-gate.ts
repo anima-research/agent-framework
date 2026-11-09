@@ -120,18 +120,20 @@ interface PendingEvent {
   content: string;
   eventType: string;
   timestamp: number;
-  /** MCPL channel messages and pushes have a message of their own in the
-   *  context window, stored at arrival (the host admits the event first and
-   *  fills the placement it gave `evaluate` as it stores the message), and so
-   *  does a module event where the host gives its write (`after`). For those,
+  /** MCPL channel messages and pushes count as in the context window by
+   *  their type, and so does a module event where the host gives its write
+   *  (`after`). A channel message or a plain push is stored at arrival (the
+   *  host admits the event first and fills the placement it gave `evaluate`
+   *  as it stores the message). A coalesced push renders into a later
+   *  request, and a silent heartbeat tick stores nothing. For all of them,
    *  the debounced wake must NOT re-quote the content —
    *  a [Gate:] copy delivered minutes later reads as a fresh, stale duplicate
    *  of a message the agent may have long since handled. */
   inContext: boolean;
   channelId?: string;
   /** Human-readable channel name (e.g. Discord channel name) when the event's
-   *  metadata carries one — batched-wake lines render this instead of the raw
-   *  composite channel id. */
+   *  metadata carries one, for the judge's summary of the batch
+   *  (judgeEventSummary). */
   channelLabel?: string;
   /** Author id of the event (discord snowflake etc.), when the metadata carries
    *  one — a debounced wake's counterparty is the author of the event
@@ -239,7 +241,10 @@ export interface WakeProvenance {
    *  written for events with no message of their own. Present only when
    *  every event with a message of its own was given its write. The host
    *  may drop the wake once the agent is done with every one of them, as
-   *  AgentFramework does (InferenceRequest.readsRows). */
+   *  AgentFramework does (InferenceRequest.readsRows). A write whose
+   *  placement names no stored message (still unfilled, or held in memory
+   *  with no id yet) can't be judged done: AgentFramework then keeps the
+   *  wake, for every write of the batch. */
   writes?: WakeWrite[];
 }
 
@@ -3441,9 +3446,13 @@ export class EventGate {
 
   /** `after`: where the host put the event's own message, which it may fill
    *  in after this call, until the event's batch is delivered. A debounced
-   *  event given one counts as in the window, as an MCPL event does: its
-   *  batch's line doesn't name it, and its wake carries the write
-   *  (WakeProvenance.writes). */
+   *  event given one counts as in the window, as an MCPL event does, so the
+   *  line the gate writes at delivery doesn't quote it. AgentFramework's
+   *  start of the wake's turn can still name it in a line, where something a
+   *  reply could be meant for follows it. Its batch's wake
+   *  carries the writes (WakeProvenance.writes) only where every event of
+   *  the batch in the window has one. It is ignored for a folded render
+   *  (GateEventInfo.folds), which takes no write. */
   evaluate(info: GateEventInfo, after?: WritePlacement): GateDecision {
     this.reloadIfChanged();
 
@@ -4066,7 +4075,8 @@ export class EventGate {
     }
   }
 
-  private handleDebounce(policy: GatePolicy, info: GateEventInfo, after?: WritePlacement): void {
+  private handleDebounce(policy: GatePolicy, info: GateEventInfo, placed?: WritePlacement): void {
+    const after = info.folds ? undefined : placed;
     const debounceMs = batchQuietMs(policy.behavior) ?? MIN_DEBOUNCE_MS;
     const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
 
