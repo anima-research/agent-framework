@@ -45,6 +45,15 @@ describe('DefaultErrorPolicy on membrane\'s schedules', () => {
     assert.deepEqual(delays(policy, err({ type: 'timeout', retryable: true, httpStatus: 408, message: 'Request Timeout' })), [1000, 2000]);
   });
 
+  it("gives a deadline expiry the deadline schedule's class and tries, or retryable's under settings with no deadline schedule", () => {
+    const expiry = Object.assign(err({ type: 'timeout', retryable: true, message: 'zz a deadline ran out' }), { [Symbol.for('membrane.deadlineExpiry')]: true });
+    assert.deepEqual(policy.onInferenceError(expiry, 'resident', 0), { retry: true, delayMs: 1000, retryClass: 'deadline', maxTries: 2 });
+    const membranes = MEMBRANE_RETRY_SETTINGS as RetrySettings;
+    assert.equal(membranes.deadline, undefined, "membrane's own settings have no deadline schedule");
+    assert.deepEqual(new DefaultErrorPolicy(membranes).onInferenceError(expiry, 'resident', 0),
+      { retry: true, delayMs: 1000, retryClass: 'retryable', maxTries: membranes.retryable!.maxAttempts });
+  });
+
   it('retries a rate limit with no stated wait at least five tries', () => {
     assert.deepEqual(delays(policy, err({ type: 'rate_limit', retryable: true, httpStatus: 429 })), [1000, 2000, 4000, 8000]);
   });
@@ -966,6 +975,44 @@ test("a 529 sent mid-stream as an error event is shown as the default policy ret
   assert.equal(waits[0]!.maxTries, (MEMBRANE_RETRY_SETTINGS as RetrySettings).overloaded!.maxAttempts);
   assert.equal(waits[0]!.nextTry, 2);
   assert.equal((health[0]!.retrying as Record<string, unknown>).retryClass, 'overloaded');
+});
+
+test('an overloaded error sent mid-stream with no status, only its message, is shown as overloaded too', async (t: TestContext) => {
+  const membrane = new EventOnceMembrane(err({ type: 'server', retryable: true, message: 'overloaded_error: Overloaded' }));
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-overload' }]));
+  const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
+  const { waits, health } = watchWaits(fw);
+  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+  await idle(fw);
+  assert.equal(waits.length >= 1, true, 'the turn waited to retry');
+  assert.equal(waits[0]!.retryClass, 'overloaded');
+  assert.equal(waits[0]!.maxTries, (MEMBRANE_RETRY_SETTINGS as RetrySettings).overloaded!.maxAttempts);
+  assert.equal((health[0]!.retrying as Record<string, unknown>).retryClass, 'overloaded');
+});
+
+test("a snapshot's retrying is a copy: changing it changes no later snapshot", async (t: TestContext) => {
+  const membrane = new FlakyMembrane(1);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
+  const fw = await makeFramework(t, membrane, {
+    maxRetries: 1,
+    onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 50, maxTries: 3 } : { retry: false }),
+  });
+  const retryingOf = () => (fw.healthSnapshot().agents as Array<Record<string, unknown>>).find((a) => a.name === 'resident')!.retrying as Record<string, unknown>;
+  let again: Record<string, unknown> | undefined;
+  fw.onTrace((e) => {
+    if (e.type !== 'inference:waiting' || again) return;
+    const first = retryingOf();
+    first.nextTry = 99;
+    first.maxTries = 99;
+    delete first.until;
+    again = retryingOf();
+  });
+  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+  await idle(fw);
+  assert.ok(again, 'the wait began');
+  assert.equal(again.nextTry, 2);
+  assert.equal(again.maxTries, 3);
+  assert.equal(typeof again.until, 'number');
 });
 
 test("an agent registered under the name of one that is waiting doesn't show that wait", async (t: TestContext) => {

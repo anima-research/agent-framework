@@ -162,6 +162,31 @@ async function heldTurn(fw: AgentFramework, internal: Internal, membrane: Script
   assert.equal(membrane.primary, 2);
 }
 
+test("a provider hold that queues a turn again starts its error policy's count over: the wait after the hold leads to try 2 again", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const wait = 300;
+    const gateway = () => new MembraneError({ type: 'server', retryable: true, httpStatus: 502, message: 'zz bad gateway', rawError: { status: 502 } });
+    // Call 1 fails into the policy's delay, its retry (call 2) into a stated
+    // wait's hold, and the hold's retry (call 3) into the policy's delay
+    // again; call 4 answers.
+    const membrane: ScriptedMembrane = new ScriptedMembrane(new Set([1, 2, 3]), (request) => (membrane.primary === 2 ? rateLimited(wait, request) : gateway()));
+    const { fw, internal } = await framework(path, membrane, {
+      errorPolicy: { maxRetries: 3, onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 20, maxTries: 4 } : { retry: false }) },
+    });
+    const tries: unknown[] = [];
+    fw.onTrace((event) => { if (event.type === 'inference:waiting') tries.push((event as { nextTry?: number }).nextTry); });
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
+      await waitFor(fw, () => membrane.primary >= 4, 'the answer after the hold');
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 4);
+      assert.deepEqual(tries, [2, 2], 'the wait before the hold and the one after it each lead to try 2');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a resident whose turn a stated wait holds for its retry is mid-turn: not drained, listed, refused surgery naming the hold; the hold's end runs the retry", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
