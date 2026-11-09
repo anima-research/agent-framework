@@ -56,10 +56,10 @@ that result, so the move isn't counted as told: the next turn starts with a
 
 On a turn whose prose is routed only when it ends (membrane's XML tool path,
 which has no per-round content), the words written before a move and after it
-can't be told apart. A move during such a turn holds the rest of the turn's
-plain speech as drafts, every later stream of it included (a budget restart's,
-a retry's), sending none of it to either destination, and the move's result
-says so. Later turns speak at the new destination.
+can't be told apart. A move during such a turn, unless it's private, holds the
+rest of the turn's plain speech as drafts, every later stream of it included
+(a budget restart's, a retry's), sending none of it to either destination,
+and the move's result says so. Later turns speak at the new destination.
 
 ## A private turn
 

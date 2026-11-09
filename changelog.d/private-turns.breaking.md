@@ -15,7 +15,10 @@
     module's channel messages to make the next turn public again once an
     operator's message has been answered, the row the module stores for each
     names the `channelId` in its metadata, with no `kind` and no `system`
-    flag, as the built-in Discord module's rows do.
+    flag, as the built-in Discord module's rows do. A row the module stored
+    before naming a channel stays an operator's message: the turn that holds
+    it, and each later turn while it's unanswered or the newest message, still
+    speaks in no channel unless the agent names one.
   - **Unchanged:** a module that stores console, TUI or API input needs no
     change, since that input is what this change is for, and nor does a
     channel delivered through an MCPL server. No sibling package needs a new

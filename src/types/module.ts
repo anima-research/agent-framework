@@ -857,10 +857,10 @@ export interface SpeechContext {
   turnId?: number;
 
   /**
-   * True when the turn holds an operator's private message (one from a
-   * surface with no channel, such as a console, the TUI or an API call), so
-   * its speech goes to no channel: a handler that publishes the speech it
-   * hears should post none of it.
+   * True when the turn is private: it held an operator's private message (one
+   * from a surface with no channel, such as a console, the TUI or an API call),
+   * or it continues a turn that did. Its speech goes to no channel, so a
+   * handler that publishes the speech it hears should post none of it.
    */
   private?: true;
 }

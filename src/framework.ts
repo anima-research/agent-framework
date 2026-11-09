@@ -23776,6 +23776,7 @@ export class AgentFramework {
   private turnRetryOf(trigger: InferenceRequest, routing: TurnRouting | undefined): InferenceRequest {
     const retry: MarkedRequest = asTurnRetry(trigger);
     delete retry.wakeChannels;
+    if (routing?.private) retry.privateCaller = true;
     return Object.assign(retry, this.wakeChannelsMark(routing));
   }
 
@@ -27609,7 +27610,6 @@ export class AgentFramework {
       routing.silent = true;
       if (continued?.roundsRan) routing.roundsRan = true;
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
-      if (continued?.private) privateOpen = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -41011,7 +41011,7 @@ export class AgentFramework {
       const speech = open?.private && home
         ? this.privateTurnSpeech(`stays in ${this.channelShown(home)}, your conversation's channel`)
         : home
-        ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
+        ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel, except while ${OPERATOR_PENDING}: then it goes to no channel.`
         : speaker && this.proseRoutingOf(speaker) === 'locked'
           ? open?.private
             ? `${this.privateTurnSpeech(this.proseLockShown(this.proseLockLocus(speaker), agentName))}${this.proseLocusMoves(agentName, open)}`
