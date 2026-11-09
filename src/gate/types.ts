@@ -531,11 +531,16 @@ export interface GateEventInfo {
    *  In a batch holding named events, each agent the batch wakes is shown the
    *  untargeted events if getAgentNames lists it, and the named events that
    *  name it. Agents shown the same events share one line, stored for them.
-   *  Batches that fire while an agent infers, or while the host is
-   *  quiesced, wait in one buffer and are delivered together, as one batch;
-   *  the buffer keeps its newest events up to its cap, and the oldest it
-   *  drops are shown to no one. An event whose channel is held when its
-   *  batch is delivered is dropped: shown to no one and woken for by no one.
+   *  A batch due for delivery, a debounce's or one the judge let through,
+   *  waits in one buffer while an agent infers or the host is quiesced, and
+   *  the buffer's batches are delivered together, as one batch; it keeps its
+   *  newest events up to its cap, and the oldest it drops are shown to no
+   *  one. A judge rule's batch that fires while a resident's turn runs, or
+   *  while the host is quiesced, is held for the judge with the rule's other
+   *  held events, up to a cap of its own, and so is one whose judging such a
+   *  turn stops. An event whose channel is held when its batch is delivered
+   *  is dropped: shown to no one and woken for by no one. A delivery that
+   *  throws drops its batch for the agents it hadn't woken.
    *  While the gate sleeps, an event is skipped before any rule, whatever its
    *  recipients, unless it is the heartbeat's or a privileged author's.
    *  An agent's upcoming wakes count a rule's pending batch only when the
