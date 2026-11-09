@@ -18,12 +18,15 @@
  * 0.6.0, and context-manager, with no one-record-per-row path, throws at the
  * first write-down on a store from 0.5.0. So each caret range of its union
  * starts at 0.6.0 or later, and the range admits 0.6.0 itself.
- * Each @animalabs package context-manager depends on too is declared within
- * context-manager's own range, so an install takes one copy of each: two
- * membrane copies make the host's `Membrane` a type context-manager's
- * refuses, and hand context-manager's formatter to a membrane its tests
- * don't cover; two chronicle copies give context-manager a store handle from
- * a chronicle it doesn't load.
+ * Each @animalabs package context-manager depends on too is declared with
+ * the releases context-manager's own range admits, no more and no fewer, so
+ * an install takes one copy of each. A narrower range gives a second copy
+ * when a host takes a release this one refuses. A wider one gives a second
+ * copy when this one takes a release context-manager refuses. Two membrane
+ * copies make the host's `Membrane` a type context-manager's refuses, and
+ * hand context-manager's formatter to a membrane its tests don't cover; two
+ * chronicle copies give context-manager a store handle from a chronicle it
+ * doesn't load.
  *
  * The floors are read from the declared range alone. Whether a range admits
  * the installed version is asked only of a package installed from the
@@ -93,6 +96,9 @@ function caretAdmits(range: string, version: string): boolean {
 const within = (inner: string, outer: string): boolean =>
   alternatives(inner).every((caret) => admits(outer, floorOf(caret).join('.')));
 
+/** Whether `a` and `b` admit the same releases. */
+const sameReleases = (a: string, b: string): boolean => within(a, b) && within(b, a);
+
 describe("agent-framework's dependency ranges (#291's release set)", () => {
   it('the caret reading', () => {
     assert.equal(admits('^0.25.0', '0.25.3'), true);
@@ -108,6 +114,10 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.equal(admits('^0.8.0 || ^0.9.0', '0.10.0'), false);
     assert.equal(within('^0.8.0', '^0.8.0 || ^0.9.0'), true);
     assert.equal(within('^0.8.0 || ^0.9.0', '^0.8.0'), false);
+    assert.equal(sameReleases('^0.8.0 || ^0.9.0', '^0.9.0 || ^0.8.0'), true);
+    assert.equal(sameReleases('^0.8.0', '^0.8.0 || ^0.9.0'), false);
+    assert.equal(sameReleases('^0.8.0 || ^0.9.0 || ^0.10.0', '^0.8.0 || ^0.9.0'), false);
+    assert.equal(sameReleases('^0.8.2', '^0.8.0'), false);
     // A floor at or past the first release with the APIs, which is admitted.
     assert.doesNotThrow(() => startsAt('^0.25.0', '0.25.0', 'x'));
     assert.doesNotThrow(() => startsAt('^0.25.0 || ^0.26.0', '0.25.0', 'x'));
@@ -167,14 +177,14 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     }
   });
 
-  it("declares each @animalabs package context-manager depends on within context-manager's range, so an install takes one copy of each", () => {
+  it("declares each @animalabs package context-manager depends on with the releases context-manager's range admits, no more and no fewer, so an install takes one copy of each", () => {
     const contextManager = installed('@animalabs/context-manager');
     const shared = Object.entries(contextManager.dependencies ?? {})
       .filter(([name]) => name.startsWith('@animalabs/') && ours.dependencies?.[name] !== undefined);
     assert.ok(shared.some(([name]) => name === '@animalabs/membrane'), 'both depend on membrane');
     assert.ok(shared.some(([name]) => name === '@animalabs/chronicle'), 'both depend on chronicle');
     const apart = shared
-      .filter(([name, theirs]) => !within(ours.dependencies![name]!, theirs))
+      .filter(([name, theirs]) => !sameReleases(ours.dependencies![name]!, theirs))
       .map(([name, theirs]) => `${name}: agent-framework ${ours.dependencies![name]}, context-manager ${contextManager.version} ${theirs}`);
     assert.deepEqual(apart, []);
     if (linked('@animalabs/membrane')) return;

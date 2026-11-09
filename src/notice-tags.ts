@@ -87,9 +87,9 @@ export const CONTEXT_MANAGER_TAGS = [
 ] as const;
 
 /**
- * The bracket openings membrane 0.8.0 writes into an agent's request outside
- * a tool result, marked as the framework's own are. Check them against each
- * membrane release the framework takes.
+ * The bracket openings membrane 0.8.0 and 0.9.0 write into an agent's request
+ * outside a tool result, marked as the framework's own are. Check them against
+ * each membrane release the framework takes.
  */
 export const MEMBRANE_TAGS = [
   'Audio', 'continuing', 'Document', 'duplicate tool_result for', 'Image', 'orphan tool_result for', 'Start', 'Tool Result', 'Video',
