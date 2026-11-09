@@ -128,7 +128,9 @@ export function foreignRowAsSent(
         out.push({
           type: 'text',
           text: reason !== undefined
-            ? transcriptLine(block.name, [' not run: ', ' not run'], [{ text: `the function_calls block it was in isn't well-formed: ${reason}`, supplied: true }])
+            ? block.name === ''
+              ? transcriptLine('a function_calls block', [" that isn't well-formed didn't run: ", " that isn't well-formed didn't run"], [{ text: reason, supplied: true }])
+              : transcriptLine(block.name, [' not run: ', ' not run'], [{ text: `the function_calls block it was in isn't well-formed: ${reason}`, supplied: true }])
             : transcriptLine(block.name, [' called: ', ' called: '], [callPiece(block)]),
         });
         break;
