@@ -134,7 +134,7 @@ async function stop(turn: Turn): Promise<void> {
 }
 
 describe('an over-long tool result keeps head and tail', () => {
-  it('stores head, marker and tail; the marker\'s read returns exactly the elided chars; the live copy is the stored one', async () => {
+  it('stores head, marker and tail; the marker\'s read returns the elided chars; the live copy is the stored one', async () => {
     const body = lines(1000);
     assert.equal(body.length, 1000 * LINE - 1);
     const turn = await startTurn({ result: { success: true, data: body }, withWorkspace: true });
@@ -167,7 +167,7 @@ describe('an over-long tool result keeps head and tail', () => {
         input.offsetChars = got.nextOffsetChars;
         assert.ok(page < 100, 'paging ends');
       }
-      assert.equal(read.slice(0, e - h), body.slice(h, e), 'the pages hold exactly the elided chars');
+      assert.equal(read.slice(0, e - h), body.slice(h, e), 'the pages start with the elided chars');
       assert.equal(await liveResult(turn.membrane), stored, 'the live copy is the stored copy');
     } finally {
       await stop(turn);
