@@ -9857,6 +9857,17 @@ export class AgentFramework {
       `[effort] ${agent.name}: membrane refused a request carrying an effort row (${error.message}). ` +
         'Its requests carry the live effort on top and no effort rows from now until the agent ends or the process does; this one is sent again at once.',
     );
+    // The row this turn's start stored is the window's newest, and no
+    // request sent it. Taking it back leaves no row a release without
+    // FrameworkConfig.effort would send down a path that refuses it.
+    const row = agent.takeEffortRowAtStart();
+    if (row !== undefined) {
+      try {
+        agent.getContextManager().removeMessage(row);
+      } catch (removal) {
+        console.error(`[effort] ${agent.name}: the refused effort row ${row} stays stored:`, removal);
+      }
+    }
     return true;
   }
 

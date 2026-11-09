@@ -378,9 +378,11 @@ export interface FrameworkConfig {
    * `systemChangeRefused`, before the stream's first tool round, the request
    * is sent again at once. The retry carries no effort rows, and the live
    * level as its top-level effort. Neither a provider hold nor a stated wait
-   * takes it first. The agent's requests go without effort rows from then
-   * on, until the agent ends or the process does. A refusal after a tool
-   * round goes to the error policy, whose retry starts the turn's next stream.
+   * takes it first. The row the turn's start stored is taken back out of the
+   * store, since no request sent it. The agent's requests go without effort
+   * rows from then on, until the agent ends or the process does. A refusal
+   * after a tool round goes to the error policy, whose retry starts the
+   * turn's next stream.
    *
    * A preview shows the row a start would write, unstored. The direct API
    * (`Agent.runInference`) sends what a turn's request would carry and writes
