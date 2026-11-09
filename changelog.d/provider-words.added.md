@@ -1,3 +1,0 @@
-- The `inference:exhausted` trace gains `shownReason`: the reason the `[inference-failed]` note may give, before the note's own 600-character cut, bounded as the trace's `error` is. It's present only when the failure's message holds no provider's text: a progress bound's cut, a stream's abort, or context-manager's refusal of a compile.
-- `InferenceLogEntry` and `InferenceLogSummary` gain `errorWords`: the entry's `error` in the framework's words, with no provider's text, which `health--snapshot` shows. Entries written before this release have none.
-- `ProviderWaitNotSleptError`'s constructor takes `ErrorOptions` as its third argument, as `Error`'s does, so one can carry a `cause`.
