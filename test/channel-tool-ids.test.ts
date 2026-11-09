@@ -41,29 +41,6 @@ const call = (text: string): unknown => JSON.parse(text);
 
 const invited = { serverId: 'discord', channelId: 'invited' };
 
-for (const [kind, written, gave] of [['a number', ID, 'a number'], ['true', 'true', 'a boolean']] as const) {
-  test(`channel_open refuses a beforeMessageId written as ${kind}, and nothing is opened or sent`, async () => {
-    const { registry, opens } = await makeRegistry();
-    const before = registry.getDesiredState('discord', 'invited');
-    const res = await registry.handleChannelToolCall('channel_open', call(`{"channelId":"invited","backscroll":5,"beforeMessageId":${written}}`), origin);
-    assert.equal(res.success, false);
-    assert.equal((res as { isError?: unknown }).isError, true);
-    assert.equal(String((res as { error?: unknown }).error).startsWith(`Nothing changed: channel_open's beforeMessageId must be a string, and this call gave ${gave}. Give it in quotes`), true, String((res as { error?: unknown }).error));
-    assert.equal(opens.length, 0, 'no channels/open was sent');
-    assert.equal(registry.getDesiredState('discord', 'invited'), before, 'no decision to open was recorded');
-  });
-
-  test(`channel_decline refuses a messageId written as ${kind}, and nothing is declined or acknowledged`, async () => {
-    const { registry, acks } = await makeRegistry();
-    const res = await registry.handleChannelToolCall('channel_decline', call(`{"channelId":"invited","messageId":${written},"acknowledge":"👀"}`), origin);
-    assert.equal(res.success, false);
-    assert.equal((res as { isError?: unknown }).isError, true);
-    assert.equal(String((res as { error?: unknown }).error).startsWith(`Nothing changed: channel_decline's messageId must be a string, and this call gave ${gave}. Give it in quotes`), true, String((res as { error?: unknown }).error));
-    assert.equal(acks.length, 0, 'no channels/acknowledge was sent');
-    assert.equal(registry.closedByAgent(invited), undefined, 'no decline was recorded');
-  });
-}
-
 test('channel_open and channel_decline pass a string id to the server as it was written', async () => {
   const opened = await makeRegistry();
   const open = await opened.registry.handleChannelToolCall('channel_open', call(`{"channelId":"invited","backscroll":5,"beforeMessageId":"${ID}"}`), origin);
@@ -99,16 +76,17 @@ test("channel_publish's refusal of a channelId written as a number carries isErr
   );
 });
 
-// Every parameter a channel tool's schema gives as a string, other than the
-// three above, each with a call that's otherwise one the tool takes.
 const STRING_PARAMETERS: Array<[tool: string, field: string, rest: Record<string, unknown>]> = [
   ['channel_open', 'channelId', { serverId: 'discord' }],
   ['channel_open', 'serverId', { channelId: 'invited' }],
+  ['channel_open', 'beforeMessageId', { channelId: 'invited', backscroll: 5 }],
   ['channel_decline', 'channelId', { serverId: 'discord', messageId: '1', acknowledge: '👀' }],
   ['channel_decline', 'serverId', { channelId: 'invited', messageId: '1', acknowledge: '👀' }],
+  ['channel_decline', 'messageId', { channelId: 'invited', acknowledge: '👀' }],
   ['channel_decline', 'acknowledge', { channelId: 'invited', serverId: 'discord', messageId: '1' }],
   ['channel_close', 'channelId', { serverId: 'discord' }],
   ['channel_close', 'serverId', { channelId: 'invited' }],
+  ['channel_publish', 'channelId', { content: 'zz-number' }],
   ['channel_publish', 'content', { channelId: 'invited' }],
   ['channel_publish', 'text', { channelId: 'invited' }],
   ['think', 'content', {}],
