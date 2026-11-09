@@ -28,5 +28,6 @@
   refusal can't tell whether it holds the name, and gives that
   instruction. An entry that holds no setting, as restoring a tool's only
   description leaves it, is no longer named "Not currently available"
-  once its tool goes away, as 0.32.0 named it, so the diagnostics and the
-  refusal agree on which names the file keeps a setting for.
+  once its tool goes away, as 0.32.0 and 0.33.0 named it, so the
+  diagnostics and the refusal agree on which names the file keeps a
+  setting for.
