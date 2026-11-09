@@ -18,7 +18,13 @@
   the agent's first view of its message. A turn that hears an operator's
   private message at a tool boundary, or is presented one at a start that
   continues it, is private for the rest of it and, unless it's silent or ends
-  there, is told so by a `[routing]` notice. Plain speech already waiting for
+  there, is told so by a `[routing]` notice. In locus, hybrid and locked
+  mode, a turn private from its open is told so by the same notice where the
+  channel it would otherwise have announced differs from the last one the
+  agent was told of, and its window alone, without a wake's mark, would make
+  it private. A private turn's delivery receipt there names its plain speech
+  as kept private.
+  Plain speech already waiting for
   a channel to open when the turn turns private still posts there. The turns
   that the framework's own wakes from a private turn open, its auto-continue,
   its ` !` continuation and a prose bounce's resend, are private too
