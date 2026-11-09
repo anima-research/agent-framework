@@ -22546,7 +22546,7 @@ export class AgentFramework {
    */
   private publishInputWithTurnLocus(input: unknown, agentName: string, callingTurn: TurnRouting | undefined): unknown {
     const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
-    if (typeof given === 'string') return input;
+    if (given !== undefined && given !== null) return input;
     // A locked turn's default is its lock, or none: never what the registry
     // resolves now, which reads the agent's latest routing (a silent start's).
     const locus = callingTurn

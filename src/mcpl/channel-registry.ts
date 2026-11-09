@@ -708,15 +708,15 @@ export function qualifiedChannelName(ref: ChannelRef): string {
   return `${ref.serverId}:${ref.channelId}`;
 }
 
-/** A channel tool's refusal of a message id given as something other than a
+/** A channel tool's refusal of an id given as something other than a
  *  string: one written as a JSON number past 2^53 is rounded when the call is
  *  parsed, so it would reach the server as a different id. */
-function idNotString(tool: string, field: string, value: unknown): ToolResult | undefined {
+function idNotString(tool: string, field: string, value: unknown, shownBy: string): ToolResult | undefined {
   if (value === undefined || value === null || typeof value === 'string') return undefined;
   return {
     success: false,
-    error: `Nothing changed: ${tool}'s ${field} must be a string. Give it in quotes, as the invitation notice does: ` +
-      'a message id written as a number can lose its last digits before it reaches the server, and then arrives as a different id.',
+    error: `Nothing changed: ${tool}'s ${field} must be a string. Give it in quotes, as ${shownBy} does: ` +
+      'an id written as a number can lose its last digits before it reaches the server, and then arrives as a different id.',
     isError: true,
   };
 }
@@ -5208,7 +5208,7 @@ export class ChannelRegistry {
     backscroll?: number;
     beforeMessageId?: string;
   }, own?: readonly ChannelRef[]): Promise<ToolResult> {
-    const badId = idNotString('channel_open', 'beforeMessageId', input.beforeMessageId);
+    const badId = idNotString('channel_open', 'beforeMessageId', input.beforeMessageId, 'the invitation notice');
     if (badId) return badId;
     const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, own);
     const entry = resolved.entry;
@@ -5602,7 +5602,7 @@ export class ChannelRegistry {
     messageId: string;
     acknowledge?: string;
   }, own?: readonly ChannelRef[]): Promise<ToolResult> {
-    const badId = idNotString('channel_decline', 'messageId', input.messageId);
+    const badId = idNotString('channel_decline', 'messageId', input.messageId, 'the invitation notice');
     if (badId) return badId;
     const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, own);
     const entry = resolved.entry;
@@ -6507,6 +6507,8 @@ export class ChannelRegistry {
     seen?: { outcome?: PublishOutcome; resolved?: ChannelRef; refusal?: PublishRefusalReason },
     tool: 'channel_publish' | 'speak_in_channel' = 'channel_publish',
   ): Promise<ToolResult> {
+    const badId = idNotString(tool, 'channelId', input.channelId, 'channel_list');
+    if (badId) return badId;
     const findIds = tool === 'channel_publish'
       ? 'channel_list shows the channel ids.'
       : 'Use the id of a tuned-out channel whose messages you are reading.';
