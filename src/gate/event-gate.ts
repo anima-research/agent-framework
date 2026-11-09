@@ -22,7 +22,7 @@ import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, rec
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
-import { isSystemNotice } from '../mcpl/tags.js';
+import { isAmbient, isSystemNotice } from '../mcpl/tags.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type { TraceEventInput } from '../types/trace.js';
@@ -4057,7 +4057,7 @@ export class EventGate {
 
     const routeChannelId = this.routeChannelFor(info);
     const replyTo = routeChannelId !== undefined && info.serverId
-      && !info.tags?.includes('chat:ambient') && !info.tags?.includes('chat:system')
+      && !isAmbient(info.tags) && !isSystemNotice(info.tags)
       ? { serverId: info.serverId, channelId: routeChannelId } : undefined;
     const event: PendingEvent = {
       policyName: policy.name,

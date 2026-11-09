@@ -108,7 +108,7 @@ import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRe
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
-import { expandCoreTags, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
+import { expandCoreTags, isAmbient, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -716,7 +716,7 @@ const authorName = (metadata: Record<string, unknown> | undefined): string =>
 /** A wake's `ambient` mark: only a message its server tagged `chat:ambient`
  *  (RFC-001) is known to ask nothing of the agent. */
 const ambientMark = (tags?: string[]): { ambient?: true } =>
-  Array.isArray(tags) && tags.includes('chat:ambient') ? { ambient: true } : {};
+  isAmbient(tags) ? { ambient: true } : {};
 
 /** A wake's `systemNotice` mark: a message its server tagged `chat:system`
  *  (RFC-001 rev 3) is a notice about the place (a join, the weather), not
