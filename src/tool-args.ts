@@ -83,7 +83,7 @@ export function markedInputRefusal(call: { name: string; unparseableInput?: stri
   if (text === undefined) return undefined;
   const reason = blockReason(call);
   if (reason !== undefined) {
-    const resend = "None of that block's calls ran; send them again, each parameter in its own complete element and each invoke ended by its closing tag.";
+    const resend = "None of that block's calls ran; send them again in one well-formed block.";
     return call.name === ''
       ? `Nothing was done: a function_calls block that isn't well-formed didn't run: ${reason}. ${resend}`
       : `Nothing was done: ${nameToTypeBack(call.name)} didn't run, because the function_calls block it was in isn't well-formed: ${reason}. ${resend}`;
