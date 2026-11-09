@@ -160,12 +160,6 @@ interface WireRecord {
    *  error reaches it: `ended` for a 404, `revision` for a 400 carrying
    *  -32022. */
   sessionEnded?: 'ended' | 'revision';
-  /**
-   * The call's own abort, given to the SDK, which cancels the call when it
-   * fires: at the call's deadline, or as soon as the stream that would carry
-   * the current leg's answer ends unanswered and can't be resumed (see
-   * ObservedTransport's `send`). Either way the call reports `no-response`.
-   */
   readonly cancel: AbortController;
 }
 
@@ -382,7 +376,7 @@ class ObservedTransport implements Transport {
   }
 
   /** Drop a finished request's legs from `awaiting`, unanswered legs
-   *  included. (Its abort, over HTTP, goes as `aborts` says.) */
+   *  included. */
   forget(record: WireRecord): void {
     for (const [id, entry] of this.awaiting) if (entry === record) this.awaiting.delete(id);
   }
@@ -1396,11 +1390,6 @@ export class ModernMcpConnection extends EventEmitter {
     }, this.backoffDelay(this.reconnectAttempts));
   }
 
-  /**
-   * With `restart`, the session the server ended is replaced at once,
-   * whatever `reconnect` says, and a failure is attempt 1 of a reconnect.
-   * Without `reconnect`, that failure also closes the connection for good.
-   */
   private async attemptReconnect(restart?: keyof typeof SESSION_END): Promise<void> {
     if (!this.willReconnect || this.session) return;
     const attempt = Math.max(1, this.reconnectAttempts);

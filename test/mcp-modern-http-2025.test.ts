@@ -875,9 +875,7 @@ for (const ended of ['as its answer asks for another', 'once the next round is o
     // The transport calls a request's stream-end callback after its answer
     // too. Here round 1's stream ends after its answer, an input_required:
     // in the same turn, before the SDK sends round 2, or once round 2 is out
-    // and not yet answered. Failing the call then would lose round 2. Each
-    // round is held at the transport (an own `send` keeps its options and
-    // sends nothing) and answered through the transport's onmessage.
+    // and not yet answered. Failing the call then would lose round 2.
     const fixture = await start2025();
     await fixture.upgrade('reject');
     const connection = await connect(fixture);
