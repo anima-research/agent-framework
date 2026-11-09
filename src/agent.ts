@@ -2821,11 +2821,13 @@ export class Agent {
 
     for (const block of content) {
       if (block.type === 'tool_use') {
+        const reason = (block as { unparseableReason?: unknown }).unparseableReason;
         toolCalls.push({
           id: block.id,
           name: block.name,
           input: block.input,
           ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
+          ...(typeof reason === 'string' ? { unparseableReason: reason } : {}),
         });
       } else if (block.type === 'text') {
         speechContent.push(block);

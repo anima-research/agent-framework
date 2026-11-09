@@ -28732,12 +28732,15 @@ export class AgentFramework {
                 assistantBlocks.push({ type: 'text', text: roundText });
               }
               for (const c of calls) {
+                const reason = (c as { unparseableReason?: unknown }).unparseableReason;
                 assistantBlocks.push({
                   type: 'tool_use',
                   id: c.id,
                   name: c.name,
                   input: c.input as Record<string, unknown>,
                   ...(rawXml ? { rawXml } : {}),
+                  ...(c.unparseableInput !== undefined ? { unparseableInput: c.unparseableInput } : {}),
+                  ...(typeof reason === 'string' ? { unparseableReason: reason } : {}),
                 });
               }
             }
@@ -29395,18 +29398,8 @@ export class AgentFramework {
             // deliveries): its targets resolve now, as a live round's do.
             // Routing publishes trimmed segments; held drafts keep the runs
             // exactly as written.
-            //
-            // A text-only turn is one message — unless an all-refused XML
-            // round (membrane `tool_attempt`, answered in-band with a
-            // `tool_notice`) separates its prose: nothing was called, but the
-            // words before the attempt and after its notice are two messages,
-            // routed as segments like a tool turn's.
             const speechRun = speechContent.map((b) => b.text).join('\n');
-            const finalSpeechRuns = speechContent.length === 0
-              ? []
-              : response.content.some((b) => (b.type as string) === 'tool_attempt')
-                ? splitProseRuns(response.content)
-                : speechRun.trim() ? [speechRun] : [];
+            const finalSpeechRuns = speechRun.trim() ? [speechRun] : [];
             const finalSpeechSegments = finalSpeechRuns.map((run) => run.trim());
             const finalRuns = hadToolCalls && allText.length > 0
               ? splitProseRuns(liveProseRouting
