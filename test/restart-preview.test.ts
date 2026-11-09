@@ -220,6 +220,8 @@ function compressHistory(framework: AgentFramework, count: number): string[] {
   const cm = framework.getAgent('prime')!.getContextManager();
   const ids: string[] = [];
   for (let i = 1; i <= count; i++) ids.push(cm.addMessage(i % 2 === 1 ? 'User' : 'prime', [{ type: 'text', text: `[h${i}] ${PAGE}` }]));
+  // A resident's window holds a stored row only once it's presented.
+  cm.presentRows(ids);
   return ids;
 }
 
@@ -551,69 +553,7 @@ test("an agent outside the shared slot counts its own manager's row edits: its r
   });
 });
 
-async function resumedSharedSlotJob(framework: AgentFramework, strategy: AgentConfig['strategy']) {
-  const { name: _name, ...job } = agentConfig({ name: 'job', maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined });
-  const first = await framework.createEphemeralAgent(
-    { ...job, name: 'job', strategy: new PassthroughStrategy() },
-    { ...workerSpec('job'), readsSharedSlot: true },
-  );
-  first.contextManager.addMessage('User', [{ type: 'text', text: 'Begin.' }]);
-  await framework.runEphemeralToCompletion(first.agent, first.contextManager);
-  return framework.resumeAgent('job', { ...job, strategy });
-}
-
-test("a resumed job that reads the shared slot reads the slot's count: its remembered decline is previewed again once a resident removes a row", async () => {
-  const membrane = new TurnMembrane([[answer('Begun.')], [...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
-  let changed = false;
-  const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: ['compression'] }));
-  const module = new PagesModule();
-  await withFramework(membrane, module, agentConfig({ triggerSources: [] }), async (framework, traces) => {
-    const prime = framework.getAgent('prime')!.getContextManager();
-    const resumed = await resumedSharedSlotJob(framework, strategy);
-    const stored = prime.addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]);
-    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
-    module.onCall = (call) => {
-      if (call !== 6) return;
-      changed = true;
-      prime.removeMessage(stored);
-    };
-    const run = await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
-    assert.ok(run.speech.includes(FINAL), `the resumed job answered on the restarted stream: ${run.speech}`);
-    assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false], 'the 4th boundary declined, the 5th took its answer');
-    assert.equal(strategy.previews, 2, "the 6th boundary, once the resident's manager removed a row, asked again");
-    assert.equal(restarted(traces).length, 1, 'and restarted');
-  });
-});
-
-test("a resumed job that reads the shared slot feeds the slot's count: a resident's remembered decline is previewed again once the job's manager edits a row", async () => {
-  const membrane = new TurnMembrane([[answer('Begun.')], [...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
-  let changed = false;
-  const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: ['compression'] }));
-  const module = new PagesModule();
-  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
-  await withFramework(membrane, module, agent, async (framework, traces) => {
-    const resumed = await resumedSharedSlotJob(framework, new PassthroughStrategy());
-    const stored = framework.getAgent('prime')!.getContextManager().addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]);
-    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
-    module.onCall = (call) => {
-      if (call !== 6) return;
-      changed = true;
-      resumed.contextManager.editMessage(stored, [{ type: 'text', text: '[x] a line' }]);
-    };
-    try {
-      ask(framework);
-      await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
-      assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false], 'the 4th boundary declined, the 5th took its answer');
-      assert.equal(strategy.previews, 2, "the 6th boundary, once the job's manager edited a row, asked again");
-      assert.equal(restarted(traces).length, 1, 'and restarted');
-      assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
-    } finally {
-      resumed.cleanup();
-    }
-  });
-});
-
-test("a resumed job on the shared slot with toolResultGuard on replaces a held result's placeholder with the result: a resident's remembered decline is previewed again at its next boundary, and not at the one after", async () => {
+test("a resumed job that asks for the shared slot opens its own, so its toolResultGuard replacing a held result's placeholder doesn't reach a resident's remembered decline: the resident takes the decline's answer at its next boundary", async () => {
   const jobRound = createMockResponse([{ type: 'tool_use', id: 'job_1', name: 'pages--read', input: {} }] as ContentBlock[], 'tool_use');
   const membrane = new TurnMembrane([[answer('Begun.')], [...toolRounds(6, 4_000), answer('Done on the first stream.')], [jobRound, answer('Job done.')], [answer(FINAL)]]);
   const strategy = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));
@@ -646,8 +586,8 @@ test("a resumed job on the shared slot with toolResultGuard on replaces a held r
       ask(framework);
       await waitUntil('the turn to end', () => storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
       assert.ok(jobSpeech.includes('Job done.'), `the guarded job ran its round during the resident's 5th tool call: ${jobSpeech}`);
-      assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, true, false], "the 4th boundary declined on a preview, the 5th previewed again after the job's settlement, the 6th took the 5th's answer");
-      assert.equal(strategy.previews, 2, 'two previews in all');
+      assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false, false], "the 4th boundary declined on a preview, and the 5th and 6th took its answer though the job's guard replaced a placeholder");
+      assert.equal(strategy.previews, 1, 'one preview in all');
       assert.equal(restarted(traces).length, 0, 'and no restart');
     } finally {
       resumed.cleanup();
