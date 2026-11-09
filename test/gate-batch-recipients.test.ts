@@ -78,20 +78,45 @@ describe('a batch shows each event to the agents it is for', () => {
     gate.dispose();
   });
 
-  it("judges a batch as a whole, for the gate's recipients, and never with an event whose list of recipients is empty", () => {
+  it("judges a batch as a whole, for the gate's recipients, and never with an event whose list of recipients is empty", async () => {
     const requests: JudgeRequest[] = [];
+    let answered!: () => void;
+    const verdict = new Promise<void>((resolve) => { answered = resolve; });
     const judge: JudgeFn = async (request) => {
       requests.push(request);
+      answered();
       return { reply: false, reason: 'not now' };
     };
     const { gate, wakes } = makeGate('judge.json', { judge: { debounceMs: 60_000 } }, judge);
     gate.evaluate(reminder('water the plants', ['other']));
     gate.evaluate(reminder('feed the cat', []));
     fire(gate);
+    await verdict;
+    const judging = gate as unknown as { judging: Map<string, unknown> };
+    for (let i = 0; i < 20 && judging.judging.size > 0; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(judging.judging.size, 0, 'premise: the verdict is applied');
     assert.equal(requests.length, 1);
     assert.deepEqual(requests[0]!.agentNames, ['agent', 'other']);
     assert.deepEqual(requests[0]!.events.map((e) => e.content), ['water the plants']);
-    assert.deepEqual(wakes, []);
+    assert.deepEqual(wakes, [], 'a WAIT wakes no one');
+    gate.dispose();
+  });
+
+  it('names on each upcoming wake the agents it would wake, of those asked about', () => {
+    const { gate } = makeGate('wakes.json', { debounce: 60_000 });
+    gate.evaluate(reminder('water the plants', ['other']));
+    gate.armSelfWake('other', 120);
+    gate.setSleep(300, undefined, 'other');
+    const wakes = gate.upcomingWakes(['agent', 'other']);
+    assert.deepEqual(wakes.map((w) => w.kind), ['debounce', 'self-wake', 'sleep-end'], 'premise: the three kinds of source');
+    assert.deepEqual(wakes.map((w) => (w as { agents?: unknown }).agents), [['other'], ['other'], ['other']]);
+    assert.deepEqual(gate.upcomingWakes(['agent']), [], "none is agent's");
+    gate.clearSleep();
+    gate.evaluate(reminder('dim the lamps'));
+    gate.setSleep(300);
+    const shared = gate.upcomingWakes(['agent', 'other']).filter((w) => w.kind !== 'self-wake');
+    assert.deepEqual(shared.map((w) => [w.kind, (w as { agents?: unknown }).agents]), [['debounce', ['agent', 'other']], ['sleep-end', ['agent', 'other']]],
+      'an untargeted event and a sleep that names no agent are for every agent asked about');
     gate.dispose();
   });
 

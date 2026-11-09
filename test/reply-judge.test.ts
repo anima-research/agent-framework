@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
 import { JudgeFailure, ReplyJudge, cut, ifYouWait, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
-import type { JudgeRequest } from '../src/gate/types.js';
+import type { JudgeRequest, UpcomingWake } from '../src/gate/types.js';
 
 function msg(participant: string, text: string): NormalizedMessage {
   return { participant, content: [{ type: 'text', text }] };
@@ -334,6 +334,31 @@ describe('reply judge: the document', () => {
     });
     await judge.judge(judgeRequest());
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
+  });
+
+  it('tells the judge only the wakes for the agent it judges for', async () => {
+    const now = Date.now();
+    const upcomingWakes = [
+      { at: now + 60_000, certain: true, what: "rule 'batch''s debounced batch of 1 event", agents: ['other'] },
+      { at: now + 120_000, certain: true, what: "Scout's own skip_reply timer", agents: ['Scout'] },
+      { at: now + 180_000, certain: true, what: 'the end of its sleep', agents: ['Scout', 'other'] },
+    ] as unknown as UpcomingWake[];
+    const listed = ifYouWait(upcomingWakes, 'Scout', now);
+    assert.match(listed, /Scout's own skip_reply timer/);
+    assert.match(listed, /the end of its sleep/);
+    assert.doesNotMatch(listed, /debounced batch/, "a wake for other alone isn't Scout's");
+    assert.match(ifYouWait(upcomingWakes.slice(0, 1), 'Scout', now), /Nothing the host knows of is scheduled to wake Scout/);
+    const { membrane, requests } = fakeMembrane();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      upcomingWakes: () => [{ certain: true, what: 'a wake already queued (x)' }],
+    });
+    await judge.judge(judgeRequest({ agentNames: ['Scout', 'other'], upcomingWakes }));
+    const question = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.match(question, /Scout's own skip_reply timer/);
+    assert.match(question, /a wake already queued \(x\)/, "the host's own wakes for the agent it reads stay");
+    assert.doesNotMatch(question, /debounced batch/);
   });
 
   it('reads the primary agent its chooser names', async () => {
