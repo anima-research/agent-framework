@@ -1126,7 +1126,7 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
 });
 
 const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-  'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
+  'coalescingBatchSubjects', 'readsRow', 'wakeLines'];
 
 function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<string | symbol, unknown>): symbol {
   const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
@@ -1308,7 +1308,7 @@ test("a held merged start's release gives its first member none of the other mem
       const dropped = { serverId: 'discord', channelId: 'discord:g:dropped' };
       first.wakeChannels = [kept];
       other.wakeChannels = [dropped];
-      other.readsStoredMessage = 'zz-no-such-message';
+      other.readsRow = 'zz-no-such-message';
       start.wakeChannels = [kept, dropped];
       go();
       await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
