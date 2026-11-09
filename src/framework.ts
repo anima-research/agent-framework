@@ -39942,7 +39942,9 @@ export class AgentFramework {
           : `This conversation is bound to channel ${homeQuoted}, so it can't open other channels, and nothing was opened. Reply in ${homeQuoted}.`);
         return;
       }
-      if (call.name === 'channel_publish' || call.name === 'channel_close') {
+      const givenId = (call.input as { channelId?: unknown } | null | undefined)?.channelId;
+      const publishRefusesId = call.name === 'channel_publish' && givenId !== undefined && givenId !== null && typeof givenId !== 'string';
+      if (!publishRefusesId && (call.name === 'channel_publish' || call.name === 'channel_close')) {
         const input = (call.input ?? {}) as { channelId?: string; serverId?: string };
         // An empty serverId is read as none given, as the channel tools and
         // channelNamed read it.

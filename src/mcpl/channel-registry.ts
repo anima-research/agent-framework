@@ -709,8 +709,9 @@ export function qualifiedChannelName(ref: ChannelRef): string {
 }
 
 /** A channel tool's refusal of an id given as something other than a
- *  string: one written as a JSON number past 2^53 is rounded when the call is
- *  parsed, so it would reach the server as a different id. */
+ *  string: one written as a JSON number past 2^53 usually loses its last
+ *  digits when the call is parsed, and then reaches the server as a different
+ *  id. */
 function idNotString(tool: string, field: string, value: unknown, shownBy: string): ToolResult | undefined {
   if (value === undefined || value === null || typeof value === 'string') return undefined;
   return {
