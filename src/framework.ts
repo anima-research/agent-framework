@@ -7182,20 +7182,19 @@ export class AgentFramework {
    *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
    *  single subject), and the write a wake reads. A wake with any of them
    *  can be withdrawn or dropped on its own, and must not stand for one
-   *  without. (coalescingBatch is set only beside one of the first two.)
-   *  And the private mark (privateCaller), so a wake without it never stands
-   *  for one with it. */
+   *  without. (coalescingBatch is set only beside one of the first two.) */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow && !a.privateCaller === !b.privateCaller &&
+      a.readsRow === b.readsRow &&
       (a.wakeLines ?? []).map(wakeLineKey).join('\n') === (b.wakeLines ?? []).map(wakeLineKey).join('\n');
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
-   *  already held marks that one, so the hold still keeps the turn alive. */
+   *  already held marks that one, so the hold still keeps the turn alive,
+   *  and a private turn's request (privateCaller) marks it private. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
     const same = held.find((r) => this.sameInferenceRequest(r, request));
     if (!same) {
@@ -7205,6 +7204,7 @@ export class AgentFramework {
     // Read the kept request's carry before marking it.
     const keptCarry = turnCarryOf(same);
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    if (request.privateCaller) same.privateCaller = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did.
     const batch = mergedBatch(request);
