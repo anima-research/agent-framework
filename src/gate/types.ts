@@ -70,10 +70,11 @@ export interface PassiveSampleConfig {
  * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
  * times out delivers the batch as a debounce's is (fail open), unless the
- * host set its `onError` to `"skip"`. The wake then carries each event's
- * write where the host gave `evaluate` one, so a host that drops an answered
- * wake, as AgentFramework does, starts no turn when the agent has answered
- * every event.
+ * host set its `onError` to `"skip"`. The wake then carries the batch's
+ * writes where the host gave `evaluate` one for each event in the window
+ * (WakeProvenance.writes), so a host that drops an answered wake, as
+ * AgentFramework does, starts no turn when the agent has answered every
+ * event.
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
