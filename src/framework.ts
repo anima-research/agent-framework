@@ -775,7 +775,7 @@ function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled', hel
 }
 
 const OPERATOR_PENDING =
-  "a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or is the newest message you've had, or on a turn that continues one where that held";
+  "a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or is the newest message there, or on a turn that continues one where that held";
 
 /**
  * Locked mode's one-time primer. Event-shaped and short, as the others are
@@ -834,8 +834,8 @@ const PROSE_LOCUS_TOOL: import('./types/index.js').ToolDefinition = {
   description:
     'Where your plain speech (text you write without a send tool) goes. It stays there, on this turn and later ones, ' +
     'until you change it here: the channel a message comes from, a heartbeat and channel_open never move it. ' +
-    'While a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or ' +
-    'is the newest message you\'ve had, or on a turn that continues one where that held, your plain speech goes to no ' +
+    'While a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or ' +
+    'is the newest message there, or on a turn that continues one where that held, your plain speech goes to no ' +
     'channel wherever this points; a change made then is kept for later turns. ' +
     'Leave `to` out (or null) to see where it goes now. `to`: "#channel", "@person" or a channel id posts your ' +
     'plain speech there; "drafts" holds it as drafts instead, posted nowhere unless you resend them with the drafts ' +
@@ -1565,8 +1565,10 @@ interface TurnRouting {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), by a round that calls `drafts`, and sends nothing else, after a send, or because the turn is private (TurnRouting.private): counted, never drafted. */
+  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts`, and sends nothing else, after a send: counted, never drafted. */
   keptPrivate: number;
+  /** Plain-speech segments kept from every channel because the turn is private (TurnRouting.private): counted, never drafted. */
+  keptForPrivacy: number;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
   /**
@@ -1623,7 +1625,7 @@ function freshTurnRouting(): TurnRouting {
     turnId: ++lastTurnId,
     engaged: new Set(),
     wasIn: [],
-    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [], heard: new Map(),
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, keptForPrivacy: 0, arrivals: [], heard: new Map(),
     addressedElsewhere: new Set(),
   };
 }
@@ -1674,7 +1676,11 @@ function operatorSurface(metadata: unknown): string | undefined {
 }
 
 function answersOperator(row: StoredMessage): boolean {
-  if ((row.metadata as { silentHeartbeat?: unknown } | undefined)?.silentHeartbeat !== undefined) return false;
+  const metadata = row.metadata as { silentHeartbeat?: unknown; external?: unknown } | undefined;
+  if (metadata?.silentHeartbeat !== undefined) return false;
+  // A module's copy of a message from outside under the agent's name, such as a history sync's of the agent's
+  // earlier post, isn't an answer the agent wrote.
+  if (metadata?.external !== undefined) return false;
   const blocks = Array.isArray(row.content) ? row.content : [];
   return !blocks.some((block) => block.type === 'tool_use')
     && blocks.some((block) => block.type === 'text' && !!(block as { text?: string }).text?.trim());
@@ -2243,8 +2249,8 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
       'channel, tries the open again if it isn\'t open. ' +
       'scope "all-except" holds EVERY channel (DMs and new channels included) except channelId, for ' +
       'durationSeconds (required); your plain speech lands in that channel meanwhile, except while a message from a ' +
-      'surface with no channel (such as a console, the TUI or an API call) is unanswered or is the newest message ' +
-      `you've had, or on a turn that continues one where that held: then it goes to no channel; ${who} pauses rather than ` +
+      'surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or is the newest message ' +
+      `there, or on a turn that continues one where that held: then it goes to no channel; ${who} pauses rather than ` +
       'cancels when its wake budget is spent. ' +
       'mode "check" reports what is held without releasing it (`peek` shows one channel\'s newest held lines).',
     inputSchema: {
@@ -13746,7 +13752,7 @@ export class AgentFramework {
       'and channels that appear later included — is held and stops waking ' +
       'you; your plain speech lands in the focused channel, except while a ' +
       'message from a surface with no channel (such as a console, the TUI or ' +
-      'an API call) is unanswered or is the newest message you\'ve had, or on ' +
+      'an API call) in your context is unanswered or is the newest message there, or on ' +
       'a turn that continues one where that held: then it goes to no channel. The ' +
       'same hold as ' +
       'tune_out with scope "all-except". mode "cancel" releases the held ' +
@@ -23199,6 +23205,7 @@ export class AgentFramework {
     const held = logical.drafts;
     logical.drafts = [];
     logical.keptPrivate = 0;
+    logical.keptForPrivacy = 0;
     delete logical.draftFailures;
     if (held.length === 0) return;
     this.recordDraftNotices(agent, this.draftsNamedInHistory(agent, held.map((d) => d.id)));
@@ -23638,7 +23645,7 @@ export class AgentFramework {
     locus: ChannelRef | null,
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
     if (round.routing.private) {
-      round.routing.keptPrivate++;
+      round.routing.keptForPrivacy++;
       return null;
     }
     if (round.routing.heldForMove) {
@@ -23728,8 +23735,9 @@ export class AgentFramework {
     // receipt names as noticed.
     const drafts = routing.drafts;
     const kept = routing.keptPrivate;
+    const keptForPrivacy = routing.keptForPrivacy;
     const notHeld = routing.draftFailures;
-    if (list.length === 0 && suppressed === 0 && drafts.length === 0 && kept === 0 && !notHeld) return;
+    if (list.length === 0 && suppressed === 0 && drafts.length === 0 && kept === 0 && keptForPrivacy === 0 && !notHeld) return;
     routing.deliveries = [];
     routing.suppressed = 0;
     const seen = new Set<string>();
@@ -23804,7 +23812,8 @@ export class AgentFramework {
         'the words remain only in your history',
       );
     }
-    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (${routing.private ? 'this turn is private' : 'skip_reply, a drafts call or a private think'})`);
+    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`);
+    if (keptForPrivacy > 0) notes.push(`${keptForPrivacy} plain-speech segment(s) kept private (this turn is private)`);
     if (suppressed > 0) {
       notes.push(this.proseRoutingOf(agent) === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
@@ -24245,9 +24254,9 @@ export class AgentFramework {
   }
 
   /**
-   * The channel a private turn's open would have resolved were it public, as
-   * `main` resolves it. Unsetting the flag for one call is safe because
-   * resolveLocus is synchronous and reads privacy only through turnRouting.
+   * The channel a private turn's open would have resolved were it public.
+   * Unsetting the flag for one call is safe because resolveLocus is
+   * synchronous and reads privacy only through turnRouting.
    */
   private publicLocusAtOpen(agentName: string, routing: TurnRouting): ChannelRef | null {
     delete routing.private;
@@ -24289,10 +24298,10 @@ export class AgentFramework {
    * Never triggers
    * inference; never locus-eligible itself (system + no channel metadata).
    */
-  private announceLocusIfChanged(agentName: string, locus: ChannelRef | null, locked = false): void {
+  private announceLocusIfChanged(agentName: string, locus: ChannelRef | null, locked = false, always = false): void {
     const hasBaseline = this.readAnnouncedLocus(agentName);
     const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
-    if (!this.announcedLocusDiffers(agentName, locus)) {
+    if (!always && !this.announcedLocusDiffers(agentName, locus)) {
       if (!hasBaseline) this.lastAnnouncedLocus.set(agentName, locus);
       return;
     }
@@ -26343,7 +26352,7 @@ export class AgentFramework {
       return;
     }
     if (!sticky && routing.private) {
-      routing.keptPrivate++;
+      routing.keptForPrivacy++;
       return;
     }
     if (!sticky && locus === null && routing.heartbeat) {
@@ -27643,13 +27652,16 @@ export class AgentFramework {
       } else if (routing.private) {
         if (turnProseRouting === 'locked') routing.locked = true;
         if (attempt === 0 && turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
-          // Where `main` would have announced a channel at this open, the flip's notice says why there is none.
-          const lost = turnProseRouting === 'locked' ? this.proseLockLocus(agent) : routing.heartbeat ? null : this.publicLocusAtOpen(agent.name, routing);
-          const surface = lost !== null && this.announcedLocusDiffers(agent.name, lost)
+          // Where a public turn's open would tell the agent where its plain speech goes (a channel, or a heartbeat's
+          // drafts), a private turn's says it goes to no channel.
+          const heartbeat = turnProseRouting !== 'locked' && routing.heartbeat === true;
+          const lost = turnProseRouting === 'locked' ? this.proseLockLocus(agent) : heartbeat ? null : this.publicLocusAtOpen(agent.name, routing);
+          const tells = heartbeat ? !continuesHeartbeat : lost !== null && this.announcedLocusDiffers(agent.name, lost);
+          const surface = tells
             ? privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata))
             : undefined;
           if (surface !== undefined) this.makeTurnPrivate(agent, routing, surface);
-          else this.announceLocusIfChanged(agent.name, null);
+          else this.announceLocusIfChanged(agent.name, null, false, tells);
         }
       } else if (turnProseRouting === 'locked') {
         // Locked mode: the agent's lock, whatever woke the turn, a heartbeat

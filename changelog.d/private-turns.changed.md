@@ -9,7 +9,10 @@
   that heard the message. A turn is private while such a message is unanswered
   or is the newest channel or surface message in its window. Only a round of
   the agent's that writes words and calls no tool answers it, so an answer
-  given only through a tool, such as a send, leaves it unanswered. A channel's
+  given only through a tool, such as a send, leaves it unanswered, and so does
+  a row under the agent's name that a module stored from outside
+  (`metadata.external`), such as the Discord history sync's copy of the
+  agent's earlier post. A channel's
   message there is a row whose inbound source is a channel, or a row with no
   inbound source, as a module writes for its channel's message, whose metadata
   names a `channelId`, that has no `kind` and no `system` flag, and that isn't
@@ -19,11 +22,14 @@
   private message at a tool boundary, or is presented one at a start that
   continues it, is private for the rest of it and, unless it's silent or ends
   there, is told so by a `[routing]` notice. In locus, hybrid and locked
-  mode, a turn private from its open is told so by the same notice where the
-  channel it would otherwise have announced differs from the last one the
-  agent was told of, and its window alone, without a wake's mark, would make
-  it private. A private turn's delivery receipt there names its plain speech
-  as kept private.
+  mode, a turn private from its open whose open would otherwise tell the
+  agent where its plain speech goes, because the channel it would announce
+  differs from the last one the agent was told of or, outside locked mode,
+  because a heartbeat woke it, is told so: by the same notice where its
+  window alone, without a wake's mark, would make it private, and otherwise
+  by the notice that its plain speech currently has no channel. A private
+  turn's delivery receipt there names the plain speech it kept for being
+  private apart from what the agent kept by choice.
   Plain speech already waiting for
   a channel to open when the turn turns private still posts there. The turns
   that the framework's own wakes from a private turn open, its auto-continue,
