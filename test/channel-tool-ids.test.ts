@@ -36,24 +36,28 @@ const call = (text: string): unknown => JSON.parse(text);
 
 const invited = { serverId: 'discord', channelId: 'invited' };
 
-test("channel_open refuses a beforeMessageId written as a number, and nothing is opened or sent", async () => {
-  const { registry, opens } = await makeRegistry();
-  const before = registry.getDesiredState('discord', 'invited');
-  const res = await registry.handleChannelToolCall('channel_open', call(`{"channelId":"invited","backscroll":5,"beforeMessageId":${ID}}`), origin);
-  assert.equal(res.success, false);
-  assert.match(String((res as { error?: unknown }).error), /^Nothing changed: channel_open's beforeMessageId must be a string\. Give it in quotes, as the invitation notice does/);
-  assert.equal(opens.length, 0, 'no channels/open was sent');
-  assert.equal(registry.getDesiredState('discord', 'invited'), before, 'no decision to open was recorded');
-});
+for (const [kind, written] of [['a number', ID], ['true', 'true']] as const) {
+  test(`channel_open refuses a beforeMessageId written as ${kind}, and nothing is opened or sent`, async () => {
+    const { registry, opens } = await makeRegistry();
+    const before = registry.getDesiredState('discord', 'invited');
+    const res = await registry.handleChannelToolCall('channel_open', call(`{"channelId":"invited","backscroll":5,"beforeMessageId":${written}}`), origin);
+    assert.equal(res.success, false);
+    assert.equal((res as { isError?: unknown }).isError, true);
+    assert.match(String((res as { error?: unknown }).error), /^Nothing changed: channel_open's beforeMessageId must be a string\. Give it in quotes, as the invitation notice does/);
+    assert.equal(opens.length, 0, 'no channels/open was sent');
+    assert.equal(registry.getDesiredState('discord', 'invited'), before, 'no decision to open was recorded');
+  });
 
-test("channel_decline refuses a messageId written as a number, and nothing is declined or acknowledged", async () => {
-  const { registry, acks } = await makeRegistry();
-  const res = await registry.handleChannelToolCall('channel_decline', call(`{"channelId":"invited","messageId":${ID},"acknowledge":"👀"}`), origin);
-  assert.equal(res.success, false);
-  assert.match(String((res as { error?: unknown }).error), /^Nothing changed: channel_decline's messageId must be a string\. Give it in quotes, as the invitation notice does/);
-  assert.equal(acks.length, 0, 'no channels/acknowledge was sent');
-  assert.equal(registry.closedByAgent(invited), undefined, 'no decline was recorded');
-});
+  test(`channel_decline refuses a messageId written as ${kind}, and nothing is declined or acknowledged`, async () => {
+    const { registry, acks } = await makeRegistry();
+    const res = await registry.handleChannelToolCall('channel_decline', call(`{"channelId":"invited","messageId":${written},"acknowledge":"👀"}`), origin);
+    assert.equal(res.success, false);
+    assert.equal((res as { isError?: unknown }).isError, true);
+    assert.match(String((res as { error?: unknown }).error), /^Nothing changed: channel_decline's messageId must be a string\. Give it in quotes, as the invitation notice does/);
+    assert.equal(acks.length, 0, 'no channels/acknowledge was sent');
+    assert.equal(registry.closedByAgent(invited), undefined, 'no decline was recorded');
+  });
+}
 
 test('channel_open and channel_decline pass a string id to the server as it was written', async () => {
   const opened = await makeRegistry();
