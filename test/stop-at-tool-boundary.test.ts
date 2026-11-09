@@ -277,11 +277,15 @@ interface Boundary {
   /** Let the round's spill write finish, and wait until the boundary has
    *  dropped, resumed or restarted the round. */
   release: () => Promise<void>;
+  /** Let the round's spill write finish, waiting for nothing after it. */
+  releaseWrite: () => Promise<void>;
   /** Whether the turn has ended: no turn alive, the agent idle. */
   turnEnded: () => boolean;
   /** The round's rows in the agent's window: its tool_use or tool_result. */
   roundRows: () => string[];
   blocks: () => string[];
+  /** Each block in the agent's window, in its order (#291: a row stored during a turn enters it at a point). */
+  windowBlocks: () => string[];
   /** What the workspace holds at the round's first spill path. */
   spilled: () => Promise<string>;
   /** stop(), bounded: a stream left running fails the test. */
@@ -389,9 +393,14 @@ async function holdAtToolBoundary(options: HoldOptions = {}): Promise<Boundary> 
       await within('the spill write to finish', spills.written);
       await within('the boundary to drop, resume or restart the round', decided.promise);
     },
+    releaseWrite: async () => {
+      spills.open();
+      await within('the spill write to finish', spills.written);
+    },
     turnEnded: () => framework.getHostModeStatus().activeTurns === 0 && agent.state.status === 'idle',
     roundRows: () => blocks().filter((b) => b.endsWith(':call_fetch')).map((b) => b.split(':')[0]),
     blocks,
+    windowBlocks: () => blocksOf(agent.getContextManager().getPresentedMessages()),
     spilled: async () => {
       const read = await workspace.readBinary(spills.paths[0]);
       return 'data' in read ? read.data.toString('utf8') : `(${read.error})`;
@@ -605,6 +614,65 @@ describe('a stop at a tool boundary', () => {
     }
   });
 
+  // AF #844 bot review 3, finding 67: storing the round's reply presents it,
+  // and that runs the presentation's listeners synchronously. One that stops
+  // the turn there ends it as the stop before the store does, but for what
+  // is stored already: the reply's call keeps its results, so the record
+  // holds no call without one, and the stream isn't resumed.
+  it("a stop made by a listener of the reply's presentation ends the turn: the round's call keeps its results, and the stream isn't resumed", async () => {
+    const b = await holdAtToolBoundary();
+    try {
+      const agent = b.framework.getAgent('prime')!;
+      let stopped = false;
+      b.framework.onTrace((event) => {
+        if (stopped || event.type !== 'presentation:presented' || event.agentName !== 'prime' || event.occasion !== 'write') return;
+        stopped = true;
+        agent.cancelStream();
+      });
+      await b.releaseWrite();
+      await waitFor('the turn to end', b.turnEnded);
+      assert.ok(stopped, "setup: the reply's presentation was traced, and its listener stopped the turn");
+      assert.ok(b.streams[0].cancelled, 'the stop cancelled the stream');
+      assert.equal(b.streams[0].resumeAttempts, 0, 'the round was not resumed');
+      await waitFor('the turn to end', b.turnEnded);
+      assert.equal(b.requests(), 1, 'no other request was made');
+      assert.deepEqual(b.roundRows(), ['tool_use', 'tool_result'], 'the call is stored with its result');
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
+  // AF #844 bot review 4, finding 14: after the round is stored, the
+  // boundary stores the clock due and presents what arrived, and those
+  // presentations run their listeners synchronously too. A stop made there
+  // ends the turn as one at the store does: what is stored and presented
+  // stays, and the stream isn't resumed with the results.
+  it("a stop made by a listener of the boundary's presentation of an arrival ends the turn, and the stream isn't resumed", async () => {
+    const b = await holdAtToolBoundary();
+    try {
+      const agent = b.framework.getAgent('prime')!;
+      let stopped = false;
+      b.framework.onTrace((event) => {
+        if (stopped || event.type !== 'presentation:presented' || event.agentName !== 'prime' || event.occasion !== 'tool-boundary') return;
+        stopped = true;
+        agent.cancelStream();
+      });
+      b.module.say('meanwhile');
+      await b.releaseWrite();
+      await waitFor('the turn to end', b.turnEnded);
+      assert.ok(stopped, "setup: the arrival's presentation at the boundary was traced, and its listener stopped the turn");
+      assert.ok(b.streams[0].cancelled, 'the stop cancelled the stream');
+      assert.equal(b.streams[0].resumeAttempts, 0, 'the round was not resumed');
+      assert.equal(b.requests(), 1, 'no other request was made');
+      assert.deepEqual(b.roundRows(), ['tool_use', 'tool_result'], 'the call is stored with its result');
+      assert.ok(b.windowBlocks().includes('text:meanwhile'), 'the arrival presented at the boundary stays in the window');
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
   it("an ephemeral run's disposal at its tool boundary cancels the stream, and the round isn't resumed or stored", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'stop-at-boundary-ephemeral-'));
     const mountDir = join(tempDir, 'mount');
@@ -673,21 +741,24 @@ describe('a stop at a tool boundary', () => {
 });
 
 describe('a tool boundary nobody stops', () => {
-  it("stores the round's tool_use with its results once the write is done, and a message sent meanwhile after them", async () => {
+  it("stores the round's tool_use with its results once the write is done; a message sent meanwhile, stored at once, enters the window after them", async () => {
     const b = await holdAtToolBoundary();
     try {
-      // While the write runs, the turn is alive, so the message is deferred.
+      // While the write runs, the turn is alive, so the message is stored
+      // out of the window (#291; it was once deferred), and enters the window
+      // after the round, whose rows are stored once the write is done: the
+      // window's order, not the record's, is the one checked here.
       b.module.say('meanwhile');
-      assert.deepEqual(b.roundRows(), [], "neither of the round's rows is in the window while its write runs");
+      assert.deepEqual(b.roundRows(), [], "neither of the round's rows is stored while its write runs");
       await b.release();
 
       assert.ok(b.traces.some((t) => t.type === 'inference:stream_resumed'), 'the round was resumed');
       await waitFor('the turn to end', b.turnEnded);
-      const blocks = b.blocks();
+      const blocks = b.windowBlocks();
       const toolUse = blocks.indexOf('tool_use:call_fetch');
       assert.ok(toolUse >= 0, "the round's tool_use is stored");
       assert.equal(blocks[toolUse + 1], 'tool_result:call_fetch', 'its result is stored right after it');
-      assert.ok(blocks.indexOf('text:meanwhile') > toolUse + 1, 'the message sent during the write lands after the round');
+      assert.ok(blocks.indexOf('text:meanwhile') > toolUse + 1, 'the message sent during the write enters the window after the round');
       assert.equal(b.traces.filter(isDropped).length, 0, 'nothing was dropped');
       await b.stop();
     } finally {
