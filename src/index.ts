@@ -3,11 +3,19 @@ export * from './types/index.js';
 
 // Core classes
 export { AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export { isReasoningLoss } from './reasoning-loss.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
+export type { PresentationOccasion } from './presentation.js';
+export { covers, coverTest, describeReadMark, markAtOrAfter, type Cover, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
+// How a resident's context and the subconscious's are opened (#291), for a host that opens one itself.
+export {
+  residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter,
+  type ContextManagerOpenOptions,
+} from './context-options.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
@@ -73,9 +81,9 @@ export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent 
 
 // EventGate
 export { EventGate, MCPL_GATE_EVENT_TYPES, wakeLineText, type EventTypesFrom, type WakeProvenance, type WritePlacement } from './gate/index.js';
-export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine } from './gate/index.js';
+export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine, SuppressConfig, SuppressionReviewOptions } from './gate/index.js';
 export { ReplyJudge, DEFAULT_JUDGE_MODEL, DEFAULT_JUDGE_MAX_INPUT_TOKENS, MIN_JUDGE_INPUT_TOKENS } from './gate/index.js';
-export type { JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, ReplyJudgeDeps, UpcomingWake } from './gate/index.js';
+export type { JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, ReplyJudgeDeps, UpcomingWake, UpcomingWakeKind } from './gate/index.js';
 export { Heartbeat, DEFAULT_HEARTBEAT, HEARTBEAT_TOOL_PREFIX } from './heartbeat/heartbeat.js';
 export type { HeartbeatOptions, HeartbeatSettings, HeartbeatWake, HeartbeatDeliveryMode, HeartbeatScheduledWake, Reminder } from './heartbeat/heartbeat.js';
 

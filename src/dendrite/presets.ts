@@ -11,10 +11,14 @@ import type { AgentName, AgentSpec, ContextInheritance, ResultRoute } from './ty
 export const DEFAULT_TASK_IDLE_TIMEOUT_MS = 15 * 60_000;
 
 /**
- * A resident: persistent, declared in configuration, reads the residents'
- * shared message slot. The first one declared owns default delivery.
+ * A resident: persistent, declared in configuration, its own rows stored in
+ * the residents' shared message slot. The first one declared owns default
+ * delivery. `observes` names the other agents whose own rows its window
+ * takes (AgentConfig.observes): an observe edge on each, `{ agent }`, which
+ * reads that agent's own slot, the residents' slot it shares, and shows it
+ * that agent's own rows there (bearingOf). None by default.
  */
-export function residentSpec(name: AgentName, options: { primary: boolean }): AgentSpec {
+export function residentSpec(name: AgentName, options: { primary: boolean; observes?: readonly AgentName[] }): AgentSpec {
   return {
     name,
     kind: 'resident',
@@ -25,6 +29,11 @@ export function residentSpec(name: AgentName, options: { primary: boolean }): Ag
       ownsProviderScheduling: true,
     },
     lifetime: { kind: 'persistent' },
+    ...(options.observes?.length ? { observes: options.observes.map((agent) => ({ agent })) } : {}),
+    ownSlot: { namespace: null },
+    // Deprecated: kept for one release beside ownSlot, which the registry
+    // reads first, for a host that reads the flag off a preset's spec or
+    // builds its specs from one.
     readsSharedSlot: true,
     namespace: `agents/${name}`,
   };
@@ -33,9 +42,9 @@ export function residentSpec(name: AgentName, options: { primary: boolean }): Ag
 /**
  * The subconscious: a persistent attention tenant of the resident it
  * serves. It persists across policy epochs (cancelling a tune-out ends a
- * channel's cadence, not this agent), observes the residents' slot with
- * held traffic included, is never a broadcast recipient, and ends with its
- * resident.
+ * channel's cadence, not this agent), stores its own rows in a slot of its
+ * own and observes the residents' slot with held traffic included, is never
+ * a broadcast recipient, and ends with its resident.
  */
 export function subconsciousSpec(name: AgentName, serves: AgentName): AgentSpec {
   return {
@@ -52,6 +61,9 @@ export function subconsciousSpec(name: AgentName, serves: AgentName): AgentSpec 
     onParentEnd: 'end',
     observes: [{ includeHeld: true }],
     resultTo: { to: serves, as: 'message' },
+    ownSlot: { namespace: `subconscious/${serves}` },
+    // Deprecated, as on residentSpec: it reads the residents' slot through
+    // its observe edge; its ownSlot places its rows.
     readsSharedSlot: true,
     namespace: `subconscious/${serves}`,
   };
