@@ -258,10 +258,9 @@ export class HookOrchestrator {
           if (typeof mcplInj.namespace !== 'string') this.readNamespace(server.id, mcplInj.namespace);
           const injection = convertMcplInjection(mcplInj, server.id);
           if (injection.position === 'system') this.noteBlocksNotShown(server.id, mcplInj.namespace, injection.content);
-          // Deprecated mechanism (agent-framework#171): still collected as
-          // before, and a server is named once on stderr at its first
-          // injection that passes the checks above.
-          warnContextInjectionDeprecated('mcpl-server', server.id);
+          // A beforeUser injection is deprecated (agent-framework#171): still
+          // collected, and its server is named once on stderr.
+          if (injection.position === 'beforeUser') warnContextInjectionDeprecated('mcpl-server', server.id);
           injections.push(injection);
         } catch (error) {
           // Such as a null block, content that isn't an array, a null

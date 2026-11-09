@@ -625,10 +625,11 @@ export class ModuleRegistry {
     await Promise.all(promises);
     for (const { slot, moduleName, registration } of asked) {
       if (this.moduleContexts.get(moduleName) === registration) {
-        // Deprecated mechanism (agent-framework#171): still collected as
-        // before, and a module is named once on stderr the first time it
-        // adds injections to the list.
-        if (results[slot].length > 0) warnContextInjectionDeprecated('module', moduleName);
+        // A beforeUser injection is deprecated (agent-framework#171): still
+        // collected, and its module is named once on stderr.
+        if (results[slot].some((injection) => injection.position === 'beforeUser')) {
+          warnContextInjectionDeprecated('module', moduleName);
+        }
         this.noteBlocksNotShown(moduleName, results[slot]);
         continue;
       }

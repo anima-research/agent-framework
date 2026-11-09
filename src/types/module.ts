@@ -47,6 +47,13 @@ export interface MessageQuery {
  * binds a reply's thinking to everything before it, every reply after its old
  * place loses its thinking. It has no effect on a `system` or `beforeUser`
  * injection, which `compile()` always places.
+ *
+ * A `beforeUser` one is deprecated (agent-framework#171): `compile()` places
+ * it again before the newest user message at every compile, so it moves, the
+ * request misses the cache from there on, and it can split a tool call from
+ * its result. A `system` one goes into the system prompt: a change to its
+ * text misses the cache from the system prompt on, and the conversation
+ * doesn't store it. (See context-injection-deprecation.ts.)
  */
 export type ModuleContextInjection = ContextInjection & { placedEachCompile?: true };
 
@@ -126,8 +133,6 @@ export interface Module {
    * default (15s) when omitted. Declare a larger budget when gatherContext
    * does real work — e.g. sequential LLM calls with provider backoff — so the
    * injection isn't silently dropped every turn.
-   *
-   * @deprecated Only meaningful for the deprecated `gatherContext` hook.
    */
   readonly contextTimeoutMs?: number;
 
@@ -220,33 +225,6 @@ export interface Module {
    * turn's start or a restart after tool results, that's where `compile()`
    * would have placed it.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
-   *
-   * @deprecated Context injection is deprecated (agent-framework#171).
-   * Injections are per-compile overlays, never stored in the conversation. A
-   * `beforeUser` or `afterUser` injection is placed beside the latest
-   * user-participant message, tool results included, on every compile, so it
-   * moves each time a newer one takes its place, which breaks prompt-cache
-   * prefixes at its old slot (head-only hits on OpenAI lanes), and a
-   * `beforeUser` injection placed beside a tool result lands between the tool
-   * call and its result in the compiled messages. With no user-participant
-   * message, context-manager 0.16 and later put both at the end, and earlier
-   * versions drop a `beforeUser` injection. A `system` injection's text is
-   * appended to the system prompt, which comes before every message, so with
-   * a prefix cache each new text of it misses the cache for everything after
-   * it. On a model that binds each signed thinking block to the request it
-   * was made in, a moved injection or new `system` text also means no reply
-   * after the point where the request first changed can keep its thinking.
-   * Do not add new implementations: changing state belongs in conversation
-   * content (events, tool results), and durable content in the agent's
-   * configured system prompt, which the host's configuration sets; `system`
-   * text that changes at runtime has no provider-independent replacement.
-   * (With membrane 0.7 and context-manager 0.22 and later, a stored
-   * `system_change` block adds system text just before the next assistant
-   * turn after its place (or at the end, after a user turn), through
-   * membrane's native formatter and an adapter that can send it, such as its
-   * Anthropic adapter, to a model that takes mid-conversation system
-   * messages, and can't replace any.) Still called for now; the framework
-   * logs one `[deprecated]` line per module whose injections it collects.
    */
   gatherContext?(agentName: string): Promise<ModuleContextInjection[]>;
 

@@ -1,8 +1,8 @@
 /**
- * Context injection is deprecated (#171). Injections are still collected as
- * before, and each module or MCPL server whose injections are collected is
- * named once on stderr; a module that returns none isn't, and nor is a
- * server whose injections the grant check drops.
+ * Placing a context injection at `beforeUser` is deprecated (#171). Every
+ * injection is still collected as before. Each module or MCPL server whose
+ * collected injections include a `beforeUser` one is named once on stderr;
+ * `system` and `afterUser` injections, which stay supported, name nothing.
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,15 +10,18 @@ import { ModuleRegistry } from '../src/module-registry.js';
 import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { resetContextInjectionDeprecationWarnings } from '../src/context-injection-deprecation.js';
-import type { Module } from '../src/types/index.js';
+import type { Module, ModuleContextInjection } from '../src/types/index.js';
+
+type Position = 'system' | 'beforeUser' | 'afterUser';
 
 function makeRegistry(modules: Module[]): ModuleRegistry {
   const registry = Object.create(ModuleRegistry.prototype) as ModuleRegistry;
   (registry as any).modules = new Map(modules.map((m) => [m.name, m]));
+  (registry as any).moduleContexts = new Map(modules.map((m) => [m.name, {}]));
   return registry;
 }
 
-function injectingModule(name: string, count: number): Module {
+function injectingModule(name: string, positions: Position[], extra: Partial<ModuleContextInjection> = {}): Module {
   return {
     name,
     start: async () => {},
@@ -26,10 +29,11 @@ function injectingModule(name: string, count: number): Module {
     getTools: () => [],
     handleToolCall: async () => ({ success: true }),
     onProcess: async () => ({}),
-    gatherContext: async () => Array.from({ length: count }, (_, i) => ({
+    gatherContext: async () => positions.map((position, i) => ({
       namespace: name,
-      position: 'afterUser' as const,
+      position,
       content: [{ type: 'text' as const, text: `${name} #${i}` }],
+      ...extra,
     })),
   };
 }
@@ -44,8 +48,8 @@ async function captureWarnings(fn: () => Promise<void>): Promise<string[]> {
 
 beforeEach(() => resetContextInjectionDeprecationWarnings());
 
-test('a module that injects is still collected and is named once across turns', async () => {
-  const registry = makeRegistry([injectingModule('hud', 1)]);
+test('a module that places a beforeUser injection is still collected and is named once across turns', async () => {
+  const registry = makeRegistry([injectingModule('hud', ['beforeUser'])]);
   let first: unknown[] = [];
   const warnings = await captureWarnings(async () => {
     first = await registry.gatherContext('agent');
@@ -56,24 +60,33 @@ test('a module that injects is still collected and is named once across turns', 
   assert.equal(warnings.length, 1, `one warning for three turns, got ${JSON.stringify(warnings)}`);
   assert.equal(
     warnings[0],
-    '[deprecated] module "hud" returns context injections, and this line changes nothing about how they\'re applied. ' +
-      'Context injection is deprecated (anima-research/agent-framework#171). Moving changing state into conversation ' +
-      'content (push events, tool results) is for whoever maintains the module or server named at the start of this ' +
-      "line. Durable system text belongs in the agent's configured system prompt, which whoever configures this host " +
-      'sets; system text that changes at runtime has no provider-independent replacement. For an MCPL server, ' +
-      'disabledCapabilities: ["contextHooks.beforeInference.inject"] in its config drops its injections and any ' +
-      'feature set of its that uses them, and keeps its other capabilities; its system injections are denied unless ' +
-      'its config enables them. A module has no such switch: turning it off removes its injections along with ' +
-      'whatever else it does.',
+    '[deprecated] module "hud" places a context injection at beforeUser, which is still applied. ' +
+      'Placing a context injection at beforeUser is deprecated (anima-research/agent-framework#171). ' +
+      'It is placed again before the newest user message at every compile, so it moves: the request misses ' +
+      'the cache from there on, and it can split a tool call from its result. Use afterUser, which is stored ' +
+      'where it lands.',
     'the whole line an operator reads',
   );
 });
 
-test('a module whose gatherContext returns nothing is not warned about', async () => {
-  const registry = makeRegistry([injectingModule('quiet', 0), injectingModule('loud', 2)]);
+test('a module whose injections are system or afterUser, placedEachCompile included, is not named', async () => {
+  const registry = makeRegistry([
+    injectingModule('instructions', ['system']),
+    injectingModule('toolsets', ['afterUser']),
+    injectingModule('near-end', ['afterUser'], { placedEachCompile: true }),
+    injectingModule('quiet', []),
+  ]);
+  let collected: unknown[] = [];
+  const warnings = await captureWarnings(async () => { collected = await registry.gatherContext('agent'); });
+  assert.equal(collected.length, 3, 'every injection still collected');
+  assert.deepEqual(warnings, []);
+});
+
+test('a module is named when any of its injections is beforeUser', async () => {
+  const registry = makeRegistry([injectingModule('mixed', ['afterUser', 'beforeUser'])]);
   const warnings = await captureWarnings(async () => { await registry.gatherContext('agent'); });
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /"loud"/);
+  assert.match(warnings[0], /^\[deprecated\] module "mixed" places a context injection at beforeUser/);
 });
 
 function orchestratorWith(grantPaths: string[], position: string) {
@@ -92,7 +105,7 @@ function orchestratorWith(grantPaths: string[], position: string) {
 
 const params = { agentName: 'agent', userMessage: 'hi' } as any;
 
-test('an MCPL server injection within its grant is still collected and named once', async () => {
+test('an MCPL server beforeUser injection within its grant is still collected and named once', async () => {
   const orchestrator = orchestratorWith(['contextHooks.beforeInference.inject.beforeUser'], 'beforeUser');
   let collected: unknown[] = [];
   const warnings = await captureWarnings(async () => {
@@ -101,11 +114,21 @@ test('an MCPL server injection within its grant is still collected and named onc
   });
   assert.equal(collected.length, 1, 'injection still collected');
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /MCPL server "recap-server" returns context injections, and this line changes nothing about how they're applied\./);
+  assert.match(warnings[0], /^\[deprecated\] MCPL server "recap-server" places a context injection at beforeUser, which is still applied\. /);
 });
 
-test('an injection outside the grant is dropped as before and does not warn', async () => {
-  const orchestrator = orchestratorWith(['contextHooks.beforeInference.inject.beforeUser'], 'system');
+for (const position of ['system', 'afterUser'] as const) {
+  test(`an MCPL server ${position} injection within its grant is collected and not named`, async () => {
+    const orchestrator = orchestratorWith([`contextHooks.beforeInference.inject.${position}`], position);
+    let collected: unknown[] = [];
+    const warnings = await captureWarnings(async () => { collected = await orchestrator.beforeInference(params); });
+    assert.equal(collected.length, 1);
+    assert.deepEqual(warnings, []);
+  });
+}
+
+test('a beforeUser injection outside the grant is dropped as before and does not warn', async () => {
+  const orchestrator = orchestratorWith(['contextHooks.beforeInference.inject.system'], 'beforeUser');
   const errs: string[] = [];
   const origErr = console.error;
   console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
