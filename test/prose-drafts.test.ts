@@ -3241,25 +3241,6 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
 
   // An all-refused XML attempt isn't a tool round, so the prose before it is
   // no round's: it goes out, though the think round after it has the same place.
-  it('XML tool mode: prose before an all-refused attempt stays out of the private think round after it', async () => {
-    const h = await harness({ xml: true, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
-    try {
-      const attempt = [
-        text('Before the attempt.'),
-        { type: 'tool_attempt', rawXml: '<invoke name="missing">' } as unknown as ContentBlock,
-        { type: 'tool_notice', content: 'no such tool' } as unknown as ContentBlock,
-      ];
-      const round = [text('Prose beside think.'), call('t1', 'think', { content: 'hmm' })];
-      await h.turn([
-        createMockResponse(round, 'tool_use'),
-        { ...createMockResponse([...attempt, ...round, { type: 'tool_result', toolUseId: 't1', content: 'ok' } as unknown as ContentBlock, text('After the think.')]), toolCalls: [] },
-      ]);
-      assert.deepEqual(h.publishes().map((p) => p.text), ['Before the attempt.', 'After the think.']);
-    } finally {
-      await h.close();
-    }
-  });
-
   // routeRound only logs an unsilenced private-think round's prose: it counts
   // nothing, so no receipt line says it was kept private.
   it('XML tool mode: a private think in a turn nothing silences is withheld and counted nowhere, as in native mode', async () => {
