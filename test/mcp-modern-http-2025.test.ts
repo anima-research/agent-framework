@@ -1499,12 +1499,21 @@ for (const kind of ['restart', 'reconnect'] as const) {
     const connection = await connect(fixture, { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
     if (kind === 'restart') await connection.listTools();
     const events = lifecycle(connection);
+    const internals = connection as unknown as { attemptReconnect: (cause?: string) => Promise<void> };
+    const attemptReconnect = internals.attemptReconnect.bind(connection);
+    const attempts: Promise<void>[] = [];
+    internals.attemptReconnect = (cause?: string) => {
+      const attempt = attemptReconnect(cause);
+      attempts.push(attempt);
+      return attempt;
+    };
     await fixture.forget(false);
     await assert.rejects(connection.callTool('echo', {}));
     await until(() => held !== undefined, 'the new session\'s discovery, held');
     connection.stopReconnecting();
     json(held!, 400, { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Bad Request: No valid session ID provided' } });
     await until(() => count(fixture, (s) => s.method === 'DELETE' && s.status !== 0) === 1 && fixture.sessions.size === 0 && !connection.willReconnect, 'the new session let go');
+    await Promise.all(attempts);
     assert.deepEqual(events, kind === 'restart'
       ? ['close willReconnect=true']
       : ['reconnect-failed 1: MCP server "remote" ended its session (HTTP 404) before the session answered a request', 'close willReconnect=true']);
