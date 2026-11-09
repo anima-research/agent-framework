@@ -2315,7 +2315,11 @@ describe('plain speech a module says it showed', () => {
       pendingRequests: Array<{ reason?: string; openingMessages?: string[] }>;
       routingOf(name: string): { openingMessages?: string[] };
       quarantinePoisonedHistory(agent: unknown, reason: string): void;
+      presentAtEndOf(agent: unknown): void;
     };
+    // The rewind sheds from the agent's window, so the row is presented
+    // there first, as a turn's end would present it.
+    i.presentAtEndOf(agent);
     i.routingOf('resident').openingMessages = ['m-opening'];
     i.quarantinePoisonedHistory(agent, 'the provider refused the request');
     const woke = i.pendingRequests.filter((r) => r.reason === 'inference-failure-rewind-retry');
