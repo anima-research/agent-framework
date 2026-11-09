@@ -174,6 +174,16 @@ for (const [name, why] of [['', 'the call the block gave no name to'], ['probe--
   });
 }
 
+test('for an agent with allowedTools, a call cut off with no reason to a tool the agent may not call gets the allowedTools refusal', async () => {
+  const h = await harness({ allowedTools: ['probe--move'] });
+  try {
+    const results = await h.turn([marked('', 'probe--look')]);
+    assert.deepEqual(h.effects, []);
+    assert.equal(results[0]!.isError, true);
+    assert.ok(results[0]!.content.includes("Tool 'probe--look' is not permitted by this agent's allowedTools"), results[0]!.content);
+  } finally { await h.close(); }
+});
+
 test('a call marked with a reason is refused even when its text is JSON null', async () => {
   const h = await harness();
   try {
@@ -363,6 +373,17 @@ test("for an agent with allowedTools, a call with a reason through executeToolCa
     });
     assert.equal(result.success, false);
     assert.ok((result.error ?? '').endsWith(`: ${REASON}. ${RESEND}`), result.error);
+    assert.equal(h.effects.length, 0);
+  } finally { await h.close(); }
+});
+
+test('for an agent with allowedTools, a call cut off with no reason through executeToolCall fails with the allowedTools refusal', async () => {
+  const h = await harness({ allowedTools: ['probe--move'] });
+  try {
+    const result = await h.framework.executeToolCall({
+      id: 'programmatic', name: 'probe--look', input: {}, unparseableInput: '', callerAgentName: 'assistant',
+    });
+    assert.deepEqual(result, { success: false, error: "Tool 'probe--look' is not permitted by this agent's allowedTools, so the call didn't run.", isError: true });
     assert.equal(h.effects.length, 0);
   } finally { await h.close(); }
 });
