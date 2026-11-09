@@ -11,13 +11,12 @@
   follow, so a long hidden section pushes the index past the first 140
   lines, and the header says which line the index starts on. That header
   line is new, so every line reference in the catalogue moves down by at
-  least one, even with nothing hidden. The catalogue's revision doesn't
-  cover its layout, so this change leaves the revision as it was, and a
-  line reference saved before the upgrade reads the wrong lines under the
-  same revision; the header's remedy, rereading the index after changes,
-  still applies. Each hidden description appears twice in the file. A
-  hidden tool that isn't available right now is still named only in the
-  diagnostics. The unknown-name refusal of `set_tool_visibility` and
+  least one, even with nothing hidden. The catalogue's revision now
+  covers its layout too, so every catalogue's revision changes once at
+  the upgrade, and a line reference saved before it belongs to a revision
+  the catalogue no longer shows. Each hidden description appears twice in
+  the file. A hidden tool that isn't available right now is still named
+  only in the diagnostics. The unknown-name refusal of `set_tool_visibility` and
   `set_tool_description` now says the resident has no tool by that name
   right now, shown or hidden, where it said none was "available to you",
   which can read as a lack of access. When the resident's file holds a

@@ -3,6 +3,7 @@ import {syncBuiltinESMExports} from 'node:module';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {mkdtempSync,rmSync,writeFileSync,readFileSync,chmodSync,statSync,existsSync,mkdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -268,6 +269,17 @@ test('the catalogue opens on what the resident hid, each with its source and the
   const noneLines=none.split('\n');
   assert.ok(noneLines.indexOf('## Index by source')>0,none);
   assert.ok(noneLines.includes(`Index by source: line ${noneLines.indexOf('## Index by source')+1}.`),none);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('the revision names the catalogue layout, so a line reference saved before the hidden section reads as stale',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-layout-'));
+ try {
+  const path=join(dir,'tools.json'), raw='{"version":1,"tools":{"example":{"visible":false}}}';
+  writeFileSync(path,raw);
+  const snapshot=new ToolPresentation({path,cataloguePath:'board/tools.md'}).resolve(presentationTargets('example','workspace--read'));
+  const earlierLayout=createHash('sha256').update(JSON.stringify({raw,entries:snapshot.entries,diagnostics:snapshot.diagnostics})).digest('hex');
+  assert.notEqual(snapshot.revision,earlierLayout);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 

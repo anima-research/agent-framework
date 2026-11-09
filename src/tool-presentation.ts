@@ -37,6 +37,8 @@ const MAX_DESCRIPTION_CHARS = 32768;
 const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'workspace--read', 'toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close']);
 export const isPresentationTool = (name: string): boolean => name === 'set_tool_visibility' || name === 'set_tool_description';
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
+/** The catalogue's line layout, folded into its revision so a line reference saved under an earlier layout reads as stale. Raise it with any change to where the catalogue's lines fall. */
+const CATALOGUE_LAYOUT = 2;
 
 /**
  * A presentation or defaults file this host can't use. Each problem is a
@@ -248,7 +250,7 @@ export class ToolPresentation {
       return {name:tool.name,source:sources.get(tool.name) ?? 'Unattributed',visible:override?.visible ?? true,originalDescription:tool.description,description,descriptionSource,inputSchema:structuredClone(tool.inputSchema)};
     });
     const available = tools.map((tool,i) => ({...structuredClone(tool),description:entries[i].description}));
-    return {revision:hash(JSON.stringify({raw,entries,diagnostics})),source:this.config.path,cataloguePath:this.config.cataloguePath,diagnostics,available,
+    return {revision:hash(JSON.stringify({layout:CATALOGUE_LAYOUT,raw,entries,diagnostics})),source:this.config.path,cataloguePath:this.config.cataloguePath,diagnostics,available,
       advertised:available.filter((_,i)=>entries[i].visible),entries};
   }
   edit(tool: string, input: unknown, available: ToolDefinition[]): ToolResult {
