@@ -57,9 +57,31 @@ class ErrorStream implements YieldingStream {
   }
 }
 
+/** A stream that runs one tool round, then reports `error` where its next round would answer. */
+class RefusedAfterToolRound extends MockYieldingStream {
+  constructor(private readonly error: Error) {
+    super([
+      createMockResponse([{ type: 'tool_use', id: 'look_1', name: 'look', input: {} }] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'Never sent.' }]),
+    ]);
+  }
+  override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+    const inner = super[Symbol.asyncIterator]();
+    for (let next = await inner.next(); !next.done; next = await inner.next()) {
+      if (this.toolDepth > 0) {
+        yield { type: 'error', error: this.error } as StreamEvent;
+        return;
+      }
+      yield next.value;
+    }
+  }
+}
+
 /** Records each request, whose it is, and answers each stream with one reply, or with what `fail` gives first. */
 class Provider extends MockMembrane {
   fail?: (request: NormalizedRequest) => Error | undefined;
+  /** A stream of the test's own for a request, where it gives one. */
+  make?: (request: NormalizedRequest) => YieldingStream | undefined;
   /** The responses a request's stream gives, where it gives any: a tool call's round, then what follows it. */
   script?: (request: NormalizedRequest) => NormalizedResponse[] | undefined;
   readonly streams = new Map<NormalizedRequest, MockYieldingStream>();
@@ -68,6 +90,8 @@ class Provider extends MockMembrane {
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
     this.onStream?.(request);
+    const made = this.make?.(request);
+    if (made) return made;
     const error = this.fail?.(request);
     if (error) return new ErrorStream(error);
     const responses = this.script?.(request) ?? [createMockResponse([{ type: 'text', text: `Reply ${this.calls.length}.` }])];
@@ -307,7 +331,7 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
-  it('changes nothing without FrameworkConfig.effort: a stored effort row goes as stored, with no top level added', async () => {
+  it('without FrameworkConfig.effort, sends a host\'s stored effort row as stored, with no top level added', async () => {
     try {
       const { framework, provider, turn } = await resident({ agent: { providerParams: { output_config: { effort: 'medium' } } } });
       await turn('One.');
@@ -480,6 +504,41 @@ describe('FrameworkConfig.effort: every agent', () => {
     } finally { await cleanup(); }
   });
 
+  it('refuses a setting that isn\'t a level or a function at create, and takes null as left out', async () => {
+    try {
+      for (const effort of ['High', 'none', 3]) {
+        await assert.rejects(resident({ effort }), (error: Error) => /FrameworkConfig\.effort is .* isn't an effort level/.test(error.message), `${JSON.stringify(effort)} at create`);
+      }
+      const { provider, turn } = await resident({ effort: null });
+      await turn('One.');
+      assert.equal(topLevel(provider.calls[0]!), undefined, 'null: no top-level effort, as left out');
+      assert.deepEqual(effortRows(provider.calls[0]!), []);
+    } finally { await cleanup(); }
+  });
+
+  it('reads a function\'s answer that isn\'t a level, or its throw, as undefined, and says so once per agent', async () => {
+    try {
+      let answer: () => unknown = () => 'High';
+      const { provider, turn } = await resident({ effort: () => answer() });
+      const logged: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        await turn('One.');
+        await turn('Two.');
+        answer = () => { throw new Error('no level today'); };
+        await turn('Three.');
+      } finally { console.error = error; }
+      assert.deepEqual(provider.calls.map(topLevel), [undefined, undefined, undefined], 'no top-level effort for an answer that isn\'t a level');
+      assert.deepEqual(provider.calls.map(effortRows), [[], [], []], 'and no row');
+      assert.equal(logged.filter((line) => line.includes('[effort] agent: FrameworkConfig.effort')).length, 1, 'one line for the agent');
+      answer = () => 'low';
+      await turn('Four.');
+      const back = provider.calls[3]!;
+      assert.ok(topLevel(back) === 'low' || effortRows(back).some((row) => row.effort === 'low'), 'a level again reaches the request');
+    } finally { await cleanup(); }
+  });
+
   it('refuses an agent given output_config.effort in providerParams while FrameworkConfig.effort is set, naming both', async () => {
     try {
       await assert.rejects(
@@ -552,6 +611,24 @@ describe('FrameworkConfig.effort: a model that refuses effort rows', { skip: NEE
       await turn('Two.');
       assert.equal(provider.calls.length, 3, 'premise: the refused request, then its retry, which fails');
       assert.deepEqual(errorPolicy.attempts, [0], 'the retry\'s failure is the turn\'s first for the policy');
+    } finally { await cleanup(); }
+  });
+
+  it('leaves a marked refusal after a tool round to the error policy, with no retry at once', async () => {
+    try {
+      let live: Level = 'high';
+      const errorPolicy = new RecordingPolicy(() => ({ retry: false }));
+      const provider = new Provider();
+      const { turn, exhausted } = await resident({ effort: () => live, provider, errorPolicy });
+      await turn('One.');
+      live = 'low';
+      provider.make = (request) => (provider.calls.length === 2 ? new RefusedAfterToolRound(refusal(true)) : undefined);
+      await turn('Two.');
+      assert.deepEqual(effortRows(provider.calls[1]!).map((r) => r.effort), ['low'], 'premise: the stream\'s request carried the row');
+      assert.equal(provider.calls.length, 2, 'no request sent again at once');
+      assert.equal(errorPolicy.asked.length, 1, 'the error policy was asked');
+      assert.equal((errorPolicy.asked[0] as { systemChangeRefused?: unknown }).systemChangeRefused, true, 'about the marked refusal');
+      assert.equal(exhausted.length, 1, 'and the turn ended as its answer says');
     } finally { await cleanup(); }
   });
 
@@ -750,6 +827,32 @@ describe('FrameworkConfig.effort: the thinking binding', () => {
       assert.deepEqual(after.provider.calls.map(signed), [true, true], 'the stored reply keeps its thinking');
     } finally { await cleanup(); }
   });
+
+  it('leaves the stored replies\' thinking out once the requests leave out the agent\'s own effort rows, and keeps it while they don\'t', { skip: NEEDS_ROWS }, async () => {
+    try {
+      const SIG = 'sig-after-row'.repeat(10);
+      const agent = { thinking: { enabled: true, budgetTokens: 1024 }, thinkingBinding: { binds: true, dropBlock: true } };
+      const signed = (request: NormalizedRequest) => request.messages.some((m) =>
+        m.content.some((b) => (b as { signature?: unknown }).signature === SIG));
+      let live: Level | undefined = 'high';
+      const provider = new Provider();
+      provider.script = () => (provider.calls.length === 2
+        ? [createMockResponse([{ type: 'thinking', thinking: '', signature: SIG } as ContentBlock, { type: 'text', text: 'Two.' }])]
+        : undefined);
+      const { turn } = await resident({ agent, provider, effort: () => live });
+      await turn('One.');
+      live = 'low';
+      await turn('Two.');
+      assert.deepEqual(effortRows(provider.calls[1]!).map((r) => r.effort), ['low'], 'premise: the row went before the signed reply');
+      await turn('Three.');
+      assert.ok(signed(provider.calls[2]!), 'control: with the row still sent, the reply keeps its thinking');
+      assert.deepEqual(effortRows(provider.calls[2]!).map((r) => r.effort), ['low']);
+      live = undefined;
+      await turn('Four.');
+      assert.deepEqual(effortRows(provider.calls[3]!), [], 'premise: the row is left out now');
+      assert.equal(signed(provider.calls[3]!), false, 'so the reply minted after it goes without its thinking');
+    } finally { await cleanup(); }
+  });
 });
 
 describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () => {
@@ -790,7 +893,7 @@ describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () =>
     } finally { await cleanup(); }
   });
 
-  it('drops an ended agent\'s base and refused rows, so a new agent of that name starts at the live level', async () => {
+  it('drops an ended agent\'s base, so a new agent of that name after a restart starts at the live level', async () => {
     try {
       const dir = mkdtempSync(join(tmpdir(), 'af-effort-ended-'));
       dirs.push(dir);
@@ -1001,7 +1104,11 @@ describe('FrameworkConfig.effort: two agents on one store', { skip: NEEDS_ROWS }
       await turn('alpha', 'One.');
       await turn('beta', 'Two.');
       live.alpha = 'low';
+      const before = provider.calls.length;
       await turn('alpha', 'Three.');
+      const alphas = provider.calls.slice(before).filter((request) => request.assistantParticipant === 'alpha');
+      assert.equal(alphas.length, 2, 'premise: alpha\'s request and its retry');
+      assert.deepEqual(effortRows(alphas[0]!).map((r) => r.effort), ['low'], 'premise: alpha\'s refused request carried its row');
       assert.deepEqual(effortRows(last('alpha')), [], 'premise: alpha\'s rows were refused, and its retry carries none');
       assert.equal(topLevel(last('alpha')), 'low');
       live.beta = 'low';
