@@ -1101,7 +1101,7 @@ describe('plain speech a module says it showed', () => {
     await f.runUntilIdle();
     assert.ok(!published.some((p) => p.text === 'Looking around.'), `premise: the send held the round's speech: ${JSON.stringify(published)}`);
     assert.ok(openDrafts(f).some((d) => d.text === 'Looking around.' && d.reason === 'explicit-send'), JSON.stringify(openDrafts(f)));
-    assert.ok(askedTexts(surface).some((a) => a.text === 'Looking around.' && a.final === false), JSON.stringify(askedTexts(surface)));
+    assert.equal(askedTexts(surface).filter((a) => a.text === 'Looking around.' && a.final === false).length, 1, JSON.stringify(askedTexts(surface)));
     assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}, for Looking around.`), receipt(f));
   });
 
@@ -1128,7 +1128,7 @@ describe('plain speech a module says it showed', () => {
     const drafts = openDrafts(f);
     assert.ok(drafts.some((d) => d.text.includes('And plain.')) && drafts.some((d) => d.text.includes('More for the room.')),
       `premise: the send held both envelopes: ${JSON.stringify(drafts)} ${JSON.stringify(published)}`);
-    assert.ok(askedTexts(surface).some((a) => a.text.includes('And plain.') && a.final === false), JSON.stringify(askedTexts(surface)));
+    assert.equal(askedTexts(surface).filter((a) => a.text.includes('And plain.') && a.final === false).length, 1, JSON.stringify(askedTexts(surface)));
     assert.ok(!surface.asked.some((a) => a.text.includes('More for the room.')), 'the >>> envelope is an explicit send');
   });
 
@@ -1448,6 +1448,7 @@ describe('plain speech a module says it showed', () => {
     });
     await turn(f, 'the opening message');
     assert.ok(membrane.calls.length >= 2, 'the turn restarted for its budget');
+    assert.equal(surface.asked.filter((a) => a.text === 'Before the restart.').length, 1, 'the round routed before the restart is asked about once');
     const afterRestart = surface.asked.filter((a) => a.text === 'After the restart.' || a.text === 'Done.');
     assert.deepEqual(afterRestart.map((a) => a.context.final), [false, true]);
     for (const asked of afterRestart) {
