@@ -1051,7 +1051,7 @@ export class ModernMcpConnection extends EventEmitter {
       const supported = stringList((data as { supported?: unknown } | undefined)?.supported) ?? null;
       const requested = (data as { requested?: unknown } | undefined)?.requested;
       const asked = typeof requested === 'string' ? requested : MODERN_MCP_PROTOCOL_VERSION;
-      const shared = supported?.filter((version) => version !== asked && offered.includes(version)) ?? [];
+      const shared = supported ? offered.filter((version) => version !== asked && supported.includes(version)) : [];
       const note = shared.length > 0
         ? ` It lists ${joinVersions(shared, 'and')}, which this client also speaks, but the SDK negotiates no further after this refusal.`
         : '';
@@ -1310,8 +1310,11 @@ export class ModernMcpConnection extends EventEmitter {
       this.youngRestartFree = lived;
       this.reconnectAttempts = 0;
       this.restarting = true;
-      this.emit('close', { reason: `the server ${SESSION_END[cause]}; a new one is starting` });
-      void this.attemptReconnect(cause);
+      try {
+        this.emit('close', { reason: `the server ${SESSION_END[cause]}; a new one is starting` });
+      } finally {
+        void this.attemptReconnect(cause);
+      }
       return;
     }
     const attempt = Math.max(1, this.reconnectAttempts);
@@ -1319,9 +1322,12 @@ export class ModernMcpConnection extends EventEmitter {
     const when = session.wire.answered
       ? `less than ${this.reconnectIntervalMs} ms after the session started`
       : 'before the session answered a request';
-    this.emit('reconnect-failed', { error: `MCP server "${this.id}" ${SESSION_END[cause]} ${when}`, attempt });
-    this.emit('close', { reason: `the server ${SESSION_END[cause]} ${when}` });
-    this.scheduleReconnect();
+    try {
+      this.emit('reconnect-failed', { error: `MCP server "${this.id}" ${SESSION_END[cause]} ${when}`, attempt });
+      this.emit('close', { reason: `the server ${SESSION_END[cause]} ${when}` });
+    } finally {
+      this.scheduleReconnect();
+    }
   }
 
   private streamReopened(session: Session): void {

@@ -1187,6 +1187,33 @@ test('a session that ends before it answered is a failed connect: refused, repor
   assert.equal(initializes(fixture).length, 1, 'no new session at once');
 });
 
+for (const answered of [true, false]) {
+  test(`a 'close' listener that throws as a session the server ended ${answered ? 'starts again' : 'counts as a failed connect'} skips nothing: the new session comes up`, async () => {
+    const fixture = await start2025({ versions: ['2025-06-18'] });
+    const connection = await connect(fixture, { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+    if (answered) {
+      await connection.listTools();
+      await outlive(20);
+    }
+    const events: string[] = [];
+    let thrown = false;
+    connection.on('close', () => {
+      events.push('close');
+      if (thrown) return;
+      thrown = true;
+      throw new Error('a listener that throws');
+    });
+    connection.on('reconnect', () => events.push('reconnect'));
+    connection.on('reconnect-failed', () => events.push('reconnect-failed'));
+    const internals = connection as unknown as { session: unknown; sessionEnded: (session: unknown, cause: string) => void };
+    assert.throws(() => internals.sessionEnded.call(connection, internals.session, 'ended'), /a listener that throws/);
+    await until(() => events.includes('reconnect'), 'the new session');
+    assert.equal(events.includes('reconnect-failed'), !answered, answered ? 'a restart, not a failed connect' : 'a failed connect');
+    assert.equal(connection.isConnected, true);
+    assert.equal(initializes(fixture).length, 2, 'one new session');
+  });
+}
+
 for (const answered of [false, true]) {
   test(`a second end reported for a session already ended changes nothing (${answered ? 'answered' : 'unanswered'})`, async () => {
     const fixture = await start2025({ versions: ['2025-06-18'] });
