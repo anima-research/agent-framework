@@ -221,6 +221,7 @@ test("a refusal's rewind tells the agent its turns couldn't be completed, naming
     assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
     const retry = rig.requests[2]!;
     const marker = markerOf(retry) ?? '';
+    assert.ok(marker.includes('[turns-set-aside] The 1 most recent turn(s)'), `the marker opens with its documented tag: ${marker}`);
     assert.ok(marker.includes(
       `${REWIND_TAG} The 1 most recent turn(s) were set aside because the requests that carried them couldn't be completed. ` +
       "Their content isn't shown here, and the originals remain in the raw record. You are clear to continue",

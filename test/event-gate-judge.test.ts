@@ -524,8 +524,11 @@ describe('judge rules: timing', () => {
   });
 
   it("a judge that rejects as soon as it's stopped still shows the gate's timeout, in gate_status and on stderr", async () => {
+    let asked = 0;
+    let stopped = 0;
     const fn: JudgeFn = (request) => new Promise<JudgeVerdict>((_, reject) => {
-      request.signal.addEventListener('abort', () => reject(new DOMException('This operation was aborted', 'AbortError')));
+      asked++;
+      request.signal.addEventListener('abort', () => { stopped++; reject(new DOMException('This operation was aborted', 'AbortError')); });
     });
     const { gate, wakes } = makeGate(writeConfig('abort-aware-timeout.json', JUDGED), { judge: fn, judgeTimeoutMs: 50 });
     const logged: string[] = [];
@@ -539,6 +542,7 @@ describe('judge rules: timing', () => {
     }
     assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
     assert.ok(logged.some((line) => line.includes('the reply judge failed (the judge took more than 50 ms)')), JSON.stringify(logged));
+    assert.deepEqual({ asked, stopped }, { asked: 1, stopped: 1 }, 'the judge was asked once, and the gate stopped it');
     gate.dispose();
   });
 

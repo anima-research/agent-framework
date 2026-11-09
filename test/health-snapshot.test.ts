@@ -118,7 +118,7 @@ describe('HealthModule snapshot error text', () => {
     const errorWords = `${'e'.repeat(399)}😀 and on`;
     const entries = [
       { sequence: 0, entry: { timestamp: 1751900000000, agentName: 'a', requestId: 'r0', success: false, error: 'x', errorWords, request: {}, durationMs: 1 } },
-    ];
+    ].map((e) => ({ ...e, summary: { timestamp: e.entry.timestamp, agentName: e.entry.agentName, requestId: e.entry.requestId, success: e.entry.success, error: e.entry.error, errorWords: e.entry.errorWords, durationMs: e.entry.durationMs, requestIsBlob: false, responseIsBlob: false } }));
     const health = new HealthModule({ timeZone: 'UTC' });
     health.bind(frameworkStub(entries), {} as JsStore);
 

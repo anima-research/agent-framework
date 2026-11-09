@@ -688,6 +688,7 @@ test('emitTrace: listeners get bounded error, stack and shown reason; the marker
   }
   const shown = traces.find((t) => t.type === 'inference:exhausted')!.shownReason as string;
   assert.ok(shown.length <= 2_000, `shownReason is ${shown.length} chars`);
+  assert.match(shown, /^Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/, 'the reason is cut, keeping its head and tail');
   assert.ok(markers[0].text.includes(` of ${error.length} characters omitted]`), 'the note cut the whole reason');
   assert.equal(markers[0].meta.reasonChars, error.length);
   assert.equal(markers[0].meta.httpStatus, 400);
@@ -988,6 +989,7 @@ test("a ~1 MB reason the framework would show is bounded in the inference log's 
   for (const entry of entries) {
     assert.ok(typeof entry.errorWords === 'string' && entry.errorWords.includes('Renderer dropped: '), String(entry.errorWords).slice(0, 80));
     assert.ok(entry.errorWords.length <= 2_000, `inference log errorWords is ${entry.errorWords.length} chars`);
+    assert.match(entry.errorWords, /Renderer dropped: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/, 'the words are cut, keeping their head and tail');
   }
 });
 
