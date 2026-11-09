@@ -45,8 +45,10 @@
   answers whose wakes the turn took, and, for a turn the framework queued to
   carry another on (a `!` continuation, an autoContinue run, a bounce's
   wake, or a retry on a history rewound after a refusal, an unstick or an
-  inference failure), the messages that opened that turn, as stored ids or
-  held-write handles that a module context's `getMessage` reads; a turn that
+  inference failure), the messages that opened that turn, as stored ids
+  that a module context's `getMessage` reads (a message kept in memory when
+  its wake was asked for, while a surgery's hold or its agent's recovery
+  keeps the write, has no id yet and isn't named); a turn that
   took a cause of its own that brought messages beside such a continuation
   before any of its rounds reached its tool calls names that cause's messages
   instead, and a cause that

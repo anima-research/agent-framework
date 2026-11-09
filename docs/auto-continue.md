@@ -66,9 +66,10 @@ acknowledge themselves and write no receipt):
 [continue] lena, another turn starts now. If you're done, call skip_reply; anything you write without it is sent as usual.
 ```
 
-It names the agent, since residents read one shared message slot. For the
-same reason it is never written while another resident's turn is alive: the
-continuation waits for that turn to end, as a clock row does. When some or
+It names the agent, since residents share one message slot. It is the
+agent's own row, which enters no other resident's window but an observer's
+(`AgentConfig.observes`), so the continuation doesn't wait for another
+resident's turn to end, and neither does a clock row. When some or
 all of the last turn's closing words were held because a send that turn may
 already have posted where they were going, it adds `Some or all of your
 closing words last turn were held, and the framework didn't send them: a send

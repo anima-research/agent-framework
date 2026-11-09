@@ -1,7 +1,7 @@
 /**
- * The head-move notice on a writable direct mount: after the store's head
- * moves away from an agent's latest direct write, through undoLastTurn or a
- * context-manager branch switch as connectome-host's /undo makes one, the
+ * The head-move notice on a writable direct mount: after an agent's latest
+ * direct write leaves its context, through undoLastTurn taking its turn out
+ * of the agent's window or a context-manager branch switch away from it, the
  * framework stores, at the agent's next start, one notice that those writes
  * are still on disk, and that start's request carries it. Whether it was
  * given is judged by the notice's own presence in the history.
@@ -21,6 +21,7 @@ import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { Module, ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolCall, ToolDefinition, ToolResult } from '../src/types/events.js';
 import type { TraceEvent } from '../src/types/trace.js';
+import { RecordJournal } from '../src/record-journal.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 const NOTICE = 'from turns the history no longer holds are still on disk';
@@ -86,6 +87,7 @@ type Cm = {
   getAllMessages(): Array<{ id: string; metadata?: Record<string, unknown> }>;
   branchAt(id: string, name: string): string;
   switchBranch(name: string): Promise<void>;
+  windowStatusOf(id: string): string;
 };
 
 class Harness {
@@ -162,7 +164,7 @@ class Harness {
     return this.cm(agent).getAllMessages().at(-1)!.id;
   }
 
-  /** A context-manager branch at `id`, switched to, as connectome-host's /undo makes one. */
+  /** A context-manager branch at `id`, switched to. */
   async branchBack(id: string, agent = 'scout'): Promise<void> {
     const name = this.cm(agent).branchAt(id, `zz-back-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
     await this.cm(agent).switchBranch(name);
@@ -185,38 +187,113 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, agents?:
   return h;
 }
 
-test("an undo of the turn that wrote a direct mount gives the notice once, at the next start, and that start's request carries it", async (t) => {
+// Since #291 an undo moves no branch: it takes the turn out of the agent's
+// window, and the workspace asks the window (useWindow) whether the turn
+// that wrote is still in it. (This test once had a twin, the same undo as a
+// branch move, which ran without the presentation index; since AF-6 every
+// framework presents, and its checks are here.)
+test("on the window, an undo of the turn that wrote a direct mount moves no branch and gives the notice once, at the next start, and that start's request carries it", async (t) => {
   const h = await harness(t);
   await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
   assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n');
-  assert.equal(h.framework.undoLastTurn('scout').undone, true);
-
+  const undone = h.framework.undoLastTurn('scout');
+  assert.equal(undone.undone, true);
+  assert.equal(undone.fromBranch, undone.toBranch, 'no branch moved');
   const [first] = await h.turn([say('back')]);
   assert.equal(carries(first), true);
   assert.equal(h.notices().length, 1);
   const stored = h.cm().getAllMessages().find((m) => m.metadata?.kind === 'workspace-head-move')!;
-  assert.deepEqual(stored.metadata, { system: true, kind: 'workspace-head-move', mounts: ['ref'] });
+  // A notice about the agent's own writes is its own row (#291's audience stamp).
+  assert.deepEqual(stored.metadata, { system: true, kind: 'workspace-head-move', mounts: ['ref'], audience: ['scout'], ownRowOf: 'scout' });
   assert.match(JSON.stringify(first!.messages), new RegExp(TEXT.replace(/[.*+?^${}()|[\]\\`]/g, '\\$&').slice(0, 60)));
-  // Later starts carry the one notice in its place, and store no other.
   const [later] = await h.turn([say('still here')]);
-  assert.equal(carries(later), true);
-  assert.equal(h.notices().length, 1);
+  assert.equal(carries(later), true, 'later starts carry the one notice in its place');
+  assert.equal(h.notices().length, 1, 'and store no other');
   assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
 });
 
-test('an undo whose fork lands at exactly the store head the write saw gives the notice', async (t) => {
+// (This test once had a twin, a redo as a branch move back to the branch
+// that held the write, which ran without the presentation index; since
+// AF-6 every framework presents, and its checks are here.)
+test('on the window, a redo of the turn that wrote finds nothing due, and a head that never moved stores no notice', async (t) => {
   const h = await harness(t);
+  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
+  await h.turn([say('again')]);
+  assert.equal(h.notices().length, 0, "the window holds the turn that wrote");
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the later turn's undo");
+  assert.equal(h.workspace.headMoveNotice('scout'), null, 'the writing turn is still in the window');
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the writing turn's undo");
+  assert.notEqual(h.workspace.headMoveNotice('scout'), null, 'a notice is due');
+  assert.equal(h.framework.redo('scout').redone, true);
+  assert.equal(h.workspace.headMoveNotice('scout'), null, 'and none once the redo puts the writing turn back');
+  const [request] = await h.turn([say('back')]);
+  assert.equal(carries(request), false);
+  assert.equal(h.notices().length, 0);
+});
+
+// AF #844 bot review 3, finding 5: a host's direct write outside any turn
+// (executeToolCall naming the agent) has no round in the agent's history,
+// so the first own row after its head is a later turn's, which the write
+// isn't part of. An undo of that turn takes nothing of the write out, and
+// gives no notice, whether the turn's checkpoint is the store head the
+// write saw or past it. (Before #291 an undo forked a branch at its turn's
+// checkpoint, and one at exactly that head gave the notice; a rollback cut
+// there still does, holdsPosition.)
+test("a host's direct write outside any turn gives no notice at an undo of a later turn, at the write's head or past it", async (t) => {
+  for (const gap of [true, false]) {
+    const h = await harness(t);
+    await h.turn([say('hello')]);
+    const written = await h.framework.executeToolCall({ id: 'direct-1', name: 'workspace--write', input: { path: 'ref/a.txt', content: 'one\n' }, callerAgentName: 'scout' } as Parameters<AgentFramework['executeToolCall']>[0]);
+    assert.equal(written.success, true, written.error);
+    const head = (h.workspace as unknown as { directHeads: Map<string, Map<string, { after: number }>> }).directHeads.get('ref')!.get('scout')!;
+    // A user message between the write and the turn, or nothing recorded between.
+    await h.turn([say('a later turn')], 'scout', { user: gap });
+    const checkpoint = (h.framework as unknown as { getTurnCheckpoints(agent: string): Array<{ sequenceBefore: number }> }).getTurnCheckpoints('scout').at(-1)!;
+    if (gap) assert.ok(checkpoint.sequenceBefore > head.after, 'premise: a row came between the write and the turn');
+    else assert.equal(checkpoint.sequenceBefore, head.after, "premise: the turn's checkpoint is exactly the head the write saw");
+    assert.equal(h.framework.undoLastTurn('scout').undone, true);
+    assert.equal(h.workspace.headMoveNotice('scout'), null, `${gap ? 'past' : 'at'} its head: no notice is due`);
+    const [first] = await h.turn([say('back')]);
+    assert.equal(carries(first), false);
+    assert.equal(h.notices().length, 0);
+    assert.equal(readFileSync(join(h.work, 'a.txt'), 'utf8'), 'one\n', 'disk keeps the write');
+  }
+});
+
+// AF #844 bot review 5, finding 46: main saved a direct write's position
+// with no word of whether a turn made it, and judged it by the branch
+// alone. A record an earlier release saved is judged so after the upgrade:
+// its head isn't taken for a later turn's, so an undo of that turn gives no
+// notice for a write no turn of the agent's made.
+test("a position an earlier release saved, with no word of a turn, is judged by the branch alone: an undo of a later turn gives no notice", async (t) => {
+  const h = new Harness();
+  t.after(() => h.cleanup());
+  await h.open();
   await h.turn([say('hello')]);
   const written = await h.framework.executeToolCall({ id: 'direct-1', name: 'workspace--write', input: { path: 'ref/a.txt', content: 'one\n' }, callerAgentName: 'scout' } as Parameters<AgentFramework['executeToolCall']>[0]);
   assert.equal(written.success, true, written.error);
-  const head = (h.workspace as unknown as { directHeads: Map<string, Map<string, { after: number }>> }).directHeads.get('ref')!.get('scout')!;
-  // A turn with nothing recorded between the write and its start.
-  await h.turn([say('nothing new')], 'scout', { user: false });
-  const checkpoint = (h.framework as unknown as { getTurnCheckpoints(agent: string): Array<{ sequenceBefore: number }> }).getTurnCheckpoints('scout').at(-1)!;
-  assert.equal(checkpoint.sequenceBefore, head.after, 'the undo forks at exactly the head the write saw');
+  await h.close();
+  // The record as main saved it: each entry's mount, root and positions, no more.
+  const store = JsStore.openOrCreate({ path: join(h.dir, 'store') });
+  try {
+    const journal = new RecordJournal<never, Array<{ mount: string; root: string; agents: Record<string, Record<string, unknown>> }>>(store, { type: 'workspace/direct-heads' });
+    const saved = journal.load().snapshot!;
+    assert.ok(saved.some((entry) => entry.agents.scout !== undefined), 'premise: the stop saved the position');
+    journal.checkpoint(saved.map(({ mount, root, agents }) => ({
+      mount, root,
+      agents: Object.fromEntries(Object.entries(agents).map(([agent, { branchId, after, notice }]) => [agent, { branchId, after, ...(notice !== undefined ? { notice } : {}) }])),
+    })), { durable: true });
+  } finally {
+    store.close();
+  }
+  await h.open();
+  await h.turn([say('a later turn')]);
   assert.equal(h.framework.undoLastTurn('scout').undone, true);
+  assert.equal(h.workspace.headMoveNotice('scout'), null, 'no notice is due: the branch holds the write');
   const [first] = await h.turn([say('back')]);
-  assert.equal(carries(first), true);
+  assert.equal(carries(first), false);
+  assert.equal(h.notices().length, 0);
+  await h.close();
 });
 
 for (const [tool, input, landed] of [
@@ -283,7 +360,7 @@ test("the notice's text is the one sentence, naming the mount", async (t) => {
   assert.deepEqual(h.workspace.headMoveNotice('scout'), { text: TEXT, mounts: ['ref'] });
 });
 
-test("a context-manager branch switch away from the agent's latest direct write, as connectome-host's /undo makes one, gives the notice", async (t) => {
+test("a context-manager branch switch away from the agent's latest direct write gives the notice", async (t) => {
   const h = await harness(t);
   await h.turn([say('hello')]);
   const before = h.newest();
@@ -304,18 +381,6 @@ test('a head that never moved stores no notice, a write turn\'s own rounds inclu
   assert.deepEqual(requests.map(carries), requests.map(() => false));
   assert.deepEqual(h.notices(), []);
   assert.equal(h.workspace.headMoveNotice('scout'), null);
-});
-
-test('a redo back to the branch that holds the latest write finds nothing due', async (t) => {
-  const h = await harness(t);
-  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
-  h.framework.undoLastTurn('scout');
-  assert.notEqual(h.workspace.headMoveNotice('scout'), null);
-  assert.equal(h.framework.redo('scout').redone, true);
-  assert.equal(h.workspace.headMoveNotice('scout'), null);
-  const [first] = await h.turn([say('forward')]);
-  assert.equal(carries(first), false);
-  assert.deepEqual(h.notices(), []);
 });
 
 test("a move to a branch that doesn't carry the notice gives it again", async (t) => {
@@ -350,6 +415,23 @@ test('a write after a notice advances the position and clears the notice, so an 
   const [first] = await h.turn([say('back once more')]);
   assert.equal(carries(first), true);
   assert.equal(h.notices().length, 2);
+});
+
+test("on the window, an undo of the turn that carried the notice gives the notice again at the next start, since the window holds neither the write nor the notice", async (t) => {
+  const h = await harness(t);
+  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the writing turn's undo");
+  const [told] = await h.turn([say('back')]);
+  assert.equal(carries(told), true, 'the next start gave the notice');
+  const [first] = h.notices();
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the undo of the turn that carried it");
+  assert.equal(h.cm().windowStatusOf(first!), 'undone', 'the notice left the window with its turn');
+  const [again] = await h.turn([say('back once more')]);
+  assert.equal(carries(again), true, 'the next start gives the notice again');
+  assert.equal(h.notices().length, 2, 'as a notice of its own');
+  const [later] = await h.turn([say('still here')]);
+  assert.equal(carries(later), true, 'later starts carry it');
+  assert.equal(h.notices().length, 2, 'and store no other');
 });
 
 test('a head moved under a running turn gives the notice at that turn\'s continuing start, and that start\'s request carries it', async (t) => {
@@ -522,7 +604,7 @@ test('a history lookup that throws decides nothing at a start, and leaves the po
   const logged: string[] = [];
   const error = console.error;
   console.error = (...args: unknown[]) => { logged.push(String(args[0])); };
-  const lookup = (h.framework as unknown as { agents: Map<string, { getContextManager(): { getMessage(id: string): unknown } }> }).agents;
+  const handedOver = (h.workspace as unknown as { historyLookup: (agentName: string, messageId: string) => boolean }).historyLookup;
   try {
     h.workspace.useHistory(() => { throw new Error('zz-lookup-failed'); });
     // At a start, no notice.
@@ -538,7 +620,7 @@ test('a history lookup that throws decides nothing at a start, and leaves the po
   } finally {
     console.error = error;
     // The framework's own lookup again.
-    h.workspace.useHistory((agent, id) => lookup.get(agent)?.getContextManager().getMessage(id) != null);
+    h.workspace.useHistory(handedOver);
   }
   // The next start whose lookup answers decides: exactly one notice.
   const [second] = await h.turn([say('readable')]);
@@ -640,4 +722,31 @@ test('the position and the notice survive a clean restart, through the stop-time
   assert.equal(carries(next), true);
   assert.equal(h.notices().length, 1);
   await h.close();
+});
+
+// AF #844 bot review 2, finding 87: a turn an earlier release stored carries
+// no audience stamp, and an undo takes it out as the agent's own by its
+// voice; the lookup reads it by the same rule.
+test("the window lookup counts an unstamped row under the agent's voice as its own, so undoing such a turn reads as the write gone", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'workspace-direct-legacy-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    modules: [],
+  });
+  t.after(async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); });
+  const cm = framework.getAgent('scout')!.getContextManager();
+  const before = cm.addMessage('user', [{ type: 'text', text: 'write it' }]);
+  cm.presentRows([before]);
+  const head = cm.getMessage(before)!.sequence;
+  // The turn as an earlier release stored it: under scout's voice, no stamp.
+  const reply = cm.addMessage('scout', [{ type: 'text', text: 'wrote it' }], {});
+  cm.presentRows([reply]);
+  const holds = (framework as unknown as { windowHoldsOwnRowsAfter(agent: string, after: number): boolean })
+    .windowHoldsOwnRowsAfter.bind(framework);
+  assert.equal(holds('scout', head), true, 'the turn is in the window');
+  cm.retractRows([reply], { undone: true });
+  assert.equal(cm.windowStatusOf(reply), 'undone', 'setup: undone');
+  assert.equal(holds('scout', head), false, 'undone, the write is no longer held');
 });
