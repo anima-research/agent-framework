@@ -120,16 +120,16 @@ describe('a batch shows each event to the agents it is for', () => {
     gate.dispose();
   });
 
-  it('an event whose list of recipients is empty joins no batch: alone it holds none, and beside one it neither joins nor restarts its quiet period', () => {
+  it('an event whose list of recipients is empty joins no batch and is let through: alone it holds none, and beside one it neither joins nor restarts its quiet period', () => {
     let clock = 1_000_000;
     const { gate, lines, wakes } = makeGate('none.json', { debounce: 60_000 }, undefined, () => clock);
     const held = gate as unknown as { debounceTimers: Map<string, { events: unknown[]; dueAt: number }> };
-    assert.equal(gate.evaluate(reminder('dim the lamps', [])).trigger, false);
+    assert.equal(gate.evaluate(reminder('dim the lamps', [])).trigger, true, 'let through, so whom it wakes is the caller\'s');
     assert.equal(held.debounceTimers.size, 0, 'alone, it holds no batch');
     gate.evaluate(reminder('water the plants', ['agent']));
     const due = held.debounceTimers.get('batch')!.dueAt;
     clock += 30_000;
-    assert.equal(gate.evaluate(reminder('feed the cat', [])).trigger, false);
+    assert.equal(gate.evaluate(reminder('feed the cat', [])).trigger, true);
     assert.equal(held.debounceTimers.get('batch')!.events.length, 1, "it doesn't join the batch");
     assert.equal(held.debounceTimers.get('batch')!.dueAt, due, "it doesn't restart the batch's quiet period");
     fire(gate);
@@ -137,6 +137,17 @@ describe('a batch shows each event to the agents it is for', () => {
     assert.equal(lines.length, 1);
     assert.ok(!lines[0]!.text.includes('feed the cat'));
     gate.dispose();
+  });
+
+  it('a probe and evaluate agree on an event whose list of recipients is empty, under a debounce rule and a judge rule', () => {
+    const judge: JudgeFn = async () => ({ reply: false, reason: 'not now' });
+    for (const [file, behavior] of [['probe-debounce.json', { debounce: 60_000 }], ['probe-judge.json', { judge: { debounceMs: 60_000 } }]] as const) {
+      const { gate } = makeGate(file, behavior, judge);
+      assert.equal(gate.probe(reminder('dim the lamps', [])).trigger, true, `${file}: the probe lets it through`);
+      assert.equal(gate.evaluate(reminder('dim the lamps', [])).trigger, true, `${file}: evaluate lets it through`);
+      assert.equal(gate.probe(reminder('water the plants', ['agent'])).trigger, false, `${file}: a probe of a named event still batches`);
+      gate.dispose();
+    }
   });
 
   it('counts a pending batch among the wakes due only for the agents it would wake', () => {
