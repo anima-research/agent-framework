@@ -49,7 +49,9 @@ export interface ActivationRequestOptions {
    *  (stored-injections.ts), put where that compile would render them, as
    *  the window's newest rows. A preview stores nothing, so the compile
    *  doesn't weigh them against the budget or shape them as it would the
-   *  stored rows. */
+   *  stored rows. An effort row among them goes as a start would send such
+   *  a stored row (FrameworkConfig.effort): left out while the setting is
+   *  set. */
   appendedMessages?: NormalizedMessage[];
   /** `false`: the caller retries this stream's failures itself, so membrane
    *  sends a failed round once and hands the error up. The framework's turns
@@ -2416,9 +2418,14 @@ export class Agent {
     options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
     const effort = this.effortPlanner?.('preview');
+    // A caller's message stands for a row a start would store, which is no row
+    // the framework marks: it goes as a start would send such a row
+    // (keepsEffortRow). The plan's own row is the agent's.
+    const given = options.appendedMessages?.filter((m) =>
+      effortOf(m.content) === undefined || keepsEffortRow(effort, [undefined], (participant) => this.isOwnParticipant(participant)));
     const appendedMessages = effort?.change
-      ? [...(options.appendedMessages ?? []), { participant: EFFORT_ROW_PARTICIPANT, content: [effortChange(effort.change)] }]
-      : options.appendedMessages;
+      ? [...(given ?? []), { participant: EFFORT_ROW_PARTICIPANT, content: [effortChange(effort.change)] }]
+      : given;
     return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, {
       ...options,
       ...(appendedMessages ? { appendedMessages } : {}),
