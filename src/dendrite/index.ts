@@ -1,5 +1,5 @@
-export { AgentRegistry, AgentSpecError } from './registry.js';
-export type { AgentRegistryOptions, RestoreOutcome, ReconcileOutcome } from './registry.js';
+export { AgentRegistry, AgentSpecError, RESIDENTS_SLOT, sameSlot, observedSlot } from './registry.js';
+export type { AgentRegistryOptions, RegisterOptions, RestoreOutcome, ReconcileOutcome } from './registry.js';
 export {
   residentSpec,
   subconsciousSpec,
@@ -17,6 +17,7 @@ export type {
   ActivationBounds,
   ParentEndPolicy,
   ResultRoute,
+  MessageSlotRef,
   ObserveEdge,
   AgentRelationships,
   ContextInheritance,
@@ -30,3 +31,14 @@ export type {
   EndOutcome,
   PolicyEpoch,
 } from './types.js';
+export {
+  AUDIENCE_KEY,
+  OWN_ROW_KEY,
+  withAudience,
+  asOwnRow,
+  audienceOf,
+  isOwnRowOf,
+  observedRowFor,
+  storeOwnRow,
+} from './audience.js';
+export type { AudienceStamp, OwnRowWriter } from './audience.js';

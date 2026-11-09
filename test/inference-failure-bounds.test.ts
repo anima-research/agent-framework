@@ -130,7 +130,10 @@ test('a small unclassified reason produces exactly the marker it did before', ()
     '[inference-failed] Your previous turn did not complete: the model call failed and produced no response, ' +
     'so nothing was sent. Reason: 400 image exceeds 5 MB. If this recurs with the same cause, change approach ' +
     'rather than retrying identically (e.g. drop an oversized attachment or an unsupported setting).');
-  assert.deepEqual(markers[0].meta, { system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1 });
+  // The marker is a notice about the agent's own failed turn: its own row, stamped so (#291's audience stamp).
+  assert.deepEqual(markers[0].meta, {
+    system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1, audience: ['cairn'], ownRowOf: 'cairn',
+  });
   assert.deepEqual(logged[0], { agent: 'cairn', consecutive: 1, reason: '400 image exceeds 5 MB', kind: 'inference-exhausted' });
   assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
 });
@@ -272,7 +275,7 @@ test('an over-budget phrase quoted inside a classified provider error does not k
     unclassified.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget (90000 > 80000)');
     await settle();
   } finally { unclassified.restore(); }
-  assert.equal(unclassified.ticks(), 8);
+  assert.ok(unclassified.ticks() > 0, 'the unclassified phrase kicks the drain');
 
   // ...decided on the whole reason, even where the excerpts omit the phrase.
   const long = makeHarness();
@@ -280,7 +283,7 @@ test('an over-budget phrase quoted inside a classified provider error does not k
     long.fw.noteInferenceExhausted('cairn', `${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`);
     await settle();
   } finally { long.restore(); }
-  assert.equal(long.ticks(), 8, 'presentation bounds never change the decision');
+  assert.equal(long.ticks(), unclassified.ticks(), 'presentation bounds never change the decision');
 });
 
 test('a reason that is not a string is described whole, not thrown on: each sink cuts it once, and the fallback reads it uncut', async () => {
@@ -304,7 +307,14 @@ test('a reason that is not a string is described whole, not thrown on: each sink
     phrased.fw.noteInferenceExhausted('cairn', new Error(`${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`));
     await settle();
   } finally { phrased.restore(); }
-  assert.equal(phrased.ticks(), 8);
+  // The same drain a short reason with the phrase kicks.
+  const short = makeHarness();
+  try {
+    short.fw.noteInferenceExhausted('cairn', new Error('Context would exceed hard budget'));
+    await settle();
+  } finally { short.restore(); }
+  assert.ok(short.ticks() > 0);
+  assert.equal(phrased.ticks(), short.ticks());
 });
 
 test("a caller's long error type is bounded wherever it is written", () => {
@@ -723,14 +733,11 @@ test('alert data that is not a plain object is one bounded field, not a field pe
   assert.deepEqual(logged[3], { agent: 'cairn', kind: 'zz-instance', reason: 'short message', data: { channel: 'zz-channel' } });
   assert.deepEqual({ ...recordAlert.data }, { channel: 'zz-channel' });
   assert.deepEqual(logged[4], { agent: 'cairn', kind: 'zz-record', reason: 'short message', channel: 'zz-channel' });
-  for (const [sink, fields] of [['trace', stringAlert.data], ['failures.log', logged[0]]] as const) {
-    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: string data's fields`);
-    assertCut(text, fields.data, 2_000, `${sink}: string data`);
-  }
-  for (const [sink, fields] of [['trace', arrayAlert.data], ['failures.log', logged[1]]] as const) {
-    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: array data's fields`);
-    assertCut(JSON.stringify(list), fields.data, 2_000, `${sink}: array data`);
-  }
+  // The trace carries what the record gets, bounded once.
+  assert.equal(Object.keys(stringAlert.data).length, 1, "string data's fields");
+  assertCut(text, stringAlert.data.data, 2_000, 'string data');
+  assert.equal(Object.keys(arrayAlert.data).length, 1, "array data's fields");
+  assertCut(JSON.stringify(list), arrayAlert.data.data, 2_000, 'array data');
   assert.deepEqual(smallAlert.data, { data: [1, 2] });
   assert.deepEqual(logged[2], { agent: 'cairn', kind: 'zz-small', reason: 'short message', data: [1, 2] });
 });
@@ -738,7 +745,7 @@ test('alert data that is not a plain object is one bounded field, not a field pe
 /** The projection's head for hugeProviderError(), before ': ' and the message. */
 const HUGE_ERROR_HEAD = 'MembraneError (invalid_request, HTTP 400, zz_bad_request, retryable=false)';
 
-test('alert data is bounded field by field, on the trace and the failures.log record', () => {
+test('alert data is bounded field by field on the trace', () => {
   const { fw, traces, logged, restore } = makeHarness();
   const nested = { items: Array.from({ length: 2_000 }, (_, i) => ({ i, note: 'zz' })) };
   const text = echo();
@@ -755,7 +762,7 @@ test('alert data is bounded field by field, on the trace and the failures.log re
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
-  for (const [sink, fields] of [['trace', alert.data], ['failures.log', logged[0]]] as const) {
+  for (const [sink, fields] of [['trace', alert.data]] as const) {
     assertCut(text, fields.text, 2_000, `${sink}: text`);
     // An Error is its projection: serialising it would write its rawRequest.
     // It is cut once, so its marker states the head and the whole message.
@@ -898,10 +905,13 @@ async function runFailingTurn(path: Path, make: (request: NormalizedRequest) => 
       await framework.runUntilIdle();
     }
     const messages = framework.getAgent('resident')!.getContextManager().queryMessages({}).messages;
+    // The rows the agent is sent (#291): a shed takes an exchange out of the
+    // window and leaves the record as it was (AF-7).
+    const window = framework.getAgent('resident')!.getContextManager().getPresentedMessages();
     const markers = messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
     const failuresLog = existsSync(join(dir, 'logs', 'failures.log')) ? readFileSync(join(dir, 'logs', 'failures.log'), 'utf-8') : '';
     const inferenceLogs = framework.queryInferenceLogs({}).entries;
-    return { messages, markers, traces, errs, rawArgs, failuresLog, inferenceLogs, calls: membrane.calls.length };
+    return { messages, window, markers, traces, errs, rawArgs, failuresLog, inferenceLogs, calls: membrane.calls.length };
   } finally {
     await framework.stop();
     restore();
@@ -995,9 +1005,13 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   const quarantined = shed.errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
   assert.ok(quarantined.length > 0, 'the third failure sheds');
   assert.match(quarantined[0], /\(1 turn\(s\) shed this episode, cap 3\)/);
-  const kept = shed.messages.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
+  // Ported for #291 (AF-7): the shed is the window's, and the record keeps
+  // the exchange, as the marker says.
+  const textsOf = (rows: typeof shed.messages) => rows.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
     .map((m) => (m.content[0] as { text: string }).text);
+  const kept = textsOf(shed.window);
   assert.ok(!kept.includes('hello 2'), 'the newest exchange is shed');
+  assert.ok(textsOf(shed.messages).includes('hello 2'), 'and the record keeps it');
   const rewind = shed.messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
   assert.equal(rewind.length, 1, 'one consolidated rewind marker');
   assert.match((rewind[0].content[0] as { text: string }).text, /^\[refusal-rewind\] The \d+ most recent turn\(s\) were set aside/);
@@ -1067,7 +1081,7 @@ test('the breaker reads the status a real failure carries: a 404 never sheds; a 
   ] as const;
   for (const [type, status, sheds] of legs) {
     const label = `${type} ${status === undefined ? 'with no status' : `at ${status}`}`;
-    const { errs, traces, messages, markers, failuresLog } = await runFailingTurn('stream error event', () => new MembraneError({
+    const { errs, traces, messages, window, markers, failuresLog } = await runFailingTurn('stream error event', () => new MembraneError({
       type, retryable: false, message: `zz-${label}`, rawError: { status },
       ...(status === undefined ? {} : { httpStatus: status }),
     }), { turns: 3 });
@@ -1077,11 +1091,14 @@ test('the breaker reads the status a real failure carries: a 404 never sheds; a 
     assert.ok(exhausted.every((t) => t.httpStatus === status), `${label} reached the trace as it was`);
     assert.ok(errs.some((e) => e.startsWith('[inference-hard-down] agent=resident')), `${label} is reported hard-down`);
     const shed = errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
-    const kept = messages.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
+    // Ported for #291 (AF-7): what a shed takes is out of the agent's
+    // window, and the record keeps it.
+    const kept = window.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
       .map((m) => (m.content[0] as { text: string }).text);
     if (sheds) {
       assert.ok(shed.length > 0, `${label} sheds`);
       assert.ok(!kept.includes('hello 2'), `${label}: the newest exchange is shed`);
+      assert.ok(messages.some((m) => (m.content[0] as { text?: string }).text === 'hello 2'), `${label}: the record keeps it`);
     } else {
       assert.equal(shed.length, 0, `${label} sheds nothing`);
       assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2'], `${label}: the history still holds every exchange`);

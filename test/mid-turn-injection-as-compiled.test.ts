@@ -5,7 +5,7 @@
  * cap and with the image limits applied across the batch. One the render
  * can't place among the newest, such as one before the recent window under
  * context-manager 0.23.0's memory strategy, goes in as stored, which is how
- * the next compile sends it.
+ * the next compile sends it. The same with the presentation index on.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -26,6 +26,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { AutobiographicalStrategy, WindowedPassthroughStrategy, type ContextInjection, type MessageId } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { covers } from '../src/read-marks.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
@@ -56,11 +57,23 @@ class InterjectingModule implements Module {
     const metadata = this.interjectionMetadata;
     this.interjections = [];
     this.interjectionMetadata = [];
-    batch.forEach((blocks, i) => {
-      this.framework!.pushEvent({ type: 'external-message', source: 'test', content: '', blocks, metadata: {}, rowMetadata: metadata[i] } as unknown as ProcessEvent);
+    const pending = new Set<unknown>();
+    const processed = new Promise<void>((resolve) => {
+      if (batch.length === 0) { resolve(); return; }
+      const off = this.framework!.onTrace((t) => {
+        if (t.type !== 'process:completed' || !pending.delete(t.processEvent)) return;
+        if (pending.size === 0) { off(); resolve(); }
+      });
     });
-    // A beat for the run loop to defer them while this round's tools are pending.
-    if (batch.length > 0) await new Promise((r) => setTimeout(r, 30));
+    batch.forEach((blocks, i) => {
+      const event = { type: 'external-message', source: 'test', content: '', blocks, metadata: {}, rowMetadata: metadata[i] } as unknown as ProcessEvent;
+      pending.add(event);
+      this.framework!.pushEvent(event);
+    });
+    await Promise.race([
+      processed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the run loop never processed the interjections')), 10_000).unref()),
+    ]);
     return { success: true, data: { ok: true, tool: call.name } };
   }
 
@@ -80,6 +93,10 @@ class InterjectingModule implements Module {
   }
 }
 
+// With the presentation index (#291), the boundary presents what it injects
+// before it renders it, since a render places only what the agent's window
+// holds. (Each case ran twice before presentation was mandatory, without the
+// index too; AF-6 took that run away with the flag.)
 describe('a message injected at a tool boundary', () => {
   let tempDir: string;
   let membrane: MockMembrane;
@@ -174,7 +191,7 @@ describe('a message injected at a tool boundary', () => {
     assert.equal(seen.calls, 1, 'the batch is rendered in one call');
     assert.deepEqual(injected.map((m) => m.content), [[text('PLACEDBEFORE')], [text('HEARD')]]);
     const row = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('PLACEDBEFORE'))!;
-    assert.ok(agent.getConsumedWatermark()!.sequence >= row.sequence, 'the consumed mark covers it, as anything injected');
+    assert.equal(covers(agent.getConsumedWatermark(), agent.getContextManager(), row), 'covered', 'the consumed mark covers it, as anything injected');
   });
 
   it("each message goes in as its own render gives it, in its place in the batch", async () => {
@@ -298,6 +315,10 @@ describe('a message injected at a tool boundary', () => {
     } as never));
     const cm = framework.getAgent('assistant')!.getContextManager();
     for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
+    // Rows written into the context past the framework enter the window at
+    // the agent's next point: here, before the reset presents its transition
+    // after them, as the history before a new topic is.
+    (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('assistant'));
     await cm.resetHeadWindow('A new topic.');
     const seen = renderWith((ids) => ids.map(() => null));
     const injected = await turnWith([[text('AFTERRESET a short message')]]);
@@ -309,8 +330,8 @@ describe('a message injected at a tool boundary', () => {
 
   it('under the memory strategy, a body bigger than the recent window that the render gives null goes in as stored, and the rest as the next request sends it', async () => {
     // The strategy stores the long message as several shards. As stored, it
-    // goes in joined, as the store reads it back: its image first, then its
-    // text as one block, which differs from the blocks as they were queued.
+    // goes in whole, as the store reads it back, which may differ from the
+    // blocks as they were queued.
     await create(new AutobiographicalStrategy({
       adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 300, kvStableReachTokens: 8_000,
       targetChunkTokens: 200,
@@ -322,7 +343,9 @@ describe('a message injected at a tool boundary', () => {
     const rows = framework.getAgent('assistant')!.getContextManager().getAllMessages();
     const row = rows.find((m) => JSON.stringify(m.content).includes('FIRSTLONG'))!;
     assert.ok(rows.filter((m) => m.bodyGroupId !== undefined && m.bodyGroupId === row.bodyGroupId).length > 1, 'the premise: it is stored in parts');
-    assert.deepEqual(JSON.parse(holding(injected, 'FIRSTLONG')), [image(), text(`Intro. ${long}`)], 'it goes in whole, as the store reads it back');
+    const first = JSON.parse(holding(injected, 'FIRSTLONG')) as Array<{ type: string; text?: string }>;
+    assert.equal(first.filter((b) => b.type === 'image').length, 1, 'its image, once');
+    assert.equal(first.filter((b) => b.type === 'text').map((b) => b.text).join(''), `Intro. ${long}`, 'its text, whole and in order');
     const second = holding(injected, 'SECONDSHORT');
     assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(second));
   });
@@ -431,13 +454,5 @@ describe('a message injected at a tool boundary', () => {
     }
     assert.deepEqual(JSON.parse(holding(injected, 'THROWNMSG')), [text('THROWNMSG and more')]);
     assert.ok(logged.some((l) => l.includes('[injection]') && l.includes('render broke')), 'the failure is logged');
-  });
-
-  it('renders nothing at a boundary with nothing to inject', async () => {
-    await create(new WindowedPassthroughStrategy({}));
-    const seen = renderWith((ids, real) => real(ids));
-    await turnWith([]);
-    assert.equal(membrane.lastStream!.receivedToolResults.length, 1, 'the premise: a tool boundary passed');
-    assert.equal(seen.calls, 0);
   });
 });

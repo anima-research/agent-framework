@@ -44,11 +44,12 @@ import {
 import type {
   EventResponse,
   Module,
+  ModuleContext,
   ProcessEvent,
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, asOwnRow } from '../src/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import {
   FALLBACK_MEDIA_TYPE,
@@ -74,6 +75,7 @@ import {
   type ReferenceTestimony,
 } from '../src/mcpl/references.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { until } from './helpers/dendrite.js';
 
 /** Give the framework MCPL server configs for its fetcher to resolve, without
  *  connecting to them: a ws:// or wss:// url for one the host connects to over
@@ -137,9 +139,18 @@ class SnapModule implements Module {
   readonly name = 'world';
   /** The `quote` tool cites this ref — set by the test once it knows it. */
   quotedRef = 'img_zzzzzz_1';
-  /** Delay before `snap` resolves — proves the same-batch barrier waits. */
-  snapDelayMs = 0;
-  async start(): Promise<void> {}
+  snapAfterCall: string | null = null;
+  /** Called as `snap` starts, and awaited, before it waits on snapAfterCall. */
+  onSnap?: () => unknown;
+  private readonly started = new Set<string>();
+  private readonly onStarted = new Set<() => void>();
+  async start(ctx: ModuleContext): Promise<void> {
+    ctx.onTrace((event) => {
+      if (event.type !== 'tool:started') return;
+      this.started.add(event.callId);
+      for (const check of [...this.onStarted]) check();
+    });
+  }
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     const schema = { type: 'object', properties: {} } as const;
@@ -239,7 +250,16 @@ class SnapModule implements Module {
           data: [png, { type: 'image', uri: 'https://cam.example/sri-named.png', name: `${'n'.repeat(200)}.png`, mimeType: 'image/png', sizeBytes: 1200 }],
         };
       default:
-        if (this.snapDelayMs > 0) await new Promise((r) => setTimeout(r, this.snapDelayMs));
+        await this.onSnap?.();
+        if (this.snapAfterCall !== null) {
+          const id = this.snapAfterCall;
+          await new Promise<void>((resolve, reject) => {
+            const bound = setTimeout(() => { this.onStarted.delete(check); reject(new Error(`the call ${id} never started`)); }, 10_000);
+            const check = () => { if (this.started.has(id)) { clearTimeout(bound); this.onStarted.delete(check); resolve(); } };
+            this.onStarted.add(check);
+            check();
+          });
+        }
         return { success: true, data: [{ type: 'text', text: 'watchtower, facing north' }, png] };
     }
   }
@@ -284,6 +304,8 @@ async function startTurn(opts: {
   inlineBound?: number;
   world?: (module: SnapModule) => void;
   workspace?: (workspace: WorkspaceModule) => void;
+  /** Residents beside prime, whose rounds prime observes (AgentConfig.observes). */
+  observes?: string[];
 }): Promise<Harness> {
   const tempDir = mkdtempSync(join(tmpdir(), opts.prefix));
   const mountDir = join(tempDir, 'mount');
@@ -301,7 +323,10 @@ async function startTurn(opts: {
   const framework = await AgentFramework.create({
     storePath: join(tempDir, 'store'),
     membrane: membrane.asMembrane(),
-    agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+    agents: [
+      { name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', ...(opts.observes ? { observes: opts.observes } : {}) },
+      ...(opts.observes ?? []).map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.` })),
+    ],
     modules: [world, workspace as unknown as Module],
     syncIntervalMs: 0,
     ...(opts.toolResultInlineMaxChars !== undefined ? { toolResultInlineMaxChars: opts.toolResultInlineMaxChars } : {}),
@@ -458,6 +483,125 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(first[0]!.source, 'attachment');
       assert.strictEqual(first[0]!.sha256, sha(GIF));
       assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not the other agent's image");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("another agent's own row, which the caller's window never held, takes no slot: index 0 is the attachment (#291)", async () => {
+    let orens = '';
+    const h = await startTurn({
+      prefix: 'sri-other-own-row-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      // After the attachment, a row stored as another agent's own (oren's
+      // round, in a slot prime shares): in the record, never in prime's window.
+      seedHistory: (framework) => {
+        orens = String(framework.getAgent('prime')!.getContextManager().addMessage('oren', [
+          { type: 'text', text: "oren's picture" },
+          { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+        ] as ContentBlock[], asOwnRow(undefined, 'oren')));
+      },
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+      assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not oren's image");
+      assert.strictEqual(h.framework.getAgent('prime')!.getContextManager().windowStatusOf(orens as never), 'out', "prime's window never held oren's row");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // AF #844 bot review 4, finding 51: an observed agent's round is in the
+  // caller's window, but its tool results' images are that agent's, whose
+  // refs the caller's ledger doesn't hold: they take no slot, so index 0 is
+  // the caller's own newest image, not a ref that can't be saved.
+  it("an observed agent's tool result in the caller's window takes no slot: index 0 is the attachment (#291)", async () => {
+    let orens = '';
+    const h = await startTurn({
+      prefix: 'sri-observed-round-',
+      observes: ['oren'],
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      // After the attachment, oren's tool result, as its own row: prime
+      // observes oren, so its turn's start presents it.
+      seedHistory: (framework) => {
+        orens = String(framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_oren_snap',
+          toolName: 'world--snap',
+          content: 'oren\'s snapshot\n[image: image/png, ~1KB, ref img_orenzz_1]',
+          isError: false,
+        }] as ContentBlock[], asOwnRow(undefined, 'oren')));
+      },
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(h.framework.getAgent('prime')!.getContextManager().windowStatusOf(orens as never), 'in', "premise: oren's round is in prime's window");
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+      assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not oren's ref");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an image that arrives while a tool runs enters the window after that round, so index 0 is it and index 1 the snapshot (#291)", async () => {
+    const SENT = Buffer.from('a picture someone sent while the snapshot ran');
+    let framework: AgentFramework | undefined;
+    const h = await startTurn({
+      prefix: 'sri-mid-round-',
+      responses: [
+        [snapCall('call_snap')],
+        [saveCall('call_save0', { path: 'files/sent.png', index: 0 })],
+        [saveCall('call_save1', { path: 'files/watchtower.png', index: 1 })],
+        done,
+        done,
+      ],
+      seedHistory: (f) => { framework = f; },
+      world: (m) => {
+        m.onSnap = async () => {
+          framework!.pushEvent({
+            type: 'external-message',
+            source: 'test',
+            content: [
+              { type: 'text', text: 'look at this' },
+              { type: 'image', source: { type: 'base64', data: SENT.toString('base64'), mediaType: 'image/png' } },
+            ],
+            metadata: {},
+            triggerInference: true,
+          } as unknown as ProcessEvent);
+          const cm = framework!.getAgent('prime')!.getContextManager();
+          await until(() => cm.queryMessages({}).messages.some((m) => JSON.stringify(m.content).includes(SENT.toString('base64'))),
+            'the sent picture to be stored');
+        };
+      },
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      const second = saved(await waitForToolResult(h.framework, 'call_save1'));
+      const cm = h.framework.getAgent('prime')!.getContextManager();
+      const isSent = (m: { content: unknown }): boolean => JSON.stringify(m.content).includes(SENT.toString('base64'));
+      const isSnapResult = (m: { content: unknown }): boolean => JSON.stringify(m.content).includes('"toolUseId":"call_snap"');
+      const record = cm.queryMessages({}).messages;
+      const window = cm.getPresentedMessages();
+      const [sentStored, roundStored] = [record.findIndex(isSent), record.findIndex(isSnapResult)];
+      const [sentShown, roundShown] = [window.findIndex(isSent), window.findIndex(isSnapResult)];
+      assert.ok(sentStored >= 0 && roundStored >= 0 && sentStored < roundStored, `stored before the round (${sentStored}, ${roundStored})`);
+      assert.ok(sentShown >= 0 && roundShown >= 0 && sentShown > roundShown, `presented after the round (${sentShown}, ${roundShown})`);
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(SENT));
+      assert.strictEqual(second[0]!.source, 'tool-result');
+      assert.strictEqual(second[0]!.sha256, sha(PNG));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
@@ -1646,7 +1790,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     // scan time and the older GIF gets saved under the snapshot's name.
     const h = await startTurn({
       prefix: 'sri-same-batch-',
-      world: (world) => { world.snapDelayMs = 150; },
+      world: (world) => { world.snapAfterCall = 'call_save'; },
       responses: [
         [snapCall('call_snap'), saveCall('call_save', { path: 'files/batched.png', index: 0 })],
         done,
@@ -1676,7 +1820,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     // at review time and never by a test.
     const h = await startTurn({
       prefix: 'sri-same-batch-rev-',
-      world: (world) => { world.snapDelayMs = 150; },
+      world: (world) => { world.snapAfterCall = 'call_save'; },
       responses: [
         [saveCall('call_save', { path: 'files/batched-rev.png', index: 0 }), snapCall('call_snap')],
         done,
@@ -2467,7 +2611,6 @@ describe('ToolImageLedger', () => {
       mimeType: `image/${'p'.repeat(240)}`,
       sizeBytes: Number.MAX_SAFE_INTEGER,
       rejectedFields: [],
-      truncatedFields: [],
       ...extra,
     });
     // The longest stub buildReferenceStub writes: every label at its bound,

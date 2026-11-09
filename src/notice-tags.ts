@@ -5,7 +5,13 @@
  * `[tag: …]` or `[tag …]`: text the framework didn't write is marked
  * wherever it would open with one of these (supplied-text.ts). A toolset's
  * `[server/toolset:instance]` label is built from its server's id and names
- * instead.
+ * instead, and so is a line of another agent's round as an agent that watches
+ * its slot is sent it (foreign-rounds.ts, #291): a bracket of the
+ * framework's around the tool's name, which the other agent supplied, and
+ * the call's input or the result's outcome. The line is marked as one text,
+ * so an opening of one of these tags is marked wherever it forms across it,
+ * the name included, while the framework's own words and placeholders in it
+ * stay unmarked.
  */
 export const NOTICE_TAG = {
   turnInterrupted: 'turn-interrupted',
@@ -39,6 +45,8 @@ export const NOTICE_TAG = {
   channelInvitation: 'Channel invitation',
   system: 'system',
   toolsets: 'toolsets',
+  wakeOnboarding: 'wake onboarding',
+  suppressionReview: 'suppression review',
   heartbeat: 'heartbeat',
   silentHeartbeat: 'silent heartbeat',
   heartbeatTick: 'heartbeat tick',
@@ -64,22 +72,24 @@ export const NOTICE_TAG = {
   truncated: 'truncated',
   cutToFit: 'cut to fit',
   blockNotShown: 'block not shown',
+  noText: 'no text',
 } as const;
 
 /**
- * The bracket openings context-manager 0.23.0 and 0.23.1 write into an
- * agent's context outside a tool result or read back from it, marked as the
- * framework's own are. Check them against each context-manager release the
- * framework takes.
+ * The bracket openings context-manager 0.25.1 writes into an agent's context
+ * outside a tool result or read back from it, the same as 0.23.1 and 0.25.0
+ * write, marked as the framework's own are. Its `[truncated — original was`
+ * isn't here: NOTICE_TAG.truncated marks it. Check them against each
+ * context-manager release the framework takes.
  */
 export const CONTEXT_MANAGER_TAGS = [
   'content omitted', 'image not shown', 'Operator note', 'Recall', 'tool call omitted', 'tool result moved', 'Topic Transition',
 ] as const;
 
 /**
- * The bracket openings membrane 0.8.0 writes into an agent's request outside
- * a tool result, marked as the framework's own are. Check them against each
- * membrane release the framework takes.
+ * The bracket openings membrane 0.8.0 and 0.9.0 write into an agent's request
+ * outside a tool result, marked as the framework's own are. Check them against
+ * each membrane release the framework takes.
  */
 export const MEMBRANE_TAGS = [
   'Audio', 'continuing', 'Document', 'duplicate tool_result for', 'Image', 'orphan tool_result for', 'Start', 'Tool Result', 'Video',

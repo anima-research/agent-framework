@@ -12,7 +12,7 @@ type TypingCall = {
   op?: 'start' | 'stop';
 };
 
-function makeRegistry() {
+function makeRegistry(granted = true) {
   const calls: TypingCall[] = [];
   const sendTypingFn = (
     serverId: string,
@@ -25,11 +25,11 @@ function makeRegistry() {
 
   const registry = new ChannelRegistry(
     // §14.1: the typing gate reads the server's grant now — a bare {} stub
-    // has no getServer and crashes. Model a post-policy server with
-    // channels.typing granted so the tests exercise dispatch, not denial.
+    // has no getServer and crashes. Model a post-policy server, with
+    // channels.typing granted unless a test asks for one without it.
     {
       getServer: () => ({
-        grant: new CapabilityGrant(new Set(['channels.typing']), []),
+        grant: new CapabilityGrant(new Set(granted ? ['channels.typing'] : []), []),
       }),
     } as unknown as McplServerRegistry,
     {} as FeatureSetManager,
@@ -148,4 +148,15 @@ test('stopTyping() global branch only dispatches stops for channels with interva
   const stops = calls.filter((c) => c.op === 'stop');
   assert.equal(stops.length, 1);
   assert.equal(stops[0].channelId, 'ch1');
+});
+
+test('a server without the channels.typing grant gets no typing notification, its stop included', () => {
+  const { registry, calls } = makeRegistry(false);
+
+  registry.startTyping('ch1', { topic: 't1' });
+  registry.stopTyping('ch1');
+  registry.startTyping('ch1', { topic: 't1' });
+  registry.stopTyping();
+
+  assert.deepEqual(calls, [], 'neither stopTyping branch sends a stop the server never had a start for');
 });

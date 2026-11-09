@@ -51,7 +51,7 @@ function coordinatorOn(registry: ChannelRegistry, window: Row[], anchors: number
     getDeferredMessages: () => [],
     emitTrace: () => {},
     currentSequence: sequence,
-    setSubconsciousAnchor: ((start) => { anchors.push(start); }) satisfies TuneOutFrameworkHooks['setSubconsciousAnchor'],
+    setSubconsciousAnchor: ((start) => { anchors.push(start.sequence); }) satisfies TuneOutFrameworkHooks['setSubconsciousAnchor'],
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
@@ -118,12 +118,9 @@ test("the subconscious keeps its window's start and its last look for a tune-out
   await withStore((store) => {
     registryOn(store).enterTuneOut('disc', CHANNEL, PARAMS, 'agent-tool');
     const registry = registryOn(store);
-    // The looks are kept in memory: the store refuses their keys, which hold
-    // a NUL between server and channel.
-    const looks = { eA: { [`disc\0${CHANNEL}`]: 8 } };
-    const state = new Map<string, unknown>([['tune-out/scout/last-looks', looks]]);
-    registry.readCoordinatorState = (id: string) => state.get(id) ?? null;
-    registry.writeCoordinatorState = (id: string, value: unknown) => { state.set(id, value); };
+    // A last look, stored as the coordinator keys a channel (the pair as JSON).
+    const looks = { eA: { [JSON.stringify(['disc', CHANNEL])]: 8 } };
+    registry.writeCoordinatorState('tune-out/scout/last-looks', looks);
     const anchors: number[] = [];
     const coordinator = coordinatorOn(registry, window3(), anchors);
     coordinator.resumeActiveEpochs();

@@ -16,16 +16,21 @@ import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-te
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { SuppressScripts, type SuppressScriptEvent } from './suppress-scripts.js';
+import { firstCatchAll, namesSomething } from './rule-scope.js';
 import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
+import { isSystemNotice } from '../mcpl/tags.js';
 
 import type { ToolDefinition } from '../types/events.js';
+import type { TraceEventInput } from '../types/trace.js';
 import type {
   GateConfig,
   GatePolicy,
   GatePolicyMatch,
+  SuppressConfig,
   GateBehavior,
   GateDecision,
   GateEntryRef,
@@ -41,6 +46,7 @@ import type {
   JudgeVerdict,
   UpcomingWake,
 } from './types.js';
+import { appendAll } from '../append-all.js';
 
 // Re-export types consumers need
 export type {
@@ -128,7 +134,9 @@ interface PendingEvent {
    *  composite channel id. */
   channelLabel?: string;
   /** Author id of the event (discord snowflake etc.), when the metadata carries
-   *  one — a debounced wake names the newest such author as its counterparty. */
+   *  one — a debounced wake's counterparty is the author of the event
+   *  wakeProvenance picks; when it picks none and gives no
+   *  `batchChannels`, the author of the batch's newest notice that has one. */
   authorId?: string;
   /** MCPL server id the event came from — the namespace for the counterparty
    *  (`<serverId>:user:<id>`), same as the direct channel-incoming path. */
@@ -137,6 +145,7 @@ interface PendingEvent {
    *  newer ambient chatter when a batched wake picks its provenance — the same
    *  rule the framework applies to the turn's speech locus. */
   addressed: boolean;
+  systemNotice?: true;
   /** The REGISTERED (composite) channel id the event arrived on, resolved by
    *  the host at enqueue time. Differs from `channelId` for push events,
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
@@ -146,15 +155,20 @@ interface PendingEvent {
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
   eventId?: string;
+  /** GateEventInfo.recipients. */
+  recipients?: readonly string[];
 }
 
 /** Where the host put a message the gate wrote: the agent whose window it
- *  went to and, when it was held for that agent's live turn, the id it waits
- *  under in the host's queue, or else the id it was stored under. */
+ *  went to; its stored id, once stored (absent while a surgery's hold, or
+ *  its agent's recovery, keeps the write in memory); and `presented: false`
+ *  when it wasn't presented to the agent: kept in memory, or stored while a
+ *  turn of the agent's was alive, or with a presentation at rest that
+ *  failed (#291's presentation index). The host marks the wake that goes with it from these. */
 export interface WritePlacement {
   agent?: string;
-  deferredId?: string;
   messageId?: string;
+  presented?: false;
 }
 
 /**
@@ -170,7 +184,13 @@ export interface WakeProvenance {
    *  channel); the framework derives the composite id on the direct path. */
   channelId?: string;
   /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
-   *  channel id's first segment only when the event carried no server id). */
+   *  channel id's first segment only when the event carried no server id).
+   *  A `chat:system` notice, unless it's a coalesced render's latest
+   *  occurrence (GateEventInfo.folds), is never chosen for a batch's route,
+   *  channel or `addressed` flag. In a batch in which no other event names a
+   *  channel or an author, and which has no `batchChannels`, the chosen
+   *  event is its newest notice that has an author, of which the wake names
+   *  only the author and its time (`at`). */
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
@@ -187,6 +207,19 @@ export interface WakeProvenance {
    *  event named its server: channel ids are unique only within one
    *  server's connection (MCPL §14.2). */
   routeServerId?: string;
+  /** The channels a batch came from, each its registered id and server, in
+   *  the order they first appear, when no event of it addressed the agent:
+   *  those the host resolved, one or more. A channel some events gave with
+   *  its server and others without is listed once each way, since only the
+   *  host can tell they're one. A `chat:system` notice counts
+   *  neither as addressing the agent nor as a channel, except as a
+   *  coalesced render's latest occurrence, which the gate takes as a
+   *  message (GateEventInfo.folds). The wake has no route, and the turn's
+   *  no-locus notice names them, one given without its server only if its id
+   *  still names one registered channel when the wake is admitted, unless the
+   *  turn's own wake named a channel that resolves to none, or the turn is an
+   *  ephemeral run's, which writes none. */
+  batchChannels?: Array<{ channelId: string; serverId?: string }>;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -260,15 +293,6 @@ interface PolicyStats {
 }
 
 // ---------------------------------------------------------------------------
-// Trace event shape (subset — avoids importing the full TraceEvent union)
-// ---------------------------------------------------------------------------
-
-interface TraceEventLike {
-  type: string;
-  [key: string]: unknown;
-}
-
-// ---------------------------------------------------------------------------
 // Glob matching (simple * wildcards)
 // ---------------------------------------------------------------------------
 
@@ -296,15 +320,25 @@ function isMetadataTruthy(value: unknown): boolean {
 }
 
 /**
- * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
- * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bearing event. Channel, author and
- * addressed all come from that one event, so they can never disagree.
+ * Provenance of a batched wake: the newest ADDRESSED event that names a
+ * channel or an author wins (mention / reply / DM outranks newer ambient
+ * chatter — the framework's own locus rule); else the newest event that
+ * names either. An addressed event's resolved route counts as its channel;
+ * an ambient one's doesn't. Channel, author and addressed all come from
+ * that one event, so they can never disagree. A `chat:system` notice is
+ * never chosen for the batch's route, channel or addressed flag, even one
+ * addressed by its place (a pin in a DM), since a notice never decides where
+ * the agent's speech goes; a coalesced render whose latest occurrence is a
+ * notice isn't taken as one (GateEventInfo.folds). A batch with no such event
+ * carries only its `batchChannels` when it has them; else its chosen event is
+ * its newest notice that has an author, of which it takes only the author
+ * and time.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
+  const said = events.filter((e) => !e.systemNotice);
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
-  for (const e of events) {
+  for (const e of said) {
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
@@ -317,20 +351,40 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
   const pick = newestAddressed ?? newest;
-  if (!pick) return undefined;
+  const channels = said.some((e) => e.addressed) ? [] : batchRoutes(said);
+  if (!pick && channels.length === 0) {
+    const notice = events.reduce<PendingEvent | undefined>(
+      (n, e) => (e.systemNotice && e.authorId && (!n || e.timestamp >= n.timestamp) ? e : n), undefined);
+    return notice ? { counterparty: counterpartyOf(notice), at: notice.timestamp } : undefined;
+  }
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
-  const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
-  const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
+  const channelId = pick?.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
   return {
     ...(channelId ? { channelId } : {}),
-    ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
-    ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId
+    ...(pick?.authorId ? { counterparty: counterpartyOf(pick) } : {}),
+    ...(pick?.addressed ? { addressed: true } : {}),
+    ...(pick?.addressed && pick.routeChannelId
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
-    at: pick.timestamp,
+    ...(channels.length > 0 ? { batchChannels: channels } : {}),
+    ...(pick ? { at: pick.timestamp } : {}),
   };
+}
+
+function counterpartyOf(e: PendingEvent): string {
+  const ns = e.serverId || (e.channelId ? e.channelId.split(':')[0] : '') || 'channel';
+  return `${ns}:user:${e.authorId}`;
+}
+
+function batchRoutes(events: PendingEvent[]): Array<{ channelId: string; serverId?: string }> {
+  const routes: Array<{ channelId: string; serverId?: string }> = [];
+  for (const e of events) {
+    if (!e.routeChannelId) continue;
+    if (routes.some((r) => r.channelId === e.routeChannelId && r.serverId === e.serverId)) continue;
+    routes.push({ channelId: e.routeChannelId, ...(e.serverId ? { serverId: e.serverId } : {}) });
+  }
+  return routes;
 }
 
 /** A `[Gate: …]` line's reference to messages already in the window: how
@@ -447,7 +501,7 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // default), it now loads without it.
 
 const CONFIG_FIELDS = ['default', 'policies'];
-const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough'];
+const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough', 'suppress'];
 const MATCH_FIELDS = [
   'scope', 'source', 'channel', 'mount', 'pathGlob', 'tagsAny', 'tagsAll', 'tagsNone', 'metadataTrue', 'filter',
 ];
@@ -456,6 +510,7 @@ const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample', 'judge'] as 
 const RATE_LIMIT_FIELDS = ['tokens', 'refillIntervalMs', 'keyBy'];
 const PASSIVE_SAMPLE_FIELDS = ['every', 'keyBy'];
 const JUDGE_FIELDS = ['debounceMs', 'maxWaitMs', 'instructions'];
+const SUPPRESS_FIELDS = ['description', 'script'];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -937,6 +992,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json', named: (pat
   const match = readMatch(r, obj.match);
   const resets = readResets(r, obj.resets);
   const passthrough = readPassthrough(r, obj.passthrough, kind);
+  const suppress = readSuppress(r, obj.suppress, obj.behavior, match, obj.match);
   const reading: RuleReading = {
     where: r.where, problems: r.problems, notes: r.notes, quiet: kind === 'skip' || kind === 'defer' || r.noTokens === true,
   };
@@ -944,6 +1000,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json', named: (pat
     const policy: GatePolicy = { name, match, behavior };
     if (resets) policy.resets = resets;
     if (passthrough) policy.passthrough = true;
+    if (suppress) policy.suppress = suppress;
     reading.policy = policy;
     if (r.matchesAll) reading.matchesAll = true;
   }
@@ -1333,8 +1390,7 @@ function readMatch(r: Reader, value: unknown): GatePolicyMatch {
   // Left with nothing that narrows it once something in it was named, it
   // matches every event. Empty lists and nulls alone always meant no
   // constraint, and name nothing.
-  const narrows = Object.entries(match).some(([field, v]) => !(field === 'scope' && Array.isArray(v) && v.length === 0));
-  if (!narrows && r.problems.length + r.notes.length > named) r.matchesAll = true;
+  if (!matchNarrows(match) && r.problems.length + r.notes.length > named) r.matchesAll = true;
   return match;
 }
 
@@ -1379,6 +1435,133 @@ function readPassthrough(r: Reader, value: unknown, kind: BehaviorKind | undefin
       + `an event it matches without waking on it; with ${given}, leave passthrough out`,
   });
   return false;
+}
+
+/** Whether a match narrows what it matches: anything but an empty scope. */
+export function matchNarrows(match: GatePolicyMatch): boolean {
+  return Object.entries(match).some(([field, v]) => !(field === 'scope' && Array.isArray(v) && v.length === 0));
+}
+
+/**
+ * Whether a suppress rule's match names what it hides: an event type, or a
+ * source, channel, mount, path or tag pattern that isn't only wildcards
+ * (namesSomething), a metadata flag, or a content filter. A pattern of
+ * wildcards alone, such as `source: "*"`, or only `tagsNone`, takes every
+ * event, which a suppress rule may not.
+ */
+function suppressMatchNarrows(match: GatePolicyMatch): boolean {
+  if ((match.scope ?? []).length > 0 || (match.metadataTrue ?? []).length > 0 || match.filter !== undefined) return true;
+  if ([match.source, match.channel, match.mount, match.pathGlob].some(namesSomething)) return true;
+  return [...(match.tagsAny ?? []), ...(match.tagsAll ?? [])].some(namesSomething);
+}
+
+/** Longest suppress description, in characters: the review sends it with every rule it judges. */
+export const MAX_SUPPRESS_DESCRIPTION = 2_000;
+/** Longest suppress script, in characters. */
+export const MAX_SUPPRESS_SCRIPT = 20_000;
+const SUPPRESS_EXAMPLE = '{"description": "the eye going on and off"}';
+
+/**
+ * A rule's `suppress`. Every problem with it is read as a rule that doesn't
+ * suppress, which is how a release without suppression reads the rule:
+ * its behavior then decides the event, and the event is rendered. The
+ * behavior has to be written out as "defer" (or "skip"), not left to
+ * default, because such a release reads a rule with no behavior as
+ * "always" and would wake the agent on every event the rule was meant to
+ * hide.
+ */
+function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GatePolicyMatch, rawMatch: unknown): SuppressConfig | undefined {
+  if (value === undefined || value === false) return undefined;
+  const without = "so the rule doesn't suppress, and its behavior decides its events as for any other rule";
+  if (!isPlainObject(value)) {
+    r.problems.push({ text: `suppress is ${shownValue(value)}, where an object such as ${SUPPRESS_EXAMPLE} is needed`, read: without });
+    return undefined;
+  }
+  const before = r.problems.length;
+  // A script given as null or "" is a script that's missing, not one left
+  // out: read as left out, the rule would hide every event its match takes.
+  const { script: _givenScript, ...rest } = value;
+  const emptyScript = Object.hasOwn(value, 'script') && (value.script === null || value.script === '');
+  if (emptyScript) {
+    r.problems.push({ text: `suppress.script is ${shownValue(value.script)}, where the source of a function such as "(event, state) => false" is needed`, read: without });
+  }
+  const given = withoutEmpty(`${r.where}: suppress`, emptyScript ? rest : value, r.notes);
+  const reported = r.problems.length;
+  readFieldNames(r, 'suppress', given, SUPPRESS_FIELDS);
+  // A field it doesn't read can't be left aside here, as elsewhere in a
+  // rule: one meant as a condition, left out, would hide every event the
+  // match takes.
+  const unread = Object.keys(given).filter((key) => !SUPPRESS_FIELDS.includes(key));
+  if (unread.length > 0 && r.problems.length === reported) {
+    r.problems.push({ text: `suppress has ${quotedList(unread)}, and a suppress rule reads only "description" and "script"`, read: without });
+  }
+  const config: SuppressConfig = { description: '' };
+  if (typeof given.description !== 'string' || given.description.trim() === '') {
+    r.problems.push({
+      text: `suppress.description is ${given.description === undefined ? 'missing' : shownValue(given.description)}, where the rule's `
+        + 'purpose in a few words is needed: the review checks what the rule hides against it',
+      read: without,
+    });
+  } else if ([...given.description].length > MAX_SUPPRESS_DESCRIPTION) {
+    r.problems.push({
+      text: `suppress.description is ${[...given.description].length.toLocaleString('en-US')} characters, over the `
+        + `${MAX_SUPPRESS_DESCRIPTION.toLocaleString('en-US')} allowed`,
+      read: without,
+    });
+  } else {
+    config.description = given.description.trim();
+  }
+  if (given.script !== undefined) {
+    if (typeof given.script !== 'string' || given.script.trim() === '') {
+      r.problems.push({ text: `suppress.script is ${shownValue(given.script)}, where the source of a function such as "(event, state) => false" is needed`, read: without });
+    } else if ([...given.script].length > MAX_SUPPRESS_SCRIPT) {
+      r.problems.push({
+        text: `suppress.script is ${[...given.script].length.toLocaleString('en-US')} characters, over the ${MAX_SUPPRESS_SCRIPT.toLocaleString('en-US')} allowed`,
+        read: without,
+      });
+    } else {
+      // Parsed only, never run here: the script runs on its worker.
+      try {
+        new Function(`"use strict";\nreturn (${given.script}\n);`);
+        config.script = given.script;
+      } catch (e) {
+        r.problems.push({ text: `suppress.script doesn't parse (${quotedValue(errorText(e))})`, read: without });
+      }
+    }
+  }
+  if (behavior !== 'defer' && behavior !== 'skip') {
+    r.problems.push({
+      text: `suppress is given, and a rule that suppresses needs "behavior": "defer" written out, so a release that `
+        + `doesn't know "suppress" defers its events instead of waking you on them; it has `
+        + (behavior === undefined ? 'no behavior' : `behavior ${shownValue(behavior)}`),
+      read: without,
+    });
+  }
+  // A match field the gate doesn't read would, left aside, hide more than was
+  // written: the condition it was meant to add is gone.
+  if (isPlainObject(rawMatch)) {
+    const rawFilter = isPlainObject(rawMatch.filter) ? Object.keys(rawMatch.filter).filter((key) => !FILTER_FIELDS.includes(key)).map((key) => `filter.${key}`) : [];
+    const unreadMatch = [...Object.keys(rawMatch).filter((key) => !MATCH_FIELDS.includes(key)), ...rawFilter];
+    if (unreadMatch.length > 0) {
+      r.problems.push({ text: `suppress is given, and match has ${quotedList(unreadMatch)}, which the gate doesn't read, so the rule would hide more than was written`, read: without });
+    }
+  }
+  if (!suppressMatchNarrows(match)) {
+    r.problems.push({
+      text: 'suppress is given, and the rule\'s match names nothing it hides: a suppress rule needs a match that names '
+        + 'a scope, a source, a channel, tags, a mount or path, metadata or a filter (not a pattern of wildcards alone, or tagsNone alone), '
+        + 'so it can\'t hide everything',
+      read: without,
+    });
+  }
+  // Only a rule read without any problem suppresses: one read past a problem
+  // (a slip of a field, a match read without a part of it) matches more, or
+  // decides otherwise, than its author wrote, and hiding is what can't be
+  // seen to go wrong. Its behavior decides its events instead.
+  if (before > 0) {
+    r.problems.push({ text: 'suppress is given on a rule with problems, and a rule suppresses only when it has none', read: without });
+  }
+  return r.problems.length === 0 ? config : undefined;
 }
 
 /** What a load or a start does with a rule. */
@@ -1560,7 +1743,7 @@ function readConfig(
       };
     }
   }
-  for (const rule of rules) sentences.push(...readingSentences(rule.reading, rule.outcome));
+  for (const rule of rules) appendAll(sentences, readingSentences(rule.reading, rule.outcome));
   // A list with no rules, or none the gate reads, where no sentence above said it has none.
   if (notUsed !== undefined && !sentences.some((said) => said.includes(notUsed))) {
     sentences.push(`${File} has no rules${rules.length > 0 ? ' but ones the gate leaves out' : ''}, so ${notUsedWhy}.`);
@@ -1962,7 +2145,9 @@ export function findShadowedPolicies(policies: GatePolicy[], eventTypesFrom?: Ev
   const out: ShadowWarning[] = [];
   for (let i = 0; i < policies.length; i++) {
     const earlier = policies[i];
-    if (earlier.passthrough) continue;
+    // A suppress rule lets addressed events and the heartbeat's by, so it
+    // can't be said to take every event of a later rule.
+    if (earlier.passthrough || earlier.suppress) continue;
     for (let j = i + 1; j < policies.length; j++) {
       const found = subsumedEventTypes(earlier, policies[j], eventTypesFrom);
       if (found) {
@@ -2002,6 +2187,33 @@ function errorText(err: unknown): string {
   } catch {
     return 'a value that could not be printed';
   }
+}
+
+class PartialDelivery extends Error {
+  constructor(readonly woke: readonly string[], readonly notWoken: readonly string[], cause: unknown) {
+    super(errorText(cause), { cause });
+  }
+}
+
+/**
+ * Runs a batch's delivery to `woken`, which pushes each agent it wakes to
+ * `woke`: a throw once any is woken is a PartialDelivery naming them and the
+ * rest; one before any wake is thrown as it is.
+ */
+function deliveredTracking(woke: string[], woken: readonly string[], deliver: () => void): void {
+  try {
+    deliver();
+  } catch (err) {
+    if (woke.length === 0) throw err;
+    throw new PartialDelivery(woke, woken.filter((name) => !woke.includes(name)), err);
+  }
+}
+
+function deliveredInPart(err: unknown): string | undefined {
+  if (!(err instanceof PartialDelivery)) return undefined;
+  const one = err.notWoken.length === 1;
+  return `woke ${joinedList(err.woke)}, and delivering it threw (${err.message}), `
+    + `so it's dropped for ${joinedList(err.notWoken)}, who ${one ? "isn't" : "aren't"} woken`;
 }
 
 /**
@@ -2123,6 +2335,8 @@ export class EventGate {
 
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
+  /** Suppress rules' scripts and their state (suppress-scripts.ts), kept beside gate.json. */
+  private readonly suppressScripts: SuppressScripts;
 
   // The shadow lint's last findings (see refreshShadowWarnings), recomputed
   // on every config change and fingerprinted so an unchanged set doesn't
@@ -2172,7 +2386,7 @@ export class EventGate {
   private lastPrivilegedCheck = 0;
 
   // Dependency-injected callbacks
-  private emitTrace: (event: TraceEventLike) => void;
+  private emitTrace: (event: TraceEventInput) => void;
   private addMessageFn: (
     participant: string,
     content: Array<{ type: 'text'; text: string }>,
@@ -2181,6 +2395,10 @@ export class EventGate {
     forAgent?: string,
     /** Out-param: where the message landed, for the wake that goes with it. */
     placement?: WritePlacement,
+    /** The agents the row is for; absent: the host's default for the write.
+     *  The host stamps those of them that read where it stores the row, and
+     *  its default when none does. */
+    audience?: readonly string[],
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
@@ -2188,7 +2406,7 @@ export class EventGate {
   private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
-  private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
+  private isNewestEntryFn?: (entry: GateEntryRef, recipients?: readonly string[]) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2197,13 +2415,14 @@ export class EventGate {
     configPath: string;
     initialConfig?: GateConfig;
     privilegedUsersPath?: string;
-    emitTrace: (event: TraceEventLike) => void;
+    emitTrace: (event: TraceEventInput) => void;
     addMessage: (
       participant: string,
       content: Array<{ type: 'text'; text: string }>,
       metadata?: Record<string, unknown>,
       forAgent?: string,
       placement?: WritePlacement,
+      audience?: readonly string[],
     ) => unknown;
     /** `after`: the placement of the message the wake is for, when it has
      *  one, so the host can drop the wake once a request that carried the
@@ -2221,6 +2440,8 @@ export class EventGate {
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** How long a suppress rule's script may take for one event before the event is shown (ms). Default 50. */
+    suppressScriptTimeoutMs?: number;
     /** The reply judge `judge` rules ask (JudgeConfig). Absent: a judge
      *  rule's batch is delivered as a debounce's, and gate_status says so. */
     judge?: JudgeFn;
@@ -2251,8 +2472,10 @@ export class EventGate {
      *  waiting to be written there. A batched wake for that one message
      *  doesn't write its line when it fires: it hands the line to the wake
      *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
-     *  (WakeLine). Absent: every batched wake writes its line, as before. */
-    isNewestEntry?: (entry: GateEntryRef) => boolean;
+     *  (WakeLine). With `recipients`, the windows are those agents', each of
+     *  which the event must be newest in. Absent: every batched wake writes
+     *  its line, as before. */
+    isNewestEntry?: (entry: GateEntryRef, recipients?: readonly string[]) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
@@ -2260,6 +2483,11 @@ export class EventGate {
     eventTypesFrom?: EventTypesFrom;
   }) {
     this.configPath = opts.configPath;
+    // Before the rules are read: a start's merge can clear a rule's state, its script's included.
+    this.suppressScripts = new SuppressScripts({
+      statePath: join(dirname(opts.configPath), 'suppress-state.json'),
+      ...(opts.suppressScriptTimeoutMs !== undefined ? { timeoutMs: opts.suppressScriptTimeoutMs } : {}),
+    });
     this.privilegedUsersPath = opts.privilegedUsersPath;
     this.emitTrace = opts.emitTrace;
     this.addMessageFn = opts.addMessage;
@@ -2541,7 +2769,6 @@ export class EventGate {
         ...changes,
         // Every name the start added to gate.json, as an append's trace gave.
         addedPolicies: names,
-        timestamp: Date.now(),
       });
     }
     if (!appended && (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default }))) {
@@ -2652,7 +2879,6 @@ export class EventGate {
         type: 'gate:config-error',
         error: why,
         configPath: this.configPath,
-        timestamp: Date.now(),
       });
     }
     this.configError = problem;
@@ -2798,7 +3024,11 @@ export class EventGate {
   private clearStateFor(was: GateConfig, next: GateConfig): { removed: string[]; cleared: string[] } {
     const behaviorsByName = (config: GateConfig): Map<string, string> => {
       const byName = new Map<string, string[]>();
-      for (const p of config.policies) byName.set(p.name, [...(byName.get(p.name) ?? []), behaviorFingerprint(p.behavior)]);
+      for (const p of config.policies) {
+        // A suppress rule's script is part of what it is: a changed script starts from a fresh state.
+        const fingerprint = behaviorFingerprint(p.behavior) + (p.suppress ? ` suppress:${p.suppress.script ?? ''}` : '');
+        byName.set(p.name, [...(byName.get(p.name) ?? []), fingerprint]);
+      }
       return new Map([...byName].map(([name, behaviors]) => [name, JSON.stringify(behaviors)]));
     };
     const before = behaviorsByName(was);
@@ -2851,7 +3081,6 @@ export class EventGate {
         removedPolicies: removedPolicies.length > 0 ? removedPolicies : undefined,
         stateClearedPolicies:
           stateClearedPolicies.length > 0 ? stateClearedPolicies : undefined,
-        timestamp: now,
       });
     } catch {
       // The rules in force stay, and the next check tries again.
@@ -2977,7 +3206,6 @@ export class EventGate {
       configPath: this.configPath,
       policyName: policy.name,
       replaced: idx >= 0,
-      timestamp: Date.now(),
     });
     if (ignored.length > 0) {
       // A caller that doesn't take the notes still gets them said, in the log.
@@ -3020,7 +3248,6 @@ export class EventGate {
       type: 'gate:policy-removed',
       configPath: this.configPath,
       policyName: name,
-      timestamp: Date.now(),
     });
     return true;
   }
@@ -3035,6 +3262,17 @@ export class EventGate {
     const read = this.readConfigFile({ unlessUnchanged: true });
     const current = read.state === 'loaded' ? read.config : this.config;
     return current.policies.map((p) => p.name);
+  }
+
+  /** The rules in force, in order (copies): what the last decision was made by. */
+  policiesInForce(): GatePolicy[] {
+    return this.config.policies.map((p) => structuredClone(p));
+  }
+
+  /** The rule in force by this name (a copy), or undefined. */
+  policyInForce(name: string): GatePolicy | undefined {
+    const p = this.config.policies.find((x) => x.name === name);
+    return p ? structuredClone(p) : undefined;
   }
 
   /** @internal For `wake_add_rule`'s and `wake_remove_rule`'s refusals; not a host API. */
@@ -3223,7 +3461,6 @@ export class EventGate {
           matchedPolicy: 'asleep',
           trigger: false,
           behavior: 'skip',
-          timestamp: this.now(),
         });
         return { trigger: false, policyName: 'asleep', behavior: 'skip' };
       }
@@ -3246,6 +3483,11 @@ export class EventGate {
       decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info);
     } else {
       for (const compiled of this.compiledPolicies) {
+        // A suppress rule doesn't decide a wake for an event suppression was
+        // asked about: one it takes was suppressed before the gate was asked,
+        // and one that reaches here is one it let by. Where suppression wasn't
+        // asked (no view to hide it from), it defers, as its behavior says.
+        if (compiled.policy.suppress && this.passesOverSuppress(info)) continue;
         if (!this.compiledMatches(compiled, info)) continue;
         const candidate = this.computeDecision(compiled.policy, info);
         if (candidate.trigger || !compiled.policy.passthrough) {
@@ -3281,7 +3523,6 @@ export class EventGate {
       trigger: decision.trigger,
       behavior: formatBehavior(decision.behavior),
       ...(observed.length > 0 ? { observed } : {}),
-      timestamp: this.now(),
     });
 
     return decision;
@@ -3306,7 +3547,6 @@ export class EventGate {
       behavior: formatBehavior(policy.behavior),
       eventType: info.eventType,
       source: info.serverId || undefined,
-      timestamp: this.now(),
     });
 
     if (policy.behavior === 'defer' || policy.behavior === 'skip') {
@@ -3452,6 +3692,7 @@ export class EventGate {
   private clearPolicyState(name: string): void {
     const debounce = this.debounceTimers.get(name);
     if (debounce) clearTimeout(debounce.timer);
+    this.suppressScripts.forget(name);
     this.rateLimitBuckets.delete(name);
     this.passiveSampleCounters.delete(name);
     this.rateLimitDenied.delete(name);
@@ -3507,6 +3748,7 @@ export class EventGate {
    */
   probe(info: GateEventInfo): GateDecision {
     for (const compiled of this.compiledPolicies) {
+      if (compiled.policy.suppress && this.passesOverSuppress(info)) continue; // as evaluate does
       if (!this.compiledMatches(compiled, info)) continue;
       const trigger = this.wouldTrigger(compiled.policy, info);
       if (trigger || !compiled.policy.passthrough) {
@@ -3515,6 +3757,135 @@ export class EventGate {
     }
     const trigger = (this.config.default ?? 'always') === 'always';
     return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
+  }
+
+  /**
+   * The suppress rule that takes this event, or null when none does.
+   * Side-effect-free, like probe: no counter moves, no batch forms, nothing
+   * is traced, and a rule's script runs on a copy of its state, which is
+   * then dropped. (A closure a script builds for itself is its own, and a
+   * dry run's timeout counts toward setting a script aside, as it costs the same.) The probe table and other dry runs ask this; the
+   * framework asks decideSuppression instead, once per event.
+   *
+   * It reads the rules as evaluate does, first match deciding: a rule ahead
+   * of the suppress rule that matches the event decides it instead (it isn't
+   * suppressed), unless it's a passthrough rule that wouldn't fire. A rule
+   * with a script (`suppress.script`) takes an event its match takes only
+   * when the script says to hide it; otherwise the event goes on to the rules
+   * after it, as one the rule doesn't match does. Sleep and gate.js aren't
+   * consulted: they decide wakes, and suppression decides what's rendered.
+   *
+   * Never suppressed, whatever the rules say: an event addressed to the
+   * agent (tagged `chat:addressed`: a mention, a reply, a DM) and the
+   * heartbeat's (the agent's own clock). A suppress rule lets them by to the
+   * rules after it, and its script isn't asked. The framework itself never
+   * asks about console or API input.
+   */
+  suppressionFor(info: GateEventInfo): string | null {
+    return this.walkSuppression(info, false);
+  }
+
+  /**
+   * suppressionFor, for an event that is arriving now: each script asked
+   * keeps the state it leaves, whatever later rules do with the event, and a
+   * suppressed event counts in the passthrough rules ahead of its rule. Ask
+   * once per event.
+   */
+  decideSuppression(info: GateEventInfo): string | null {
+    return this.walkSuppression(info, true);
+  }
+
+  private walkSuppression(info: GateEventInfo, commit: boolean): string | null {
+    this.reloadIfChanged();
+    this.syncSuppressScripts();
+    if (info.serverId === 'heartbeat') return null;
+    const addressed = Array.isArray(info.tags) && info.tags.includes('chat:addressed');
+    let event: SuppressScriptEvent | undefined;
+    const observers: GatePolicy[] = [];
+    for (const compiled of this.compiledPolicies) {
+      if (!this.compiledMatches(compiled, info)) continue;
+      const suppress = compiled.policy.suppress;
+      if (suppress) {
+        if (addressed) continue;
+        if (suppress.script !== undefined) {
+          event ??= this.suppressScriptEvent(info);
+          const ran = this.suppressScripts.run(compiled.policy.name, event, commit);
+          // A script that failed shows the event: it goes on to the rules after.
+          if (!ran || !('hide' in ran) || !ran.hide) continue;
+        }
+        // A suppressed event never reaches evaluate, so the passthrough rules
+        // ahead of this one count it here, as evaluate would have: none of
+        // them fires for it, and each fires on its schedule. A dry run counts
+        // nothing.
+        if (commit) for (const observer of observers) this.computeDecision(observer, info);
+        return compiled.policy.name;
+      }
+      if (compiled.policy.passthrough && !this.wouldTrigger(compiled.policy, info)) { observers.push(compiled.policy); continue; }
+      return null;
+    }
+    return null;
+  }
+
+  /** Whether evaluate and probe pass over a suppress rule for this event: suppression was asked about it, or it's one suppression always lets by. */
+  private passesOverSuppress(info: GateEventInfo): boolean {
+    return info.suppressionAsked === true || info.serverId === 'heartbeat'
+      || (Array.isArray(info.tags) && info.tags.includes('chat:addressed'));
+  }
+
+  /** The scripts in step with the rules in force (SuppressScripts.sync: only changed ones are compiled). */
+  private syncSuppressScripts(): void {
+    this.suppressScripts.sync(this.config.policies.map((p) => ({ name: p.name, ...(p.suppress?.script !== undefined ? { script: p.suppress.script } : {}) })));
+  }
+
+  /** What a suppress script is given for an event: plain JSON, its metadata included where it can be. */
+  private suppressScriptEvent(info: GateEventInfo): SuppressScriptEvent {
+    let metadata: Record<string, unknown> = {};
+    try { metadata = JSON.parse(JSON.stringify(info.metadata ?? {})) as Record<string, unknown>; } catch { metadata = {}; }
+    const channel = this.routeChannelFor(info) ?? (info.channelId || undefined);
+    const author = this.extractAuthorId(info.metadata);
+    return {
+      eventType: info.eventType,
+      source: info.serverId,
+      ...(channel ? { channel } : {}),
+      ...(author ? { author } : {}),
+      tags: [...(info.tags ?? [])],
+      text: info.content,
+      at: this.now(),
+      metadata,
+    };
+  }
+
+  /**
+   * Whether a suppress script compiles to a function, on the scripts' worker:
+   * an error's text, or null. wake_add_rule asks before it saves a rule.
+   */
+  checkSuppressScript(script: string): string | null {
+    return this.suppressScripts.check(script);
+  }
+
+  /** A suppress rule's script state as it stands (a copy), for a host or a test. */
+  suppressScriptState(name: string): Record<string, unknown> | undefined {
+    this.syncSuppressScripts();
+    return this.suppressScripts.stateOf(name);
+  }
+
+  /**
+   * Count a row the framework suppressed by `name` (suppressionFor's
+   * answer) once it's written. The rule's stats count it as a match, so
+   * gate_status shows how many events each suppress rule took since start.
+   */
+  noteSuppressed(name: string, info: Pick<GateEventInfo, 'eventType' | 'serverId' | 'channelId'>): void {
+    const policyStats = this.stats.get(name) ?? { matchCount: 0, lastMatchTimestamp: null };
+    policyStats.matchCount++;
+    policyStats.lastMatchTimestamp = this.now();
+    this.stats.set(name, policyStats);
+    this.emitTrace({
+      type: 'gate:suppressed',
+      policyName: name,
+      eventType: info.eventType,
+      ...(info.serverId ? { serverId: info.serverId } : {}),
+      ...(info.channelId ? { channelId: info.channelId } : {}),
+    });
   }
 
   /** The canonical synthetic events the probe table runs: chat shapes as MCPL delivers them, and a heartbeat. */
@@ -3592,7 +3963,12 @@ export class EventGate {
    */
   probeTable(): GateProbeRow[] {
     return this.probeEvents().map(({ label, info }) => {
-      const d = this.probe(info);
+      const suppressedBy = this.suppressionFor(info);
+      if (suppressedBy !== null) {
+        return { probe: label, eventType: info.eventType, policy: suppressedBy, behavior: 'suppress', wouldWake: false };
+      }
+      // As admission asks: suppression first, so a script that says show lets the probe on.
+      const d = this.probe({ ...info, suppressionAsked: true });
       return {
         probe: label,
         eventType: info.eventType,
@@ -3642,7 +4018,6 @@ export class EventGate {
         type: 'gate:shadow-warnings',
         reason,
         warnings: warnings.map(formatShadowWarning),
-        timestamp: this.now(),
       });
     }
   }
@@ -3702,9 +4077,11 @@ export class EventGate {
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
+      ...(isSystemNotice(info.tags) && !info.folds ? { systemNotice: true as const } : {}),
       routeChannelId: this.routeChannelFor(info),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
+      ...(info.recipients !== undefined ? { recipients: [...info.recipients] } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -3764,8 +4141,8 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
+        `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} `
+        + (deliveredInPart(err) ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
       return;
     }
@@ -3774,7 +4151,6 @@ export class EventGate {
       type: 'gate:debounce-delivered',
       policyName,
       eventCount: events.length,
-      timestamp: Date.now(),
     });
   }
 
@@ -3796,11 +4172,34 @@ export class EventGate {
         type: 'gate:held-dropped',
         dropped: batched.length - events.length,
         channels: [...new Set(batched.filter((e) => !events.includes(e)).map(heldAt))],
-        timestamp: this.now(),
       });
     }
     if (events.length === 0) return;
+    // Who each delivery woke, so that a throw after a wake is told as a
+    // delivery in part (PartialDelivery), the batch dropped only for those
+    // it didn't wake.
+    const woke: string[] = [];
+    if (events.every((e) => e.recipients === undefined)) {
+      const names = this.getAgentNamesFn();
+      deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
+      return;
+    }
+    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
+    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
+    const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
+    for (const agentName of woken) {
+      const seen = events.filter((e) => e.recipients === undefined || e.recipients.includes(agentName));
+      const key = seen.map((e) => events.indexOf(e)).join(',');
+      const group = groups.get(key) ?? { agents: [], events: seen };
+      group.agents.push(agentName);
+      groups.set(key, group);
+    }
+    deliveredTracking(woke, [...woken], () => {
+      for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents, woke);
+    });
+  }
 
+  private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {
     const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL
@@ -3859,7 +4258,12 @@ export class EventGate {
     const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
-    if (only && this.newestEntry(only)) {
+    // Where a line stored now landed, for the delivery agent's wake, as the
+    // self-wake's notice places its own (readsRowFor): a live turn that
+    // carried and answered the line drops the wake. Other agents' wakes stay
+    // plain by readsRowFor's rule.
+    const placement: WritePlacement = {};
+    if (only && this.newestEntry(only, audience)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
       line = {
         entry: entryRef(only),
@@ -3872,30 +4276,32 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
-      });
+      }, undefined, placement, audience);
     }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
     // ADDRESSED event first, else the newest event naming a channel or an
-    // author; channel + author + addressed from that ONE event. When that
-    // event addressed the agent and its registered channel is known,
-    // `routeChannelId` names the turn's speech locus too — the reply goes
-    // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches set no locus. A batch whose line the
-    // gate left to the turn's start carries it too (`line`), one object
-    // shared by every agent the batch wakes, so it is written once.
+    // author, `chat:system` notices aside; channel + author + addressed from
+    // that ONE event. When that event addressed the agent and its registered
+    // channel is known, `routeChannelId` names the turn's speech locus too —
+    // the reply goes back to whoever addressed the agent, not to whichever
+    // channel last saw any traffic. Ambient-only batches set no locus, and
+    // name the channels they came from (`batchChannels`). A batch whose line
+    // the gate left to the turn's start carries it too (`line`), one object
+    // shared by every agent woken with these messages, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
-    for (const agentName of this.getAgentNamesFn()) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+    for (const agentName of woken) {
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance, line ? undefined : placement);
+      woke?.push(agentName);
     }
   }
 
   /** isNewestEntry for one event; a callback fault keeps the line. */
-  private newestEntry(event: PendingEvent): boolean {
+  private newestEntry(event: PendingEvent, recipients?: readonly string[]): boolean {
     if (!this.isNewestEntryFn) return false;
     try {
-      return this.isNewestEntryFn(entryRef(event)) === true;
+      return this.isNewestEntryFn(entryRef(event), recipients) === true;
     } catch {
       return false;
     }
@@ -3918,7 +4324,7 @@ export class EventGate {
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
     if (deciding) {
-      deciding.queued.push(...events);
+      appendAll(deciding.queued, events);
       this.capJudgeEvents(deciding.queued);
       return;
     }
@@ -3971,7 +4377,7 @@ export class EventGate {
   private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
     const held = this.judgeHeld.get(policyName);
     if (held) {
-      held.events.push(...events);
+      appendAll(held.events, events);
       held.judge = judge;
       this.capJudgeEvents(held.events);
     } else {
@@ -4014,7 +4420,8 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires; a judge rule's goes to the judge, so it only may).
+   * when it fires; a judge rule's goes to the judge, so it only may). A batch,
+   * and a sleep with no agent named, reach the gate's recipients alone.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4022,19 +4429,21 @@ export class EventGate {
     for (const name of agentNames) {
       const due = this.selfWakeDue.get(name);
       if (due && this.selfWakeTimers.has(name)) {
-        wakes.push({ at: due.at, certain: true, what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
+        wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
       }
     }
-    if (this.sleepUntil > now && (this.sleepAgent === undefined || agentNames.includes(this.sleepAgent))) {
-      wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
+    const recipients = this.getAgentNamesFn();
+    const recipient = agentNames.some((name) => recipients.includes(name));
+    if (this.sleepUntil > now && (this.sleepAgent === undefined ? recipient : agentNames.includes(this.sleepAgent))) {
+      wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep' });
     }
     for (const [name, state] of this.debounceTimers) {
-      if (name === exceptPolicy || state.events.length === 0) continue;
+      if (!recipient || name === exceptPolicy || state.events.length === 0) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
+        : { at: state.dueAt, certain: true, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
@@ -4131,7 +4540,6 @@ export class EventGate {
       ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
       ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
       ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
-      timestamp: Date.now(),
     });
     if (this.disposed) return;
     const judge = this.currentJudge(policyName, state.judge);
@@ -4156,8 +4564,8 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
+        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} `
+        + (deliveredInPart(err) ?? `couldn't be delivered (${errorText(err)}), so the batch is dropped`),
       );
     }
   }
@@ -4231,8 +4639,8 @@ export class EventGate {
    * buffer through the same path a turn's end uses. Self-wake and sleep-expiry
    * timers deliberately do NOT route through this — their inference requests
    * are per-agent targeted pushes that the framework's quiesce wake gate parks
-   * and releases at resume, whereas the buffer's deliverEvents broadcasts a
-   * wake to every agent.
+   * and releases at resume, whereas the buffer's deliverEvents wakes every
+   * agent a batch is for.
    */
   setQuiesced(quiesced: boolean): void {
     if (this.quiesced === quiesced) return;
@@ -4260,10 +4668,12 @@ export class EventGate {
           this.deliverEvents(events);
         } catch (err) {
           const one = events.length === 1;
-          console.error(
-            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
-            + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
-          );
+          const held = `${events.length} ${one ? 'event' : 'events'}`;
+          const partly = deliveredInPart(err);
+          console.error(partly
+            ? `[gate] a batch of ${held}, held for an agent's turn or the host's quiesce, ${partly}`
+            : `[gate] ${held} held for an agent's turn or the host's quiesce couldn't be delivered (${errorText(err)}), `
+              + `so ${one ? "it's" : "they're"} dropped`);
         }
       });
     }
@@ -4347,7 +4757,6 @@ export class EventGate {
       matchedPolicy: 'asleep',
       trigger: false,
       behavior: 'skip',
-      timestamp: this.now(),
     });
     return { until: this.sleepUntil };
   }
@@ -4405,13 +4814,13 @@ export class EventGate {
         matchedPolicy: 'self-wake',
         trigger: true,
         behavior: 'always',
-        timestamp: this.now(),
       });
       // Compact in-window notice: without it the wake turn contains nothing
       // new, so the agent can't tell WHAT woke it (its own timer vs. a
       // heartbeat) or WHEN. One line, timestamped to the second. Added
-      // before the inference request so it rides the wake turn (addMessage's
-      // turn-alive guard defers it to that turn's start if needed).
+      // before the inference request so it rides the wake turn: it is stored
+      // at once, and while a turn of the agent's is alive it is kept out of
+      // the window until the agent's next presentation point.
       const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
       // Deliver the notice into the WAKING agent's window — a self-wake
       // armed by a non-primary agent (e.g. a subconscious cadence) must not
@@ -4440,7 +4849,6 @@ export class EventGate {
       matchedPolicy: 'self-wake',
       trigger: false,
       behavior: 'skip',
-      timestamp: this.now(),
     });
     return { inMs: ms, armed: true };
   }
@@ -4483,7 +4891,6 @@ export class EventGate {
       matchedPolicy: 'asleep',
       trigger: true,
       behavior: 'always',
-      timestamp: this.now(),
     });
     const detail = note ? `${reason}: ${note}` : reason;
     const targets = agent ? [agent] : this.getAgentNamesFn();
@@ -4613,6 +5020,7 @@ export class EventGate {
   }
 
   getStatus(): GateStatus {
+    this.syncSuppressScripts();
     const policies: GatePolicyStats[] = this.config.policies.map(p => {
       const stats = this.stats.get(p.name);
       const debounce = this.debounceTimers.get(p.name);
@@ -4621,6 +5029,9 @@ export class EventGate {
         behavior: p.behavior,
         matchCount: stats?.matchCount ?? 0,
         lastMatchTimestamp: stats?.lastMatchTimestamp ?? null,
+        ...(p.suppress
+          ? { suppress: { ...p.suppress, ...(p.suppress.script !== undefined && this.suppressScripts.status(p.name) ? { scriptStatus: this.suppressScripts.status(p.name)! } : {}) } }
+          : {}),
       };
       if (typeof p.behavior === 'object' && 'debounce' in p.behavior) {
         result.debounceState = {
@@ -4684,6 +5095,13 @@ export class EventGate {
       // Fresh, not the cache: the sources the host knows (eventTypesFrom)
       // change as servers connect, with no change to the rules.
       shadowWarnings: this.lintShadows().map(formatShadowWarning),
+      ...((): Pick<GateStatus, 'catchAll'> => {
+        const rule = firstCatchAll(this.config.policies, { lettingBy: true });
+        return rule ? { catchAll: {
+          rule,
+          note: `${JSON.stringify(rule)} lets MCPL events by without waking you and without naming a server, a channel or a tag, so a server connected later is handled by it until a rule for that server goes ahead of it.`,
+        } } : {};
+      })(),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,
@@ -4720,6 +5138,7 @@ export class EventGate {
 
   dispose(): void {
     this.gateScript.dispose();
+    this.suppressScripts.dispose();
     for (const state of this.debounceTimers.values()) {
       clearTimeout(state.timer);
     }

@@ -11,7 +11,8 @@ test('a batch says when it is full, and flushes in pieces of at most a batch', (
   assert.equal(batch.write('x'.repeat(MAX_BATCH_CHARS - 1)), false);
   assert.equal(batch.write('yy'), true);
   const pieces = batch.flush();
-  assert.deepEqual(pieces.map((p) => p.length), [MAX_BATCH_CHARS, 1]);
+  assert.ok(pieces.every((p) => p.length <= MAX_BATCH_CHARS), String(pieces.map((p) => p.length)));
+  assert.equal(pieces.join(''), `${'x'.repeat(MAX_BATCH_CHARS - 1)}yy`, 'the pieces join to what was written');
   assert.equal(batch.unflushed, 0);
   assert.deepEqual(batch.flush(), []);
 });

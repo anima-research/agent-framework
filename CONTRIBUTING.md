@@ -203,7 +203,8 @@ npx tsc --noEmit      # typecheck
 
 `npm test` runs the compiled output, so a stale `dist/` will happily test
 code you no longer have — always build before testing, and after switching
-branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
+branches. The `pretest` hook copies `test/fixtures/*.mjs` and code_execution's
+`quickjs.wasm` into `dist/`.
 
 `--test-timeout=600000` bounds each test file as a whole under Node
 22.12, as it did under Node 20, and each test under Node 24, at ten
@@ -211,16 +212,26 @@ minutes; the slowest file, `mcpl-runtime-lifecycle`, takes about three.
 Each job in `ci.yml` also has a `timeout-minutes` limit, which ends a hang
 the test timeout doesn't reach.
 
-CI (`ci.yml`'s Build & Test, and `publish.yml`) runs as many test files at
-once as the runner has cores, by setting `AF_TEST_CONCURRENCY`; `npm test`
+CI (`ci.yml`'s Build & Test, and `publish.yml`) runs the suite with
+`node scripts/test-as-ci.mjs`, which runs `npm test` with `AF_TEST_CONCURRENCY`
+set to twice the machine's cores, whatever the environment sets; `npm test`
 passes it on as `--test-concurrency` only when it's set. Unset, as it is
 locally, Node's default of one file fewer than the cores applies. To run the
 suite as CI schedules it, for example to chase a failure that shows only
-under load, set it: `AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length") npm test`.
+under load, run `node scripts/test-as-ci.mjs`. To run it at another width,
+set `AF_TEST_CONCURRENCY` yourself and run `npm test`.
 
-Push-time CI (`ci.yml`) builds, typechecks and runs the whole suite once on
+Push-time CI (`ci.yml`) builds, typechecks and runs the whole suite on
 every pull request and every push to main, on ubuntu at the engines floor
-(Node 22.12.0). Every other leg, macOS at 22.12.0, 24 and the newest Node
+(Node 22.12.0). It does so with the dependencies as `npm install` resolves
+them, and, in jobs of their own, with each dependency, optional and peer ones
+included, at the lowest release its range admits, since a host's own range or
+lockfile can hold that one. A range that joins lines with `||` gets one more
+run for each of its lines' lowest releases other than the range's own lowest,
+with every other dependency at its lowest
+(`scripts/install-dependency-floors.mjs`). The other lines of two such ranges
+aren't tested in crossed combinations.
+Every other leg, macOS at 22.12.0, 24 and the newest Node
 and ubuntu at 24 and the newest Node, only installs the package and loads
 it: it builds and runs `node scripts/pack-installs-alone.mjs`, the pack
 check below, which loads the package's entry points and each bin's imports

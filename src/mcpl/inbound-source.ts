@@ -167,15 +167,16 @@ export function conversationKey(source: InboundSource): string | undefined {
  * well-formed is dropped (the store doesn't keep it). An `undefined` array
  * element is written as `null`, as JSON writes it: the store's append
  * refuses a body holding one, so no stored copy does. So a value
- * hashes alike however its keys were ordered (content read back from the
- * store has them in a different order than it was written), and alike
+ * hashes alike however its keys were ordered (a store on chronicle before
+ * 0.5.1 hands content back with its keys sorted), and alike
  * before and after the store. editMessage writes JSON instead, so an edited
  * copy can keep what an append wouldn't; it has changed anyway.
  *
  * It expects JSON-shaped values, as the MCPL lanes deliver them (parsed from
  * JSON). Any other object is written by its own enumerable entries, unlike
  * JSON.stringify: a Date becomes `{}`, as the store's own write keeps it, but
- * a deferred write recovered from its JSON file brings it back as a string.
+ * a write an earlier release's deferral queue left in its JSON file, which
+ * the importer stores at boot, brings it back as a string.
  *
  * sourceBodyDigest's serializer, kept out of the package API: serialization
  * and framing both stay inside sourceBodyDigest, so consumers don't

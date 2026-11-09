@@ -1,14 +1,16 @@
 /**
  * The Discord module over writes the framework holds (F198, with #516's
- * record of the creates on their way). The framework holds a module's writes
- * while the agent's turn is alive or the host is quiesced, and a module's
- * reads now see them, marked held, and its edits and removals reach them. So
- * a message deleted while its create is held is never stored, one edited
- * then is stored as edited, a sync's held add keeps a live create from
- * adding a second copy, and a create whose write hasn't landed ends its
+ * record of the creates on their way). The framework stores a module's write
+ * at once and holds it from the agent's window while the agent's turn is
+ * alive or the host is quiesced (#291), and a module's reads see it, marked
+ * held, and its edits and removals reach it. So a message deleted while its
+ * create is held is removed, and none of it is stored after the resume, one
+ * edited then is stored as edited, a sync's held add keeps a live create
+ * from adding a second copy, and a create stored while quiesced ends its
  * record once its row shows, so a sync no longer passes over the message.
  * The module runs in a real framework, which holds its writes by quiescing
- * the host, the same branch of addMessage a live turn takes.
+ * the host, the same branch of addMessage a live turn takes. A create that
+ * a surgery's or a recovery's hold keeps unstored is withKeptCreate's.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,11 +18,12 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
+import { WriteOutcomeUnknownError, type MessageId } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
-import type { Module, ModuleContext, ModuleMessage, ToolDefinition, ToolResult } from '../src/index.js';
+import type { Module, ModuleContext, ModuleMessage, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { DiscordModule } from '../src/modules/discord/index.js';
 import type { DiscordClientInterface, DiscordMessageData, HistoryMessage } from '../src/modules/discord/types.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 /** The Discord side: the module's handlers, and the history a sync fetches. */
 class FakeDiscord {
@@ -105,7 +108,7 @@ const storedTexts = (framework: AgentFramework, id: string): string[] =>
     .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === id)
     .map(textOf);
 
-test('a message deleted while its create is held is never stored', async () => {
+test('a message deleted while its create is held is removed, and none of it is stored after the resume', async () => {
   await withDiscord(async ({ framework, discord, rows }) => {
     await discord.onMessageHandler!(live('m1', 'taken back'));
     await waitFor('the create to be held', () => rows('m1').length === 1);
@@ -131,7 +134,7 @@ test('a message edited while its create is held is stored as edited', async () =
 test("a live create that comes after a sync's held add of its message adds no second copy", async () => {
   await withDiscord(async ({ framework, discord, module, rows }) => {
     discord.history = [history('m3', 'seen by the sync first')];
-    assert.equal((await module.syncChannelHistory('c1')).newMessages, 1);
+    await module.syncChannelHistory('c1');
     assert.equal(rows('m3')[0]?.held, true, "the sync's add is held");
     await discord.onMessageHandler!(live('m3', 'seen by the sync first'));
     await waitFor('the create to be answered', () => module.creating.get('m3')?.phase === 'writing');
@@ -146,19 +149,602 @@ test("a live create that comes after a sync's held add of its message adds no se
   });
 });
 
-test("a create whose write hasn't landed ends its record once its held row shows, so a sync then reaches the message", async () => {
+test("a create stored while quiesced, its row held from the agent's window, ends its record once the row shows, so a sync then reaches the message", async () => {
   await withDiscord(async ({ discord, module, rows }) => {
     await discord.onMessageHandler!(live('m4', 'as sent'));
     await waitFor('the create to be held', () => rows('m4').length === 1);
     // The next Discord event ends the entries whose row the store shows.
     await discord.onMessageHandler!(live('m5', 'another message'));
     await waitFor('the next create to be held', () => rows('m5').length === 1);
-    assert.equal(module.creating.has('m4'), false, 'the held row ends the record');
     // An edit the live path missed: the sync brings it to the held write,
     // where it adds no copy.
     discord.history = [history('m4', 'edited while offline'), history('m5', 'another message')];
-    const synced = await module.syncChannelHistory('c1');
-    assert.deepEqual([synced.newMessages, synced.editedMessages], [0, 1]);
+    await module.syncChannelHistory('c1');
     assert.deepEqual(rows('m4').map((m) => [m.held, textOf(m)]), [[true, 'edited while offline']]);
+    assert.equal(rows('m5').length, 1, 'no second copy of a message the sync found stored');
   });
+});
+
+type Hold = 'a branch move holding the store' | "the primary's recovery wait";
+
+async function within<T>(promise: Promise<T>, what: string, ms = 10_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${what}`)), ms); });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function withKeptCreate(
+  hold: Hold,
+  run: (s: { framework: AgentFramework; discord: FakeDiscord; processed: (type: string, id: string) => Promise<void>; kept: () => number; texts: (id: string) => string[] }) => Promise<void>,
+  options: { triggerOn?: 'all'; modules?: Module[]; membrane?: MockMembrane } = {},
+): Promise<{ framework: AgentFramework; texts: (id: string) => string[]; cleanup: () => Promise<void> }> {
+  const dir = mkdtempSync(join(tmpdir(), 'discord-kept-create-'));
+  const discord = new FakeDiscord();
+  const module = new DiscordModule(discord as unknown as DiscordClientInterface, { token: 't', autoTyping: false, ...(options.triggerOn ? { triggerOn: options.triggerOn } : {}) });
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: (options.membrane ?? new MockMembrane()).asMembrane(),
+    agents: [{ name: 'Sol', model: 'test-model', systemPrompt: 'test' }],
+    modules: [module, ...(options.modules ?? [])],
+  });
+  const cleanup = async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); };
+  const waiters: Array<{ type: string; id: string; done: () => void }> = [];
+  framework.onTrace((event) => {
+    if (event.type !== 'process:completed') return;
+    const done = event.processEvent as { type: string; discordMessageId?: string };
+    for (const w of waiters.splice(0)) {
+      if (w.type === done.type && w.id === done.discordMessageId) w.done(); else waiters.push(w);
+    }
+  });
+  const processed = (type: string, id: string) => within(new Promise<void>((done) => { waiters.push({ type, id, done }); }), `${type} for ${id} to be processed`);
+  const released = new Promise<void>((done) => framework.onTrace((event) => {
+    if (event.type === 'message:added' && event.source === 'surgery-release') done();
+  }));
+  const texts = (id: string) => framework.getAgent('Sol')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === id)
+    .map(textOf);
+  const kept = () => framework.getHostModeStatus().deferredWrites;
+  framework.start();
+  const branch = framework.getStore().currentBranch().name;
+  const strategy = framework.getAgent('Sol')!.getContextManager().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
+  const initialize = strategy.initialize;
+  const restore = () => { if (initialize) strategy.initialize = initialize; else delete strategy.initialize; };
+  const quiet = console.error;
+  let open: (() => void) | undefined;
+  try {
+    if (hold === 'a branch move holding the store') {
+      const gate = new Promise<void>((resolve) => { open = resolve; });
+      let reached!: () => void;
+      const inMove = new Promise<void>((resolve) => { reached = resolve; });
+      strategy.initialize = async function (this: unknown, ...args: unknown[]) { reached(); await gate; return initialize?.apply(this, args); };
+      const move = framework.switchBranch(branch);
+      await within(inMove, 'the move to reach its initialization');
+      await run({ framework, discord, processed, kept, texts });
+      open!();
+      await within(move, 'the move');
+    } else {
+      strategy.initialize = async () => { throw new Error('zz-injected initialization failure'); };
+      console.error = () => {};
+      await framework.switchBranch(branch);
+      restore();
+      await run({ framework, discord, processed, kept, texts });
+      console.error = quiet;
+      await framework.switchBranch(branch);
+    }
+    await within(released, 'the release');
+  } catch (error) {
+    open?.();
+    for (const extra of options.modules ?? []) (extra as { release?: () => void }).release?.();
+    await cleanup().catch(() => {});
+    throw error;
+  } finally {
+    console.error = quiet;
+    restore();
+  }
+  return { framework, texts, cleanup };
+}
+
+async function drained(framework: AgentFramework): Promise<void> {
+  const marker = `zz-drained-${Math.random().toString(36).slice(2)}`;
+  const seen = new Promise<void>((done) => framework.onTrace((event) => {
+    if (event.type === 'process:completed' && (event.processEvent as { marker?: string }).marker === marker) done();
+  }));
+  (framework as unknown as { pushEvent(event: unknown): void }).pushEvent({ type: 'zz-drained', marker });
+  await within(seen, 'the queue to drain');
+}
+
+for (const hold of ['a branch move holding the store', "the primary's recovery wait"] as const) {
+  test(`a message deleted while its create is kept in memory by ${hold} isn't stored once the hold releases`, async () => {
+    const s = await withKeptCreate(hold, async ({ discord, processed, kept, texts }) => {
+      const created = processed('discord:message', 'k1');
+      await discord.onMessageHandler!(live('k1', 'taken back'));
+      await created;
+      assert.deepEqual([kept(), texts('k1')], [1, []], 'the create is kept in memory, not stored');
+      const deleted = processed('discord:delete', 'k1');
+      discord.onDeleteHandler!('k1');
+      await deleted;
+    });
+    try {
+      await drained(s.framework);
+      assert.deepEqual(s.texts('k1'), [], 'the deleted message is not in the store');
+    } finally {
+      await s.cleanup();
+    }
+  });
+
+  test(`a message edited while its create is kept in memory by ${hold} is stored as edited once the hold releases`, async () => {
+    const s = await withKeptCreate(hold, async ({ discord, processed, kept, texts }) => {
+      const created = processed('discord:message', 'k2');
+      await discord.onMessageHandler!(live('k2', 'before'));
+      await created;
+      assert.deepEqual([kept(), texts('k2')], [1, []], 'the create is kept in memory, not stored');
+      const edited = processed('discord:edit', 'k2');
+      discord.onEditHandler!('k2', 'after');
+      await edited;
+    });
+    try {
+      await drained(s.framework);
+      assert.deepEqual(s.texts('k2'), ['after'], 'the store holds the edited text');
+    } finally {
+      await s.cleanup();
+    }
+  });
+}
+
+test("a message deleted and then edited while its create is kept in memory isn't stored once the hold releases", async () => {
+  const s = await withKeptCreate('a branch move holding the store', async ({ discord, processed, kept, texts }) => {
+    const created = processed('discord:message', 'k8');
+    await discord.onMessageHandler!(live('k8', 'taken back'));
+    await created;
+    assert.deepEqual([kept(), texts('k8')], [1, []], 'the create is kept in memory, not stored');
+    const deleted = processed('discord:delete', 'k8');
+    discord.onDeleteHandler!('k8');
+    await deleted;
+    const edited = processed('discord:edit', 'k8');
+    discord.onEditHandler!('k8', 'taken back, unfurled');
+    await edited;
+  });
+  try {
+    await drained(s.framework);
+    assert.deepEqual(s.texts('k8'), [], 'the deleted message is not in the store');
+  } finally {
+    await s.cleanup();
+  }
+});
+
+class Holder implements Module {
+  readonly name = 'holder';
+  private open!: () => void;
+  private readonly gate = new Promise<void>((resolve) => { this.open = resolve; });
+  private enter!: () => void;
+  readonly entered = new Promise<void>((resolve) => { this.enter = resolve; });
+  async start(): Promise<void> {}
+  async stop(): Promise<void> { this.open(); }
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(): Promise<ToolResult> { return { success: false, error: 'no tools', isError: true }; }
+  async onProcess(event: { type: string }): Promise<Record<string, never>> {
+    if (event.type === 'zz-hold') { this.enter(); await this.gate; }
+    return {};
+  }
+  release(): void { this.open(); }
+}
+
+for (const [change, kept, gone] of [['deleted', [], 'taken back'], ['edited', ['as edited'], 'as first sent']] as const) {
+  test(`a message ${change} while its create is kept in memory reaches no turn's request in its earlier form, when an event is still being handled at the release`, async () => {
+    const holder = new Holder();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    let requested!: () => void;
+    const firstRequest = new Promise<void>((resolve) => { requested = resolve; });
+    const stream = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request, options) => { requested(); return stream(request, options); };
+    const s = await withKeptCreate('a branch move holding the store', async ({ framework, discord, processed, kept: held, texts }) => {
+      const created = processed('discord:message', 'k5');
+      await discord.onMessageHandler!(live('k5', gone));
+      await created;
+      assert.deepEqual([held(), texts('k5')], [1, []], 'the create is kept in memory, not stored');
+      const changed = processed(change === 'deleted' ? 'discord:delete' : 'discord:edit', 'k5');
+      if (change === 'deleted') discord.onDeleteHandler!('k5'); else discord.onEditHandler!('k5', 'as edited');
+      await changed;
+      framework.pushEvent({ type: 'zz-hold' } as never);
+      await within(holder.entered, 'the held event');
+    }, { triggerOn: 'all', modules: [holder], membrane });
+    try {
+      holder.release();
+      await within(firstRequest, "the turn's first request");
+      const messages = JSON.stringify(membrane.calls[0]!.messages);
+      assert.ok(!messages.includes(gone), `the turn's request doesn't carry "${gone}"`);
+      if (change === 'edited') assert.ok(messages.includes('as edited'), "the turn's request carries the edited text");
+      await drained(s.framework);
+      assert.ok(membrane.calls.every((call) => !JSON.stringify(call.messages).includes(gone)), `no request of the turn's carries "${gone}"`);
+      assert.deepEqual(s.texts('k5'), kept);
+    } finally {
+      await s.cleanup();
+    }
+  });
+}
+
+test("a message deleted while its create is kept in memory, whose delete is still queued at the release, reaches no turn's request", async () => {
+  const holder = new Holder();
+  const membrane = new MockMembrane();
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+  let requested!: () => void;
+  const firstRequest = new Promise<void>((resolve) => { requested = resolve; });
+  const stream = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (request, options) => { requested(); return stream(request, options); };
+  const s = await withKeptCreate('a branch move holding the store', async ({ framework, discord, processed, kept: held, texts }) => {
+    const created = processed('discord:message', 'k9');
+    await discord.onMessageHandler!(live('k9', 'taken back'));
+    await created;
+    assert.deepEqual([held(), texts('k9')], [1, []], 'the create is kept in memory, not stored');
+    framework.pushEvent({ type: 'zz-hold' } as never);
+    await within(holder.entered, 'the held event');
+    discord.onDeleteHandler!('k9');
+  }, { triggerOn: 'all', modules: [holder], membrane });
+  try {
+    holder.release();
+    await within(firstRequest, "the turn's first request");
+    assert.ok(!JSON.stringify(membrane.calls[0]!.messages).includes('taken back'), "the turn's request doesn't carry the deleted text");
+    await drained(s.framework);
+    assert.ok(membrane.calls.every((call) => !JSON.stringify(call.messages).includes('taken back')), "no request of the turn's carries the deleted text");
+    assert.deepEqual(s.texts('k9'), []);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+for (const removes of [true, false]) test(removes
+  ? "edits made while a create is kept in memory apply in turn at the release, so a later text-only edit keeps an earlier edit's removed attachment removed"
+  : "the control: a text-only edit made while a create is kept in memory keeps the attachment the create carried", async (t) => {
+  const original = globalThis.fetch;
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return new Response('NOTES BODY', { status: 200, headers: { 'content-type': 'text/plain' } }); }) as typeof fetch;
+  t.after(() => { globalThis.fetch = original; });
+  const edit = (discord: FakeDiscord, text: string, attachments?: unknown[]) =>
+    (discord.onEditHandler as unknown as (id: string, content: string, attachments?: unknown[]) => void)('k10', text, attachments);
+  const s = await withKeptCreate('a branch move holding the store', async ({ discord, processed, kept, texts }) => {
+    const created = processed('discord:message', 'k10');
+    await discord.onMessageHandler!({
+      ...live('k10', 'with notes'),
+      attachments: [{ id: 'a1', filename: 'notes.txt', url: 'https://cdn.example.invalid/notes.txt', contentType: 'text/plain', size: 10 }],
+    });
+    await created;
+    assert.deepEqual([fetched, kept(), texts('k10')], [1, 1, []], "the create's attachment was fetched, and the create is kept in memory, not stored");
+    if (removes) {
+      const first = processed('discord:edit', 'k10');
+      edit(discord, 'with notes', []);
+      await first;
+    }
+    const second = processed('discord:edit', 'k10');
+    edit(discord, 'edited text');
+    await second;
+  });
+  try {
+    await drained(s.framework);
+    const row = JSON.stringify(s.framework.getAgent('Sol')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === 'k10').map((m) => m.content));
+    assert.ok(row.includes('edited text'), `the later edit's text is stored: ${row}`);
+    if (removes) assert.ok(!row.includes('NOTES BODY'), `the attachment the earlier edit removed stays removed: ${row}`);
+    else assert.ok(row.includes('NOTES BODY'), `the create's attachment is stored with the text-only edit: ${row}`);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("an edit kept while its create is held that fails at the release leaves the edits after it to apply, as their own events would", async () => {
+  let refused = 0;
+  const s = await withKeptCreate('a branch move holding the store', async ({ framework, discord, processed, kept, texts }) => {
+    const created = processed('discord:message', 'k11');
+    await discord.onMessageHandler!(live('k11', 'before'));
+    await created;
+    assert.deepEqual([kept(), texts('k11')], [1, []], 'the create is kept in memory, not stored');
+    const internals = framework as unknown as { editMessage(id: string, content: unknown): void };
+    const edit = internals.editMessage.bind(framework);
+    internals.editMessage = (id, content) => {
+      if (JSON.stringify(content).includes('first edit')) {
+        refused++;
+        throw new Error('zz-edit-refused');
+      }
+      return edit(id, content);
+    };
+    const first = processed('discord:edit', 'k11');
+    discord.onEditHandler!('k11', 'first edit');
+    await first;
+    const second = processed('discord:edit', 'k11');
+    discord.onEditHandler!('k11', 'second edit');
+    await second;
+  });
+  try {
+    await drained(s.framework);
+    assert.equal(refused, 1, 'premise: the store refused the first edit at the release');
+    assert.deepEqual(s.texts('k11'), ['second edit'], 'the later edit is stored');
+  } finally {
+    await s.cleanup();
+  }
+});
+
+interface LostCreateInternals {
+  creating: Map<string, { phase: string; unapplied?: unknown }>;
+  storedRow(discordMessageId: string): unknown;
+  syncChannelHistory(channelId: string): Promise<{ newMessages: number }>;
+}
+
+/**
+ * A create of `id` ('zz-kept-create') kept in memory by a branch move
+ * holding the store, `during` run while it is kept, then released with the
+ * release's store of it replaced by `store` (given the real one), and the
+ * module's store read throwing at the release where `readThrows` is set.
+ */
+async function withLostRelease(
+  id: string,
+  during: (s: { discord: FakeDiscord; processed: (type: string, id: string) => Promise<void> }) => Promise<void>,
+  atRelease: { store: (add: () => MessageId) => MessageId; readThrows?: boolean },
+): Promise<{
+  framework: AgentFramework; discord: FakeDiscord; module: LostCreateInternals; traces: TraceEvent[];
+  processed: (type: string, id: string) => Promise<void>; texts: (id: string) => string[]; cleanup: () => Promise<void>;
+  /** How many store reads `readThrows` refused at the release. */
+  readsRefused: () => number;
+}> {
+  const dir = mkdtempSync(join(tmpdir(), 'discord-lost-release-'));
+  const discord = new FakeDiscord();
+  const module = new DiscordModule(discord as unknown as DiscordClientInterface, { token: 't', autoTyping: false });
+  const internals = module as unknown as LostCreateInternals;
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'Sol', model: 'test-model', systemPrompt: 'test' }],
+    modules: [module],
+  });
+  const cleanup = async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); };
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => { traces.push(event); });
+  const waiters: Array<{ type: string; id: string; done: () => void }> = [];
+  framework.onTrace((event) => {
+    if (event.type !== 'process:completed') return;
+    const done = event.processEvent as { type: string; discordMessageId?: string };
+    for (const w of waiters.splice(0)) {
+      if (w.type === done.type && w.id === done.discordMessageId) w.done(); else waiters.push(w);
+    }
+  });
+  const processed = (type: string, of: string) => within(new Promise<void>((done) => { waiters.push({ type, id: of, done }); }), `${type} for ${of} to be processed`);
+  const texts = (of: string) => framework.getAgent('Sol')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata?.external as { id?: string } | undefined)?.id === of)
+    .map(textOf);
+  const fw = framework as unknown as { addMessage(participant: string, content: ContentBlock[], ...rest: unknown[]): MessageId };
+  const addMessage = fw.addMessage.bind(framework);
+  const storedRow = internals.storedRow.bind(module);
+  const strategy = framework.getAgent('Sol')!.getContextManager().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
+  const initialize = strategy.initialize;
+  const quiet = console.error;
+  let readsRefused = 0;
+  let open: (() => void) | undefined;
+  try {
+    framework.start();
+    const branch = framework.getStore().currentBranch().name;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    let reached!: () => void;
+    const inMove = new Promise<void>((resolve) => { reached = resolve; });
+    strategy.initialize = async function (this: unknown, ...args: unknown[]) { reached(); await gate; return initialize?.apply(this, args); };
+    const move = framework.switchBranch(branch);
+    await within(inMove, 'the move to reach its initialization');
+    const created = processed('discord:message', id);
+    await discord.onMessageHandler!(live(id, 'zz-kept-create'));
+    await created;
+    assert.equal(internals.creating.get(id)?.phase, 'writing', 'premise: the create was answered, and is kept in memory');
+    assert.deepEqual(texts(id), [], 'premise: not stored');
+    await during({ discord, processed });
+
+    fw.addMessage = (participant, content, ...rest) => JSON.stringify(content).includes('zz-kept-create')
+      ? atRelease.store(() => addMessage(participant, content, ...rest))
+      : addMessage(participant, content, ...rest);
+    if (atRelease.readThrows) internals.storedRow = () => { readsRefused++; throw new Error('zz-read-refused (test)'); };
+    console.error = () => {};
+    open!();
+    await within(move, 'the move');
+  } catch (error) {
+    open?.();
+    await cleanup().catch(() => {});
+    throw error;
+  } finally {
+    console.error = quiet;
+    fw.addMessage = addMessage;
+    internals.storedRow = storedRow;
+    if (initialize) strategy.initialize = initialize; else delete strategy.initialize;
+  }
+  return { framework, discord, module: internals, traces, processed, texts, cleanup, readsRefused: () => readsRefused };
+}
+
+const lostTraces = (traces: TraceEvent[]) =>
+  traces.filter((t) => t.type === 'message:lost') as Array<Extract<TraceEvent, { type: 'message:lost' }>>;
+
+test("a kept create whose release can't say it landed, though it did, applies the edit kept for it (bot review 2, #11)", async () => {
+  const s = await withLostRelease('u1', async ({ discord, processed }) => {
+    const edited = processed('discord:edit', 'u1');
+    discord.onEditHandler!('u1', 'after edit');
+    await edited;
+  }, {
+    store: (add) => {
+      const landed = add();
+      throw new WriteOutcomeUnknownError({ landed: [], unknown: [landed], unnamed: 0 }, new Error('zz-read-failed (test)'));
+    },
+  });
+  try {
+    assert.deepEqual(lostTraces(s.traces).map((t) => [t.external, t.mayBeStored]), [[{ source: 'discord', id: 'u1' }, true]],
+      'premise: the release traced the write as maybe stored');
+    assert.ok(!s.traces.some((t) => t.type === 'message:added' && t.source === 'surgery-release'), 'premise: no message:added for it');
+    assert.deepEqual(s.texts('u1'), ['after edit'], 'the edit kept for it is applied to the row that landed');
+    // The next Discord event's sweep ends the entry, leaving nothing unapplied.
+    const next = s.processed('discord:message', 'u2');
+    await s.discord.onMessageHandler!(live('u2', 'next message'));
+    await next;
+    assert.equal(s.module.creating.has('u1'), false);
+    assert.deepEqual(s.texts('u1'), ['after edit']);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+// AF #844 bot review 3, finding 15: where the lookup endLostCreate makes
+// throws, the entry stays with its edit unapplied; the next Discord event's
+// sweep applies it to the row it finds before it ends the entry.
+test("a kept create whose release can't say it landed, and whose read then throws, has its edit applied by the next event's sweep", async () => {
+  const s = await withLostRelease('w1', async ({ discord, processed }) => {
+    const edited = processed('discord:edit', 'w1');
+    discord.onEditHandler!('w1', 'after edit');
+    await edited;
+  }, {
+    store: (add) => {
+      const landed = add();
+      throw new WriteOutcomeUnknownError({ landed: [], unknown: [landed], unnamed: 0 }, new Error('zz-read-failed (test)'));
+    },
+    readThrows: true,
+  });
+  try {
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
+    assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
+    assert.deepEqual(s.texts('w1'), ['zz-kept-create'], 'premise: the row landed as created');
+    const next = s.processed('discord:message', 'w2');
+    await s.discord.onMessageHandler!(live('w2', 'next message'));
+    await next;
+    assert.equal(s.module.creating.has('w1'), false, 'the sweep ends the entry');
+    assert.deepEqual(s.texts('w1'), ['after edit'], 'having applied the edit kept for it');
+  } finally {
+    await s.cleanup();
+  }
+});
+
+// AF #844 bot review 4, finding 35: a lost create whose outcome is unknown
+// and whose lookup throws at the release is kept, flagged; the next event's
+// sweep that reads the store and finds no row ends it, as endLostCreate
+// does when it finds none, so a history sync then reaches the message.
+test("a kept create whose release can't say it landed, and whose read then throws, is ended by the next event's sweep that finds no row", async () => {
+  const s = await withLostRelease('x1', async () => {}, {
+    store: () => { throw new WriteOutcomeUnknownError({ landed: [], unknown: [], unnamed: 1 }, new Error('zz-store-unknown (test)')); },
+    readThrows: true,
+  });
+  try {
+    assert.deepEqual(lostTraces(s.traces).map((t) => [t.external, t.mayBeStored]), [[{ source: 'discord', id: 'x1' }, true]],
+      'premise: the release traced the write as maybe stored');
+    assert.deepEqual(s.texts('x1'), [], 'premise: no row landed');
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
+    assert.equal(s.module.creating.has('x1'), true, 'premise: kept, its read having thrown');
+    const next = s.processed('discord:message', 'x2');
+    await s.discord.onMessageHandler!(live('x2', 'next message'));
+    await next;
+    assert.equal(s.module.creating.has('x1'), false, 'the sweep reads no row for it, and ends its record');
+    s.discord.history = [history('x1', 'from the sync')];
+    const synced = await s.module.syncChannelHistory('c1');
+    assert.equal(synced.newMessages, 1);
+    assert.deepEqual(s.texts('x1'), ['from the sync']);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+// AF #844 bot review 4, finding 36: each answered create's lookup is its
+// own. One that throws at an event's sweep is logged and that entry kept
+// for the next event; the other entries are still applied and ended, and
+// the event goes on.
+test("a lookup that throws for one kept create at an event's sweep leaves the others to be applied and ended, and that one to the next event", async () => {
+  const s = await withLostRelease('w1', async ({ discord, processed }) => {
+    const edited = processed('discord:edit', 'w1');
+    discord.onEditHandler!('w1', 'after edit');
+    await edited;
+  }, {
+    store: (add) => {
+      const landed = add();
+      throw new WriteOutcomeUnknownError({ landed: [], unknown: [landed], unnamed: 0 }, new Error('zz-read-failed (test)'));
+    },
+    readThrows: true,
+  });
+  const quiet = console.error;
+  try {
+    assert.ok(s.readsRefused() >= 1, "premise: the release's lookup of the row threw");
+    assert.ok(s.module.creating.get('w1')?.unapplied, 'premise: the entry is kept, its edit unapplied');
+    // A second answered create whose row is stored, with an edit kept for it.
+    s.framework.getAgent('Sol')!.getContextManager().addMessage('User', [{ type: 'text', text: 'k9 as created' }],
+      { external: { source: 'discord', id: 'k9' } } as never);
+    (s.module.creating as Map<string, unknown>).set('k9', { phase: 'writing', deleted: false, unapplied: [{ text: 'k9 edited' }] });
+    const storedRow = s.module.storedRow.bind(s.module);
+    let refuseOnce = true;
+    s.module.storedRow = (id: string) => {
+      if (id === 'w1' && refuseOnce) { refuseOnce = false; throw new Error('zz-read-refused (test)'); }
+      return storedRow(id);
+    };
+    console.error = () => {};
+    const next = s.processed('discord:message', 'w2');
+    await s.discord.onMessageHandler!(live('w2', 'next message'));
+    await next;
+    assert.deepEqual(s.texts('k9'), ['k9 edited'], "the other entry's edit is applied");
+    assert.equal(s.module.creating.has('k9'), false, 'and its entry ended');
+    assert.ok(s.module.creating.get('w1')?.unapplied, 'the entry whose lookup threw is kept, its edit unapplied');
+    assert.deepEqual(s.texts('w2'), ['next message'], 'the event went on');
+    const after = s.processed('discord:message', 'w3');
+    await s.discord.onMessageHandler!(live('w3', 'another message'));
+    await after;
+    assert.deepEqual(s.texts('w1'), ['after edit'], "the next event's sweep applies it");
+    assert.equal(s.module.creating.has('w1'), false);
+  } finally {
+    console.error = quiet;
+    await s.cleanup();
+  }
+});
+
+// AF #844 bot review 5, finding 45: an edit kept for an answered create
+// waits for a sweep that finds the row; one whose lookup throws leaves it
+// for the next event. An edit of the same message that comes meanwhile goes
+// behind the kept ones, so the next sweep applies them in the order they
+// were made and the row ends with the newest text.
+test("an edit that comes while edits kept for its message wait for a sweep goes behind them, so the row ends with the newest text", async () => {
+  const s = await withLostRelease('w1', async () => {}, { store: (add) => add() });
+  const quiet = console.error;
+  try {
+    s.framework.getAgent('Sol')!.getContextManager().addMessage('User', [{ type: 'text', text: 'k9 as created' }],
+      { external: { source: 'discord', id: 'k9' } } as never);
+    (s.module.creating as Map<string, unknown>).set('k9', { phase: 'writing', deleted: false, unapplied: [{ text: 'k9 older edit' }] });
+    const storedRow = s.module.storedRow.bind(s.module);
+    let refuseOnce = true;
+    s.module.storedRow = (id: string) => {
+      if (id === 'k9' && refuseOnce) { refuseOnce = false; throw new Error('zz-read-refused (test)'); }
+      return storedRow(id);
+    };
+    console.error = () => {};
+    const edited = s.processed('discord:edit', 'k9');
+    s.discord.onEditHandler!('k9', 'k9 newer edit');
+    await edited;
+    assert.equal(refuseOnce, false, "setup: the edit's sweep couldn't read k9's row, so the older edit waits");
+    const next = s.processed('discord:message', 'w3');
+    await s.discord.onMessageHandler!(live('w3', 'another message'));
+    await next;
+    assert.deepEqual(s.texts('k9'), ['k9 newer edit'], 'the newer edit is applied after the older one');
+    assert.equal(s.module.creating.has('k9'), false, 'and the entry ended');
+  } finally {
+    console.error = quiet;
+    await s.cleanup();
+  }
+});
+
+test("a kept create lost at its release ends its record with no store read, so a read that throws then doesn't keep it (bot review 2, #12)", async () => {
+  const s = await withLostRelease('d1', async () => {}, {
+    store: () => { throw new Error('zz-store-refused (test)'); },
+    readThrows: true,
+  });
+  try {
+    assert.deepEqual(lostTraces(s.traces).map((t) => [t.external, t.mayBeStored]), [[{ source: 'discord', id: 'd1' }, undefined]],
+      'premise: a definite loss');
+    assert.deepEqual(s.texts('d1'), [], 'premise: no row landed');
+    assert.equal(s.module.creating.has('d1'), false, 'the record of the create ends');
+    assert.equal(s.readsRefused(), 0, 'with no store read');
+    // A history sync now stores the message, which it would pass over while the record stayed.
+    s.discord.history = [history('d1', 'from the sync')];
+    const synced = await s.module.syncChannelHistory('c1');
+    assert.equal(synced.newMessages, 1);
+    assert.deepEqual(s.texts('d1'), ['from the sync']);
+  } finally {
+    await s.cleanup();
+  }
 });

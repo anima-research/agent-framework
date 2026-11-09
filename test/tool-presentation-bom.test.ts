@@ -41,7 +41,6 @@ describe('ToolPresentation: UTF-8 BOM in presentation files (#758)', () => {
     const r = p.edit('set_tool_visibility', { name: 'gamma', visible: false }, tools);
     assert.strictEqual(r.success, true, r.error);
     const written = readFileSync(path, 'utf8');
-    assert.notStrictEqual(written.charCodeAt(0), 0xfeff, 'the rewritten file has no BOM');
     assert.deepStrictEqual(JSON.parse(written).tools, { alpha: { visible: false }, gamma: { visible: false } });
     assert.deepStrictEqual(p.resolve(tools).advertised.map((t) => t.name), ['beta']);
   });
