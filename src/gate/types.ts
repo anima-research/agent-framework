@@ -514,8 +514,9 @@ export interface GateEventInfo {
    *  trigger that read the slot its messages land in and whose view shows a
    *  message it stores, where it stores any. A resident's view leaves out a
    *  message held from the residents and a subconscious's keeps it, so a
-   *  response storing held messages alone names its subconscious, not its
-   *  residents, and the framework wakes no named agent its view shuts out.
+   *  response storing held messages alone names, of the agents it asks for,
+   *  a subconscious and not a resident, and the framework wakes no named
+   *  agent its view shuts out.
    *  - Untargeted (absent): shown to every agent getAgentNames lists, and
    *    wakes them. A batch of untargeted events alone stores its line as a
    *    write that names no agent.
