@@ -171,13 +171,13 @@ async function waitForStoredToolResult(
   return null;
 }
 
-/** Effective-cap provenance through the framework's own settings extension. */
 function keptChars(stored: string, after = /(?:)/): number {
   const at = new RegExp(`chars (\\d+) to (\\d+) of (\\d+) elided here${after.source}`).exec(stored);
   assert.ok(at, `a marker naming what it elides: ${stored.slice(0, 120)} … ${stored.slice(-300)}`);
   return Number(at[1]) + Number(at[3]) - Number(at[2]);
 }
 
+/** Effective-cap provenance through the framework's own settings extension. */
 function capProvenance(framework: AgentFramework): Record<string, unknown> {
   const extensions = (framework as unknown as {
     collectAgentSettingsExtensions(): Map<string, { get(agentName: string): Record<string, unknown> }>;

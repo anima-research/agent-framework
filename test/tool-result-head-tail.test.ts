@@ -156,6 +156,8 @@ describe('an over-long tool result keeps head and tail', () => {
       const input = JSON.parse(command[1]!) as { path: string; offsetChars: number; limitChars: number };
       assert.equal(input.path, path);
       assert.equal(input.offsetChars, h, 'the read starts where the head ends');
+      const until = Number(/until it is null or at least (\d+)/.exec(stored)?.[1]);
+      assert.equal(until, e, 'the read stops where the marker says the middle ends');
       let read = '';
       for (let page = 0; ; page++) {
         const result = await turn.framework.executeToolCall({ id: `page-${page}`, name: 'workspace--read', input, callerAgentName: 'prime' });
@@ -163,7 +165,7 @@ describe('an over-long tool result keeps head and tail', () => {
         const got = result.structured as { content: string; offsetChars: number; nextOffsetChars: number | null };
         assert.equal(got.offsetChars, h + read.length);
         read += got.content;
-        if (got.nextOffsetChars === null || got.nextOffsetChars >= e) break;
+        if (got.nextOffsetChars === null || got.nextOffsetChars >= until) break;
         input.offsetChars = got.nextOffsetChars;
         assert.ok(page < 100, 'paging ends');
       }
@@ -225,7 +227,7 @@ describe('an over-long tool result keeps head and tail', () => {
   });
 
   it('under a reader\'s bound keeps both ends, the copy within the bound', async () => {
-    const body = lines(400);
+    const body = lines(400).replaceAll('\n', ' ');
     const turn = await startTurn({ result: { success: true, data: body }, withWorkspace: true, bounded: true });
     try {
       const stored = await storedResult(turn.framework);
@@ -238,7 +240,7 @@ describe('an over-long tool result keeps head and tail', () => {
       assert.ok(stored.length <= bound, `stored ${stored.length} of a bound of ${bound}`);
       const { h, e, m } = headMarkerTail(stored, body);
       assert.ok(h + (m - e) <= bound - TOOL_RESULT_NOTICE_ROOM, `kept ${h + m - e}`);
-      assert.ok(h > m - e, `head ${h} tail ${m - e}: 60/40`);
+      assert.equal(h, Math.max(1, Math.floor((h + m - e) * 0.6)), `head ${h} tail ${m - e}: 60/40 of what it keeps`);
     } finally {
       await stop(turn);
     }

@@ -18,11 +18,12 @@
  * Second review round (#140) added three more representations of the same
  * failure, each pinned below:
  *   6. truncation/spill keeps the image slots the resident saw, and keeps
- *      none they didn't see: a result carrying images keeps past its cut
- *      the image slots its live copy showed, the newest 64 of them that fit
- *      the readers' bound, saying how many it left out; a text result,
- *      whose live copy is its stored text, keeps none past the cut; and no
- *      cut ends in part of a slot (#403).
+ *      none they didn't see: a cut keeps its head and its tail with the
+ *      slots in them, and a result carrying images keeps from its elided
+ *      middle the image slots its live copy showed, the newest 64 of them
+ *      that fit the readers' bound, saying how many it left out; a text
+ *      result, whose live copy is its stored text, keeps none from its
+ *      elided middle; and no cut ends in part of a slot (#403).
  *   7. a save dispatched in the same batch as the snapshot waits for it.
  *   8. refs are namespaced per ledger — a stale ref resolves to nothing,
  *      and a direct `ref` is saved through its occurrence in context.
