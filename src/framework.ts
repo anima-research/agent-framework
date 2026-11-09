@@ -23685,15 +23685,16 @@ export class AgentFramework {
    *  heartbeat's turn with no locus of its own (InferenceRequest.heartbeatTurn)
    *  and a private turn (InferenceRequest.privateCaller), so the turn it opens
    *  is one too; nothing for any other turn. */
-  private heartbeatTurnMark(routing: TurnRouting): { heartbeatTurn?: true; privateCaller?: true } {
+  private turnMarks(routing: TurnRouting): { heartbeatTurn?: true; privateCaller?: true } {
     const privateCaller = routing.private ? { privateCaller: true as const } : {};
     // A locked turn's locus is its lock, not a channel the heartbeat answered.
     return routing.heartbeat && (!routing.locus || routing.locked) ? { heartbeatTurn: true, ...privateCaller } : privateCaller;
   }
 
-  private opensPrivate(agent: Agent, trigger: InferenceRequest | undefined): boolean {
-    return trigger?.privateCaller === true
-      || privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata)) !== undefined;
+  private privateOpening(agent: Agent, trigger: InferenceRequest | undefined): { surface?: string } | undefined {
+    const surface = privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata));
+    if (surface !== undefined) return { surface };
+    return trigger?.privateCaller === true ? {} : undefined;
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
@@ -24251,20 +24252,6 @@ export class AgentFramework {
           : `Your plain speech ${this.proseLockShown(locus, agentName, true)}, on this turn's later rounds and on later turns, until you change it.`,
       },
     };
-  }
-
-  /**
-   * The channel a private turn's open would have resolved were it public.
-   * Unsetting the flag for one call is safe because resolveLocus is
-   * synchronous and reads privacy only through turnRouting.
-   */
-  private publicLocusAtOpen(agentName: string, routing: TurnRouting): ChannelRef | null {
-    delete routing.private;
-    try {
-      return this.channelRegistry?.resolveLocus(agentName) ?? null;
-    } finally {
-      routing.private = true;
-    }
   }
 
   /**
@@ -25781,7 +25768,7 @@ export class AgentFramework {
       reason: 'prose-continuation',
       source: 'framework',
       timestamp: Date.now(),
-      ...this.heartbeatTurnMark(routing),
+      ...this.turnMarks(routing),
     });
   }
 
@@ -25877,7 +25864,7 @@ export class AgentFramework {
       timestamp: Date.now(),
       ...channel,
       autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
-      ...this.heartbeatTurnMark(routing),
+      ...this.turnMarks(routing),
     });
   }
 
@@ -26727,7 +26714,7 @@ export class AgentFramework {
         reason: 'prose-bounce',
         source: 'framework',
         timestamp: Date.now(),
-        ...this.heartbeatTurnMark(round.routing),
+        ...this.turnMarks(round.routing),
       });
     }
   }
@@ -27453,7 +27440,7 @@ export class AgentFramework {
       const mark = trigger.autoContinueRun;
       const { autoContinueRun: _mark, ...unmarked } = trigger;
       trigger = unmarked;
-      if (!this.writeAutoContinueNotice(agent, mark, trigger.heartbeatTurn === true, this.opensPrivate(agent, trigger))) {
+      if (!this.writeAutoContinueNotice(agent, mark, trigger.heartbeatTurn === true, this.privateOpening(agent, trigger) !== undefined)) {
         this.giveBackAutoContinue(agent.name, 'its row could not be stored');
         if (mark.sole) {
           console.error(`[continue] ${agent.name}: turn not started (the continuation was its only cause)`);
@@ -27523,6 +27510,8 @@ export class AgentFramework {
     // queued still reads and writes its own.
     let routing: TurnRouting;
     let opensTurn = false;
+    let privateOpen = false;
+    let opening: { surface?: string } | undefined;
     if (resumesTurn) {
       routing = this.routingOf(agent.name);
       if (!trigger?.suppressProse && !this.openLogical.has(agent.name)) this.openLogical.set(agent.name, routing);
@@ -27532,7 +27521,7 @@ export class AgentFramework {
       routing.silent = true;
       if (continued?.roundsRan) routing.roundsRan = true;
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
-      if (continued?.private) routing.private = true;
+      if (continued?.private) privateOpen = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -27556,7 +27545,8 @@ export class AgentFramework {
     this.turnRouting.set(agent.name, routing);
     if (opensTurn) {
       carry = undefined;
-      if (this.opensPrivate(agent, trigger)) routing.private = true;
+      opening = this.privateOpening(agent, trigger);
+      if (opening) privateOpen = true;
     } else if (!routing.private) {
       const surface = this.presents(agent)
         ? presented.map((row) => operatorSurface(row.metadata)).find((name) => name !== undefined)
@@ -27636,19 +27626,17 @@ export class AgentFramework {
         // tells servers and gives a send with no channel is its lock or
         // nothing, never the channel that woke it or a fallback.
         routing.locked = true;
-        const locus = routing.private ? null : this.proseLockLocus(agent);
+        const locus = privateOpen ? null : this.proseLockLocus(agent);
         if (locus !== null) routing.locus = locus;
-      } else if (routing.private) {
+      } else if (privateOpen) {
         if (turnProseRouting === 'locked') routing.locked = true;
         if (attempt === 0 && turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
           // Where a public turn's open would have a channel to speak in, or a heartbeat's drafts, a private turn's
           // says its plain speech goes to no channel.
           const heartbeat = turnProseRouting !== 'locked' && routing.heartbeat === true;
-          const lost = turnProseRouting === 'locked' ? this.proseLockLocus(agent) : heartbeat ? null : this.publicLocusAtOpen(agent.name, routing);
+          const lost = turnProseRouting === 'locked' ? this.proseLockLocus(agent) : heartbeat ? null : (this.channelRegistry?.resolveLocus(agent.name) ?? null);
           const tells = heartbeat ? !continuesHeartbeat : lost !== null;
-          const surface = tells
-            ? privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata))
-            : undefined;
+          const surface = tells ? opening?.surface : undefined;
           if (surface !== undefined) this.makeTurnPrivate(agent, routing, surface);
           else this.announceLocusIfChanged(agent.name, null, false, tells);
         }
@@ -27683,6 +27671,7 @@ export class AgentFramework {
           this.announceLocusIfChanged(agent.name, locus);
         }
       }
+      if (privateOpen) routing.private = true;
     } else {
       // Every other start of the turn keeps its locus: a resume, or a start
       // that continues the open turn. A message no tool boundary of the turn
