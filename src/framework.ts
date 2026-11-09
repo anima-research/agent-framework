@@ -1295,13 +1295,26 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
+/**
+ * The rows a batched wake is for (WakeProvenance.writes), on the wake of
+ * every agent the batch wakes: a fresh start of the turn it starts writes one
+ * `[Gate: …]` line naming those of them in the agent's window, as its own
+ * row, where a row a reply could be meant for follows them there
+ * (placeBatchLine). Internal: a mark the framework's own gate wiring sets,
+ * exported for tests.
+ */
+export const BATCH_ROWS: unique symbol = Symbol('batch-rows');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
 interface TurnCarry {
   silence: TurnSilence | null;
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [BATCH_ROWS]?: string[] };
+
+function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
+  return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
+}
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
@@ -4124,6 +4137,20 @@ function readsRowsKey(request: InferenceRequest | undefined): string {
   return JSON.stringify(request?.readsRows ?? null);
 }
 
+function batchRowsKey(request: InferenceRequest | undefined): string {
+  return JSON.stringify(batchRowsOf(request) ?? null);
+}
+
+/** A batched wake's line, as `main`'s gate wrote it (referenceLine): how many
+ *  of the wake's messages in one channel, and how long ago the oldest
+ *  arrived, as of `now`. */
+function batchReferenceLine(count: number, channel: string, oldest: number, now: number): string {
+  const age = Math.round((now - oldest) / 1000);
+  return `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
+    `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
+    `batched wake, not new content`;
+}
+
 function wakeChannelsOf(requests: readonly ({ wakeChannels?: ChannelRef[] } | undefined)[]): ChannelRef[] | undefined {
   const channels: ChannelRef[] = [];
   for (const channel of requests.flatMap((r) => r?.wakeChannels ?? [])) {
@@ -4685,6 +4712,8 @@ export class AgentFramework {
    *  where the liveness watchdog starts, or would if it isn't enabled, and
    *  leaves in stop() where the watchdog stops. */
   private static readonly diagnosed = new Set<AgentFramework>();
+  /** How many of a window's newest rows batchIsNewest reads. */
+  private static readonly NEWEST_SCAN_ROWS = 32;
   private static diagnosticsListenerInstalled = false;
 
   // MCPL subsystems (null when no mcplServers configured)
@@ -4808,6 +4837,14 @@ export class AgentFramework {
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
+  /** The batched wakes' rows (BATCH_ROWS) whose line a start
+   *  has written, and the agents each was written for (placeBatchLine), so
+   *  every later start of the wake writes it at most once per agent: every
+   *  copy of a wake's request carries the same array. A merge's union keeps
+   *  the arrays it was made from (batchRowsParts), so placing it places
+   *  them. */
+  private readonly placedBatchRows = new WeakMap<readonly string[], Set<string>>();
+  private readonly batchRowsParts = new WeakMap<readonly string[], ReadonlyArray<readonly string[]>>();
   /** Rounds of tool calls, by their results array, that a save_recent_image
    *  in the round counted by their share of the bound: such a round is
    *  stored by its share whether or not it fits (buildStoredToolResultContent). */
@@ -5586,6 +5623,12 @@ export class AgentFramework {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             ...(provenance?.writes ? framework.readsRowsFor(provenance.writes, agentName) : framework.readsRowFor(after, agentName)),
+            // The rows the batch is for, on every agent's wake: each one's
+            // start decides its own line by its own window (placeBatchLine).
+            ...((): Partial<MarkedRequest> => {
+              const rows = (provenance?.writes ?? []).flatMap(({ after: placed }) => (placed.messageId ? [placed.messageId] : []));
+              return rows.length > 0 ? { [BATCH_ROWS]: rows } : {};
+            })(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
             // as TELEMETRY fields — the host's stamp reads them.
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
@@ -7099,7 +7142,7 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b);
+      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b);
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
@@ -22237,6 +22280,11 @@ export class AgentFramework {
           const pair = prev ? [prev, request] : undefined;
           const channels = pair ? wakeChannelsOf(pair) : undefined;
           if (channels) kept.wakeChannels = channels;
+          if (pair) {
+            const rows = this.mergedBatchRows(kept.agentName, pair);
+            if (rows) (kept as MarkedRequest)[BATCH_ROWS] = rows;
+            else delete (kept as MarkedRequest)[BATCH_ROWS];
+          }
           newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
@@ -22494,7 +22542,7 @@ export class AgentFramework {
       // exists only once assembly renders it. Recorded for the whole batch
       // (not inherited from requests[0]), so a requeued trigger stays honest.
       const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
-      const merged: InferenceRequest = {
+      const merged: MarkedRequest = {
         ...trigger,
         coalescingBatch: batchOnly || undefined,
         coalescingBatchSubjects: batchOnly
@@ -22513,6 +22561,9 @@ export class AgentFramework {
           ? trigger?.readsRow : undefined,
         readsRows: requests.every((r) => readsRowsKey(r) === readsRowsKey(trigger))
           ? trigger?.readsRows : undefined,
+        // A batched wake's line names the rows of every batch the turn is
+        // for, and none where a wake that isn't a batch's is merged in.
+        [BATCH_ROWS]: trigger ? this.mergedBatchRows(trigger.agentName, requests) : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         // A heartbeat's turn when any cause is a heartbeat's wake and none
@@ -27304,6 +27355,13 @@ export class AgentFramework {
     // vector 25). Not while quiesced, when others' rows are frozen. One that
     // fails throws, and fails the start, as the turn start's does.
     if (assembled && !this.quiesced && this.presents(agent)) this.presentation!.presentAtStart(agent, 'assembly');
+
+    // A batched wake's line, decided now that the turn's inputs are in and
+    // before its own notices and checkpoint (placeBatchLine). Fresh starts
+    // only: a retry re-sends the same turn, and what follows the wake's
+    // messages by then is mostly the first attempt's own notices or rounds.
+    const batchRows = batchRowsOf(trigger);
+    if (batchRows && attempt === 0 && !resumesTurn) this.placeBatchLine(agent, batchRows);
 
     // An autoContinue continuation's `[continue]` row, written here: the
     // turn has passed every gate that could still stop it (a stopping
@@ -34257,6 +34315,133 @@ export class AgentFramework {
       rows.push({ row, ...(replyTo ? { replyTo } : {}) });
     }
     return rows.length > 0 ? { readsRows: rows } : {};
+  }
+
+  /**
+   * The batched wake's rows (BATCH_ROWS) a turn merging `requests` for
+   * `agentName` is for: the union of every request's, leaving out those
+   * whose line a start already wrote for the agent, or none when a request
+   * carries none (a wake that isn't a batch's), since the line would name
+   * only some of the turn's causes. One open array is kept as it is, so its
+   * identity places it; a union records the arrays it was made from.
+   */
+  private mergedBatchRows(agentName: string, requests: readonly InferenceRequest[]): string[] | undefined {
+    const each = requests.map(batchRowsOf);
+    if (each.length === 0 || !each.every((rows) => rows !== undefined)) return undefined;
+    const arrays = [...new Set(each as string[][])];
+    const open = arrays.filter((rows) => !this.batchRowsPlaced(rows, agentName));
+    if (open.length <= 1) return open[0] ?? arrays[0];
+    const union = [...new Set(open.flat())];
+    this.batchRowsParts.set(union, open);
+    return union;
+  }
+
+  private batchRowsPlaced(rows: readonly string[], agentName: string): boolean {
+    return this.placedBatchRows.get(rows)?.has(agentName) === true;
+  }
+
+  private markBatchRowsPlaced(rows: readonly string[], agentName: string): void {
+    for (const placed of [rows, ...(this.batchRowsParts.get(rows) ?? [])]) {
+      const agents = this.placedBatchRows.get(placed) ?? new Set<string>();
+      agents.add(agentName);
+      this.placedBatchRows.set(placed, agents);
+    }
+  }
+
+  /**
+   * Write a batched wake's line into the starting agent's own window, as its
+   * own row, where a row a reply could be meant for follows the wake's rows
+   * there (batchIsNewest): one line naming those of the rows its window
+   * holds, by count and channel, as `main`'s gate named messages already
+   * shown. Called by a fresh start that doesn't resume a logical turn, after
+   * the turn's own inputs and before its own notices (the locus notice among
+   * them), so a line lands after whatever entered the window since the batch
+   * was delivered and before the agent's answer.
+   *
+   * - Each agent the batch woke decides its own line by its own window; for
+   *   an agent whose window isn't presented, only the delivery agent's start
+   *   writes the slot's one line.
+   * - None is written while the host is quiesced, as for a clock row, nor
+   *   where the rows are the newest; either way the line stays undecided, for
+   *   a later fresh start of the same wake (a provider hold's release).
+   * - Once written for the agent, by the rows' identity, no later start of
+   *   the wake writes it again. A write that fails doesn't fail the start: the
+   *   line stays undecided; one that landed though it threw counts as written.
+   */
+  private placeBatchLine(agent: Agent, rows: readonly string[]): void {
+    const slot = this.deliveryAgent();
+    if (!slot || (agent !== slot && !this.presents(agent))) return;
+    if (this.quiesced || this.batchRowsPlaced(rows, agent.name)) return;
+    const cm = agent.getContextManager();
+    const held = rows
+      .filter((id) => this.windowHolds(agent, id))
+      .map((id) => cm.getMessage(id as MessageId))
+      .filter((m): m is StoredMessage => m != null
+        && (m.metadata as { source?: unknown } | undefined)?.source !== 'gate:debounce');
+    if (held.length === 0 || this.batchIsNewest(agent, rows)) return;
+    const now = Date.now();
+    const byChannel = new Map<string, { name: string; count: number; oldest: number }>();
+    for (const m of held) {
+      const md = (m.metadata ?? {}) as { serverId?: unknown; channelId?: unknown };
+      const serverId = typeof md.serverId === 'string' ? md.serverId : undefined;
+      const channelId = typeof md.channelId === 'string' && md.channelId !== '' ? md.channelId : undefined;
+      const name = channelId === undefined ? '(unknown channel)'
+        : serverId !== undefined ? this.channelShown({ serverId, channelId }) : suppliedValue(channelId);
+      const at = m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp);
+      const key = JSON.stringify([serverId ?? null, channelId ?? null]);
+      const entry = byChannel.get(key) ?? { name, count: 0, oldest: Number.isFinite(at) ? at : now };
+      entry.count += 1;
+      if (Number.isFinite(at)) entry.oldest = Math.min(entry.oldest, at);
+      byChannel.set(key, entry);
+    }
+    const lines = [...byChannel.values()].map(({ name, count, oldest }) => batchReferenceLine(count, name, oldest, now));
+    const text = `[${NOTICE_TAG.gate}: ${held.length} event${held.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    const metadata = { source: 'gate:debounce' } as MessageMetadata;
+    const before = this.storedCountOf(agent);
+    let id: MessageId;
+    try {
+      id = storeOwnRow(agent, 'user', [{ type: 'text', text }], metadata);
+    } catch (err) {
+      const landed = before === undefined ? undefined
+        : this.storedSince(agent, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', "a batched wake's line");
+      if (!landed || landed.length === 0) {
+        console.error(`[gate] ${agent.name}: a batched wake's line could not be written${landed ? '' : ' (whether it landed is unknown)'}:`, err);
+        return;
+      }
+      console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
+      id = landed[0]!.id;
+      agent.ownRowsStored([id]);
+    }
+    this.markBatchRowsPlaced(rows, agent.name);
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
+  }
+
+  /** Whether the newest row of `agent`'s window a reply could be meant for
+   *  is one of `rows`, as the start's request will hold it: clock rows and
+   *  stored context injections aside. Past NEWEST_SCAN_ROWS rows, it answers
+   *  no. A presented window is the request's own: the start has presented
+   *  what arrived (an observed co-resident's round among it), and what
+   *  arrives from here waits for the next request. A window still in legacy
+   *  mode (its write-down failed) is the slot's record, read from its newest
+   *  row, through the agent's view (agentSees). */
+  private batchIsNewest(agent: Agent, rows: readonly string[]): boolean {
+    const cm = agent.getContextManager();
+    const presented = cm.windowMode() === 'presented';
+    const tail = presented
+      ? cm.getPresentedMessages().slice(-AgentFramework.NEWEST_SCAN_ROWS).reverse()
+      : cm.queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages;
+    const newest = tail.find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND
+      && !storedInjectionMarkOf(m.metadata) && (presented || this.agentSees(agent, m.metadata)));
+    return newest !== undefined && rows.includes(newest.id);
+  }
+
+  /** Whether the start's request holds row `id`: in a presented window, or
+   *  for a window still in legacy mode, stored and seen by the agent's view. */
+  private windowHolds(agent: Agent, id: string): boolean {
+    const cm = agent.getContextManager();
+    if (cm.windowMode() === 'presented') return cm.windowStatusOf(id as MessageId) === 'in';
+    const row = cm.getMessage(id as MessageId);
+    return row != null && this.agentSees(agent, row.metadata);
   }
 
   private answeredWrite(after: WritePlacement): boolean {

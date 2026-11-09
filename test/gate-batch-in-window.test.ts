@@ -92,7 +92,7 @@ describe('a batched wake writes no gate line for events already in the window', 
     } finally { await f.close(); }
   });
 
-  it('one message with another stored after it before the batch fires: the first request holds both, and no gate line', async () => {
+  it('one message with another stored after it before the batch fires: the first request holds both, and a line naming the first', async () => {
     const f = await fixture({
       agents: [resident('scout')],
       framework: { gate: { config: { policies: [addressedOnly], default: 'skip' }, onboarding: false } },
@@ -111,7 +111,12 @@ describe('a batched wake writes no gate line for events already in the window', 
       assert.ok(first, 'premise: the batch woke scout');
       assert.ok(requestText(first).includes('the question') && requestText(first).includes('chatter after it'),
         'premise: the first request holds both messages');
-      assert.ok(!requestText(first).includes('[Gate:'), 'the first request holds no gate line');
+      const texts = (first!.messages as Array<{ content: Array<{ type: string; text?: string }> }>)
+        .map((m) => m.content.map((c) => c.text ?? '').join(''));
+      const lines = texts.filter((t) => t.startsWith('[Gate:'));
+      assert.equal(lines.length, 1, 'one line, at the start: something follows the batch\'s message');
+      assert.match(lines[0]!, /^\[Gate: 1 event matched\]\n\n- 1 message in work \(oldest ~\d+s ago\) — already shown above at arrival; this is a batched wake, not new content$/);
+      assert.ok(texts.indexOf(lines[0]!) > texts.findIndex((t) => t.includes('chatter after it')), 'after the later message');
     } finally { await f.close(); }
   });
 
