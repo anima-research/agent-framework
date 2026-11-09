@@ -15,10 +15,11 @@
   membrane 0.9.0 to 0.10.1, with the changes membrane's changelog for
   0.10.0 and 0.10.1 lists. context-manager's changelog for 0.26.0 and 0.27.0
   lists its changes. The framework opens every agent's context manager
-  with its own copy, and one of them changes what it does today: where a
-  later tool call reuses an earlier call's id, `stripUnpairedToolBlocks`,
-  which the framework runs on a fork's seed, now pairs each result with
-  the nearest call before it with that id, so it can drop a call or result
-  it kept. 0.26.0's request limit and 0.27.0's checks on a system change
-  carrying `effort` apply only where a caller passes `requestLimitTokens`
-  or writes `effort`, which the framework doesn't yet.
+  with its own copy, and one of context-manager's changes alters what that
+  copy does today: where a later tool call reuses an earlier call's id,
+  `stripUnpairedToolBlocks`, which the framework runs on a fork's seed,
+  now pairs each result with the nearest call before it with that id, so
+  it can drop a call or result it kept. 0.26.0's request limit and
+  0.27.0's checks on a system change carrying `effort` apply only where a
+  caller passes `requestLimitTokens` or writes `effort`, and the framework
+  itself does neither.
