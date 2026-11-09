@@ -47,8 +47,9 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
 function batchedWakeRig(opts: {
   speech?: { locus: 'delivery' | 'latest-inbound' };
   proseRouting?: 'locus' | 'hybrid';
+  unpromptedChannel?: string;
 } = {}) {
-  const { speech, proseRouting } = opts;
+  const { speech, proseRouting, unpromptedChannel } = opts;
   let tempDir: string;
   let statusPath: string;
   let commandPath: string;
@@ -67,6 +68,7 @@ function batchedWakeRig(opts: {
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', ...(proseRouting ? { proseRouting } : {}) }],
       ...(speech ? { speech } : {}),
+      ...(unpromptedChannel ? { unpromptedChannel } : {}),
       gate: {
         config: {
           policies: [{
@@ -358,6 +360,43 @@ describe("batched wake routing with proseRouting 'hybrid'", () => {
     assertNamesBatchChannels(notices[0]!, ['room'], 'still thinking'.length);
   });
 });
+
+for (const locus of ['delivery', 'latest-inbound'] as const) {
+  describe(`an ambient-only batch with unpromptedChannel set, under speech.locus '${locus}'`, () => {
+    const rig = batchedWakeRig({ speech: { locus }, unpromptedChannel: ROOM });
+    const { incoming, sent, publishes, holdBatches } = rig;
+    const expected = locus === 'latest-inbound' ? [GENERAL] : [];
+
+    const settled = async (): Promise<void> => {
+      await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
+      await rig.framework().runUntilIdle();
+      const texts = (): string[] => rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+      await waitFor(
+        () => publishes().length > 0 || texts().some((t) => t.startsWith('[send-undeliverable]')),
+        'the reply was routed: published, or found no channel',
+      );
+    };
+
+    it('chatter in one channel: the reply goes where it would without the setting, not to the unprompted channel', async () => {
+      rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+      incoming(GENERAL, 'ambient', 'anyone know how to fix this?');
+      await settled();
+      assert.deepEqual(publishes(), expected);
+    });
+
+    it('chatter in two channels, in one batch: the same', async () => {
+      const held = holdBatches();
+      rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+      incoming(ROOM, 'ambient', 'first');
+      await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+      await waitFor(() => held() >= 1, "the first message's batch held past its window");
+      incoming(GENERAL, 'ambient', 'second');
+      await settled();
+      assert.deepEqual(publishes(), expected);
+    });
+  });
+}
 
 describe('batched wake routing with conversation forks', () => {
   let tempDir: string;

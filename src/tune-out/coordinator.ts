@@ -1481,7 +1481,7 @@ export class TuneOutCoordinator {
   private anchorSubconscious(occasion: 'enter' | 'resume' = 'enter'): void {
     const active = this.activeStarts();
     if (active.length === 0) return;
-    const sequence = Math.min(...active.map((e) => e.sequence));
+    const sequence = active.reduce((min, e) => Math.min(min, e.sequence), Infinity);
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
     const kept = this.ordinalsKept();
     const read = kept ? this.readWindowState() : { starts: {} };
@@ -5181,7 +5181,7 @@ export class TuneOutCoordinator {
     if (trigger === 'cadence' && backlog.length === 0) return false;
     // The cursor only moves forward: a returned row handed again can be
     // behind it.
-    const cursor = Math.max(this.readerCursor.get(key) ?? -1, ...backlog.map((m) => m.sequence));
+    const cursor = backlog.reduce((max, m) => Math.max(max, m.sequence), this.readerCursor.get(key) ?? -1);
     if (backlog.length > 0) this.readerCursor.set(key, cursor);
     const returned = this.readerReturned.get(key);
     if (returned) {
