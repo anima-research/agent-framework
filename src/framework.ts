@@ -7739,16 +7739,20 @@ export class AgentFramework {
     return hold !== undefined && continuesTurn(hold.turn);
   }
 
-  private dropHeldContinuation(agentName: string, why: string): void {
-    const hold = this.budgetHolds?.get(agentName);
-    if (!hold || !continuesTurn(hold.turn)) return;
-    this.dropHeldTurn(agentName, hold, why);
+  private dropHeldTurn(agentName: string, hold: BudgetHold, why: string): void {
+    this.endDetachedHold(agentName, this.detachBudgetHold(agentName, hold), why);
   }
 
-  private dropHeldTurn(agentName: string, hold: BudgetHold, why: string): void {
+  /** Take `hold` out of its agent's wait, with no trace yet. */
+  private detachBudgetHold(agentName: string, hold: BudgetHold): BudgetHold {
     this.budgetHolds.delete(agentName);
     clearInterval(hold.recheck);
     hold.recheck = undefined;
+    return hold;
+  }
+
+  /** End a turn detachBudgetHold took out of its wait: its wakes back in the queue, then its end traced. */
+  private endDetachedHold(agentName: string, hold: BudgetHold, why: string): void {
     this.pendingRequests.push(...hold.wakes);
     hold.wakes = [];
     try {
@@ -16281,13 +16285,31 @@ export class AgentFramework {
     toBranch?: string;
     window?: { retracted: number; represented: number };
   } {
+    // A turn under way that waits for compression stands on what the undo
+    // takes out. It leaves its wait first, so the undo finds the agent idle,
+    // and it ends once the undo has kept its record, so a listener of its
+    // end finds the undo done.
+    const held = this.budgetHolds?.get(agent.name);
+    const taken = held && continuesTurn(held.turn) && !this.hasTurn(agent.name) && !this.turnAlive(agent)
+      ? this.detachBudgetHold(agent.name, held) : undefined;
+    try {
+      return this.undoTurnOnWindow(agent, requester);
+    } finally {
+      if (taken) this.endDetachedHold(agent.name, taken, 'an undo took out what its held turn stood on');
+    }
+  }
+
+  private undoTurnOnWindow(agent: Agent, requester?: OperatorRequester): {
+    undone: boolean;
+    turnIndex?: number;
+    fromBranch?: string;
+    toBranch?: string;
+    window?: { retracted: number; represented: number };
+  } {
     const agentName = agent.name;
     // A turn alive (its start, its stream, its tools, a continuation or a
     // provider hold's retry on its way) holds the window: its next rows
     // would land on what the undo took out.
-    if (this.heldContinuation(agentName) && !this.hasTurn(agentName) && !this.turnAlive(agent)) {
-      this.dropHeldContinuation(agentName, 'an undo took out what its held turn stood on');
-    }
     if (this.logicalTurnAlive(agent)) {
       throw new OperatorActionError('agent-busy', `Cannot undo: a turn of ${agentName}'s is alive`);
     }
@@ -28033,6 +28055,8 @@ export class AgentFramework {
       routing.silent = true;
       if (continued?.roundsRan) routing.roundsRan = true;
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
+      if (continued?.start) routing.start = continued.start;
+      if (continued?.firstRow !== undefined) routing.firstRow = continued.firstRow;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -28046,7 +28070,7 @@ export class AgentFramework {
     }
     if (opensTurn) {
       const head = agent.branchHead();
-      if (head) routing.start = head;
+      if (head && !routing.start) routing.start = head;
       const firstRow = this.activeTurnTriggers.get(agent.name)?.readsRow;
       if (firstRow !== undefined) routing.firstRow = firstRow;
       // A silent start, and an agent whose configuration turns the pin off

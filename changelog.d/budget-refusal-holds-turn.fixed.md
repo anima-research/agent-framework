@@ -1,14 +1,16 @@
 - A turn whose compile is refused for budget while compression is pending
   now waits, idle, and runs once compression has made room, instead of
-  ending (#304). The refusal comes before any provider call, for example
-  after an immediate budget decrease. Before, the error policy retried it
+  ending (#304). The refusal comes before the start's own provider call,
+  for example after an immediate budget decrease. Before, the error policy retried it
   into the same refusal within seconds and ended the turn, and once
   compression had caught up nothing ran it again, so the agent stayed silent
   until its next wake. A refusal with nothing pending, an ephemeral run, and
   a framework that `start()` hasn't started fail as before.
   - **While it waits** the agent is idle: a surgery, a branch switch, an
-    undo, a redo or a puppet call is admitted, a quiesce drains at once, and
-    the wait holds no place in the event gate. `getHostModeStatus()`'s
+    undo or a redo is admitted, a quiesce drains at once, and the wait holds
+    no place in the event gate. A puppet call is admitted while a first
+    start waits. While a turn under way waits, it's refused, naming
+    `abortInference()` as the way to end that turn. `getHostModeStatus()`'s
     `gatedRequests` counts the waiting turn and the wakes that joined it.
     Wakes that arrive join the wait. For a turn's first start, their
     messages enter the agent's window as they arrive, and the released
@@ -45,6 +47,10 @@
     pending.
     A waiting turn lives in memory, so a restart drops it, and the agent
     waits for its next wake, as after an exhausted turn before.
+  - **Hosts watching for failed turns:** a turn that waits doesn't end in
+    `inference:exhausted` or leave the `[inference-failed]` marker, as the
+    refused turn did before. `inference:held` and `inference:hold_ended`,
+    and `healthSnapshot()`'s `budgetHold`, show it waiting.
   - **The note:** as the wait releases, it stores "[budget-hold] Your
     context didn't fit its budget (100,201 tokens against 48,568) when a
     turn came to start. That turn waited 7 min." in the agent's window, as
@@ -66,8 +72,8 @@
     a turn under way whose opening
     message, where its trigger read one, or own rows one removed, each
     ending with `inference:aborted`. The wakes that joined a dropped turn go
-    back to the queue. An undo of the agent ends a waiting turn under way
-    first, then runs. A waiting turn whose trigger
+    back to the queue. An undo of the agent ends a waiting turn under way,
+    and that turn's end is traced after the undo's own. A waiting turn whose trigger
     has no row of its own, such as console input, a heartbeat or a merged
     wake whose messages read different rows, is checked only by the rows it
     has written, and one with none yet can't be checked and runs on what the
