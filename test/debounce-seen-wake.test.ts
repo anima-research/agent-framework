@@ -277,6 +277,7 @@ describe('debounced writes already read and answered', () => {
       module.release('first');
       await idle;
       assert.deepEqual(turns, ['other'], "premise: other's turn read the slot after the event and was answered");
+      assert.match(JSON.stringify(f.membrane.calls[0]), /new event/, "premise: other's request carried the event");
       fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual(turns.slice(1).sort(), ['agent', 'other'], "the event is the delivery agent's write, so other's answer doesn't take its wake");
