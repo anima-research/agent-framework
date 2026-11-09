@@ -21,7 +21,10 @@
     digits, such as a Discord id a model writes unquoted, reaches the tool
     from membrane 0.10.1 as those digits, a string, on the streamed paths
     the framework takes, where it could be rounded to another number.
-  - Through OpenRouter, membrane 0.10.0 no longer puts the floating cache
-    marker on a block that adapter sends without one, such as a tool
-    result, so a request's float can go on the message before the round's
-    calling turn instead, where it is sent.
+  - membrane 0.10.0's floating cache marker passes over whitespace-only
+    text and media with no source, which the Anthropic and Bedrock builders
+    drop, to the block before it, where before it went on the dropped block
+    and wasn't sent. Through OpenRouter, it no longer goes on a block that
+    adapter sends without one, such as a tool result, so a request's float
+    can go on the message before the round's calling turn instead, where it
+    is sent.
