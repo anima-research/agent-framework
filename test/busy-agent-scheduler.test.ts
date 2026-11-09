@@ -94,7 +94,7 @@ test('stale busy-agent diagnostics are throttled with the warning', async () => 
   assert.equal(framework.pendingRequests.length, 1, 'diagnostics do not consume the deferred wake');
 });
 
-test('a budget restart defines turn semantics when batched behind an ordinary wake', async () => {
+test('a budget restart batched behind an ordinary wake starts alone, defining the turn semantics, and the wake goes back to the queue', async () => {
   const framework = busyAgentHarness();
   const now = Date.now();
   framework.pendingRequests = [
@@ -126,5 +126,118 @@ test('a budget restart defines turn semantics when batched behind an ordinary wa
     'context_budget_restart',
     'the request that bypasses the turn-alive lock must preserve continuation semantics',
   );
-  assert.equal(framework.pendingRequests.length, 0, 'the mixed wake batch is consumed once');
+  assert.deepEqual(framework.pendingRequests.map((r) => r.reason), ['mcpl:channel-incoming'],
+    'the ordinary wake goes back to the queue, for a turn of its own');
+});
+
+test("a tool_results_ready wake stays with the budget restart its batch carries, and only the batch's other wakes go back to the queue", async () => {
+  const framework = busyAgentHarness();
+  const now = Date.now();
+  framework.pendingRequests = [
+    { agentName: 'Sol', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: now - 2 },
+    { agentName: 'Sol', reason: 'tool_results_ready', source: 'framework', timestamp: now - 1 },
+    { agentName: 'Sol', reason: 'context_budget_restart', source: 'framework', timestamp: now },
+  ];
+  framework.agents = new Map([['Sol', { state: { status: 'idle' } }]]);
+  framework.activeTurnTokens.set('Sol', 1);
+  let selectedTrigger: { reason: string } | undefined;
+  framework.startAgentStream = async (_agent, trigger) => {
+    selectedTrigger = trigger;
+  };
+
+  await framework.processInferenceRequests();
+
+  assert.equal(selectedTrigger?.reason, 'context_budget_restart', 'the batch starts as the restart');
+  assert.deepEqual(framework.pendingRequests.map((r) => r.reason), ['mcpl:channel-incoming'],
+    'the tool_results_ready wake goes with the restart, as through a quiesce; the ordinary wake goes back');
+});
+
+test("a batch with a tool_results_ready wake ahead of a guard retry starts as the retry", async () => {
+  const framework = busyAgentHarness();
+  const now = Date.now();
+  framework.pendingRequests = [
+    { agentName: 'Sol', reason: 'tool_results_ready', source: 'framework', timestamp: now - 1 },
+    { agentName: 'Sol', reason: 'tool_result_guard_retry', source: 'framework', timestamp: now },
+  ];
+  framework.agents = new Map([['Sol', { state: { status: 'idle' } }]]);
+  let selectedTrigger: { reason: string } | undefined;
+  framework.startAgentStream = async (_agent, trigger) => {
+    selectedTrigger = trigger;
+  };
+
+  await framework.processInferenceRequests();
+
+  assert.equal(selectedTrigger?.reason, 'tool_result_guard_retry', 'the request that resumes the turn defines its start');
+  assert.deepEqual(framework.pendingRequests, [], 'both went into the one start');
+});
+
+test("a policy that drops a batch's restart leaves a provider hold's pending primary for the wake the batch sent back", async () => {
+  const framework = busyAgentHarness() as FrameworkHarness & {
+    providerGates: Map<string, { primaryPending: boolean }>;
+    providerAccelerationRecoveries: Map<string, unknown>;
+    endContinuedTurn(): void;
+    flushAuxiliaryAdmission(): void;
+  };
+  const now = Date.now();
+  framework.pendingRequests = [
+    { agentName: 'Sol', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: now - 1 },
+    { agentName: 'Sol', reason: 'context_budget_restart', source: 'framework', timestamp: now },
+  ];
+  framework.agents = new Map([['Sol', { state: { status: 'idle' } }]]);
+  framework.activeTurnTokens.set('Sol', 1);
+  const gate = { primaryPending: true };
+  framework.providerGates = new Map([['Sol', gate]]);
+  framework.providerAccelerationRecoveries = new Map([['Sol', {}]]);
+  framework.endContinuedTurn = () => {};
+  framework.flushAuxiliaryAdmission = () => {};
+  framework.inferencePolicy = {
+    shouldInfer: ((_agent: string, requests: Array<{ reason: string }>) =>
+      !requests.some((r) => r.reason === 'context_budget_restart')) as () => boolean,
+  };
+  let started = false;
+  framework.startAgentStream = async () => {
+    started = true;
+  };
+
+  await framework.processInferenceRequests();
+
+  assert.equal(started, false, 'the policy dropped the restart');
+  assert.deepEqual(framework.pendingRequests.map((r) => r.reason), ['mcpl:channel-incoming'], 'the wake waits to run');
+  assert.equal(gate.primaryPending, true, 'so the primary the hold left pending stays pending');
+  assert.ok(framework.providerAccelerationRecoveries.has('Sol'));
+});
+
+test("a policy that drops a batch's restart, with nothing else of the agent's queued, ends a provider hold's pending primary, whatever other agents have queued", async () => {
+  const framework = busyAgentHarness() as FrameworkHarness & {
+    providerGates: Map<string, { primaryPending: boolean }>;
+    providerAccelerationRecoveries: Map<string, unknown>;
+    endContinuedTurn(): void;
+    flushAuxiliaryAdmission(): void;
+  };
+  const now = Date.now();
+  framework.pendingRequests = [
+    // Another agent's wake, which its own turn holds back: the pass puts it
+    // back in the queue before it reaches Sol's batch.
+    { agentName: 'Luna', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: now },
+    { agentName: 'Sol', reason: 'context_budget_restart', source: 'framework', timestamp: now },
+  ];
+  framework.agents = new Map([['Sol', { state: { status: 'idle' } }], ['Luna', { state: { status: 'idle' } }]]);
+  framework.activeTurnTokens.set('Sol', 1);
+  framework.activeTurnTokens.set('Luna', 2);
+  const gate = { primaryPending: true };
+  framework.providerGates = new Map([['Sol', gate]]);
+  framework.providerAccelerationRecoveries = new Map([['Sol', {}]]);
+  framework.endContinuedTurn = () => {};
+  framework.flushAuxiliaryAdmission = () => {};
+  framework.inferencePolicy = {
+    shouldInfer: ((_agent: string, requests: Array<{ reason: string }>) =>
+      !requests.some((r) => r.reason === 'context_budget_restart')) as () => boolean,
+  };
+  framework.startAgentStream = async () => {};
+
+  await framework.processInferenceRequests();
+
+  assert.deepEqual(framework.pendingRequests.map((r) => r.agentName), ['Luna'], "Luna's wake waits for Luna's turn");
+  assert.equal(gate.primaryPending, false, "Sol's pending primary ends: nothing of Sol's waits to run");
+  assert.equal(framework.providerAccelerationRecoveries.has('Sol'), false);
 });

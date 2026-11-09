@@ -3,10 +3,10 @@
  *
  * A committing compile commits fold resolutions and queues compression work.
  * Agent-framework also moves the agent's consumed watermark (RFC-006) and
- * settles a prepared budget change at a full compile. With context-manager's
- * thinking binding (context-manager#160), a committing compile also commits
- * stamps and joins the branch's compiles awaiting acceptance, where one never
- * sent can fence the replies of a live stream. Previews and the API's message
+ * settles a prepared budget change at a full compile. With the thinking
+ * binding (`thinkingBinding.binds`), a committing compile also writes the
+ * context manager's binding record, which a compile never sent would leave
+ * vouching for a request nobody made. Previews and the API's message
  * list and context are never sent, so each compiles as a dry run.
  */
 import { describe, it } from 'node:test';
@@ -19,6 +19,7 @@ import type { Membrane } from '@animalabs/membrane';
 import { AgentFramework, ApiServer } from '../src/index.js';
 import { Agent } from '../src/agent.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { covers } from '../src/read-marks.js';
 
 async function make(agent: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'unsent-compiles-'));
@@ -67,12 +68,15 @@ describe('compiles that are never sent', () => {
       const agent = x.framework.getAgent('agent')!;
       const before = agent.getConsumedWatermark();
       const id = agent.getContextManager().addMessage('user', [{ type: 'text', text: 'not yet read' }]);
+      // Written straight to the context manager, it enters the window at a
+      // point (#291), which the compiles below read.
+      (x.framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(agent);
       await x.framework.previewActivation('agent');
       assert.deepEqual(agent.getConsumedWatermark(), before);
       // The control: a request that is sent assembled it, so it's read.
       await agent.buildActivationRequest([]);
       const sequence = agent.getContextManager().getMessage(id)!.sequence;
-      assert.ok((agent.getConsumedWatermark()?.sequence ?? -1) >= sequence, 'a sent request moves the watermark past what it assembled');
+      assert.equal(covers(agent.getConsumedWatermark(), agent.getContextManager(), { id, sequence }), 'covered', 'a sent request moves the watermark past what it assembled');
     } finally { await x.close(); }
   });
 

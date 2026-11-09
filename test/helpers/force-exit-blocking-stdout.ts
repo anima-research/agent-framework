@@ -2,7 +2,9 @@
  * Loaded by `npm test` (`node --import`) into the test runner and into each
  * test file's process. In a test file's own process under the runner
  * (NODE_TEST_CONTEXT is child-v8), it makes stdout blocking: that pipe
- * carries the file's results to the runner.
+ * carries the file's results to the runner. It also disarms Node's
+ * report-on-signal there, which the Node 24+ runner switches on via
+ * execArgv (see the note at the bottom).
  *
  * With --test-force-exit, Node's runner ends a test file's process with
  * process.exit() as soon as its last test has finished and its results are
@@ -18,6 +20,13 @@
  * as it is.
  */
 const stdout = process.stdout as typeof process.stdout & { _handle?: { setBlocking?: (blocking: boolean) => number } };
-if (process.env.NODE_TEST_CONTEXT === 'child-v8') stdout._handle?.setBlocking?.(true);
+if (process.env.NODE_TEST_CONTEXT === 'child-v8') {
+  stdout._handle?.setBlocking?.(true);
+  // From Node 24 the runner passes its execArgv to each test file, arming
+  // report-on-signal by default; any in-process SIGUSR2 then writes an
+  // environment dump into the cwd (#697 R1-3). Disarm it suite-wide: the
+  // runner turned it on by accident, and on Node 22 it is off anyway.
+  if (process.report) process.report.reportOnSignal = false;
+}
 
 export {};

@@ -36,6 +36,12 @@ const SELF_TIMED = new Set([
 ]);
 /** A process of its own that holds this one's fd 3 for `ms` after this one has gone, writing nothing. */
 const holdFd3 = (ms: number) => spawn(process.execPath, ['-e', `setTimeout(() => {}, ${ms})`], { stdio: ['ignore', 'ignore', 'ignore', 3] }).unref();
+/** As holdFd3, until the file `gate` appears, and 20 s at most. */
+const holdFd3Until = (gate: string) => spawn(process.execPath, ['-e', [
+  "const fs = require('node:fs');",
+  `setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) process.exit(0); }, 10);`,
+  'setTimeout(() => process.exit(0), 20000);',
+].join('\n')], { stdio: ['ignore', 'ignore', 'ignore', 3] }).unref();
 if (how === 'stopped-as-agent') {
   const decoder = new FrameDecoder(MAX_FRAME_BYTES, true);
   process.stdin.on('data', (chunk: Buffer) => {
@@ -178,11 +184,14 @@ if (how === 'reuse-timed-out-id') {
   });
   setInterval(() => {}, 60_000);
 } else if (how === 'wakes-after-stop') {
-  // Ready once its listener is on; at a stop, as many wakes as argv[3] says, each with an id of its own, none seen.
+  // Ready once its listener is on; at a stop, as many wakes as argv[3] says, each with an id of its own, none seen,
+  // and then it says it stopped and exits.
   writeSync(3, encodeFrame({ t: 'out', text: 'ready' }));
   parentFrames((frame) => {
     if (frame.t !== 'stop') return;
     for (let id = 1; id <= Number(process.argv[3]); id++) call(id, '(wake_agent)', '"after"');
+    writeSync(3, encodeFrame({ t: 'end', how: 'stopped', reason: 'agent' }));
+    process.exit(0);
   });
   setInterval(() => {}, 60_000);
 } else if (how === 'calls-then-exit-on-gate') {
@@ -250,14 +259,14 @@ if (how === 'wakes-then-garbage-on-gate') {
   }, 10);
 }
 if (how === 'wake-then-exit-on-gate') {
-  // Two wakes, the second waiting out the spacing; once the gate file (argv[3]) appears, gone, with fd 3 held open for 4 s.
+  // Two wakes, the second waiting out the spacing; once the gate file (argv[3]) appears, gone, with fd 3 held open until a second gate file (argv[4]) appears.
   call(1, '(wake_agent)', '1');
   call(2, '(wake_agent)', '2');
   const gate = process.argv[3]!;
   const poll = setInterval(() => {
     if (!existsSync(gate)) return;
     clearInterval(poll);
-    holdFd3(4_000);
+    holdFd3Until(process.argv[4]!);
     process.exit(0);
   }, 10);
 }

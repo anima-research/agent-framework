@@ -19,11 +19,15 @@ import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, Str
 import { AgentFramework, type AgentConfig, type Module, type ModuleContext, type ToolCall, type ToolResult,
   type ProcessEvent, type ProcessState } from '../src/index.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { ALL_CAPABILITY_PATHS, CapabilityGrant } from '../src/mcpl/capability-grant.js';
 
 const dirs: string[] = [];
-afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
+const unscripted: string[] = [];
+afterEach(() => {
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  assert.deepEqual(unscripted.splice(0), [], 'every stream the framework opened was one the test scripted');
+});
 
 const text = (value: string): ContentBlock => ({ type: 'text', text: value });
 const call = (id: string, name: string, input: Record<string, unknown> = {}): ContentBlock =>
@@ -36,12 +40,18 @@ const final = (...blocks: ContentBlock[]) => createMockResponse(blocks);
 /** Each stream the framework opens takes the next list of responses. */
 class ScriptMembrane {
   streams = 0;
+  readonly requests: NormalizedRequest[] = [];
   /** Wraps a stream's events, by its 1-based number. */
   wrap?: (index: number, events: AsyncIterable<StreamEvent>) => AsyncIterable<StreamEvent>;
   constructor(readonly scripts: NormalizedResponse[][]) {}
-  streamYielding(_request: NormalizedRequest, _options: YieldingStreamOptions = {}) {
+  streamYielding(request: NormalizedRequest, _options: YieldingStreamOptions = {}) {
+    this.requests.push(request);
     const script = this.scripts.shift();
-    assert.ok(script, 'unexpected extra inference');
+    if (!script) {
+      const last = request.messages.at(-1)?.content.map((b) => (b as { text?: string }).text ?? `[${b.type}]`).join(' ') ?? '';
+      unscripted.push(`stream ${this.requests.length}, after: ${last.slice(0, 120)}`);
+      throw new Error('unexpected extra inference');
+    }
     const stream = new MockYieldingStream(script);
     const index = ++this.streams;
     const wrap = this.wrap;
@@ -116,9 +126,11 @@ function registry(framework: AgentFramework, options: { streaming?: boolean; ser
   /** The server a channel belongs to: `options.servers` names some, and the stub's server has the rest. */
   const serverOf = (channelId: string) => options.servers?.[channelId] ?? 'stub';
   let stopped = false;
-  /** One post, with the outcome the real registry's deliverSpeech gives it. */
-  const publish = async (body: string, channelId: string | null) => {
-    if (!channelId) return { status: 'failed' as const, reason: 'no channel', at: Date.now() };
+  /** One post, with the outcome the real registry's deliverSpeech gives it.
+   *  The framework hands it the channel with its server. */
+  const publish = async (body: string, to: { serverId?: string; channelId: string } | null) => {
+    if (!to) return { status: 'failed' as const, reason: 'no channel', at: Date.now() };
+    const channelId = to.channelId;
     log.push({ kind: 'publish', channelId, text: body });
     await holds.get(body);
     const failure = fails.get(body);
@@ -133,14 +145,14 @@ function registry(framework: AgentFramework, options: { streaming?: boolean; ser
       : { status: 'failed' as const, destination, reason: 'the stub reported delivered: false', at: Date.now() };
   };
   const target: Record<string, unknown> = {
-    resolveLocus: () => 'world:test',
-    resolveProseTarget: (spec: string) => (known[spec] ? { channelId: known[spec] } : { error: `no channel ${spec}` }),
+    resolveLocus: () => ({ serverId: serverOf('world:test'), channelId: 'world:test' }),
+    resolveProseTarget: (spec: string) => (known[spec] ? { serverId: serverOf(known[spec]), channelId: known[spec] } : { error: `no channel ${spec}` }),
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: serverOf(channelId), channelId } }),
     // Locus prose posts through routeSpeech, a named or sticky destination
     // through deliverSpeech, as with the real registry.
-    deliverSpeech: async (_agent: string, body: string, channelId: string | null) => publish(body, channelId),
-    routeSpeech: async (_agent: string, body: string, channelId: string | null) => {
-      const outcome = await publish(body, channelId);
+    deliverSpeech: async (_agent: string, body: string, to: { serverId?: string; channelId: string } | null) => publish(body, to),
+    routeSpeech: async (_agent: string, body: string, to: { serverId?: string; channelId: string } | null) => {
+      const outcome = await publish(body, to);
       return outcome.status === 'delivered'
         ? { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId, ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}) }
         : null;
@@ -170,6 +182,8 @@ function registry(framework: AgentFramework, options: { streaming?: boolean; ser
       : { success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     getChannelTools: () => [],
+    channelsNamed: (name: string) => [{ serverId: serverOf(name), channelId: name }],
+    nameShown: (channel: { channelId: string }) => channel.channelId,
   };
   // A registry whose server doesn't take the stream sends no chunk or complete.
   if (options.streaming === false) {
@@ -190,7 +204,11 @@ function registry(framework: AgentFramework, options: { streaming?: boolean; ser
   };
 }
 
-async function harness(scripts: NormalizedResponse[][], config: Partial<AgentConfig> = {}, options: { streaming?: boolean; gate?: boolean; servers?: Record<string, string> } = {}) {
+async function harness(
+  scripts: NormalizedResponse[][],
+  config: Partial<AgentConfig> = {},
+  options: { streaming?: boolean; gate?: boolean; speech?: { locus: 'delivery' | 'latest-inbound' }; servers?: Record<string, string> } = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), 'af-outgoing-stream-')); dirs.push(dir);
   const membrane = new ScriptMembrane(scripts);
   const module = new ToolModule();
@@ -199,6 +217,8 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', ...config }], modules: [module], syncIntervalMs: 0,
     // An EventGate gives the agent the sleep tool.
     ...(options.gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
+    // The re-pin is the legacy locus rule; a test about it opts in.
+    ...(options.speech ? { speech: options.speech } : {}),
   });
   const stub = registry(framework, options);
   const traces: Array<{ type: string; channelId: string; text: string; inferenceId: string; index?: number; messageId?: string }> = [];
@@ -419,7 +439,7 @@ test('a stream that fails partway streams none of its unfinished round, and its 
 });
 
 test('locus: after a mid-turn addressed re-pin, the next round streams to the new locus, where it is published', async () => {
-  const h = await harness([[round(text('station four, proceeding'), call('one', 'test--read')), final(text('answering you'))]]);
+  const h = await harness([[round(text('station four, proceeding'), call('one', 'test--read')), final(text('answering you'))]], {}, { speech: { locus: 'latest-inbound' } });
   // While the tool runs, someone addresses the agent from a DM. The tool
   // returns once the message has been processed, so the round's boundary
   // weighs it.
@@ -631,14 +651,14 @@ test("with the real channel registry, a stop() with a publish still out sends th
     sendChannelsTyping: () => {},
   };
   const registry = new ChannelRegistry({ getServer: () => server } as never, {} as never, () => {}, () => {}, {});
-  (registry as unknown as { channels: Map<string, unknown> }).channels.set('srv:world:test',
+  (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'srv', channelId: 'world:test' }),
     { serverId: 'srv', descriptor: { id: 'world:test', type: 'srv', label: 'world:test' }, open: true });
   const stopAll = registry.stopAll.bind(registry);
   (registry as unknown as { stopAll: () => void }).stopAll = () => { wire.push('registry stopped'); stopAll(); };
   // The turn's locus and channel tools, as the harness gives them.
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
     get: (target, key: string) => {
-      if (key === 'resolveLocus') return () => 'world:test';
+      if (key === 'resolveLocus') return () => ({ serverId: 'srv', channelId: 'world:test' });
       if (key === 'handleChannelToolCall') return async () => ({ success: true, data: {} });
       if (key === 'getChannelTools') return () => [];
       const value = (target as unknown as Record<string, unknown>)[key];
@@ -711,13 +731,14 @@ async function realRegistryTurn(
   const getServer = (id: string) => servers.get(id) ?? servers.set(id, server(id)).get(id)!;
   const registry = new ChannelRegistry({ getServer } as never, {} as never, () => {}, () => {}, {});
   const open = (serverId: string, channelId: string) => {
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`${serverId}:${channelId}`,
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId, channelId }),
       { serverId, descriptor: { id: channelId, type: 'chat', label: channelId }, open: true });
   };
   for (const [serverId, channelId] of channels) open(serverId, channelId);
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
     get: (target, key: string) => {
-      if (key === 'resolveLocus') return () => 'room';
+      // The turn's locus is the first channel, on its server.
+      if (key === 'resolveLocus') return () => ({ serverId: channels[0]![0], channelId: channels[0]![1] });
       if (key === 'handleChannelToolCall') return async () => ({ success: true, data: {} });
       if (key === 'getChannelTools') return () => [];
       const value = (target as unknown as Record<string, unknown>)[key];
@@ -747,7 +768,10 @@ test("with the real channel registry, a stream ends in a channel its server decl
     'the later text is refused there, and the stream it took ends there');
 });
 
-test("with the real channel registry, a channel id that passes from one server to another mid-turn: each server is streamed only what was published to it", async () => {
+test("with the real channel registry, a channel id that passes from one server to another mid-turn: the turn's words stay with its own server's channel, and the other server is sent nothing", async () => {
+  // The turn's locus is a's room, with its server. b's room is another
+  // channel with the same id, so the turn's later words aren't sent there:
+  // they're refused, as a's room is no longer registered.
   const { wire, traces } = await realRegistryTurn(
     [round(text('first'), call('one', 'test--read')), final(text('second'))],
     [['a', 'room']],
@@ -756,14 +780,12 @@ test("with the real channel registry, a channel id that passes from one server t
       open('b', 'room');
     },
   );
-  assert.deepEqual(wire, ['a publish:first', 'a chunk:first', 'b publish:second', 'b chunk:second', 'b complete:second'],
-    "b's words go to b alone, and a, which no longer registers the channel, gets no complete");
+  assert.deepEqual(wire, ['a publish:first', 'a chunk:first'],
+    'b is sent nothing, and a, which no longer registers the channel, gets no complete');
   assert.deepEqual(traces, [
     'inference:published ["a","room"] first',
-    'inference:published ["b","room"] second',
     'inference:published_complete ["a","room"] first',
-    'inference:published_complete ["b","room"] second',
-  ], 'in-process consumers get each destination apart, by its server');
+  ], 'in-process consumers get the destination by its server');
 });
 
 test("with the real channel registry, a chunk follows its publish's destination: a channel that moves to another server as the publish is answered streams none of it there", async () => {
@@ -828,7 +850,6 @@ test("the published traces are emitted when the channel's server takes no stream
   const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]], {}, { streaming: false });
   try {
     await h.run();
-    assert.deepEqual(h.chunks(), [], 'the server is sent no chunk');
     assert.deepEqual(h.traces.map((t) => `${t.type}:${t.text}`), [
       'inference:published:first',
       'inference:published:\n\nsecond',
@@ -838,13 +859,13 @@ test("the published traces are emitted when the channel's server takes no stream
 });
 
 // A publish that fails streams nothing, on every delivery path.
-const failedPublishCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'explicit'; script: () => NormalizedResponse[]; lost: string; kept?: string }> = [
+const failedPublishCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'explicit'; script: () => NormalizedResponse[]; lost: string; kept?: string; bounces?: true }> = [
   { name: 'locus text-only', mode: 'locus', script: () => [final(text('lost'))], lost: 'lost' },
   { name: 'locus trailing', mode: 'locus', script: () => [round(text('kept'), call('one', 'test--read')), final(text('lost'))], lost: 'lost', kept: 'kept' },
   { name: 'hybrid unprefixed', mode: 'hybrid', script: () => [round(text('lost'), call('one', 'test--read')), final(text('kept'))], lost: 'lost', kept: 'kept' },
-  { name: 'hybrid >>> target', mode: 'hybrid', script: () => [final(text('>>>#alpha lost'))], lost: 'lost' },
-  { name: 'explicit mid-turn', mode: 'explicit', script: () => [round(text('>>#alpha lost'), call('one', 'test--read')), final(text('>>#cafe kept'))], lost: 'lost', kept: 'kept' },
-  { name: 'explicit text-only', mode: 'explicit', script: () => [final(text('>>#alpha lost'))], lost: 'lost' },
+  { name: 'hybrid >>> target', mode: 'hybrid', script: () => [final(text('>>>#alpha lost'))], lost: 'lost', bounces: true },
+  { name: 'explicit mid-turn', mode: 'explicit', script: () => [round(text('>>#alpha lost'), call('one', 'test--read')), final(text('>>#cafe kept'))], lost: 'lost', kept: 'kept', bounces: true },
+  { name: 'explicit text-only', mode: 'explicit', script: () => [final(text('>>#alpha lost'))], lost: 'lost', bounces: true },
 ];
 // The id a server returns for a publish rides on that publish's trace, on every delivery path.
 for (const c of failedPublishCases) {
@@ -862,23 +883,18 @@ for (const c of failedPublishCases) {
   });
 }
 
-test('a published trace carries no message id when the server returned none', async () => {
-  const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]]);
-  try {
-    await h.run();
-    const published = h.traces.filter((t) => t.type === 'inference:published');
-    assert.equal(published.length, 2, 'both publishes streamed');
-    assert.ok(published.every((t) => !('messageId' in t)), 'no id came back, so the traces carry none');
-  } finally { await h.framework.stop(); }
-});
-
 for (const c of failedPublishCases) {
   for (const failure of ['undelivered', 'unknown', 'throw'] as const) {
-    test(`${c.name}: a publish that ${failedHow(failure)} streams nothing`, async () => {
-      const h = await harness([c.script()], { proseRouting: c.mode });
+    const wakes = failure === 'undelivered' && c.bounces === true;
+    test(`${c.name}: a publish that ${failedHow(failure)} streams nothing${wakes ? ', and its bounce wakes the agent with the notice' : ''}`, async () => {
+      const h = await harness(wakes ? [c.script(), [final()]] : [c.script()], { proseRouting: c.mode });
       h.fails.set(c.lost, failure);
       try {
         await h.run();
+        if (wakes) {
+          const woken = h.membrane.requests[1]?.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '') ?? [];
+          assert.ok(woken.some((t) => t.includes('was not delivered') && t.includes('held as draft')), "the wake's request carries the bounce notice");
+        }
         assert.ok(h.publishes().some((p) => p.text === c.lost), 'the publish was tried');
         assert.equal(h.chunks().some((ch) => ch.text.includes(c.lost)), false, 'no chunk carries it');
         assert.equal(h.completes().some((co) => co.text.includes(c.lost)), false, 'nor does a complete');

@@ -2,20 +2,23 @@
  * Held prose drafts: a resident's plain speech that was not sent.
  *
  * Plain speech is held back for reasons that are right in themselves: an
- * explicit send in the same round suppresses the round's prose (so a "sent
- * it" postscript is not posted twice), a turn may have no destination, and a
+ * explicit send suppresses plain speech aimed where it may have posted, in
+ * its round and the turn's later ones (so a "sent it" postscript is not
+ * posted twice), a turn may have no destination, and a
  * malformed or unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
  * the exact words until the resident resends or dismisses them, or the
  * retention below lets it go.
  *
- * The boundary is publication and agency, not visibility: a draft is never
+ * The boundary is publication and agency: a draft is never
  * published except by its resident's explicit resend (or `{{unsent}}`), and
  * only that resident can list or act on it. Its notices go into the
- * resident's own history — which residents that share one message slot
- * (#197) share, as they already share the assistant turn the words came
- * from.
+ * resident's own history: residents that share one message slot store
+ * them in that slot, but each is stamped as its resident's: the drafts
+ * notice as its own row, which enters no other resident's window but an
+ * observer's (AgentConfig.observes), as the assistant turn the words came
+ * from does, and a bounce notice as for that resident alone.
  *
  * Durability is outside the conversation. Drafts live in a RecordJournal of
  * typed Chronicle records, which do not follow branch switches: undo,
@@ -23,8 +26,10 @@
  * in a turn that is later undone stays usable (the words were genuinely
  * written and held back), and a delivered draft stays delivered. The
  * notices that name a draft are conversation, so they do follow the branch: a draft counts as
- * named while a message naming it is on the current branch, and one a
- * rollback or branch move has left unnamed is named again.
+ * named while a message naming it is on the current branch and, on a
+ * presented window, not taken out of it by an undo; one a rollback or
+ * branch move has left unnamed, or whose notice an undo took out of the
+ * window, is named again.
  *
  * Drafts are kept, not hoarded. Each resident's KEEP_NEWEST newest drafts
  * are always kept; an older one, in any state, is let go at the journal's
@@ -53,7 +58,7 @@ export const PROSE_DRAFT_RECORD_TYPE = 'framework/prose-draft';
 
 /** Why words were held instead of sent. */
 export type DraftReason =
-  /** An explicit send in the same round suppressed the round's plain speech. */
+  /** An explicit send in its turn may have posted where the speech was going. */
   | 'explicit-send'
   /** The speech had no destination (no route this turn, or a failed envelope). */
   | 'no-destination'
@@ -404,13 +409,13 @@ export class ProseDraftStore {
   }
 
   /**
-   * Open drafts, newest first, that no notice on the current branch names:
-   * none was recorded (a crash before the notice), or a rollback or branch
-   * move took away every message that named them. `onBranch` says whether a
-   * message, by id, is on the current branch.
+   * Open drafts, newest first, that no standing notice names: none was
+   * recorded (a crash before the notice), or a rollback, a branch move or an
+   * undo took away every message that named them. `stands` says whether a
+   * message, by id, still names them to the agent.
    */
-  unnoticed(agent: string, onBranch: (messageId: string) => boolean): Draft[] {
-    return this.open(agent).filter((d) => !d.noticedIn?.some(onBranch));
+  unnoticed(agent: string, stands: (messageId: string) => boolean): Draft[] {
+    return this.open(agent).filter((d) => !d.noticedIn?.some(stands));
   }
 
   /**

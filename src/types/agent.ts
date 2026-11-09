@@ -2,12 +2,32 @@ import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
+import type { WakeLine } from '../gate/types.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
   | 'runtime_override'
   | 'recipe'
   | 'compatibility_default';
+
+/** What a continuation's `[continue]` row says (InferenceRequest.autoContinueRun). */
+export interface AutoContinueRun {
+  /** How the agent stops, as the row puts it ("call skip_reply"). */
+  stop: string;
+  /** The turn before ended in words some or all of which were held, not
+   *  sent, because a send in it may already have posted where they were
+   *  going. */
+  heldAfterSend?: boolean;
+  /** Set by the scheduler: the continuation is the turn's only cause. */
+  sole?: boolean;
+}
+
+/** `AgentConfig.autoContinue` as an object (`true` means `{}`). */
+export interface AutoContinueConfig {
+  /** Continuations in a row before the agent waits for the next event:
+   *  a whole number, 1 to 20. Default 3. */
+  maxConsecutive?: number;
+}
 
 /**
  * Configuration for an agent.
@@ -35,13 +55,15 @@ export interface AgentConfig {
    * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
    * - string[]: exact tool names, including module--utility names for utilities.
-   * Utilities aren't tools of their own: an agent's model and its scripts are
-   * offered them only through 'utils', whose run checks the utility's own
-   * name. An agent that should use a utility lists both 'utils' and
-   * 'module--utility'. The name alone passes the dispatch check for any call
-   * by that name, whether the host makes it with executeToolCall on the
-   * agent's behalf or the model or a script makes it without being offered
-   * it. The slot is hidden when no utility is permitted.
+   * Utilities and the host's other rarely-used tools are in the host's
+   * built-in toolset ("settings"), out of the tool list: the model reaches
+   * them with toolsets--open {toolset:"settings"} and toolsets--act, each
+   * checked under the tool's own name. An agent that should use a utility
+   * from its model lists 'toolsets--open', 'toolsets--act' and
+   * 'module--utility' (an agent without the two meta-tools keeps every other
+   * tool in its list, but no utility). The name alone passes the dispatch
+   * check for any call by that name, whether the host makes it with
+   * executeToolCall on the agent's behalf or the model or a script makes it.
    * Trusted module calls are exempt. Genuinely unidentified public callers,
    * including unknown legacy names, remain unrestricted. Framework-created
    * identities have tool authority only while registered.
@@ -62,7 +84,11 @@ export interface AgentConfig {
   temperature?: number;
 
   /** Max input tokens before framework breaks a yielding stream and
-   *  restarts with recompiled (compressed) context. Default: 150000. */
+   *  restarts with recompiled (compressed) context. Default: 150000. Not
+   *  checked mid-turn for an agent whose model binds its thinking
+   *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
+   *  there would take the turn's own earlier reasoning out of the request, and
+   *  the window projection still guards the provider's hard cap. */
   maxStreamTokens?: number;
 
   /**
@@ -75,7 +101,9 @@ export interface AgentConfig {
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
    * stream has reported its prompt. Unset → no projection; only the
-   * maxStreamTokens restart applies.
+   * maxStreamTokens restart applies. A value is converted to a number as a
+   * comparison converts it, so a string such as "200000" reads as its number;
+   * one whose number isn't finite, such as null, reads as unset.
    */
   physicalWindowTokens?: number;
 
@@ -133,7 +161,9 @@ export interface AgentConfig {
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks
    * with cryptographic signatures, and the API enforces `temperature: 1`
-   * (Membrane handles this). Omit or set `enabled: false` to disable.
+   * (Membrane handles this). Omit or set `enabled: false` to disable, except
+   * on a model whose thinking is always on (Fable, Mythos), which thinks
+   * whatever this says.
    */
   thinking?: {
     enabled: boolean;
@@ -143,9 +173,110 @@ export interface AgentConfig {
     /**
      * How thinking content is returned: 'summarized' (readable summary) or
      * 'omitted' (empty thinking field, signature only). Fable 5 / Opus 4.7+
-     * default to 'omitted' — set 'summarized' to receive thinking text.
+     * default to 'omitted' — set 'summarized' to receive thinking text. A
+     * model whose thinking is always on (Fable, Mythos) is sent a thinking
+     * config only to carry `thinkingBinding.dropBlock`, so this reaches it
+     * only with that set.
      */
     display?: 'summarized' | 'omitted';
+  };
+  /**
+   * How the provider binds this agent's signed thinking to the conversation
+   * before it. A host sets it from what it knows of the agent's model and
+   * route.
+   */
+  thinkingBinding?: {
+    /**
+     * Ask the provider to drop a signed thinking block whose earlier
+     * conversation has changed, as a fold changes it, rather than refuse the
+     * request. An account that enforces the binding otherwise answers such a
+     * request with a 400. One that doesn't decides for itself: the four
+     * accounts tried on 2026-10-18 dropped such blocks silently, so there the
+     * model sees nothing different and the report is what's new, and one
+     * that would show such a block to the model is asked to drop it instead.
+     *
+     * It's sent as `thinking.block_binding.prefix_mismatch_behavior:
+     * "drop_block"` with the `thinking-binding-controls-2026-08-01` beta,
+     * which membrane's Anthropic and Bedrock adapters carry (Bedrock's
+     * acceptance of the beta hasn't been tried). On any other adapter it does
+     * nothing, so a host should refuse it there. A thinking config the host
+     * sends itself, through `request.extra` or as `thinking` in
+     * `providerParams`, replaces the one membrane builds, control included.
+     *
+     * On a model whose thinking is always on (Fable, Mythos), membrane
+     * carries it in an adaptive thinking config whatever `thinking.enabled`
+     * says, with `thinking.display` when that's set, so such an agent's
+     * `display` takes effect only with this setting. On any other model, it
+     * goes only in the thinking config membrane sends while thinking is on.
+     * Membrane tells the first kind by its id, which names `fable` or
+     * `mythos`. Opus 5.5, Haiku 5.5, Sonnet 5.5, Sonnet 5, Fable 5 and Fable
+     * 5.1 accepted the config on 2026-10-18. Mythos hasn't been tried, and
+     * membrane notes that the family has refused thinking configs with a 400
+     * before, so for a Mythos model the setting may fail every request.
+     *
+     * On a framework turn, each call's report of the blocks the provider
+     * dropped goes to its `inference:usage` trace, and neither that call nor
+     * its stream's later calls feed the context strategy's calibration, since
+     * the provider doesn't bill a block it dropped and the strategy still
+     * counts it. After a fold, each block after the stretch it rewrote is
+     * bound to a conversation the request no longer holds. Where the context
+     * strategy still sends such a block, the provider drops it on every call
+     * until a later fold takes it out of the context, or, with `binds` set
+     * too, until the next compile after a note lands: the stream tells the
+     * context manager which stored reply's thinking was dropped
+     * (`noteThinkingDropped`), and once a note lands, the next compile sends
+     * that reply without it. While such blocks are sent,
+     * no stream gives a sample and the calibration keeps the value it had. A
+     * strategy that leaves that thinking out at the fold sends none to drop.
+     * The direct API carries the control too, but reads no report: it traces
+     * no usage, feeds no calibration and notes nothing.
+     *
+     * Default false: nothing is sent, and the account's default applies.
+     */
+    dropBlock?: boolean;
+    /**
+     * Whether this agent's model binds its signed thinking to the
+     * conversation before it, as the host knows from its own model records.
+     * A context manager that keeps a record of what each branch sent can
+     * then leave out thinking whose earlier conversation changed before the
+     * provider sees it. Set:
+     * - each compile the agent sends tells the context manager so
+     *   (`thinkingBinding`: `binds`, `dropBlock` as set here, and the agent's
+     *   name as the `participant` whose replies are its own), with digests
+     *   of what the request carries ahead of its messages (`identity`: the
+     *   system text with its system-position injections, the tools in the
+     *   order sent, the model, and the thinking config, `maxTokens`,
+     *   `providerParams` and `prefillUserMessage`);
+     * - each framework stream tells the context manager which stored rows
+     *   its later rounds and its last reply carried as stored
+     *   (`noteRequestSent`), naming the compile it was built from, so their
+     *   thinking is kept at the next compile. The direct API
+     *   (`runInference`) notes nothing, so each of its replies' thinking is
+     *   left out at the compile after it's stored;
+     * - with `dropBlock` set too, each framework stream tells the context
+     *   manager which stored replies' thinking the provider reports dropping
+     *   (`noteThinkingDropped`), naming the compile it was built from, so
+     *   once a note lands, the next compile sends those replies without their
+     *   thinking;
+     * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
+     *   starts a new stream mid-turn, since the new stream's compile can take
+     *   the turn's earlier reasoning out of the request;
+     * - with `dropBlock` set too, where a compile reports where the branch's
+     *   record began (`thinkingRecordedAfter`), a block the provider drops
+     *   that the record doesn't account for raises the
+     *   `thinking-binding-loss` ops alert, once per incident and again if a
+     *   call drops more. The provider reports drops only on a request that
+     *   carries the drop control; without it, such a block is refused;
+     * - the agent is told nothing of reasoning left out or dropped: no line
+     *   about the mechanics of its own memory or reasoning is put in its
+     *   context. Hosts can observe compiles' strips through
+     *   `Agent.onThinkingStrip`;
+     * The record and the notes
+     * vouch for requests as agent-framework hands them to membrane, so a
+     * membrane `beforeRequest` hook that changes a request must change every
+     * request alike. Default false: compiles and streams are as they were.
+     */
+    binds?: boolean;
   };
   /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).
@@ -208,8 +339,57 @@ export interface AgentConfig {
    * - 'disabled': generated prose is never published. Only explicit tools may
    *   send externally; prose remains in Chronicle, and a turn that wrote plain
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
+   * - 'locked': unprefixed prose goes to one destination the agent chose, on
+   *   every turn, and nothing moves it automatically: not the channel that
+   *   woke the turn, not an addressed message, a heartbeat or channel_open.
+   *   Only the `prose_locus` tool moves it, to a channel or to drafts (held,
+   *   never posted unless the agent resends them). The choice persists
+   *   across turns and restarts. Until the agent first makes one,
+   *   `proseLock` is the destination. It governs routing through the channel
+   *   registry: a module that handles final speech itself (`onAgentSpeech`,
+   *   such as the in-process Discord module) receives it in every mode, this
+   *   one included. See docs/locked-prose-routing.md.
    */
-  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
+
+  /**
+   * Locked mode's destination until the agent chooses one with `prose_locus`:
+   * `"#channel"`, `"@person"`, a channel id, or `"drafts"`. Resolved as a
+   * `>>` target is, at each turn's start, so a channel its server hasn't
+   * registered yet resolves once it has; until it resolves, plain speech is
+   * held as drafts. Left out, plain speech is held as drafts until the agent
+   * chooses. The agent's own choice, once made, takes its place. Ignored in
+   * the other modes.
+   */
+  proseLock?: string;
+
+  /**
+   * Stored participants that are this agent's own voice, in addition to its
+   * name: their turns are presented to the model as this agent's assistant
+   * turns. A derived agent sets this to the agent it inherited from, so the
+   * parent's turns read as its own history. Model-facing role assignment
+   * only, applied at request assembly — stored authorship is never rewritten.
+   */
+  selfParticipants?: string[];
+
+  /**
+   * The participant name this agent's own turns are presented under at
+   * request assembly. Defaults to `name`. A derived agent that should share
+   * its parent's provider prefix sets the parent's name, so the two
+   * requests are identical in formatters that render participant names as
+   * well as in those that only assign roles. New turns are still STORED
+   * under the agent's own name.
+   */
+  presentAs?: string;
+
+  /**
+   * Tools refused when this agent calls them, although they stay advertised.
+   * Restricts a derived agent without changing the tool block at the front
+   * of its request — removing a tool from `allowedTools` instead would
+   * change those bytes and forfeit the provider prefix it shares with its
+   * parent.
+   */
+  denyToolsAtDispatch?: string[];
 
   /**
    * Fail-closed containment for a text response whose entire visible prose is
@@ -218,6 +398,111 @@ export interface AgentConfig {
    * content-free system receipt is stored instead. Default false.
    */
   toolWrapperProseGuard?: boolean;
+
+  /**
+   * Continue on the agent's own turn ending (off when left out): a turn the
+   * model ends itself (stop reason `end_turn` or `stop_sequence`), whether
+   * its last response is prose or empty, is followed by another turn,
+   * instead of a pause until the next event. A turn ended through
+   * `skip_reply` (or another tool that ends the turn, such as `sleep`), or
+   * whose last prose envelope is `>>skip_reply` (explicit) or `>>>skip_reply`
+   * (hybrid), pauses as usual. So does one whose closing prose bounced (the
+   * bounce and its cap answer it), and an agent offered no way to stop
+   * (locus or disabled mode without an offered `skip_reply`).
+   *
+   * As the next turn starts, a short `[continue]` system row naming the agent
+   * joins the window: another turn starts, how to stop, and that unmarked
+   * words are sent as usual; on the last continuation of a run, that the
+   * agent waits for the next event after it. It's written only when the
+   * continuation is that turn's whole cause: a message batched with it makes
+   * it that message's turn, with no row, in the message's channel. Otherwise
+   * the next turn keeps the turn's locus (locus and hybrid modes). At most
+   * `maxConsecutive` (default 3) continuations run in a row: the count
+   * starts again when a turn starts with a cause of its own (a message, a
+   * timer, a heartbeat that isn't a silent tick) or a tool ends one. Silent
+   * heartbeat ticks, refusals, `max_tokens` cut-offs, the stall guard's
+   * ends, ephemeral runs, conversation forks and a quiesce never continue. A
+   * ` !` continuation the turn asked for runs instead, and counts toward
+   * nothing. See docs/auto-continue.md.
+   */
+  autoContinue?: boolean | AutoContinueConfig;
+
+  /**
+   * Clock rows (off when left out): when a boundary of this interval on the
+   * agent's local wall clock (counted from local midnight, in the
+   * framework's `timeZone`) has passed since the last clock row, the window
+   * takes one more — `Clock: 10:50 Europe/Berlin (UTC+02:00)`, with the date
+   * when the day has changed — before the next thing it takes: an incoming
+   * event, a turn's start, or, mid-turn, after a tool round's results, where
+   * it also joins the live stream. Only the latest boundary is written, and
+   * a window that holds no clock row yet takes one at the next of these. A
+   * clock reads the boundary's time where its tick would have stood, else
+   * the time it is written (after a tool's results, say), so it never
+   * reads earlier than a row before it. A clock wakes no one. See
+   * src/clock-rows.ts.
+   *
+   * - A stream that can't carry injected messages (membrane's XML prefill
+   *   path) takes no mid-turn clock: the next event or turn start writes it.
+   * - On some models a clock after a tool's results drops the loop's
+   *   earlier thinking from the request, as any message heard while acting
+   *   does there: at most once an interval.
+   * - Residents share one window, so every resident reads the clock rows any
+   *   of them writes, a resident with no `clock` of its own included. Each
+   *   writes one when a boundary of its own interval has passed since the
+   *   window's last clock, whichever resident wrote that. The subconscious
+   *   takes none of its own: it reads the residents' through its merged
+   *   view.
+   */
+  clock?: import('../clock-rows.js').ClockConfig;
+
+  /**
+   * Keep the rows that open a turn raw for the whole turn (on when left out):
+   * at a start that opens a turn, the framework pins raw the rows of the
+   * agent's window after its newest own message and its consumed mark
+   * (`pinRange`, named `agent-framework:turn-inputs`; the README says
+   * which rows exactly), and removes the pin when the turn ends, so the
+   * strategy doesn't compress the rows the turn opened with while it runs,
+   * unless a committing compile refuses as over budget with it held: the
+   * pin is then removed and the compile runs once more (README). `false` places no pin:
+   * the turn's opening rows are compressed as any others, and a pin of the
+   * name left from before (a crash's) is removed at the next start that opens
+   * a turn, as a silent start removes one.
+   */
+  turnInputsPin?: boolean;
+
+  /**
+   * The other configured agents whose own rows this agent's window takes
+   * (none when left out). Residents share one slot, and each is shown only
+   * its own rows and the rows meant for it: another resident's rounds,
+   * replies, tool results and notes stay out of its window (#291, decision
+   * 1; rows an earlier release stored carry no stamp and stay in the window
+   * written down from the record: 291-presentation-mandatory). A name here
+   * is an observe edge in this agent's registry record, on
+   * that agent (`{ agent: name }`, the path the subconscious's edge takes),
+   * and the presentation index presents that agent's own rows to this one
+   * at its points, as it does any arrival (bearingOf); the history tools
+   * leave them in for its calls (ModuleContext.observes). That agent's own
+   * rows this one's window doesn't hold yet, those stored before the edge
+   * was declared included, enter it at its next presentation point, after
+   * what it holds: an edge declared on a store with history hands the
+   * observer that agent's earlier rows at once, at the end of its window
+   * (`ObserveEdge.fromMessageId`, which would start the edge at a row, is
+   * read by nothing yet). Only own rows: mail and channel traffic meant for that agent, and its stored
+   * context injections, stay out. One way: `nova` observing `mira` shows
+   * nova mira's rows, not mira nova's. `create()` refuses a name that is
+   * this agent's own or no configured agent's. Read when a configured agent
+   * is created; a derived agent's spec carries its own edges.
+   */
+  observes?: string[];
+
+  /**
+   * How the rounds of an agent it observes (`observes`) go out in this
+   * agent's requests, as `PersistentReaderConfig.foreignRounds` for the
+   * persistent subconscious: `'transcript'` (the default), a line per tool
+   * call and per result and none of their thinking, or `'raw'`, as stored.
+   * Unread for an agent that observes no one.
+   */
+  foreignRounds?: 'transcript' | 'raw';
 }
 
 /** The intentionally small set of agent settings that may change in-process. */
@@ -326,7 +611,8 @@ export interface InferenceOptions {
  * `supportsInjectedMessages` is what the stream declared with the round's
  * tool calls (membrane's `ToolContext.supportsInjectedMessages`): whether it
  * can carry messages injected with that round's results. It's absent when
- * the stream doesn't say, as on membrane 0.5.87 and earlier.
+ * the stream doesn't say, which reads as a stream that can't, and when there
+ * is no stream, as for the direct API.
  */
 export type AgentState =
   | { status: 'idle' }
@@ -371,10 +657,19 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
-  /** Host-owned: this wake's sole cause is reading this deferred write, a
-   *  coalesced render placed in its agent's queue (wakeToRead). Once the
-   *  agent has read the write, or it was removed, the wake starts no turn. */
-  readsDeferredWrite?: string;
+  /** Host-owned: this wake's sole cause is this row, by the stored row's
+   *  id: one stored for its agent as it arrived, or one stored and not
+   *  presented to its agent at its write, because a turn of the agent's was
+   *  alive: a coalesced render its turn being assembled doesn't read
+   *  (wakeToRead), or a message, notice or event whose wake was queued with
+   *  it. Once a request that carried the row was answered (an answered
+   *  request's consumed watermark covers it, in the agent's window once its
+   *  context presents rows) and, for a wake that carries a channel and isn't
+   *  marked `ambient`, the agent has since published into that channel
+   *  having read it, or once the row is not on its store's current branch,
+   *  the wake starts no turn. A row stored and not yet presented to the
+   *  agent keeps its wake. */
+  readsRow?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -385,11 +680,42 @@ export interface InferenceRequest {
    * the turn's auto-published plain-text speech here so a single TRUNK agent
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
-   * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel, except an
+   * redux). Undefined for non-channel wakes (heartbeat, timers, module events).
+   * A heartbeat's turn takes no channel at all, and holds its plain speech as
+   * drafts; any other falls back to the global default channel, except an
    * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
+  /**
+   * The server of `channelId`'s channel. MCPL requires a channel id to be
+   * unique only within one server's connection (§14.2), so where two
+   * servers register the same id only the pair names one channel. The
+   * framework's own wakes set it beside `channelId`. A host's request that
+   * gives `channelId` alone names the one channel that id, or its
+   * server-qualified name (`serverId:channelId`), means; one that two
+   * servers' channels answer to names none, and the turn's speech has no
+   * channel of its own.
+   */
+  channelServerId?: string;
+  /**
+   * Framework-set: this wake carries an autoContinue continuation
+   * (AgentConfig.autoContinue), with what its `[continue]` row says. The
+   * scheduler keeps the mark on the turn's trigger only when the
+   * continuation is that turn's whole cause, and the turn writes the row as
+   * it starts. Hosts don't set it.
+   */
+  autoContinueRun?: AutoContinueRun;
+  /**
+   * Framework-set: whether this wake's turn is a heartbeat's, which has no
+   * channel and holds its plain speech as drafts. True on a wake that
+   * continues a heartbeat's turn with no channel of its own (an autoContinue
+   * continuation, a bounce's resend wake, a ` !` continuation, and a re-arm,
+   * which copies its trigger), and on a merged batch whose causes include a
+   * heartbeat's wake and name no channel; false on a merged batch with none,
+   * so the batch's first request doesn't decide it. Unset, a wake is a
+   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it.
+   */
+  heartbeatTurn?: boolean;
   /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
@@ -398,6 +724,26 @@ export interface InferenceRequest {
    * not capture the agent's voice just by being newest.
    */
   addressed?: boolean;
+  /**
+   * Host-owned: true when the triggering message's server marked it ambient
+   * (`chat:ambient`). A coalesced push's wake carries it only to read a
+   * render, and only when every notice the render stands for was. Such a
+   * message asked nothing of the agent, so a wake for it that carries
+   * `readsRow` is dropped once a request that carried the message
+   * was answered, with no publish asked of the agent. A message with neither
+   * tag is in doubt, and is judged as an addressed one.
+   */
+  ambient?: true;
+  /**
+   * Host-owned: true when the triggering message's server marked it a
+   * `chat:system` notice (RFC-001 rev 3): an event about the place, such as
+   * a join or the weather changing, not something anyone said. Such a wake
+   * names no channel for its turn's plain speech, though it carries
+   * `channelId`: a turn it starts alone resolves its locus as a heartbeat's
+   * does. Like an ambient one, a wake to read it is done once read. Never
+   * set on a coalesced render's wake, which may fold messages too.
+   */
+  systemNotice?: true;
   /**
    * Who spoke the message that triggered this inference, as an adapter-
    * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display
@@ -416,8 +762,36 @@ export interface InferenceRequest {
    * channel (ambient-only batches leave it unset).
    */
   wakeChannelId?: string;
+  /**
+   * Framework-set on a gate wake whose batch held no message that addressed
+   * the agent, and which so took no route: the channels its messages came
+   * from (a `chat:system` notice names none, unless it's a coalesced
+   * render's latest occurrence), each once. A start merged from several
+   * requests carries every one's channels, or, when any of them comes from
+   * outside the framework, isn't a silent heartbeat tick and brought
+   * channels, only those requests' channels. A request a quiesce keeps in
+   * another's place, and one a provider hold takes another into, carry both
+   * requests' channels.
+   * The framework's own wakes that continue a
+   * turn (a restart, a re-inference, a continuation, a retry, a bounce, a
+   * re-arm), unless its own wake named a channel that resolves to none,
+   * carry the channels the turn's starts gathered, whether or not the turn
+   * had a locus, so a turn's trigger can name channels from several batches,
+   * and a turn they open with no locus can name them too.
+   * When such a turn's plain speech, or a sleep's announcement, is routed
+   * with no locus, the agent is told these channels, unless the turn's own
+   * wake named a channel that resolves to none, or the turn is an ephemeral
+   * run's, which is told nothing.
+   */
+  wakeChannels?: Array<{ serverId: string; channelId: string }>;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
+  /** Batched-wake lines the gate handed to this wake rather than wrote
+   *  (WakeLine), decided by a fresh start of its turn as WakeLine says: each
+   *  written once into the window it names, or left for a later fresh start
+   *  of the same wake. A retry, or a start that resumes a logical turn,
+   *  decides none. */
+  wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;

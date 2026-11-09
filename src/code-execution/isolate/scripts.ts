@@ -26,11 +26,14 @@
  * dispatcher a script's calls go through, and how to wake an agent.
  */
 
+import { NOTICE_TAG } from '../../notice-tags.js';
 import { ChildCapacity, ScriptRun, type CallAnswer, type Ending, type ScriptRunOptions, type ToolAnswer } from './runner.js';
 import type { CallSummary } from './calls.js';
+import type { ReadMark } from '../../read-marks.js';
 import type { OutputBounds, OutputWindow } from './output.js';
 import type { PreludeTool } from './prelude.js';
 import { glimpse } from './render.js';
+import { quotedJson, suppliedValue } from '../../supplied-text.js';
 
 /** The run or wait call watching a script: its turn, which the script's calls carry, and whether one of them ended that turn. */
 export interface ScriptWatch {
@@ -46,6 +49,10 @@ export interface ScriptCallContext {
   watch?: ScriptWatch;
   /** The call watching the script now, if one is: a result that ends the turn ends it at that call's return. Without it, `watch`. */
   watching?(): ScriptWatch | undefined;
+  /** The turn the script's run call was made in, when one was: the turn its words were written in, which a later turn's wait doesn't change. */
+  startTurnId?: number;
+  /** What its agent had read when the run call started the script (the host's consumed watermark), given at run: what the script's words were written having read, which a later round's wait doesn't change. */
+  startReadThrough?: ReadMark | null;
 }
 
 export interface ScriptsHost {
@@ -113,7 +120,7 @@ interface Script {
   /** The code it runs. */
   code: string;
   run: ScriptRun;
-  context: { origin?: unknown };
+  context: { origin?: unknown; startReadThrough?: ReadMark | null };
   /** The turn its run call was made in, when one was: its agent's turns end it by that. */
   turnId: number | undefined;
   startedAt: number;
@@ -176,7 +183,7 @@ export class AgentScripts {
     agentName: string,
     code: string,
     askedMs?: number,
-    options: { origin?: unknown; watch?: ScriptWatch } = {},
+    options: { origin?: unknown; watch?: ScriptWatch; startReadThrough?: ReadMark | null } = {},
   ): Promise<ScriptReturn> {
     // Listed first, so a module whose tool list throws refuses the run with nothing taken.
     let tools: readonly PreludeTool[];
@@ -202,7 +209,10 @@ export class AgentScripts {
       agentName,
       code,
       run: null as unknown as ScriptRun,
-      context: options.origin === undefined ? {} : { origin: options.origin },
+      context: {
+        ...(options.origin === undefined ? {} : { origin: options.origin }),
+        ...(options.startReadThrough === undefined ? {} : { startReadThrough: options.startReadThrough }),
+      },
       turnId: options.watch?.turnId,
       startedAt: Date.now(),
       endedAt: null,
@@ -231,6 +241,7 @@ export class AgentScripts {
           ...script.context,
           ...(script.watch ? { watch: script.watch } : {}),
           watching: () => script.watch ?? undefined,
+          ...(script.turnId !== undefined ? { startTurnId: script.turnId } : {}),
         }),
       onWake: (payload, n) => this.wake(script, payload, n),
       onEnd: (ending) => this.ended(script, ending),
@@ -351,6 +362,30 @@ export class AgentScripts {
     return [...this.scripts.values()].filter((s) => s.agentName === agentName && !s.gone && !s.run.ended).length;
   }
 
+  /**
+   * The marks this agent's running scripts started with (their
+   * `startReadThrough`), which each one's sends are credited with having
+   * read: a redo on the agent's window gives them again, as it gives the
+   * agent's own (Agent.heldReadMarks), over the rows it puts back.
+   */
+  readMarksOf(agentName: string): ReadMark[] {
+    const marks: ReadMark[] = [];
+    for (const s of this.scripts.values()) {
+      const mark = s.context.startReadThrough;
+      if (mark && s.agentName === agentName && !s.gone && !s.run.ended) marks.push(mark);
+    }
+    return marks;
+  }
+
+  /** Put each mark `replacements` maps in place of the start mark of this agent's scripts that hold it (readMarksOf), as Agent.replaceReadMarks does the agent's own: their later calls carry it. */
+  replaceReadMarks(agentName: string, replacements: ReadonlyMap<ReadMark, ReadMark>): void {
+    for (const s of this.scripts.values()) {
+      const mark = s.context.startReadThrough;
+      const next = mark && s.agentName === agentName ? replacements.get(mark) : undefined;
+      if (next) s.context.startReadThrough = next;
+    }
+  }
+
   /** Running scripts that no call is watching: those acting outside any turn. */
   leftRunning(): number {
     return [...this.scripts.values()].filter((s) => !s.run.ended && s.watch === null).length;
@@ -464,16 +499,16 @@ export class AgentScripts {
 
 function leftEndingText(scriptId: string, ending: Ending): string {
   const how = ending.how === 'failed'
-    ? `failed: ${ending.error.name ? `${ending.error.name}: ` : ''}${glimpse(ending.error.message, 300)}`
+    ? `failed: ${ending.error.name ? `${suppliedValue(ending.error.name)}: ` : ''}${suppliedValue(glimpse(ending.error.message, 300))}`
     : ending.how === 'crashed'
-      ? `crashed: ${ending.detail}`
+      ? `crashed: ${suppliedValue(ending.detail)}`
       : ending.how === 'stopped'
-        ? ending.why ? `was stopped: ${ending.why}` : 'was stopped at its limit'
+        ? ending.why ? `was stopped: ${suppliedValue(glimpse(ending.why, 300))}` : 'was stopped at its limit'
         : 'ended';
-  return `[script ${scriptId}] Your script ${how}. {"action": "wait", "script_id": "${scriptId}"} gives its result.`;
+  return `[${NOTICE_TAG.script} ${scriptId}] Your script ${how}. {"action": "wait", "script_id": "${scriptId}"} gives its result.`;
 }
 
 function wakeText(scriptId: string, payloadJson: string, n: number, max: number, ageMs: number): string {
   const minutes = Math.round(ageMs / 60_000);
-  return `[script ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${payloadJson}`;
+  return `[${NOTICE_TAG.script} ${scriptId}] Woke you with wake_agent(), ${minutes} min after it started (wake ${n} of ${max}): ${quotedJson(payloadJson)}`;
 }

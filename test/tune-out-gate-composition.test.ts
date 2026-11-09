@@ -26,6 +26,9 @@ function harness(opts?: { privileged?: boolean }) {
   const wakes: string[] = [];
   const acks: string[] = [];
   const registry = {
+    // Each channel's id is unique here, so it's shown by its id.
+    nameShown: (channel: { channelId: string }) => channel.channelId,
+    quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
     getTuneOutState: () => ({ params: PARAMS, wakeCount: 0 }),
     recordTuneOutWake: () => ({ params: PARAMS, wakeCount: 1 }),
     listChannelsRaw: () => [],
@@ -64,11 +67,15 @@ describe('duration expiry', () => {
   it('an expired deadline at resume cancels immediately via the standard flow', () => {
     const cancels: string[] = [];
     const registry = {
+      // Each channel's id is unique here, so it's shown by its id.
+      nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: '#a' } }],
       getTuneOutState: () => ({
         params: { ...PARAMS, expiresAtMs: Date.now() - 5_000 },
         wakeCount: 0,
       }),
+      readCoordinatorState: () => null,
       cancelTuneOut: (_s: string, c: string) => {
         cancels.push(c);
         return { params: PARAMS, wakeCount: 0 };
@@ -96,8 +103,11 @@ describe('duration expiry', () => {
   it('a live deadline arms a timer that cancels on schedule', async () => {
     const cancels: string[] = [];
     const registry = {
+      // Each channel's id is unique here, so it's shown by its id.
+      nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
-      getTuneOutState: () => null,
+      getTuneOutState: (_s: string, c: string) => (c === '#a' && !cancels.includes(c) ? { params: PARAMS, wakeCount: 0 } : null),
       enterTuneOut: () => {},
       cancelTuneOut: (_s: string, c: string) => {
         cancels.push(c);
@@ -131,8 +141,12 @@ describe('duration expiry', () => {
   it('enter() stamps expiresAtMs only when durationSeconds is given', () => {
     const entered: TuneOutParams[] = [];
     const registry = {
+      // Each channel's id is unique here, so it's shown by its id.
+      nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
+      readCoordinatorState: () => null,
       enterTuneOut: (_s: string, _c: string, p: TuneOutParams) => { entered.push(p); },
     } as unknown as ChannelRegistry;
     const hooks = {
@@ -163,6 +177,9 @@ describe('duration expiry', () => {
 describe('dispositions injection', () => {
   function dispositionHarness() {
     const registry = {
+      // Each channel's id is unique here, so it's shown by its id.
+      nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
       readCoordinatorState: () => null,

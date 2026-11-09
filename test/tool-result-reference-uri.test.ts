@@ -1,9 +1,12 @@
 /**
  * A tool result's data never reaches the agent, or its history, with an
  * RFC-005 reference's uri, wherever in the data it sits: data that isn't a
- * content array of blocks the serializer recognizes is written as JSON with
- * each reference as its stub and inline data claiming a uri or a disposition
- * withheld. Everything else in it is written as JSON writes it, as before.
+ * string or a content array of blocks the serializer recognizes is written
+ * as JSON with each reference as its stub and inline data claiming a uri or
+ * a disposition withheld. Everything else in it is written as JSON writes
+ * it, as before. MCP's resource_link is a reference too, and where the host
+ * can't fetch one, as with no server, it shows its uri, the agent's only
+ * handle on it, unless the uri may carry a credential.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,12 +14,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import { convertBlock } from '../src/mcpl/convert-block.js';
 import { answerText, scriptCall } from './helpers/script-call.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
 import { keptWhenWithheld } from '../src/tool-result-guard.js';
-import { classifyBlock } from '../src/mcpl/references.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const SIGNATURE = 'zz-secret-signature';
@@ -101,7 +104,6 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     const array = toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, block]);
     assert.equal(array, toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, { type: 'image', data: BASE64, mimeType: 'image/png' }]));
     assert.ok(!array.includes(SIGNATURE), array);
-    assert.deepEqual(classifyBlock(block), { kind: 'inline', contradiction: false });
     // A null or empty uri is none: inline data beside it isn't a claim.
     const nullUri = { type: 'audio', data: BASE64, mimeType: 'audio/wav', uri: null };
     assert.equal(toolResultDataToHistoryString({ clip: nullUri }), JSON.stringify({ clip: nullUri }));
@@ -121,9 +123,25 @@ describe('data the serializer doesn\'t read as content blocks', () => {
   });
 
   it('writes data with nothing RFC-005 governs exactly as JSON does', () => {
-    const plain = [{ id: 1, url: URI, type: 'zz-record' }, { type: 'resource_link', uri: URI, name: 'zz' }, 'zz', 7, null];
+    const plain = [{ id: 1, url: URI, type: 'zz-record' }, 'zz', 7, null];
     assert.equal(toolResultDataToHistoryString(plain), JSON.stringify(plain));
     assert.equal(toolResultDataToHistoryString({ a: 1 }), '{"a":1}');
+  });
+
+  it("governs MCP's resource_link at any depth: one the host can't fetch shows its uri only where it can't carry a credential", () => {
+    // References (RFC-005 §8.1) with no server, as a module's are. A link's
+    // uri is the agent's only handle on it, so it stays where it can't carry
+    // a credential, as the JSON showed it; a resource's never shows.
+    const signed = { type: 'resource_link', uri: URI, name: 'zz.pdf', mimeType: 'application/pdf' };
+    const plainUri = 'https://zz-files.example/plain.pdf';
+    const plainLink = { ...signed, uri: plainUri };
+    const text = toolResultDataToHistoryString([{ id: 1, type: 'zz-record' }, signed, 'zz', RESOURCE, plainLink]);
+    assert.ok(!text.includes(SIGNATURE), text);
+    const [record, signedShown, plain, stub, plainShown] = parsed(text) as [unknown, string, string, string, string];
+    assert.deepEqual([record, plain], [{ id: 1, type: 'zz-record' }, 'zz']);
+    assert.match(signedShown, /^\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result — it's not tied to any server/);
+    assert.match(stub, STUB);
+    assert.equal(plainShown, `[resource link "zz.pdf": ${plainUri}, application/pdf; not fetched]`);
   });
 
   it('writes a record that only shares a type name, with no uri and no string data, as JSON does', () => {
@@ -146,7 +164,8 @@ describe('data the serializer doesn\'t read as content blocks', () => {
 
   it("governs MCP's embedded resource, whose uri sits under resource, at any depth", () => {
     const embedded = { type: 'resource', resource: { uri: URI, mimeType: 'application/pdf', blob: BASE64 } };
-    const line = '[Reference not shown: it arrived without a link.]';
+    // Its contents show as the block they make, and a pdf's data is no block any lane shows.
+    const line = "[Resource not shown: this host can't display its data (application/pdf, 24B).]";
     const nested = toolResultDataToHistoryString({ result: { content: [embedded] } });
     assert.ok(!nested.includes(SIGNATURE) && !nested.includes(BASE64), nested);
     assert.deepEqual(parsed(nested), { result: { content: [line] } });
@@ -167,8 +186,9 @@ describe('data the serializer doesn\'t read as content blocks', () => {
       numeric: '[Image not shown: it arrived with no usable data or link.]',
       both: '[Audio not shown: it arrived with no usable inline data.]',
     });
-    // A media block with neither reads as it does with fields that aren't strings.
-    assert.deepEqual(classifyBlock({ type: 'image' }), { kind: 'invalid', shown: '[Image not shown: it arrived with no usable data or link.]' });
+    // On the push lane, a media block with neither reads as it does with
+    // fields that aren't strings.
+    assert.deepEqual(convertBlock({ type: 'image' } as never, 'p', 's'), { type: 'text', text: '[Image not shown: it arrived with no usable data or link.]' });
   });
 
   it("leaves a nested reference's stub out of save_recent_image's inventory, as main left the reference", () => {

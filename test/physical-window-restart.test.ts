@@ -55,15 +55,19 @@ class QueuedStreamsMembrane extends MockMembrane {
   }
 }
 
+/** A tool whose result is the data given: by default a 30,000-character
+ *  blob, or the blocks of a content array, such as an image beside what a
+ *  test puts there. */
 class BlobToolModule implements Module {
   readonly name = 'canned';
+  constructor(private readonly result: Pick<ToolResult, 'data' | 'dataIsContent'> = { data: { blob: 'x'.repeat(30_000) } }) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
-    return { success: true, data: { blob: 'x'.repeat(30_000) } };
+    return { success: true, ...this.result };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
     if (event.type === 'external-message') {
@@ -84,7 +88,7 @@ const image = (): ContentBlock => ({ type: 'image', source: { type: 'base64', da
 /**
  * A tool whose first call brings in a message with the given blocks beside
  * a line of text while it runs, as someone sending photos mid-turn does.
- * The framework holds the message, and the next round carries it as a
+ * The framework stores the message, and the next round carries it as a
  * mid-turn injection. Later calls bring in nothing.
  */
 class PhotosDuringToolModule implements Module {
@@ -111,12 +115,15 @@ class PhotosDuringToolModule implements Module {
         content: [{ type: 'text', text: PHOTOS_TEXT }, ...this.blocks],
         metadata: {},
       } as unknown as ProcessEvent);
-      // The call returns once the framework holds this message for the
-      // round's boundary.
-      const held = () => (framework as unknown as { deferredMessages: Array<{ content: ContentBlock[] }> }).deferredMessages
-        .some((m) => m.content.some((b) => b.type === 'text' && b.text === PHOTOS_TEXT));
+      // The call returns once the framework has stored this message, out of
+      // the live turn's window until the round's boundary presents it (#291;
+      // it once waited in the deferred queue).
+      const cm = (framework as unknown as { deliveryAgent(): { getContextManager(): { getAllMessages(): Array<{ content: ContentBlock[] }> } } })
+        .deliveryAgent().getContextManager();
+      const held = () => cm.getAllMessages()
+        .some((m) => m.content.some((b) => b.type === 'text' && (b as { text?: string }).text === PHOTOS_TEXT));
       for (const end = Date.now() + 5_000; !held();) {
-        if (Date.now() > end) throw new Error('the message was never held for the boundary');
+        if (Date.now() > end) throw new Error('the message was never stored for the boundary');
         await new Promise((r) => setTimeout(r, 5));
       }
     }
@@ -427,6 +434,55 @@ describe('physical-window mid-turn restart (issue #92)', () => {
   // pin it whole.
   const APPENDED = 6_049;
 
+  it("counts an embedded resource's image as the image it's sent as", async () => {
+    // A 170k prompt with 2k output and the 32k reserve crosses the window
+    // whatever the round adds, so each turn restarts once and its projection
+    // shows what the image round added: the same for an MCP image block and
+    // for an embedded resource's image blob, each sent as a native image.
+    const png = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+    const projected = async (blocks: unknown[]) => {
+      const t = await windowTurn([
+        [
+          round('call_1', { inputTokens: 20_000, cacheReadTokens: 150_000, outputTokens: 2_000 }),
+          round(null, { inputTokens: 21_000, cacheReadTokens: 300_000, outputTokens: 2_500 }),
+        ],
+        afterRestart,
+      ], new BlobToolModule({ data: blocks, dataIsContent: true }));
+      try {
+        assert.ok(t.done, 'the turn should finish');
+        assert.strictEqual(t.restarts.length, 1);
+        return t.restarts[0]!.inputTokens!;
+      } finally {
+        await t.close();
+      }
+    };
+    const image = { type: 'image', data: png, mimeType: 'image/png' };
+    const inline = await projected([image]);
+    const embedded = await projected([{ type: 'resource', resource: { uri: 'file:///zz/shot.png', mimeType: 'image/png', blob: png } }]);
+    assert.ok(inline >= 170_000 + 2_000 + 32_000 + 1_600, String(inline));
+    assert.strictEqual(embedded, inline);
+    // An image whose result's markers pass the cap together goes as the
+    // stored text (goesNative), so it adds nothing beyond that text: the
+    // projection counts the images the live copy sends, not the ones the
+    // data holds. 400 embedded pdfs' markers, 77 characters each, pass the
+    // default cap of 24,000; the same markers alone project within a few
+    // tokens of them beside the image, where 1,600 for the image would show.
+    const pdf = { type: 'resource', resource: { uri: 'file:///zz/doc.pdf', mimeType: 'application/pdf', blob: png } };
+    const markers = Array.from({ length: 400 }, () => pdf);
+    const besideImage = await projected([image, ...markers]);
+    const alone = await projected(markers);
+    assert.ok(Math.abs(besideImage - alone) < 100, `${besideImage} beside the image, ${alone} alone`);
+    // Beside an image the live copy goes natively, each text block cut at
+    // the cap on its own, so each embedded text counts as the text sent, not
+    // as the stored copy, which is cut at the cap once (Ada-1017, room-203
+    // #207161): a second 30,000-character text adds about the cap's 6,000
+    // tokens more.
+    const text = { type: 'resource', resource: { uri: 'file:///zz/notes.txt', mimeType: 'text/plain', text: 'z'.repeat(30_000) } };
+    const one = await projected([image, text]);
+    const two = await projected([image, text, text]);
+    assert.ok(two - one > 5_000, `${two} with two texts, ${one} with one`);
+  });
+
   it('counts a cache-write prompt term toward a restart', async () => {
     // 10k fresh + 30k cache write + 120k cache read = a 160k prompt; with 2k
     // output, the appended round and the 32k reserve it projects to 200,049.
@@ -634,11 +690,19 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
   });
 
-  it("prices a mid-turn image at its tokenEstimate stamp", async () => {
+  // Since #291 a message is stored at once and a boundary injects the stored
+  // copy, and the store keeps an inline image as its source alone (no
+  // tokenEstimate stamp: context-manager's blob round trip). So the stamp
+  // reaches no injection, and the image is priced at 1,600, as the store's
+  // later compiles price it; an overestimate, which costs one early restart.
+  // This test once had the stamp price the injection, from the deferral
+  // queue's copy as it was written.
+  it("prices a mid-turn image as the store keeps it: a stamp the stored copy doesn't carry prices nothing", async () => {
     const stamped = { ...image(), tokenEstimate: 100 } as ContentBlock;
-    const { restarted, carried } = await photosRound([stamped, stamped, stamped]);
-    assert.ok(!restarted, 'three images stamped at 100 tokens fit, where three unstamped cross');
-    assert.ok(carried, 'the message rode into the next round');
+    const { restarted, appended, carried } = await photosRound([stamped, stamped, stamped]);
+    assert.ok(restarted, 'three images cross the window, as three unstamped do');
+    assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
+    assert.ok(carried, 'the restarted request carries the message');
   });
 
   for (const stamp of [Number.NaN, -1_600]) {

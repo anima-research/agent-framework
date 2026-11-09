@@ -421,8 +421,10 @@ describe("the conversation router's generation counters", () => {
       f.alwaysRespond();
       await f.framework.runUntilIdle();
       assert.ok(failedWrites.count > 0, "the batch reached its fork's spawn and tried to store the counter");
-      const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): unknown } }).conversationRouter;
-      assert.equal(router.getBinding('chat'), undefined, 'no fork was bound');
+      const router = (f.framework as unknown as {
+        conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): unknown };
+      }).conversationRouter;
+      assert.equal(router.getBinding({ serverId: 'editor', channelId: 'chat' }), undefined, 'no fork was bound');
       assert.equal(f.framework.getAgent(forkAgentName('conversation', 'editor', 'chat', 1)), null);
       assert.equal(store.getStateJson(ROUTER), null);
     } finally {
@@ -452,9 +454,15 @@ describe("the conversation router's generation counters", () => {
       createMockResponse([{ type: 'tool_use', id: 'one', name: 'test--read', input: {} }], 'tool_use'),
       { aborted: true, reason: 'test-abort' },
     ];
+    const unscripted: number[] = [];
+    let calls = 0;
     (f.membrane as unknown as { stream: () => Promise<unknown> }).stream = async () => {
+      calls++;
       const response = responses.shift();
-      assert.ok(response, 'unexpected inference');
+      if (!response) {
+        unscripted.push(calls);
+        throw new Error('unexpected inference');
+      }
       return response;
     };
     try {
@@ -487,6 +495,7 @@ describe("the conversation router's generation counters", () => {
       assert.ok(f.framework.getAgent(forkAgentName('conversation', 'editor', 'chat', 1)));
       assert.ok(f.framework.getAgent(forkAgentName('conversation', 'editor', 'side', 1)));
       assert.deepEqual(store.getStateJson(ROUTER), { generations: { chat: 1, side: 1 } });
+      assert.deepEqual(unscripted, [], 'every inference the framework asked for was one the test scripted');
     } finally {
       write.open();
       await f.close();

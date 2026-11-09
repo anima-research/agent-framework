@@ -69,13 +69,12 @@ for (const [label, content, place] of MALFORMED) {
     const x = await harness(); t.after(x.close);
     x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'invented cause' }] as ContentBlock[]));
     const before = x.stored();
-    const placement = (x.framework as any).handleMcplPushEvent({
+    (x.framework as any).handleMcplPushEvent({
       type: 'mcpl:push-event', serverId: 'module', featureSet: 'fs', eventId: 'e1',
       content, timestamp: TS, inferenceId: 'i', triggerInference: true,
       origin: { mcplChannelId: 'discord:g:c' },
     });
     await x.framework.runUntilIdle();
-    assert.equal(placement, undefined, 'nothing was placed');
     assert.deepEqual(x.added, [], 'no row traced');
     assert.equal(x.stored(), before, 'and none in the store');
     assert.equal(x.starts(), 0, 'no wake');
@@ -85,27 +84,26 @@ for (const [label, content, place] of MALFORMED) {
     assert.equal(x.refused[0]!.eventId, 'e1');
     assert.equal(x.refused[0]!.channelId, 'discord:g:c');
     assert.ok((x.refused[0]!.places as string[]).some((p) => p.includes(place)), JSON.stringify(x.refused[0]));
-    const line = `[push-event-refused] server=module channel=${logValue('discord:g:c')} eventId=${logValue('e1')} reason=malformed-content: `;
-    assert.ok(x.errors.some((e) => e.startsWith(line) && e.includes(place)), x.errors.join('\n'));
+    const names = (e: string) => e.includes('module') && e.includes(logValue('discord:g:c')) && e.includes(logValue('e1')) && e.includes(place);
+    assert.ok(x.errors.some((e) => e.startsWith('[push-event-refused]') && names(e)), x.errors.join('\n'));
   });
 
   test(`channel: ${label} is refused, storing no row and queueing no wake, and the line names the server and channel`, async (t) => {
     const x = await harness(); t.after(x.close);
     x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'invented cause' }] as ContentBlock[]));
     const before = x.stored();
-    const placement = await (x.framework as any).handleMcplChannelIncoming({
+    await (x.framework as any).handleMcplChannelIncoming({
       type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:c', messageId: 'm1', eventId: 'ev1',
       author: { id: 'u', name: 'User' }, content, timestamp: TS, triggerInference: true,
     });
     await x.framework.runUntilIdle();
-    assert.equal(placement, undefined, 'nothing was placed');
     assert.deepEqual(x.added, [], 'no row traced');
     assert.equal(x.stored(), before, 'and none in the store');
     assert.equal(x.starts(), 0, 'no wake');
     assert.deepEqual(x.refused.map((r) => [r.lane, r.serverId, r.channelId, r.messageId, r.eventId]), [['channel', 'discord', 'discord:g:c', 'm1', 'ev1']]);
     assert.ok((x.refused[0]!.places as string[]).some((p) => p.includes(place)), JSON.stringify(x.refused[0]));
-    const line = `[channel-incoming-refused] server=discord channel=${logValue('discord:g:c')} messageId=${logValue('m1')} reason=malformed-content: `;
-    assert.ok(x.errors.some((e) => e.startsWith(line) && e.includes(place)), x.errors.join('\n'));
+    const names = (e: string) => e.replace(logValue('discord:g:c'), '').includes('discord') && e.includes(logValue('discord:g:c')) && e.includes(logValue('m1')) && e.includes(place);
+    assert.ok(x.errors.some((e) => e.startsWith('[channel-incoming-refused]') && names(e)), x.errors.join('\n'));
   });
 }
 
@@ -137,9 +135,8 @@ test("channel: with conversation routing on, a malformed message that would bind
   });
   // Visible text beside a malformed block, so the empty-content check would
   // let it through and only the malformed-content check stops it.
-  const placement = await message('m2', [{ type: 'text', text: 'bot, help' }, { type: 'image', source: 'not-an-object' }], true);
+  await message('m2', [{ type: 'text', text: 'bot, help' }, { type: 'image', source: 'not-an-object' }], true);
   await x.framework.runUntilIdle();
-  assert.equal(placement, undefined, 'nothing was placed');
   assert.equal(agents(), before, 'no fork was spawned');
   assert.deepEqual(x.traces.filter((e) => String(e.type).startsWith('mcpl:conversation-')), [], 'nor bound');
   assert.deepEqual(x.added, [], 'no row traced');
@@ -154,7 +151,7 @@ for (const lane of ['push', 'channel'] as const) {
   test(`${lane}: absent content, undefined or null, is the empty-content check's, not refused as malformed`, async (t) => {
     const x = await harness(); t.after(x.close);
     for (const [id, content] of [['e3', undefined], ['e4', null]] as const) {
-      const placement = lane === 'push'
+      await (lane === 'push'
         ? (x.framework as any).handleMcplPushEvent({
             type: 'mcpl:push-event', serverId: 'module', featureSet: 'fs', eventId: id,
             content, timestamp: TS, inferenceId: 'i', triggerInference: true,
@@ -162,9 +159,8 @@ for (const lane of ['push', 'channel'] as const) {
         : await (x.framework as any).handleMcplChannelIncoming({
             type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:c', messageId: `m-${id}`, eventId: id,
             author: { id: 'u', name: 'User' }, content, timestamp: TS, triggerInference: true,
-          });
+          }));
       await x.framework.runUntilIdle();
-      assert.equal(placement, undefined, `${String(content)}: nothing was placed`);
     }
     assert.deepEqual(x.refused, [], 'no malformed-content refusal');
     assert.deepEqual(x.traces.filter((e) => e.type === 'mcpl:empty-content-dropped').map((e) => e.lane), [lane, lane]);

@@ -63,7 +63,8 @@ export function createServer(opts = {}) {
       const ms = Number(args.ms ?? 1000);
       const signal = ctx?.mcpReq?.signal;
       note('slow-start');
-      signal?.addEventListener('abort', () => note('slow-aborted'));
+      if (signal?.aborted) note('slow-aborted');
+      else signal?.addEventListener('abort', () => note('slow-aborted'));
       if (typeof args.release === 'string') {
         // Held until the test lets it go, so the call stays in flight for as
         // long as the test needs, however slow the machine is, or until the

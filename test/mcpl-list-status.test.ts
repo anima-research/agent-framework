@@ -41,6 +41,7 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
   assert.deepEqual(listed, [{
     id: 'discord',
     connected: true,
+    closedTab: false,
     retrying: false,
     family: 'legacy',
     // The stub never handshook, so no revision is established.

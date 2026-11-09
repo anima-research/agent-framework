@@ -29,7 +29,6 @@ import type {
 } from '../src/index.js';
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
-import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 /** The residence's cap, and the strategy's bound beneath it (1000 tokens, 4 characters each). */
@@ -137,6 +136,12 @@ function storedResults(framework: AgentFramework): Map<string, string> {
   return results;
 }
 
+/** Opens the host's built-in toolset, where module utilities are, for the agent. */
+async function openSettings(framework: AgentFramework): Promise<void> {
+  const opened = await framework.executeToolCall({ id: 'open-settings', name: 'toolsets--open', input: { toolset: 'settings' }, callerAgentName: 'prime' });
+  assert.ok(opened.success, opened.error);
+}
+
 describe('ToolCall.resultMaxChars', () => {
   it("a model's call carries the agent's inline cap, under which its result is stored whole while its round fits the bound", async () => {
     const membrane = new MockMembrane();
@@ -145,11 +150,12 @@ describe('ToolCall.resultMaxChars', () => {
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'call_past', name: 'probe--look', input: { over: 1 } },
-      { type: 'tool_use', id: 'call_utility', name: 'utils', input: { action: 'run', name: 'probe--peek', args: {} } },
+      { type: 'tool_use', id: 'call_utility', name: 'toolsets--act', input: { tool: 'probe--peek', args: {} } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     const { framework, probe, done } = await makeFramework(membrane);
     try {
+      await openSettings(framework);
       framework.pushEvent({
         type: 'external-message',
         source: 'test',
@@ -169,12 +175,15 @@ describe('ToolCall.resultMaxChars', () => {
       assert.equal(stored.get('call_at'), 'x'.repeat(BOUNDED), 'a result of resultMaxChars is stored whole');
       // call_past's round, beside the utility's short result, fits the bound,
       // so each is stored as it would be alone. This framework has no
-      // workspace to spill to, so the store keeps the start: as much as
-      // leaves the notice its room under the bound.
-      assert.equal(stored.get('call_past'),
-        `${'x'.repeat(BOUNDED - TOOL_RESULT_NOTICE_ROOM)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
-        'one character more is cut, its notice within the bound');
-      // A utility run through the utils tool is stored as that call's result.
+      // workspace to spill to, so the store keeps the start.
+      const past = stored.get('call_past')!;
+      const kept = /^x*/.exec(past)![0].length;
+      assert.ok(kept > 0 && kept < BOUNDED + 1, `one character more is cut to its start: kept ${kept}`);
+      assert.equal(past,
+        `${'x'.repeat(kept)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
+        'its notice follows the start');
+      assert.ok(past.length <= BOUNDED, `what is stored fits the cap: ${past.length}`);
+      // A utility run through toolsets--act is stored as that call's result.
       assert.equal(caps.get('call_utility'), BOUNDED);
       assert.equal(probe.calls.find((call) => call.id === 'call_utility')?.name, 'peek');
     } finally {
@@ -187,7 +196,8 @@ describe('ToolCall.resultMaxChars', () => {
     try {
       const { toolUseId } = await framework.puppetToolCall('prime', 'probe--look', {});
       assert.equal(probe.calls.find((call) => call.id === toolUseId)?.resultMaxChars, BOUNDED);
-      const utility = await framework.puppetToolCall('prime', 'utils', { action: 'run', name: 'probe--peek', args: {} });
+      await openSettings(framework);
+      const utility = await framework.puppetToolCall('prime', 'toolsets--act', { tool: 'probe--peek', args: {} });
       const peek = probe.calls.find((call) => call.id === utility.toolUseId);
       assert.equal(peek?.name, 'peek');
       assert.equal(peek?.resultMaxChars, BOUNDED, 'the utility is stored under the cap the puppet stores the pair under');
@@ -203,10 +213,11 @@ describe('ToolCall.resultMaxChars', () => {
     const limit = Math.floor((Math.floor(memoryMaxBytes / 3) - 80) / 6);
     const { framework, probe, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes });
     try {
+      await openSettings(framework);
       const result = await framework.executeToolCall({
         id: 'script', name: 'code_execution', callerAgentName: 'prime', input: { code: [
           'const r = await tools["probe--look"]({ fill: true });',
-          'await tools.utils({ action: "run", name: "probe--peek", args: {} });',
+          'await tools["toolsets--act"]({ tool: "probe--peek", args: {} });',
           'const t = r.content[0].text;',
           'let nul = true;',
           'for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) !== 0) { nul = false; break; }',
@@ -339,11 +350,12 @@ describe('ToolCall.resultMaxChars', () => {
   it('a call made in process carries what its caller put on it, and so does a utility it runs', async () => {
     const { framework, probe, done } = await makeFramework();
     try {
-      const run = { action: 'run', name: 'probe--peek', args: {} };
+      const run = { tool: 'probe--peek', args: {} };
+      await openSettings(framework);
       await framework.executeToolCall({ id: 'bare-look', name: 'probe--look', input: {}, callerAgentName: 'prime' });
       await framework.executeToolCall({ id: 'capped-look', name: 'probe--look', input: {}, callerAgentName: 'prime', resultMaxChars: 4321 });
-      await framework.executeToolCall({ id: 'bare-utility', name: 'utils', input: run, callerAgentName: 'prime' });
-      await framework.executeToolCall({ id: 'capped-utility', name: 'utils', input: run, callerAgentName: 'prime', resultMaxChars: 1234 });
+      await framework.executeToolCall({ id: 'bare-utility', name: 'toolsets--act', input: run, callerAgentName: 'prime' });
+      await framework.executeToolCall({ id: 'capped-utility', name: 'toolsets--act', input: run, callerAgentName: 'prime', resultMaxChars: 1234 });
       const caps = new Map(probe.calls.map((call) => [call.id, call.resultMaxChars]));
       assert.deepEqual([...caps.entries()], [['bare-look', undefined], ['capped-look', 4321], ['bare-utility', undefined], ['capped-utility', 1234]]);
     } finally {

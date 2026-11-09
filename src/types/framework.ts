@@ -6,6 +6,7 @@ import type { ProcessEvent } from './events.js';
 import type { McplServerConfig, InferenceRoutingPolicy } from '../mcpl/types.js';
 import type { ConversationRouterConfig } from '../mcpl/conversation-router.js';
 import type { GateOptions } from '../gate/types.js';
+import type { InferenceBoundsOptions } from '../inference-bounds.js';
 
 // Re-export trace types
 export type { TraceEvent, TraceEventListener } from './trace.js';
@@ -16,6 +17,13 @@ export type { TraceEvent, TraceEventListener } from './trace.js';
 export interface ModuleProcessResponse {
   moduleName: string;
   response: EventResponse;
+  /**
+   * Set when applying the response threw: the operation it threw at, such
+   * as `the edit of <id>`, and the error's message. What the response asked
+   * for before that was applied, that operation may have taken effect in
+   * part or whole, and the rest of it wasn't (EventResponse).
+   */
+  threw?: { at: string; error: string };
 }
 
 /**
@@ -110,6 +118,50 @@ export type ProviderHoldHook = (
 
 export interface FrameworkConfig {
   /**
+   * Dendrite agent lifecycle options.
+   */
+  dendrite?: {
+    /**
+     * When an agent ends while task work it spawned is still running, the
+     * orphan is always told. With this on (the default), the first agent
+     * that could adopt it — its nearest live ancestor, else the primary —
+     * also receives a factual notice, which is what makes the reparenting
+     * offer visible to a model. Turn it off when the host makes adoption
+     * decisions itself from the `dendrite:agent-orphaned` trace.
+     */
+    announceOrphans?: boolean;
+    /**
+     * With a `derivationNotice`, after this many derivations of one kind from
+     * one agent, the line it's given is a count line every so many instead of
+     * a line per fork, so a reader loop that forks a hundred times a session
+     * doesn't fill its source's context with stamps; every derivation still
+     * emits its `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     * Without a `derivationNotice` the source is told nothing.
+     */
+    collapseDerivationNoticesAfter?: number;
+    /**
+     * A host's say over each derivation, ephemeral spawn and resume, before the
+     * agent or its new incarnation exists, given the spec of what is about to
+     * exist (name, kind, spawner, route, inheritance, metadata). A shared
+     * derivation's record then adds the child's branch, and names the
+     * parent's namespace as its own. Return nothing to allow, or `{ refuse }`
+     * with the reason, which the caller gets as the error. The framework
+     * attaches no meaning to the decision: consent, budget, hours, a mind's
+     * standing instruction, a use not yet imagined are all the host's.
+     */
+    beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
+    /**
+     * What an agent is told when something is derived from it. Given the
+     * record, the agent it was derived from and the framework's own line,
+     * return the text to add (that line, or the host's own), or null to add
+     * nothing. Absent, nothing is added: an agent isn't told of derivations
+     * unless the host asks for it. The `dendrite:agent-created` trace is
+     * emitted either way.
+     */
+    derivationNotice?: (record: import('../dendrite/types.js').AgentRecord, from: string, defaultText: string) => string | null;
+  };
+
+  /**
    * The subconscious resident (issue #77): a persistent side-agent that
    * receives diverted traffic from tuned-out channels and reports to the
    * resident in its own voice. See src/tune-out/tools.ts.
@@ -117,9 +169,55 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * IANA zone used only when rendering wall-clock times for the agent.
-   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
-   * then the process zone.
+   * Tune-out settings. Residents are offered `tune_out` only with a reader
+   * (`subconscious`), or while a hold a failed release left is still on
+   * record to check or cancel: a hold nothing summarizes would hand the resident an
+   * undated backlog all at once when it ends. `enabled`, which offered one
+   * without a reader, was removed in 0.33.0: `enabled: true` is refused at
+   * `create` (`false` is still accepted, from JavaScript, and does nothing).
+   */
+  tuneOut?: {
+    /**
+     * Announce the all-except scope in the excepted channel: one bracketed
+     * line under the resident's name when it opens (who, for how long) and
+     * one when it closes. Default true — a hold the room cannot see is the
+     * failure the scope exists to prevent. `false` keeps both quiet.
+     */
+    announce?: boolean;
+  };
+
+  /**
+   * Where a turn's plain prose lands when nothing names a destination
+   * (architecture channel, 2026-10-06: the §3 carve-out accepted by the
+   * residents).
+   *
+   * - `'delivery'` (default): the locus comes from the delivery that woke
+   *   the turn, a conversation fork's home channel, or a channel the agent
+   *   opened during the turn, and past those only from an open all-except
+   *   hold's channel or `unpromptedChannel` (below), each for the turns that
+   *   take it. Incoming traffic never moves it — not between turns, not
+   *   mid-turn. A turn with no such locus keeps its prose private, and says
+   *   so in a `[routing]` notice.
+   * - `'latest-inbound'`: the previous rule. The most recent delivered
+   *   inbound message is a global fallback locus for turns without one, and
+   *   an addressed message injected mid-turn re-pins the turn's locus.
+   *
+   * Held traffic never moves the locus under either rule. Under either, a
+   * turn the agent's own timer starts takes `unpromptedChannel` where it's
+   * set, after an all-except hold's channel and before both rules' own
+   * fallbacks. Neither rule applies to an agent under locked prose routing
+   * (AgentConfig.proseRouting 'locked'): its turns speak at its lock,
+   * whatever arrives.
+   */
+  speech?: {
+    locus?: 'delivery' | 'latest-inbound';
+  };
+
+  /**
+   * IANA zone of the agent's wall clock: it renders wall-clock times for the
+   * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
+   * counted from local midnight here). Stored/protocol timestamps remain
+   * epoch/UTC. Defaults to AGENT_TIMEZONE, then the process zone.
    */
   timeZone?: string;
 
@@ -146,11 +244,51 @@ export interface FrameworkConfig {
   hostModePath?: string;
 
   /**
-   * Branch-independent durable queue of context writes deferred while
-   * quiesced. Defaults to `<storePath>/recovery/deferred-writes.json`; same
-   * rationale and fallback as `hostModePath`.
+   * Where a release before #291 kept its durable queue of deferred context
+   * writes. Defaults to `<storePath>/recovery/deferred-writes.json`; without
+   * either, the store's `framework/deferred-writes` slot. This release keeps
+   * no durable queue: a write is stored when it is made, and enters each
+   * agent's window at that agent's presentation points. Two holds keep a
+   * write in memory instead, and a crash loses it: a live operator surgery
+   * (a rollback, a suppression, a branch switch), until its release stores
+   * it, and an agent's context manager refusing its work after a failed
+   * re-initialization, until a branch move (switchBranch, a rollback or a
+   * suppression) re-initializes it.
+   *
+   * create() reads the record once and stores its writes. A write for an
+   * agent no longer registered goes to the primary when it is a failed
+   * reply, a channel notice its reader could act on, or a module's write
+   * for a run or a fork, and is dropped otherwise, logged. It then rewrites
+   * the record with what it left for the next boot: a write it couldn't
+   * store, or couldn't tell had already landed, with that agent's later
+   * writes. A write the store refuses as malformed is dropped, logged, as an
+   * earlier release's flush dropped it. When the store doesn't sync after
+   * the import, the record is left as it was.
+   *
+   * @deprecated Read once at boot by the deferred-write importer; removed in
+   * the next release.
    */
   deferredWritesPath?: string;
+
+  /**
+   * The Dendrite agent registry's recovery file: its live records and the
+   * results it holds for delivery, written atomically and fsynced, and read
+   * first at boot. Defaults to `<storePath>/recovery/dendrite-registry.json`.
+   * Outside the chronicle for the reason `hostModePath` is: a branch switch
+   * or historical rollback would otherwise take back held results. Set
+   * explicitly when providing an app-owned `store` without `storePath`;
+   * without either, the registry persists only in the branch-local store,
+   * with a warning at create.
+   */
+  agentRegistryPath?: string;
+
+  /**
+   * The registry's ended-record log recovery file (its newest records, as
+   * many as a restart reads). Defaults to
+   * `<storePath>/recovery/dendrite-ended.json`; same rationale and fallback
+   * as `agentRegistryPath`.
+   */
+  agentRegistryEndedPath?: string;
 
   /** Emoji used for branch-awareness markers (default: 💤). */
   discordAwarenessEmoji?: string;
@@ -190,6 +328,30 @@ export interface FrameworkConfig {
   errorPolicy?: ErrorPolicy;
 
   /**
+   * How long a model call may go without progress before it is cut. A
+   * resident's streamed call, and an MCPL server's, gets membrane's progress
+   * bounds where its adapter's stream reports content (Anthropic, Bedrock),
+   * and on every adapter a flat bound from its last provider event: the
+   * larger of a setup term (the larger of `beforeContentMs` and
+   * `betweenEventsMs`) plus the request's `maxTokens` at
+   * `thinkTokensPerSecond`, and `flatMinimumMs`. An auxiliary call
+   * (compression, the reply judge) and an MCPL server's non-streamed call get
+   * a bound on the whole call from its send, the setup term plus that
+   * allowance (the larger of the setup term and `flatMinimumMs` when it
+   * names no `maxTokens`), unless its
+   * caller passed a `progressTimeoutMs` of its own; where an adapter's
+   * `complete()` streams under the hood, membrane renews it at each parsed
+   * provider event. A call a bound cuts fails
+   * with type `timeout`, and on an agent's turn DefaultErrorPolicy gives each
+   * such call one fresh call, except in a turn that re-arms an exhausted one,
+   * where `exhaustedTurnRearmMs` says what a cut does. One setting covers
+   * every agent. `false` sets
+   * none of these bounds. Default: membrane's PROGRESS_BOUNDS and
+   * FLAT_MINIMUM_MS.
+   */
+  inferenceBounds?: false | InferenceBoundsOptions;
+
+  /**
    * Host verdict on a failed inference: "this cannot succeed until later".
    * Consulted before the error policy and before the built-in
    * organization-acceleration classification, for a persistent agent's
@@ -209,6 +371,62 @@ export interface FrameworkConfig {
    * treated as "no hold".
    */
   providerHold?: ProviderHoldHook;
+
+  /**
+   * Delays before a turn whose retries ran out is sent again, in ms (default
+   * `[120000, 480000, 1920000]`: 2, 8 and 32 minutes), or `false` never to.
+   * When a persistent agent's turn ends exhausted on a transient failure (a
+   * server error, an overload, a rate limit, a network failure, or a timeout
+   * membrane marks retryable and not as a deadline it reports as run out, such
+   * as a 408 or a socket's ETIMEDOUT), its trigger is queued again after the
+   * first delay, as a wake of its own. It opens where the exhausted turn's
+   * plain speech was going: its locus, where a message mid-turn may have moved
+   * it, else its trigger channel. Carrying that channel, it ranks as addressed
+   * in a merged wake's choice of channel, so a newer ambient wake from
+   * elsewhere doesn't take it; an autoContinue continuation's still yields its
+   * channel to any wake's, as it does on main; a continuation's, such as a
+   * budget restart's, names no author. A re-arm that would have to guess a
+   * channel isn't sent again: one whose turn was woken for a channel id that
+   * names no one registered channel and never found one, and whose request
+   * names none of its own. A failure that states a wait is held for that wait
+   * first, as any turn's is, and a turn that ends on a deadline, whether the
+   * host set it or membrane marks one as run out (the runtime's or undici's
+   * on a sent request, the Anthropic adapter's watchdogs, or the Anthropic
+   * SDK's timeout, which covers its connect timeout too), isn't re-armed,
+   * save the exception below. Until one of the re-armed turn's rounds has run
+   * or had its tool calls cut off, its failure gets no retries from the error
+   * policy: on another transient failure the next delay follows, until the
+   * list runs out, and a failure of any other kind ends the re-arming. The
+   * one exception is a re-armed turn's send that fails with a deadline marked
+   * as run out, membrane's or a bound the host sets on the call
+   * (`inferenceBounds`), as when a stream stalls. Such a cut counts as a
+   * transient failure, so a turn that ends on it is re-armed as for a
+   * transient failure, unless it follows another such cut with no transient
+   * failure, answered round or message said to the agent between them: two
+   * such cuts in a row end the re-arming, and the second gets no retry from
+   * the error policy, even in a re-armed turn that got partway. A transient
+   * failure or an answered round in any of the agent's turns clears an
+   * earlier cut, and so does a message said to the agent, or the agent's end.
+   * Every such cut counts, including one the error policy retries or a host's
+   * provider hold takes. A wake for the agent while it waits starts its turn
+   * at once, with the re-armed trigger merged in. That turn is the
+   * wake's: the error policy retries its failures. A completed turn starts the
+   * count again, and so does a message said to the agent: not a system message
+   * or notice; not an edit, reaction or deletion, unless an edit is the first
+   * version of a message the agent sees; not a message its own view leaves
+   * out, such as one a tune-out holds from it; and not the agent's own
+   * schedule, the heartbeat's tick or reminder, a self-wake timer it set, or a
+   * script's wake. A notice a module or an MCPL server stores as a message
+   * counts. A message in the residents' shared slot counts for each resident
+   * that reads it. Any other wake leaves the count going on. A re-armed turn's
+   * transient failure writes no `[inference-failed]` marker unless a round of
+   * it ran or had its tool calls cut off; any other failure of it writes one.
+   * Each counts toward the hard-down streak. Ephemeral runs and conversation
+   * forks are never re-armed. The wait and the count are kept in memory:
+   * `stop()` drops them, and so does a restart. The wait isn't a turn, so
+   * `abortInference()` doesn't end it.
+   */
+  exhaustedTurnRearmMs?: number[] | false;
 
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;
@@ -240,8 +458,9 @@ export interface FrameworkConfig {
    * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
    * name, overwritten on collision, retained until the workspace owner
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview
-   * plus the file reference; with no writable mount without an include, the
-   * fallback is explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
+   * plus the file reference; with no writable mount without an include that
+   * keeps its files in the store (not configured direct), the fallback is
+   * explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
    * >= 1000. A resident's own agent_settings value
    * `tool_result_inline_max_chars` (durable, persisted in framework state)
    * takes precedence over this for that agent; the EFFECTIVE cap for every
@@ -275,11 +494,65 @@ export interface FrameworkConfig {
    */
   hostToolClasses?: Record<string, string[]>;
 
-  /** Inference routing policy for server-initiated inference (optional). */
+  /**
+   * Inference routing policy for server-initiated inference (optional): the
+   * model an MCPL server's inference/request runs on. Without one, each such
+   * request is refused with -32603 and a message naming this setting; the
+   * framework doesn't choose a model for a server. A server's effective
+   * grant can still list `inferenceRequest` then, since the grant comes from
+   * what the server advertises and `enabledCapabilities`, not from this
+   * policy. A policy that names no model for a request's feature set (no
+   * override, byFeature or wildcards entry that names one, and an empty
+   * `default`) refuses that request the same way, naming the feature set.
+   */
   inferenceRouting?: InferenceRoutingPolicy;
+
+  /**
+   * The channel for a turn the agent's own timer starts, which no message
+   * prompted: the wake `skip_reply` schedules, or the end of a `sleep`. Plain
+   * speech in locus or hybrid prose routing goes there, and so does
+   * `channel_publish` naming no channel in any prose routing mode but locked,
+   * which servers are told as the turn's default outgoing channel. An
+   * all-except hold's channel still comes first while one is open, and without
+   * the setting such a turn follows `speech.locus`. A turn the framework opens
+   * to continue such a turn that had no locus of its own, as in explicit or
+   * disabled routing, takes it too: a `!` continuation, autoContinue's next
+   * turn, or a bounced reply's wake. No other turn takes it: not one a message
+   * prompted, from a channel, a module, a person at a console or another agent;
+   * not a heartbeat's or a reminder's (its plain speech is held as drafts); not
+   * a conversation fork's or an ephemeral run's; not a locked agent's, which
+   * speaks at its lock or holds its speech as drafts; and not a start merged
+   * from a timer's wake and any other cause. One value, for every agent on the
+   * framework. A registered channel's id, e.g. `discord:{guildId}:{channelId}`,
+   * or, to pick one server's where two register that id,
+   * `{serverId}:{channelId}`. `create()` refuses a value that is neither a
+   * string nor null, or is blank; null reads as not set. A value that names no
+   * registered channel, several, or one its server declared inbound-only, when
+   * a turn would take it, is logged, and logged again only after a turn has
+   * used it since; the turn takes what it would without the setting.
+   * `channel_publish`'s description adds a default for such turns only on a
+   * framework with an event gate, the only one with such turns; on any other
+   * the description is as it is without the setting.
+   */
+  unpromptedChannel?: string | null;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;
+  /**
+   * The heartbeat: the agent's own periodic check-in and reminders, kept by
+   * the framework (src/heartbeat/heartbeat.ts), with the tools
+   * `heartbeat--heartbeat_status`, `heartbeat--heartbeat_configure`,
+   * `heartbeat--heartbeat_trigger`, `heartbeat--reminder_add`,
+   * `heartbeat--reminder_list` and `heartbeat--reminder_cancel`. `true` turns it
+   * on with its defaults; `false`, null or leaving it out leaves it off. Its
+   * wakes go to the gate as heartbeat-mcpl's pushes did, from the server id
+   * `heartbeat`, so the agent's rules decide them and a sleep lets them
+   * through. It replaces the heartbeat-mcpl server, which is refused beside it
+   * (by its id, a heartbeat tool prefix, or its command), at create and at a
+   * runtime connect: both would wake the agent. `importFrom` brings that
+   * server's schedule and reminders along.
+   */
+  heartbeat?: boolean | null | import('../heartbeat/heartbeat.js').HeartbeatOptions;
 
   /**
    * Liveness watchdog: fail hard (and let the supervisor restart) if the main
@@ -378,7 +651,10 @@ export interface InferencePolicy {
  */
 export interface ErrorPolicy {
   /**
-   * Handle an inference error.
+   * Handle an inference error. `attempt` is how many times the turn's
+   * request has failed before this one; for a deadline expiry (a progress
+   * bound's cut, or one membrane marks), how many times that call's request
+   * has expired in a row before this one.
    */
   onInferenceError(
     error: Error,

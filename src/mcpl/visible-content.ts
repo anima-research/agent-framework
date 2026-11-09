@@ -14,31 +14,44 @@
  * a stored message.
  */
 
+import { classifyBlock, NON_STRING_TEXT_PLACEHOLDER } from './references.js';
+
 /**
  * True when `content` holds nothing the model would see: no non-text block,
  * and no text block whose text has a non-whitespace character. Mirrors the
  * request sanitizer, which drops text that is not a string or trims to ''.
- * Accepts MCPL wire blocks and converted membrane blocks alike.
+ * Accepts MCPL wire blocks and converted membrane blocks alike. A wire
+ * block is judged as the block the converter makes of it where that's text:
+ * MCP's embedded resource shows as the block its contents make
+ * (classifyBlock's `embedded`), so one whose contents are blank text holds
+ * nothing to see.
  */
 export function isVisiblyEmptyContent(content: readonly unknown[] | null | undefined): boolean {
   if (!Array.isArray(content)) return true;
   for (const block of content) {
     if (!block || typeof block !== 'object') continue;
     const b = block as { type?: unknown; text?: unknown };
+    const shown = b.type === 'resource' ? embeddedText(b) : undefined;
+    if (shown !== undefined) {
+      if (shown.trim() !== '') return false;
+      continue;
+    }
     if (b.type !== 'text') return false;
     if (typeof b.text === 'string' && b.text.trim() !== '') return false;
   }
   return true;
 }
 
-/**
- * What the converter (convertBlock, on every lane) shows for a text
- * block whose text isn't a string, which only a nonconformant sender writes,
- * so the agent learns that a block was there. It is the host's word, not the
- * sender's, so it never makes content visible (isVisiblyEmptyConversion).
- * The other blocks the converters can't show have theirs in references.ts.
- */
-export const NON_STRING_TEXT_PLACEHOLDER = '[Text not shown: a text part arrived without readable text.]';
+/** The text an embedded resource's contents make, or undefined for any other
+ *  block, an embedded resource shown as anything but text among them. */
+function embeddedText(block: unknown): string | undefined {
+  const c = classifyBlock(block);
+  return c.kind === 'embedded' && c.contents.kind === 'block' && c.contents.block.type === 'text' ? c.contents.block.text : undefined;
+}
+
+// What the converter shows for a text block whose text isn't a string,
+// beside the converters' other markers in references.ts.
+export { NON_STRING_TEXT_PLACEHOLDER };
 
 /** A wire text block whose text isn't a string, which the converter shows as
  *  NON_STRING_TEXT_PLACEHOLDER. */

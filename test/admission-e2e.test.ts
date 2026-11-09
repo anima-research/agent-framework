@@ -1,0 +1,555 @@
+/**
+ * The admission stage (issue #232 §3.5, Dendrite §D): one decision per
+ * inbound event per recipient, taken before any side effect. These are the
+ * #232 gap probes as regression tests — each `it` names the gap it closes.
+ *
+ * Harness: the RFC-006 loopback MCPL server and a mocked model. The event
+ * loop is driven explicitly (`runUntilIdle`), so every wake that is expected
+ * has a scripted response and every wake that is not shows up as a hang-free
+ * `membrane.calls` count. The persistent subconscious is the reader unless a
+ * test says otherwise.
+ */
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { cpSync, existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { GateModule } from './helpers/dendrite.js';
+import type { FrameworkConfig } from '../src/types/framework.js';
+import {
+  type Stored, SUB, internals, textOf, stored, held, has, find, inWindow, AMBIENT, MENTION,
+  incoming, dm, registerOpen, enter, settle, channellessTurnLocus, blockInTool,
+} from './helpers/admission.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+
+/** A module that stores a row for the primary from its start(), as a host's module may. */
+class StartWriter implements Module {
+  readonly name = 'start-writer';
+  async start(ctx: ModuleContext): Promise<void> {
+    ctx.addMessage('user', [{ type: 'text', text: 'written at the module\'s start' } as ContentBlock]);
+  }
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'no tools' }; }
+  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
+}
+
+describe('admission: the hold is decided once, before any side effect', () => {
+  it('gap 1 — tuning out a DM holds the next DM (the push-event lane consults the hold)', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await dm(f, 'dm-0', 'first dm');
+      await f.turn();
+      assert.ok(has(f, 'first dm'));
+      const callsBefore = f.membrane.calls.length;
+      assert.ok(callsBefore >= 1, 'the first DM woke the resident');
+
+      enter(f, 'discord:dm:777');
+      await dm(f, 'dm-1', 'second dm');
+      await settle(f);
+      assert.ok(held(find(f, 'second dm')), 'the second DM carries the hold record');
+      const compiled = await f.framework.getAgent('agent')!.getContextManager().compile();
+      assert.ok(!compiled.messages.some((m) => textOf(m as Stored).includes('second dm')), 'a held DM is not in the resident\'s view');
+    } finally { await f.close(); }
+  });
+
+  it('gap 2 — held traffic never moves the speech locus; under the default rule no inbound traffic does', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      await incoming(f, 'work', 'w1', 'hello from work');
+      await f.turn();
+      assert.ok(has(f, 'hello from work'));
+      // `speech.locus: 'delivery'` (default): a turn nothing delivered into
+      // (a heartbeat here) has no locus — not the last channel that spoke.
+      assert.equal(await channellessTurnLocus(f), null, 'no global latest-inbound locus');
+      assert.ok(has(f, 'no channel'), 'the resident is told their prose stays private');
+
+      enter(f, 'noisy');
+      await incoming(f, 'noisy', 'n1', 'noise');
+      await settle(f);
+      assert.ok(held(find(f, 'noise')));
+      assert.notEqual(internals(f).channelRegistry.getDefaultPublishChannel(), 'noisy', 'held traffic is not "the latest inbound" either');
+      assert.equal(await channellessTurnLocus(f), null);
+    } finally { await f.close(); }
+  });
+
+  it('gap 2 (legacy rule) — `speech.locus: "latest-inbound"`: delivered traffic moves the locus, held traffic does not', async () => {
+    const f = await fixture({ framework: { subconscious: SUB, speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      await incoming(f, 'work', 'w1', 'hello from work');
+      await f.turn();
+      assert.equal(await channellessTurnLocus(f), 'work', 'legacy: the last delivered channel is the fallback locus');
+
+      enter(f, 'noisy');
+      await incoming(f, 'noisy', 'n1', 'noise');
+      await settle(f);
+      assert.equal(await channellessTurnLocus(f), 'work', 'held traffic did not move it');
+    } finally { await f.close(); }
+  });
+
+  it('gap 3 — a debounce policy never queues a held mention; the reader still gets the gate\'s verdict', async () => {
+    const f = await fixture({
+      framework: {
+        subconscious: SUB,
+        gate: { config: { default: 'always', policies: [
+          { name: 'noisy-debounce', match: { scope: ['mcpl:channel-incoming'], channel: 'noisy' }, behavior: { debounce: 60_000 } },
+        ] } },
+      } as Partial<FrameworkConfig>,
+    });
+    try {
+      await registerOpen(f, 'noisy');
+      const gate = internals(f).eventGate!;
+      // Control: not held → the debounce batches the mention, nobody wakes yet.
+      await incoming(f, 'noisy', 'c1', 'hey agent', MENTION);
+      await settle(f);
+      assert.ok(has(f, 'hey agent'));
+      assert.equal(gate.debounceTimers.size, 1, 'control: the gate batched the mention');
+      gate.debounceTimers.forEach((s) => clearTimeout((s as { timer: ReturnType<typeof setTimeout> }).timer));
+      gate.debounceTimers.clear();
+
+      enter(f, 'noisy');
+      await incoming(f, 'noisy', 'h1', 'agent, you there?', MENTION);
+      await settle(f);
+      assert.ok(held(find(f, 'you there')));
+      assert.equal(gate.debounceTimers.size, 0, 'a held mention is not batched for the resident');
+      const coordinator = internals(f).tuneOutCoordinator as unknown as { pendingWakes: Map<string, unknown> };
+      assert.equal(coordinator.pendingWakes.size, 1, 'the reader wake is scheduled: the gate\'s verdict (would wake) reached the coordinator');
+    } finally { await f.close(); }
+  });
+
+  it('gap 4 — the release names non-text blocks instead of dropping them', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      await incoming(f, 'noisy', 'i1', '', AMBIENT, [{ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }]);
+      await incoming(f, 'noisy', 'i2', '', AMBIENT, [
+        { type: 'text', text: 'look at this' },
+        { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
+      ]);
+      await settle(f);
+      assert.equal(stored(f).filter(held).length, 2, 'two held messages');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      const release = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(release, /antra: \[image\]/, 'an image-only message names its image');
+      assert.match(release, /antra: look at this \[image\]/, 'a captioned image keeps both');
+    } finally { await f.close(); }
+  });
+
+  // A held message is stored at once, whatever the resident's turn (#291):
+  // it was deferred behind the turn and stored at its tool boundary, and is
+  // now in the store while the tool still waits, so its reader has it.
+  it('gap 5 — a held message arriving mid-turn is stored at once, not injected into the live turn', async () => {
+    const gate = new GateModule();
+    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy');
+      const { loop } = await blockInTool(f, gate);
+      await incoming(f, 'noisy', 'n1', 'held while acting');
+      await eventually(() => has(f, 'held while acting'), 'held message stored while the tool waits');
+      gate.release('g1');
+      await loop;
+      assert.ok(held(find(f, 'held while acting')), 'stored with the hold record');
+      const injected = f.membrane.lastStream!.receivedToolResultOptions
+        .flatMap((o) => o?.injectedMessages ?? [])
+        .map((m) => JSON.stringify(m.content));
+      assert.ok(!injected.some((s) => s.includes('held while acting')), 'the live turn never saw the held message');
+      const compiled = await f.framework.getAgent('agent')!.getContextManager().compile();
+      assert.ok(!compiled.messages.some((m) => textOf(m as Stored).includes('held while acting')), 'nor does the next compile');
+    } finally { await f.close(); }
+  });
+
+  // A held message arriving mid-turn is stored at once now (#291), so the
+  // release reads it from the record, as it does one stored while quiesced
+  // (the twin below).
+  it('gap 7 — a held message stored mid-turn, before the cancel, is in the release', async () => {
+    const gate = new GateModule();
+    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const { loop } = await blockInTool(f, gate);
+      await incoming(f, 'noisy', 'n1', 'deferred and held');
+      await eventually(() => has(f, 'deferred and held'), 'held message stored mid-turn');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      // The cancel wakes the resident (after this turn) and the reader; the
+      // mock answers every further request so neither wake is left streaming.
+      f.alwaysRespond();
+      gate.release('g1');
+      await loop;
+      const release = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(release, /messages=1/, 'the deferred message is counted');
+      assert.match(release, /antra: deferred and held/, 'and listed');
+    } finally { await f.close(); }
+  });
+
+  // Ported for #291: a write while quiesced is stored at once, where this
+  // test once had the quiesce queue it and the release read the queue.
+  it('gap 7 (quiesce) — a held message stored while quiesced is in a release made during it, stored before the cancel returns, which enters the window at resume', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const epochId = internals(f).channelRegistry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      await f.framework.quiesce();
+      // As admission stores a held message (a quiesce pauses the MCPL data
+      // plane, so this one comes in past it), for the primary.
+      (f.framework as unknown as { addMessage(p: string, c: unknown[], m: Record<string, unknown>): string })
+        .addMessage('antra', [{ type: 'text', text: 'stored while quiesced' }], {
+          tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+        });
+      assert.ok(has(f, 'stored while quiesced'), 'premise: stored at once');
+      assert.deepEqual(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test'), { ok: true });
+      assert.ok(has(f, '<tuned-out-backlog'), 'the release is stored before the cancel returns, while quiesced');
+      assert.equal(inWindow(f, '<tuned-out-backlog'), false, 'and is in no window while quiesced');
+      const release = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(release, /messages=1/, 'the message is counted');
+      assert.match(release, /antra: stored while quiesced/, 'and listed');
+      f.alwaysRespond();
+      await f.framework.resume();
+      await eventually(() => inWindow(f, '<tuned-out-backlog'), 'the release enters the window at resume');
+    } finally { await f.close(); }
+  });
+
+  // docs/dendrite.md: "A cancel that runs stores and syncs its release
+  // before it returns" (commitDeliveries).
+  it('gap 6 — a cancel that runs syncs its release before it returns', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const store = (f.framework as unknown as { store: { sync: () => void } }).store;
+      const sync = store.sync.bind(store);
+      let syncedWithRelease = 0;
+      store.sync = () => { if (has(f, '<tuned-out-backlog')) syncedWithRelease++; sync(); };
+      assert.deepEqual(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test'), { ok: true });
+      assert.ok(syncedWithRelease > 0, 'the store was synced with the release in it before the cancel returned');
+    } finally { await f.close(); }
+  });
+
+  // Review 2, J-AF29: a surgery's hold keeps a write in memory until the
+  // hold's release stores it. A check during the hold reads those writes
+  // beside the record (getSurgeryHeldMessages), as it once read the
+  // deferral queue. A cancel asked for during the hold (its expiry, say)
+  // waits for the release (AF-C-1, below), which stores them before the
+  // cancel runs, so its dump lists them from the record. A dump is made
+  // during the hold only where the writesHeld hook throws and the cancel
+  // goes on, and then reads them beside the record too. Before, the dump
+  // left the message out, and the release stored it under the ended
+  // tune-out's hold, so no resident was ever shown it.
+  it('gap 7 (surgery) — a held message a surgery keeps in memory is counted while held and is in the release of a cancel asked for during the hold', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const epochId = internals(f).channelRegistry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as {
+        addMessage(p: string, c: unknown[], m: Record<string, unknown>): string;
+        reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      };
+      // As admission stores a held message, for the primary.
+      const heldMessage = (t: string) => framework.addMessage('antra', [{ type: 'text', text: t }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      heldMessage('stored before the hold');
+      const release = framework.reserveStoreForSurgery('roll back', 'agent');
+      try {
+        assert.equal(heldMessage('kept by the hold'), '', 'premise: the hold keeps it in memory');
+        assert.ok(!has(f, 'kept by the hold'), 'premise: not stored');
+        assert.equal(coordinator.check().channels.find((c) => c.channelId === 'noisy')?.held, 2, 'a check counts it while held');
+        const peek = coordinator.check({ peek: { serverId: 'editor', channelId: 'noisy' } }).peek ?? [];
+        assert.ok(peek.some((line) => line.includes('kept by the hold')), 'and peeks it');
+        // The tune-out's end time passes while the hold is up: its cancel
+        // waits for the release.
+        assert.ok(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed').ok);
+      } finally {
+        release();
+      }
+      f.alwaysRespond();
+      await f.framework.runUntilIdle();
+      const dump = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(dump, /messages=2/, 'the message the hold kept is counted');
+      assert.match(dump, /antra: stored before the hold\nantra: kept by the hold/, 'and listed, in arrival order');
+      assert.ok(held(find(f, 'kept by the hold')), 'stored at the release, with its hold record, as the dump covers it');
+    } finally { await f.close(); }
+  });
+
+  // AF-C-1: a tune-out's end recorded during a surgery's hold, its release
+  // kept in memory, would leave a crash before the release with neither the
+  // tune-out nor its backlog: the held messages filtered from the resident for
+  // good. So a cancel asked for while the hold keeps writes in memory waits,
+  // the tune-out in force, until the release stores them; then it runs. A
+  // crash during the hold leaves the tune-out in force, its stored messages
+  // held for the next boot's cancel.
+  it('gap 6 (surgery) — a cancel under a surgery hold waits for its release; a crash during the hold leaves the tune-out in force, and a cancel at the next boot releases its backlog', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    const crashed = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
+    try {
+      await registerOpen(f, 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const registry = internals(f).channelRegistry;
+      const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as {
+        addMessage(p: string, c: unknown[], m: Record<string, unknown>): string;
+        reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      };
+      // As admission stores a held message, for the primary.
+      const heldMessage = (t: string) => framework.addMessage('antra', [{ type: 'text', text: t }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      heldMessage('stored before the hold');
+      const release = framework.reserveStoreForSurgery('roll back', 'agent');
+      try {
+        assert.equal(heldMessage('kept by the hold'), '', 'premise: the hold keeps it in memory');
+        // Its end time passes, as armExpiry's cancel, while the hold is up.
+        assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true });
+        assert.ok(registry.getTuneOutState('editor', 'noisy'), 'the tune-out stays in force while the hold keeps writes in memory');
+        assert.equal(has(f, '<tuned-out-backlog'), false, 'no release is stored yet');
+        assert.ok(!(internals(f) as unknown as { surgeryHeldWrites: Array<{ metadata?: { kind?: string } }> }).surgeryHeldWrites
+          .some((write) => write.metadata?.kind === 'tune-out-cancel'), 'nor kept in memory');
+        // The process ends here: the store as its last sync left it, what the hold kept gone with the process.
+        f.framework.getStore().sync();
+        cpSync(join(f.dir, 'store'), join(crashed, 'store'), { recursive: true });
+      } finally {
+        release();
+      }
+      // In this process, the cancel runs once the release has stored the hold's writes.
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
+      const dump = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(dump, /messages=2/, 'the message the hold kept is counted');
+      assert.match(dump, /antra: stored before the hold\nantra: kept by the hold/, 'and listed, in arrival order');
+    } finally { await f.close(); }
+
+    const g = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig>, dir: crashed });
+    try {
+      assert.ok(internals(g).channelRegistry.getTuneOutState('editor', 'noisy'), 'the crash left the tune-out in force');
+      assert.equal(has(g, '<tuned-out-backlog'), false);
+      assert.ok(internals(g).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      const dump = textOf(find(g, '<tuned-out-backlog'));
+      assert.match(dump, /messages=1/);
+      assert.match(dump, /antra: stored before the hold/, 'the backlog reaches the resident');
+      assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'in its window');
+    } finally { await g.close(); }
+  });
+
+  // A write for a primary whose context manager refuses its work after a
+  // failed re-initialization waits in memory too, until the switch that
+  // re-initializes it stores it (heldForRecovery): a tune-out reads those
+  // writes as it reads a surgery's hold, so a check counts the message and a
+  // peek shows it while it waits, and it is stored once, with its hold
+  // record, when the switch recovers the primary.
+  it('gap 7 (recovery) — a held message kept in memory for a primary whose manager refuses its work is counted while kept, and stored once, with its hold record, when a switch recovers it; a cancel asked for meanwhile waits, the tune-out in force, and its release then lists it', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const epochId = internals(f).channelRegistry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as { addMessage(p: string, c: unknown[], m: Record<string, unknown>): string };
+      // As admission stores a held message, for the primary.
+      const heldMessage = (t: string) => framework.addMessage('antra', [{ type: 'text', text: t }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      heldMessage('stored before the failure');
+      const strategy = f.framework.getAgent('agent')!.getContextManager().getStrategy() as unknown as {
+        initialize?: (...args: unknown[]) => Promise<void>;
+      };
+      const initialize = strategy.initialize?.bind(strategy);
+      let failNext = true;
+      strategy.initialize = async (...args: unknown[]) => {
+        if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+        await initialize?.(...args);
+      };
+      const branch = f.framework.getStore().currentBranch().name;
+      await f.framework.switchBranch(branch);
+      assert.equal(heldMessage('kept for the recovery'), '', 'premise: kept in memory, not refused at its writer');
+      assert.ok(!has(f, 'kept for the recovery'), 'premise: not stored');
+      assert.equal(coordinator.check().channels.find((c) => c.channelId === 'noisy')?.held, 2, 'a check counts it while kept');
+      const peek = coordinator.check({ peek: { serverId: 'editor', channelId: 'noisy' } }).peek ?? [];
+      assert.ok(peek.some((line) => line.includes('kept for the recovery')), 'and peeks it');
+      assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true });
+      assert.ok(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), 'the tune-out stays in force while the write waits in memory');
+      assert.equal(has(f, '<tuned-out-backlog'), false, 'no release is stored yet');
+      await f.framework.switchBranch(branch);
+      const copies = stored(f).filter((m) => textOf(m).includes('kept for the recovery') && !textOf(m).includes('<tuned-out-backlog'));
+      assert.equal(copies.length, 1, 'stored once, at the recovery');
+      assert.ok(held(copies[0]!), 'with its hold record');
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), null, 'the cancel ran once the recovery stored the write');
+      const dump = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(dump, /messages=2/, 'its release counts the write the recovery stored');
+      assert.match(dump, /antra: stored before the failure\nantra: kept for the recovery/, 'and lists it, in arrival order');
+    } finally { await f.close(); }
+  });
+
+  // Ported for #291: a release made behind a live turn is stored at once, so
+  // nothing waits in memory for a crash to lose, and no queue file is
+  // written. This test once checked the release was persisted in the
+  // deferral queue's recovery file and re-woke the resident at the boot
+  // that found it; such a file an earlier release left is the importer's
+  // now (deferred-import-boot.test.ts).
+  it('gap 6 — a release made behind a live turn is stored at once, with no queue file, and enters the window once the turn ends', async () => {
+    const gate = new GateModule();
+    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
+    const recovery = join(f.dir, 'store', 'recovery', 'deferred-writes.json');
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const { loop } = await blockInTool(f, gate);
+      await incoming(f, 'noisy', 'n1', 'held before the crash');
+      await eventually(() => has(f, 'held before the crash'), 'held message stored');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      assert.match(textOf(find(f, '<tuned-out-backlog')), /antra: held before the crash/, 'the release is stored while the tool waits');
+      assert.equal(inWindow(f, '<tuned-out-backlog'), false, "out of the live turn's window");
+      assert.equal(existsSync(recovery), false, 'no queue file is written');
+      f.alwaysRespond();
+      gate.release('g1');
+      await loop;
+      await eventually(() => inWindow(f, '<tuned-out-backlog'), 'the release enters the window once the turn ends');
+    } finally { await f.close(); }
+  });
+
+  // The release is stored at once (#291), and made durable by the cancel, but
+  // the wake it asks for is in memory: a process that ends while the
+  // resident's turn is alive, the release still out of its window, owes the
+  // resident that wake at the next boot (AF-6's wakeForUnpresentedTuneOutRows,
+  // where an earlier release restored it from its persisted queue).
+  it('gap 6 — a release stored behind a live turn that a crash cut off re-wakes the resident at the next boot, and its turn reads it', async () => {
+    const gate = new GateModule();
+    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
+    const crashed = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const { loop } = await blockInTool(f, gate);
+      await incoming(f, 'noisy', 'n1', 'held before the crash');
+      await eventually(() => has(f, 'held before the crash'), 'held message stored');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      assert.equal(inWindow(f, '<tuned-out-backlog'), false, "out of the live turn's window");
+      // The process ends here, the turn still alive: the store is what the
+      // cancel's sync left.
+      cpSync(join(f.dir, 'store'), join(crashed, 'store'), { recursive: true });
+      f.alwaysRespond();
+      gate.release('g1');
+      await loop;
+    } finally { await f.close(); }
+
+    const g = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig>, dir: crashed });
+    try {
+      const pending = internals(g).pendingRequests;
+      assert.deepEqual(pending.filter((r) => r.agentName === 'agent' && /tune-out released/.test(r.reason)).length, 1,
+        'the release owes the resident its wake, once');
+      assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'the boot presents it at rest');
+      await g.turn();
+      assert.match(g.lastRequest(), /tuned-out-backlog[^]*antra: held before the crash/, "the wake's turn reads the release");
+    } finally { await g.close(); }
+  });
+
+  it('gap 6 — the next boot keeps the release\'s wake when a module writes at its start, before the boot reads what is owed', async () => {
+    const gate = new GateModule();
+    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
+    const crashed = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const { loop } = await blockInTool(f, gate);
+      await incoming(f, 'noisy', 'n1', 'held before the crash');
+      await eventually(() => has(f, 'held before the crash'), 'held message stored');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      assert.equal(inWindow(f, '<tuned-out-backlog'), false, "out of the live turn's window");
+      cpSync(join(f.dir, 'store'), join(crashed, 'store'), { recursive: true });
+      f.alwaysRespond();
+      gate.release('g1');
+      await loop;
+    } finally { await f.close(); }
+
+    const g = await fixture({ framework: { subconscious: SUB, modules: [new StartWriter()] } as Partial<FrameworkConfig>, dir: crashed });
+    try {
+      assert.ok(has(g, 'written at the module\'s start'), "the premise: the module's start wrote its row");
+      const pending = internals(g).pendingRequests;
+      assert.deepEqual(pending.filter((r) => r.agentName === 'agent' && /tune-out released/.test(r.reason)).length, 1,
+        'the release owes the resident its wake, once');
+      assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'the boot presents it at rest');
+    } finally { await g.close(); }
+  });
+
+  it('a boot asks no wake for a release the resident was shown before the process ended', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    const ended = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
+    try {
+      await registerOpen(f, 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      await incoming(f, 'noisy', 'n1', 'held while idle');
+      await settle(f);
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      assert.equal(inWindow(f, '<tuned-out-backlog'), true, 'presented at rest: no turn of the resident was alive');
+      cpSync(join(f.dir, 'store'), join(ended, 'store'), { recursive: true });
+    } finally { await f.close(); }
+
+    const g = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig>, dir: ended });
+    try {
+      assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'the restarted host loaded the release, presented already');
+      assert.equal(internals(g).pendingRequests.some((r) => /tune-out released/.test(r.reason)), false,
+        'its wake ran or was lost with the process, as before #291');
+    } finally { await g.close(); }
+  });
+
+  it('gap 9 — channel_close on a tuned-out channel is refused: its cancel is what ends the hold, and the release follows', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      await incoming(f, 'noisy', 'n1', 'held before close');
+      await settle(f);
+      assert.equal(stored(f).filter(held).length, 1);
+      // main's rule: a tuned-out channel's decision is the tune-out; a close
+      // recorded over it would end it without its cancel, so the backlog it
+      // diverted would never reach the agent. The close is refused and says so.
+      const result = await f.framework.executeToolCall({ id: 'c1', name: 'channel_close', input: { channelId: 'noisy' }, callerAgentName: 'agent' } as never);
+      assert.equal(result.success, false);
+      assert.match(result.error ?? '', /is tuned out: its messages are held from you and read by Subconscious, and channel_close doesn't change that/);
+      assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'noisy'), 'tuned-out', 'nothing changed');
+      assert.equal(stored(f).filter(held).length, 1, 'the held message is still held');
+      // The cancel ends it, with the release — and the channel can be closed after.
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), null, 'the epoch ended');
+      assert.match(textOf(find(f, '<tuned-out-backlog')), /antra: held before close/, 'the release was delivered');
+      const closed = await f.framework.executeToolCall({ id: 'c2', name: 'channel_close', input: { channelId: 'noisy' }, callerAgentName: 'agent' } as never);
+      assert.ok(closed.success, closed.error);
+      assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'noisy'), 'closed');
+    } finally { await f.close(); }
+  });
+
+  it('without a reader there is no tune-out: no coordinator, no tune_out tool', async () => {
+    const f = await fixture({ framework: { tuneOut: { enabled: false } } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'noisy');
+      assert.equal(internals(f).tuneOutCoordinator, null, 'no reader, no hold machinery');
+      const names = f.framework.getAllTools().map((t) => t.name);
+      assert.ok(names.length > 0, 'premise: the framework lists its tools');
+      assert.ok(!names.includes('tune_out'), 'tune_out is not offered');
+    } finally { await f.close(); }
+  });
+
+  it('gap 8 — the tune_out tool refuses an ambiguous channel id and takes serverId', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'noisy');
+      const i = internals(f);
+      // A second server with the same channel id.
+      i.channelRegistry.channels.set('other:noisy', { serverId: 'other', descriptor: { id: 'noisy', type: 'discord', label: 'noisy' }, open: true });
+      const ambiguous = await i.handleTuneOutTool('agent', { channelId: 'noisy' });
+      assert.equal(ambiguous.success, false);
+      assert.match(ambiguous.error ?? '', /ambiguous|is on more than one server/);
+      const resolved = await i.handleTuneOutTool('agent', { channelId: 'noisy', serverId: 'editor' });
+      assert.ok(resolved.success, resolved.error);
+      assert.ok(i.channelRegistry.getTuneOutState('editor', 'noisy'));
+    } finally { await f.close(); }
+  });
+});

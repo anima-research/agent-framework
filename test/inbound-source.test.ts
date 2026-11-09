@@ -19,6 +19,7 @@ import {
   // The package's public digest: consumers import it from the root.
   sourceBodyDigest,
   PassthroughStrategy,
+  type ChannelRef,
   type InboundSource,
   type Module,
   type ModuleContext,
@@ -29,7 +30,7 @@ import {
   type ToolCall,
   type ToolResult,
 } from '../src/index.js';
-import { ContextManager, MalformedContentError } from '@animalabs/context-manager';
+import { ContextManager, MalformedContentError, blockAsStored } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { canonicalJson } from '../src/mcpl/inbound-source.js';
@@ -113,6 +114,14 @@ describe('inbound source envelope', () => {
   const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
   const storedWith = (pred: (m: Record<string, unknown>) => boolean) =>
     stored().find((m) => pred((m.metadata ?? {}) as Record<string, unknown>));
+  /** The agent closes ROOM, so an addressed push from it comes with the closed-channel invitation. */
+  const closeRoom = async (): Promise<void> => {
+    const registry = (framework as unknown as {
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<{ success: boolean }>; isChannelOpen(channel: ChannelRef): boolean };
+    }).channelRegistry;
+    assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' })).success, true);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: ROOM }), false);
+  };
 
   it('stamps a channels/incoming message with its registered channel, label, reply edge and acceptance time', async () => {
     const before = Date.now();
@@ -132,7 +141,7 @@ describe('inbound source envelope', () => {
     assert.equal(source.serverId, 'discord');
     assert.equal(source.lane, 'channels/incoming');
     assert.equal(source.coalesced, undefined);
-    assert.match(source.binding, /^[0-9a-f]{16}$/);
+    assert.ok(typeof source.binding === 'string' && source.binding.length > 0, 'an endpoint binding, opaque');
     assert.equal(source.channelId, ROOM);
     assert.equal(source.messageId, 'm-1');
     assert.equal(source.label, '#room (Guild One)');
@@ -185,9 +194,12 @@ describe('inbound source envelope', () => {
     const expected = createHash('sha256').update(canonicalJson([[{ type: 'text', text: 'digest me' }]])).digest('hex');
     assert.equal(meta.sourceBodyDigest, expected);
     assert.equal(sourceBodyDigest([{ text: 'digest me', type: 'text' }]), expected, 'key order does not matter');
-    // This lane stores the body as delivered: the stored copy hashes the same.
+    // The stored digest is of the stored copy. On this branch the copy
+    // carries the author as the agent reads them (presentAuthor), so it
+    // hashes the same as the delivered body exactly when presenting the
+    // author changed nothing.
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content));
-    assert.equal(meta.storedBodyDigest, meta.sourceBodyDigest);
+    assert.equal(meta.storedBodyDigest === meta.sourceBodyDigest, sourceBodyDigest(message.content) === meta.sourceBodyDigest);
     // Outside the frozen admission envelope.
     assert.equal((readInboundSource(message.metadata) as unknown as Record<string, unknown>).sourceBodyDigest, undefined);
 
@@ -205,7 +217,7 @@ describe('inbound source envelope', () => {
     // appended after ingestion stamped the delivered digest, at storage
     // time, when the channel has closed in between.
     const registry = (framework as unknown as {
-      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(id: string): boolean };
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(channel: ChannelRef): boolean };
     }).channelRegistry;
     const fw = framework as unknown as { pushEvent(e: { type: string }): void };
     const held: Array<{ type: string }> = [];
@@ -214,7 +226,7 @@ describe('inbound source envelope', () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-closed', mode: 'addressed', text: 'hello while open' });
     await waitFor(() => held.length > 0, 'incoming accepted and held');
     await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' });
-    assert.equal(registry.isChannelOpen(ROOM), false);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: ROOM }), false);
     fw.pushEvent = push;
     for (const e of held) push(e);
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-closed'), 'message stored');
@@ -226,15 +238,28 @@ describe('inbound source envelope', () => {
   });
 
   it('on the push lane, the delivered digest excludes host decoration and the stored digest covers it', async () => {
-    command({ op: 'dm', eventId: 'ev-dig', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'dm stored');
+    // A mention pushed from a channel the agent closed: the host appends its invitation.
+    await closeRoom();
+    command({
+      op: 'push', eventId: 'ev-dig', text: 'psst',
+      origin: { source: 'discord', mcplChannelId: ROOM, messageId: 'pm-dig', authorName: 'antra' },
+      tags: ['chat:mention', 'chat:addressed'],
+    });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'push stored');
     const message = storedWith((m) => m.eventId === 'ev-dig')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'psst' }]), 'the adapter body alone');
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored');
-    // The DM's channel is closed, so the host appends its invitation.
     assert.equal(message.content.length, 2);
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the closed-channel invitation decorates the stored copy');
+    // A DM's channel is closed too, but all of a DM reaches the agent, so
+    // nothing decorates it and its two digests agree.
+    command({ op: 'dm', eventId: 'ev-dm', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dm'), 'dm stored');
+    const dm = storedWith((m) => m.eventId === 'ev-dm')!;
+    const dmMeta = dm.metadata as Record<string, unknown>;
+    assert.equal(dmMeta.channelInvitation, undefined, 'no invitation on a DM');
+    assert.equal(dmMeta.storedBodyDigest, dmMeta.sourceBodyDigest);
   });
 
   it('a visibly-empty ordinary push is refused and stores nothing; an accepted push carries the host\'s digests, never the adapter\'s', async () => {
@@ -254,12 +279,17 @@ describe('inbound source envelope', () => {
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
   });
 
-  it('a DM pushed into a closed channel carries the host\'s digests, never the adapter\'s: the delivered body, and the stored copy with its invitation', async () => {
+  it('a mention pushed from a closed channel carries the host\'s digests, never the adapter\'s: the delivered body, and the stored copy with its invitation', async () => {
+    await closeRoom();
     command({
-      op: 'dm', eventId: 'ev-forged', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst again',
-      origin: { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
+      op: 'push', eventId: 'ev-forged', text: 'psst again',
+      origin: {
+        source: 'discord', mcplChannelId: ROOM, messageId: 'pm-forged', authorName: 'antra',
+        sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value',
+      },
+      tags: ['chat:mention', 'chat:addressed'],
     });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-forged'), 'dm stored');
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-forged'), 'push stored');
     const message = storedWith((m) => m.eventId === 'ev-forged')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.channelInvitation, true, 'stored with the closed-channel invitation');
@@ -585,19 +615,24 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.deepEqual(observed, [stored]);
   });
 
-  it('a channel message deferred mid-turn and stored at the boundary still hashes to its stored digest', async (t) => {
+  // Ported for #291: the message is stored at once while the turn runs, out
+  // of the window, where it was once deferred and stored at the boundary's
+  // flush; its digest is the stored copy's either way.
+  it('a channel message stored mid-turn, out of the window, still hashes to its stored digest', async (t) => {
     const f = await fixture(); t.after(f.close);
     await f.register('chat');
-    const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; flushDeferredWrites(label: string): Promise<void> };
+    const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; presentAtEndOf(agent: unknown): void };
     internals.activeTurnTokens.set('agent', 100);
     await f.send('channels/incoming', { messages: [f.channel('e1', 'deferred_words', { initial: true })] });
-    assert.ok(!f.context().includes('deferred_words'), 'held until the boundary');
+    await eventually(() => f.context().includes('deferred_words'), 'stored while the turn runs');
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const copy = cm.getAllMessages().find((m) => JSON.stringify(m.content).includes('deferred_words'))!;
+    assert.equal(cm.ordinalOf(copy.id), undefined, 'out of the window until the turn ends');
     internals.activeTurnTokens.delete('agent');
-    await internals.flushDeferredWrites('test');
-    const copy = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
-      .find((m) => JSON.stringify(m.content).includes('deferred_words'))!;
+    internals.presentAtEndOf(f.framework.getAgent('agent'));
+    assert.notEqual(cm.ordinalOf(copy.id), undefined, 'in it once the turn has ended');
     const meta = copy.metadata as Record<string, unknown>;
-    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'the copy stored at the boundary matches');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'the stored copy matches');
     assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'deferred_words' }]), 'the delivered body, unchanged');
   });
 
@@ -605,7 +640,8 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close);
     await f.register();
     const forged = { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' };
-    const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
+    const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: ChannelRef): { agentName: string } | undefined; unbind(channel: ChannelRef): void } }).conversationRouter;
+    const chat: ChannelRef = { serverId: 'editor', channelId: 'chat' };
     const check = (text: string, fork: string) => {
       const copy = f.framework.getAgent(fork)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
       assert.ok(copy, `${text} stored in ${fork}`);
@@ -615,13 +651,13 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     };
     // Routed into a fresh fork by the conversation router.
     await f.send('channels/incoming', { messages: [{ ...f.channel('c1', 'routed_original', { initial: true }), metadata: forged }] });
-    const fork = router.getBinding('chat')!.agentName;
+    const fork = router.getBinding(chat)!.agentName;
     check('routed_original', fork);
     // A correction follows the prior delivery into that fork, though the
     // channel is no longer bound to it.
-    router.unbind('chat');
+    router.unbind(chat);
     await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'fork_correction'), metadata: forged }] });
-    assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the correction');
+    assert.equal(router.getBinding(chat), undefined, 'no fresh fork was spawned for the correction');
     check('fork_correction', fork);
   });
 
@@ -662,46 +698,49 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     ({ type: 'image', source: { type: 'base64', data, mediaType }, ...extra });
   const media = (type: string, data: string, mediaType: string, extra: Record<string, unknown> = {}) =>
     ({ type, source: { type: 'base64', data, mediaType }, ...extra });
-  /** Each body, and whether the store hands it back changed. */
-  const bodies: Record<string, { blocks: unknown[]; changed: boolean }> = {
-    'a labeled image': { blocks: [image(png)], changed: false },
-    'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true },
-    'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true },
-    // One fixture per branch of the copied sniffer, each labeled as something
+  const bodies: Record<string, { blocks: unknown[]; changed: boolean; digest: string }> = {
+    'plain text': { blocks: [{ type: 'text', text: 'hello' }], changed: false, digest: '20e8a9654f001815055a7b61692923120a516fc0095519f521c8c821421cb4b9' },
+    'a labeled image': { blocks: [image(png)], changed: false, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true, digest: '828ac28be2d13e7621768ba98ec74d555409d97567f9c05b1a1428e614cf9233' },
+    // One fixture per signature the store sniffs, each labeled as something
     // else, so a context-manager that stops sniffing one fails here.
-    'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
-    'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true },
-    'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
-    'base64 with a newline in it': { blocks: [image(`${png.slice(0, 11)}\n${png.slice(11)}`)], changed: true },
-    'base64 with whitespace around it': { blocks: [image(`  ${png}\n`)], changed: true },
-    'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true },
-    'base64 with non-zero unused bits': { blocks: [image(png.replace(/8=$/, '9='))], changed: true },
-    'base64 in the URL-safe alphabet': { blocks: [image(png.replace(/\//g, '_'))], changed: true },
+    'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e6e7bf5cc2225c979b2063abbe811ba02db8208e49b8315d0cab6565b55631fc' },
+    'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true, digest: 'd7b8b855a4e81d88931ebf4a1d91c76c57da9d79572f523e29de1b9d23143fb1' },
+    'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true, digest: 'e643b5a67e56b99e8c555cd1064bc24ccba134e76a240b99c651934b761a9c72' },
+    'base64 with a newline in it': { blocks: [image(`${png.slice(0, 11)}\n${png.slice(11)}`)], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 with whitespace around it': { blocks: [image(`  ${png}\n`)], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 with non-zero unused bits': { blocks: [image(png.replace(/8=$/, '9='))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'base64 in the URL-safe alphabet': { blocks: [image(png.replace(/\//g, '_'))], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image whose data is not base64': { blocks: [image('not base64 at all!')], changed: true, digest: '75f6aed70407609a42b127029df45b37de6f61019f25c9ed8ea76c904c7ab6ed' },
     // Bytes the store has no signature for keep their label. Labeled
     // image/png, so a context-manager that learns to sniff one fails here.
-    'SVG bytes labeled image/png': { blocks: [image(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'))], changed: false },
-    'BMP bytes labeled image/png': { blocks: [image(Buffer.from('424d3a0000000000000036000000', 'hex').toString('base64'))], changed: false },
-    'AVIF bytes labeled image/png': { blocks: [image(Buffer.from('0000001c6674797061766966000000006d696631', 'hex').toString('base64'))], changed: false },
-    'an image whose source is neither base64 nor a URL': { blocks: [{ type: 'image', source: { type: 'file', data: png, mediaType: 'image/png' } }], changed: true },
-    'an image with fields the store drops': { blocks: [image(png, 'image/png', { sourceUrl: 'https://cdn.example/a.png', tokenEstimate: 85 })], changed: true },
-    'an image by URL, its fields kept': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png' }, sourceUrl: 'https://cdn.example/a.png' }], changed: false },
-    'audio, wrapped, with a duration': { blocks: [media('audio', 'SUQz\nAwAAAAAA', 'audio/mpeg', { duration: 3 })], changed: true },
-    'a document with a filename': { blocks: [media('document', 'JVBERi0xLjQ=', 'application/pdf', { filename: 'a.pdf' })], changed: true },
-    'text with lone surrogates': { blocks: [{ type: 'text', text: 'cut \ud83d here, \ude00 there, \ud83d\ud83d twice' }], changed: true },
-    'a key that is not well-formed': { blocks: [{ type: 'text', text: 'x', rawItem: { 'k\ud800': 1, kept: 2 } }], changed: true },
-    'a relabeled image with a text decoration': { blocks: [image(png, 'image/jpeg'), { type: 'text', text: '[invitation]' }], changed: true },
-    'a video with a duration': { blocks: [media('video', 'AAAAGGZ0eXBtcDQy', 'video/mp4', { duration: 2 })], changed: true },
+    'SVG bytes labeled image/png': { blocks: [image(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'))], changed: false, digest: 'b4f895f137c12d828e3c38d9213f02b8126372824adbca4d49c084b2af7c8a99' },
+    'BMP bytes labeled image/png': { blocks: [image(Buffer.from('424d3a0000000000000036000000', 'hex').toString('base64'))], changed: false, digest: '8b4d4b8cd7ad44bebd5612eccb4119fca58cf99179217dc5598fae0910c6cf4e' },
+    'AVIF bytes labeled image/png': { blocks: [image(Buffer.from('0000001c6674797061766966000000006d696631', 'hex').toString('base64'))], changed: false, digest: '29ee62d0947b86ae92afc97520104f1df0971bef0cdc42f896f84238862bf0c7' },
+    'an image whose source is neither base64 nor a URL': { blocks: [{ type: 'image', source: { type: 'file', data: png, mediaType: 'image/png' } }], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image with fields the store drops': { blocks: [image(png, 'image/png', { sourceUrl: 'https://cdn.example/a.png', tokenEstimate: 85 })], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image by URL, its fields kept': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png' }, sourceUrl: 'https://cdn.example/a.png' }], changed: false, digest: '86c0304289fb63c7aa9c553bb4f74715e41f48dd3369c2a9d3036264436deb37' },
+    'audio, wrapped, with a duration': { blocks: [media('audio', 'SUQz\nAwAAAAAA', 'audio/mpeg', { duration: 3 })], changed: true, digest: '98cffd2cea1945c6369cb5e7baff7b9c8227e297bb2065eb75ac756f6be2ec76' },
+    'a document with a filename': { blocks: [media('document', 'JVBERi0xLjQ=', 'application/pdf', { filename: 'a.pdf' })], changed: true, digest: '8d07d2f460b247e61d54154454f0c53601b54996af04de5403ac5059a6a7ef2a' },
+    'text with lone surrogates': { blocks: [{ type: 'text', text: 'cut \ud83d here, \ude00 there, \ud83d\ud83d twice' }], changed: true, digest: '5d9fcff202fa2c652254c3eba7ac8dcf970124927ad4ae27c8ba77d46c460de8' },
+    'a key that is not well-formed': { blocks: [{ type: 'text', text: 'x', rawItem: { 'k\ud800': 1, kept: 2 } }], changed: true, digest: 'a9f7d2e0c020bfbf5b5c7018327a62b27e905283a531cdce6809b2bd0bd40bda' },
+    'a relabeled image with a text decoration': { blocks: [image(png, 'image/jpeg'), { type: 'text', text: '[invitation]' }], changed: true, digest: '5361c3940444c2049c32585c60da69561f6b5a7da723fec876ea2e9cc048d0ec' },
+    'a video with a duration': { blocks: [media('video', 'AAAAGGZ0eXBtcDQy', 'video/mp4', { duration: 2 })], changed: true, digest: 'f861b815a4330c4f428ec70f6842b427755a1f32e70d195b242a419f0e7edc52' },
     // No media type: an image takes its bytes' own (an image without a
     // signature, or other media, is refused at write: see below).
-    'an image without a media type': { blocks: [{ type: 'image', source: { type: 'base64', data: png } }], changed: true },
-    'an image whose media type is undefined': { blocks: [{ type: 'image', source: { type: 'base64', data: png, mediaType: undefined } }], changed: true },
-    'a text block with an undefined field': { blocks: [{ type: 'text', text: 'x', note: undefined }], changed: true },
+    'an image without a media type': { blocks: [{ type: 'image', source: { type: 'base64', data: png } }], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'an image whose media type is undefined': { blocks: [{ type: 'image', source: { type: 'base64', data: png, mediaType: undefined } }], changed: true, digest: '45ece3b08410bd3892995e358b0bcae6941f44ce43028ac9255aa83eb0870c1f' },
+    'a text block with an undefined field': { blocks: [{ type: 'text', text: 'x', note: undefined }], changed: true, digest: 'e96649c55e4c0362c808071bd07421837b9d6cb02b71739d66e112ef8950ae9e' },
     // Only a non-URL image is blobbed: a URL image keeps even a stray data
     // string as given, and storedBlock must not re-encode it.
-    'an image by URL with a stray data string': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } }], changed: false },
+    'an image by URL with a stray data string': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } }], changed: false, digest: 'bc49add8c15470ee7f0c265407c27a487a5a4db29e0a72bcd67459cb40790d7c' },
+    'a tool_use whose input is a string': { blocks: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: 'not an object' }], changed: true, digest: 'cad2fc7ae441d577c80caf5c1b600b75b1fac068fbad1bb3c927cf5eaa6ecc8e' },
+    'a document whose data is a byte array': { blocks: [{ type: 'document', source: { type: 'base64', data: [...Buffer.from('%PDF-1.4')], mediaType: 'application/pdf' } }], changed: true, digest: '8d07d2f460b247e61d54154454f0c53601b54996af04de5403ac5059a6a7ef2a' },
   };
 
-  it('every body hashes alike as handed to the store and as read back, live and after reopening', async () => {
+  it('every body hashes alike as handed to the store, as read back live and after reopening, and as stamped', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'stored-digest-'));
     const path = join(dir, 'store.chronicle');
     try {
@@ -712,11 +751,12 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
         ids.set(name, cm.addMessage('user', blocks as never, { storedBodyDigest: sourceBodyDigest(blocks) }));
       }
       const check = (when: string) => {
-        for (const [name, { blocks, changed }] of Object.entries(bodies)) {
+        for (const [name, { blocks, changed, digest }] of Object.entries(bodies)) {
           const back = cm.getMessage(ids.get(name)!)!;
           if (changed) assert.notDeepEqual(back.content, blocks, `${when}, ${name}: the store hands it back changed`);
           else assert.deepEqual(back.content, blocks, `${when}, ${name}: the store hands it back as it was`);
           assert.equal(sourceBodyDigest(back.content), (back.metadata as Record<string, unknown>).storedBodyDigest, `${when}, ${name}: it still hashes as handed over`);
+          assert.equal(sourceBodyDigest(back.content), digest, `${when}, ${name}: it hashes as stamped`);
         }
       };
       check('live');
@@ -762,6 +802,40 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('a body the store refuses is digested as given, and nothing is logged for it', (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    for (const block of [
+      { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } },
+      { type: 'image', source: { type: 'base64', data: Buffer.from('<svg/>').toString('base64') } },
+      { type: 'blob_ref', blobKind: 'image', hash: 'deadbeef', mediaType: 'image/png' },
+    ]) {
+      const titled = { ...block, title: 'a' };
+      for (const given of [block, titled]) {
+        assert.throws(() => blockAsStored(given as never), MalformedContentError, `${given.type}: the store refuses it`);
+      }
+      assert.match(sourceBodyDigest([block]), /^[0-9a-f]{64}$/, `${block.type}: it has a digest`);
+      assert.notEqual(sourceBodyDigest([titled]), sourceBodyDigest([block]), `${block.type}: every field of a refused body counts`);
+    }
+    assert.deepEqual(logged, []);
+  });
+
+  it('any other error from the store\'s transform still gives the block\'s digest as given, and is logged once', (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    let reads = 0;
+    const block = {
+      type: 'text',
+      get text() {
+        if (reads++ === 0) throw new TypeError('the first read fails');
+        return 'x';
+      },
+    };
+    assert.equal(sourceBodyDigest([block]), sourceBodyDigest([{ type: 'text', text: 'x' }]));
+    assert.equal(logged.length, 1, logged.join('\n'));
+    assert.match(logged[0], /^\[stored-digest-as-given\] error=TypeError: .*the first read fails/);
   });
 
   it('a block the store keeps as given is digested as given', () => {

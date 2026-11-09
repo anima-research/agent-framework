@@ -153,7 +153,7 @@ test('a channel_close whose record fails to append answers that nothing changed 
   assert.equal(closeCalls.length, closesBefore, 'nothing went to the server');
 
   const retried = await registry.handleChannelToolCall('channel_close', { channelId: 'c1' });
-  assert.deepEqual(retried.data, { channelId: 'c1', status: 'closed' });
+  assert.deepEqual(retried.data, { channelId: 'c1', serverId: 'discord', status: 'closed' });
   assert.deepEqual(decision(registry, 'c1'), { state: 'closed', source: 'agent-tool' });
 
   const restarted = makeRegistry(store).registry;
@@ -188,7 +188,7 @@ test('a channel_decline whose decision fails to append answers that nothing chan
   // decision is a change of state and has a record to append.
   const { registry, ackCalls } = makeRegistry(store);
   registry.ensureChannelRegistered('discord', 'c7', '#lobby');
-  assert.equal(decision(registry, 'c7'), undefined);
+  assert.equal(registry.getDesiredState('discord', 'c7'), undefined);
   const decline = { channelId: 'c7', messageId: 'm1', acknowledge: 'not now' };
 
   failNext(decisionWrite);
@@ -197,7 +197,7 @@ test('a channel_decline whose decision fails to append answers that nothing chan
   assert.equal(failed.isError, true);
   assert.match(failed.error ?? '', DISK_FULL);
   assert.match(failed.error ?? '', /^Nothing changed for channel "c7": this host couldn't record the decision: .*, so no acknowledgment was posted and nothing was sent to the server\. Calling channel_decline again tries again; if it fails the same way, ask whoever runs this host\.$/);
-  assert.equal(decision(registry, 'c7'), undefined);
+  assert.equal(registry.getDesiredState('discord', 'c7'), undefined);
   assert.equal(ackCalls.length, 0, 'nothing went to the server');
 
   const retried = await registry.handleChannelToolCall('channel_decline', decline);
@@ -214,11 +214,11 @@ test('speech whose open fails to append its decision says nothing changed, and w
   // A store's words that end in a period lose it where the reason composes
   // them.
   failNext(decisionWrite, 'The disk is full.');
-  const outcome = await registry.deliverSpeech('agent', 'hello', 'c1');
+  const outcome = await registry.deliverSpeech('agent', 'hello', { serverId: 'discord', channelId: 'c1' });
   assert.equal(outcome.status, 'failed');
   assert.equal(outcome.reason, "opening the channel for these words didn't complete: this host couldn't record the decision: " +
     'The disk is full, so try again; if it fails the same way, ask whoever runs this host');
-  assert.equal(decision(registry, 'c1'), undefined);
+  assert.equal(registry.getDesiredState('discord', 'c1'), undefined);
   assert.deepEqual(openCalls, [], 'nothing went to the server');
 }));
 

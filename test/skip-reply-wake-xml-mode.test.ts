@@ -67,7 +67,7 @@ class XmlStream implements YieldingStream {
     this.events.push({
       type: 'tool-calls',
       calls: r.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
-      context: { rawText: raw(r.calls), preamble: before, roundPreamble: before.slice(this.roundStart), depth: this.round, previousResults: [], accumulated: before + raw(r.calls) },
+      context: { rawText: raw(r.calls), preamble: before, roundPreamble: before.slice(this.roundStart), depth: this.round, previousResults: [], accumulated: before + raw(r.calls), supportsInjectedMessages: false },
     } as StreamEvent);
     this.acc = before + raw(r.calls);
     this.waiting = true;
@@ -152,8 +152,8 @@ async function xmlTurn(rounds: Round[], finalText: string, thinking = false, opt
     ? [{ name: 'skip_reply', description: 'End your turn without sending anything.', inputSchema: { type: 'object' as const, properties: {} } }]
     : [];
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-    getChannelTools: () => channelTools, resolveLocus: () => 'channel:test',
-    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+    getChannelTools: () => channelTools, resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
     handleChannelToolCall: async (name: string) => {
       registrySaw.push(name);
       return { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } };

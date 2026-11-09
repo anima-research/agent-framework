@@ -344,11 +344,12 @@ describe('ProviderWaits: durable and pending acts (room-225 #46276)', () => {
       const recorded = () => store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
       fail.checkpoint = 1; // the 64th entry's flush checkpoints, and the store's append of it throws
       for (let i = 0; i < 64; i++) waits.set(`zz-agent-${i}`, 'zz-model', 600_000, 'zz 429');
+      const atCheckpoint = recorded();
       assert.deepEqual(waits.release('zz-nobody', 'zz-model', 'operator'), [], 'an act with nothing to record tries no checkpoint again');
       waits.set('ada', 'zz-model', 600_000, 'zz after');
       time.advance(30_000);
       assert.ok(waits.active('ada', 'zz-model'), 'a later wait binds in this process');
-      assert.equal(recorded(), 64, 'the entries before the checkpoint are recorded, and nothing after it');
+      assert.equal(recorded(), atCheckpoint, 'nothing is recorded after the checkpoint');
       assert.equal(lines.filter((line) => line.includes('until the store is reopened')).length, 1, 'said once');
       assert.equal(lines.filter((line) => line.includes('could not')).length, 0, 'not as a failed checkpoint or once per act');
       store.close();
@@ -631,6 +632,11 @@ type Internal = {
   providerAccelerationJitterMs: number;
 };
 
+/** The resident's provider admission, as healthSnapshot() reports it. */
+type Admission = { cooldownUntil: number | null; cooldownReason: string | null; hostHold: boolean; heldRequests: number; providerWaits: Array<{ model: string }> };
+const admission = (fw: AgentFramework): Admission => (fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: Admission }> })
+  .agents.find((agent) => agent.name === 'resident')!.providerAdmission;
+
 async function framework(path: string, membrane: WaitingMembrane) {
   const fw = await AgentFramework.create({
     storePath: path, membrane: membrane.asMembrane(),
@@ -724,9 +730,9 @@ test('a stated wait past the framework cap is honoured in full, until an operato
       const before = Date.now();
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      const cooldown = internal.providerAccelerationCooldowns.get('resident')!;
-      assert.ok(cooldown.until >= before + twentyMinutes, 'not shortened to the 10-minute cap');
-      assert.equal(cooldown.waitModel, 'zz-model');
+      const held = admission(fw);
+      assert.ok(held.cooldownUntil !== null && held.cooldownUntil >= before + twentyMinutes, 'not shortened to the 10-minute cap');
+      assert.deepEqual(held.providerWaits.map((w) => w.model), ['zz-model'], "the model's stated wait binds it");
 
       const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
       assert.equal(released.ok, true);
@@ -918,7 +924,8 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
   await withStoreDir(async (path) => {
     const log = silence();
     const { fw } = await framework(path, new WaitingMembrane(0, undefined));
-    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }): Promise<void> };
+    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }, agent: unknown): Promise<void>; waitingTraceEveryMs: number };
+    stepping.waitingTraceEveryMs = Number.POSITIVE_INFINITY;
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const mocked = globalThis.setTimeout;
     const delays: number[] = [];
@@ -928,7 +935,7 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
     }) as unknown as typeof setTimeout;
     try {
       let done = false;
-      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }).then(() => { done = true; });
+      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }, fw.getAgent('resident')).then(() => { done = true; });
       t.mock.timers.tick(ONE_TIMER_MS);
       for (let i = 0; i < 20; i++) await Promise.resolve();
       assert.equal(done, false, "still waiting after one timer's worth");
@@ -1011,13 +1018,13 @@ test('stop() cancels a retry wait on the path that does not own provider admissi
       },
     });
     const internal = fw as unknown as {
-      conversationAgentHomes: Map<string, string>;
+      registry: AgentRegistryRecords;
       retryWaitWakers: Set<unknown>;
       startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
     };
     let stopped = false;
     try {
-      internal.conversationAgentHomes.set('resident', 'world:zz');
+      asConversationAgent(internal, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       const run = internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       for (let i = 0; i < 300 && internal.retryWaitWakers.size === 0; i++) await sleep(10);
@@ -1317,15 +1324,15 @@ test("releasing a provider wait leaves a host hold the host's", async () => {
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      const hold = internal.providerAccelerationCooldowns.get('resident')!;
-      assert.ok(hold.hostHoldError, 'a host hold');
-      const until = hold.until;
+      const hold = admission(fw);
+      assert.equal(hold.hostHold, true, 'a host hold');
+      const until = hold.cooldownUntil;
       assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'the stated wait is recorded beside it');
 
       const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
       assert.deepEqual((released.released as Array<{ model: string }>).map((w) => w.model), ['zz-model']);
       assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'the stated wait is released');
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, until, 'the host hold stands, unchanged');
+      assert.deepEqual([admission(fw).hostHold, admission(fw).cooldownUntil], [true, until], 'the host hold stands, unchanged');
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'and still holds the turn');
     } finally { await fw.stop(); log.restore(); }
@@ -1413,18 +1420,19 @@ test('a release whose context strategy throws still releases the hold it lifted 
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new WaitingMembrane(1, 60_000);
-    const { fw, internal } = await framework(path, membrane);
+    const { fw } = await framework(path, membrane);
     const cm = fw.getAgent('resident')!.getContextManager() as unknown as { getStrategy(): unknown };
     const getStrategy = cm.getStrategy;
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model');
+      assert.deepEqual(admission(fw).providerWaits.map((w) => w.model), ['zz-model'], 'held for the stated wait');
+      assert.notEqual(admission(fw).cooldownReason, null);
       cm.getStrategy = () => { throw new Error('zz strategy unavailable'); };
       const released = fw.releaseProviderWait('resident', 'zz-model', 'zz-operator');
       cm.getStrategy = getStrategy;
       assert.deepEqual(released.map((w) => w.model), ['zz-model']);
-      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold is released');
+      assert.equal(admission(fw).cooldownReason, null, 'the hold is released');
       await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the release');
     } finally { cm.getStrategy = getStrategy; await fw.stop(); log.restore(); }
   });
@@ -1482,11 +1490,11 @@ test('a primary 429 stating a negative retry-after is retried, not held until re
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new WaitingMembrane(1, -1_000);
-    const { fw, internal } = await framework(path, membrane);
+    const { fw } = await framework(path, membrane);
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'no hold');
+      assert.equal(admission(fw).cooldownReason, null, 'no hold');
       assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'no wait binds');
       assert.equal(membrane.primary, 2, 'the error policy retried, and the retry recovered');
       assert.ok(!log.lines.some((line) => /\[provider-wait\].* holds /.test(line)), 'and nothing is logged as held');
@@ -1604,8 +1612,6 @@ test('unreadable recorded waits raise an ops alert for the whole framework as th
 // before the stream exists, here thrown from streamYielding).
 // ---------------------------------------------------------------------------
 
-/** A stream whose iteration throws, instead of yielding an error event:
- *  driveStream's catch, the third failure site. */
 class ThrowingStream extends ErrorStream {
   constructor(private readonly thrown: Error) { super(thrown); }
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -1630,8 +1636,22 @@ class FailingAt extends WaitingMembrane {
   }
 }
 
+/** The registry records the framework consults for an agent's roles and home. */
+type AgentRegistryRecords = {
+  get(name: string): { homeChannel?: { serverId: string; channelId: string } | string; roles: { ownsProviderScheduling: boolean } } | undefined;
+};
+
+/** Make a registered resident a conversation agent: homed in `channelId`,
+ *  not owning provider admission — what the registry says of a fork. */
+function asConversationAgent(internal: { registry: AgentRegistryRecords }, name: string, home: { serverId: string; channelId: string }): void {
+  const record = internal.registry.get(name);
+  if (!record) throw new Error(`no registry record for ${name}`);
+  record.homeChannel = { ...home };
+  record.roles.ownsProviderScheduling = false;
+}
+
 type NonOwning = Internal & {
-  conversationAgentHomes: Map<string, string>;
+  registry: AgentRegistryRecords;
   retryWaitWakers: Set<() => void>;
   pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
   startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
@@ -1667,7 +1687,7 @@ async function waitFor(fw: AgentFramework, done: () => boolean, what: string, bo
 }
 
 async function conversationTurn(fw: AgentFramework, internal: NonOwning, text: string): Promise<void> {
-  internal.conversationAgentHomes.set('resident', 'world:zz');
+  asConversationAgent(internal, 'resident', { serverId: 'stub', channelId: 'world:zz' });
   fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text }]);
   await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
 }
@@ -1745,15 +1765,15 @@ test("a conversation agent's non-retryable failure that states a wait records it
       await conversationTurn(fw, nonOwning, 'zz-first');
       await waitFor(fw, () => fw.providerWaitSnapshot('resident').length > 0, 'the recorded wait');
       await drive(fw);
-      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'a terminal failure is not held');
+      assert.equal(admission(fw).cooldownReason, null, 'a terminal failure is not held');
       assert.equal(membrane.primary, 1, 'nor retried');
 
       // Real time passes the wait before the next wake, as on a loaded host.
       await clock.outlast(wait);
       nonOwning.pendingRequests.push({ agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       await drive(fw);
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the next wake is held by the recorded wait');
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the wake');
+      assert.deepEqual(admission(fw).providerWaits.map((w) => w.model), ['zz-model'], 'the next wake is held by the recorded wait');
+      assert.equal(admission(fw).heldRequests, 1, 'the hold has the wake');
       assert.equal(membrane.primary, 1);
       clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 2, 'the held wake after the wait');
@@ -2097,12 +2117,27 @@ test('an ephemeral run sleeps a stated wait within the framework cap and retries
  *  compiles, and counts how often a stream is iterated: membrane sends then. */
 class WaitDuringCompile extends WaitingMembrane {
   sent = 0;
-  constructor(private readonly during: () => void) { super(0, undefined); }
+  /** cancel() calls on the streams it makes, with `cancelThrows`. */
+  cancels = 0;
+  /** With `cancelThrows`, each stream's first cancel() throws, as a host's stream can. */
+  constructor(private readonly during: () => void, private readonly cancelThrows = false) { super(0, undefined); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.during();
     const stream = super.streamYielding(request);
     const iterate = stream[Symbol.asyncIterator].bind(stream);
     Object.defineProperty(stream, Symbol.asyncIterator, { value: () => { this.sent++; return iterate(); } });
+    if (this.cancelThrows) {
+      const cancel = stream.cancel.bind(stream);
+      let threw = false;
+      Object.defineProperty(stream, 'cancel', {
+        value: () => {
+          this.cancels++;
+          if (threw) return cancel();
+          threw = true;
+          throw new Error('zz the stream refused its cancel');
+        },
+      });
+    }
     return stream;
   }
 }
@@ -2139,6 +2174,30 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
       clock.pass(wait);
       await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
       assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a conversation agent's turn is held after its compile all the same when its stream's cancel throws", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; }, true);
+    const { fw, internal } = await framework(path, membrane);
+    record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
+    const traces: Array<{ type: string; error?: string }> = [];
+    fw.onTrace((event) => {
+      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'resident') traces.push(event as { type: string; error?: string });
+    });
+    try {
+      await conversationTurn(fw, internal as NonOwning, 'zz-first');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
+      assert.deepEqual(traces.map((trace) => trace.type), ['inference:started', 'inference:failed']);
+      assert.match(traces[1]!.error!, /^Provider wait: zz-model is held for resident until /, "the hold's report, not the cancel's throw");
+      assert.ok(log.lines.some((line) => /the cancel of a turn's stream held by a provider wait recorded while it compiled threw; it was never iterated, so it sent nothing/.test(line)));
+      assert.equal(membrane.cancels, 1, 'the agent lets go of the stream without cancelling it again');
     } finally { await fw.stop(); log.restore(); }
   });
 });
@@ -2222,7 +2281,7 @@ test("the last boundary holds no agent the framework no longer has: a disposed f
     const nonOwning = internal as NonOwning;
     try {
       const agent = fw.getAgent('resident')!;
-      nonOwning.conversationAgentHomes.set('resident', 'world:zz');
+      asConversationAgent(nonOwning, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz recorded for the fork');
       nonOwning.disposeConversationAgent('resident');
       // Its retry wakes after the disposal and reaches the boundary.

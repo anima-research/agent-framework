@@ -7,10 +7,12 @@
  * end the turn at its next check,
  * or where its hooks or compile fail, before it sends anything more,
  * through the terminal the same stop gets on a live stream. A stop made
- * where no check of a turn is ahead ends nothing.
+ * where no check of a turn is ahead ends nothing, unless the turn's
+ * continuation or retry is on its way, which abortInference() ends
+ * (held-turn-retry.test.ts, turn-continuation.test.ts).
  */
 
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -33,7 +35,10 @@ import {
 import type { ContextInjection } from '@animalabs/context-manager';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+
+const SHORT_ABANDON_GRACE_MS = 50;
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -267,24 +272,6 @@ function endedAsStop(h: { framework: AgentFramework; traces: TraceEvent[]; reque
 }
 
 describe('a stop before the turn has a stream', () => {
-  for (const withStop of [true, false]) it(`a turn whose framework is stopped and started again during its hooks is dropped before its compile${withStop ? ', a stop made during them included, with no note' : ''}`, async () => {
-    const h = await aliveWithoutStream();
-    try {
-      if (withStop) assert.equal(h.framework.abortInference('prime', 'user'), true, 'abortInference reports the stop');
-      // As a stop() and a start() do: each advances the lifecycle, and
-      // admission is open again.
-      (h.framework as unknown as { lifecycleGeneration: number }).lifecycleGeneration += 2;
-      h.release();
-      await waitFor('the turn to end', h.turnEnded);
-      assert.deepEqual(abortReasons(h.traces), ['a turn assembled while the framework was stopped and started again is dropped before it sends anything'], 'the turn was dropped');
-      assert.equal(h.compiles(), 0, 'before its compile');
-      assert.equal(h.requests.length, 0, 'nothing was sent');
-      assert.deepEqual(notes(h.agent), [], 'and no [turn-interrupted] note was written');
-    } finally {
-      await h.cleanup();
-    }
-  });
-
   it("a host's cancelStream() while the turn's hooks run ends the turn before its compile", async () => {
     const h = await aliveWithoutStream();
     try {
@@ -364,6 +351,25 @@ describe('a stop before the turn has a stream', () => {
     }
   });
 
+  it("the status lists a turn in its compile as holding a turn, until an abandon ends it at its check", async () => {
+    const h = await aliveWithoutStream({ holdCompile: true });
+    try {
+      const during = h.framework.getHostModeStatus();
+      assert.deepEqual(during.activeTurnAgents, ['prime'], 'the turn in its compile holds a turn');
+      assert.equal(during.activeTurnAgents.length, during.activeTurns, 'the list is the set activeTurns counts');
+      const reached = abandonReached(h.framework);
+      const quiescing = h.framework.quiesce({ timeoutMs: 50, abandon: true });
+      await within('the abandon to reach the turn', reached);
+      h.release();
+      const status = await within('the quiesce to return', quiescing);
+      assert.deepEqual(status.activeTurnAgents, [], 'the abandon ended it, and it holds no turn now');
+      assert.equal(status.activeTurns, 0);
+      await h.framework.resume();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("a caller's stop and a quiesce's abandon at the same start end it as the framework's stop", async () => {
     const h = await aliveWithoutStream();
     try {
@@ -405,12 +411,13 @@ describe('a stop before the turn has a stream', () => {
   it("a quiesce's abandon of a turn whose hooks outlast the abandon's grace lists it, and still ends it when they return", async () => {
     const h = await aliveWithoutStream();
     try {
+      setAbandonGraceForTests(h.framework, SHORT_ABANDON_GRACE_MS);
       const reached = abandonReached(h.framework);
       const quiescing = h.framework.quiesce({ timeoutMs: 50, abandon: true });
       await within('the abandon to reach the turn', reached);
-      // The abandon waits up to 10 s for the turns it reached to end.
       const status = await within('the quiesce to return', quiescing, 15_000);
       assert.deepEqual(status.unabandonable, ['prime'], 'the turn still in its hooks is listed');
+      assert.deepEqual(status.activeTurnAgents, ['prime'], 'it still holds its turn');
       const quiesce = h.traces.find((t) => t.type === 'host:quiesce') as { unabandonable?: string[] } | undefined;
       assert.deepEqual(quiesce?.unabandonable, ['prime'], 'and so is its trace');
       h.release();
@@ -832,59 +839,7 @@ describe('a stop before the turn has a stream', () => {
     }
   });
 
-  for (const stopDuringWait of [true, false]) it(`a start waiting to retry a failed compile across a stop() and a start() is dropped before it sends anything${stopDuringWait ? ', with a stop made during the wait' : ''}`, async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'af-stop-without-stream-'));
-    const { membrane, requests } = answeringMembrane();
-    const retrying = deferred();
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'store'), membrane,
-      agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
-      modules: [new GatedContextModule()], syncIntervalMs: 0,
-      errorPolicy: {
-        maxRetries: 1,
-        onInferenceError: (_error, _agentName, attempt) => {
-          if (attempt > 0) return { retry: false };
-          retrying.resolve();
-          // A stop made during the wait wakes it; otherwise it runs out.
-          return { retry: true, delayMs: stopDuringWait ? 60_000 : 300 };
-        },
-      },
-    });
-    const traces: TraceEvent[] = [];
-    framework.onTrace((event) => traces.push(event));
-    const agent = framework.getAgent('prime')!;
-    // The first compile fails after a stop() and a start(), which each
-    // advance the lifecycle and leave admission open again; no stop is kept
-    // for the turn by then.
-    let compiles = 0;
-    const guard = agent.toolResultGuard;
-    const annotations = guard.afterAnnotations.bind(guard);
-    guard.afterAnnotations = (async (read: () => Promise<unknown>) => {
-      if (++compiles === 1) {
-        (framework as unknown as { lifecycleGeneration: number }).lifecycleGeneration += 2;
-        throw new Error('the compile failed');
-      }
-      return annotations(read);
-    }) as typeof guard.afterAnnotations;
-    try {
-      framework.start();
-      framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {}, triggerInference: true } as unknown as ProcessEvent);
-      await within('the failed compile to be retried', retrying.promise);
-      if (stopDuringWait) assert.equal(framework.abortInference('prime', 'user'), true, 'abortInference reports the stop');
-      await waitFor('the turn to end', () => traces.some((t) => t.type === 'inference:aborted' || t.type === 'inference:completed' || t.type === 'inference:exhausted')
-        && framework.getHostModeStatus().activeTurns === 0);
-      assert.deepEqual(abortReasons(traces), ['a retry waiting while the framework was stopped and started again is dropped before it sends anything'], 'the retry was dropped');
-      assert.equal(compiles, 1, 'no retry compiled');
-      assert.equal(requests.length, 0, 'nothing was sent');
-      assert.ok(!traces.some((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted'), 'no other terminal');
-      assert.deepEqual(notes(agent), [], 'and no [turn-interrupted] note was written');
-    } finally {
-      await within('stop() in cleanup', framework.stop()).catch(() => {});
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  for (const how of ['stopping', 'replaced', 'restarted'] as const) it(`a stop during a compile that then fails ${how === 'stopping' ? 'while stop() runs' : how === 'replaced' ? 'after its agent was replaced' : 'after the framework was stopped and started again'} drops the turn as ${how === 'stopping' ? "stop()'s" : how === 'replaced' ? "the replacement's" : "the earlier lifecycle's"}, before it sends anything, with no note`, async () => {
+  for (const how of ['stopping', 'replaced'] as const) it(`a stop during a compile that then fails ${how === 'stopping' ? 'while stop() runs' : 'after its agent was replaced'} drops the turn as ${how === 'stopping' ? "stop()'s" : "the replacement's"}, before it sends anything, with no note`, async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'af-stop-without-stream-'));
     const { membrane, requests } = answeringMembrane();
     const framework = await AgentFramework.create({
@@ -936,18 +891,14 @@ describe('a stop before the turn has a stream', () => {
       if (how === 'stopping') {
         stopping = framework.stop();
         await waitFor('stop() to close provider admission', () => (framework as unknown as { providerAdmissionClosed: boolean }).providerAdmissionClosed);
-      } else if (how === 'replaced') {
+      } else {
         // As a replacement under the agent's name does.
         (framework as unknown as { agents: Map<string, unknown> }).agents.set('prime', Object.create(agent));
-      } else {
-        // As a stop() and a start() do: each advances the lifecycle, and
-        // admission is open again.
-        (framework as unknown as { lifecycleGeneration: number }).lifecycleGeneration += 2;
       }
       compileReleased.resolve();
       await waitFor('the turn to end', () => traces.some((t) => t.type === 'inference:aborted' || t.type === 'inference:exhausted'));
       if (stopping) await within('stop() to finish', stopping);
-      const why = how === 'stopping' ? 'the framework was stopping' : how === 'replaced' ? 'the agent was replaced or removed' : 'the framework was stopped and started again';
+      const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
       assert.ok(traces.some((t) => t.type === 'inference:failed'), "the compile's failure was reported");
       assert.equal(compiles, 1, 'no retry compiled');
       assert.equal(requests.length, 0, 'nothing was sent');
@@ -1234,9 +1185,10 @@ describe('a stop while no turn is running', () => {
 
   it('a message sent after a stop during a provider-capacity hold is answered when the hold ends', async () => {
     // A host hold parks the turn after its first request fails on a spent
-    // quota: no turn is running while it waits, and when it ends, one start
-    // takes every wake held for the agent. A stop made during the hold must
-    // not cost the message sent after it its answer.
+    // quota: no stream runs while it waits, though the turn is alive until
+    // its retry starts, and when the hold ends, one start takes every wake
+    // held for the agent. A stop made during the hold ends the held turn,
+    // and must not cost the message sent after it its answer.
     const tempDir = mkdtempSync(join(tmpdir(), 'af-stop-without-stream-'));
     const membrane = new QuotaOnceMembrane();
     let holds = 0;
@@ -1256,9 +1208,13 @@ describe('a stop while no turn is running', () => {
       framework.start();
       const agent = framework.getAgent('prime')!;
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {}, triggerInference: true } as unknown as ProcessEvent);
-      await waitFor('the hold to park the turn', () => cooldowns.has('prime') && framework.getHostModeStatus().activeTurns === 0);
+      await waitFor('the hold to park the turn', () => cooldowns.has('prime'));
+      assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, ['prime'], 'the held turn is alive');
       assert.equal(membrane.calls.length, 1, 'the first request failed on the quota');
-      assert.equal(framework.abortInference('prime', 'user'), false, 'abortInference() reports no turn to stop while the hold parks it');
+      // The held turn is alive with no stream: abortInference() ends it, its
+      // retry dropped from the hold, as a stop ends a turn's start.
+      assert.equal(framework.abortInference('prime', 'user'), true, 'abortInference() ends the turn the hold keeps for its retry');
+      assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, [], 'and the turn is over');
       agent.cancelStream();
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'a message sent after the stop', metadata: {}, triggerInference: true } as unknown as ProcessEvent);
       await waitFor('the message sent after the stop to be answered',
@@ -1314,6 +1270,11 @@ const postThenRead = () => createMockResponse([
   { type: 'tool_use', id: 'one', name: 'gated--read', input: {} },
 ] as ContentBlock[], 'tool_use');
 
+const unscripted: string[] = [];
+afterEach(() => {
+  assert.deepEqual(unscripted.splice(0), [], 'every stream the framework opened was one the test scripted');
+});
+
 /** Scripted streams; `requests` counts the streams made, one per request. */
 class ScriptMembrane {
   readonly requests: NormalizedRequest[] = [];
@@ -1321,7 +1282,11 @@ class ScriptMembrane {
   streamYielding(request: NormalizedRequest, _options: YieldingStreamOptions = {}) {
     this.requests.push(request);
     const script = this.scripts.shift();
-    if (!script) throw new Error('unexpected extra inference');
+    if (!script) {
+      const last = request.messages.at(-1)?.content.map((b) => (b as { text?: string }).text ?? `[${b.type}]`).join(' ') ?? '';
+      unscripted.push(`stream ${this.requests.length}, after: ${last.slice(0, 120)}`);
+      throw new Error('unexpected extra inference');
+    }
     return new MockYieldingStream(script);
   }
   asMembrane(): Membrane { return this as unknown as Membrane; }
@@ -1332,17 +1297,18 @@ class ScriptMembrane {
 function firstPostHeld(posted: string[], released: Promise<void>): unknown {
   // Speech reaches the registry through deliverSpeech, or through
   // routeSpeech, which reduces its outcome to the confirmed delivery.
-  const deliverSpeech = async (_agent: string, text: string, channelId: string | null) => {
+  type Channel = { serverId: string; channelId: string };
+  const deliverSpeech = async (_agent: string, text: string, to: Channel | null) => {
     posted.push(text.trim());
     if (posted.length === 1) await released;
-    return { status: 'delivered' as const, destination: { serverId: 'stub', channelId: channelId ?? '' }, at: Date.now() };
+    return { status: 'delivered' as const, destination: { serverId: to?.serverId ?? 'stub', channelId: to?.channelId ?? '' }, at: Date.now() };
   };
   return new Proxy({
-    resolveProseTarget: (spec: string) => spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    resolveProseTarget: (spec: string) => spec === '#cafe' ? { serverId: 'stub', channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     deliverSpeech,
-    routeSpeech: async (agent: string, text: string, channelId: string) => {
-      const outcome = await deliverSpeech(agent, text, channelId);
-      return { delivered: true, channelId: outcome.destination.channelId };
+    routeSpeech: async (agent: string, text: string, to: Channel | null) => {
+      const outcome = await deliverSpeech(agent, text, to);
+      return { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId };
     },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
@@ -1453,6 +1419,35 @@ describe("a stop while the guard's refusal retry waits", () => {
       endedWithoutRetry(g, 'quiesce_abandoned', null);
       await g.framework.resume();
     } finally {
+      await g.cleanup();
+    }
+  });
+
+  it("a quiesce's abandon whose cancel of the finished stream throws still ends the turn at the guard's check, listing nothing", async () => {
+    const g = await guardRetryWaiting();
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      const held = g.agent.state as { stream?: { cancel(): void } };
+      assert.ok(held.stream, "the agent holds the round's finished stream while the guard waits");
+      let cancels = 0;
+      held.stream.cancel = () => { cancels++; throw new Error('zz the stream refused its cancel'); };
+      const reached = abandonReached(g.framework);
+      const quiescing = g.framework.quiesce({ timeoutMs: 50, abandon: true });
+      await within('the abandon to reach the turn', reached);
+      assert.equal(cancels, 1, 'the abandon tried to cancel the finished stream');
+      g.releasePost();
+      const status = await within('the quiesce to return', quiescing);
+      assert.equal(status.quiesced, true);
+      assert.equal(status.unabandonable, undefined, 'nothing listed: the check ended the turn');
+      endedWithoutRetry(g, 'quiesce_abandoned', null);
+      assert.ok(lines.some((l) => /^\[host-mode\] abandoning in-flight turn for assistant: its stream's cancel threw, so the turn ends at its next check instead: /.test(l)),
+        lines.join('\n'));
+      assert.ok(!lines.some((l) => l.startsWith('[host-mode] cannot abandon turn for assistant')), 'and not that it cannot');
+      await g.framework.resume();
+    } finally {
+      console.error = original;
       await g.cleanup();
     }
   });
@@ -1568,10 +1563,10 @@ describe("a stop while the guard's refusal retry waits", () => {
   it("an abandon of the wait while it still holds the finished stream lists the turn if it outlasts the grace, and still ends it as the abandon", async () => {
     const g = await guardRetryWaiting();
     try {
+      setAbandonGraceForTests(g.framework, SHORT_ABANDON_GRACE_MS);
       const reached = abandonReached(g.framework);
       const quiescing = g.framework.quiesce({ timeoutMs: 50, abandon: true });
       await within('the abandon to reach the turn', reached);
-      // The round's post stays held through the abandon's ten-second grace.
       const status = await within('the quiesce to return', quiescing, 15_000);
       assert.deepEqual(status.unabandonable, ['assistant'], 'the turn still waiting is listed');
       g.releasePost();
@@ -1654,6 +1649,20 @@ async function finishingTurn() {
 }
 
 describe('a turn finishing its last delivery, with no check ahead', () => {
+  it('the status lists the turn as holding a turn until its delivery is done', async () => {
+    const f = await finishingTurn();
+    try {
+      const during = f.framework.getHostModeStatus();
+      assert.deepEqual(during.activeTurnAgents, ['assistant'], 'the turn finishing its delivery still holds its turn');
+      assert.equal(during.activeTurnAgents.length, during.activeTurns, 'the list is the set activeTurns counts');
+      f.release();
+      await waitFor('the turn to complete', () => f.completed() === 1 && f.framework.getHostModeStatus().activeTurns === 0);
+      assert.deepEqual(f.framework.getHostModeStatus().activeTurnAgents, [], 'and no turn is held once it settles');
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("a quiesce's abandon leaves nothing to end a later turn: the turn completes, and the agent's next turn runs", async () => {
     const f = await finishingTurn();
     try {

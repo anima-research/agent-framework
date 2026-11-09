@@ -11,7 +11,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
-import { QuiesceBlockedError, ResumeBlockedError } from '../framework.js';
+import { ResumeBlockedError } from '../framework.js';
 import { isReleaseModel } from '../provider-waits.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
@@ -489,9 +489,13 @@ export class ApiServer {
     if (!params.participant || !params.content) {
       throw new Error('participant and content are required');
     }
-    // ApiModule stores the message as one text block, which context-manager
-    // refuses unless its text is a string, so content that isn't text is
-    // refused here, where the caller hears it, rather than at dispatch.
+    // ApiModule stores the participant as a name, and the message as one text
+    // block, which context-manager refuses unless its text is a string. So a
+    // participant or content that isn't text is refused here, where the
+    // caller hears it, rather than at dispatch.
+    if (typeof params.participant !== 'string') {
+      throw new Error('participant must be text');
+    }
     if (typeof params.content !== 'string') {
       throw new Error('content must be text');
     }
@@ -518,8 +522,7 @@ export class ApiServer {
     const contextManager = agent.getContextManager();
     // A dry run: listed, never sent, so it persists no fold resolutions and
     // queues none of the compression its fold plan calls for (see
-    // Agent.compileWithInjections for what a dry run still leaves, and for
-    // context-manager#160's thinking binding).
+    // Agent.compileWithInjections for what a dry run still leaves).
     const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
@@ -598,12 +601,14 @@ export class ApiServer {
     // during a live turn or once stop() has begun, and stop() waits for one
     // already running. It moves the store once any maintenance already
     // running has finished, so the move can come after this call returns.
+    // It writes the switch to the operator log as a checkout over this
+    // surface.
     // The event names this switch's own move, from the branch read here to
     // the one it was asked for: another switch can move the store again
     // before this one continues.
     let switched = false;
     try {
-      await this.framework.switchBranch(params.name);
+      await this.framework.switchBranch(params.name, { requester: { via: 'api' } });
       switched = true;
     } finally {
       // A later step can fail after the store has moved: clients still hear
@@ -650,16 +655,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.undoLastTurn(params.agentName);
-
-    if (result.undone) {
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'undo',
-      });
-    }
-
+    const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
+    await settled;
     return result;
   }
 
@@ -668,16 +665,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.redo(params.agentName);
-
-    if (result.redone) {
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'redo',
-      });
-    }
-
+    const { settled, ...result } = this.framework.redo(params.agentName);
+    await settled;
     return result;
   }
 
@@ -1075,9 +1064,6 @@ export class ApiServer {
               verdicts: error.verdicts,
               hostMode: this.framework.getHostModeStatus(),
             });
-          } else if (error instanceof QuiesceBlockedError) {
-            // A refusal, as resume()'s is: the host's mode is as it was.
-            respond(409, { error: error.message, hostMode: this.framework.getHostModeStatus() });
           } else {
             respond(500, { error: error instanceof Error ? error.message : String(error) });
           }
