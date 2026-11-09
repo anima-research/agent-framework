@@ -4362,11 +4362,8 @@ export class EventGate {
       this.deliverOrBuffer(events);
       return;
     }
-    // The judge is asked for the agents the batch would wake; a batch that
-    // wakes no one isn't judged.
-    const agentNames = [...this.wokenBy(events)];
-    if (agentNames.length === 0) return;
     const abort = new AbortController();
+    const agentNames = this.getAgentNamesFn();
     const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [] };
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
@@ -4382,7 +4379,7 @@ export class EventGate {
       asked = fn({
         policyName,
         ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
-        events: shownOf(events).map((e) => this.judgeEventSummary(e)),
+        events: events.map((e) => this.judgeEventSummary(e)),
         agentNames,
         upcomingWakes: this.upcomingWakes(agentNames, policyName),
         signal: abort.signal,
