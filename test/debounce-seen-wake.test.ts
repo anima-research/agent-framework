@@ -28,6 +28,16 @@ class TargetedReminderModule extends ReminderModule {
   }
 }
 
+/** A reminder's message held from the residents, as a tune-out holds one. */
+class HeldReminderModule extends ReminderModule {
+  override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
+    const response = await super.onProcess(event, state);
+    return response.addMessages
+      ? { ...response, addMessages: response.addMessages.map((m) => ({ ...m, metadata: { ...m.metadata, tuneOut: { epochId: 'held' } } })) }
+      : response;
+  }
+}
+
 class EndingModule extends ReminderModule {
   ended = false;
 
@@ -257,6 +267,23 @@ describe('debounced writes already read and answered', () => {
       const request = JSON.stringify(f.membrane.calls[turns.indexOf('other')]);
       assert.ok(request.includes('water the plants'), "the resident outside the message's audience is woken with the event");
     } finally { off(); await f.close(); }
+  });
+
+  it("a module's lone message held from the residents: the gate quotes the event, as it quotes one with no message", async () => {
+    const module = new HeldReminderModule();
+    const { f } = await setup(60_000, false, undefined, undefined, module);
+    try {
+      await send(f, 'module', 'water the plants');
+      await f.framework.runUntilIdle();
+      fire(f);
+      const idle = f.framework.runUntilIdle();
+      await eventually(() => module.entered.has('first'), 'the turn reached its tool');
+      module.release('first');
+      await idle;
+      const request = JSON.stringify(f.membrane.calls[0]);
+      assert.ok(!request.includes('"text":"water the plants"'), 'premise: no resident is shown the held row itself');
+      assert.match(request, /\[Gate: 1 event matched\]\\n\\n- \[batch\] \(clock:reminder\): water the plants/, `the gate quotes the event: ${request.slice(request.indexOf('[Gate:'), request.indexOf('[Gate:') + 200)}`);
+    } finally { await f.close(); }
   });
 
   it("a co-resident whose own turn answered the slot after the event still wakes for a batch written to the delivery agent's window", async () => {

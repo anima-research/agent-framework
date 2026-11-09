@@ -19554,7 +19554,7 @@ export class AgentFramework {
           placement, ...(audience ? { audience } : {}),
           ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source: stampSource } } : {}),
         });
-        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined && !audience) added = placement;
+        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined && !audience && !heldFromResidents(metadata)) added = placement;
         // A write kept in memory (a surgery's hold, or the wait for its
         // agent's recovery) has no id yet: it is traced once, as it is
         // stored ('surgery-release').

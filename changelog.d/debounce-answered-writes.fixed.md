@@ -18,8 +18,9 @@
   message-mode heartbeat ticks and reminders, and module events whose response
   stored exactly one message, for every agent, where neither the event nor the
   message names a channel and the event isn't console or API input. A module
-  message stored only for the agents its response asked inference for is
-  quoted, as before. An event with no message of its own keeps the wake,
+  message stored only for the agents its response asked inference for, or one
+  held from the residents, is quoted, as before. An event with no message of
+  its own keeps the wake,
   unless a turn already under way read and answered the batch's line, which
   quotes it. A silent heartbeat tick stores nothing and isn't quoted, so it
   keeps the wake. A judge rule's batch is judged so too where no judge decided

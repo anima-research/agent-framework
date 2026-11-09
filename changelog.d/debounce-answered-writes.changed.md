@@ -2,8 +2,9 @@
   message of their own in the window, quoting each, as it did: a module event
   whose response stored no single message, for one. An MCPL channel message or
   push, a message-mode heartbeat tick or a reminder, and a module event whose
-  response stored exactly one message, where neither the event nor the message
-  names a channel and the event isn't console or API input, are in the window
+  response stored exactly one message, for every agent and not held from the
+  residents, where neither the event nor the message names a channel and the
+  event isn't console or API input, are in the window
   already and get no line, where they were counted by channel in one ("N
   messages in #chan (oldest ~Ns ago) — already shown above at arrival; this is
   a batched wake, not new content"), or, for a batch's one message still the
