@@ -223,13 +223,14 @@ set `AF_TEST_CONCURRENCY` yourself and run `npm test`.
 
 Push-time CI (`ci.yml`) builds, typechecks and runs the whole suite on
 every pull request and every push to main, on ubuntu at the engines floor
-(Node 22.12.0). It does so first with the dependencies as `npm install`
-resolves them, and again with each dependency, optional and peer ones
+(Node 22.12.0). It does so with the dependencies as `npm install` resolves
+them, and, in jobs of their own, with each dependency, optional and peer ones
 included, at the lowest release its range admits, since a host's own range or
 lockfile can hold that one. A range that joins lines with `||` gets one more
-run for each line other than its lowest, at that line's lowest release, with
-every other dependency at its lowest (`scripts/install-dependency-floors.mjs`).
-The other lines of two such ranges aren't tested in crossed combinations.
+run for each of its lines' lowest releases other than the range's own lowest,
+with every other dependency at its lowest
+(`scripts/install-dependency-floors.mjs`). The other lines of two such ranges
+aren't tested in crossed combinations.
 Every other leg, macOS at 22.12.0, 24 and the newest Node
 and ubuntu at 24 and the newest Node, only installs the package and loads
 it: it builds and runs `node scripts/pack-installs-alone.mjs`, the pack

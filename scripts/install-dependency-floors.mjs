@@ -1,17 +1,3 @@
-// CI's floors job: installs each dependency a host installs with this package
-// at the floor of a line its range admits, so the build and the suite run
-// against releases a host may be held at. A floor is the lowest published
-// release that satisfies a range, as the registry answers
-// `npm view NAME@RANGE version`. devDependencies are left to npm: no host
-// installs them. A range that admits a prerelease is refused, not ordered.
-//
-// `plan` prints the legs as `legs=JSON` for $GITHUB_OUTPUT: one with every
-// range at its lowest, then one for each further member of a `||` range, at
-// that member's floor with everything else at its lowest. `install` installs
-// the leg given as JSON in LEG, as `plan` printed it, and fails if any is then
-// installed otherwise. It refuses a leg that doesn't name exactly the
-// dependencies `plan` reads, before npm runs: npm would otherwise resolve each
-// it leaves out as usual, and the job could pass without its floors.
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { npmCommand } from "./single-threaded.mjs";

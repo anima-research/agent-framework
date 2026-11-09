@@ -1,11 +1,3 @@
-/**
- * scripts/install-dependency-floors.mjs, which CI's floor-legs and floors jobs
- * run: `plan` gives the legs, one with every range at its lowest and one for
- * each further line a `||` range admits, and `install` installs a leg and
- * fails rather than build against anything else, a leg that leaves out a
- * dependency included. Run here against a stand-in
- * npm on PATH that answers `npm view` from a table and records each call.
- */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -52,7 +44,7 @@ function floors(mode: string, manifest: object, view: Record<string, string | st
       cwd: dir,
       encoding: 'utf8',
       env: {
-        ...process.env,
+        ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'LEG')),
         PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
         FLOORS_SEEN: seen,
         FLOORS_VIEW: JSON.stringify(view),

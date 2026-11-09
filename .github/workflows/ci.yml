@@ -117,15 +117,6 @@ jobs:
           found=$(find . -name 'report.*.json' -not -path './node_modules/*')
           if [ -n "$found" ]; then echo "Node diagnostic reports were written (they list the environment):"; echo "$found"; exit 1; fi
 
-  # Build & Test leaves each range to npm's resolution, so nothing else
-  # builds against a range's floor on purpose, where a host may be held by its
-  # own range or lockfile. These jobs install each dependency a
-  # host installs at its floor, then build and run the suite with Build &
-  # Test's own checks after it: a change that needs a newer release than its
-  # range promises fails here, not in a host. floor-legs fixes the releases
-  # once, so the legs can't disagree if one is published mid-run: one leg with
-  # every range at its lowest, and one for each further line a `||` range
-  # admits (scripts/install-dependency-floors.mjs).
   floor-legs:
     name: Dependency floors to test
     runs-on: ubuntu-latest
