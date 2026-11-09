@@ -88,6 +88,8 @@ export function endedTooSoon(livedMs: number, ended: ConnectionEnd = {}): string
 export function reconnectDelay(failures: number, baseMs: number, capMs: number, random: () => number = Math.random): number {
   const exponent = Math.max(0, Math.min(failures - 1, 30));
   const capped = Math.min(baseMs * 2 ** exponent, capMs);
+  // Node and Bun run a timer longer than MAX_TIMER_MS after 1 ms, so an
+  // unclamped wait would retry at once.
   return Math.min(capped * (0.75 + random() * 0.5), MAX_TIMER_MS);
 }
 
