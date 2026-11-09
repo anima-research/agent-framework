@@ -256,6 +256,7 @@ test('the catalogue opens on what the resident hid, one line each: its source, i
    const m=/ — details: offset (\d+), limit (\d+)$/.exec(line);
    assert.ok(m,line);
    assert.equal(lines[Number(m[1])-1],`#### ${name} (hidden)`,'the offset reaches its full definition');
+   assert.ok(lines.slice(Number(m[1])-1,Number(m[1])-1+Number(m[2])).some(l=>l.startsWith('Schema:')),'the limit reaches its schema');
    return line.slice(0,m.index);
   };
   assert.equal(at(hiddenLines[2]!,'web--fetch'),'- web--fetch (MCPL server: web): "Fetch, as the host words it"');
@@ -304,6 +305,19 @@ test('a hidden tool\'s line quotes at most 200 characters of its description\'s 
   const hiddenAt=lines.indexOf('## Hidden (2)');
   assert.ok(lines[hiddenAt+2]!.startsWith(`- exact--tool (Unattributed): "${exact}" — details: `),'200 characters, counted by code point, show whole');
   assert.ok(lines[hiddenAt+3]!.startsWith(`- long--tool (Unattributed): "${'x'.repeat(197)}"... (201 characters) — details: `),lines[hiddenAt+3]);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a hidden tool\'s line ends its description\'s first line at any line break the catalogue reads as one',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-breaks-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const breaks=['\r','\v','\f','\x85','\u2028','\u2029'];
+  const tools=[...breaks.map((b,i)=>({name:`break${i}--tool`,description:`first${b}second`,inputSchema:{type:'object' as const}})),...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:Object.fromEntries(breaks.map((_,i)=>[`break${i}--tool`,{visible:false}]))}));
+  const lines=renderCatalogue(p.resolve(tools)).split('\n');
+  const hiddenAt=lines.indexOf(`## Hidden (${breaks.length})`);
+  breaks.forEach((b,i)=>assert.ok(lines[hiddenAt+2+i]!.startsWith(`- break${i}--tool (Unattributed): "first" — details: `),`${JSON.stringify(b)}: ${lines[hiddenAt+2+i]}`));
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
