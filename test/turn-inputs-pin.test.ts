@@ -448,7 +448,7 @@ test('when the compile refuses without the pin too, the pin is dropped once and 
   });
 });
 
-test('when the compile finds no room in the window beside the request\'s overhead, the pin stays: dropping it can\'t make room, so the compile runs once', async () => {
+test('when the compile finds no room in the window beside the request\'s overhead, the refusal doesn\'t drop the pin: dropping it can\'t make room, so the compile runs once', async () => {
   const module = new PagesModule();
   const membrane = new TurnMembrane([[answer(FINAL)]]);
   const agent = agentConfig({ contextBudgetTokens: 8_000, strategy: strategy('kv-unified') });

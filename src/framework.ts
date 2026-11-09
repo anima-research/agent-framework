@@ -35334,8 +35334,11 @@ export class AgentFramework {
         'context-refusal',
         agentName,
         `compile refused (window_full): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
-        'no drain kicked, since no history or budget makes room: the system prompt, the tools and the reply\'s ' +
-        'maxTokens fill physicalWindowTokens. Lower maxTokens or the tools, or check physicalWindowTokens against the model\'s window.',
+        'no drain kicked, since no history or budget makes room: as context-manager prices them, the reply\'s maxTokens, ' +
+        'the system prompt, the tools, the messages the turn sends beside its history and the message injections leave ' +
+        'physicalWindowTokens no room for the conversation, by the figures the reason gives. Lower maxTokens, the system ' +
+        'prompt, the tools, the message injections or what the turn sends beside its history, or check physicalWindowTokens ' +
+        'against the model\'s window.',
         { skipLog: true },
       );
     }

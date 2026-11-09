@@ -178,8 +178,9 @@ const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT
 
 /**
  * Whether `error` is context-manager's refusal of a compile whose request limit leaves the context no room beside
- * the reply's reserve and what the request sends besides it (`requestAllowanceTokens` at or below 0). No history and
- * no budget makes room there: only a smaller reply, system prompt or tool list, or a larger window.
+ * the reply's reserve, the system prompt, the tools, the messages the request sends beside its history and the message
+ * injections (`requestAllowanceTokens` at or below 0). No history and no budget makes room there: only less of those,
+ * or a larger window.
  */
 export function leavesNoRoomInWindow(error: unknown): boolean {
   if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') return false;
