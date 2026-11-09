@@ -5,9 +5,11 @@
  * through its whole quiet period, so by the time its turn starts a message
  * that woke nothing (another channel's chatter) can be the newest entry, and
  * an agent reading the last entry as its cause would answer it into the
- * batch's channel. So a fresh start of a turn a batched wake starts writes
- * one line naming the wake's messages, as its own row, when a row a reply
- * could be meant for follows them in its window (InferenceRequest.batchRows).
+ * batch's channel. So a fresh start of a turn a batched wake starts (its
+ * BATCH_ROWS) writes one line naming the wake's messages its window holds,
+ * as its own row, when a row a reply could be meant for follows them there:
+ * none for a turn that merges a wake that isn't a batch's, and in a window
+ * still in legacy mode, only the delivery agent's start.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,6 +26,7 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import { incoming, registerOpen, MENTION, AMBIENT } from './helpers/admission.js';
 import { GateModule, waitCall, say } from './helpers/dendrite.js';
+import { storeOwnRow } from '../src/dendrite/audience.js';
 
 /** The framework's internal mark of a batched wake's rows, read loosely so
  *  this file still runs, red, against a framework without it. */
@@ -89,16 +92,18 @@ type Bare = {
     processInferenceRequests(): Promise<void>;
     storeInjections(agent: Agent, injections: ContextInjection[] | undefined): unknown;
     placeBatchLine(agent: Agent, rows: readonly string[]): void;
+    activeTurnTokens: Map<string, number>;
   };
 };
 
-async function bare(names: string[], membrane: MockMembrane = new MockMembrane(), extra: Record<string, unknown> = {}): Promise<Bare> {
+async function bare(names: string[], membrane: MockMembrane = new MockMembrane(), extra: Record<string, unknown> = {}, config: Record<string, unknown> = {}): Promise<Bare> {
   const dir = mkdtempSync(join(tmpdir(), 'wake-pointer-'));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'test.chronicle'),
     membrane: membrane.asMembrane(),
     agents: names.map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, ...((extra[name] as object | undefined) ?? {}) })),
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    ...config,
   } as never);
   return { framework, membrane, dir, internals: framework as unknown as Bare['internals'] };
 }
@@ -362,6 +367,86 @@ describe("a batched wake's line is written once per wake", () => {
     } finally { await done(b); }
   });
 
+  it("a line whose write fails doesn't fail the start and stays undecided for a later one; one that landed though its write threw counts as written", async () => {
+    const b = await bare(['scout']);
+    try {
+      const scout = b.framework.getAgent('scout')!;
+      const cm = scout.getContextManager() as unknown as { addMessage: (...a: unknown[]) => unknown };
+      const real = cm.addMessage;
+      const first = [storeDm(b, 'ev-1', 'are you there?')];
+      storeChatter(b);
+      cm.addMessage = () => { throw new Error('store unavailable'); };
+      try { b.internals.placeBatchLine(scout, first); } finally { cm.addMessage = real; }
+      assert.deepEqual(linesOf(b), [], 'not written');
+      b.internals.placeBatchLine(scout, first);
+      assert.equal(linesOf(b).length, 1, 'written by the next start');
+      const second = [storeDm(b, 'ev-2', 'and now?')];
+      storeChatter(b, 'more chatter');
+      cm.addMessage = (...a: unknown[]) => { real.apply(cm, a); throw new Error('propagation failed'); };
+      try { b.internals.placeBatchLine(scout, second); } finally { cm.addMessage = real; }
+      assert.equal(linesOf(b).length, 2, 'it landed');
+      b.internals.placeBatchLine(scout, second);
+      assert.equal(linesOf(b).length, 2, 'and the next start writes it no second time');
+    } finally { await done(b); }
+  });
+
+  it("the agent's own row presented during its turn, before a batch row stored earlier is: the batch row enters the window after it, newest, so no line", async () => {
+    const b = await bare(['scout']);
+    try {
+      const scout = b.framework.getAgent('scout')!;
+      const window = (): string[] => scout.getContextManager().getPresentedMessages().map(rowText);
+      b.internals.activeTurnTokens.set('scout', 1);
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      storeOwnRow(scout, 'scout', [{ type: 'text', text: 'my own words' }]);
+      b.internals.activeTurnTokens.delete('scout');
+      assert.ok(window().includes('my own words'), 'premise: the own row is presented');
+      assert.ok(!window().includes('are you there?'), 'premise: the batch row waits outside the window');
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const all = window();
+      assert.ok(all.indexOf('are you there?') > all.indexOf('my own words'), 'premise: the batch row entered after the own row');
+      assert.deepEqual(linesOf(b), []);
+    } finally { await done(b); }
+  });
+
+  it("a batched message whose metadata names its channel, chatter after it: the line names the channel by that name, as the gate's quote did", async () => {
+    const b = await bare(['scout']);
+    try {
+      const row = b.internals.addMessage('antra', [{ type: 'text', text: 'in work' }], { serverId: 'discord', channelId: 'discord:g1:work', channelName: 'work', messageId: 'w1' });
+      storeChatter(b);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([row]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      assert.deepEqual(LINE.exec(lines[0]!)?.slice(1), ['1', '1', '#work (discord:g1:work)'], lines[0]);
+    } finally { await done(b); }
+  });
+
+  it("one batched message in one server's general and two in another server's general, chatter after them: one line counting each server's channel apart", async () => {
+    const b = await bare(['scout']);
+    try {
+      const rows = [
+        b.internals.addMessage('antra', [{ type: 'text', text: 'a in one' }], { serverId: 'one', channelId: 'general', messageId: 'a1' }),
+        b.internals.addMessage('antra', [{ type: 'text', text: 'b in two' }], { serverId: 'two', channelId: 'general', messageId: 'b1' }),
+        b.internals.addMessage('antra', [{ type: 'text', text: 'c in two' }], { serverId: 'two', channelId: 'general', messageId: 'b2' }),
+      ];
+      storeChatter(b);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake(rows));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      const counts = [...lines[0]!.matchAll(/^- (\d+) messages? in general /gm)].map((m) => m[1]).sort();
+      assert.deepEqual(counts, ['1', '2'], lines[0]);
+      assert.match(lines[0]!, /^\[Gate: 3 events matched\]/);
+    } finally { await done(b); }
+  });
+
   it('a batched wake merged with a wake that names no rows: no line', async () => {
     const b = await bare(['scout']);
     try {
@@ -581,6 +666,39 @@ describe('through the gate, a debounced batch in alpha', () => {
     } finally { await f.close(); }
   });
 
+  it("whose start announces the locus, then fails and is retried at the same turn: the retry writes no line for its first start's notice", async () => {
+    const f = await fixture({ framework: {
+      errorPolicy: { maxRetries: 1, onInferenceError: (_e: Error, _a: string, attempt: number) => attempt === 0 ? { retry: true, delayMs: 20 } : { retry: false } },
+      gate: { config: { policies: [addressedOnly], default: 'skip' }, onboarding: false },
+    } });
+    try {
+      (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+        f.membrane.calls.push(request);
+        if (f.membrane.calls.length === 1) {
+          const error = new MembraneError({ type: 'server', retryable: true, httpStatus: 500, message: 'Internal server error', rawError: { status: 500 }, rawRequest: request });
+          return {
+            isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+            provideToolResults() { throw new Error('not waiting'); },
+            cancel() {},
+            async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> { yield { type: 'error', error } as StreamEvent; },
+          } as unknown as YieldingStream;
+        }
+        return new MockYieldingStream([say('plain answer')]);
+      };
+      await registerOpen(f, 'alpha');
+      await incoming(f, 'alpha', 'm1', 'the question', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => pending(f) === 1, 'batched');
+      fireAll(f);
+      await settleUntil(f.framework, () => f.membrane.calls.length >= 2, 'the failed attempt and its retry');
+      assert.equal(f.membrane.calls.length, 2, 'premise: the attempt and its retry');
+      const retried = requestTexts(f.membrane.calls[1]);
+      const at = retried.findIndex((t) => t.includes('the question'));
+      assert.ok(at >= 0 && retried.slice(at).some((t) => t.startsWith('[routing]')), "premise: the first start's routing notice follows the question in the retry's request");
+      assert.ok(!retried.some((t) => t.startsWith('[Gate:')), 'no line');
+    } finally { await f.close(); }
+  });
+
   it('answered at a tool boundary, then chatter in beta, then the fire: the wake drops and no line is written', async () => {
     const module = new GateModule();
     const f = await fixture({ framework: { modules: [module], errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) }, gate: { config: { policies: [addressedOnly], default: 'skip' }, onboarding: false } } });
@@ -599,8 +717,13 @@ describe('through the gate, a debounced batch in alpha', () => {
       await loop;
       await incoming(f, 'beta', 'm3', 'chatter in beta', AMBIENT);
       await f.framework.runUntilIdle();
+      const gate = gateOf(f) as unknown as { requestInferenceFn: (agentName: string, ...rest: unknown[]) => void };
+      const requested: string[] = [];
+      const original = gate.requestInferenceFn;
+      gate.requestInferenceFn = (agentName, ...rest) => { requested.push(agentName); original(agentName, ...rest); };
       fireAll(f);
       await f.framework.runUntilIdle();
+      assert.deepEqual(requested, ['agent'], 'premise: the batch requested its wake');
       assert.equal(f.membrane.calls.length, 1, 'the answered wake starts no turn');
       assert.ok(!f.context().includes('[Gate:'), 'no line');
     } finally { await f.close(); }

@@ -15,14 +15,15 @@
   quoted again in a line, and under conversation routing the trunk, woken for
   a fork's messages it doesn't hold, no longer gets a line saying they were
   shown above.
-- Where a row a reply could be meant for follows a batched wake's messages in
-  an agent's window when the turn the wake starts begins, such as another
+- Where a row a reply could be meant for follows a batched wake's messages in an
+  agent's window when the turn the wake starts begins, such as another
   channel's message stored during the batch's quiet period, that fresh start
   writes one `[Gate: …]` line naming them by count and channel, as the agent's
   own row, before the start's own notices. A clock row, a stored context
   injection, a row the agent's view leaves out and an unobserved co-resident's
   own round don't count; an observed co-resident's round owed to the agent
-  does. Each agent the batch wakes decides its own line by its own window,
+  does. Past the window's 32 newest rows that don't count, the line is
+  written. Each agent the batch wakes decides its own line by its own window,
   once per wake, and none is written while the host is quiesced. A turn that
   merges batched wakes names all their messages, and one that merges a wake
   that isn't a batch's names none. 0.33.0 wrote such a line at the turn's

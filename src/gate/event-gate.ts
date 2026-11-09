@@ -119,10 +119,11 @@ interface PendingEvent {
   content: string;
   eventType: string;
   timestamp: number;
-  /** The framework stores MCPL event content in the context window AT ARRIVAL
-   *  (channel-incoming and push-event both addMessage before the gate decides
-   *  anything), and a module event's own message where the host gives its
-   *  write (`after`). For those, the debounced wake must NOT re-quote the content —
+  /** MCPL channel messages and pushes have a message of their own in the
+   *  context window, stored at arrival (the host admits the event first and
+   *  fills the placement it gave `evaluate` as it stores the message), and so
+   *  does a module event where the host gives its write (`after`). For those,
+   *  the debounced wake must NOT re-quote the content —
    *  a [Gate:] copy delivered minutes later reads as a fresh, stale duplicate
    *  of a message the agent may have long since handled. */
   inContext: boolean;
@@ -153,6 +154,9 @@ interface PendingEvent {
   recipients?: readonly string[];
   after?: WritePlacement;
   replyTo?: { serverId: string; channelId: string };
+  /** The event's own placement where withoutWrite took its write out of the
+   *  wake: the batch's line can still name its row (BATCH_LINE_ROWS). */
+  named?: WritePlacement;
 }
 
 /** Where the host put a message the gate wrote, or an event's own message
@@ -398,9 +402,19 @@ function isWrite(after: WritePlacement | undefined): after is WritePlacement & {
 }
 
 function withoutWrite(event: PendingEvent): PendingEvent {
-  const { after: _after, replyTo: _replyTo, ...rest } = event;
-  return rest;
+  const { after, replyTo: _replyTo, ...rest } = event;
+  return after ? { ...rest, named: after } : rest;
 }
+
+/**
+ * The rows a batched wake's line can name, on the provenance of every wake
+ * the batch requests: the line the gate wrote for its quoted events, and each
+ * event with a message of its own whose placement the host gave, whether or
+ * not the wake carries that event's write. The framework's own wiring reads
+ * it; it isn't part of WakeProvenance.
+ */
+export const BATCH_LINE_ROWS: unique symbol = Symbol('batch-line-rows');
+export type MarkedProvenance = WakeProvenance & { [BATCH_LINE_ROWS]?: WritePlacement[] };
 
 /**
  * Default route-channel resolution when the host supplies none: a
@@ -4212,6 +4226,13 @@ export class EventGate {
           ...inContext.map(e => ({ after: e.after!, ...(e.replyTo ? { replyTo: e.replyTo } : {}) })),
         ]
       : undefined;
+    const lineRows = [
+      ...(quoted.length > 0 ? [placement] : []),
+      ...inContext.flatMap((e) => {
+        const row = e.after ?? e.named;
+        return row ? [row] : [];
+      }),
+    ];
 
     // Provenance of the batched wake (who/where woke the agent): the newest
     // ADDRESSED event first, else the newest event naming a channel or an
@@ -4222,7 +4243,9 @@ export class EventGate {
     // channel last saw any traffic. Ambient-only batches set no locus, and
     // name the channels they came from (`batchChannels`).
     const chosen = wakeProvenance(events);
-    const provenance = writes ? { ...chosen, writes } : chosen;
+    const provenance: MarkedProvenance | undefined = writes || lineRows.length > 0
+      ? { ...chosen, ...(writes ? { writes } : {}), ...(lineRows.length > 0 ? { [BATCH_LINE_ROWS]: lineRows } : {}) }
+      : chosen;
     for (const agentName of woken) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
       woke?.push(agentName);

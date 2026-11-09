@@ -2,7 +2,12 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import * as gateModule from '../src/gate/event-gate.js';
 import { EventGate, wakeProvenance, type WakeWrite, type WritePlacement } from '../src/gate/event-gate.js';
+
+/** The gate's internal mark of the rows a batched wake's line can name, read
+ *  loosely so this file still runs, red, against a gate without it. */
+const BATCH_LINE_ROWS: symbol = (gateModule as unknown as { BATCH_LINE_ROWS?: symbol }).BATCH_LINE_ROWS ?? Symbol('no line rows');
 import type { GateConfig, GateEventInfo } from '../src/gate/types.js';
 
 // ---------------------------------------------------------------------------
@@ -1423,6 +1428,17 @@ describe('a batched wake writes no line for events with a message of their own',
     assert.strictEqual(messages.length, 0);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].writes, undefined);
+  });
+
+  it("a placed message beside a push the host gave no write: the wake carries no writes, but its line rows still name the placed message", () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('line-rows-unplaced.json'));
+    const placed = { agent: 'agent', messageId: 'row-1' };
+    gate.evaluate(message('m1'), placed);
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'a coalesced push', metadata: { eventId: 'ev-1' } }));
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 0, 'premise: no line at delivery');
+    assert.strictEqual(inferenceRequests[0]!.writes, undefined, 'premise: nothing to drop the wake by');
+    assert.deepStrictEqual((inferenceRequests[0] as Record<symbol, unknown>)[BATCH_LINE_ROWS], [placed]);
   });
 
   it('what the judge is told: a debounced batch whose every event has a write placed for the agent only may wake it', () => {

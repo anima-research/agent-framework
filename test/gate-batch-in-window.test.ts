@@ -68,7 +68,7 @@ class CustomModule extends GateModule {
   }
 }
 
-describe('a batched wake writes no gate line for events already in the window', () => {
+describe('a batched wake writes no gate line when it is delivered for events already in the window', () => {
   it("two messages in two residents' windows: each resident's first request holds both, and no gate line", async () => {
     const f = await fixture({
       agents: [resident('scout'), resident('mira')],

@@ -2,7 +2,12 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import * as gateModule from '../src/gate/event-gate.js';
 import { EventGate, type WakeWrite, type WritePlacement } from '../src/gate/event-gate.js';
+
+/** The gate's internal mark of the rows a batched wake's line can name, read
+ *  loosely so this file still runs, red, against a gate without it. */
+const BATCH_LINE_ROWS: symbol = (gateModule as unknown as { BATCH_LINE_ROWS?: symbol }).BATCH_LINE_ROWS ?? Symbol('no line rows');
 import type { GateConfig, GateEventInfo, JudgeFn, JudgeRequest, JudgeVerdict } from '../src/gate/types.js';
 import type { ToolDefinition } from '../src/types/index.js';
 
@@ -53,12 +58,12 @@ function scriptedJudge() {
 function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[]; isAnswered?: (after: WritePlacement) => boolean } = {}) {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const wakes: Array<{ agentName: string; reason: string; writes?: WakeWrite[] }> = [];
+  const wakes: Array<{ agentName: string; reason: string; writes?: WakeWrite[]; lineRows?: unknown }> = [];
   const gate = new EventGate({
     configPath,
     emitTrace: (e) => traces.push(e as { type: string }),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
-    requestInference: (a, r, _s, p) => wakes.push({ agentName: a, reason: r, ...(p?.writes ? { writes: p.writes } : {}) }),
+    requestInference: (a, r, _s, p) => wakes.push({ agentName: a, reason: r, ...(p?.writes ? { writes: p.writes } : {}), ...(p && BATCH_LINE_ROWS in p ? { lineRows: (p as Record<symbol, unknown>)[BATCH_LINE_ROWS] } : {}) }),
     getAgentNames: () => ['agent'],
     ...(opts.judge ? { judge: opts.judge } : {}),
     ...(opts.judgeTimeoutMs !== undefined ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
@@ -159,6 +164,22 @@ describe('judge rules: verdicts', () => {
       gate.dispose();
     });
   }
+
+  it("a reply with an event the host says is already answered: the wake carries no writes, but its line rows still name both events' rows", async () => {
+    const judge = scriptedJudge();
+    const answered = new Set<string>(['row-1']);
+    const { gate, wakes } = makeGate(writeConfig('reply-line-rows.json', JUDGED), {
+      judge: judge.fn, isAnswered: (after) => answered.has(after.messageId!),
+    });
+    gate.evaluate(chat('already answered'), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(chat('still open'), { agent: 'agent', messageId: 'row-2' });
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.strictEqual(wakes[0]!.writes, undefined, 'premise: the answered event keeps the wake');
+    assert.deepStrictEqual(wakes[0]!.lineRows, [{ agent: 'agent', messageId: 'row-1' }, { agent: 'agent', messageId: 'row-2' }]);
+    gate.dispose();
+  });
 
   it('a reply asks isAnswered only about events with a stored write, never an unfilled placement', async () => {
     const judge = scriptedJudge();
@@ -799,7 +820,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
   for (const [what, writes, woken, certain] of [
     ['its one event written to the agent it wakes only may wake it, since an answered batch starts no turn', [toAgent], ['agent'], false],
     ['each of its events written to the agent it wakes only may wake it', [toAgent, { agent: 'agent', messageId: 'row-2' }], ['agent'], false],
-    ['with an event given no write, it wakes the agent, which can never have answered that one', [toAgent, undefined], ['agent'], true],
+    ['with an event given no write, it wakes the agent: the framework has no write to drop the wake by', [toAgent, undefined], ['agent'], true],
     ["with an event written to another agent's window, it wakes the agent", [{ agent: 'other', messageId: 'row-1' }], ['agent'], true],
     ['with a write that names no agent, it wakes the agent', [{ messageId: 'row-1' }], ['agent'], true],
     ["it wakes a co-resident, whom the delivery agent's answer doesn't take it from", [toAgent], ['agent', 'other'], true],

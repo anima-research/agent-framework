@@ -43,7 +43,7 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
   throw new Error(`timed out waiting for: ${what}`);
 }
 
-describe('a batched wake writes no line for messages already in the window', () => {
+describe('a batched wake writes no line when it is delivered for messages already in the window', () => {
   let tempDir: string;
   let commandPath: string;
   let membrane: MockMembrane;

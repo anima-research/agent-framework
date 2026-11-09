@@ -965,7 +965,7 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
-import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, type WakeWrite, type WritePlacement } from './gate/event-gate.js';
+import { BATCH_LINE_ROWS, EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, type MarkedProvenance, type WakeWrite, type WritePlacement } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
 import {
   WakeDecisions, carriesAttention, isSuggestedRuleOf, isUndecided, offerFor, placementFor, rulesToWrite,
@@ -1296,11 +1296,11 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
 /**
- * The rows a batched wake is for (WakeProvenance.writes), on the wake of
- * every agent the batch wakes: a fresh start of the turn it starts writes one
- * `[Gate: …]` line naming those of them in the agent's window, as its own
- * row, where a row a reply could be meant for follows them there
- * (placeBatchLine). Internal: a mark the framework's own gate wiring sets,
+ * The rows a batched wake's line can name (the gate's BATCH_LINE_ROWS), on
+ * the wake of every agent the batch wakes: a fresh start of the turn it
+ * starts writes one `[Gate: …]` line naming those of them in the agent's
+ * window, as its own row, where a row a reply could be meant for follows
+ * them there (placeBatchLine). Internal: a mark the framework's own gate wiring sets,
  * exported for tests.
  */
 export const BATCH_ROWS: unique symbol = Symbol('batch-rows');
@@ -4154,9 +4154,8 @@ function batchRowsKey(request: InferenceRequest | undefined): string {
   return JSON.stringify(batchRowsOf(request) ?? null);
 }
 
-/** A batched wake's line, as `main`'s gate wrote it (referenceLine): how many
- *  of the wake's messages in one channel, and how long ago the oldest
- *  arrived, as of `now`. */
+/** One channel's entry in a batched wake's line: how many of the wake's
+ *  messages are in it, and how long ago the oldest arrived, as of `now`. */
 function batchReferenceLine(count: number, channel: string, oldest: number, now: number): string {
   const age = Math.round((now - oldest) / 1000);
   return `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
@@ -4850,12 +4849,10 @@ export class AgentFramework {
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
-  /** The batched wakes' rows (BATCH_ROWS) whose line a start
-   *  has written, and the agents each was written for (placeBatchLine), so
-   *  every later start of the wake writes it at most once per agent: every
-   *  copy of a wake's request carries the same array. A merge's union keeps
-   *  the arrays it was made from (batchRowsParts), so placing it places
-   *  them. */
+  /** The batched wakes' rows (BATCH_ROWS) whose line a start has written,
+   *  with the agents it was written for, by the array every copy of a wake's
+   *  request carries; and a merge's union's parts (batchRowsParts), which
+   *  placing the union places. */
   private readonly placedBatchRows = new WeakMap<readonly string[], Set<string>>();
   private readonly batchRowsParts = new WeakMap<readonly string[], ReadonlyArray<readonly string[]>>();
   /** Rounds of tool calls, by their results array, that a save_recent_image
@@ -5637,10 +5634,10 @@ export class AgentFramework {
           const request: MarkedRequest = {
             agentName, reason, source, timestamp: Date.now(),
             ...(provenance?.writes ? framework.readsRowsFor(provenance.writes, agentName) : framework.readsRowFor(after, agentName)),
-            // The rows the batch is for, on every agent's wake: each one's
-            // start decides its own line by its own window (placeBatchLine).
+            // The rows the batch's line can name, on every agent's wake: each
+            // one's start decides its own line by its own window (placeBatchLine).
             ...((): Partial<MarkedRequest> => {
-              const rows = (provenance?.writes ?? []).flatMap(({ after: placed }) => (placed.messageId ? [placed.messageId] : []));
+              const rows = ((provenance as MarkedProvenance | undefined)?.[BATCH_LINE_ROWS] ?? []).flatMap((placed) => (placed.messageId ? [placed.messageId] : []));
               return rows.length > 0 ? { [BATCH_ROWS]: rows } : {};
             })(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -19554,7 +19551,7 @@ export class AgentFramework {
           placement, ...(audience ? { audience } : {}),
           ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source: stampSource } } : {}),
         });
-        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
+        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined && !audience) added = placement;
         // A write kept in memory (a surgery's hold, or the wait for its
         // agent's recovery) has no id yet: it is traced once, as it is
         // stored ('surgery-release').
@@ -34382,11 +34379,10 @@ export class AgentFramework {
    * Write a batched wake's line into the starting agent's own window, as its
    * own row, where a row a reply could be meant for follows the wake's rows
    * there (batchIsNewest): one line naming those of the rows its window
-   * holds, by count and channel, as `main`'s gate named messages already
-   * shown. Called by a fresh start that doesn't resume a logical turn, after
-   * the turn's own inputs and before its own notices (the locus notice among
-   * them), so a line lands after whatever entered the window since the batch
-   * was delivered and before the agent's answer.
+   * holds, by count and channel. Called by a fresh start that doesn't resume
+   * a logical turn, after the turn's own inputs and before its own notices
+   * (the locus notice among them), so a line lands after whatever entered the
+   * window since the batch was delivered and before the agent's answer.
    *
    * - Each agent the batch woke decides its own line by its own window; for
    *   an agent whose window isn't presented, only the delivery agent's start
@@ -34412,11 +34408,14 @@ export class AgentFramework {
     const now = Date.now();
     const byChannel = new Map<string, { name: string; count: number; oldest: number }>();
     for (const m of held) {
-      const md = (m.metadata ?? {}) as { serverId?: unknown; channelId?: unknown };
+      const md = (m.metadata ?? {}) as { serverId?: unknown; channelId?: unknown; channelName?: unknown };
       const serverId = typeof md.serverId === 'string' ? md.serverId : undefined;
       const channelId = typeof md.channelId === 'string' && md.channelId !== '' ? md.channelId : undefined;
+      const label = typeof md.channelName === 'string' && md.channelName !== '' ? md.channelName : undefined;
       const name = channelId === undefined ? '(unknown channel)'
-        : serverId !== undefined ? this.channelShown({ serverId, channelId }) : suppliedValue(channelId);
+        : serverId === undefined ? suppliedValue(channelId)
+        : label !== undefined ? this.labelledChannel({ serverId, channelId, label: label.startsWith('#') ? label : `#${label}` })
+        : this.channelShown({ serverId, channelId });
       const at = m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp);
       const key = JSON.stringify([serverId ?? null, channelId ?? null]);
       const entry = byChannel.get(key) ?? { name, count: 0, oldest: Number.isFinite(at) ? at : now };
@@ -34435,7 +34434,7 @@ export class AgentFramework {
       const landed = before === undefined ? undefined
         : this.storedSince(agent, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', "a batched wake's line");
       if (!landed || landed.length === 0) {
-        console.error(`[gate] ${agent.name}: a batched wake's line could not be written${landed ? '' : ' (whether it landed is unknown)'}:`, err);
+        console.error(`[gate] ${agent.name}: a batched wake's line ${landed ? 'was not written' : 'may not have been written (whether it landed is unknown)'}; the turn goes on without it, and a later fresh start of the wake decides it again:`, err);
         return;
       }
       console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
