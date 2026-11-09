@@ -240,9 +240,9 @@ describe('ProseDraftStore', () => {
 
 type Publish = { event: string; channelId: string; text: string; messageId?: string };
 
-/** A stream in XML tool mode: tool-calls carry no verbatim roundContent. */
+/** A stream in XML tool mode: tool-calls carry no verbatim roundContent, from round `fromRound` on. */
 class XmlModeStream implements YieldingStream {
-  constructor(private readonly inner: YieldingStream, private readonly roundPreamble = false) {}
+  constructor(private readonly inner: YieldingStream, private readonly roundPreamble = false, private readonly fromRound = 1) {}
   provideToolResults(...args: Parameters<YieldingStream['provideToolResults']>): void {
     this.inner.provideToolResults(...args);
   }
@@ -251,8 +251,9 @@ class XmlModeStream implements YieldingStream {
   get pendingToolCallIds(): string[] { return this.inner.pendingToolCallIds; }
   get toolDepth(): number { return this.inner.toolDepth; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    let round = 0;
     for await (const event of this.inner) {
-      if (event.type !== 'tool-calls') {
+      if (event.type !== 'tool-calls' || ++round < this.fromRound) {
         yield event;
         continue;
       }
@@ -268,10 +269,10 @@ class XmlModeStream implements YieldingStream {
 }
 
 /** A membrane in XML tool mode (the inner mock's streams, wrapped). */
-function xmlMode(inner: MockMembrane, roundPreamble = false): MockMembrane {
+function xmlMode(inner: MockMembrane, roundPreamble = false, fromRound = 1): MockMembrane {
   const streamYielding = inner.streamYielding.bind(inner);
   (inner as unknown as { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream }).streamYielding =
-    (request, options) => new XmlModeStream(streamYielding(request, options), roundPreamble);
+    (request, options) => new XmlModeStream(streamYielding(request, options), roundPreamble, fromRound);
   return inner;
 }
 
@@ -4855,7 +4856,7 @@ describe('the held-draft notice written mid-turn', () => {
 describe("an explicit send's result says what it holds", () => {
   const PLACE = `#room \\(Guild One\\) \\(${ROOM}\\)`;
   const FROM_ROUND = ', from this round on, is held as drafts until a new message reaches you or this turn ends, except in a round that keeps its speech private\\.';
-  const TURN = ' this turn is held as drafts until a new message reaches you or this turn ends, except in a round that keeps its speech private\\.';
+  const TURN = ' this turn is held as drafts until this turn ends, except in a round that keeps its speech private\\.';
   const resultOf = (h: Awaited<ReturnType<typeof harness>>, id: string): string => {
     const block = h.messages().flatMap((m) => m.content)
       .find((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === id) as { content?: unknown } | undefined;
@@ -4888,6 +4889,23 @@ describe("an explicit send's result says what it holds", () => {
       ]);
       assert.equal(h.drafts().length, 2, 'premise: both rounds\' speech is held');
       assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE}${TURN}`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a send in a round with no round content, after a round routed as it streams, takes the from-this-round line, as the routing does', async () => {
+    const h = await harness();
+    xmlMode(h.membrane, false, 2);
+    try {
+      await h.turn([
+        createMockResponse([text('Looking first.'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('sent it.'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.ok(!h.drafts().some((d) => d.text === 'Looking first.'), 'premise: the first round was routed as it streamed, not held');
+      const answer = JSON.parse(resultOf(h, 's1')) as Record<string, unknown>;
+      assert.match(String(answer.routing), new RegExp(`^Your plain speech to ${PLACE}${FROM_ROUND}$`));
     } finally {
       await h.close();
     }
