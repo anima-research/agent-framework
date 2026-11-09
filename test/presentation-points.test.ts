@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager as StoreWindow, PassthroughStrategy, type ContextManager, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
-import type { ContentBlock } from '@animalabs/membrane';
+import { MembraneError, type ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, OperatorActionError, audienceOf } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { residentContextOptions } from '../src/context-options.js';
@@ -56,6 +56,9 @@ type Internals = {
   surgeryHeldWrites: unknown[];
   storeDueClock(agent: Agent, occasion: 'event' | 'turn-start' | 'tool-boundary'): { id: MessageId } | undefined;
   sweepExpiredConversations(): void;
+  nonOwningProviderWait(agent: Agent, error: Error): 'held' | 'fail' | undefined;
+  budgetHolds: Map<string, unknown>;
+  providerAccelerationCooldowns: Map<string, { until: number; heldRequests: Array<{ reason?: string }> }>;
   conversationRouter: unknown;
   lastConversationSweep: number;
   closingConversationAgents: Set<string>;
@@ -613,6 +616,95 @@ describe('presentation points (#291)', () => {
     h.internals.activeTurnTokens.delete('oren');
     h.internals.presentAtEndOf(h.agent('oren'));
     assert.equal(h.cm('oren').ordinalOf(clock.id), undefined, "nor once oren's turn has ended and its point has run");
+  });
+
+  it("a closing fork whose closure wake waits isn't disposed when the turn that was alive at its expiry ends, and its closure turn runs", async () => {
+    const h = await boot({ forks: true });
+    const fork = await h.fork('fork-room');
+    let release!: () => void;
+    h.membrane.hold('fork-room', new Promise<void>((resolve) => { release = resolve; }));
+    h.framework.start();
+    h.internals.storeInFork(fork, [text('a question')], {});
+    h.internals.pendingRequests.push({ agentName: 'fork-room', reason: 'zz-question', source: 'test', timestamp: Date.now() });
+    await until(() => h.membrane.callsFor('fork-room').length === 1, "the fork's turn is alive");
+    const real = h.internals.conversationRouter;
+    let expired = false;
+    h.internals.conversationRouter = {
+      expired: () => (expired ? [] : (expired = true, [{ channelId: 'room', serverId: 'chat', agentName: 'fork-room' }])),
+      unbind: () => {},
+      getBinding: () => undefined,
+      closurePrompt: 'the conversation is closing',
+    };
+    h.internals.lastConversationSweep = 0;
+    try {
+      h.internals.sweepExpiredConversations();
+      assert.ok(h.internals.closingConversationAgents.has('fork-room'));
+      release();
+      await until(() => h.membrane.callsFor('fork-room').length === 2, 'the closure turn runs');
+      assert.ok(JSON.stringify(h.membrane.callsFor('fork-room')[1]).includes('the conversation is closing'), 'reading the closure prompt');
+      await until(() => !h.framework.getAgent('fork-room'), 'disposed once the closure turn ends');
+    } finally {
+      h.internals.conversationRouter = real;
+      h.internals.closingConversationAgents.clear();
+    }
+  });
+
+  it("the fallback reaper doesn't dispose a closing fork while a provider's stated wait keeps its closure wake, and the closure turn runs", async () => {
+    const h = await boot({ forks: true });
+    const fork = await h.fork('fork-room');
+    h.framework.start();
+    const real = h.internals.conversationRouter;
+    let expired = false;
+    h.internals.conversationRouter = {
+      expired: () => (expired ? [] : (expired = true, [{ channelId: 'room', serverId: 'chat', agentName: 'fork-room' }])),
+      unbind: () => {},
+      getBinding: () => undefined,
+      closurePrompt: 'the conversation is closing',
+    };
+    const limit = new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 600_000,
+      message: 'zz rate limit reached for requests', rawError: { status: 429 },
+    } as ConstructorParameters<typeof MembraneError>[0]);
+    try {
+      assert.equal(h.internals.nonOwningProviderWait(fork, limit), 'held', "the provider's stated wait holds the fork's turns");
+      h.internals.lastConversationSweep = 0;
+      h.internals.sweepExpiredConversations();
+      assert.ok(h.internals.closingConversationAgents.has('fork-room'));
+      await until(() => (h.internals.providerAccelerationCooldowns.get('fork-room')?.heldRequests ?? []).some((r) => r.reason === 'conversation:closure'),
+        'the wait keeps the closure wake');
+      h.internals.lastConversationSweep = 0;
+      h.internals.sweepExpiredConversations();
+      assert.ok(h.framework.getAgent('fork-room'), 'a sweep during the wait leaves the fork');
+      h.framework.releaseProviderWait('fork-room');
+      await until(() => h.membrane.callsFor('fork-room').length === 1, 'the closure turn runs');
+      assert.ok(JSON.stringify(h.membrane.callsFor('fork-room')[0]).includes('the conversation is closing'), 'reading the closure prompt');
+      await until(() => !h.framework.getAgent('fork-room'), 'disposed once the closure turn ends');
+    } finally {
+      h.internals.conversationRouter = real;
+      h.internals.closingConversationAgents.clear();
+    }
+  });
+
+  it('the fallback reaper leaves a closing fork while a budget hold of its agent exists', async () => {
+    const h = await boot({ forks: true });
+    await h.fork('fork-room');
+    const real = h.internals.conversationRouter;
+    h.internals.conversationRouter = { expired: () => [], unbind: () => {}, getBinding: () => undefined, closurePrompt: 'the conversation is closing' };
+    h.internals.closingConversationAgents.add('fork-room');
+    h.internals.budgetHolds.set('fork-room', { startedAt: Date.now(), wait: { since: Date.now() }, turn: { agentName: 'fork-room', reason: 'conversation:closure', source: 'test', timestamp: Date.now() }, standsOn: [], wakes: [] });
+    try {
+      h.internals.lastConversationSweep = 0;
+      h.internals.sweepExpiredConversations();
+      assert.ok(h.framework.getAgent('fork-room'), 'kept while its hold exists');
+      h.internals.budgetHolds.delete('fork-room');
+      h.internals.lastConversationSweep = 0;
+      h.internals.sweepExpiredConversations();
+      assert.ok(!h.framework.getAgent('fork-room'), 'disposed by the next sweep once the hold has ended');
+    } finally {
+      h.internals.budgetHolds.delete('fork-room');
+      h.internals.conversationRouter = real;
+      h.internals.closingConversationAgents.clear();
+    }
   });
 
   it('a closure prompt written while the fork\'s turn is alive waits for that turn\'s next point (here its end)', async () => {

@@ -164,6 +164,55 @@ export type TraceEvent =
       /** The provider's own error code, when it sent one (at most 128 characters). */
       providerErrorCode?: string;
     })
+  | (TraceEventBase & {
+      /**
+       * A start whose compile was refused for budget while compression was
+       * pending waits in the agent's budget hold, idle, instead of failing
+       * (#304). It follows the refused attempt's `inference:failed`. Once
+       * something the refused compile depends on has changed (compression's
+       * progress, nothing left pending, a surgery or an undo, the agent's
+       * budget or live context settings, or a quiesce's end), the hold ends,
+       * the held requests are queued, and its note is stored as the agent's
+       * own row, entering its window at once or, while a turn of the agent's
+       * is alive, at its next presentation point; a failed write stores
+       * none. Their start's own compile is the check: refused again while
+       * compression is pending, it waits in a new hold, with a new
+       * `inference:held`. `inference:hold_ended` follows each, once. An
+       * ephemeral run's start, and one before the framework's `start()`,
+       * never waits.
+       */
+      type: 'inference:held';
+      agentName: string;
+      /** 'over_budget', or 'context_refusal' when no summary covers a span the compile would drop. */
+      errorType: 'over_budget' | 'context_refusal';
+      /** The refusal's message, bounded as a trace event's `error` is (2,000 characters). */
+      error: string;
+      /** The refused compile's budget and size in tokens, when context-manager gave them. */
+      budget?: number;
+      actual?: number;
+      /** When this hold started (epoch ms). A wait held again after its
+       *  release starts a new hold; its `context-refusal` alert and the note
+       *  count from the wait's first hold. */
+      since: number;
+      /** Requests the hold holds as it starts: the refused start's own. */
+      heldRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'inference:hold_ended';
+      agentName: string;
+      /**
+       * 'released': something the refused compile depends on changed, so the
+       * held requests were queued and their start's compile is the check.
+       * 'stopped': the held turn was ended by `abortInference()`, `stop()` or
+       * its agent's end, reported after its `inference:aborted`. 'removed': a
+       * surgery or an undo removed what the held turn stood on, reported after
+       * its `inference:aborted`, and the wakes that joined it go back to the
+       * queue.
+       */
+      outcome: 'released' | 'stopped' | 'removed';
+      /** Since the hold started (`inference:held`'s `since`). */
+      waitedMs: number;
+    })
 
   // Streaming inference lifecycle
   | (TraceEventBase & {
@@ -1039,14 +1088,19 @@ export type TraceEvent =
   // this stream, not a separate system. See connectome docs/observability.md.
   | (TraceEventBase & {
       type: 'ops:alert';
-      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | … */
+      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | …
+       *  A kind ending in `-clear` ends the alert of the kind before it:
+       *  'context-refusal-clear' is raised when a budget hold whose wait
+       *  raised 'context-refusal' ends with its turn stopped or removed, so
+       *  the waiting start doesn't run. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
       /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record),
-       *  bounded field by field as that record is. */
+      /** Kind-specific structured payload (mirrors the failures.log record,
+       *  where the alert writes one: a budget hold's 'context-refusal' and its
+       *  clear write none), bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 
@@ -1556,7 +1610,7 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
 
 /**
  * Listener for trace events.
