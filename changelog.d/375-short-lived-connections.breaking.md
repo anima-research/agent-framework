@@ -4,9 +4,9 @@
   with `reconnect: true`, and on any server the modern engine runs, which
   also uses them to back off reopening a lost tool-list subscription (#375).
   `create()`, `connectMcplServer` and `restartMcplServer` refuse it before
-  anything opens, and `serverConfigProblems` lists it, naming the server and
-  the field, and the value when it's a number. Each of those values retried
-  at once on every attempt.
+  that server opens, and `serverConfigProblems` lists it, naming the server
+  and the field, and the value when it's a number. Each of those values
+  retried at once on every attempt.
   - At `create()`, such an entry fails that server alone at startup, as an
     unusable `requestTimeoutMs` does: it's logged, traced as
     `mcpl:server-connect-failed` and alerted as `mcpl-down`, and the other

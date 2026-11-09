@@ -96,9 +96,10 @@ function connectionOf(framework: AgentFramework, engine: Engine, id: string): ob
 }
 
 function backdate(framework: AgentFramework, engine: Engine, id: string, ms: number): void {
-  const connection = connectionOf(framework, engine, id) as { connectedAt: number; adoptedAt: number };
-  if (engine === 'legacy') connection.connectedAt -= ms;
-  else connection.adoptedAt -= ms;
+  const connection = connectionOf(framework, engine, id) as Record<string, unknown>;
+  const field = engine === 'legacy' ? 'connectedAt' : 'adoptedAt';
+  assert.equal(typeof connection[field], 'number', `${engine}'s connection keeps its start in ${field}`);
+  connection[field] = (connection[field] as number) - ms;
 }
 
 async function endConnection(server: Awaited<ReturnType<typeof started>>, index: number, reportsBefore: number): Promise<void> {
