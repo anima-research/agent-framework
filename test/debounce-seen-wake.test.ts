@@ -616,6 +616,8 @@ describe('debounced writes already read and answered', () => {
         assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 1, 'premise: the batch fired during the turn is held for it');
         module.release('first');
         await eventually(() => publishing, 'final publication started');
+        assert.ok((f.framework as unknown as { hasTurn(name: string): boolean }).hasTurn('agent'), 'premise: the turn is still under way while its publication is pending');
+        assert.equal(f.membrane.calls.length, 1, 'premise: no second call while the publication is pending');
         if (outcome === 'disposes') {
           (f.framework as unknown as { disposeConversationAgent(name: string): void }).disposeConversationAgent('agent');
           assert.equal(f.framework.getAgent('agent'), null);
