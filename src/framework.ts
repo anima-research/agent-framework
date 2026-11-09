@@ -1782,18 +1782,10 @@ const roundSilenceOf = (calls: readonly RoundCall[], round: number): TurnSilence
 const mergeSilence = (a: TurnSilence | null, b: TurnSilence | null): TurnSilence | null =>
   a === 'private' || b === 'private' ? 'private' : mergeSends(a, b);
 
-const keepsDraftsRound = (calls: readonly RoundCall[]): boolean =>
-  calls.some((c) => c.permitted && c.name === 'drafts')
-  && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
+type HoldClaim = 'from-round' | 'turn';
 
-type HoldClaim = 'with-round' | 'after-round' | 'turn-with-earlier' | 'turn';
-
-const holdClaimOf = (calls: readonly RoundCall[], live: boolean, privateThink: boolean, keptEarlier: boolean): HoldClaim | undefined => {
-  if (calls.some((c) => c.cause === 'private' && !c.refused)) return undefined;
-  const roundKept = calls.some((c) => c.refused);
-  if (!live) return roundKept || keptEarlier ? 'turn' : 'turn-with-earlier';
-  return roundKept || privateThink || keepsDraftsRound(calls) ? 'after-round' : 'with-round';
-};
+const holdClaimOf = (calls: readonly RoundCall[], live: boolean): HoldClaim | undefined =>
+  calls.some((c) => c.cause === 'private' && !c.refused) ? undefined : live ? 'from-round' : 'turn';
 
 const sendHoldAt = (sends: SendsReached, to: ChannelRef | null): SendHold | undefined => {
   if (sends.unknown) return { kind: 'unknown', ...sends.unknown };
@@ -22853,15 +22845,14 @@ export class AgentFramework {
   };
 
   private static readonly HOLD_CLAIM_TEXT: Record<HoldClaim, string> = {
-    'with-round': ", this round's included,",
-    'after-round': ' after this round',
-    'turn-with-earlier': ' this turn, earlier rounds included,',
-    turn: ' this turn, except in a round where your skip_reply was refused,',
+    'from-round': ', from this round on,',
+    turn: ' this turn',
   };
 
   private sendHoldLine(reach: SendReach, claim: HoldClaim): string | undefined {
     if (reach.kind === 'nowhere') return undefined;
-    const held = `${AgentFramework.HOLD_CLAIM_TEXT[claim]} is held as drafts until a new message reaches you or this turn ends.`;
+    const held = `${AgentFramework.HOLD_CLAIM_TEXT[claim]} is held as drafts until a new message reaches you or this turn ends, ` +
+      'except in a round that keeps its speech private.';
     if (reach.kind === 'channel') return `Your plain speech to ${this.channelShown(reach.to)}${held}`;
     if (reach.why === 'no-answer') return undefined;
     return `The framework can't tell ${reach.why === 'error' ? 'whether or where' : 'where'} this posted (${AgentFramework.UNKNOWN_REACH_TEXT[reach.why]}), ` +
@@ -28883,7 +28874,8 @@ export class AgentFramework {
               turnSends = mergeSends(turnSends, sendsOf(calls, toolRound));
               const roundSilence = silence;
               const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
-              const draftsCause = keepsDraftsRound(calls);
+              const draftsCause = draftsRound
+                && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
@@ -28974,8 +28966,7 @@ export class AgentFramework {
               // the calls of every script its code_execution calls watch while
               // it waits, one whose code names no routing tool included.
               const sends = new Map<string, SendReach | undefined>(sendCallIds.map((id) => [id, undefined]));
-              const claim = holdClaimOf(roundCalls, liveRound,
-                roundToolNames.includes('think') && requestSnapshot.sameRoundThinkTextPolicy === 'private', refusedWakeRounds.size > 0);
+              const claim = holdClaimOf(roundCalls, liveRound);
               const answered = (): RoundCall[] => [
                 ...roundCalls.map((c, i) => (sends.has(calls[i]!.id) ? { ...c, reach: sends.get(calls[i]!.id) } : c)),
                 ...[...round.scripts.values()].flat(),
