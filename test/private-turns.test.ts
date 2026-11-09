@@ -291,6 +291,34 @@ describe('private turns: when a turn is private (part 1)', () => {
     } finally { await f.close(); }
   });
 
+  it("a locked agent's private silent tick stays private on its tool-result guard's retry, though the operator's message left its window first", async () => {
+    const { f, probe } = await make({ mode: 'locked', lock: 'work', wakes: false, agent: { toolResultGuard: true } });
+    try {
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      probe.acts.push(() => {
+        const secret = storedText(f, SECRET)[0] as unknown as { id: string };
+        (f.framework as unknown as { removeMessage(id: string): void }).removeMessage(secret.id);
+      });
+      const refusal = { ...createMockResponse([{ type: 'text', text: 'zz-discarded' }], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test' } } } } as NormalizedResponse;
+      script(f, [act('a1'), refusal], [callTool('p1', 'channel_publish', { content: 'zz-retry post' }), say('')]);
+      const live: Array<Routing | undefined> = [];
+      const reasons: string[] = [];
+      const off = f.framework.onTrace((t) => {
+        if (t.type === 'inference:started') { live.push(hidden(f).turnRouting.get('agent')); reasons.push(String((t as { reason?: unknown }).reason)); }
+      });
+      wake(f, { reason: 'heartbeat', source: 'heartbeat', suppressProse: true, silentHeartbeat: { eventId: 'hb-1', serverId: 'heartbeat' } });
+      await f.framework.runUntilIdle();
+      off();
+      assert.equal(live[0]?.private, true, 'premise: the tick was private');
+      assert.ok(!inWindow(f, SECRET), "premise: the operator's message left the window before the retry");
+      assert.equal(live.length, 2, `premise: the tick and its guard's retry each started a stream: ${JSON.stringify(reasons)}`);
+      assert.equal(live[1]?.private, true, "the guard's retry is private, as the tick was");
+      assert.ok(storedText(f, 'This turn has no channel of its own').length > 0, 'so channel_publish naming no channel was refused');
+      assert.deepEqual(sent(f, 'zz-retry post'), [], 'and posted nowhere');
+    } finally { await f.close(); }
+  });
+
   it("a locked agent's private silent tick stays private on the provider hold's retry, though the operator's message left its window meanwhile", async () => {
     let holds = 0;
     const { f } = await make({ mode: 'locked', lock: 'work', wakes: false, framework: {
