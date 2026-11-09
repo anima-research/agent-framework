@@ -1980,7 +1980,38 @@ test("a fork's channel_publish with a channelId that isn't a string is refused a
     await until(() => results.has(id), `the ${id} publish`);
     assert.equal(results.get(id)?.success, false, `${id}: ${JSON.stringify(results.get(id))}`);
     assert.equal(results.get(id)?.isError, true, `${id}: the refusal reaches the model as an error`);
-    assert.match(results.get(id)?.error ?? '', /^Nothing changed: channel_publish's channelId must be a string\./);
+    assert.match(results.get(id)?.error ?? '', /^Nothing changed: channel_publish's channelId must be a string, and this call gave /);
   }
+  assert.deepEqual(f.calls.filter((c) => c.includes('publish')), [], 'nothing was published');
+});
+
+test("a fork's channel_close with a channelId or serverId that isn't a string is refused as one, and its home stays open", async (t) => {
+  const f = await frameworkWith(t, ['a', 'b']);
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
+  const results = toolResults(t, f.framework);
+  const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
+  for (const [id, text, field, gave] of [
+    ['close-zero', '{"channelId":0}', 'channelId', 'a number'],
+    ['close-false', '{"channelId":false}', 'channelId', 'a boolean'],
+    ['close-server-zero', '{"channelId":"general","serverId":0}', 'serverId', 'a number'],
+  ] as const) {
+    dispatch('scout', { id, name: 'channel_close', input: JSON.parse(text) as Record<string, unknown> });
+    await until(() => results.has(id), `the ${id} close`);
+    const result = results.get(id);
+    assert.equal(result?.isError, true, `${id}: ${JSON.stringify(result)}`);
+    assert.equal(result?.error?.startsWith(`Nothing changed: channel_close's ${field} must be a string, and this call gave ${gave}.`), true, `${id}: ${result?.error}`);
+  }
+  assert.equal(f.i.channelRegistry.closedByAgent(b), undefined, "the fork's home wasn't closed");
+});
+
+test("a fork's channel_publish naming another server's channel stays refused when its serverId isn't a string", async (t) => {
+  const f = await frameworkWith(t, ['a', 'b']);
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
+  const results = toolResults(t, f.framework);
+  const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
+  dispatch('scout', { id: 'other', name: 'channel_publish', input: { channelId: 'a:general', serverId: 0, content: 'zz-other' } });
+  await until(() => results.has('other'), 'the publish');
+  assert.equal(results.get('other')?.success, false, JSON.stringify(results.get('other')));
+  assert.match(results.get('other')?.error ?? '', /is not allowed\.$/);
   assert.deepEqual(f.calls.filter((c) => c.includes('publish')), [], 'nothing was published');
 });

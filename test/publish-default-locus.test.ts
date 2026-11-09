@@ -51,7 +51,7 @@ describe('channel_publish without channelId', () => {
       await eventually(() => !!publishOf(f, 'done') || !!publishOf(f, 'zz-number'), 'the turn spoke');
       assert.equal(publishOf(f, 'zz-number'), undefined, 'nothing was posted at the locus for a number channelId');
       const answered = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
-        .some((m) => JSON.stringify(m.content).includes("Nothing changed: channel_publish's channelId must be a string."));
+        .some((m) => JSON.stringify(m.content).includes("Nothing changed: channel_publish's channelId must be a string, and this call gave a number."));
       assert.ok(answered, 'the refusal says the channelId must be a string');
     } finally { await f.close(); }
   });

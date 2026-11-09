@@ -1398,6 +1398,7 @@ describe('Conversation routing', () => {
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       getDescriptor: () => ({}),
+      nonStringRefusal: () => undefined,
     } as typeof fw.channelRegistry;
 
     // (a) omitted channelId → rewritten to the home channel, passes the fence
