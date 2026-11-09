@@ -528,11 +528,12 @@ export interface GateEventInfo {
    *    them, whether getAgentNames lists them or not.
    *  - An empty list: for no one in a batch. It joins no batch, so a batch
    *    wakes no one for it, and it neither restarts a batch's quiet period
-   *    nor takes room in it. A rule that doesn't batch decides on it as on
-   *    any event, and whom the caller then wakes is the caller's: the
-   *    framework wakes a named agent that reads no slot of the residents',
-   *    such as an isolated job, as it does any named agent, when its view
-   *    shows a message the response stores, where it stores any.
+   *    nor takes room in it. A rule that batches lets it through, and one
+   *    that doesn't decides on it as on any event; whom the caller then wakes
+   *    is the caller's: the framework wakes a named agent that reads no slot
+   *    of the residents', such as an isolated job, as it does any named
+   *    agent, when its view shows a message the response stores, where it
+   *    stores any.
    *  In a batch holding named events, each agent the batch wakes is shown the
    *  untargeted events if getAgentNames lists it, and the named events that
    *  name it. Agents shown the same events share one line, stored for them.

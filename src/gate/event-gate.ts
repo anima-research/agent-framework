@@ -3570,8 +3570,11 @@ export class EventGate {
     if (typeof policy.behavior === 'object') {
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
         // An event whose list of recipients is empty is for no one, so it
-        // joins no batch (GateEventInfo.recipients).
-        if (info.recipients === undefined || info.recipients.length > 0) this.handleDebounce(policy, info);
+        // joins no batch, and the rule lets it through (GateEventInfo.recipients).
+        if (info.recipients !== undefined && info.recipients.length === 0) {
+          return { trigger: true, policyName: policy.name, behavior: policy.behavior };
+        }
+        this.handleDebounce(policy, info);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
       }
       if ('rate_limit' in policy.behavior) {
@@ -3723,7 +3726,9 @@ export class EventGate {
     if (b === 'always') return true;
     if (b === 'defer' || b === 'skip') return false;
     if (typeof b === 'object') {
-      if ('debounce' in b || 'judge' in b) return false; // batches; never triggers inline
+      // Batches, so never triggers inline, except for an event no batch is
+      // for, which evaluate lets through.
+      if ('debounce' in b || 'judge' in b) return info.recipients !== undefined && info.recipients.length === 0;
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
         const key = this.resolveKey(info, cfg.keyBy);

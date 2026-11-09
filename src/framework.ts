@@ -19542,7 +19542,6 @@ export class AgentFramework {
     const eventServer = (event as { serverId?: unknown }).serverId;
     const stampSource = typeof eventServer === 'string' && eventServer !== '' ? eventServer : source;
     let added: WritePlacement | undefined;
-    // Each write's metadata as handed to addMessage, for whose view shows it.
     const written: Array<MessageMetadata | undefined> = [];
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
