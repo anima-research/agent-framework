@@ -549,7 +549,7 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       try {
         const told = withText(framework, 'has ended');
         assert.equal(told.length, 1);
-        assert.match(textOf(told[0]!), /A reply by conversation-gone \(12 chars\) could not be delivered to room \(no registered channel\)\. Nothing was posted\. conversation-gone has ended\./);
+        assert.match(textOf(told[0]!), /A reply by conversation-gone \(12 chars\) could not be delivered to room \(no registered channel\)\. The framework posted nothing there\. conversation-gone has ended\./);
         assert.equal(writeIdOf(told[0]!), 'g1');
         assert.deepEqual(audienceOf(told[0]!.metadata)?.audience, ['agent'], "the primary's alone");
         assert.equal(withText(framework, 'an ordinary write').length, 0);
