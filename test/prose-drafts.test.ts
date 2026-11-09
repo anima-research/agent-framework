@@ -366,12 +366,13 @@ function failWhileToolsRun(membrane: MockMembrane, atRound = 1): void {
 }
 
 /**
- * The next stream yields its round's tool-calls and then completes at once,
- * its calls unanswered: a stream that ends while the framework still waits
- * for tools.
+ * The next stream yields its round's tool-calls and then completes at once
+ * (or once `ready` holds; `missed` says it never did), its calls unanswered: a stream that ends while the
+ * framework still waits for tools.
  */
-function completeWhileWaiting(membrane: MockMembrane, response: NormalizedResponse): void {
+function completeWhileWaiting(membrane: MockMembrane, response: NormalizedResponse, ready?: () => boolean): { missed: boolean } {
   const streamYielding = membrane.streamYielding.bind(membrane);
+  const gate = { missed: false };
   let used = false;
   (membrane as unknown as { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream }).streamYielding = (request, options) => {
     const inner = streamYielding(request, options);
@@ -387,6 +388,15 @@ function completeWhileWaiting(membrane: MockMembrane, response: NormalizedRespon
         for await (const event of inner) {
           yield event;
           if (event.type === 'tool-calls') {
+            // `ready`: complete only once it holds, as when a script's call
+            // has reached the host, so the case shows what it says it does.
+            // A gate that never opens is the case's failure, not the stream's:
+            // the turn still completes, and the case asserts !gate.missed.
+            const started = Date.now();
+            while (ready && !ready()) {
+              if (Date.now() - started > 10_000) { gate.missed = true; break; }
+              await new Promise((r) => setTimeout(r, 10));
+            }
             yield { type: 'complete', response } as StreamEvent;
             return;
           }
@@ -394,6 +404,7 @@ function completeWhileWaiting(membrane: MockMembrane, response: NormalizedRespon
       },
     } as YieldingStream;
   };
+  return gate;
 }
 
 /** The second stream the membrane opens, such as a guard retry's, answers with this response. */
@@ -3576,9 +3587,33 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.sendMode('hang');
         const hangs = `await tools.think({ content: "hmm" }); await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
         const round = [text(LINE), script('ce1', hangs)];
-        completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] });
+        // The send reaches the host only after the think returned.
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] }, () => h.sends().length === 1);
         await h.turn([createMockResponse(round, 'tool_use')]);
+        assert.equal(gate.missed, false, 'the stream completed after the script got past its think to the send');
         assert.deepEqual(inRoom(h), []);
+        assert.deepEqual(held(h), [], 'never drafted');
+      } finally {
+        await h.close();
+      }
+    });
+
+    // Under the private policy a round whose watched script hasn't returned
+    // (its code names a routing tool, here the send) is kept back whether it
+    // called think or not: it may yet. So this twin, with no think, keeps its
+    // prose back too, and the case above shows a think that has run doesn't
+    // release it. A script naming no routing tool isn't watched, so isn't held.
+    it(`${mode}: XML tool mode: a script with no think still running when the stream completes keeps its round's prose back`, async () => {
+      const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: mode, sameRoundThinkTextPolicy: 'private' }], sendTool: true, codeExecution: true });
+      try {
+        await h.sendMode('hang');
+        const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
+        const round = [text(LINE), script('ce1', hangs)];
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] }, () => h.sends().length === 1);
+        await h.turn([createMockResponse(round, 'tool_use')]);
+        assert.equal(gate.missed, false, 'the stream completed after the script\'s send reached the host');
+        assert.deepEqual(inRoom(h), []);
+        assert.deepEqual(held(h), [], 'never drafted');
       } finally {
         await h.close();
       }
