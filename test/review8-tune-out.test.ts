@@ -60,7 +60,8 @@ function deferredSetup() {
     quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
     cancelTuneOut: () => { if (!state.inForce) return null; state.inForce = false; return { params, wakeCount: 0 }; },
     listChannelsRaw: () => [],
-    tuneOutsOnRecord: (): ReturnType<typeof onRecordOf> => onRecordOf(registry),
+    // On record whether or not its channel is registered, as the real registry's record is.
+    tuneOutsOnRecord: () => (state.inForce ? [{ serverId: 'disc', channelId: 'disc:guild:a', params, source: 'agent-tool' }] : []),
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
