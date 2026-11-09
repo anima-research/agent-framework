@@ -193,6 +193,7 @@ import {
   sha256Hex,
   storedCutText,
   storedImageSlots,
+  elidedChars,
   toolResultHeadTail,
   toolResultShare,
   type ParsedImagePlaceholder,
@@ -31899,7 +31900,7 @@ export class AgentFramework {
   private spillNotice(kept: { head: number; tail: number }, content: string, shown: ShownRanges | null, bound: number | undefined,
     readCap: number, written: SpillWrite): string {
     const to = content.length - kept.tail;
-    const elided = `${NOTICE_TAG.truncated} — chars ${kept.head} to ${to} of ${content.length} elided here`;
+    const elided = `${NOTICE_TAG.truncated} — ${elidedChars(kept.head, to, content.length)}`;
     if (written && written.error === undefined) {
       const atBound = bound === undefined ? undefined : cutStoredToolResultToFit(content, bound, shown, bound);
       const canRaise = atBound === undefined || atBound.head.length + atBound.tail.length > kept.head + kept.tail;
@@ -32415,7 +32416,7 @@ export class AgentFramework {
       if (block.kind === 'text' && maxChars && text.length > maxChars) {
         const { headEnd, tailStart } = toolResultHeadTail(text, maxChars);
         const start = live.spans[i]!.start;
-        text = `${text.slice(0, headEnd)}\n\n[${NOTICE_TAG.truncated} — chars ${start + headEnd} to ${start + tailStart} of ${length} elided here`
+        text = `${text.slice(0, headEnd)}\n\n[${NOTICE_TAG.truncated} — ${elidedChars(start + headEnd, start + tailStart, length)}`
           + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
           + ']'
           + (tailStart < text.length ? `\n${text.slice(tailStart)}` : '');

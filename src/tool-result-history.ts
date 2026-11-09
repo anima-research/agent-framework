@@ -40,7 +40,8 @@ import {
   type ResultClaims,
   type ScriptLine,
 } from './mcpl/references.js';
-import { formatToolImagePlaceholder, toolResultHeadTail } from './tool-image-ledger.js';
+import { elidedChars, formatToolImagePlaceholder, toolResultHeadTail } from './tool-image-ledger.js';
+import { NOTICE_TAG } from './notice-tags.js';
 
 /** Where one block of a content array sits in its history text, and what
  *  kind of block it was: text, an inline image (its placeholder), an RFC-005
@@ -369,7 +370,7 @@ function thrownLine(error: unknown): string {
 export function truncateForHistory(str: string, maxChars: number): string {
   if (str.length <= maxChars) return str;
   const { headEnd, tailStart } = toolResultHeadTail(str, maxChars);
-  return `${str.slice(0, headEnd)}\n\n[truncated — chars ${headEnd} to ${tailStart} of ${str.length} elided here]`
+  return `${str.slice(0, headEnd)}\n\n[${NOTICE_TAG.truncated} — ${elidedChars(headEnd, tailStart, str.length)}]`
     + (tailStart < str.length ? `\n${str.slice(tailStart)}` : '');
 }
 

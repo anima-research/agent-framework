@@ -6,7 +6,7 @@ import type { CompletedToolCall } from './types/index.js';
 import { ensureStateRegistered } from './module-registry.js';
 import { classifyBlock } from './mcpl/references.js';
 import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
-import { toolResultHeadTail } from './tool-image-ledger.js';
+import { elidedChars, toolResultHeadTail } from './tool-image-ledger.js';
 import { asOwnRow, presentLandedThenRethrow } from './dendrite/audience.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
@@ -136,7 +136,7 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept, undefined, { claims });
   if (!maxChars || whole.length <= maxChars) return whole;
   const { headEnd, tailStart } = toolResultHeadTail(whole, maxChars);
-  return `${whole.slice(0, headEnd)} [cut: chars ${headEnd} to ${tailStart} of these fields' ${whole.length} elided here; ` +
+  return `${whole.slice(0, headEnd)} [cut: ${elidedChars(headEnd, tailStart, whole.length, "these fields' ")}; ` +
     'the whole result is where this note says]' + (tailStart < whole.length ? ` ${whole.slice(tailStart)}` : '');
 }
 

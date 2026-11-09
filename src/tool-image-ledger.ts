@@ -402,6 +402,11 @@ export function toolResultHeadTail(text: string, cap: number): { headEnd: number
   return { headEnd, tailStart };
 }
 
+/** What a cut copy's notice says it elides: chars `from` to `to` of the whole's `total`. */
+export function elidedChars(from: number, to: number, total: number, whose = ''): string {
+  return `chars ${from} to ${to} of ${whose}${total} elided here`;
+}
+
 /**
  * Cut a tool result's text at its inline `cap` as its stored copy keeps it
  * (toolResultHeadTail): the stored copy keeps what the live copy showed. A
