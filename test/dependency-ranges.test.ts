@@ -5,11 +5,13 @@
  * presentation index calls. Main published context-manager 0.23.0, then 0.24.0
  * (Dendrite's derive), without them, so the presentation release is 0.25.0, and
  * a range that admitted any 0.24.x would install a context-manager this
- * framework fails to load on. Its floor is 0.25.1, the release with
- * `noteThinkingDropped`, which the framework calls when the provider sets aside
- * a stored reply's thinking. So each caret range of its union starts at
- * 0.25.1 or later, and the range admits 0.25.1 itself, the release the
- * changelog names.
+ * framework fails to load on. 0.25.1 is the first with `noteThinkingDropped`,
+ * which the framework calls when the provider sets aside a stored reply's
+ * thinking. Its floor is 0.27.0, the first release whose membrane range is
+ * this package's (`^0.8.0 || ^0.9.0 || ^0.10.0`): 0.25.1 and 0.26.0 refuse
+ * membrane 0.10.0, so a host on it would get a second membrane under them. So
+ * each caret range of its union starts at 0.27.0 or later, and the range
+ * admits 0.27.0 itself, the release the changelog names.
  * chronicle's range takes only a release with the identity-stamped batched
  * append context-manager writes a window with: the published 0.5.0 (Dendrite's
  * branch views) has none of the batched calls, so the presentation release is
@@ -124,7 +126,7 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.throws(() => startsAt('^0.26.0', '0.25.0', 'x'), /admits x 0\.25\.0/);
   });
 
-  it("takes context-manager only at a release with the window APIs and noteThinkingDropped: not main's 0.23.0 or 0.24.0, which have no window APIs, or 0.25.0, which can't be told of a set-aside reply", (t) => {
+  it("takes context-manager only at a release with the window APIs, noteThinkingDropped and this package's membrane range: not main's 0.23.0 or 0.24.0, which have no window APIs, 0.25.0, which can't be told of a set-aside reply, or 0.25.1 and 0.26.0, which refuse membrane 0.10.0", (t) => {
     const range = ours.dependencies?.['@animalabs/context-manager'];
     assert.ok(range, 'agent-framework depends on context-manager');
     for (const published of ['0.23.0', '0.24.0']) {
@@ -132,7 +134,10 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
         `${range} admits context-manager ${published}, published without windowStatusOf, presentRows, retractRows or getPresentedMessages`);
     }
     assert.equal(admits(range, '0.25.0'), false, `${range} admits context-manager 0.25.0, published without noteThinkingDropped`);
-    startsAt(range, '0.25.1', 'context-manager');
+    for (const published of ['0.25.1', '0.26.0']) {
+      assert.equal(admits(range, published), false, `${range} admits context-manager ${published}, whose membrane range refuses 0.10.0`);
+    }
+    startsAt(range, '0.27.0', 'context-manager');
     const proto = ContextManager.prototype as unknown as Record<string, unknown>;
     for (const method of ['windowStatusOf', 'presentRows', 'retractRows', 'getPresentedMessages', 'noteThinkingDropped']) {
       assert.equal(typeof proto[method], 'function', `the context-manager this suite runs on has ${method}`);
