@@ -350,8 +350,8 @@ export interface FrameworkConfig {
    *
    * When membrane refuses an agent's request that carries an effort row, with
    * `systemChangeRefused`, the request is sent again at once with no effort
-   * rows and the live level as its top-level effort. That agent's requests on
-   * that model go that way until the process ends.
+   * rows and the live level as its top-level effort. That agent's requests go
+   * that way until the process ends.
    *
    * A preview shows the row a start would write, unstored. The direct API
    * (`Agent.runInference`) sends what a turn's request would carry and writes

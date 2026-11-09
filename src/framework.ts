@@ -4255,10 +4255,6 @@ function assertEffortSource(config: AgentConfig, effort: FrameworkConfig['effort
   }
 }
 
-function effortKey(agent: Agent): string {
-  return `${agent.name}\u0000${agent.model}`;
-}
-
 function endsOnNewInput(agent: Agent, rows: readonly StoredMessage[]): boolean {
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i]!;
@@ -9722,7 +9718,7 @@ export class AgentFramework {
     const setting = this.effortSetting;
     if (setting === undefined) return undefined;
     const live = typeof setting === 'function' ? setting({ name: agent.name, model: agent.model }) : setting;
-    if (this.effortRowsRefused.has(effortKey(agent))) return { rows: false, ...(live !== undefined ? { topLevel: live } : {}) };
+    if (this.effortRowsRefused.has(agent.name)) return { rows: false, ...(live !== undefined ? { topLevel: live } : {}) };
     const record = this.readEffortBase(agent.name);
     const kept = record?.model === agent.model ? record.effort : undefined;
     const base = live === undefined ? 'none' : kept ?? live;
@@ -9731,8 +9727,7 @@ export class AgentFramework {
     const plan: EffortPlan = { rows: true, ...(base !== 'none' ? { topLevel: base } : {}) };
     if (use === 'direct') return plan;
     const cm = agent.getContextManager();
-    const rows = (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages())
-      .filter((row) => this.agentSees(agent, row.metadata));
+    const rows = this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages();
     let inForce: string | undefined = base === 'none' ? undefined : base;
     for (let i = rows.length - 1; i >= 0; i--) {
       const level = effortOf(rows[i]!.content);
@@ -9773,10 +9768,10 @@ export class AgentFramework {
   private refuseEffortRows(agent: Agent, error: Error, request: NormalizedRequest | undefined): boolean {
     if (this.effortSetting === undefined || (error as { systemChangeRefused?: unknown }).systemChangeRefused !== true) return false;
     if (!request?.messages.some((m) => effortOf(m.content) !== undefined)) return false;
-    this.effortRowsRefused.add(effortKey(agent));
+    this.effortRowsRefused.add(agent.name);
     console.error(
-      `[effort] ${agent.name} on ${agent.model}: membrane refused a request carrying an effort row (${error.message}). ` +
-        'Its requests on this model carry the live effort on top and no effort rows from now until the process ends; this one is sent again at once.',
+      `[effort] ${agent.name}: membrane refused a request carrying an effort row (${error.message}). ` +
+        'Its requests carry the live effort on top and no effort rows from now until the process ends; this one is sent again at once.',
     );
     return true;
   }

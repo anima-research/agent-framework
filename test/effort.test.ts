@@ -78,9 +78,12 @@ class InputModule implements Module {
   async handleToolCall(_call: ToolCall) { return { success: false, isError: true, error: 'none' }; }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
-    const metadata = (event as { metadata?: { poke?: boolean; quiet?: boolean } }).metadata;
+    const metadata = (event as { metadata?: { poke?: boolean; quiet?: boolean; to?: string } }).metadata;
     if (metadata?.poke) return { requestInference: true };
-    return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: !metadata?.quiet };
+    return {
+      addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }],
+      requestInference: metadata?.to ? [metadata.to] : !metadata?.quiet,
+    };
   }
 }
 
@@ -554,3 +557,63 @@ describe('the history tool and effort rows', () => {
   });
 });
 
+
+describe('FrameworkConfig.effort: two agents on one store', () => {
+  async function pair() {
+    const dir = mkdtempSync(join(tmpdir(), 'af-effort-two-'));
+    dirs.push(dir);
+    const provider = new Provider();
+    const live: Record<string, Level> = { alpha: 'high', beta: 'high' };
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: provider.asMembrane(),
+      agents: ['alpha', 'beta'].map((name) => ({ name, model: 'claude-opus-5-5', systemPrompt: 'test', proseRouting: 'disabled' })),
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      effort: (agent: { name: string }) => live[agent.name],
+    } as never);
+    frameworks.push(framework);
+    const ended: TraceEvent[] = [];
+    framework.onTrace((event) => { if (event.type === 'inference:completed' || event.type === 'inference:exhausted') ended.push(event); });
+    framework.start();
+    const turn = async (to: string, text: string) => {
+      const before = ended.length;
+      framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: { to } } as never);
+      await framework.runUntilIdle();
+      for (const until = Date.now() + 10_000; ended.length === before && Date.now() < until;) await new Promise((r) => setTimeout(r, 10));
+      assert.ok(ended.length > before, `${to}'s turn for "${text}" ended`);
+    };
+    const last = (agent: string) => provider.calls.filter((r) => r.assistantParticipant === agent).at(-1)!;
+    return { provider, live, turn, last };
+  }
+
+  it('sends an agent only its own effort rows, and reads its own as in force', async () => {
+    try {
+      const { live, turn, last } = await pair();
+      await turn('alpha', 'One.');
+      await turn('beta', 'Two.');
+      live.alpha = 'low';
+      await turn('alpha', 'Three.');
+      assert.deepEqual(effortRows(last('alpha')).map((r) => r.effort), ['low'], 'premise: alpha wrote its row');
+      await turn('beta', 'Four.');
+      assert.ok(indexOfText(last('beta'), 'Four.') >= 0, 'premise: beta\'s request carries its input');
+      assert.deepEqual(effortRows(last('beta')), [], 'beta is sent none of alpha\'s rows, and writes none of its own');
+      assert.equal(topLevel(last('beta')), 'high');
+    } finally { await cleanup(); }
+  });
+
+  it('keeps sending another agent\'s rows on the same model after one agent\'s rows are refused', async () => {
+    try {
+      const { provider, live, turn, last } = await pair();
+      provider.fail = (request) => (request.assistantParticipant === 'alpha' && effortRows(request).length > 0 ? refusal(true) : undefined);
+      await turn('alpha', 'One.');
+      await turn('beta', 'Two.');
+      live.alpha = 'low';
+      await turn('alpha', 'Three.');
+      assert.deepEqual(effortRows(last('alpha')), [], 'premise: alpha\'s rows were refused, and its retry carries none');
+      assert.equal(topLevel(last('alpha')), 'low');
+      live.beta = 'low';
+      await turn('beta', 'Four.');
+      assert.deepEqual(effortRows(last('beta')).map((r) => r.effort), ['low'], 'beta still sends its row');
+      assert.equal(topLevel(last('beta')), 'high', 'under its base');
+    } finally { await cleanup(); }
+  });
+});
