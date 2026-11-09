@@ -19557,9 +19557,16 @@ export class AgentFramework {
           ? this.registry.untargetedRecipients()
           : response.requestInference;
       const triggered = targetAgents.filter((name) => this.agents.get(name)?.canBeTriggeredBy(source) === true);
-      // A response that stores a message held from the residents names no
-      // recipient: a batch's line would quote what the message holds back.
-      const holds = response.addMessages?.some((msg) => heldFromResidents(msg.metadata)) === true;
+      // A named agent is woken only if the response stores no message, or one
+      // its view shows: a message held from the residents is out of a
+      // resident's view and in a subconscious's, so a resident it alone was
+      // for would wake to nothing new, and a batch's line would quote it.
+      const stored = response.addMessages ?? [];
+      const sees = (name: string): boolean => {
+        const agent = this.agents.get(name);
+        return agent !== undefined && stored.some((msg) => this.agentSees(agent, msg.metadata));
+      };
+      const woken = response.requestInference === true || stored.length === 0 ? triggered : triggered.filter(sees);
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
@@ -19569,12 +19576,12 @@ export class AgentFramework {
           serverId: source,
           channelId: '',
           ...(suppressionAsked ? { suppressionAsked: true } : {}),
-          ...(response.requestInference !== true ? { recipients: holds ? [] : triggered.filter((name) => requested?.includes(name) === true) } : {}),
+          ...(response.requestInference !== true ? { recipients: woken.filter((name) => requested?.includes(name) === true) } : {}),
         });
         if (!decision.trigger) return;
       }
 
-      for (const agentName of triggered) {
+      for (const agentName of woken) {
         this.pendingRequests.push({
           agentName,
           reason: event.type,

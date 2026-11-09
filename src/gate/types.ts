@@ -511,22 +511,38 @@ export interface GateEventInfo {
    *  to and wakes. Admission sets it for a targeted MCPL event (its
    *  targetAgents that are registered). The framework sets it for a module's
    *  response asking inference for named agents: those its source can
-   *  trigger that read the slot its messages land in, and none when the
-   *  response stores a message held from the residents.
+   *  trigger that read the slot its messages land in and whose view shows a
+   *  message it stores, where it stores any. A resident's view leaves out a
+   *  message held from the residents and a subconscious's keeps it, so a
+   *  response storing held messages alone names its subconscious, not its
+   *  residents, and the framework wakes no named agent its view shuts out.
    *  - Untargeted (absent): shown to every agent getAgentNames lists, and
    *    wakes them. A batch of untargeted events alone stores its line as a
    *    write that names no agent.
    *  - Named (a non-empty list): shown to the agents it names, and wakes
    *    them, whether getAgentNames lists them or not.
-   *  - An empty list: for no one. It joins no batch, so it wakes no one, and
-   *    it neither restarts a batch's quiet period nor takes room in it.
+   *  - An empty list: for no one in a batch. It joins no batch, so a batch
+   *    wakes no one for it, and it neither restarts a batch's quiet period
+   *    nor takes room in it. A rule that doesn't batch decides on it as on
+   *    any event, and whom the caller then wakes is the caller's: the
+   *    framework wakes a named agent that reads no slot of the residents',
+   *    such as an isolated job, as it does any named agent.
    *  In a batch holding named events, each agent the batch wakes is shown the
    *  untargeted events if getAgentNames lists it, and the named events that
    *  name it. Agents shown the same events share one line, stored for them.
-   *  An agent's upcoming wakes count a batch only when the batch would wake
-   *  that agent. A judge rule's batch is judged as a whole, for the agents
-   *  getAgentNames lists, and a batch queued while the judge decides rides
-   *  its verdict. */
+   *  Batches that fire while an agent infers, or while the host is
+   *  quiesced, wait in one buffer and are delivered together, as one batch;
+   *  the buffer keeps its newest events up to its cap, and the oldest it
+   *  drops are shown to no one. An event whose channel is held when its
+   *  batch is delivered is dropped: shown to no one and woken for by no one.
+   *  While the gate sleeps, an event is skipped before any rule, whatever its
+   *  recipients, unless it is the heartbeat's or a privileged author's.
+   *  An agent's upcoming wakes count a rule's pending batch only when the
+   *  batch would wake that agent. A judge rule's batch is judged as a whole,
+   *  for the agents getAgentNames lists. A batch queued while the judge
+   *  decides goes with it when the judge answers reply (or fails, under
+   *  onError "wake"), and is judged afresh when it answers wait (or fails,
+   *  under onError "skip"). */
   recipients?: readonly string[];
   /**
    * Set when the framework asked whether the event is suppressed before it
