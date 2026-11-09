@@ -315,6 +315,15 @@ describe('the copies with no file keep head and tail (truncateForHistory)', () =
     }
   });
 
+  it('moves the head back to a line break that lies within half its share of the head\'s end', () => {
+    for (let k = 0; k < 10; k++) {
+      const text = 'a'.repeat(k) + '\n' + 'X'.repeat(100);
+      const { h } = headMarkerTail(truncateForHistory(text, 17), text);
+      const dropped = 10 - (k + 1);
+      assert.equal(h, dropped < 5 ? k + 1 : 10, `a break after char ${k}: the head keeps ${dropped < 5 ? 'to the break' : 'its share'}`);
+    }
+  });
+
   it('starts the tail past a reference stub its share would split, whatever the reference\'s type', () => {
     const stub = '[ref_1_ab3d] ' + 'notes '.repeat(20) + '— text/plain, 1.2KB claimed — from tool result';
     const text = 'a'.repeat(2000) + '\n' + stub + '\n' + 'z'.repeat(10);
