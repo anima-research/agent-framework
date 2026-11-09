@@ -13,12 +13,15 @@ type Asked = string[] | true;
 class ReminderModule extends GateModule {
   override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'clock:reminder') return {};
-    const reminder = event as unknown as { content: string; agents: Asked; held?: boolean };
+    const reminder = event as unknown as { content: string; agents: Asked; held?: boolean | 'beside' };
+    const message = (text: string, held: boolean) => ({
+      participant: 'user', content: [{ type: 'text' as const, text }],
+      ...(held ? { metadata: { tuneOut: { epochId: 'e1' } } } : {}),
+    });
     return {
-      addMessages: [{
-        participant: 'user', content: [{ type: 'text', text: reminder.content }],
-        ...(reminder.held ? { metadata: { tuneOut: { epochId: 'e1' } } } : {}),
-      }],
+      addMessages: reminder.held === 'beside'
+        ? [message(`${reminder.content}, held`, true), message(reminder.content, false)]
+        : [message(reminder.content, reminder.held === true)],
       requestInference: reminder.agents,
     };
   }
@@ -28,9 +31,9 @@ type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 const BATCH: GatePolicy[] = [{ name: 'batch', match: { scope: ['clock:reminder'] }, behavior: { debounce: 60_000 } }];
 
-async function setup(agents: unknown[], policies: GatePolicy[] = BATCH) {
+async function setup(agents: unknown[], policies: GatePolicy[] = BATCH, framework: Record<string, unknown> = {}) {
   const module = new ReminderModule();
-  const f = await fixture({ agents, framework: { modules: [module], gate: { config: { policies, default: 'always' } } } });
+  const f = await fixture({ agents, framework: { modules: [module], gate: { config: { policies, default: 'always' } }, ...framework } });
   (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
     f.membrane.calls.push(request);
     const job = JSON.stringify(request.messages).includes('[WORKER-FRAMING]') && !module.entered.has('g-worker');
@@ -43,7 +46,7 @@ async function setup(agents: unknown[], policies: GatePolicy[] = BATCH) {
   return { f, module, turns, off };
 }
 
-const remind = (f: Fixture, content: string, agents: Asked, held = false) =>
+const remind = (f: Fixture, content: string, agents: Asked, held: boolean | 'beside' = false) =>
   f.framework.pushEvent({ type: 'clock:reminder', source: 'clock', content, agents, held } as unknown as ProcessEvent);
 
 const gateOf = (f: Fixture) =>
@@ -161,6 +164,50 @@ describe("a debounced module event wakes the agents its response asked inference
       assert.ok(JSON.stringify(lines[0]!.content).includes('dim the lamps'));
       assert.ok(!JSON.stringify(lines[0]!.content).includes('water the plants'));
     } finally { off(); await f.close(); }
+  });
+
+  it('with no rule batching it, a request whose message is held from the residents wakes no one either', async () => {
+    const { f, turns, off } = await setup([resident('agent'), resident('other')], []);
+    const added: string[] = [];
+    const offAdded = f.framework.onTrace((event) => {
+      if (event.type === 'message:added') added.push(event.source);
+    });
+    try {
+      remind(f, 'water the plants', ['agent'], true);
+      await f.framework.runUntilIdle();
+      assert.deepEqual(added, ['clock:reminder'], 'premise: the held message is stored');
+      assert.deepEqual(turns, []);
+    } finally { offAdded(); off(); await f.close(); }
+  });
+
+  it('a request whose response stores a held message beside one the resident sees wakes it, as before', async () => {
+    const { f, turns, off } = await setup([resident('agent'), resident('other')], []);
+    try {
+      remind(f, 'water the plants', ['agent'], 'beside');
+      await f.framework.runUntilIdle();
+      assert.deepEqual(turns, ['agent']);
+      assert.ok(JSON.stringify(f.membrane.calls[0]).includes('water the plants'), 'its request carries the message it sees');
+    } finally { off(); await f.close(); }
+  });
+
+  it('a held message wakes the subconscious it names, whose view keeps held traffic, and not the resident, batched or not', async () => {
+    for (const policies of [[], BATCH]) {
+      const { f, turns, off } = await setup([resident('agent'), resident('other')], policies, { subconscious: { enabled: true, systemPrompt: 'You notice.' } });
+      try {
+        remind(f, 'water the plants', ['agent', 'Subconscious'], true);
+        await f.framework.runUntilIdle();
+        if (policies.length > 0) {
+          fire(f);
+          await f.framework.runUntilIdle();
+        }
+        const how = policies.length > 0 ? 'batched' : 'no rule';
+        assert.deepEqual([...new Set(turns)], ['Subconscious'], `${how}: only the subconscious wakes`);
+        const call = f.membrane.calls.find((c) => JSON.stringify(c).includes('You notice.'));
+        assert.ok(call && JSON.stringify(call).includes('water the plants'), `${how}: the subconscious is woken with the held message in view`);
+        const lines = rows(f, '[Gate:');
+        assert.deepEqual(lines.map(audienceOf), policies.length > 0 ? [['Subconscious']] : [], 'a line, if any, is stored for the subconscious alone');
+      } finally { off(); await f.close(); }
+    }
   });
 
   it('a request for every agent (true) is batched as before: the batch wakes every resident, and its line is stored as a write that names no agent', async () => {
