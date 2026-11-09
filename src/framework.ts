@@ -13475,7 +13475,9 @@ export class AgentFramework {
    * `name`, its message and stack cut to 2,000 characters, and, from a
    * MembraneError, its `type`, `retryable`, `httpStatus`, `providerErrorCode`
    * and `retryAfterMs`, which a host reads by name. It carries no `rawError`
-   * or `rawRequest`, and `instanceof MembraneError` doesn't hold on it.
+   * or `rawRequest`, and `instanceof MembraneError` doesn't hold on it. Its
+   * message and stack are the failure's own, a provider's words included, for
+   * classifying the failure and for logs, and aren't for showing to an agent.
    *
    * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
    * The task message should already be in the context manager.
