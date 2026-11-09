@@ -106,17 +106,6 @@ const MAX_CONTEXT_TIMEOUT_MS = 30_000;
 export const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
 
 /**
- * How long the modules' answers about one piece of plain speech a turn
- * routes (Module.onSpeechRouted), all asked at once, are waited for: by the
- * piece itself when it routes with no channel, and by the turn's receipt. A
- * piece's own channel post never waits for its answers; pieces route in
- * order, so a post that follows a routed piece with no channel waits behind
- * that piece's answers, only while a module hasn't answered. A piece held as
- * a draft is waited for only by the receipt.
- */
-export const SPEECH_RECEIPT_WAIT_MS = 5_000;
-
-/**
  * Registered speech handler.
  */
 interface SpeechHandler {
@@ -138,7 +127,6 @@ function speechPlace(named: unknown): string | undefined {
 export class ModuleRegistry {
   /** Each module's tool-batch hook still running, past its bound or not. */
   private batchHooksRunning = new Map<string, Promise<unknown>>();
-  private speechAsksOverdue = new Map<string, Set<Promise<unknown>>>();
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
@@ -499,7 +487,6 @@ export class ModuleRegistry {
         this.moduleContexts.delete(module.name);
         this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
         this.batchHooksRunning.delete(module.name);
-        this.speechAsksOverdue.delete(module.name);
         this.stopping.delete(module);
         context?.retire();
         return;
@@ -768,76 +755,34 @@ export class ModuleRegistry {
   }
 
   /** @internal For the framework's speech routing; not a host API. */
-  async askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext, onPlace?: () => void): Promise<string[]> {
-    const asked = [...this.modules.values()].filter((module) => {
+  askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext, onPlace?: () => void): string[] {
+    const places: string[] = [];
+    for (const module of [...this.modules.values()]) {
+      let hook: Module['onSpeechRouted'];
       try {
-        return typeof module.onSpeechRouted === 'function';
+        hook = module.onSpeechRouted;
       } catch (error) {
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) error reading its onSpeechRouted:`, error);
-        return false;
+        continue;
       }
-    }).filter((module) => {
-      if (!this.speechAsksOverdue.has(module.name)) return true;
-      console.error(`Speech-routed module ${module.name} (agent ${agentName}) is still answering an earlier ask past the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: not asked, counted as having sent nothing`);
-      return false;
-    }).map((module) => ({ module, registration: this.moduleContexts.get(module.name) }));
-    const answers = await Promise.all(asked.map(({ module, registration }) => new Promise<string | undefined>((resolve) => {
-      let settled = false;
-      let call: Promise<unknown> | undefined;
-      const timer = setTimeout(() => {
-        settled = true;
-        console.error(`Speech-routed module ${module.name} (agent ${agentName}) hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
-        if (call && this.moduleContexts.get(module.name) === registration) {
-          const overdue = this.speechAsksOverdue.get(module.name);
-          if (overdue) overdue.add(call);
-          else this.speechAsksOverdue.set(module.name, new Set([call]));
-        }
-        resolve(undefined);
-      }, SPEECH_RECEIPT_WAIT_MS);
+      if (typeof hook !== 'function') continue;
+      let place: string | undefined;
       try {
-        call = Promise.resolve(module.onSpeechRouted!(agentName, text, context));
+        const answer = hook.call(module, agentName, text, context);
+        place = speechPlace((answer as { sentTo?: unknown } | null | undefined)?.sentTo);
       } catch (error) {
-        call = Promise.reject(error);
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) error:`, error);
+        continue;
       }
-      const asking = call;
-      const overdueEnds = (): void => {
-        const overdue = this.speechAsksOverdue.get(module.name);
-        if (overdue?.delete(asking) && overdue.size === 0) this.speechAsksOverdue.delete(module.name);
-      };
-      asking.then(overdueEnds, overdueEnds);
-      const fail = (error: unknown): void => {
-        console.error(`Speech-routed module ${module.name} (agent ${agentName}) error${settled ? ' after the wait' : ''}:`, error);
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(undefined);
-      };
-      asking.then((answer) => {
-        if (settled) {
-          console.error(`Speech-routed module ${module.name} (agent ${agentName}) answered after the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: its answer counts for nothing`);
-          return;
-        }
-        let named: unknown;
-        try {
-          named = (answer as { sentTo?: unknown } | null | undefined)?.sentTo;
-        } catch (error) {
-          fail(error);
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        const place = this.moduleContexts.get(module.name) === registration ? speechPlace(named) : undefined;
-        if (place !== undefined) {
-          try {
-            onPlace?.();
-          } catch (error) {
-            console.error(`Speech-routed module ${module.name} (agent ${agentName}) place's callback error:`, error);
-          }
-        }
-        resolve(place);
-      }, fail);
-    })));
-    return answers.filter((place): place is string => place !== undefined);
+      if (place === undefined) continue;
+      try {
+        onPlace?.();
+      } catch (error) {
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) place's callback error:`, error);
+      }
+      places.push(place);
+    }
+    return places;
   }
 
   private getStateId(moduleName: string): string {

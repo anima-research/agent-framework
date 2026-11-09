@@ -1,42 +1,25 @@
-- `Module.onSpeechRouted(agentName, text, context)`: asked as a turn routes
+- `Module.onSpeechRouted(agentName, text, context)`: called as a turn routes
   each piece of its plain speech, in routing order, or holds one as a draft,
   which can be after later pieces have routed (prose routing by locus, hybrid
-  or locked, on a host with a channel registry). Resolve to a `SpeechSent`, `{
-  sentTo }`, when the module showed that text to someone; the turn names the
+  or locked, on a host with a channel registry). For a piece no channel
+  takes, a surface may show it then. Return a `SpeechSent`, `{ sentTo }`,
+  when the module showed that text to someone; the turn names the
   place in its receipt and, with no channel, writes no undeliverable notice
   for it. The place reads as one line, each whitespace run as one space and
   none at either end, and an opening of a tag the framework marks in text it
   supplies, its own notice tags and those of context-manager and membrane,
   such as `[routing]` or `[Recall]`, reads with a backslash before it.
-  Resolve to `{}` otherwise: the notice then still says another
+  Return `{}` otherwise: the notice then still says another
   surface may have shown it. A piece held as a draft gets no such notice,
-  since it's named as a draft. Modules are asked together, and their answers
-  about each piece are waited for at most `SPEECH_RECEIPT_WAIT_MS` (5 s,
-  exported) from each hook's call; a hook that blocks synchronously past it
-  and returns its answer still has it taken, and a module still answering
-  earlier asks past it isn't asked again until each of those answers comes. A piece with a channel posts without waiting for its own answers;
-  since a turn's pieces route in order, a post after a routed piece with no
-  channel waits behind that piece's answers, only while a module hasn't answered. The
-  turn's `[delivered]` receipt waits up to the same bound for answers still
-  due. Private envelopes and words kept private, explicit sends (prefixed
-  envelopes included) and their own words held as drafts, turns under explicit
-  routing, which write no receipt, and an ephemeral run's speech with no
-  channel that it doesn't try to hold as a draft, which is its caller's
-  result, are never asked about. Answer
-  from what the module already holds: for a turn that ends with its reply or
-  a tool, the turn's receipt and the agent's next turn wait for every answer,
-  each piece's up to the bound, and a routed piece with no channel waits for
-  its answers before the next piece routes, so a turn of several such pieces
-  can wait that long for each; only the turn's receipt waits for a held
-  piece's answers. A turn that fails or is stopped writes no receipt
-  and doesn't wait. A turn that had finished when `stop()` began still routes
-  its speech, and `stop()` waits for those answers in the same way, within its
-  own timeout, after which it stops the modules and a later answer names no
-  place. That holds except for
-  an ephemeral run's, whose stream its run's end leaves to finish on its own:
-  when its reply ends the run, its receipt can come after the run returns, and
-  a `stop()` before it comes loses it; when a tool ends it, it writes no
-  receipt, as before, and a place a module names for its speech is logged.
+  since it's named as a draft. The call is synchronous, and routing goes on
+  when it returns, so showing a piece is a write that doesn't wait; a module
+  that throws names no place. A piece with `final: true` comes after the
+  turn's `inference:completed` trace and before the agent's next
+  `inference:started`. Private envelopes and words kept private, explicit
+  sends (prefixed envelopes included) and their own words held as drafts,
+  turns under explicit routing, which write no receipt, and an ephemeral
+  run's speech with no channel that it doesn't try to hold as a draft, which
+  is its caller's result, are never asked about.
 - `SpeechRoutedContext`: `final` (the turn's final reply: its speech after
   its last tool call, a refused XML attempt or a call cut off unrun being
   none), `turnId`, and

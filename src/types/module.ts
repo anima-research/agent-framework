@@ -206,9 +206,11 @@ export interface Module {
   ): Promise<void>;
 
   /**
-   * Asked as a turn routes a piece of the agent's plain speech, `text`,
-   * as it goes to the turn's channel, or, when the turn has no channel,
-   * before the turn is told it had nowhere to go. There are two answers:
+   * Called with each piece of the agent's plain speech, `text`, that the
+   * framework routes: as it goes to the turn's channel, or, when the turn has
+   * no channel, before the turn is told it had nowhere to go. For a piece no
+   * channel takes, a surface may show it then and answer where. There are
+   * two answers:
    * - a `SpeechSent` naming a place, `{ sentTo }`, when this module showed
    *   that text to someone, such as the person whose message opened the
    *   turn: the turn's `[delivered]` receipt names the place, and a turn
@@ -218,42 +220,27 @@ export interface Module {
    *   still says another surface may have shown it. A piece held as a draft
    *   gets no such notice, since it's named as a draft.
    *
-   * Asked as the turn routes each piece of its plain speech, in the order it
-   * routes them, or holds one as a draft, which can be after later pieces
+   * Called as the turn routes each piece of its plain speech, in the order
+   * it routes them, or holds one as a draft, which can be after later pieces
    * have routed, under prose routing by locus, hybrid or locked on a host
-   * with a channel registry. Never asked
-   * about private envelopes or words kept private, explicit sends (prefixed
-   * envelopes included) or their own words held as drafts, a turn under
-   * explicit routing, which writes no receipt, or an ephemeral run's unheld
-   * speech with no channel, which is its caller's result. A module that throws, or
-   * hasn't answered within `SPEECH_RECEIPT_WAIT_MS` of its call, names no
-   * place, as `{}` does, and so does a module removed or replaced before it
-   * answers. A module still answering earlier asks past that bound isn't
-   * asked again until each of those answers comes, and names no place meanwhile, as a
-   * wedged `onToolBatchComplete` isn't called again. A hook that blocks
-   * synchronously past that bound
-   * and returns its answer still has it taken, since no timer runs while it
-   * blocks. For a turn that ends with its reply or a tool, the turn's receipt
-   * and the agent's next turn wait for every answer, each piece's up to that
-   * bound, and a routed piece with no channel waits for its answers before
-   * the next piece routes, so a turn of several such pieces can wait that
-   * long for each; only the turn's receipt waits for a held piece's answers. Answer from what the module already holds rather than after a
-   * round trip. A turn that fails or is stopped writes no receipt and
-   * doesn't wait. A turn that had finished when `stop()` began still routes
-   * its speech, and `stop()` waits for those answers in the same way, within
-   * its own timeout: once that runs out it stops the modules, and an answer
-   * that comes after its module has stopped names no place. That holds except for
-   * an ephemeral run's, whose stream its run's end leaves to finish on its
-   * own: when its reply ends the run, its receipt can come after the run
-   * returns, and a `stop()` before it comes loses it; when a tool ends it, it
-   * writes no receipt, as before, and a place a module names for its speech
-   * is logged.
+   * with a channel registry. Never called with private envelopes or words
+   * kept private, explicit sends (prefixed envelopes included) or their own
+   * words held as drafts, a turn under explicit routing, which writes no
+   * receipt, or an ephemeral run's unheld speech with no channel, which is
+   * its caller's result.
+   *
+   * The call is synchronous, and routing goes on when it returns, so showing
+   * a piece has to be a write that doesn't wait, such as a socket write that
+   * isn't awaited. A module that throws names no place, as `{}` does.
+   *
+   * A piece with `final: true` comes after the turn's `inference:completed`
+   * trace and before the agent's next `inference:started`.
    */
   onSpeechRouted?(
     agentName: string,
     text: string,
     context: SpeechRoutedContext
-  ): Promise<SpeechSent>;
+  ): SpeechSent;
 
   /**
    * Gather context injections before agent inference.

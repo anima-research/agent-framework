@@ -1550,8 +1550,6 @@ interface TurnRouting {
   /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
   deliveries: ChannelRef[];
   sentTo?: string[];
-  asking?: Promise<string[]>[];
-  asksSettled?: 'receipt' | 'no receipt';
   postTried?: true;
   openedBy?: InferenceRequest;
   openingMessages?: string[];
@@ -1642,27 +1640,6 @@ function speechOpening(text: string): string {
 function notFinal(round: ProseRound): ProseRound {
   const { final: _final, ...rest } = round;
   return rest;
-}
-
-function logLateAsk(agentName: string, settled: 'receipt' | 'no receipt', asked: Promise<string[]>): void {
-  void asked.then((places) => {
-    if (places.length === 0) return;
-    console.error(`[speechRouted] ${agentName}: shown by ${places.map(logValue).join(' · ')}` +
-      (settled === 'receipt' ? " after the turn's receipt took its asks, which doesn't name it" : ', for speech of a turn that ended without a receipt'));
-  });
-}
-
-async function settleSpeechAsks(routing: TurnRouting): Promise<void> {
-  routing.asksSettled = 'receipt';
-  const asking = routing.asking;
-  if (!asking) return;
-  delete routing.asking;
-  const known = routing.sentTo ??= [];
-  for (const places of await Promise.all(asking)) {
-    for (const place of places) {
-      if (!known.includes(place)) known.push(place);
-    }
-  }
 }
 
 function mergedOpeningMessages(requests: readonly ({ openingMessages?: string[] } | undefined)[]): string[] | undefined {
@@ -6352,7 +6329,6 @@ export class AgentFramework {
     // A stopped host must never hang behind its own cooldown.
     step(() => this.cancelProviderAdmission());
     // An open logical turn doesn't survive a stop.
-    const endedTurns = [...this.openLogical];
     this.openLogical.clear();
 
     // Cancel the stream of every agent whose state holds one: streaming,
@@ -6415,16 +6391,7 @@ export class AgentFramework {
       return [...all].map(([promise, label]) => ({ label, promise }));
     };
 
-    // Wait for all stream iteration handles to settle. An agent's
-    // activeStreams entry alone doesn't say that a stream is still running:
-    // a restart whose compile failed after taking the stream id leaves the
-    // old frame's entry, which that frame no longer owns.
-    const stillStreaming = new Set<string>();
-    for (const [name, stream] of this.activeStreams) {
-      stillStreaming.add(name);
-      const settled = () => { stillStreaming.delete(name); };
-      void stream.then(settled, settled);
-    }
+    // Wait for all stream iteration handles to settle.
     // A stream whose cancel threw may run on until it ends of its own accord,
     // which a stop() with no budget would wait for, holding the rest of the
     // teardown. So it counts as a wait that ran out: this stop() doesn't wait
@@ -6435,9 +6402,6 @@ export class AgentFramework {
     const waited = withLeftovers('stream', streams.filter(({ name }) => !uncancelled.has(name)));
     leaveRunning(streams.filter(({ name }) => uncancelled.has(name)), 'stream');
     await waitFor(waited, 'stream');
-    for (const [name, routing] of endedTurns) {
-      if (!stillStreaming.has(name)) step(() => this.abandonSpeechAsks(name, routing));
-    }
     await waitFor(scriptsStopped ? [{ label: 'code_execution scripts', promise: scriptsStopped }] : []);
 
     // Stop sync timer
@@ -13354,7 +13318,6 @@ export class AgentFramework {
     // Its scripts take it as a settle's end of the turn: the start sent
     // nothing, so none of its own calls is waiting on a script.
     this.settledTurns.add(routing);
-    this.abandonSpeechAsks(agentName, routing);
     this.releaseTurnInputs(routing);
     this.codeExecution?.scripts.turnEnded(agentName, { id: routing.turnId, live: this.liveTurns(agentName, routing) }, false);
   }
@@ -13421,7 +13384,6 @@ export class AgentFramework {
       // Ended, unless it's the logical turn this settle left open.
       if (this.openLogical.get(agentName) !== stream) {
         this.settledTurns.add(stream);
-        if (outcome.stopReason === 'exhausted') this.abandonSpeechAsks(agentName, stream);
         this.releaseTurnInputs(stream);
       }
       this.codeExecution?.scripts.turnEnded(
@@ -22934,7 +22896,7 @@ export class AgentFramework {
         const plain = typeof t === 'string' ? t : t.deliberate ? '' : t.text;
         const final = typeof t === 'string' ? opts.final : t.final ?? opts.final;
         const round: ProseRound = { routing: opts.routing, notice: opts.notice, ...(final ? { final: true } : {}) };
-        if (plain.trim()) this.trackSpeechAsk(agent, opts.routing, this.askSpeechRouted(agent, round, plain));
+        if (plain.trim()) this.noteSpeechPlaces(opts.routing, this.askSpeechRouted(agent, round, plain));
       }
     }
     const { held, notHeld } = this.proseDrafts.hold(
@@ -23696,10 +23658,9 @@ export class AgentFramework {
     if (locus === null && !this.takesGlobalFallback(agent.name)) {
       return this.channelRegistry!.routeSpeech(agent.name, text, locus);
     }
-    const asked = this.askSpeechRouted(agent, round, text);
-    this.trackSpeechAsk(agent, round.routing, asked);
+    const places = this.askSpeechRouted(agent, round, text);
+    this.noteSpeechPlaces(round.routing, places);
     if (locus === null) {
-      const places = await asked;
       const current = this.agents.get(agent.name);
       if (current && current !== agent) {
         console.error(`[routeSpeech] ${agent.name}: replaced while its modules were asked; ${text.length} chars not routed for the replacement`);
@@ -23719,35 +23680,22 @@ export class AgentFramework {
     return this.usedEphemeralAgentNames.get(conversationId) !== 'run';
   }
 
-  private async askSpeechRouted(agent: Agent, round: ProseRound, text: string): Promise<string[]> {
-    try {
-      return await this.moduleRegistry.askSpeechRouted(agent.name, text, {
-        final: round.final === true,
-        turnId: round.routing.turnId,
-        ...speechOpenedBy(round.routing),
-      }, () => {
-        if (!round.final) round.routing.liveSpeech = true;
-      });
-    } catch (err) {
-      console.error(`[speechRouted] ${agent.name}: asking the modules where speech went failed:`, err);
-      return [];
-    }
+  private askSpeechRouted(agent: Agent, round: ProseRound, text: string): string[] {
+    return this.moduleRegistry.askSpeechRouted(agent.name, text, {
+      final: round.final === true,
+      turnId: round.routing.turnId,
+      ...speechOpenedBy(round.routing),
+    }, () => {
+      if (!round.final) round.routing.liveSpeech = true;
+    });
   }
 
-  private trackSpeechAsk(agent: Agent, routing: TurnRouting, asked: Promise<string[]>): void {
-    if (!routing.asksSettled) {
-      (routing.asking ??= []).push(asked);
-      return;
+  private noteSpeechPlaces(routing: TurnRouting, places: readonly string[]): void {
+    if (places.length === 0) return;
+    const known = routing.sentTo ??= [];
+    for (const place of places) {
+      if (!known.includes(place)) known.push(place);
     }
-    logLateAsk(agent.name, routing.asksSettled, asked);
-  }
-
-  private abandonSpeechAsks(agentName: string, routing: TurnRouting): void {
-    if (routing.asksSettled) return;
-    routing.asksSettled = 'no receipt';
-    const asking = routing.asking;
-    delete routing.asking;
-    for (const asked of asking ?? []) logLateAsk(agentName, 'no receipt', asked);
   }
 
   /**
@@ -27149,7 +27097,6 @@ export class AgentFramework {
     if (!this.providerAdmissionClosed) return false;
     const ending = this.agents?.get(agentName);
     if (ending) this.nameUnpostedSpeech(ending, routing);
-    this.abandonSpeechAsks(agentName, routing);
     this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt);
     return true;
   }
@@ -27580,7 +27527,6 @@ export class AgentFramework {
         opensTurn = true;
       }
     }
-    delete routing.asksSettled;
     if (opensTurn) {
       const head = agent.branchHead();
       if (head) routing.start = head;
@@ -28648,7 +28594,6 @@ export class AgentFramework {
       // the continuation stream's end writes one receipt for it.
       if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
         await turnSpeechChain;
-        await settleSpeechAsks(streamRouting);
         this.appendProseDeliveryReceipt(agent, streamRouting);
       } else if (cancelKind === 'turn_ended' && !trigger?.suppressProse) {
         // Explicit mode doesn't hold the turn for its deliveries, so its
@@ -29895,7 +29840,6 @@ export class AgentFramework {
             // the prose gateway, and whose turn ends with the closed-channel
             // note alone, where one is due.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
-              await settleSpeechAsks(streamRouting);
               this.appendProseDeliveryReceipt(agent, streamRouting);
             } else if (!trigger?.suppressProse) {
               this.appendClosedChannelNoteAlone(agent, streamRouting);
@@ -30613,7 +30557,6 @@ export class AgentFramework {
       // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
       this.decideWaitingRound(agent, myStreamId, 'its stream ended');
-      if (this.agents.get(agent.name) !== agent) this.abandonSpeechAsks(agent.name, streamRouting);
 
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to (completeOutgoing). Every exit path does,

@@ -16,7 +16,7 @@ export {
   type ContextManagerOpenOptions,
 } from './context-options.js';
 export { ProcessQueueImpl } from './queue.js';
-export { ModuleRegistry, SPEECH_RECEIPT_WAIT_MS } from './module-registry.js';
+export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
 export { CLOCK_ROW_KIND, resolveClockConfig } from './clock-rows.js';

@@ -25,14 +25,9 @@
   length alone.
 - **Hosts:** a turn's receipt that can't be recorded logs `[delivered]
   <agent>: its receipt couldn't be recorded; it named <places>: <error>`,
-  where it logged `delivery receipt append failed: <error>`. A module's answer
-  that names a place after its turn's receipt, or for a turn that ended with
-  none, logs `[speechRouted] <agent>: shown by <places> …`, and a failure to
-  ask the modules logs `[speechRouted] <agent>: asking the modules where
-  speech went failed:`. Each module asked logs `Speech-routed module <name>
-  (agent <agent>) …` when its hook can't be read or errors, hasn't answered
-  within the wait, answers after it, or isn't asked while it's still
-  answering an earlier ask, and when the framework's callback for a place it
+  where it logged `delivery receipt append failed: <error>`. Each module
+  called logs `Speech-routed module <name> (agent <agent>) …` when its hook
+  can't be read or throws, and when the framework's callback for a place it
   names throws.
 - **Hosts:** once another agent holds an agent's name, plain speech the
   replaced agent routes after that, under locus, locked, hybrid or explicit
