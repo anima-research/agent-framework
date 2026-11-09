@@ -361,11 +361,12 @@ function toolResultCutAt(text: string, cap: number): number {
 
 /**
  * Where a text longer than `cap` keeps its head and its tail: the head is
- * `[0, headEnd)` and the tail `[tailStart, length)`, at most `cap` together,
- * as Hands keeps a long output. The head takes 60% of the cap, rounded down
- * and at least one character, cut by toolResultCutAt, and the tail the rest. Each end moves to a line break
- * when one lies within half its share: the head back to just after the
- * last, the tail forward to just after the first. The tail never starts on
+ * `[0, headEnd)` and the tail `[tailStart, length)`, at most `cap` together.
+ * The head takes 60% of the cap, rounded down and at least one character,
+ * cut by toolResultCutAt, and the tail the rest. An end that splits a line
+ * moves to a line break when one lies within half its share: the head back
+ * to just after the last, the tail forward to just after the first. An end
+ * that falls at a line break keeps its whole line. The tail never starts on
  * the second half of a surrogate pair, nor inside an image slot, which it
  * moves past, so a slot lies wholly in the head, the elided middle or the
  * tail. A text within the cap is all head; a cap of 0 or less keeps nothing.
@@ -376,12 +377,15 @@ export function toolResultHeadTail(text: string, cap: number): { headEnd: number
   const headChars = Math.max(1, Math.floor(cap * 0.6));
   const tailChars = cap - headChars;
   let headEnd = toolResultCutAt(text, headChars);
-  const lastNewline = text.lastIndexOf('\n', headEnd - 1);
-  if (lastNewline > headChars / 2) headEnd = lastNewline + 1;
+  if (text[headEnd] !== '\n') {
+    const lastNewline = text.lastIndexOf('\n', headEnd - 1);
+    if (lastNewline > headChars / 2) headEnd = lastNewline + 1;
+  }
   if (tailChars <= 0) return { headEnd, tailStart: text.length };
   let tailStart = text.length - tailChars;
   const unit = text.charCodeAt(tailStart);
   if (unit >= 0xdc00 && unit <= 0xdfff) tailStart++;
+  if (text[tailStart - 1] === '\n') return { headEnd, tailStart };
   const firstNewline = text.indexOf('\n', tailStart);
   if (firstNewline !== -1 && firstNewline - tailStart < tailChars / 2) return { headEnd, tailStart: firstNewline + 1 };
   const lineStart = text.lastIndexOf('\n', tailStart - 1) + 1;
@@ -456,9 +460,9 @@ export function storedCutText(cut: StoredCut, notice: string): string {
 
 /** The most a stored copy's truncation notice takes (spillOrTruncate,
  *  framework.ts): the spill notice names its file twice, once in its paging
- *  advice, and fits this on a path from a mount name of up to about seventy
- *  characters. */
-export const TOOL_RESULT_NOTICE_ROOM = 640;
+ *  advice, and fits this on a path from a mount name of up to seventy
+ *  characters, with nine-digit offsets. */
+export const TOOL_RESULT_NOTICE_ROOM = 720;
 
 /**
  * A result's cap and bound when its message holds `n` results. A reader's

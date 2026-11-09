@@ -1532,8 +1532,8 @@ describe('save_recent_image provenance (issue #104)', () => {
       responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
     });
     try {
-      // The cap of 3000 is under the bound less the notice's room (3360), but
-      // the kept slots take more than the 360 between them, so head and tail
+      // The cap of 3000 is under the bound less the notice's room (3280), but
+      // the kept slots take more than the 280 between them, so head and tail
       // shrink below the cap, as they would under any higher cap.
       const stored = await waitForToolResult(h.framework, 'call_listed');
       const at = /chars (\d+) to (\d+) of (\d+) elided here/.exec(stored.content);
@@ -1556,7 +1556,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
     });
     try {
-      // The 13 slots the live copy showed take more than the 860 characters
+      // The 13 slots the live copy showed take more than the 780 characters
       // the bound leaves beside the notice, so the head is empty and the
       // oldest slots are left out until the rest fit.
       const stored = await waitForToolResult(h.framework, 'call_listed');
@@ -1622,7 +1622,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     try {
       // Alone, the result keeps the attachment line, at 301, in a head cut at
       // the cap, and the round would fit. Beside the save its share is 1000,
-      // whose fit leaves a head of 215, before the line. The two ways differ,
+      // whose fit leaves a head of 167, before the line. The two ways differ,
       // so the save counts by the share and marks the round, which is then
       // stored by it: the stored copy holds no slot, and index 0 is the GIF.
       const stored = await waitForToolResult(h.framework, 'call_mid');

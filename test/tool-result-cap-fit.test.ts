@@ -305,8 +305,8 @@ test("the puppet's call stores its result within the readers' bound, notice incl
 });
 
 test("a cap the bound's fit already holds the head under gets no offer to raise it, since a higher cap would show no more", async () => {
-  // A bound of 4000 leaves a head of at most 4000 less the notice's room, so
-  // a cap of 3800 and one of 4000 keep the same head.
+  // A bound of 4000 leaves head and tail at most 4000 less the notice's room,
+  // so a cap of 3800 and one of 4000 keep the same.
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', inlineMaxChars: 3800 }, async ({ framework, stored }) => {
     assert.equal(capProvenance(framework, 'solo').tool_result_inline_max_chars_effective, 3800);
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);

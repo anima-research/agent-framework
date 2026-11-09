@@ -15,6 +15,7 @@ import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
+import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { JsStore } from '@animalabs/chronicle';
 
 /**
@@ -3593,9 +3594,9 @@ test("#277: a withheld round's stubs share their message's bound, each keeping i
     await h.run();
     const stubs = toolResults(h.framework).map((block) => String(block.content));
     // Two results share the bound of 4000, so each stub keeps 2000 less the
-    // notice's room of 640: 1360 characters of its fields.
+    // notice's room of its fields.
     const whole = JSON.stringify({ written });
-    assert.deepEqual(stubs, [marked, marked].map(() => `${AUDIT_STUB}${LISTS}${keptCut(whole, 1360)}`));
+    assert.deepEqual(stubs, [marked, marked].map(() => `${AUDIT_STUB}${LISTS}${keptCut(whole, 2000 - TOOL_RESULT_NOTICE_ROOM)}`));
     const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
     assert.ok(total <= 4000, `the stubs are ${total} characters together`);
   } finally { await h.framework.stop(); }
@@ -3610,9 +3611,9 @@ test("#277: a withheld result alone under a bound keeps its fields cut within th
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
     // The bound of 4000 clamps the cap to 4000, and the stub keeps 4000 less
-    // the notice's room of 640: 3360 characters of its fields.
+    // the notice's room of its fields.
     const whole = JSON.stringify({ written });
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${keptCut(whole, 3360)}`);
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${keptCut(whole, 4000 - TOOL_RESULT_NOTICE_ROOM)}`);
     assert.ok(stub.length <= 4000, `the stub is ${stub.length} characters`);
   } finally { await h.framework.stop(); }
 });
