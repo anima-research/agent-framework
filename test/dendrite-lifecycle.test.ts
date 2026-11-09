@@ -557,6 +557,7 @@ describe('Dendrite lifecycle', () => {
     await boss.settled;
     gates.release('g-job');
     assert.ok((await job.settled).ok);
+    assert.equal(framework.getAgentRecord('job')?.orphaned?.candidates[0], 'oren', 'oren is its first candidate');
     const delivery = framework.deliverAgentResult('job', [{ type: 'text', text: 'job result' }]);
     assert.equal(delivery.delivered, false);
     assert.equal(textsIn(framework, 'oren').filter((m) => m.metadata.kind === 'agent-lifecycle').length, 0, 'no notice');
