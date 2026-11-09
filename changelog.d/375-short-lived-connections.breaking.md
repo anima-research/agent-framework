@@ -7,9 +7,10 @@
   anything opens, and `serverConfigProblems` lists it, naming the server and
   the field, and the value when it's a number. Each of those values retried
   at once on every attempt.
-  - One such entry among `mcplServers` makes `create()` refuse the whole
-    configuration: it throws, and none of the servers is brought up, the
-    valid ones included.
+  - At `create()`, such an entry fails that server alone at startup, as an
+    unusable `requestTimeoutMs` does: it's logged, traced as
+    `mcpl:server-connect-failed` and alerted as `mcpl-down`, and the other
+    servers are brought up.
   - **Migration:** give the field a number of milliseconds above 0, or leave
     it out (or `null`) for its default, 5000 for `reconnectIntervalMs` and
     300000 for `reconnectMaxIntervalMs`.

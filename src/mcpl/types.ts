@@ -445,8 +445,9 @@ export interface McplServerConfig {
    * subscription by it and `reconnectMaxIntervalMs`, whether or not it
    * reconnects. Default: 5000 (5 seconds). With `reconnect: true`, or on a
    * server the modern engine runs, a value read as 0, below 0 or not a
-   * number is refused by `create()`, `connectMcplServer`,
-   * `restartMcplServer` and `serverConfigProblems`; `null` means the default.
+   * number fails that server alone at `create()`, and `connectMcplServer`,
+   * `restartMcplServer` and `serverConfigProblems` refuse it; `null` means
+   * the default.
    */
   reconnectIntervalMs?: number;
 

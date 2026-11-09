@@ -239,14 +239,15 @@ test("legacy: the host's own recycle of a connection that hadn't lasted is that 
 
 const agents = [{ name: 'agent', model: 'test', systemPrompt: 'test' }];
 
-test('where the timings are used, a timing read as 0, below 0 or not a number is refused before any server is brought up, naming the server and the field', { timeout: 30_000 }, async (t) => {
+test('where the timings are used, a timing read as 0, below 0 or not a number fails that server at startup, naming the server and the field, and the others are brought up', { timeout: 60_000 }, async (t) => {
   const dir = scratchDir('timings');
   t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.mock.method(console, 'error', () => {});
   const writes = (path: string) => ({ command: process.execPath, args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(path)}, '')`] });
-  const ran: string[] = [];
   const legacyReconnecting = { ...writes(join(dir, 'never')), reconnect: true };
   const modernNotReconnecting = { ...writes(join(dir, 'never')), protocol: 'modern', reconnect: false };
   const httpNotReconnecting = { url: 'http://127.0.0.1:9/mcp' };
+  let index = 0;
   for (const [field, value, shown, where] of [
     ['reconnectIntervalMs', 0, '0', legacyReconnecting],
     ['reconnectIntervalMs', -5, '-5', legacyReconnecting],
@@ -255,28 +256,35 @@ test('where the timings are used, a timing read as 0, below 0 or not a number is
     ['reconnectIntervalMs', 0, '0', modernNotReconnecting],
     ['reconnectIntervalMs', 0, '0', httpNotReconnecting],
   ] as const) {
-    await assert.rejects(
-      AgentFramework.create({
-        storePath: join(dir, `store-${ran.length}`),
-        membrane: new MockMembrane().asMembrane(),
-        agents,
-        modules: [],
-        maintenanceIntervalMs: 0,
-        mcplServers: [
-          { id: 'good', ...writes(join(dir, `ran-${ran.push(`${field} ${shown} on ${JSON.stringify(where)}`)}`)) },
-          { id: 'timed', ...where, [field]: value } as McplServerConfig,
-        ],
-      }),
-      (error: Error) => {
-        assert.match(error.message, /"timed"/);
-        assert.match(error.message, new RegExp(field));
-        assert.ok(error.message.includes(`(got ${shown})`), error.message);
-        return true;
-      },
-    );
+    index++;
+    const what = `${field} ${shown} on ${JSON.stringify(where)}`;
+    const framework = await AgentFramework.create({
+      storePath: join(dir, `store-${index}`),
+      membrane: new MockMembrane().asMembrane(),
+      agents,
+      modules: [],
+      maintenanceIntervalMs: 0,
+      mcplServers: [
+        { id: 'timed', ...where, [field]: value } as McplServerConfig,
+        { id: 'good', ...writes(join(dir, `ran-${index}`)) },
+      ],
+    });
+    try {
+      const traces: Array<Record<string, unknown>> = [];
+      framework.onTrace((event) => traces.push(event as unknown as Record<string, unknown>), { replay: true });
+      const failed = traces.find((event) => event.type === 'mcpl:server-connect-failed' && event.serverId === 'timed');
+      assert.ok(failed, `no failed connect traced for ${what}`);
+      assert.match(String(failed.error), new RegExp(field));
+      assert.ok(String(failed.error).includes(`(got ${shown})`), String(failed.error));
+      assert.equal(failed.willRetry, false);
+      assert.ok(traces.some((event) => event.type === 'ops:alert' && event.kind === 'mcpl-down' && event.agentName === 'timed'), `no mcpl-down alert for ${what}`);
+      assert.ok(existsSync(join(dir, `ran-${index}`)), `the other server wasn't brought up for ${what}`);
+    } finally {
+      await framework.stop();
+    }
   }
   await new Promise((resolve) => setTimeout(resolve, 2000));
-  ran.forEach((what, index) => assert.equal(existsSync(join(dir, `ran-${index + 1}`)), false, `a server was brought up for ${what}`));
+  assert.equal(existsSync(join(dir, 'never')), false, 'a server with an unusable timing was brought up');
   const problems = serverConfigProblems({ id: 'timed', ...writes(join(dir, 'never')), reconnect: true, reconnectIntervalMs: 0 });
   assert.equal(problems.length, 1, problems.join(' | '));
   assert.match(problems[0]!, /^MCP server "timed": reconnectIntervalMs .*\(got 0\)/);

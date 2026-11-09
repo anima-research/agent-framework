@@ -26,7 +26,7 @@ import { MAX_LINE_CHARS, escapeLineSeparators, readLines } from '../line-reader.
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, reconnectTimingProblems, redactServerText, redactUrl, resolveServerBinding, serverConfigProblems, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
+import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverConfigProblems, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -1053,8 +1053,6 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
     const kind = typeof presentation === 'string' ? 'another string' : Array.isArray(presentation) ? 'a list' : typeof presentation;
     throw new Error(`MCPL server "${config.id}" presentation must be "full", "tab" or "closed-tab" (or left out for full), not ${kind}`);
   }
-  const timings = reconnectTimingProblems(config);
-  if (timings.length > 0) throw new Error(timings.join('; '));
 }
 
 /**
