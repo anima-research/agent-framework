@@ -281,6 +281,14 @@ describe('the copies with no file keep head and tail (truncateForHistory)', () =
     assert.equal(truncateForHistory(text, text.length), text, 'a text at its cap is unchanged');
   });
 
+  it('keeps a whole line at either end when its share ends or starts exactly at a line break', () => {
+    const text = 'ninechars\n'.repeat(20);
+    const at100 = headMarkerTail(truncateForHistory(text, 100), text);
+    assert.deepEqual([at100.h, at100.e], [60, 160], 'a tail starting a line keeps it');
+    const at99 = headMarkerTail(truncateForHistory(text, 99), text);
+    assert.deepEqual([at99.h, at99.e], [59, 160], 'a head ending at a line break keeps the line');
+  });
+
   it('splits no surrogate pair at either end', () => {
     for (const cap of [1000, 1001, 1002, 1003]) {
       const text = '😀'.repeat(5000);
@@ -312,6 +320,21 @@ describe('the copies with no file keep head and tail (truncateForHistory)', () =
     const text = nonErrorResultText({ error }, 2000);
     headMarkerTail(text, error);
     assert.ok(text.endsWith(error.split('\n').at(-1)!));
+  });
+});
+
+describe('the stored copy\'s notice', () => {
+  it('fits TOOL_RESULT_NOTICE_ROOM at its longest: a seventy-character mount, the longest label and nine-digit offsets', () => {
+    const framework = Object.create(AgentFramework.prototype) as {
+      spillNotice(kept: { head: number; tail: number }, content: string, shown: null, bound: undefined, readCap: number, written: { path: string }): string;
+    };
+    const path = `${'m'.repeat(70)}/tool-results/${'l'.repeat(80)}.txt`;
+    const content = { length: 999_999_999 } as unknown as string;
+    const notice = framework.spillNotice({ head: 123_456_789, tail: 123_456_789 }, content, null, undefined, 1_000_000, { path });
+    assert.match(notice, /chars 123456789 to 876543210 of 999999999 elided here/);
+    assert.match(notice, /"limitChars":2000\}/, 'the largest page');
+    assert.match(notice, /Or raise the inline cap/, 'with the offer to raise');
+    assert.ok(notice.length <= TOOL_RESULT_NOTICE_ROOM, `a notice of ${notice.length} in a room of ${TOOL_RESULT_NOTICE_ROOM}`);
   });
 });
 
