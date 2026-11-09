@@ -966,7 +966,7 @@ const settingBoolean = (name: string, value: unknown): boolean => {
 
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { asCalled, blockReason, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText, type WritePlacement } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
@@ -30831,13 +30831,14 @@ export class AgentFramework {
       return failure;
     };
     const marked = markedInputRefusal(call);
-    if (marked !== undefined) return failed({ success: false, error: marked, isError: true });
+    if (marked !== undefined && blockReason(call) !== undefined) return failed({ success: false, error: marked, isError: true });
     // utils was removed: said whatever the allowlist names (dispatchToolCall).
     if (call.name === 'utils') return failed({ success: false, isError: true, error: this.utilsRemoved(origin.kind === 'agent' ? origin.agentName : call.callerAgentName) });
     if (origin.kind === 'agent') {
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
       if (failure) return failed(failure);
     }
+    if (marked !== undefined) return failed({ success: false, error: marked, isError: true });
 
     const subject = origin.kind === 'agent' ? origin.agentName : call.callerAgentName ?? '__ephemeral__';
     const route = this.toolRoute(call, call.callerAgentName);
@@ -32872,10 +32873,10 @@ export class AgentFramework {
    * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
-    const marked = this.markedInputFailure(agentName, call);
-    if (marked) {
+    const blockRefusal = blockReason(call) === undefined ? undefined : this.markedInputFailure(agentName, call);
+    if (blockRefusal) {
       this.pushEvent({
-        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: marked,
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: blockRefusal,
       });
       return;
     }
@@ -32907,7 +32908,7 @@ export class AgentFramework {
       });
       return;
     }
-    const refusal = this.agentToolPermissionFailure(agentName, call);
+    const refusal = this.agentToolPermissionFailure(agentName, call) ?? this.markedInputFailure(agentName, call);
     if (refusal) {
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
