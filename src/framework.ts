@@ -1565,7 +1565,7 @@ interface TurnRouting {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts`, and sends nothing else, after a send: counted, never drafted. */
+  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), by a round that calls `drafts`, and sends nothing else, after a send, or because the turn is private (TurnRouting.private): counted, never drafted. */
   keptPrivate: number;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
@@ -23637,7 +23637,10 @@ export class AgentFramework {
     text: string,
     locus: ChannelRef | null,
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
-    if (round.routing.private) return null;
+    if (round.routing.private) {
+      round.routing.keptPrivate++;
+      return null;
+    }
     if (round.routing.heldForMove) {
       // The lock moved during a turn whose words wait for its end: which came
       // before the move can't be told, so the rest of the turn's plain speech,
@@ -23801,7 +23804,7 @@ export class AgentFramework {
         'the words remain only in your history',
       );
     }
-    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`);
+    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (${routing.private ? 'this turn is private' : 'skip_reply, a drafts call or a private think'})`);
     if (suppressed > 0) {
       notes.push(this.proseRoutingOf(agent) === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
@@ -24242,6 +24245,40 @@ export class AgentFramework {
   }
 
   /**
+   * The channel a private turn's open would have resolved were it public, as
+   * `main` resolves it. Unsetting the flag for one call is safe because
+   * resolveLocus is synchronous and reads privacy only through turnRouting.
+   */
+  private publicLocusAtOpen(agentName: string, routing: TurnRouting): ChannelRef | null {
+    delete routing.private;
+    try {
+      return this.channelRegistry?.resolveLocus(agentName) ?? null;
+    } finally {
+      routing.private = true;
+    }
+  }
+
+  /** Read the last locus announced to the agent back from the store, once; whether there is one. */
+  private readAnnouncedLocus(agentName: string): boolean {
+    if (!this.lastAnnouncedLocus.has(agentName)) {
+      try {
+        const stored = (this.store.getStateJson(FRAMEWORK_STATE_ID) as { announcedLoci?: Record<string, ChannelRef | null> } | null)?.announcedLoci;
+        if (stored && Object.hasOwn(stored, agentName)) this.lastAnnouncedLocus.set(agentName, stored[agentName] ?? null);
+      } catch (err) {
+        console.error(`[routing] ${agentName}: the announced locus couldn't be read back, so this turn compares with none:`, err);
+      }
+    }
+    return this.lastAnnouncedLocus.has(agentName);
+  }
+
+  /** Whether announce-on-change would announce `locus`: it differs from the last one announced, or none was and it isn't null. */
+  private announcedLocusDiffers(agentName: string, locus: ChannelRef | null): boolean {
+    return this.readAnnouncedLocus(agentName)
+      ? !sameChannel(this.lastAnnouncedLocus.get(agentName) ?? null, locus)
+      : locus !== null;
+  }
+
+  /**
    * Announce-on-change locus notice (turn-frozen routing). Appends a durable
    * `[routing]` window message when the turn's effective outbound locus
    * differs from the last one announced — the agent must never have to guess
@@ -24253,17 +24290,9 @@ export class AgentFramework {
    * inference; never locus-eligible itself (system + no channel metadata).
    */
   private announceLocusIfChanged(agentName: string, locus: ChannelRef | null, locked = false): void {
-    if (!this.lastAnnouncedLocus.has(agentName)) {
-      try {
-        const stored = (this.store.getStateJson(FRAMEWORK_STATE_ID) as { announcedLoci?: Record<string, ChannelRef | null> } | null)?.announcedLoci;
-        if (stored && Object.hasOwn(stored, agentName)) this.lastAnnouncedLocus.set(agentName, stored[agentName] ?? null);
-      } catch (err) {
-        console.error(`[routing] ${agentName}: the announced locus couldn't be read back, so this turn compares with none:`, err);
-      }
-    }
-    const hasBaseline = this.lastAnnouncedLocus.has(agentName);
+    const hasBaseline = this.readAnnouncedLocus(agentName);
     const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
-    if (hasBaseline ? sameChannel(prev, locus) : locus === null) {
+    if (!this.announcedLocusDiffers(agentName, locus)) {
       if (!hasBaseline) this.lastAnnouncedLocus.set(agentName, locus);
       return;
     }
@@ -26313,7 +26342,10 @@ export class AgentFramework {
       this.holdProseDrafts(agent, [envelope], 'no-destination', round.draftsRound ? { ...round, notice: 'later' } : round);
       return;
     }
-    if (!sticky && routing.private) return;
+    if (!sticky && routing.private) {
+      routing.keptPrivate++;
+      return;
+    }
     if (!sticky && locus === null && routing.heartbeat) {
       this.holdHeartbeatProse(agent, [envelope], round);
       return;
@@ -27610,7 +27642,15 @@ export class AgentFramework {
         if (locus !== null) routing.locus = locus;
       } else if (routing.private) {
         if (turnProseRouting === 'locked') routing.locked = true;
-        if (attempt === 0 && turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') this.announceLocusIfChanged(agent.name, null);
+        if (attempt === 0 && turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
+          // Where `main` would have announced a channel at this open, the flip's notice says why there is none.
+          const lost = turnProseRouting === 'locked' ? this.proseLockLocus(agent) : routing.heartbeat ? null : this.publicLocusAtOpen(agent.name, routing);
+          const surface = lost !== null && this.announcedLocusDiffers(agent.name, lost)
+            ? privateWindowSurface(agent.getContextManager(), agent.name, (metadata) => this.agentSees(agent, metadata))
+            : undefined;
+          if (surface !== undefined) this.makeTurnPrivate(agent, routing, surface);
+          else this.announceLocusIfChanged(agent.name, null);
+        }
       } else if (turnProseRouting === 'locked') {
         // Locked mode: the agent's lock, whatever woke the turn, a heartbeat
         // included; none (drafts) until it has one. Announce-on-change speaks
