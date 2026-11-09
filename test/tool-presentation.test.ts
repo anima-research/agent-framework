@@ -310,69 +310,6 @@ test('a hidden tool with no override and no configured default shows its install
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
-test('an edit naming a name the file holds but the resident has no tool for says its setting stays, and only for that exact name',()=>{
- const dir=mkdtempSync(join(tmpdir(),'presentation-away-'));
- try {
-  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
-  const tools=[...presentationTargets('example','workspace--read'),...presentationTools('board/tools.md')];
-  const held='away--a_tool_name_long_enough_that_messages_cut_it_a_tool_name_long_enough_that_messages_cut_it_';
-  const keeps='Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.';
-  writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
-  const r=p.edit('set_tool_visibility',{name:held,visible:true},tools);
-  assert.equal(r.success,false);
-  assert.ok(r.error!.endsWith(` ${keeps}`),r.error);
-  assert.ok(!r.error!.includes('Copy the exact name'),'a name with no tool now is in no index to copy from');
-  assert.equal(JSON.parse(readFileSync(path,'utf8')).tools[held].visible,false,'its setting stays');
-  const rd=p.edit('set_tool_description',{name:held,description:'new words'},tools);
-  assert.equal(rd.success,false);
-  assert.ok(rd.error!.endsWith(` ${keeps}`),rd.error);
-  assert.ok(!rd.error!.includes('Copy the exact name'),rd.error);
-  assert.deepEqual(JSON.parse(readFileSync(path,'utf8')).tools[held],{visible:false},'a description edit changes nothing either');
-  const typo=held.slice(0,-2)+'x_';
-  assert.equal(typo.length,held.length);
-  const r2=p.edit('set_tool_visibility',{name:typo,visible:true},tools);
-  assert.equal(r2.success,false);
-  assert.ok(r2.error!.startsWith('Nothing was changed: you have no tool named '),r2.error);
-  assert.ok(!r2.error!.includes(keeps),'a name that differs past the cut gets no such sentence');
-  assert.ok(r2.error!.includes('Copy the exact name'),'so it gives the index instruction');
-  writeFileSync(path,'not json');
-  const r3=p.edit('set_tool_visibility',{name:held,visible:true},tools);
-  assert.ok(r3.error!.startsWith('Nothing was changed: you have no tool named '),r3.error);
-  assert.ok(!r3.error!.includes(keeps),'with a file it can\'t parse, the refusal can\'t tell whether the name is held');
-  assert.ok(r3.error!.includes('Copy the exact name'),'so it gives the index instruction');
-  writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
-  const r4=p.edit('set_tool_visibility',{name:'toString',visible:true},tools);
-  assert.ok(r4.error!.startsWith('Nothing was changed: you have no tool named '),r4.error);
-  assert.ok(!r4.error!.includes(keeps),'a name the file holds only through its prototype is no setting');
-  assert.ok(r4.error!.includes('Copy the exact name'),'so it gives the index instruction');
-  for (const setting of [{description:'my words'},{description:''}]) {
-   writeFileSync(path,JSON.stringify({version:1,tools:{[held]:setting}}));
-   const rs=p.edit('set_tool_visibility',{name:held,visible:true},tools);
-   assert.ok(rs.error!.endsWith(` ${keeps}`),`a description alone, ${JSON.stringify(setting.description)} included, is a setting: ${rs.error}`);
-   assert.ok(!rs.error!.includes('Copy the exact name'),rs.error);
-  }
-  writeFileSync(path,JSON.stringify({version:1,tools:{exampel:{visible:false}}}));
-  assert.equal(p.edit('set_tool_visibility',{name:'exampel',visible:true},tools).error,
-   `Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? ${keeps}`,'a held name close to an available one gets the guess and the setting sentence');
- } finally {rmSync(dir,{recursive:true,force:true});}
-});
-
-test('a name whose entry holds no setting, as restoring its only description leaves it, gets the index instruction',()=>{
- const dir=mkdtempSync(join(tmpdir(),'presentation-emptied-'));
- try {
-  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
-  const tools=[...presentationTargets('example','workspace--read'),...presentationTools('board/tools.md')];
-  const withAway=[...tools,...presentationTargets('away--gone')];
-  assert.equal(p.edit('set_tool_description',{name:'away--gone',description:'my words'},withAway).success,true);
-  assert.equal(p.edit('set_tool_description',{name:'away--gone',description:null},withAway).success,true);
-  assert.deepEqual(JSON.parse(readFileSync(path,'utf8')).tools['away--gone'],{},'restoring the only setting leaves an empty entry');
-  const r=p.edit('set_tool_visibility',{name:'away--gone',visible:false},tools);
-  assert.equal(r.success,false);
-  assert.ok(!r.error!.includes('Your file keeps a setting'),'an empty entry keeps no setting');
-  assert.ok(r.error!.includes('Copy the exact name'),r.error);
- } finally {rmSync(dir,{recursive:true,force:true});}
-});
-
 test('an edit refusal names every problem with its arguments, the call that works, and the closest names',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-refusals-'));
  try {
@@ -472,21 +409,6 @@ test('a presentation file the host can\'t use: edits refuse it and the catalogue
   assert.match(lines[0],/^Diagnostic: Your tool presentation file can't be used \(it isn't valid JSON: .*\), so none of its settings apply: .* ask whoever runs this host to repair it\.$/);
   assert.deepEqual(lines.slice(1),['Diagnostic: first\\nsecond','Diagnostic: third\\nfourth','Diagnostic: fifth\\nsixth']);
  } finally {rmSync(dir,{recursive:true,force:true});}
-});
-
-test('an entry holding no setting is named nowhere once its tool is gone, as the editing tools\' refusal has it',()=>{
- const dir=mkdtempSync(join(tmpdir(),'presentation-emptied-entry-'));
- try {
-  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
-  const tools=presentationTargets('example','workspace--read'), without=presentationTargets('workspace--read');
-  assert.equal(p.edit('set_tool_description',{name:'example',description:'mine'},tools).success,true);
-  assert.equal(p.edit('set_tool_description',{name:'example',description:null},tools).success,true);
-  assert.deepEqual(p.resolve(without).diagnostics,[],'restoring its only description left the entry holding nothing');
-  writeFileSync(path,JSON.stringify({version:1,tools:{gone:{},left:{visible:false}}}));
-  assert.deepEqual(p.resolve(without).diagnostics,['Not currently available: "left"'],'a {} written by hand is named nowhere either');
- } finally {
-  rmSync(dir,{recursive:true,force:true});
- }
 });
 
 test('a presentation file holding {} is the empty document, as a missing one is, and a 0-byte file, half a document or a value that isn\'t an object still refuses',()=>{

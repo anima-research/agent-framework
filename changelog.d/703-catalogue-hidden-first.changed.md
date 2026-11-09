@@ -16,17 +16,7 @@
   the upgrade, and a line reference saved before it belongs to a revision
   the catalogue no longer shows. Each hidden description appears twice in
   the file. A hidden tool that isn't available right now is still named
-  only in the diagnostics. The unknown-name refusal of `set_tool_visibility` and
-  `set_tool_description` now says the resident has no tool by that name
-  right now, shown or hidden, where it said none was "available to you",
-  which can read as a lack of access. When the resident's file holds a
-  setting under that exact name, the refusal says its setting stays, which
-  the resident can change if it has a tool by that name, and leaves out
-  the instruction to copy the name from the catalogue's index, which lists
-  only available tools. When this host can't read or parse the file, the
-  refusal can't tell whether it holds the name, and gives that
-  instruction. An entry that holds no setting, as restoring a tool's only
-  description leaves it, is no longer named "Not currently available"
-  once its tool goes away, as 0.32.0 and 0.33.0 named it, so the
-  diagnostics and the refusal agree on which names the file keeps a
-  setting for.
+  only in the diagnostics. The unknown-name refusal of
+  `set_tool_visibility` and `set_tool_description` now says the resident
+  has no tool by that name right now, shown or hidden, where it said none
+  was "available to you", which can read as a lack of access.
