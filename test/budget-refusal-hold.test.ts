@@ -1426,6 +1426,9 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.internal.budgetHolds.get('prime')!.wakes.push({ ...wake('zz-merged'), [mark]: [wake('zz-a'), wake('zz-b')] } as never);
         assert.equal(t.framework.getHostModeStatus().gatedRequests, 3, 'the waiting turn, and the two wakes merged in the request it keeps');
         assert.equal(t.hold()?.heldRequests, 3, "and the agent's health counts them the same way");
+        t.internal.budgetHolds.get('prime')!.wakes.push(wake('context_budget_restart') as never);
+        assert.equal(t.framework.getHostModeStatus().gatedRequests, 3, 'a restart a quiesce lets through is not a gated request');
+        assert.equal(t.hold()?.heldRequests, 3, "and the agent's health leaves it out the same way");
       } finally {
         await t.close();
       }

@@ -35442,7 +35442,7 @@ export class AgentFramework {
           return {
             since: hold.startedAt,
             pending: 'pending' in readiness && readiness.pending ? boundFailureText(readiness.pending) : null,
-            heldRequests: 1 + hold.wakes.flatMap((r) => mergedBatch(r) ?? [r]).length,
+            heldRequests: 1 + hold.wakes.flatMap((r) => mergedBatch(r) ?? [r]).filter((r) => !passesQuiesce(r)).length,
             errorType: hold.errorType,
             ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
             ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
