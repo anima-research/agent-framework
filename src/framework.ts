@@ -19566,7 +19566,6 @@ export class AgentFramework {
           serverId: source,
           channelId: '',
           ...(suppressionAsked ? { suppressionAsked: true } : {}),
-          // anima-research/agent-framework#243, its module-event row for named agents.
           ...(response.requestInference !== true ? { recipients: triggered.filter((name) => requested?.includes(name) === true) } : {}),
         });
         if (!decision.trigger) return;

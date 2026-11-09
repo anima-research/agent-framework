@@ -404,6 +404,11 @@ export function wakeLineText(line: WakeLine, now: number): string {
   return `[${NOTICE_TAG.gate}: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
 }
 
+/** A batch's events less those whose list of recipients is empty, which are for no one: no line or judge is shown them. */
+function shownOf(events: readonly PendingEvent[]): PendingEvent[] {
+  return events.filter((e) => e.recipients === undefined || e.recipients.length > 0);
+}
+
 /** The event's own stored entry, as the framework is asked about it. */
 function entryRef(event: PendingEvent): GateEntryRef {
   return {
@@ -4187,17 +4192,22 @@ export class EventGate {
     // delivery in part (PartialDelivery), the batch dropped only for those
     // it didn't wake.
     const woke: string[] = [];
-    if (events.every((e) => e.recipients === undefined)) {
+    const shown = shownOf(events);
+    if (shown.length === 0) return;
+    if (shown.every((e) => e.recipients === undefined)) {
       const names = this.getAgentNamesFn();
-      deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
+      deliveredTracking(woke, names, () => this.deliverBatch(shown, names, undefined, woke));
       return;
     }
-    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
-    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
+    // An untargeted event, one with no list of recipients, is for the gate's
+    // recipients alone, as in a batch of such events; one that names its
+    // recipients, for them.
+    const recipients = new Set(this.getAgentNamesFn());
+    const woken = this.wokenBy(shown);
     const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
     for (const agentName of woken) {
-      const seen = events.filter((e) => e.recipients === undefined || e.recipients.includes(agentName));
-      const key = seen.map((e) => events.indexOf(e)).join(',');
+      const seen = shown.filter((e) => (e.recipients === undefined ? recipients.has(agentName) : e.recipients.includes(agentName)));
+      const key = seen.map((e) => shown.indexOf(e)).join(',');
       const group = groups.get(key) ?? { agents: [], events: seen };
       group.agents.push(agentName);
       groups.set(key, group);
@@ -4205,6 +4215,13 @@ export class EventGate {
     deliveredTracking(woke, [...woken], () => {
       for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents, woke);
     });
+  }
+
+  /** The agents a batch of these events wakes: the recipients its events name, and the gate's recipients when any event is untargeted. */
+  private wokenBy(events: readonly PendingEvent[]): Set<string> {
+    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
+    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
+    return woken;
   }
 
   private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {
@@ -4345,8 +4362,11 @@ export class EventGate {
       this.deliverOrBuffer(events);
       return;
     }
+    // The judge is asked for the agents the batch would wake; a batch that
+    // wakes no one isn't judged.
+    const agentNames = [...this.wokenBy(events)];
+    if (agentNames.length === 0) return;
     const abort = new AbortController();
-    const agentNames = this.getAgentNamesFn();
     const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [] };
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
@@ -4362,7 +4382,7 @@ export class EventGate {
       asked = fn({
         policyName,
         ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
-        events: events.map((e) => this.judgeEventSummary(e)),
+        events: shownOf(events).map((e) => this.judgeEventSummary(e)),
         agentNames,
         upcomingWakes: this.upcomingWakes(agentNames, policyName),
         signal: abort.signal,
@@ -4428,8 +4448,9 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires; a judge rule's goes to the judge, so it only may). A batch,
-   * and a sleep with no agent named, reach the gate's recipients alone.
+   * when it fires; a judge rule's goes to the judge, so it only may). A batch
+   * counts for the agents it would wake (wokenBy); a sleep with no agent
+   * named reaches the gate's recipients alone.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4446,7 +4467,9 @@ export class EventGate {
       wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep' });
     }
     for (const [name, state] of this.debounceTimers) {
-      if (!recipient || name === exceptPolicy || state.events.length === 0) continue;
+      if (name === exceptPolicy || state.events.length === 0) continue;
+      const woken = this.wokenBy(state.events);
+      if (!agentNames.some((agentName) => woken.has(agentName))) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
