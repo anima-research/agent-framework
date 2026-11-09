@@ -1,0 +1,1 @@
+- The `inference:exhausted` trace gains `shownReason`: the reason the `[inference-failed]` note gives, when it gives one. It's present only when the failure's message holds no provider's text: a progress bound's cut, a stream's abort, or context-manager's refusal of a compile.
