@@ -4253,7 +4253,13 @@ function wakeChannelsOf(requests: readonly ({ wakeChannels?: ChannelRef[] } | un
   return channels.length > 0 ? channels : undefined;
 }
 
+/** Whether the scheduler could drop `request` once the agent has read it: it
+ *  reads rows (readsRow, readsRows), or it's a start merged from wakes
+ *  (MERGED_BATCH) each of which could be, since the scheduler judges those
+ *  one by one. */
 function droppableAsRead(request: InferenceRequest): boolean {
+  const batch = mergedBatch(request);
+  if (batch?.length) return batch.every(droppableAsRead);
   return request.readsRow !== undefined || request.readsRows !== undefined;
 }
 
@@ -6875,9 +6881,10 @@ export class AgentFramework {
    * request already queued for it, which runs as soon as the agent is free,
    * and turns a provider cooldown holds until its end. Either only may wake
    * the agent when each request reads rows (readsRow, readsRows) and nothing
-   * else, since the scheduler drops one whose rows the agent has answered by
-   * then. The reply judge is told of them beside the gate's own timers, so
-   * it can weigh what waiting costs.
+   * else, or is a start merged from such wakes (droppableAsRead), since the
+   * scheduler drops one whose rows the agent has answered by then. The reply
+   * judge is told of them beside the gate's own timers, so it can weigh what
+   * waiting costs.
    */
   private upcomingWakesFor(agentName: string): import('./gate/types.js').UpcomingWake[] {
     const wakes: import('./gate/types.js').UpcomingWake[] = [];
@@ -28055,9 +28062,10 @@ export class AgentFramework {
     if (assembled && !this.quiesced && this.presents(agent)) this.presentation!.presentAtStart(agent, 'assembly');
 
     // A batched wake's line, decided now that the turn's inputs are in and
-    // before its own notices and checkpoint (placeBatchLine). Fresh starts
-    // only: a retry re-sends the same turn, and what follows the wake's
-    // messages by then is mostly the first attempt's own notices or rounds.
+    // before its own notices and checkpoint (placeBatchLine). At a fresh
+    // start of the wake only, a provider hold's release among them: an
+    // attempt after the first re-sends the same request, and a start that
+    // resumes a logical turn continues one already under way.
     const batchRows = batchRowsOf(trigger);
     if (batchRows && attempt === 0 && !resumesTurn) this.placeBatchLine(agent, batchRows);
 

@@ -4386,8 +4386,9 @@ export class EventGate {
    * batches of rules other than `exceptPolicy`. A debounce's batch wakes the
    * agent when it fires. It only may where each of `agentNames` is given none
    * of its events, or each event delivery gives that agent has a message of its
-   * own whose write was placed for it. A host that reads WakeProvenance.writes
-   * starts no turn for an agent that has read and answered every one. A judge
+   * own whose write was placed for it. A host whose scheduler drops such a wake
+   * by its WakeProvenance.writes, as AgentFramework's does, starts no turn for
+   * an agent that has read and answered every one. A judge
    * rule's batch goes to the judge, so it only may. A batch, and a sleep with
    * no agent named, reach the gate's recipients alone.
    */
