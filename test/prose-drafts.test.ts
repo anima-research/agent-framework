@@ -607,7 +607,7 @@ describe('held prose drafts, end to end', () => {
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
-      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
+      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.map((id) => `${id} (explicit send in its turn)`).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
@@ -681,7 +681,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
       assert.equal(
         h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => `${d.id} (explicit send in its turn)`).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
       );
     } finally {
       await h.close();
@@ -766,7 +766,7 @@ describe('held prose drafts, end to end', () => {
       const held = h.drafts();
       assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (explicit send in its turn) (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
@@ -2126,7 +2126,7 @@ describe('draft notices and turn-end settlement', () => {
       const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
         .filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
         .find((text) => text.startsWith('[delivered]'))!;
-      const held = receipt.match(/held as drafts? ([^(]+)\(not sent/)?.[1] ?? '';
+      const held = receipt.match(/held as drafts? (.+?) \(not sent/)?.[1] ?? '';
       assert.ok(held.includes(newer.id), `the draft still held is reported as held: ${receipt}`);
       assert.ok(!held.includes(old.id), `the let-go draft is not offered as held: ${receipt}`);
       assert.ok(receipt.includes(`draft ${old.id} held this turn and since let go by retention (no longer held, so not resendable)`), receipt);
@@ -2929,7 +2929,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       await h.turn(rounds([text(`>>>${ROOM} {{unsent}}`), explicitSend('s2')]));
       assert.equal(h.drafts().length, count, 'a bare {{unsent}} mints no copy');
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (not sent — drafts can resend them unchanged, or dismiss them)`);
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (routing prefix bounced) (not sent — drafts can resend them unchanged, or dismiss them)`);
 
       // Once the bounce may have been posted, held words copied from it carry its risk.
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -2978,7 +2978,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'resend me']);
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
         `[delivered] plain speech → #room (Guild One) (${ROOM}) (draft ${ids[0]}, by your resend) · ` +
-        `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged, or dismiss them) · ` +
+        `1 plain-speech segment(s) held as draft ${ids[2]} (explicit send in its turn) (not sent — drafts can resend them unchanged, or dismiss them) · ` +
         `draft ${ids[1]} dismissed by you`);
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -4832,6 +4832,124 @@ describe('the held-draft notice written mid-turn', () => {
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("an explicit send's result says what it holds", () => {
+  const PLACE = `#room \\(Guild One\\) \\(${ROOM}\\)`;
+  const resultOf = (h: Awaited<ReturnType<typeof harness>>, id: string): string => {
+    const block = h.messages().flatMap((m) => m.content)
+      .find((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === id) as { content?: unknown } | undefined;
+    assert.ok(block, `premise: ${id}'s result is in the context`);
+    const content = block.content;
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) return content.map((b: { text?: unknown }) => (typeof b.text === 'string' ? b.text : JSON.stringify(b))).join('\n');
+    return JSON.stringify(content);
+  };
+
+  it('native: a send to a place says the plain speech there, this round included, is held until a new message or the turn ends', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('sent it.'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.equal(h.drafts()[0]?.text, 'sent it.', 'premise: the line beside the send is held');
+      assert.match(resultOf(h, 's1'), new RegExp(`"routing": ?"Your plain speech to ${PLACE}, this round's included, is held as drafts until a new message reaches you or this turn ends\\."`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML: a send to a place says the turn's plain speech there, earlier rounds included, is held", async () => {
+    const h = await harness({ xml: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Narration before the send.'), explicitSend('s1')], 'tool_use'),
+        { ...createMockResponse([text('Narration before the send.'), explicitSend('s1'), text('And after it.')]), toolCalls: [] },
+      ]);
+      assert.equal(h.drafts().length, 2, 'premise: both rounds\' speech is held');
+      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE} this turn, earlier rounds included, is held as drafts\\.`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a send whose place can't be told says the plain speech anywhere is held, and why", async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([createMockResponse([text('done, messaged them.'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.equal(h.drafts()[0]?.text, 'done, messaged them.', 'premise: the line is held');
+      assert.match(resultOf(h, 's1'), /The framework can't tell where this posted \(its answer named no channel the framework reads\), so your plain speech anywhere, this round's included, is held as drafts until a new message reaches you or this turn ends\./);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a send that answered with an error says, after its error, that the plain speech anywhere is held', async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('error');
+    try {
+      await h.turn([createMockResponse([text('done, messaged them.'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.equal(h.drafts()[0]?.text, 'done, messaged them.', 'premise: the line is held');
+      assert.match(resultOf(h, 's1'), /Discord refused part 2\. Attempted destination: \S+\nThe framework can't tell whether or where this posted \(it answered with an error\), so your plain speech anywhere, this round's included, is held as drafts until a new message reaches you or this turn ends\./);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a send that posted nowhere, a turn in explicit mode, a silent turn and a turn kept private add no line', async () => {
+    const nowhere = await harness();
+    try {
+      nowhere.command({ op: 'publish-mode', mode: 'not-delivered' });
+      await nowhere.turn([createMockResponse([text('sent it.'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.doesNotMatch(resultOf(nowhere, 's1'), /plain speech/);
+    } finally {
+      await nowhere.close();
+    }
+    const explicit = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      await explicit.turn([createMockResponse([text('sent it.'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.doesNotMatch(resultOf(explicit, 's1'), /plain speech/);
+    } finally {
+      await explicit.close();
+    }
+    const silent = await harness();
+    try {
+      await silent.turn([createMockResponse([text('private narration'), explicitSend('s1')], 'tool_use'), createMockResponse([])], 'scout', 'silent');
+      assert.doesNotMatch(resultOf(silent, 's1'), /plain speech/);
+    } finally {
+      await silent.close();
+    }
+    const afterPrivate = await harness();
+    try {
+      await afterPrivate.turn([
+        createMockResponse([
+          text('Private, beside the refused wake.'),
+          call('w1', 'skip_reply', { reason: 'later', wake_in_seconds: 60 }),
+          call('m1', 'tools--skip_reply', {}),
+        ], 'tool_use'),
+        createMockResponse([text('Still private.'), explicitSend('s2')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(afterPrivate.drafts(), [], 'premise: the turn keeps its plain speech private after the refused wake, holding none');
+      assert.doesNotMatch(resultOf(afterPrivate, 's2'), /plain speech/);
+    } finally {
+      await afterPrivate.close();
+    }
+  });
+
+  it("a drafts resend's result says what it holds, as any send's does", async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([createMockResponse([text('the words'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
+      const [held] = h.drafts();
+      assert.ok(held, 'premise: a draft is held');
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [held!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.match(resultOf(h, 'r1'), new RegExp(`Your plain speech to ${PLACE}, this round's included, is held as drafts until a new message reaches you or this turn ends\\.`));
+      assert.doesNotMatch(resultOf(h, 'r1'), /"routing"/, "the line follows the resend's answer as its own text, not as a field of it");
+    } finally {
+      await h.close();
     }
   });
 });

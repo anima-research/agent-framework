@@ -1833,6 +1833,7 @@ interface ScriptRound {
   scriptsReturned?: () => void;
   /** Routes the round's prose; called once, when its last awaited result arrives. */
   route: () => void;
+  holdLine: (reach: SendReach) => string | undefined;
   /**
    * Withholds the round's prose when its routing can't be decided: before
    * its scripts returned, its stream ended or no longer waits on it, or a
@@ -22832,6 +22833,31 @@ export class AgentFramework {
     return heldAny;
   }
 
+  private static readonly UNKNOWN_REACH_TEXT: Record<Exclude<UnknownReach, 'no-answer'>, string> = {
+    error: 'it answered with an error',
+    'no-channel': 'its answer named no channel the framework reads',
+    unresolved: "its answer named a channel the framework couldn't match to one it knows",
+  };
+
+  private sendHoldLine(reach: SendReach, live: boolean): string | undefined {
+    if (reach.kind === 'nowhere') return undefined;
+    const held = live
+      ? ", this round's included, is held as drafts until a new message reaches you or this turn ends."
+      : ' this turn, earlier rounds included, is held as drafts.';
+    if (reach.kind === 'channel') return `Your plain speech to ${this.channelShown(reach.to)}${held}`;
+    if (reach.why === 'no-answer') return undefined;
+    return `The framework can't tell ${reach.why === 'error' ? 'whether or where' : 'where'} this posted (${AgentFramework.UNKNOWN_REACH_TEXT[reach.why]}), ` +
+      `so your plain speech anywhere${held}`;
+  }
+
+  private static withHoldLine(result: ToolResult, line: string): void {
+    const data = result.data;
+    if (Array.isArray(data)) result.data = [...data, { type: 'text', text: line }];
+    else if (typeof data === 'string') result.data = `${data}\n${line}`;
+    else if (data !== null && typeof data === 'object') result.data = { ...data, routing: line };
+    else if (data === undefined && result.error !== undefined) result.error = `${result.error}\n${line}`;
+  }
+
   private sendHoldText(hold: SendHold, target: ChannelRef | null, when: number | 'end' | 'turn'): string {
     const said = (round: number): string => (when === 'turn' ? 'this turn' : round === when ? 'in this round' : 'earlier this turn');
     const lasts = (round: number, there: boolean): string =>
@@ -22844,15 +22870,11 @@ export class AgentFramework {
       return `your ${suppliedValue(place.tool)} ${said(place.round)} ${place.delivered ? 'delivered' : 'may have posted'} to ${where}, ` +
         `where this was going${lasts(place.round, true)}`;
     }
-    const why = hold.why === 'error'
-      ? 'it answered with an error'
-      : hold.why === 'no-channel'
-        ? 'its answer named no channel the framework reads'
-        : hold.why === 'unresolved'
-          ? "its answer named a channel the framework couldn't match to one it knows"
-          : hold.round === when
-            ? "it hadn't answered when this speech was routed"
-            : "it hadn't answered by the end of its round";
+    const why = hold.why !== 'no-answer'
+      ? AgentFramework.UNKNOWN_REACH_TEXT[hold.why]
+      : hold.round === when
+        ? "it hadn't answered when this speech was routed"
+        : "it hadn't answered by the end of its round";
     const going = target ? `, and this was going to ${this.channelShown(target)}` : '';
     return `the framework can't tell ${hold.why === 'error' || hold.why === 'no-answer' ? 'whether or where' : 'where'} your ${suppliedValue(hold.tool)} ${said(hold.round)} posted (${why})${going}${lasts(hold.round, false)}`;
   }
@@ -23752,7 +23774,7 @@ export class AgentFramework {
     const held = inState('held');
     if (held.length > 0) {
       notes.push(
-        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
+        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${held.map((d) => `${d.id} (${AgentFramework.DRAFT_REASON_SHORT[d.reason]})`).join(', ')} ` +
         '(not sent — drafts can resend them unchanged, or dismiss them)',
       );
     }
@@ -28947,6 +28969,7 @@ export class AgentFramework {
                 scriptsReturned: () => {
                   if (waits()) decidable = true;
                 },
+                holdLine: (reach) => (silence === 'private' ? undefined : this.sendHoldLine(reach, liveRound)),
                 route: () => {
                   // Only while this stream still owns the agent and waits on
                   // the round: a turn replaced, reset or cancelled meanwhile
@@ -31264,7 +31287,12 @@ export class AgentFramework {
     const round = this.scriptRounds.get(agentName);
     if (!round) return;
     if (round.sends.has(callId)) {
-      if (round.pending.has(callId)) round.sends.set(callId, this.sendReachOf(result));
+      if (round.pending.has(callId)) {
+        const reach = this.sendReachOf(result);
+        round.sends.set(callId, reach);
+        const line = round.holdLine(reach);
+        if (line) AgentFramework.withHoldLine(result, line);
+      }
     } else if (this.scriptRoundOfResult.get(result) !== round) {
       return;
     }
