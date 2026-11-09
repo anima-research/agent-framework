@@ -267,8 +267,9 @@ export interface McplServerConfig {
    * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
    *   binding. The host dials it and runs the same newline-delimited JSON-RPC
    *   as over stdio.
-   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
-   *   Streamable HTTP.
+   * - `http://` or `https://` is a modern MCP server over Streamable HTTP.
+   *   Its revision is negotiated at each connect: 2026-07-28 when the server
+   *   offers it, and otherwise 2025-11-25, 2025-06-18 or 2025-03-26.
    */
   url?: string;
 
@@ -428,6 +429,21 @@ export interface McplServerConfig {
    * Only `true` turns it on, and null counts as not set. `create()`,
    * `connectMcplServer` and `restartMcplServer` refuse any other value, such
    * as a quoted "false".
+   *
+   * A modern server reached over HTTP at a 2025 revision can hold a session
+   * for this client. When the server ends it (HTTP 404), or stops serving its
+   * revision or its streams as a server upgraded to 2026-07-28 does, after it
+   * has answered a request, a new session starts at once whether or not this
+   * is set: the connection emits 'close' while its `willReconnect` reads
+   * true, then 'reconnect'. If that new session can't start, this setting
+   * decides, as for any lost connection, and a revision verdict stops it for
+   * good, as on any reconnect; without this setting, a second 'close', while
+   * `willReconnect` reads false, says the server is gone. An answered session
+   * that ends less than `reconnectIntervalMs` after it started gets a new
+   * one at once only if the last session restarted that way had lived that
+   * long, or there was none. A second such young end in a row, and a session
+   * that ends before it has answered, count as a failed connect, and follow
+   * this setting.
    */
   reconnect?: boolean;
 
@@ -440,7 +456,14 @@ export interface McplServerConfig {
    * minutes) is a failed attempt too, reported by `reconnect-failed` with how
    * long it lived, unless its launch can't be reaped, which is the permanent
    * failure that halts reconnecting; the count starts afresh only once a
-   * connection lasts that long.
+   * connection lasts that long. A modern server's 2025 session over HTTP
+   * that the server ends starts again at once, with the count afresh, unless
+   * it ended before answering a request, or less than this interval after it
+   * started twice in a row, which is a failed attempt. Over HTTP the same
+   * backoff paces a modern server's streams: a dropped stream's first try
+   * waits the server's `retry` hint when it sent one above 0, and the
+   * backoff's first step otherwise, and a try after a failed one waits the
+   * longer of the hint and the doubling backoff.
    * The modern engine also backs off reopening a lost tool-list
    * subscription by it and `reconnectMaxIntervalMs`, whether or not it
    * reconnects. Default: 5000 (5 seconds). With `reconnect: true`, or on a

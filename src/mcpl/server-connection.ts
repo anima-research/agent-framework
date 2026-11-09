@@ -161,20 +161,27 @@ const UNSUPPORTED_PROTOCOL_VERSION_CODE = -32022;
 const MAX_TOOL_LIST_PAGES = 100;
 
 /**
- * The server and this engine have no protocol revision in common, so the
- * connection was never established. This is a protocol-negotiation fact, not
- * a request outcome. Retrying cannot change it: each engine offers one
- * revision, and only configuration can fix the mismatch. A connection that
- * gets this error does not schedule reconnects. The legacy engine and the
- * modern one (ModernMcpConnection, whose pinned revision the server refused)
- * both throw it, so its readers treat them alike.
+ * This engine and the server could not negotiate a protocol revision, so the
+ * connect that throws it established no connection. Usually they share none. Over HTTP it
+ * can also be the SDK's own refusal: after a -32022 whose list names a
+ * revision from 2026-07-28 on that this client doesn't speak, the SDK
+ * negotiates no further, even when the list also names a 2025 revision both
+ * speak. This is a protocol-negotiation fact, not a request outcome.
+ * Retrying cannot change it: each engine offers the same revisions every
+ * time (`offeredRevisions`), and only configuration, or the server's
+ * operator, can fix the mismatch. A connection that gets this error does not
+ * schedule reconnects. The legacy engine and the modern one
+ * (ModernMcpConnection) both throw it, so its readers treat them alike.
  *
- * - `rejected`: the server refused the offered revision: the legacy engine's
- *   `initialize` answered with error -32022, or a modern server's discovery
- *   or error naming no common revision. `supported` is the server's own list,
- *   when it gave one.
- * - `mismatch`: the server answered the legacy engine's `initialize` with a
- *   revision other than 2024-11-05, or with none.
+ * - `rejected`: the server refused the revision offered. The legacy
+ *   engine's `initialize` was answered with error -32022. A modern server's
+ *   discovery or -32022 error named no revision in common (over HTTP, a
+ *   discovery's list counts once the server has refused the `initialize`
+ *   tried after it too), or, over HTTP, named one this client doesn't speak,
+ *   as above. `supported` is the server's own list, when it gave one.
+ * - `mismatch`: the server answered `initialize` with a revision that
+ *   handshake doesn't accept, or with none: the legacy engine's, or a modern
+ *   connection's 2025 handshake over HTTP.
  */
 export class McplProtocolVersionError extends Error {
   constructor(
@@ -189,9 +196,15 @@ export class McplProtocolVersionError extends Error {
      *  redacted (`rejected`). */
     readonly code?: number,
     readonly data?: unknown,
-    /** The revision this client offered: the legacy engine's, unless a
-     *  modern connection's. */
+    /** The revision this client offered first, in its order of preference:
+     *  the legacy engine's (2024-11-05), a modern connection's over stdio
+     *  (2026-07-28), or over HTTP 2026-07-28, the first of
+     *  `offeredRevisions`. */
     readonly offered: string = MCP_PROTOCOL_VERSION,
+    /** Every revision this client offered, in its order of preference: the
+     *  legacy engine's one, a modern connection's one over stdio, or its
+     *  list over HTTP. */
+    readonly offeredRevisions: readonly string[] = [offered],
   ) {
     super(message);
     this.name = 'McplProtocolVersionError';
