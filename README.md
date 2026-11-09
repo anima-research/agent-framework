@@ -326,18 +326,19 @@ A pattern that matches no tool is reported once, as a console line and an
 A pattern that could name a server's tools is not judged until that server
 has listed them, so late connects and reconnects don't cause early reports.
 
-#### Modern MCP servers (2026-07-28)
+#### Modern MCP servers
 
-The same `mcplServers` list also takes servers that speak modern MCP
-(revision `2026-07-28`), reached through the official SDK client. The
-configuration chooses the family, and nothing is probed:
+The same `mcplServers` list also takes servers that speak modern MCP,
+reached through the official SDK client: revision `2026-07-28`, and over
+HTTP the 2025 revisions too. The configuration chooses the family, and a
+stdio server speaks `2026-07-28` alone:
 
 | Configuration | Family | Transport |
 |---|---|---|
 | `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket (`token` / `accessProvider` as `?token=`, or as bearer with `tokenTransport: 'header'`) |
-| `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
+| `url: 'http://…'` / `'https://…'` | modern MCP (`2026-07-28`, `2025-11-25`, `2025-06-18` or `2025-03-26`, negotiated) | Streamable HTTP (`token` / `accessProvider` as bearer) |
 | `command` | MCPL | stdio |
-| `command` + `protocol: 'modern'` | modern MCP | stdio |
+| `command` + `protocol: 'modern'` | modern MCP (`2026-07-28`) | stdio |
 
 ```typescript
 {
@@ -437,6 +438,114 @@ server that refuses `2024-11-05` with `-32022` fails with
 revisions the server says it supports ("none listed" for an empty list), or its error text when it sends no list,
 and when the list includes `2026-07-28` it says to configure the server with
 `protocol: 'modern'` (stdio) or reach it over http(s).
+
+Over HTTP the revision is negotiated at each connect. The client asks
+`server/discover` first and connects at `2026-07-28` when the server offers
+it. A server that doesn't gets the 2025 `initialize` handshake, which asks
+for `2025-11-25` and accepts `2025-11-25`, `2025-06-18` or `2025-03-26` in
+the answer.
+`listMcplServers()` shows the revision it settles on as `protocolVersion`,
+and its `family` stays `modern`. On a 2025 revision:
+- List changes arrive on the session's standalone stream, which is kept
+  open while the session lives, whether or not the server issues a session
+  id, unless the server answers its first open with a status that won't
+  pass: a 405, which says it offers no stream, a 501 or 505, a 4xx other
+  than 408, 409 and 429, or a redirect the SDK doesn't follow, such as one
+  off the server's origin. With a `token` or `accessProvider` set, a 401
+  first gets one more try, after the SDK refreshes the credential.
+  Such an open isn't tried again, and the session's list changes don't
+  arrive. A failure to open it that may pass is reported as the
+  connection's `error` and tried again, and a stream that drops is
+  reopened: the first try waits the server's `retry` hint, or the first
+  step of the connection's backoff when it gave none or a hint of 0, and a
+  try after a failed one waits the longer of the hint and the connection's
+  backoff.
+  Its first open, once the connection is up, and a reopen that missed what
+  came meanwhile each relist the tools of a server that announces list
+  changes, since a change announced while no stream was open never
+  arrives.
+- A request's stream that the server closes after a priming event is
+  resumed for as long as the request lives. Its cancellation at the
+  deadline stops the resume too. A stream cut again before it carried a
+  new event id can't be resumed: the SDK sends its resume without the id
+  (modelcontextprotocol/typescript-sdk#2499), which the server can't match
+  to the call's stream, so the call doesn't get its answer, and fails as
+  `no-response`, at the latest at its deadline.
+  A call whose stream ends unanswered with nothing to resume from fails
+  then, as `no-response`, not at its deadline.
+- The server ends the session by answering 404 to a request that carried
+  its id (except the stream's first open, whose 404 can also mean the
+  server has no GET route). A call whose POST met the 404 fails as
+  `error-response` with `data.httpStatus` 404, and isn't replayed. A call
+  whose stream the server's restart cut is `no-response`, since the server
+  may have run it. A session that had answered a request gets a new one at
+  once, whatever `reconnect` says: the connection emits `close` while its
+  `willReconnect` reads true, then `reconnect`, and the framework keeps the
+  server and its tools and relists. If the new session can't start,
+  `reconnect` decides, as for any lost connection, and a revision verdict
+  stops it for good, as on any reconnect. Without `reconnect`, that failure
+  emits a second `close`, while `willReconnect` reads false: the server is
+  gone. An answered session that ended less than the base interval
+  (`reconnectIntervalMs`) after it started gets a new one at once only if
+  the last session restarted that way had lived the interval, or there was
+  none: a server restarted once soon after a connect costs a restart, not
+  the server. A second such young end in a row is a failed connect, as is
+  a session's end before it answered anything: it emits `reconnect-failed`
+  and `close`, and follows `reconnect` with a growing backoff. So a load
+  balancer without sticky sessions, or a rolling upgrade that lands a
+  connect on an old node and its requests on a new one, shows up as a
+  failing server, with the framework's alert at the fifth attempt, when its
+  sessions end within the interval. A deployment whose sessions each live
+  longer restarts at most once an interval, and each restart costs the
+  calls in flight: the client can't tell a balancer that moves a session's
+  requests from a server that restarts. Once the framework's `stop()` has
+  begun, an ended session isn't started again, and a new one already
+  connecting doesn't come up.
+- A server that moves to `2026-07-28` in place is followed, since the
+  session's end brings a new connect, which negotiates afresh. Two more
+  answers end a 2025 session, with a session id or without: a 400 carrying
+  JSON-RPC `-32022` to any request, as the SDK's 2026 handler answers 2025
+  traffic it refuses (`legacy: 'reject'`), and a 405 to a GET for one of
+  the session's streams after the server had served it (the standalone
+  stream's reopen, or a request stream's resume with its event id), as that
+  handler answers a 2025 session it serves statelessly (its default). A call
+  refused with `-32022` fails as `error-response` with the server's data,
+  its code in the host's log, and isn't replayed. Its words say the server
+  refused the session's revision, so the request didn't run, and whether
+  this host is reconnecting. A server that keeps serving a 2025 revision
+  statelessly to a connection that never had a standalone stream isn't
+  followed, unless its upgrade cut a call's stream, whose resume with its
+  event id then meets the 405: that connection stays on 2025 until its next
+  connect.
+- Each session the server holds by its id is ended with a `DELETE` when the
+  connection lets it go, waiting at most 3 s: at `close()`, and so `stop()`
+  or a disconnect, a connect in flight included, and when a connect fails
+  after its `initialize` was answered. A session the server let go, with a
+  404, a `-32022` or such a 405, gets none.
+
+On `2026-07-28` too, a dropped stream's retries follow that timing. They
+stop after two failed tries, the SDK's default, on every stream: a listen
+stream that can't be resumed is reopened, with a relist, and a call whose
+stream can't be resumed fails then, as `no-response`, rather than at its
+deadline.
+
+A server over HTTP that this client can't negotiate a revision with fails
+with `McplProtocolVersionError`, naming what each side speaks, and is not
+retried: the SDK's own refusal, after which it negotiates no further (a
+`-32022` whose list names a revision from `2026-07-28` on that this client
+doesn't speak, even if the list also names a 2025 revision it does, which
+the message then says); a discovery or `-32022` error that lists no
+revision in common, once the server has also refused the `initialize`
+tried after it (`rejected`); or an `initialize` answered with a revision
+the 2025 handshake doesn't accept, or with none (`mismatch`). `2026-07-28` is
+negotiated through `server/discover` alone, so it isn't accepted from
+`initialize`. An `initialize` that fails without an answer, such as a
+timeout, is no verdict, and is retried as any failed connect is. The
+error's `offeredRevisions` lists the revisions this client offered, and
+`offered` is the first of them. `2024-11-05` isn't one of them over HTTP:
+its HTTP binding was HTTP+SSE, another transport. Over stdio, a discovery
+answer that lists revisions without `2026-07-28` is a verdict too, even one
+the SDK can't read as a DiscoverResult.
 
 Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it; with `tokenTransport: 'header'` it sets none), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command and arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. A JSON-RPC tool answer's result passes through as sent. No error a host's own call gets, whether thrown, rejected with or in an error answer's data, carries a credential this filtering replaces, whoever wrote its words: a server's words are redacted, then bounded, where an error is built from them, the strings in an error answer's data are redacted, and an error a library raised, such as a failed modern connect's, is handed on as its name and its redacted words alone. A stdio child that couldn't be started is refused with Node's words redacted, stopping before Node's quote of a value it refused at once, and a cause that keeps Node's error's name, those words and its `code`. With a configuration that can't be read, the server's words and data are withheld. A failed handshake's `stderrTail` is the end of the server's stderr, with every credential of up to 14,336 characters that reaches into it replaced whole. A number in an error answer's data is matched as JavaScript reads it, so one with more significant digits than a double holds has lost its last digits before it's matched. A close's or a cleanup's failure carries the transports' own words, a child's pid, its server's id and the wait it was given. A connection's events are inputs to the framework's records, which redact them.
 

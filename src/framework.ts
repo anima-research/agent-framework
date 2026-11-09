@@ -4987,7 +4987,8 @@ export class AgentFramework {
   private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
-  /** Modern-MCP (2026-07-28) servers, by id; read through modernServers().
+  /** Modern-MCP servers (2026-07-28, or a 2025 revision over HTTP), by id;
+   *  read through modernServers().
    *  They are kept apart from the MCPL registry on purpose: they have no
    *  grant, planes or server→host traffic, so the MCPL machinery (quiesce's
    *  plane pauses, policy) never sees them. They take part
@@ -38016,8 +38017,9 @@ export class AgentFramework {
     closedTab: boolean;
     retrying: boolean;
     /** Which engine serves it: `legacy` (MCP 2024-11-05 + MCPL) or `modern`
-     *  (MCP 2026-07-28), as its configuration selects; null when the
-     *  configuration names no usable transport (see `refused`). */
+     *  (the SDK's client: MCP 2026-07-28, or over HTTP a 2025 revision), as
+     *  its configuration selects; null when the configuration names no
+     *  usable transport (see `refused`). */
     family: 'legacy' | 'modern' | null;
     /** The MCP revision its last handshake established; null until one has. */
     protocolVersion: string | null;
