@@ -303,7 +303,7 @@ has listed them, so late connects and reconnects don't cause early reports.
 The same `mcplServers` list also takes servers that speak modern MCP,
 reached through the official SDK client: revision `2026-07-28`, and over
 HTTP the 2025 revisions too. The configuration chooses the family, and a
-stdio server is never probed:
+stdio server speaks `2026-07-28` alone:
 
 | Configuration | Family | Transport |
 |---|---|---|
@@ -429,8 +429,9 @@ and its `family` stays `modern`. On a 2025 revision:
   arrive. A failure to open it that may pass is reported as the
   connection's `error` and tried again, and a stream that drops is
   reopened: the first try waits the server's `retry` hint, or the first
-  step of the connection's backoff when it gave none, and a try after a
-  failed one waits the longer of the hint and the connection's backoff.
+  step of the connection's backoff when it gave none or a hint of 0, and a
+  try after a failed one waits the longer of the hint and the connection's
+  backoff.
   Its first open, once the connection is up, and a reopen that missed what
   came meanwhile each relist the tools of a server that announces list
   changes, since a change announced while no stream was open never

@@ -355,10 +355,11 @@ test('a list change on a 2025 session is announced, and the next listing has the
   const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
   const errors: string[] = [];
   connection.on('error', (error: Error) => errors.push(error.message));
+  await until(() => streamOpened(connection), 'the stream open');
   let changes = 0;
   connection.on('tools-list-changed', () => changes++);
   await connection.callTool('add_tool', {});
-  await until(() => changes > 0, 'the list change');
+  await until(() => changes === 1, 'the list change');
   assert.ok((await connection.listTools()).some((tool) => tool.name === 'added_1'));
   await sleep(150);
   assert.deepEqual(errors.filter((message) => /subscription/.test(message)), []);
@@ -1156,7 +1157,9 @@ test('a call whose stream is cut again before it carried a new event fails at it
     assert.equal(err.outcome, 'no-response');
     assert.match(err.message, /^The "remote" server didn't answer within 3 seconds, so whether the request took effect is unknown/);
     return true;
-  });
+  }, 'the call was answered: this SDK release resumes with the event id (typescript-sdk#2499 fixed), so the README sentence on a stream cut twice and this test change');
+  assert.ok(fixture.events.includes('slow-finished'), 'the tool finished');
+  assert.ok(count(fixture, (s) => s.method === 'GET' && !s.resumed) >= 2, 'a resume without the event id, beside the standalone open');
   assert.equal(reconnects, 0, "the session wasn't restarted");
   assert.equal(count(fixture, (s) => s.method === 'DELETE'), 0, "the session wasn't ended");
   assert.ok(connection.isConnected);
@@ -1187,7 +1190,7 @@ test('a session that ends before it answered is a failed connect: refused, repor
 });
 
 for (const answered of [false, true]) {
-  test(`a second 404 for a session already ended changes nothing (${answered ? 'answered' : 'unanswered'})`, async () => {
+  test(`a second end reported for a session already ended changes nothing (${answered ? 'answered' : 'unanswered'})`, async () => {
     const fixture = await start2025({ versions: ['2025-06-18'] });
     const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
     if (answered) {
@@ -1288,7 +1291,7 @@ test('an answered session\'s end counts failed connects afresh: a later session 
   assert.deepEqual(failed, [1, 1]);
 });
 
-test('a restart that meets a revision verdict, with reconnect set, stops for good as any reconnect does: alerted, and still registered', async () => {
+test('a restart that meets a revision verdict, with reconnect set, stops for good as any reconnect does: a permanent reconnect-failed, and nothing tried after', async () => {
   let downgraded = false;
   const fixture = await start2025({
     versions: ['2025-06-18'],
@@ -1476,7 +1479,7 @@ for (const kind of ['restart', 'reconnect'] as const) {
     await until(() => held !== undefined, 'the new session\'s discovery, held');
     connection.stopReconnecting();
     json(held!, 400, { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Bad Request: No valid session ID provided' } });
-    await until(() => count(fixture, (s) => s.method === 'DELETE') === 1 && !connection.willReconnect, 'the new session let go');
+    await until(() => count(fixture, (s) => s.method === 'DELETE' && s.status !== 0) === 1 && fixture.sessions.size === 0 && !connection.willReconnect, 'the new session let go');
     assert.deepEqual(events, kind === 'restart'
       ? ['close willReconnect=true']
       : ['reconnect-failed 1: MCP server "remote" ended its session (HTTP 404) before the session answered a request', 'close willReconnect=true']);

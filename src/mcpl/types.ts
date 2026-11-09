@@ -454,9 +454,9 @@ export interface McplServerConfig {
    * (for a modern server's 2025 session over HTTP, once that session's end
    * starts a new one at once). Over HTTP the same backoff paces a modern
    * server's streams: a dropped stream's first try waits the server's
-   * `retry` hint when it sent one, and this interval otherwise, and a try
-   * after a failed one waits the longer of the hint and the doubling
-   * backoff. Default: 5000 (5 seconds).
+   * `retry` hint when it sent one above 0, and the backoff's first step
+   * otherwise, and a try after a failed one waits the longer of the hint
+   * and the doubling backoff. Default: 5000 (5 seconds).
    */
   reconnectIntervalMs?: number;
 

@@ -1,8 +1,8 @@
 - **On `2026-07-28` over HTTP**, a dropped stream's retries take the same
   timing as on a 2025 revision: the first try waits the server's `retry`
-  hint, or the first step of the connection's backoff when it gave none,
-  and a try after a failed one waits the longer of the hint and the
-  connection's backoff. They stop after two failed tries, the SDK's
+  hint, or the first step of the connection's backoff when it gave none or
+  a hint of 0, and a try after a failed one waits the longer of the hint
+  and the connection's backoff. They stop after two failed tries, the SDK's
   default, on every stream: a listen stream that can't be resumed is
   reopened, with a relist, and a call whose stream can't be resumed fails
   then, as `no-response`, rather than at its deadline.
@@ -10,3 +10,5 @@
   `2026-07-28` is a `McplProtocolVersionError` (`rejected`) that isn't
   retried, even when the SDK can't read the answer as a discovery result.
   Such an answer the SDK couldn't read was an ordinary failed connect.
+- **Once the framework's `stop()` has begun**, a modern reconnect still
+  connecting is closed rather than adopted, and emits no `reconnect`.

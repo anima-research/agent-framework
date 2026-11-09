@@ -8,8 +8,9 @@
   in flight: a call whose request met the server's 404 didn't run, and fails
   as `error-response` with `data.httpStatus` 404; one whose stream was cut
   may have run, and is `no-response`. A session that ends before it
-  answered a request, or the second session in a row to end within
-  `reconnectIntervalMs` of starting, is a failed connect instead: it emits
+  answered a request, or an answered one that ends within
+  `reconnectIntervalMs` of starting when the last session restarted that
+  way hadn't lived that long, is a failed connect instead: it emits
   `reconnect-failed`, follows `reconnect`, and counts toward the framework's
   alert at the fifth attempt.
 - **`McplProtocolVersionError` over HTTP** names the revisions each side
