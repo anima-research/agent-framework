@@ -1968,3 +1968,18 @@ test("a [channels] notice names a channel whose id another server shares by its 
   assert.equal(notices.length, 2, notices.join('\n'));
   assert.ok(notices.every((n) => n.includes('#general (b:general)')), notices.join('\n'));
 });
+
+test("a fork's channel_publish with a channelId that isn't a string is refused as one, not posted at its home or refused as foreign", async (t) => {
+  const f = await frameworkWith(t, ['a', 'b']);
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
+  const results = toolResults(t, f.framework);
+  const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
+  for (const [id, written] of [['zero', '0'], ['false', 'false'], ['number', '1437820485836259419']] as const) {
+    const input = JSON.parse(`{"channelId":${written},"content":"zz-${id}"}`) as Record<string, unknown>;
+    dispatch('scout', { id, name: 'channel_publish', input });
+    await until(() => results.has(id), `the ${id} publish`);
+    assert.equal(results.get(id)?.success, false, `${id}: ${JSON.stringify(results.get(id))}`);
+    assert.match(results.get(id)?.error ?? '', /^Nothing changed: channel_publish's channelId must be a string\./);
+  }
+  assert.deepEqual(f.calls.filter((c) => c.includes('publish')), [], 'nothing was published');
+});

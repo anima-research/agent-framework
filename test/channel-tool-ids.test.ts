@@ -11,11 +11,13 @@ const origin = { kind: 'agent' as const, agentName: 'sol' };
 async function makeRegistry() {
   const opens: Array<{ history?: { beforeMessageId?: unknown } }> = [];
   const acks: Array<{ messageId?: unknown }> = [];
+  const publishes: unknown[] = [];
   const server = {
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsOpen: async (params: { history?: { beforeMessageId?: unknown } }) => { opens.push(params); return {}; },
     sendChannelsClose: async () => ({}),
     sendChannelsAcknowledge: async (params: { messageId?: unknown }) => { acks.push(params); return { acknowledged: true }; },
+    sendChannelsPublish: async (params: unknown) => { publishes.push(params); return { delivered: true, messageId: 'm1' }; },
   };
   const registry = new ChannelRegistry(
     { getServer: () => server } as unknown as McplServerRegistry,
@@ -29,7 +31,7 @@ async function makeRegistry() {
       { id: 'invited', type: 'discord', label: '#invited', direction: 'bidirectional' },
     ],
   } as never);
-  return { registry, opens, acks };
+  return { registry, opens, acks, publishes };
 }
 
 const call = (text: string): unknown => JSON.parse(text);
@@ -80,4 +82,13 @@ test('channel_open takes a null beforeMessageId as no anchor, as before', async 
   const history = opens[0]?.history;
   assert.ok(history, 'the backscroll asked for history');
   assert.equal('beforeMessageId' in history, false, 'no anchor was sent');
+});
+
+test('channel_publish refuses a channelId written as a number, and nothing is posted', async () => {
+  const { registry, publishes } = await makeRegistry();
+  const res = await registry.handleChannelToolCall('channel_publish', call(`{"channelId":${ID},"content":"zz-number"}`), origin);
+  assert.equal(res.success, false);
+  assert.equal((res as { isError?: unknown }).isError, true);
+  assert.match(String((res as { error?: unknown }).error), /^Nothing changed: channel_publish's channelId must be a string\. Give it in quotes, as channel_list does/);
+  assert.equal(publishes.length, 0, 'no channels/publish was sent');
 });
