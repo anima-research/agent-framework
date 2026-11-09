@@ -48,7 +48,6 @@ function coordinatorOn(registry: ChannelRegistry, window: Row[], anchors: number
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => window,
-    getDeferredMessages: () => [],
     emitTrace: () => {},
     currentSequence: sequence,
     setSubconsciousAnchor: ((start) => { anchors.push(start.sequence); }) satisfies TuneOutFrameworkHooks['setSubconsciousAnchor'],
