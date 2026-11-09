@@ -2537,11 +2537,11 @@ export interface HostModeStatus {
    * merged from several requests counts as those it took in. A start parked on
    * provider admission behind an auxiliary call counts once in
    * `parkedAdmissions` instead, however many wakes are merged into it. A turn
-   * a budget hold holds counts once, since the wakes merged into its start are
-   * the turn's, and each wake that joined it while it waited counts too.
-   * Continuations of a turn (budget restart, tool results) and a held turn's
-   * retry, which a quiesce lets through, are never counted, but for those a
-   * budget hold holds. */
+   * a budget hold holds counts once, continuation or not. The wakes merged
+   * into its start are part of it. Wakes that joined it while it waited count
+   * as other gated requests do. Other continuations (budget restart, tool
+   * results, the tool-result guard's retry) and a held turn's retry, which a
+   * quiesce lets through, are never counted. */
   gatedRequests: number;
   /** code_execution scripts still running that no call is waiting on: left
    * running after a yield, outside any turn. Quiesce does NOT stop them —
