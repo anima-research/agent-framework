@@ -137,7 +137,7 @@ const BLOCK = [
   tag('/invoke'), tag('/function_calls'),
 ].join('');
 const REASON = "the first invoke's parameter steps has no closing tag";
-const RESEND = "None of that block's calls ran; send them again, each parameter in its own complete element and each invoke ended by its closing tag.";
+const RESEND = "None of that block's calls ran; send them again in one well-formed block.";
 
 test("a call membrane marks with a reason doesn't run, and the model is told that reason in words that name no tag", async () => {
   const h = await harness();
