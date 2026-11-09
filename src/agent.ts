@@ -35,6 +35,7 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+import { appendAll } from './append-all.js';
 
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
@@ -112,6 +113,11 @@ export interface StartStreamResult {
    *  far in sent order, with this request's head (context-manager's `noteRequestSent`). Present only where the
    *  model binds its thinking and the context manager keeps a record it can be told of. */
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
+  /** Tells the context manager which stored bodies' thinking the provider dropped from a call of this stream, by the
+   *  ids `placeDrops` gives for a `reply` drop, with the compile the stream was built from (context-manager's
+   *  `noteThinkingDropped`), so, once the context manager takes the note, its record leaves them without their
+   *  thinking from the next compile on. Present only where `noteRequestSent` is. */
+  noteThinkingDropped?: (messageIds: readonly MessageId[]) => boolean;
   /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
    *  Absent when the compile reports no provenance. */
   carriedBodies?: ReadonlySet<MessageId>;
@@ -802,7 +808,7 @@ export class Agent {
       return await this.compileAtLiveBudgetNoting(compile, started);
     } finally {
       this.compilesRunning.delete(started);
-      const earliest = Math.min(...this.compilesRunning);
+      const earliest = [...this.compilesRunning].reduce((min, start) => Math.min(min, start), Infinity);
       for (const [budget, start] of this.latestEndedStart) {
         if (start < earliest) this.latestEndedStart.delete(budget);
       }
@@ -1925,7 +1931,7 @@ export class Agent {
       // inferring, sends the same ones.
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
-      messages.push(...unguardedResults);
+      appendAll(messages, unguardedResults);
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
@@ -2268,9 +2274,10 @@ export class Agent {
     return { ...own, blockBinding: { prefixMismatchBehavior: 'drop_block' } };
   }
 
-  /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given:
-   *  where the agent's model binds its thinking (context-manager's `noteRequestSent`). */
-  private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent'> {
+  /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given,
+   *  and which stored bodies' thinking the provider dropped: where the agent's model binds its thinking
+   *  (context-manager's `noteRequestSent` and `noteThinkingDropped`). */
+  private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent' | 'noteThinkingDropped'> {
     const identity = binding.identity;
     // Each note names the compile the stream was built from, so a note can't vouch for this stream under a record a
     // later committing compile with binds wrote. A compile that reports no provenance gives the stream nothing to name, and the
@@ -2278,7 +2285,10 @@ export class Agent {
     const compileId = compiled.provenance?.compileId;
     if (!identity || compileId === undefined) return {};
     const cm = this.contextManager;
-    return { noteRequestSent: (rows) => cm.noteRequestSent(rows, identity, compileId) };
+    return {
+      noteRequestSent: (rows) => cm.noteRequestSent(rows, identity, compileId),
+      noteThinkingDropped: (messageIds) => cm.noteThinkingDropped(messageIds, compileId),
+    };
   }
 
   /**

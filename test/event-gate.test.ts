@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { EventGate, wakeLineText } from '../src/gate/event-gate.js';
+import { EventGate, wakeLineText, wakeProvenance } from '../src/gate/event-gate.js';
 import type { GateConfig, GateEntryRef, GateEventInfo, WakeLine } from '../src/gate/types.js';
 
 // ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; line?: WakeLine }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; batchChannels?: Array<{ channelId: string; serverId?: string }>; line?: WakeLine }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -63,6 +63,16 @@ function event(overrides?: Partial<GateEventInfo>): GateEventInfo {
     channelId: '',
     ...overrides,
   };
+}
+
+function arriving(at: number, evaluate: () => void): void {
+  const realNow = Date.now;
+  Date.now = () => at;
+  try {
+    evaluate();
+  } finally {
+    Date.now = realNow;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +578,7 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].addressed, true);
   });
 
-  it('an addressed batch names its registered route channel; ambient-only batches name none', async (t) => {
+  it('an addressed batch names its registered route channel; an ambient batch names none, and names the channel it came from', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route.json', {
       policies: [
@@ -596,7 +606,8 @@ describe('debounce', () => {
     const text = JSON.stringify(messages.at(-1)?.content);
     assert.ok(text.includes('discord:dm:1548'), 'gate line shows the registered channel id');
 
-    // Ambient-only batch: telemetry provenance, no route.
+    // Ambient-only batch: telemetry provenance, no route, and the channel it
+    // came from, for the notice its reply gets.
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'x',
       metadata: { authorId: '8' } }));
     t.mock.timers.tick(150);
@@ -604,6 +615,8 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
     assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, 'ambient chatter never sets a route');
     assert.strictEqual(inferenceRequests[1].routeServerId, undefined, 'nor its server');
+    assert.deepStrictEqual(inferenceRequests[1].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }],
+      'it names the channel it came from');
   });
 
   it('the default resolver routes an addressed channel-incoming event; a push event needs the host resolver', async (t) => {
@@ -686,7 +699,148 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].channelId, 'surface:room:general', 'telemetry keeps the attributable event');
     assert.strictEqual(inferenceRequests[0].counterparty, 'surface:user:7');
-    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'ambient batches never route');
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'an ambient batch from two channels has no route');
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [
+      { channelId: 'surface:room:general', serverId: 'surface' },
+      { channelId: 'surface:room:feed', serverId: 'surface' },
+    ], 'and names both channels, for the notice its reply gets');
+  });
+
+  it('a batch with an addressed event names no channels, even when that event names none', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-addressed-nowhere.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : info.channelId || undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'surface', channelId: 'surface:room:general',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'for you', tags: ['chat:addressed'] }));
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, "the addressed message's reply isn't sent into the chatter's channel");
+    assert.strictEqual(inferenceRequests[0].batchChannels, undefined, "nor is it told the chatter's channel was where it came from");
+  });
+
+  it('an addressed chat:system notice takes no part in its batch\'s provenance, but for its author when nothing else names one', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-route-dm-notice.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: (info) => info.channelId || undefined });
+    const pin = () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:dm:5',
+      content: '[pinned a message]', tags: ['chat:dm', 'chat:addressed', 'chat:system'], metadata: { authorId: '5' } }));
+    arriving(100, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: '@agent hi', tags: ['chat:mention', 'chat:addressed'], metadata: { authorId: '1' } })));
+    arriving(200, pin);
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:g:room', "the mention's channel: a pin in a DM is still a notice");
+    assert.strictEqual(inferenceRequests[0].addressed, true, 'addressed by the mention');
+    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:room');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:1');
+    assert.strictEqual(inferenceRequests[0].at, 100, "the mention's arrival, not the newer pin's");
+
+    arriving(400, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'chatter', metadata: { authorId: '7' } })));
+    arriving(500, pin);
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 2);
+    assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, "an addressed notice takes no route, and makes no batch addressed");
+    assert.strictEqual(inferenceRequests[1].addressed, undefined);
+    assert.deepStrictEqual(inferenceRequests[1].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }]);
+    assert.strictEqual(inferenceRequests[1].at, 400, "the chatter's arrival, not the newer pin's");
+    assert.strictEqual(inferenceRequests[1].counterparty, 'discord:user:7', "the chatter's author, not the pin's");
+    assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
+
+    arriving(1_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'pat joined', tags: ['chat:system'], metadata: { authorId: '6' } })));
+    arriving(2_000, pin);
+    arriving(3_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'the weather turned', tags: ['chat:system'] })));
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 3);
+    const alone = inferenceRequests[2];
+    assert.deepStrictEqual(
+      [alone.channelId, alone.routeChannelId, alone.addressed, alone.batchChannels, alone.counterparty, alone.at],
+      [undefined, undefined, undefined, undefined, 'discord:user:5', 2_000],
+      "notices alone give the newest author among them, and that notice's arrival time, and nothing else",
+    );
+  });
+
+  it("a push the host can't place is passed over when a batch names its channels", async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-route-unplaced.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      info.eventType === 'mcpl:channel-incoming' ? info.channelId || undefined : undefined;
+    const { gate, messages, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'status',
+      metadata: { channelId: '1548' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    t.mock.timers.tick(150);
+    assert.strictEqual(messages.length, 1);
+    assert.ok((messages[0].content as Array<{ text: string }>)[0].text.includes('2 event'), 'premise: the push is in the batch');
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }]);
+  });
+
+  it("a batch of notices alone gives its newest authored notice's author and time", () => {
+    const notice = (timestamp: number, authorId?: string) => ({ policyName: 'chat', content: 'x', eventType: 'mcpl:channel-incoming',
+      timestamp, addressed: false, systemNotice: true, serverId: 'discord', channelId: 'discord:g:room', routeChannelId: 'discord:g:room',
+      ...(authorId ? { authorId } : {}) });
+    const provenance = wakeProvenance([notice(10, '5'), notice(20)] as Parameters<typeof wakeProvenance>[0]);
+    assert.deepStrictEqual(provenance, { counterparty: 'discord:user:5', at: 10 });
+  });
+
+  it("a batch lists a channel once with its server and once without, since only the host can tell they're one", async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-server-and-none.json', {
+      policies: [{ name: 'push', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } }],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: () => 'discord:g:room' });
+    for (const serverId of ['discord', '', 'discord', '']) {
+      gate.evaluate(event({ eventType: 'mcpl:push-event', serverId, content: 'status' }));
+    }
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }, { channelId: 'discord:g:room' }]);
+  });
+
+  it('an ambient batch of pushes that name only their registered channel names that channel', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-route-only-pushes.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    for (const content of ['status ping', 'status pong']) {
+      gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content, metadata: { mcplChannelId: 'surface:room:feed' } }));
+    }
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'surface:room:feed', serverId: 'surface' }]);
+    assert.strictEqual(inferenceRequests[0].counterparty, undefined, 'no author to name');
+    assert.strictEqual(inferenceRequests[0].at, undefined, 'no chosen event, so no time');
   });
 
   it('a throwing route resolver never breaks gating', async (t) => {

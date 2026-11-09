@@ -5,8 +5,10 @@
  * presentation index calls. Main published context-manager 0.23.0, then 0.24.0
  * (Dendrite's derive), without them, so the presentation release is 0.25.0, and
  * a range that admitted any 0.24.x would install a context-manager this
- * framework fails to load on. So each caret range of its union starts at
- * 0.25.0 or later, and the range admits 0.25.0 itself, the release the
+ * framework fails to load on. Its floor is 0.25.1, the release with
+ * `noteThinkingDropped`, which the framework calls when the provider sets aside
+ * a stored reply's thinking. So each caret range of its union starts at
+ * 0.25.1 or later, and the range admits 0.25.1 itself, the release the
  * changelog names.
  * chronicle's range takes only a release with the identity-stamped batched
  * append context-manager writes a window with: the published 0.5.0 (Dendrite's
@@ -14,12 +16,15 @@
  * 0.6.0, and context-manager, with no one-record-per-row path, throws at the
  * first write-down on a store from 0.5.0. So each caret range of its union
  * starts at 0.6.0 or later, and the range admits 0.6.0 itself.
- * Each @animalabs package context-manager depends on too is declared within
- * context-manager's own range, so an install takes one copy of each: two
- * membrane copies make the host's `Membrane` a type context-manager's
- * refuses, and hand context-manager's formatter to a membrane its tests
- * don't cover; two chronicle copies give context-manager a store handle from
- * a chronicle it doesn't load.
+ * Each @animalabs package context-manager depends on too is declared with
+ * the releases context-manager's own range admits, no more and no fewer, so
+ * an install takes one copy of each. A narrower range gives a second copy
+ * when a host takes a release this one refuses. A wider one gives a second
+ * copy when this one takes a release context-manager refuses. Two membrane
+ * copies make the host's `Membrane` a type context-manager's refuses, and
+ * hand context-manager's formatter to a membrane its tests don't cover; two
+ * chronicle copies give context-manager a store handle from a chronicle it
+ * doesn't load.
  *
  * The floors are read from the declared range alone. Whether a range admits
  * the installed version is asked only of a package installed from the
@@ -89,6 +94,9 @@ function caretAdmits(range: string, version: string): boolean {
 const within = (inner: string, outer: string): boolean =>
   alternatives(inner).every((caret) => admits(outer, floorOf(caret).join('.')));
 
+/** Whether `a` and `b` admit the same releases. */
+const sameReleases = (a: string, b: string): boolean => within(a, b) && within(b, a);
+
 describe("agent-framework's dependency ranges (#291's release set)", () => {
   it('the caret reading', () => {
     assert.equal(admits('^0.25.0', '0.25.3'), true);
@@ -104,6 +112,10 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.equal(admits('^0.8.0 || ^0.9.0', '0.10.0'), false);
     assert.equal(within('^0.8.0', '^0.8.0 || ^0.9.0'), true);
     assert.equal(within('^0.8.0 || ^0.9.0', '^0.8.0'), false);
+    assert.equal(sameReleases('^0.8.0 || ^0.9.0', '^0.9.0 || ^0.8.0'), true);
+    assert.equal(sameReleases('^0.8.0', '^0.8.0 || ^0.9.0'), false);
+    assert.equal(sameReleases('^0.8.0 || ^0.9.0 || ^0.10.0', '^0.8.0 || ^0.9.0'), false);
+    assert.equal(sameReleases('^0.8.2', '^0.8.0'), false);
     // A floor at or past the first release with the APIs, which is admitted.
     assert.doesNotThrow(() => startsAt('^0.25.0', '0.25.0', 'x'));
     assert.doesNotThrow(() => startsAt('^0.25.0 || ^0.26.0', '0.25.0', 'x'));
@@ -112,16 +124,17 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.throws(() => startsAt('^0.26.0', '0.25.0', 'x'), /admits x 0\.25\.0/);
   });
 
-  it("takes context-manager only at a release with the window APIs: not main's 0.23.0 or 0.24.0, which have none", (t) => {
+  it("takes context-manager only at a release with the window APIs and noteThinkingDropped: not main's 0.23.0 or 0.24.0, which have no window APIs, or 0.25.0, which can't be told of a set-aside reply", (t) => {
     const range = ours.dependencies?.['@animalabs/context-manager'];
     assert.ok(range, 'agent-framework depends on context-manager');
     for (const published of ['0.23.0', '0.24.0']) {
       assert.equal(admits(range, published), false,
         `${range} admits context-manager ${published}, published without windowStatusOf, presentRows, retractRows or getPresentedMessages`);
     }
-    startsAt(range, '0.25.0', 'context-manager');
+    assert.equal(admits(range, '0.25.0'), false, `${range} admits context-manager 0.25.0, published without noteThinkingDropped`);
+    startsAt(range, '0.25.1', 'context-manager');
     const proto = ContextManager.prototype as unknown as Record<string, unknown>;
-    for (const method of ['windowStatusOf', 'presentRows', 'retractRows', 'getPresentedMessages']) {
+    for (const method of ['windowStatusOf', 'presentRows', 'retractRows', 'getPresentedMessages', 'noteThinkingDropped']) {
       assert.equal(typeof proto[method], 'function', `the context-manager this suite runs on has ${method}`);
     }
     const version = installed('@animalabs/context-manager').version;
@@ -161,14 +174,14 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     }
   });
 
-  it("declares each @animalabs package context-manager depends on within context-manager's range, so an install takes one copy of each", () => {
+  it("declares each @animalabs package context-manager depends on with the releases context-manager's range admits, no more and no fewer, so an install takes one copy of each", () => {
     const contextManager = installed('@animalabs/context-manager');
     const shared = Object.entries(contextManager.dependencies ?? {})
       .filter(([name]) => name.startsWith('@animalabs/') && ours.dependencies?.[name] !== undefined);
     assert.ok(shared.some(([name]) => name === '@animalabs/membrane'), 'both depend on membrane');
     assert.ok(shared.some(([name]) => name === '@animalabs/chronicle'), 'both depend on chronicle');
     const apart = shared
-      .filter(([name, theirs]) => !within(ours.dependencies![name]!, theirs))
+      .filter(([name, theirs]) => !sameReleases(ours.dependencies![name]!, theirs))
       .map(([name, theirs]) => `${name}: agent-framework ${ours.dependencies![name]}, context-manager ${contextManager.version} ${theirs}`);
     assert.deepEqual(apart, []);
     if (linked('@animalabs/membrane')) return;
