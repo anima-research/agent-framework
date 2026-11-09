@@ -173,7 +173,7 @@ describe('private turns: when a turn is private (part 1)', () => {
     } finally { await f.close(); }
   });
 
-  it("a provider hold keeps a private turn's wake beside an unmarked wake equal to it in every other field, in either order", async () => {
+  it("a provider hold keeps a private turn's wake and an unmarked wake equal to it in every other field once, with the mark, in either order", async () => {
     const { f } = await make({ wakes: false });
     try {
       const fw = f.framework as unknown as { holdRequest(held: Array<Record<string, unknown>>, request: Record<string, unknown>): void };
@@ -183,8 +183,8 @@ describe('private turns: when a turn is private (part 1)', () => {
       for (const order of [[unmarked, marked], [marked, unmarked]]) {
         const held: Array<Record<string, unknown>> = [];
         for (const request of order) fw.holdRequest(held, { ...request });
-        assert.equal(held.filter((r) => r.privateCaller === true).length, 1, `the private turn's wake is kept: ${JSON.stringify(held)}`);
-        assert.equal(held.length, 2, `and so is the unmarked wake: ${JSON.stringify(held)}`);
+        assert.equal(held.length, 1, `the hold keeps the two once: ${JSON.stringify(held)}`);
+        assert.equal(held[0]!.privateCaller, true, `with the private turn's mark: ${JSON.stringify(held)}`);
       }
       const held: Array<Record<string, unknown>> = [];
       fw.holdRequest(held, { ...unmarked });
@@ -327,6 +327,48 @@ describe('private turns: when a turn is private (part 1)', () => {
       assert.equal(live[1]?.private, true, "the retry's turn is private, as the tick was");
       assert.ok(storedText(f, 'This turn has no channel of its own').length > 0, "so channel_publish naming no channel was refused");
       assert.deepEqual(sent(f, 'zz-tick post'), [], 'and posted nowhere');
+    } finally { await f.close(); }
+  });
+
+  it("an unmarked wake equal to a private turn's held retry is kept once with the mark, so under a quiesce one turn runs for them, private", async () => {
+    let holds = 0;
+    const { f } = await make({ rule: 'delivery', framework: {
+      providerHold: (error: Error) => (error.message === 'provider unavailable' && holds++ === 0 ? { holdMs: 60_000, reason: 'test hold' } : undefined),
+    } });
+    const cooldowns = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, { until: number; heldRequests: Array<Record<string, unknown>> }> }).providerAccelerationCooldowns;
+    try {
+      script(f, [say('zz-retried')]);
+      const scripted = f.membrane.streamYielding.bind(f.membrane);
+      let failed = false;
+      f.membrane.streamYielding = (request, options) => {
+        if (failed) return scripted(request, options);
+        failed = true;
+        return new (class extends MockYieldingStream {
+          override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> { throw new Error('provider unavailable'); }
+        })([], true);
+      };
+      const live: Array<Routing | undefined> = [];
+      const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') live.push(hidden(f).turnRouting.get('agent')); });
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      const held = cooldowns.get('agent')?.heldRequests ?? [];
+      assert.equal(held.length, 1, "premise: the operator's turn failed into a provider hold that keeps its retry");
+      const retry = held.splice(0, 1)[0]!;
+      assert.equal(retry.privateCaller, true, "premise: the retry carries the turn's mark");
+      held.push(Object.fromEntries(Object.entries(retry).filter(([key]) => key !== 'privateCaller')));
+      (f.framework as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
+      assert.equal(held.length, 1, 'the hold keeps the retry and its unmarked equal once');
+      assert.equal(held[0]!.privateCaller, true, 'with the mark');
+      const quiesce = f.framework.quiesce({ timeoutMs: 5_000 });
+      cooldowns.get('agent')!.until = Date.now();
+      (f.framework as unknown as { releaseProviderAccelerationCooldown(agent: string): void }).releaseProviderAccelerationCooldown('agent');
+      await quiesce;
+      await f.framework.resume();
+      await f.framework.runUntilIdle();
+      off();
+      assert.ok(has(f, 'zz-retried'), 'premise: the retry spoke');
+      assert.equal(live.length, 2, 'after the failed start, one turn ran for them, under the quiesce and after it');
+      assert.equal(live[1]?.private, true, "and it's private");
     } finally { await f.close(); }
   });
 

@@ -1093,7 +1093,7 @@ async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membra
     const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
     const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
     const leader = (start[batchKey] as Array<Record<string | symbol, unknown>>).find((member) => (member[retryKey] === true) === (leads === 'retry'));
-    assert.ok(leader && identityKeys.filter((key) => key !== 'privateCaller').every((key) => JSON.stringify(leader[key]) === JSON.stringify(start[key])), `premise: the merged start is led by its ${leads}`);
+    assert.ok(leader && identityKeys.every((key) => JSON.stringify(leader[key]) === JSON.stringify(start[key])), `premise: the merged start is led by its ${leads}`);
   }
   return () => {
     if (how === 'parked') {
@@ -1126,7 +1126,7 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
 });
 
 const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-  'coalescingBatchSubjects', 'readsRow', 'privateCaller', 'wakeLines'];
+  'coalescingBatchSubjects', 'readsRow', 'wakeLines'];
 
 function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<string | symbol, unknown>): symbol {
   const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
