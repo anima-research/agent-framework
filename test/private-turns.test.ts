@@ -1540,13 +1540,14 @@ describe('private turns: what the resident is told', () => {
       agent.getContextManager().addMessage('user', [{ type: 'text', text: 'zz-meanwhile, in the room' }], { channelId: 'work' } as never);
       (f.framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(agent);
       const before = told();
+      const flipsBefore = storedText(f, 'This turn now holds a message from').length;
       const internalsOf = f.framework as unknown as { lastAnnouncedLocus: Map<string, unknown> };
       assert.ok(internalsOf.lastAnnouncedLocus.has('agent') && internalsOf.lastAnnouncedLocus.get('agent') === null, 'premise: the last locus announced is none');
       wake(f, { privateCaller: true });
       await f.framework.runUntilIdle();
       await eventually(() => has(f, 'zz-marked words'), "premise: the marked wake's turn spoke");
       assert.deepEqual(sent(f, 'zz-marked words'), [], "premise: the marked turn's speech went to no channel");
-      assert.deepEqual(storedText(f, 'This turn now holds a message from'), [], "premise: the window read found no operator's message keeping it private");
+      assert.equal(storedText(f, 'This turn now holds a message from').length, flipsBefore, "premise: the window read found no operator's message keeping it private");
       assert.equal(told() - before, 1, 'the marked turn was told its plain speech has no channel');
     } finally { await f.close(); }
   });
@@ -1571,6 +1572,29 @@ describe('private turns: what the resident is told', () => {
       } finally { await f.close(); }
     });
   }
+
+  it("a room turn that opens private and loses the channel the agent was last told of is told why, by the flip's notice", async () => {
+    const { f } = await make({ rule: 'delivery', wakes: false });
+    try {
+      const flips = () => storedText(f, 'This turn now holds a message from').length;
+      const generic = () => storedText(f, 'Your plain speech currently has no channel').length;
+      script(f, [say('zz-public answer')], [say('zz-private room answer')]);
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => sent(f, 'zz-public answer').length > 0, 'premise: the public turn spoke in work');
+      const announced = (f.framework as unknown as { lastAnnouncedLocus: Map<string, { channelId?: string } | null> }).lastAnnouncedLocus;
+      assert.equal(announced.get('agent')?.channelId, 'work', 'premise: the agent was last told its speech lands in work');
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      assert.equal(storedText(f, SECRET).length, 1, "premise: the operator's message is stored");
+      await incoming(f, 'work', 'w2', 'agent, one more', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => has(f, 'zz-private room answer'), 'premise: the room turn spoke');
+      assert.deepEqual(sent(f, 'zz-private room answer'), [], 'premise: the room turn was private');
+      assert.equal(flips(), 1, "the room turn's open told it why, by the flip's notice");
+      assert.equal(generic(), 0, 'and not by the no-channel notice');
+    } finally { await f.close(); }
+  });
 
   it("a public turn's receipt names no kept speech", async () => {
     const { f } = await make({ rule: 'delivery' });
