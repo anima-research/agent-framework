@@ -575,6 +575,9 @@ const call = (id: string, name: string, input: Record<string, unknown>) =>
 const drafts = (id: string, input: Record<string, unknown>) =>
   call(id, 'drafts', { action: null, draftIds: null, destination: null, confirmDuplicate: null, offset: null, ...input });
 const explicitSend = (id: string) => call(id, 'channel_publish', { channelId: ROOM, content: 'an explicit note' });
+const refusedBlock = (id: string, name: string) =>
+  ({ type: 'tool_use', id, name, input: {}, unparseableInput: 'the block as written', unparseableReason: 'an invoke has no closing tag' }) as ContentBlock;
+const result = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
 const unplacedSend = (id: string) => call(id, 'discord--send_message', { channelId: GENERAL, text: 'an explicit note' });
 
 describe('held prose drafts, end to end', () => {
@@ -3063,23 +3066,17 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
-  it('XML tool mode: runs around a refused attempt are held with their edge whitespace and resent exactly', async () => {
+  it('XML tool mode: runs around a refused block are held with their edge whitespace and resent exactly', async () => {
     const h = await harness({ xml: true });
     try {
       const before = '    before\n';
       const after = '\n after  ';
       const round = [text(before), explicitSend('s1')];
+      const refused = refusedBlock('m1', 'missing');
       await h.turn([
         createMockResponse(round, 'tool_use'),
-        {
-          ...createMockResponse([
-            ...round,
-            { type: 'tool_attempt', rawXml: '<invoke name="missing">' } as unknown as ContentBlock,
-            { type: 'tool_notice', notices: [] } as unknown as ContentBlock,
-            text(after),
-          ]),
-          toolCalls: [],
-        },
+        createMockResponse([refused], 'tool_use'),
+        { ...createMockResponse([...round, result('s1'), refused, result('m1'), text(after)]), toolCalls: [] },
       ]);
       const held = h.drafts().reverse();
       assert.deepEqual(held.map((d) => d.text), [before, after]);
@@ -3109,21 +3106,85 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
   });
 
   for (const mode of ['locus', 'hybrid'] as const) {
-    it(`${mode}: prose around an all-refused XML attempt posts as two messages`, async () => {
-      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+    it(`${mode}, XML tool mode: prose around an all-refused block posts as two messages`, async () => {
+      const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: mode }] });
       try {
-        await h.turn([createMockResponse([
-          text('Before the attempt.'),
-          { type: 'tool_attempt', rawXml: '<invoke name="send_message"><parameter name="x">' } as unknown as ContentBlock,
-          { type: 'tool_notice', notices: [{ ordinal: 0, kind: 'refused', message: 'boundary' }] } as unknown as ContentBlock,
-          text('After its notice.'),
-        ])]);
-        assert.deepEqual(h.publishes().map((p) => p.text), ['Before the attempt.', 'After its notice.']);
+        const refused = refusedBlock('m1', 'send_message');
+        await h.turn([
+          createMockResponse([text('Before the block.'), refused], 'tool_use'),
+          { ...createMockResponse([text('Before the block.'), refused, result('m1'), text('After its result.')]), toolCalls: [] },
+        ]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['Before the block.', 'After its result.']);
       } finally {
         await h.close();
       }
     });
   }
+
+  it('locus, XML tool mode: a refused block is a round of its own, so a later round kept private is the one whose prose stays out', async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'locus' }] });
+    try {
+      const refused = refusedBlock('b1', 'channel_list');
+      const wake = call('w1', 'skip_reply', { reason: 'later', wake_in_seconds: 60 });
+      await h.turn([
+        createMockResponse([text('Before the block.'), refused], 'tool_use'),
+        createMockResponse([text('Private, beside the refused wake.'), wake], 'tool_use'),
+        {
+          ...createMockResponse([
+            text('Before the block.'), refused, result('b1'),
+            text('Private, beside the refused wake.'), wake, result('w1'),
+            text('After the wake.'),
+          ]),
+          toolCalls: [],
+        },
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['Before the block.', 'After the wake.']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: each call of a refused block keeps its marker and reason in the stored history, across a restart", async () => {
+    const h = await harness({ xml: true });
+    try {
+      const listed = refusedBlock('b1', 'channel_list');
+      const posted = refusedBlock('b2', 'channel_publish');
+      await h.turn([
+        createMockResponse([listed, posted], 'tool_use'),
+        { ...createMockResponse([listed, posted, result('b1'), result('b2')]), toolCalls: [] },
+      ]);
+      await h.restart();
+      const stored = h.messages().flatMap((m) => m.content).filter((b) => b.type === 'tool_use')
+        .map((b) => b as { id: string; unparseableInput?: string; unparseableReason?: string });
+      assert.deepEqual(stored.map((b) => [b.id, b.unparseableInput, b.unparseableReason]), [
+        ['b1', 'the block as written', 'an invoke has no closing tag'],
+        ['b2', 'the block as written', 'an invoke has no closing tag'],
+      ]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('locus, XML tool mode: a refused block whose skip_reply is not its first call keeps its round private and silences nothing after it', async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'locus' }] });
+    try {
+      const listed = refusedBlock('b1', 'channel_list');
+      const skipped = refusedBlock('b2', 'skip_reply');
+      await h.turn([
+        createMockResponse([text('Private, beside the refused block.'), listed, skipped], 'tool_use'),
+        {
+          ...createMockResponse([
+            text('Private, beside the refused block.'), listed, skipped, result('b1'), result('b2'),
+            text('After the block.'),
+          ]),
+          toolCalls: [],
+        },
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['After the block.']);
+    } finally {
+      await h.close();
+    }
+  });
 });
 
 describe('an explicit send holds plain speech only where it may have posted', () => {

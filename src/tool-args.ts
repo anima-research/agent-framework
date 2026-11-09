@@ -72,9 +72,22 @@ function notAnObject(input: unknown, field = 'input'): string {
   return `its ${field} must be an object, and this call gave ${withArticle(kindOf(input))}`;
 }
 
-export function markedInputRefusal(call: { name: string; unparseableInput?: string }): string | undefined {
+/** The reason membrane gave for refusing a marked call's XML block, when it gave a non-empty one. */
+export function blockReason(call: { unparseableInput?: string; unparseableReason?: unknown }): string | undefined {
+  const reason = call.unparseableReason;
+  return call.unparseableInput !== undefined && typeof reason === 'string' && reason !== '' ? reason : undefined;
+}
+
+export function markedInputRefusal(call: { name: string; unparseableInput?: string; unparseableReason?: unknown }): string | undefined {
   const text = call.unparseableInput;
   if (text === undefined) return undefined;
+  const reason = blockReason(call);
+  if (reason !== undefined) {
+    const resend = "None of that block's calls ran; send them again in one well-formed block.";
+    return call.name === ''
+      ? `Nothing was done: a function_calls block that isn't well-formed didn't run: ${reason}. ${resend}`
+      : `Nothing was done: ${nameToTypeBack(call.name)} didn't run, because the function_calls block it was in isn't well-formed: ${reason}. ${resend}`;
+  }
   // When a stream ends before a call's block stops, membrane marks the call
   // with what had arrived of its arguments: nothing, a part, or a whole
   // object. A block still open when a stream breaks the API's block order

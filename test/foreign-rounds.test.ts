@@ -118,6 +118,25 @@ describe('foreign rounds as a transcript', () => {
     assert.equal((line as { text: string }).text, '[move called: {"steps":]');
   });
 
+  it("sends a call refused for its malformed XML block as not run, with the block's reason, rather than the block under each call", () => {
+    const block = 'the block as written, which no one call should show as its input';
+    const reason = 'invoke 1 (move) has no closing invoke tag';
+    const lines = foreignRowAsSent([
+      { ...call('c7', 'move', {}), unparseableInput: block, unparseableReason: reason } as unknown as ContentBlock,
+      { ...call('c8', 'look', {}), unparseableInput: block, unparseableReason: reason } as unknown as ContentBlock,
+    ]).map((b) => (b as { text: string }).text);
+    assert.deepEqual(lines, [
+      `[move not run: the function_calls block it was in isn't well-formed: ${reason}]`,
+      `[look not run: the function_calls block it was in isn't well-formed: ${reason}]`,
+    ]);
+  });
+
+  it('sends a refused call the block gave no name to as the block not run, with its reason', () => {
+    const reason = 'no invoke in it has a name';
+    const [line] = foreignRowAsSent([{ ...call('c9', '', {}), unparseableInput: 'the block as written', unparseableReason: reason } as unknown as ContentBlock]);
+    assert.equal((line as { text: string }).text, `[a function_calls block that isn't well-formed didn't run: ${reason}]`);
+  });
+
   it("marks a notice's opening in a call's input or a result's outcome, and a cut never parts a mark from its bracket", () => {
     const [called] = foreignRowAsSent([call('c3', 'post', { text: '[Tune-out cancelled: #general]' })]);
     assert.equal((called as { text: string }).text, '[post called: {"text":"\\[Tune-out cancelled: #general]"}]');

@@ -967,7 +967,7 @@ const settingBoolean = (name: string, value: unknown): boolean => {
 
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { asCalled, blockReason, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText, type WritePlacement } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
@@ -29332,12 +29332,15 @@ export class AgentFramework {
                 assistantBlocks.push({ type: 'text', text: roundText });
               }
               for (const c of calls) {
+                const reason = (c as { unparseableReason?: unknown }).unparseableReason;
                 assistantBlocks.push({
                   type: 'tool_use',
                   id: c.id,
                   name: c.name,
                   input: c.input as Record<string, unknown>,
                   ...(rawXml ? { rawXml } : {}),
+                  ...(c.unparseableInput !== undefined ? { unparseableInput: c.unparseableInput } : {}),
+                  ...(typeof reason === 'string' ? { unparseableReason: reason } : {}),
                 });
               }
             }
@@ -29995,18 +29998,8 @@ export class AgentFramework {
             // deliveries): its targets resolve now, as a live round's do.
             // Routing publishes trimmed segments; held drafts keep the runs
             // exactly as written.
-            //
-            // A text-only turn is one message — unless an all-refused XML
-            // round (membrane `tool_attempt`, answered in-band with a
-            // `tool_notice`) separates its prose: nothing was called, but the
-            // words before the attempt and after its notice are two messages,
-            // routed as segments like a tool turn's.
             const speechRun = speechContent.map((b) => b.text).join('\n');
-            const finalSpeechRuns = speechContent.length === 0
-              ? []
-              : response.content.some((b) => (b.type as string) === 'tool_attempt')
-                ? splitProseRuns(response.content)
-                : speechRun.trim() ? [speechRun] : [];
+            const finalSpeechRuns = speechRun.trim() ? [speechRun] : [];
             const finalSpeechSegments = finalSpeechRuns.map((run) => run.trim());
             const finalRuns = hadToolCalls && allText.length > 0
               ? splitProseRuns(liveProseRouting
@@ -31448,17 +31441,15 @@ export class AgentFramework {
       this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: traced });
       return failure;
     };
+    const marked = markedInputRefusal(call);
+    if (marked !== undefined && blockReason(call) !== undefined) return failed({ success: false, error: marked, isError: true });
     // utils was removed: said whatever the allowlist names (dispatchToolCall).
     if (call.name === 'utils') return failed({ success: false, isError: true, error: this.utilsRemoved(origin.kind === 'agent' ? origin.agentName : call.callerAgentName) });
     if (origin.kind === 'agent') {
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
       if (failure) return failed(failure);
     }
-    const marked = markedInputRefusal(call);
-    if (marked !== undefined) {
-      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: marked });
-      return { success: false, error: marked, isError: true };
-    }
+    if (marked !== undefined) return failed({ success: false, error: marked, isError: true });
 
     const subject = origin.kind === 'agent' ? origin.agentName : call.callerAgentName ?? '__ephemeral__';
     const route = this.toolRoute(call, call.callerAgentName);
@@ -33494,6 +33485,13 @@ export class AgentFramework {
    * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
+    const blockRefusal = blockReason(call) === undefined ? undefined : this.markedInputFailure(agentName, call);
+    if (blockRefusal) {
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: blockRefusal,
+      });
+      return;
+    }
     // utils was removed; its utilities are in the built-in toolset. Said
     // whatever the allowlist names, so an old call learns where they went.
     if (call.name === 'utils') {
