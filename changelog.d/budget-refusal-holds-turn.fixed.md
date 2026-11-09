@@ -61,8 +61,9 @@
     the reply.
   - **A surgery or an undo:** a waiting turn whose trigger's row a rollback,
     suppression or branch switch removed, or an undo took out of the
-    agent's window, is dropped, as is a released one whose row did so
-    before its start began, and so is a turn under way whose opening
+    agent's window, is dropped, as is a released one whose row left the
+    agent's window before its start began, whatever took it out, and so is
+    a turn under way whose opening
     message, where its trigger read one, or own rows one removed, each
     ending with `inference:aborted`. The wakes that joined a dropped turn go
     back to the queue. An undo of the agent ends a waiting turn under way
