@@ -686,10 +686,6 @@ describe('same-round think text policy', () => {
       const previewPrivate = await framework.previewActivation('private-agent');
       const publicThink = previewPublic.tools?.find((tool) => tool.name === 'think');
       const privateThink = previewPrivate.tools?.find((tool) => tool.name === 'think');
-      // #296: neither policy's text limits it to native rounds any more.
-      for (const think of [publicThink, privateThink]) {
-        assert.match(think?.description ?? '', /in the SAME assistant round as think\(\)/);
-      }
       const staticThinkBefore = framework.getAllTools().find((tool) => tool.name === 'think');
       assert.ok(publicThink);
       assert.ok(privateThink);

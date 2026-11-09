@@ -9134,8 +9134,8 @@ export class AgentFramework {
         'Reason privately. The think({content}) argument stays in your own context and is NOT sent ' +
         'to channels or other surfaces. ' +
         (policy === 'private'
-          ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
-          : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
+          ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
+          : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
         ) +
         ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy.' +
         (canSkipReply ? ' To deliberately not reply this turn, call skip_reply instead.' : ''),
@@ -14282,7 +14282,7 @@ export class AgentFramework {
           type: 'string',
           enum: ['public', 'private'],
           description:
-            'Routing policy for ordinary text emitted in the same assistant round as think(). ' +
+            'Routing policy for ordinary text emitted in the same native assistant round as think(). ' +
             "Omitted in the recipe preserves the compatibility carry-forward: public.",
         },
         settings: {
