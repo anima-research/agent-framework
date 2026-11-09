@@ -424,6 +424,43 @@ test('ephemeral run settles only after recovery and counts each tool once', asyn
   } finally { await h.framework.stop(); }
 });
 
+for (const routing of ["holds a later batch's channels in its routing", 'has no channel'] as const) test(`a guard retry of a turn with no locus that ${routing} carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its start's"}`, async (t) => {
+  const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
+  try {
+    const internal = h.framework as unknown as {
+      pendingRequests: unknown[];
+      turnRouting: Map<string, { wakeChannels?: unknown; noChannel?: true }>;
+      startAgentStream(...args: unknown[]): Promise<void>;
+    };
+    const first = { serverId: 'discord', channelId: 'discord:g:first' };
+    const later = { serverId: 'discord', channelId: 'discord:g:later' };
+    const triggers: Array<Record<string, unknown> | undefined> = [];
+    let written = false;
+    const original = internal.startAgentStream.bind(internal);
+    t.mock.method(internal, 'startAgentStream', (agent: unknown, trigger: Record<string, unknown> | undefined, ...rest: unknown[]) => {
+      triggers.push(trigger);
+      return original(agent, trigger, ...rest);
+    });
+    const handle = h.module.handleToolCall.bind(h.module);
+    t.mock.method(h.module, 'handleToolCall', (call: ToolCall) => {
+      const turn = internal.turnRouting.get('assistant');
+      if (turn && !written) {
+        if (routing === 'has no channel') turn.noChannel = true;
+        else turn.wakeChannels = [first, later];
+        written = true;
+      }
+      return handle(call);
+    });
+    h.framework.getAgent('assistant')!.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    internal.pendingRequests.push({ agentName: 'assistant', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [later] });
+    await h.framework.runUntilIdle();
+    assert.ok(written, "premise: the turn's routing was there at its tool call");
+    const retry = triggers.find((r) => r?.reason === 'tool_result_guard_retry');
+    assert.ok(retry, `premise: the guard retried: ${triggers.map((r) => r?.reason).join(', ')}`);
+    assert.deepEqual(retry.wakeChannels, routing === 'has no channel' ? undefined : [first, later]);
+  } finally { await h.framework.stop(); }
+});
+
 test('quiesced scheduler admits a queued guard recovery as a continuation', async () => {
   const h = await harness([[answer()]], { toolResultGuard: true });
   try {
