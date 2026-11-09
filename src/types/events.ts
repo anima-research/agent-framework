@@ -276,15 +276,16 @@ export interface ToolCall {
   /**
    * membrane's marker (ToolUseContent.unparseableInput), present when `input`
    * isn't the model's arguments. The framework refuses such a call without
-   * running it, except one whose text is JSON `null` and that has no
-   * `unparseableReason`, which runs as a call with no arguments.
+   * running it, before the agent's tool permissions are checked, except one
+   * whose text is JSON `null` and whose `unparseableReason` is absent or
+   * empty, which runs as a call with no arguments.
    */
   unparseableInput?: string;
   /**
-   * Why `input` isn't the model's arguments, when membrane says: a clause
-   * with no closing period, such as why the XML block the call was in isn't
-   * well-formed. Present only beside `unparseableInput`. The framework's
-   * refusal says it.
+   * Why the XML `function_calls` block the call came in isn't well-formed,
+   * when membrane refuses one: a clause with no closing period. Present only
+   * beside `unparseableInput`. The framework's refusal says it; an empty one
+   * counts as none.
    */
   unparseableReason?: string;
   /** The agent that made this tool call. Set by the framework dispatch layer. */

@@ -391,8 +391,8 @@ export class ModuleRegistry {
    * requires, is answered before the module runs, with an error result that
    * opens "Nothing was done:" and names what to send (toolArgsProblems).
    * So is a call membrane marked `unparseableInput`, unless its text is JSON
-   * `null` and it has no `unparseableReason`, which reaches the module as a
-   * call with no arguments (markedInputRefusal).
+   * `null` and its `unparseableReason` is absent or empty, which reaches the
+   * module as a call with no arguments (markedInputRefusal).
    * A caller that has already resolved the tool's definition passes it as
    * `definition`, and it's checked against that one.
    */

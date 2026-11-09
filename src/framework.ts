@@ -30830,16 +30830,13 @@ export class AgentFramework {
       this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: traced });
       return failure;
     };
+    const marked = markedInputRefusal(call);
+    if (marked !== undefined) return failed({ success: false, error: marked, isError: true });
     // utils was removed: said whatever the allowlist names (dispatchToolCall).
     if (call.name === 'utils') return failed({ success: false, isError: true, error: this.utilsRemoved(origin.kind === 'agent' ? origin.agentName : call.callerAgentName) });
     if (origin.kind === 'agent') {
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
       if (failure) return failed(failure);
-    }
-    const marked = markedInputRefusal(call);
-    if (marked !== undefined) {
-      this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: marked });
-      return { success: false, error: marked, isError: true };
     }
 
     const subject = origin.kind === 'agent' ? origin.agentName : call.callerAgentName ?? '__ephemeral__';
@@ -32875,6 +32872,13 @@ export class AgentFramework {
    * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
+    const marked = this.markedInputFailure(agentName, call);
+    if (marked) {
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: marked,
+      });
+      return;
+    }
     // utils was removed; its utilities are in the built-in toolset. Said
     // whatever the allowlist names, so an old call learns where they went.
     if (call.name === 'utils') {
@@ -32903,7 +32907,7 @@ export class AgentFramework {
       });
       return;
     }
-    const refusal = this.agentToolPermissionFailure(agentName, call) ?? this.markedInputFailure(agentName, call);
+    const refusal = this.agentToolPermissionFailure(agentName, call);
     if (refusal) {
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,

@@ -6,5 +6,7 @@
   gave no name to gets the same sentence without one. Such a call is refused
   whatever its marked text is, JSON `null` included. In XML tool mode the
   stored round keeps both fields on each refused call, so the history tells
-  it from a call made with no arguments. `ToolCall` gains
-  `unparseableReason`. A marked call with no reason is refused as before.
+  it from a call made with no arguments, and a watching agent's transcript
+  shows each such call as not run, with the reason. `ToolCall` gains
+  `unparseableReason`. A marked call with no reason, or an empty one, is
+  answered as before.

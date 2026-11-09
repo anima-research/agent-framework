@@ -37,6 +37,7 @@
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 import { NOTICE_TAG } from './notice-tags.js';
 import { cutToFit, markedTexts, oneLine } from './supplied-text.js';
+import { blockReason } from './tool-args.js';
 
 /** How long one transcript line's call or outcome runs before it is cut. */
 const BRIEF_CHARS = 160;
@@ -123,7 +124,13 @@ export function foreignRowAsSent(
         break;
       case 'tool_use': {
         changed = true;
-        out.push({ type: 'text', text: transcriptLine(block.name, [' called: ', ' called: '], [callPiece(block)]) });
+        const reason = blockReason(block);
+        out.push({
+          type: 'text',
+          text: reason !== undefined
+            ? transcriptLine(block.name, [' not run: ', ' not run'], [{ text: `the function_calls block it was in isn't well-formed: ${reason}`, supplied: true }])
+            : transcriptLine(block.name, [' called: ', ' called: '], [callPiece(block)]),
+        });
         break;
       }
       case 'tool_result': {

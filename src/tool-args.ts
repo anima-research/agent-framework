@@ -72,11 +72,17 @@ function notAnObject(input: unknown, field = 'input'): string {
   return `its ${field} must be an object, and this call gave ${withArticle(kindOf(input))}`;
 }
 
+/** The reason membrane gave for refusing a marked call's XML block, when it gave a non-empty one. */
+export function blockReason(call: { unparseableInput?: string; unparseableReason?: unknown }): string | undefined {
+  const reason = call.unparseableReason;
+  return call.unparseableInput !== undefined && typeof reason === 'string' && reason !== '' ? reason : undefined;
+}
+
 export function markedInputRefusal(call: { name: string; unparseableInput?: string; unparseableReason?: unknown }): string | undefined {
   const text = call.unparseableInput;
   if (text === undefined) return undefined;
-  const reason = call.unparseableReason;
-  if (typeof reason === 'string' && reason !== '') {
+  const reason = blockReason(call);
+  if (reason !== undefined) {
     const resend = "None of that block's calls ran; send them again, each parameter in its own complete element and each invoke ended by its closing tag.";
     return call.name === ''
       ? `Nothing was done: a function_calls block that isn't well-formed didn't run: ${reason}. ${resend}`
