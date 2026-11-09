@@ -183,6 +183,17 @@ describe('judge rules: verdicts', () => {
     gate.dispose();
   });
 
+  it("a reply to a batch with nothing in the window to name: its wake still carries line rows, none, so a merge with another batch's wake keeps that batch's line", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('reply-no-line-rows.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('a push with no stored message of its own'));
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    judge.answer({ reply: true, reason: 'worth a look', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.deepStrictEqual(wakes[0]!.lineRows, []);
+    gate.dispose();
+  });
+
   it('a reply asks isAnswered only about events with a stored write, never an unfilled placement', async () => {
     const judge = scriptedJudge();
     const asked: WritePlacement[] = [];
@@ -962,6 +973,28 @@ describe('judge rules: what waiting leaves the agent with', () => {
       gate.dispose();
     });
   }
+
+  it("tells the judge of a pending debounced batch split by recipient: each agent's wake is told by the events delivery gives it", () => {
+    const { gate } = makeGate(writeConfig('upcoming-split.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+    }));
+    gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate({ content: 'b.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['other'] }, { agent: 'other', messageId: 'row-2' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false], "the agent's wake has its own event's write alone");
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [false], "and so has the other's");
+    gate.dispose();
+  });
+
+  it("tells the judge of a pending debounced batch split by recipient: one agent's event with no write wakes that agent", () => {
+    const { gate } = makeGate(writeConfig('upcoming-split-unwritten.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+    }));
+    gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate({ content: 'b.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['other'] });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [true]);
+    gate.dispose();
+  });
 
   it("counts a batch's due time on the gate's clock", () => {
     let clock = 1_000_000;

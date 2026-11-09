@@ -9,7 +9,9 @@
  * BATCH_ROWS) writes one line naming the wake's messages its window holds,
  * as its own row, when a row a reply could be meant for follows them there:
  * none for a turn that merges a wake that isn't a batch's, and in a window
- * still in legacy mode, only the delivery agent's start.
+ * still in legacy mode, only the delivery agent's start. The scan reads the
+ * window's last 32 rows: where every one of them is a row it leaves aside,
+ * such as a clock row or a stored context injection, it writes the line.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -117,6 +119,8 @@ const storeChatter = (b: Bare, text = 'unrelated chatter'): string =>
   b.internals.addMessage('someone', [{ type: 'text', text }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-${text}` });
 const rowText = (m: { content: Array<{ type: string; text?: string }> }): string => m.content.map((x) => (x.type === 'text' ? x.text ?? '' : '')).join('');
 const texts = (b: Bare, name = 'scout'): string[] => b.framework.getAgent(name)!.getContextManager().getAllMessages().map(rowText);
+/** The rows of `name`'s presented window, as the start's request holds them. */
+const presentedTexts = (b: Bare, name = 'scout'): string[] => b.framework.getAgent(name)!.getContextManager().getPresentedMessages().map(rowText);
 /** The gate lines written as `name`'s own rows. */
 const linesOf = (b: Bare, name = 'scout'): string[] => b.framework.getAgent(name)!.getContextManager().getAllMessages()
   .filter((m) => (m.metadata as { ownRowOf?: unknown } | undefined)?.ownRowOf === name)
@@ -140,6 +144,28 @@ describe("a batched wake's line at its turn's start, where something follows its
       const all = texts(b);
       assert.ok(all.indexOf(lines[0]!) > all.indexOf('unrelated chatter'), 'the line follows the chatter');
       assert.ok(JSON.stringify(b.membrane.calls[0]).includes('[Gate: 1 event matched]'), 'and is in the turn\'s request');
+    } finally { await done(b); }
+  });
+
+  it("a read that throws while the start decides the line: the turn goes on without one, and the fault is logged", async (t) => {
+    const b = await bare(['scout']);
+    try {
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      storeChatter(b);
+      const cm = b.framework.getAgent('scout')!.getContextManager();
+      const status = cm.windowStatusOf.bind(cm);
+      t.mock.method(cm, 'windowStatusOf', (id: Parameters<typeof cm.windowStatusOf>[0]) => {
+        if (id === dm) throw new Error('store unreadable');
+        return status(id);
+      });
+      const logged: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'the turn ran');
+      assert.deepEqual(linesOf(b), [], 'without a line');
+      assert.ok(logged.some((line) => line.includes("a batched wake's line") && line.includes('store unreadable')), logged.join('\n'));
     } finally { await done(b); }
   });
 
@@ -177,6 +203,8 @@ describe("a batched wake's line at its turn's start, where something follows its
       b.internals.pendingRequests.push(wake([dm]));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const shown = presentedTexts(b);
+      assert.ok(shown.indexOf('are you there?') >= 0 && shown.indexOf('are you there?') < shown.indexOf('[clock row]'), `premise: the window holds the DM, then the clock row: ${JSON.stringify(shown)}`);
       assert.deepEqual(linesOf(b), [], "a clock row isn't a message a reply could be meant for");
     } finally { await done(b); }
   });
@@ -221,6 +249,8 @@ describe("a batched wake's line at its turn's start, where something follows its
       b.internals.pendingRequests.push(wake([dm]));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const shown = presentedTexts(b);
+      assert.ok(shown.indexOf('are you there?') >= 0 && shown.indexOf('are you there?') < shown.indexOf('LESSON one'), `premise: the window holds the DM, then the injection: ${JSON.stringify(shown)}`);
       assert.deepEqual(linesOf(b), []);
     } finally { await done(b); }
   });
@@ -518,6 +548,23 @@ describe("a batched wake's line is written once per wake", () => {
       const counts = [...lines[0]!.matchAll(/^- (\d+) messages? in general /gm)].map((m) => m[1]).sort();
       assert.deepEqual(counts, ['1', '2'], lines[0]);
       assert.match(lines[0]!, /^\[Gate: 3 events matched\]/);
+    } finally { await done(b); }
+  });
+
+  it("a batched wake merged with another batch's wake that names nothing: the line names the first batch's rows", async () => {
+    const b = await bare(['scout']);
+    try {
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      storeChatter(b);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      const at = Date.now();
+      b.internals.pendingRequests.push(wake([dm], 'scout', at));
+      b.internals.pendingRequests.push(wake([], 'scout', at + 1));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: one merged turn');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      assert.deepEqual(LINE.exec(lines[0]!)?.slice(1), ['1', '1', 'discord:dm:1'], lines[0]);
     } finally { await done(b); }
   });
 

@@ -9,6 +9,11 @@ import { incoming, registerOpen, MENTION } from './helpers/admission.js';
 import { GateModule, waitCall, say } from './helpers/dendrite.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { readMarkForTest } from '../src/read-marks.js';
+import * as frameworkModule from '../src/framework.js';
+
+/** The framework's internal mark of a batched wake's rows, read loosely so
+ *  this file still runs, red, against a framework without it. */
+const BATCH_ROWS: symbol = (frameworkModule as unknown as { BATCH_ROWS?: symbol }).BATCH_ROWS ?? Symbol('no batch mark');
 
 class ReminderModule extends GateModule {
   override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -100,11 +105,11 @@ function fire(f: Fixture) {
     gate.fireDebounce(name);
   }
 }
-async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixture) => Promise<void>, agents?: unknown[], module: ReminderModule = new ReminderModule()) {
+async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixture) => Promise<void>, agents?: unknown[], module: ReminderModule = new ReminderModule(), scope = ['clock:reminder', 'mcpl:channel-incoming', 'mcpl:push-event']) {
   const f = await fixture({ agents, framework: {
     modules: [module],
     errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
-    gate: { config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder', 'mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce } }], default: 'always' } },
+    gate: { config: { policies: [{ name: 'batch', match: { scope }, behavior: { debounce } }], default: 'always' } },
   } });
   const streams: MockYieldingStream[] = [];
   (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
@@ -205,6 +210,24 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
+  it("a silent heartbeat tick's batched wake carries the batch's rows, none, so a merge with another batch's wake keeps that batch's line", async () => {
+    const { f, module, start } = await setup(60_000);
+    try {
+      const { loop } = await start();
+      (f.framework as unknown as { deliverHeartbeat(wake: import('../src/heartbeat/heartbeat.js').HeartbeatWake): void }).deliverHeartbeat(
+        { kind: 'heartbeat', reason: 'schedule', silent: true, text: 'tick prompt', eventId: 'tick' });
+      module.release('first');
+      await loop;
+      assert.ok(!stored(f, 'tick prompt'), 'premise: the silent tick stored nothing');
+      const pending = (f.framework as unknown as { pendingRequests: Array<Record<string | symbol, unknown>> }).pendingRequests;
+      const before = pending.length;
+      fire(f);
+      const queued = pending.slice(before).filter((r) => r.reason === 'gate:debounce');
+      assert.equal(queued.length, 1, 'premise: the batch queued its wake');
+      assert.deepEqual(queued[0]![BATCH_ROWS], []);
+    } finally { await f.close(); }
+  });
+
   it('a partial batch keeps the event arriving mid-turn after the request was built', async () => {
     const { f, module, streams, start } = await setup(60_000, false, async (f) => {
       await send(f, 'module', 'still unread', 'second');
@@ -267,6 +290,22 @@ describe('debounced writes already read and answered', () => {
       const request = JSON.stringify(f.membrane.calls[turns.indexOf('other')]);
       assert.ok(request.includes('water the plants'), "the resident outside the message's audience is woken with the event");
     } finally { off(); await f.close(); }
+  });
+
+  it("a module's own wake for its one message, stored for the agent alone and not debounced: the turn that read and answered it leaves the wake nothing to start", async () => {
+    const module = new TargetedReminderModule();
+    const { f, streams, start } = await setup(60_000, false, undefined, undefined, module, ['mcpl:channel-incoming']);
+    try {
+      const { loop } = await start();
+      await send(f, 'module', 'water the plants');
+      await eventually(() => stored(f, 'water the plants'), 'the message stored mid-turn');
+      module.release('first');
+      await loop;
+      await f.framework.runUntilIdle();
+      assert.equal(gateOf(f).debounceTimers.size, 0, 'premise: no rule debounced it');
+      assert.ok(heard(streams[0]!).includes('water the plants'), 'premise: the turn read it');
+      assert.equal(f.membrane.calls.length, 1, 'no second turn');
+    } finally { await f.close(); }
   });
 
   it("a module's lone message held from the residents: the gate quotes the event, as it quotes one with no message", async () => {
@@ -653,10 +692,13 @@ describe('debounced writes already read and answered', () => {
       const edit = await f.send('channels/incoming', { messages: [f.channel('e', 'newest text', {}, 'work', 'edited')] });
       assert.equal(edit.result.results[0].coalesce.outcome, 'replaced', 'premise: the edit replaced the unread original');
       await f.send('channels/incoming', { messages: [f.channel('l', 'later text', { initial: true }, 'work', 'later')] });
+      assert.equal(gateOf(f).debounceTimers.get('batch')!.events.length, 2, 'premise: the batch holds the edit and the later message');
       fire(f);
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 1, 'premise: the batch wakes the agent');
-      assert.ok(!JSON.stringify(f.membrane.calls[0]).includes('[Gate:'), 'no line');
+      const request = JSON.stringify(f.membrane.calls[0]);
+      assert.ok(request.includes('newest text') && request.includes('later text'), 'premise: the request holds both messages');
+      assert.ok(!request.includes('[Gate:'), 'no line');
     } finally { await f.close(); }
   });
 
