@@ -15,7 +15,7 @@ import { DiscordModule } from '../src/modules/discord/index.js';
 import type { ConversationContext, DiscordClientInterface } from '../src/modules/discord/types.js';
 
 type F = Awaited<ReturnType<typeof fixture>>;
-type Routing = { private?: true; locus?: { serverId: string; channelId: string }; pin?: unknown; drafts: unknown[] };
+type Routing = { private?: true; silent?: boolean; locus?: { serverId: string; channelId: string }; pin?: unknown; drafts: unknown[] };
 type Hidden = {
   turnRouting: Map<string, Routing>;
   openLogical: Map<string, Routing>;
@@ -329,6 +329,49 @@ describe('private turns: when a turn is private (part 1)', () => {
       assert.deepEqual(sent(f, 'zz-tick post'), [], 'and posted nowhere');
     } finally { await f.close(); }
   });
+
+  it("a locked agent's private silent tick's retry stays private when a room's wake starts with it, though the operator's message left its window meanwhile", async () => {
+    let holds = 0;
+    const { f } = await make({ mode: 'locked', lock: 'work', wakes: false, framework: {
+      providerHold: (error: Error) => (error.message === 'provider unavailable' && holds++ === 0 ? { holdMs: 60_000, reason: 'test hold' } : undefined),
+    } });
+    const cooldowns = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, { until: number }> }).providerAccelerationCooldowns;
+    try {
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      script(f, [callTool('p1', 'channel_publish', { content: 'zz-tick post' }), say('')]);
+      const scripted = f.membrane.streamYielding.bind(f.membrane);
+      let failed = false;
+      f.membrane.streamYielding = (request, options) => {
+        if (failed) return scripted(request, options);
+        failed = true;
+        return new (class extends MockYieldingStream {
+          override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> { throw new Error('provider unavailable'); }
+        })([], true);
+      };
+      const live: Array<Routing | undefined> = [];
+      const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') live.push(hidden(f).turnRouting.get('agent')); });
+      wake(f, { reason: 'heartbeat', source: 'heartbeat', suppressProse: true, silentHeartbeat: { eventId: 'hb-1', serverId: 'heartbeat' } });
+      await f.framework.runUntilIdle();
+      assert.ok(cooldowns.has('agent'), 'premise: the silent tick failed into a provider hold');
+      assert.equal(live[0]?.private, true, 'premise: the tick was private');
+      const secret = storedText(f, SECRET)[0] as unknown as { id: string };
+      (f.framework as unknown as { removeMessage(id: string): void }).removeMessage(secret.id);
+      assert.ok(!inWindow(f, SECRET), "premise: the operator's message left the window during the hold");
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      assert.equal(live.length, 1, "premise: the room's wake waited for the hold");
+      cooldowns.get('agent')!.until = Date.now();
+      (f.framework as unknown as { releaseProviderAccelerationCooldown(agent: string): void }).releaseProviderAccelerationCooldown('agent');
+      await f.framework.runUntilIdle();
+      off();
+      assert.equal(live.length, 2, "premise: the retry and the room's wake started one stream");
+      assert.notEqual(live[1]?.silent, true, "premise: the room's wake made the start not silent");
+      assert.equal(live[1]?.private, true, "the turn the retry starts with the room's wake is private, as the tick was");
+      assert.ok(storedText(f, 'This turn has no channel of its own').length > 0, "so channel_publish naming no channel was refused");
+      assert.deepEqual(sent(f, 'zz-tick post'), [], 'and posted nowhere');
+    } finally { await f.close(); }
+  });
 });
 
 describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () => {
@@ -594,11 +637,13 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       const guard = (agent as unknown as { toolResultGuard: { afterAnnotations<T>(read: () => Promise<T>): Promise<T> } }).toolResultGuard;
       const afterAnnotations = guard.afterAnnotations.bind(guard);
       let waits = 0;
+      let storedInWait: number | undefined;
+      let stopTaken = false;
       guard.afterAnnotations = async (read) => {
         if (++waits === 2) {
           await (f.framework as unknown as { handleProcessEvent(event: unknown): Promise<void> }).handleProcessEvent(surfaceMessage(SECRET));
-          assert.equal(storedText(f, SECRET).length, 1, "premise: the message is stored while the guard's annotation wait holds the retry");
-          assert.ok(f.framework.abortInference('agent', 'test stop'), 'premise: the stop was taken');
+          storedInWait = storedText(f, SECRET).length;
+          stopTaken = f.framework.abortInference('agent', 'test stop');
         }
         return afterAnnotations(read);
       };
@@ -621,6 +666,8 @@ describe('private turns: the flip, and what it clears (parts 2, 3 and 9)', () =>
       await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
       await f.framework.runUntilIdle();
       await eventually(() => waits >= 2, "premise: the retry reached the guard's annotation wait");
+      assert.equal(storedInWait, 1, "premise: the message is stored while the guard's annotation wait holds the retry");
+      assert.ok(stopTaken, 'premise: the stop was taken');
       await eventually(() => !hidden(f).openLogical.has('agent'), 'premise: the stop ended the turn');
       await f.framework.runUntilIdle();
       assert.ok(!has(f, 'zz-retried'), 'premise: the retry never spoke');
@@ -812,12 +859,12 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
         assert.ok(has(f, 'zz-private answer'), 'premise: the private turn answered');
         await incoming(f, 'work', 'm1', 'zz-marker', [tag]);
         await f.framework.runUntilIdle();
-        assert.equal(storedText(f, 'zz-marker').length, 1, `premise: the ${tag} item is in the window`);
         if (!has(f, 'zz-after the marker')) {
           wake(f);
           await f.framework.runUntilIdle();
         }
         assert.ok(has(f, 'zz-after the marker'), 'premise: a turn spoke after the marker');
+        assert.ok(inWindow(f, 'zz-marker'), `premise: the ${tag} item is in the window of the turn after it`);
         await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
         await f.framework.runUntilIdle();
         await sentinel(f);
