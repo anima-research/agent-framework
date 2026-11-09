@@ -8,7 +8,7 @@ import type { NormalizedResponse, StreamEvent } from '@animalabs/membrane';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture, eventually, crash } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
-import { internals, textOf, stored, has, MENTION, AMBIENT, SUB, incoming, registerOpen, enter } from './helpers/admission.js';
+import { internals, textOf, stored, has, inWindow, MENTION, AMBIENT, SUB, incoming, registerOpen, enter } from './helpers/admission.js';
 import { bindAsConversationFork, GateModule, waitCall } from './helpers/dendrite.js';
 import { SurfaceModule, ActModule, SpeechProbe, surfaceMessage, say, callTool, act } from './helpers/surface.js';
 import { DiscordModule } from '../src/modules/discord/index.js';
@@ -287,6 +287,45 @@ describe('private turns: when a turn is private (part 1)', () => {
       await f.framework.runUntilIdle();
       const refusal = storedText(f, 'This turn has no channel of its own');
       assert.ok(refusal.length > 0, `channel_publish naming no channel was refused: ${stored(f).slice(-3).map((m) => JSON.stringify(m.content)).join('\n')}`);
+      assert.deepEqual(sent(f, 'zz-tick post'), [], 'and posted nowhere');
+    } finally { await f.close(); }
+  });
+
+  it("a locked agent's private silent tick stays private on the provider hold's retry, though the operator's message left its window meanwhile", async () => {
+    let holds = 0;
+    const { f } = await make({ mode: 'locked', lock: 'work', wakes: false, framework: {
+      providerHold: (error: Error) => (error.message === 'provider unavailable' && holds++ === 0 ? { holdMs: 60_000, reason: 'test hold' } : undefined),
+    } });
+    const cooldowns = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, { until: number }> }).providerAccelerationCooldowns;
+    try {
+      f.framework.pushEvent(surfaceMessage(SECRET));
+      await f.framework.runUntilIdle();
+      script(f, [callTool('p1', 'channel_publish', { content: 'zz-tick post' }), say('')]);
+      const scripted = f.membrane.streamYielding.bind(f.membrane);
+      let failed = false;
+      f.membrane.streamYielding = (request, options) => {
+        if (failed) return scripted(request, options);
+        failed = true;
+        return new (class extends MockYieldingStream {
+          override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> { throw new Error('provider unavailable'); }
+        })([], true);
+      };
+      const live: Array<Routing | undefined> = [];
+      const off = f.framework.onTrace((t) => { if (t.type === 'inference:started') live.push(hidden(f).turnRouting.get('agent')); });
+      wake(f, { reason: 'heartbeat', source: 'heartbeat', suppressProse: true, silentHeartbeat: { eventId: 'hb-1', serverId: 'heartbeat' } });
+      await f.framework.runUntilIdle();
+      assert.ok(cooldowns.has('agent'), 'premise: the silent tick failed into a provider hold');
+      assert.equal(live[0]?.private, true, 'premise: the tick was private');
+      const secret = storedText(f, SECRET)[0] as unknown as { id: string };
+      (f.framework as unknown as { removeMessage(id: string): void }).removeMessage(secret.id);
+      assert.ok(!inWindow(f, SECRET), "premise: the operator's message left the window during the hold");
+      cooldowns.get('agent')!.until = Date.now();
+      (f.framework as unknown as { releaseProviderAccelerationCooldown(agent: string): void }).releaseProviderAccelerationCooldown('agent');
+      await f.framework.runUntilIdle();
+      off();
+      assert.equal(live.length, 2, 'premise: the tick and its retry each started a stream');
+      assert.equal(live[1]?.private, true, "the retry's turn is private, as the tick was");
+      assert.ok(storedText(f, 'This turn has no channel of its own').length > 0, "so channel_publish naming no channel was refused");
       assert.deepEqual(sent(f, 'zz-tick post'), [], 'and posted nowhere');
     } finally { await f.close(); }
   });
@@ -1455,7 +1494,7 @@ describe('private turns: what the resident is told', () => {
     } finally { await f.close(); }
   });
 
-  it("each heartbeat while the operator's message is unanswered is told its plain speech goes to no channel, not that it's held as a draft", async () => {
+  it("each heartbeat while no channel's message is newer than the operator's is told its plain speech goes to no channel, not that it's held as a draft", async () => {
     const { f } = await make({ rule: 'delivery', framework: noFailureRetry });
     try {
       const notices = () => storedText(f, 'This turn now holds a message from').length;
@@ -1533,7 +1572,7 @@ describe('private turns: what the resident is told', () => {
     });
   }
 
-  it("a public turn's receipt is as main's", async () => {
+  it("a public turn's receipt names no kept speech", async () => {
     const { f } = await make({ rule: 'delivery' });
     try {
       script(f, [say('zz-public answer')]);

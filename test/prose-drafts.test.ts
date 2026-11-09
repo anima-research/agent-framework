@@ -3664,6 +3664,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           h.framework.pushEvent(surfaceMessage('for your eyes only'));
           await h.until(() => markers(h).length > 0, 'the failure marker');
           await turnEnded(h);
+          assert.ok(h.messages().some((m) => m.content.some((b) => b.type === 'tool_result')), "premise: the round's results were stored before the failure");
           assert.equal(routings[0]?.private, true, 'premise: the turn was private');
           assert.equal(published(h, SPEECH).length, 0, 'premise: nothing it wrote was posted');
           assert.equal(notices(h).length, named ? 1 : 0, JSON.stringify(notices(h)));
