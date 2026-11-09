@@ -143,7 +143,8 @@ export type TraceEvent =
        *  its schedule, not a count of sends. Absent from a framework before
        *  this field. */
       nextTry?: number;
-      /** The most tries the error policy allows (ErrorAction.maxTries), when it says. */
+      /** The most tries the error policy allows (ErrorAction.maxTries), when it
+       *  says so as a positive whole number. */
       maxTries?: number;
       /** What the error policy retries the failure as (ErrorAction.retryClass),
        *  such as `overloaded`, when it says. */

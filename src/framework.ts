@@ -2947,7 +2947,8 @@ interface TurnRetryWait {
    *  policy's place in its schedule, not a count of sends. Absent only from a
    *  wait started without it. */
   nextTry?: number;
-  /** The most tries the policy allows (ErrorAction.maxTries), when it says. */
+  /** The most tries the policy allows (ErrorAction.maxTries), when it says
+   *  so as a positive whole number. */
   maxTries?: number;
   /** What the policy retries the failure as (ErrorAction.retryClass), such as
    *  `overloaded`, when it says. */
@@ -7443,7 +7444,7 @@ export class AgentFramework {
     const action = about?.action;
     const shown = {
       ...(about ? { nextTry: about.nextTry } : {}),
-      ...(action?.retry && typeof action.maxTries === 'number' ? { maxTries: action.maxTries } : {}),
+      ...(action?.retry && Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? { maxTries: action.maxTries } : {}),
       ...(action?.retry && typeof action.retryClass === 'string' ? { retryClass: boundFailureText(action.retryClass, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
     };
     const record: TurnRetryWait = { since, ...(until <= MAX_DATE_MS ? { until } : {}), ...shown };
@@ -34744,9 +34745,11 @@ export class AgentFramework {
         // failed call and its retry, and while a turn's teardown is pending:
         // `turnAlive` and `retrying` say what it doesn't.
         status: agent.state.status,
-        /** A turn of the agent's is alive (its continuation on its way, as the scheduler reads it), whatever `status` says. */
+        /** A turn of the agent's is alive (it holds its token, or its continuation or retry is on its way, as the scheduler reads it), whatever `status` says. */
         turnAlive: this.hasTurn(name),
-        /** The turn's wait for its error policy's next try, or null: see TurnRetryWait. */
+        /** The turn's wait for its error policy's next try, or null: see TurnRetryWait. A retry a provider hold
+         *  keeps (a stated wait, an acceleration limit or a host's hold) reads null here, and
+         *  `providerAdmission` shows the hold: `cooldownUntil`, `cooldownReason` and `hostHold`. */
         retrying: (() => {
           const wait = this.turnRetryWaits?.get(agent);
           return wait ? { ...wait } : null;

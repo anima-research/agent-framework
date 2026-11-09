@@ -644,8 +644,9 @@ export type ErrorAction =
        *  not acted on: the wait reports it in `healthSnapshot()` and on
        *  `inference:waiting`. A policy that leaves it out is shown without it. */
       retryClass?: string;
-      /** The most tries that class allows the turn, the first send included,
-       *  shown beside the try the wait leads to. Left out for no bound. */
+      /** The most tries that class allows the turn, counted as the wait's
+       *  `nextTry` counts them, the first included, and shown beside it when
+       *  it is a positive whole number. Left out for no bound. */
       maxTries?: number;
     }
   | { retry: false; emit?: ProcessEvent };
