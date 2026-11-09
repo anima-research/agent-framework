@@ -1314,7 +1314,7 @@ const TURN_CARRY: unique symbol = Symbol('turn-carry');
 const BUDGET_WAIT: unique symbol = Symbol('budget-wait');
 interface BudgetWait {
   since: number;
-  row?: string;
+  rows?: string[];
   alerted?: true;
 }
 interface TurnCarry {
@@ -1393,6 +1393,12 @@ function continuesTurn(request: InferenceRequest): boolean {
 
 function budgetWaitOf(request: InferenceRequest | undefined): BudgetWait | undefined {
   return request ? (request as MarkedRequest)[BUDGET_WAIT] : undefined;
+}
+
+/** The rows a wake is for: its one row, or a batched wake's rows. */
+function wakeRows(request: InferenceRequest | undefined): string[] {
+  if (request?.readsRow !== undefined) return [request.readsRow];
+  return (request?.readsRows ?? []).map(({ row }) => row);
 }
 
 function turnCarryOf(request: InferenceRequest | undefined): TurnCarry | undefined {
@@ -1561,7 +1567,8 @@ interface TurnRouting {
   /** The turn asked for a ` !` continuation; taken once. */
   continuation: boolean;
   start?: { branch: string; sequence: number };
-  firstRow?: string;
+  /** The rows the wake that opened the turn reads: its one row, or a batched wake's rows. */
+  triggerRows?: string[];
   roundsRan?: true;
   unflushedRounds?: number;
   unpostedSpeech?: true;
@@ -3137,7 +3144,11 @@ interface BudgetHold {
   startedAt: number;
   wait: BudgetWait;
   turn: InferenceRequest;
+  /** The rows its wake read. It's dropped once every one has left, since one
+   *  removed message leaves the others still to answer. */
   standsOn: string[];
+  /** A continued turn's own rows since its start. Any one leaving drops it. */
+  ownRows: string[];
   wakes: InferenceRequest[];
   errorType: 'over_budget' | 'context_refusal';
   reason: string;
@@ -7472,12 +7483,12 @@ export class AgentFramework {
     const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
-    const standsOn = !continuesTurn(turn) && carried
-      ? (carried.row !== undefined ? [carried.row] : [])
+    const { standsOn, ownRows } = !continuesTurn(turn) && carried
+      ? { standsOn: [...(carried.rows ?? [])], ownRows: [] }
       : this.rowsTurnStandsOn(agent, turn, routing);
     const wait: BudgetWait = {
       since: carried?.since ?? startedAt,
-      ...(!continuesTurn(turn) && standsOn[0] !== undefined ? { row: standsOn[0] } : {}),
+      ...(!continuesTurn(turn) && standsOn.length > 0 ? { rows: standsOn } : {}),
       ...(carried?.alerted ? { alerted: true } : {}),
     };
     (turn as MarkedRequest)[BUDGET_WAIT] = wait;
@@ -7487,6 +7498,7 @@ export class AgentFramework {
       wait,
       turn,
       standsOn,
+      ownRows,
       wakes: [],
       errorType,
       reason: boundFailureText(String(error.message)),
@@ -7544,14 +7556,12 @@ export class AgentFramework {
     return true;
   }
 
-  private rowsTurnStandsOn(agent: Agent, turn: InferenceRequest, routing: TurnRouting): string[] {
-    if (!continuesTurn(turn)) {
-      const row = this.activeTurnTriggers.get(agent.name)?.readsRow;
-      return row !== undefined ? [row] : [];
-    }
-    const rows = routing.firstRow !== undefined ? [routing.firstRow] : [];
+  private rowsTurnStandsOn(agent: Agent, turn: InferenceRequest, routing: TurnRouting): { standsOn: string[]; ownRows: string[] } {
+    if (!continuesTurn(turn)) return { standsOn: wakeRows(this.activeTurnTriggers.get(agent.name)), ownRows: [] };
+    const standsOn = [...(routing.triggerRows ?? [])];
+    const rows: string[] = [];
     const from = routing.start?.sequence;
-    if (from === undefined) return rows;
+    if (from === undefined) return { standsOn, ownRows: rows };
     try {
       const ownCalls = new Set<string>();
       for (const row of agent.getContextManager().getPresentedMessages()) {
@@ -7560,9 +7570,9 @@ export class AgentFramework {
         rows.push(String(row.id));
       }
     } catch (error) {
-      console.error(`[budget-hold] agent=${agent.name}: could not read the rows its held turn stands on, so a surgery checks its first row alone:`, error);
+      console.error(`[budget-hold] agent=${agent.name}: could not read the rows its held turn stands on, so a surgery checks its wake's rows alone:`, error);
     }
-    return rows;
+    return { standsOn, ownRows: rows };
   }
 
   private compressionPending(agent: Agent): boolean {
@@ -7787,8 +7797,8 @@ export class AgentFramework {
   }
 
   private budgetWaitEnded(agent: Agent, trigger: InferenceRequest | undefined): boolean {
-    const row = budgetWaitOf(trigger)?.row;
-    if (row === undefined || !this.rowLeftWindow(agent, row)) return false;
+    const rows = budgetWaitOf(trigger)?.rows ?? [];
+    if (rows.length === 0 || !rows.every((row) => this.rowLeftWindow(agent, row))) return false;
     const batch = mergedBatch(trigger!);
     if (batch) appendAll(this.pendingRequests, batch.filter((r) => budgetWaitOf(r) === undefined));
     this.endContinuedTurn(agent.name, { kind: 'dropped', why: 'what its held turn stood on was removed', reason: BUDGET_HELD_TURN_REMOVED }, true);
@@ -7799,12 +7809,16 @@ export class AgentFramework {
     for (const [agentName, hold] of [...(this.budgetHolds?.entries() ?? [])]) {
       const agent = this.agents.get(agentName);
       if (!agent || (only !== undefined && agentName !== only) || this.budgetHolds?.get(agentName) !== hold) continue;
-      const wakes = hold.wakes.filter((wake) => wake.readsRow === undefined || !this.rowGone(agent, wake.readsRow));
+      const wakes = hold.wakes.filter((wake) => {
+        const rows = wakeRows(wake);
+        return rows.length === 0 || !rows.every((row) => this.rowGone(agent, row));
+      });
       if (wakes.length < hold.wakes.length) {
         console.error(`[budget-hold] agent=${agentName}: ${hold.wakes.length - wakes.length} held wake(s) dropped, their rows removed`);
       }
       hold.wakes = wakes;
-      if (hold.standsOn.some((row) => this.rowLeftWindow(agent, row))) {
+      const left = (row: string) => this.rowLeftWindow(agent, row);
+      if (hold.ownRows.some(left) || (hold.standsOn.length > 0 && hold.standsOn.every(left))) {
         this.dropHeldTurn(agentName, hold, 'a surgery or an undo removed what its held turn stood on');
       } else if (release) {
         this.releaseBudgetHold(agentName);
@@ -28078,7 +28092,7 @@ export class AgentFramework {
       if (continued?.roundsRan) routing.roundsRan = true;
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
       if (continued?.start) routing.start = continued.start;
-      if (continued?.firstRow !== undefined) routing.firstRow = continued.firstRow;
+      if (continued?.triggerRows !== undefined) routing.triggerRows = continued.triggerRows;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -28093,8 +28107,8 @@ export class AgentFramework {
     if (opensTurn) {
       const head = agent.branchHead();
       if (head && !routing.start) routing.start = head;
-      const firstRow = this.activeTurnTriggers.get(agent.name)?.readsRow;
-      if (firstRow !== undefined) routing.firstRow = firstRow;
+      const triggerRows = wakeRows(this.activeTurnTriggers.get(agent.name));
+      if (triggerRows.length > 0) routing.triggerRows = triggerRows;
       // A silent start, and an agent whose configuration turns the pin off
       // (turnInputsPin: false), pin nothing, and a pin of the name left from
       // before goes.
