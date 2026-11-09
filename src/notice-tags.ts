@@ -17,7 +17,7 @@ export const NOTICE_TAG = {
   turnInterrupted: 'turn-interrupted',
   closedChannel: 'closed channel',
   tunedOut: 'tuned out',
-  refusalRewind: 'refusal-rewind',
+  refusalRewind: 'turns-set-aside',
   drafts: 'drafts',
   delivered: 'delivered',
   routing: 'routing',
@@ -74,6 +74,8 @@ export const NOTICE_TAG = {
   blockNotShown: 'block not shown',
   noText: 'no text',
 } as const;
+
+export const FORMER_NOTICE_TAGS = ['refusal-rewind'] as const;
 
 /**
  * The bracket openings context-manager 0.27.0 writes into an agent's context

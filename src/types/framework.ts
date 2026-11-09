@@ -711,6 +711,8 @@ export interface InferenceLogEntry {
   success: boolean;
   /** Why it didn't succeed: the failure's message, or what stopped it */
   error?: string;
+  /** `error` in the framework's words, with no provider's text: what an agent may be shown of it */
+  errorWords?: string;
   /** Request data or blob ID if large. A stream the framework ended at a
    *  tool boundary (stopReason 'turn_ended', 'context_budget' or
    *  'physical_window') records a note in place of the body. */

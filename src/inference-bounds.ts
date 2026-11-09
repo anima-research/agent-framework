@@ -98,6 +98,8 @@ export function withHostSetting(message: string): string {
   return setting === undefined ? message : `${message} (the host's setting for this bound: \`inferenceBounds.${setting}\`)`;
 }
 
+const CUTS = new WeakSet<object>();
+
 export function deadlineCut(message: string | undefined): MembraneError {
   const error = new MembraneError({
     type: 'timeout',
@@ -106,5 +108,10 @@ export function deadlineCut(message: string | undefined): MembraneError {
     rawError: undefined,
   });
   Object.defineProperty(error, DEADLINE_EXPIRY, { value: true });
+  CUTS.add(error);
   return error;
+}
+
+export function isDeadlineCut(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && CUTS.has(error);
 }
