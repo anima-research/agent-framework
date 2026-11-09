@@ -95,6 +95,8 @@ async function open(physicalWindowTokens: number | undefined, config: Config = {
   for (let i = 0; i < 40; i++) {
     cm.addMessage(i % 2 ? 'prime' : 'User', [{ type: 'text', text: `Message ${i}: the river runs past the mill and the heron waits by the reeds. `.repeat(8) }]);
   }
+  const traces: Array<Record<string, unknown>> = [];
+  framework.onTrace((event) => traces.push(event as unknown as Record<string, unknown>));
   const compiled: Compiled[] = [];
   const original = cm.compile.bind(cm);
   cm.compile = ((budget: unknown, injections: unknown, opts: Record<string, unknown> | undefined) => {
@@ -105,7 +107,12 @@ async function open(physicalWindowTokens: number | undefined, config: Config = {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   };
-  return { framework, agent, membrane, compiled, close };
+  return { framework, agent, membrane, compiled, traces, close };
+}
+
+async function until(what: string, done: () => boolean): Promise<void> {
+  for (let i = 0; i < 1_000 && !done(); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(done(), `timed out waiting for ${what}`);
 }
 
 async function turn(framework: AgentFramework, membrane: MockMembrane): Promise<NormalizedRequest> {
@@ -283,16 +290,81 @@ describe('a request bounded by the model\'s window (physicalWindowTokens)', () =
     }
   });
 
-  it('a window the system prompt and tools fill by themselves sends nothing', async () => {
-    const t = await open(REPLY + 500);
+  it('a window the system prompt and tools fill by themselves sends nothing, kicks no drain, and says what would make room', async () => {
+    const window = REPLY + 500;
+    const t = await open(window);
     try {
       t.framework.start();
       t.framework.pushEvent({
         type: 'external-message', source: 'test', content: [{ type: 'text', text: 'Anything?' }], metadata: {}, triggerInference: true,
       } as unknown as ProcessEvent);
-      for (let i = 0; i < 100; i++) await new Promise((r) => setTimeout(r, 10));
+      await until('the turn to fail', () => t.traces.some((event) => event.type === 'inference:exhausted'));
+      await until('the alert', () => t.traces.some((event) => event.type === 'ops:alert' && event.kind === 'context-refusal'));
+      assert.ok(t.compiled.some((c) => c.opts?.requestLimitTokens === window), 'premise: the compile ran, given the window');
+      const failed = t.traces.find((event) => event.type === 'inference:exhausted')!;
+      assert.equal(failed.errorType, 'window_full', String(failed.error));
+      const alert = String(t.traces.find((event) => event.type === 'ops:alert' && event.kind === 'context-refusal')!.message);
+      assert.match(alert, /no drain kicked/, alert);
+      assert.match(alert, /maxTokens/, alert);
+      assert.doesNotMatch(alert, /raise contextBudgetTokens/, alert);
       assert.equal(t.membrane.calls.length, 0, 'no request went to the provider');
     } finally {
+      await t.close();
+    }
+  });
+
+  it('a caller\'s budget that reserves less than the agent\'s maxTokens is still bounded by the reply the request asks for', async () => {
+    const window = 20_000;
+    const t = await open(window, { maxTokens: 11_000 });
+    try {
+      await turn(t.framework, t.membrane);
+      const tools = t.framework.getAllTools();
+      const request = await t.agent.buildActivationRequest(tools, undefined, { maxTokens: 100_000, reserveForResponse: 500 }, tools, { dryRun: true });
+      assert.equal(request.config?.maxTokens, 11_000, 'premise: the request asks for the agent\'s maxTokens, not the budget\'s reserve');
+      assert.ok(JSON.stringify(request.messages).includes('Message 39:'), 'premise: the request carries the history');
+      assert.ok(requestTokens(request) <= window, `the request is ${requestTokens(request)} tokens, the window ${window}`);
+    } finally {
+      await t.close();
+    }
+  });
+
+  for (const window of [undefined, WINDOW]) {
+    it(`the direct API reads a ready tool result once (${window === undefined ? 'without' : 'with'} a window)`, async () => {
+      const t = await open(window, { callsTool: true });
+      try {
+        const tools = t.framework.getAllTools();
+        await t.agent.runInference(tools);
+        let reads = 0;
+        t.agent.provideToolResult('tu1' as never, { success: true, get data() { reads++; return 'the mill is quiet'; } } as never);
+        await t.agent.runInference(tools);
+        assert.ok(JSON.stringify(t.membrane.calls[t.membrane.calls.length - 1]!.messages).includes('the mill is quiet'), 'premise: the request carries the result');
+        assert.equal(reads, 1, `its data was read ${reads} times`);
+      } finally {
+        await t.close();
+      }
+    });
+  }
+
+  it('a guard batch whose audit isn\'t durable is priced as the placeholders it sends, not as its originals', async () => {
+    const t = await open(WINDOW, { callsTool: true, toolResultGuard: true });
+    const store = t.framework.getStore() as unknown as { sync: () => void };
+    const sync = store.sync.bind(store);
+    try {
+      const tools = t.framework.getAllTools();
+      await t.agent.runInference(tools);
+      store.sync = () => {
+        if (t.agent.toolResultGuard.hasPending) throw new Error('disk full');
+        sync();
+      };
+      t.agent.provideToolResult('tu1' as never, { success: true, data: RESULT_DATA } as never);
+      await t.agent.runInference(tools);
+      const request = t.membrane.calls[t.membrane.calls.length - 1]!;
+      assert.ok(!JSON.stringify(request.messages).includes('a row of output'), 'premise: the request sends the placeholder, not the original');
+      const sent = t.compiled[t.compiled.length - 1]!;
+      const beside = (sent.opts?.requestOverhead as { messages?: ContentBlock[][] } | undefined)?.messages ?? [];
+      assert.ok(!JSON.stringify(beside).includes('a row of output'), 'the original isn\'t priced beside the window');
+    } finally {
+      store.sync = sync;
       await t.close();
     }
   });

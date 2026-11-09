@@ -448,6 +448,36 @@ test('when the compile refuses without the pin too, the pin is dropped once and 
   });
 });
 
+test('when the compile finds no room in the window beside the request\'s overhead, the pin stays: dropping it can\'t make room, so the compile runs once', async () => {
+  const module = new PagesModule();
+  const membrane = new TurnMembrane([[answer(FINAL)]]);
+  const agent = agentConfig({ contextBudgetTokens: 8_000, strategy: strategy('kv-unified') });
+  const errorPolicy = { maxRetries: 0, onInferenceError: () => ({ retry: false as const }) };
+  await capturingErrors(async (logged) => {
+    await withFramework(membrane, module, agent, async (framework) => {
+      const cm = cmOf(framework);
+      for (let i = 1; i <= 16; i++) cm.addMessage('Dana', text(`[a${i}] ${PAGE}`));
+      presentTo(framework);
+      for (let tick = 0; tick < 300 && cm.getPendingWork(); tick++) await cm.tick();
+      const refusals: number[] = [];
+      cm.compile = async () => {
+        refusals.push(inputPins(framework).length);
+        throw Object.assign(new Error('The request limit leaves the context no room'), {
+          name: 'OverBudgetError',
+          diagnostics: { requestLimitTokens: 2_000, requestAllowanceTokens: -500 },
+        });
+      };
+      ask(framework);
+      await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL));
+      assert.deepEqual(refusals, [1], 'the compile refused once, with the pin');
+      assert.equal(failureRows(framework)[0]?.errorType, 'window_full', "the turn ended with the compile's refusal");
+      assert.equal(membrane.streams.length, 0, 'no request was sent');
+      assert.deepEqual(inputPins(framework), [], 'no pin is left');
+    }, { errorPolicy });
+    assert.equal(logged.filter((line) => line.includes('[turn-inputs] prime: the compile refused')).length, 0, 'the pin was not dropped for it');
+  });
+});
+
 test("two committing compiles that refuse at once with the turn's pin held each compile again without it", async () => {
   const module = new PagesModule();
   const membrane = new TurnMembrane([[...toolRounds(1), answer(FINAL)]]);

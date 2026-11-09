@@ -937,11 +937,10 @@ describe('a reached budget across a restart', () => {
    * ran while that plan was under way: the budget each plan was asked for,
    * the record as the second began, the log, and what it threw.
    */
-  async function refusedFirst(f: AgentFramework, meanwhile?: () => void) {
+  async function refusedFirst(f: AgentFramework, meanwhile?: () => void, refusal: Error = Object.assign(new Error('over budget'), { name: 'OverBudgetError' })) {
     const original = (ContextManager.prototype as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile;
     const planned: number[] = [];
     let recordAtRetry: Record | undefined;
-    const refusal = Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
     const log = quietErrors();
     let thrown: unknown;
     try {
@@ -1036,6 +1035,23 @@ describe('a reached budget across a restart', () => {
         assert.equal(budgets(restarted).target, 60_000, 'the boot budget stays set');
       });
     }
+  });
+
+  it('a budget applied at once at boot whose first compile finds no room in the window beside the request\'s overhead stays as it is: no budget makes room there', async () => {
+    await run(async (h) => {
+      const restarted = await provenAtBoot(h, 60_000);
+      const marked = persisted(restarted);
+      const noRoom = Object.assign(new Error('The request limit leaves the context no room'), {
+        name: 'OverBudgetError',
+        diagnostics: { requestLimitTokens: 2_000, requestAllowanceTokens: -500 },
+      });
+      const { planned, lines, thrown } = await refusedFirst(restarted, undefined, noRoom);
+      assert.equal(thrown, noRoom, 'the refusal is the compile\'s');
+      assert.deepEqual(planned, [60_000], 'no second compile');
+      assert.ok(!lines.some((l) => l.includes('paced')), lines.join('\n'));
+      assert.deepEqual(budgets(restarted), { target: 60_000, effective: 60_000, transition: 'stable' });
+      assert.deepEqual(persisted(restarted), marked, 'the budget\'s marker stays: the budget isn\'t what refused');
+    });
   });
 
   it('a budget at or above the recipe\'s, applied at once at boot, has no paced restore to fall back to: its refusal is the compile\'s', async () => {
