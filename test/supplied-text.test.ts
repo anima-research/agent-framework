@@ -19,6 +19,13 @@ describe('marking many texts', () => {
     assert.deepEqual(markedTexts(['a', '', `[${NOTICE_TAG.routing}] b`]), ['a', '', `\\[${NOTICE_TAG.routing}] b`]);
   });
 
+  it("marks the rewind marker's tag, and the tag its rows had before, which stored rows still hold", () => {
+    assert.deepEqual(
+      markedTexts([`[${NOTICE_TAG.refusalRewind}] a`, '[refusal-rewind] b']),
+      [`\\[${NOTICE_TAG.refusalRewind}] a`, '\\[refusal-rewind] b'],
+    );
+  });
+
   it("finds the text that holds each of many openings with at most 2n·⌈log₂ n⌉ reads of the texts' starts, a bound that grows as n log n", () => {
     const n = 2_000;
     let reads = 0;

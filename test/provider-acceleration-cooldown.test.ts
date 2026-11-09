@@ -153,6 +153,44 @@ test('organization acceleration 429 defers one fresh compile, includes arrivals,
   }
 });
 
+class ThrowingQuotaMembrane extends MockMembrane {
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    const error = new MembraneError({
+      type: 'rate_limit', retryable: false, httpStatus: 429,
+      message: 'zz weekly quota spent: zz-provider-words-7f3a', rawError: { status: 429 }, rawRequest: request,
+    });
+    const stream = new ErrorStream(error);
+    Object.defineProperty(stream, Symbol.asyncIterator, { value: async function* () { throw error; } });
+    return stream;
+  }
+}
+
+test("a failure thrown from the stream that the host holds is logged in the framework's words beside the provider's", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-host-hold-'));
+  const membrane = new ThrowingQuotaMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    providerHold: () => ({ holdMs: 60_000, reason: 'weekly quota spent' }),
+  });
+  const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1);
+    assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the turn is held');
+    const failed = framework.queryInferenceLogs({ limit: 10 }).entries.map((e) => e.summary ?? e.entry).filter((e) => !e.success);
+    assert.equal(failed.length, 1, JSON.stringify(failed));
+    assert.equal(failed[0]!.error, 'Provider acceleration cooldown: zz weekly quota spent: zz-provider-words-7f3a');
+    assert.equal(failed[0]!.errorWords, 'Provider acceleration cooldown: the model call failed (rate_limit, HTTP 429)');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('dynamic conversation forks are excluded from provider cooldown ownership', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-provider-conversation-'));
   const membrane = new AccelerationThenSuccessMembrane();

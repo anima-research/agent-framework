@@ -2,8 +2,10 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { MembraneError } from '@animalabs/membrane';
 import * as gateModule from '../src/gate/event-gate.js';
 import { EventGate, type WakeWrite, type WritePlacement } from '../src/gate/event-gate.js';
+import { JudgeFailure } from '../src/gate/reply-judge.js';
 
 /** The gate's internal mark of the rows a batched wake's line can name, read
  *  loosely so this file still runs, red, against a gate without it. */
@@ -595,12 +597,101 @@ describe('judge rules: timing', () => {
     } finally {
       console.error = original;
     }
-    assert.ok(gate.getStatus().errors.some((e) => e.includes('failed its last 3 requests') && e.includes('400 model not found')));
+    assert.ok(gate.getStatus().errors.some((e) => e.includes('failed its last 3 requests (the newest: the call failed)')), JSON.stringify(gate.getStatus().errors));
+    assert.ok(!gate.getStatus().errors.some((e) => e.includes('400 model not found')), "gate_status doesn't quote an error the framework didn't write");
     gate.evaluate(chat('ok'));
     await until(() => judge.waiting() === 1, 'the judge is asked');
     judge.answer({ reply: false, reason: 'fine' });
     await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the verdict');
     assert.ok(!gate.getStatus().errors.some((e) => e.includes('failed its last')));
+    gate.dispose();
+  });
+
+  it("a judge that fails on a provider's error shows the framework's words in gate_status, and stderr keeps the provider's", async () => {
+    const SENTINEL = 'zz-provider-words-7f3a';
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('provider-words.json', JUDGED), { judge: judge.fn });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        gate.evaluate(chat(`m${i}`));
+        await until(() => judge.waiting() === 1, 'the judge is asked');
+        judge.fail(new MembraneError({ type: 'server', retryable: true, httpStatus: 529, message: `Overloaded: ${SENTINEL}`, rawError: undefined }));
+        await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === i + 1, 'the failure counted');
+      }
+    } finally {
+      console.error = original;
+    }
+    const status = gate.getStatus();
+    assert.strictEqual(status.policies[0]!.judgeState!.last!.reason, 'the model call failed (server, HTTP 529)');
+    assert.ok(status.errors.some((e) => e.includes('failed its last 3 requests (the newest: the model call failed (server, HTTP 529))')), JSON.stringify(status.errors));
+    assert.ok(!JSON.stringify(status).includes(SENTINEL), JSON.stringify(status));
+    assert.ok(logged.some((line) => line.includes(SENTINEL)), "stderr keeps the provider's words");
+    gate.dispose();
+  });
+
+  it("a judge the gate times out shows the gate's own words in gate_status", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('timeout-words.json', JUDGED), { judge: judge.fn, judgeTimeoutMs: 50 });
+    const original = console.error;
+    console.error = () => {};
+    try {
+      gate.evaluate(chat('hello'));
+      await until(() => wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
+    gate.dispose();
+  });
+
+  it("a judge whose answer held no verdict is shown in the framework's words, and stderr keeps what the answer said", async () => {
+    const SENTINEL = 'zz-judge-words-7f3a';
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('no-verdict-words.json', JUDGED), { judge: judge.fn });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        gate.evaluate(chat(`m${i}`));
+        await until(() => judge.waiting() === 1, 'the judge is asked');
+        judge.fail(new JudgeFailure("the judge's answer held no verdict", `stop: refusal, text: "${SENTINEL}"`));
+        await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === i + 1, 'the failure counted');
+      }
+    } finally {
+      console.error = original;
+    }
+    const status = gate.getStatus();
+    assert.strictEqual(status.policies[0]!.judgeState!.last!.reason, "the judge's answer held no verdict");
+    assert.ok(status.errors.some((e) => e.includes("(the newest: the judge's answer held no verdict)")), JSON.stringify(status.errors));
+    assert.ok(!JSON.stringify(status).includes(SENTINEL) && !JSON.stringify(status).includes('refusal'), JSON.stringify(status));
+    assert.ok(logged.some((line) => line.includes(SENTINEL)), 'stderr keeps what the answer said');
+    gate.dispose();
+  });
+
+  it("a judge that rejects as soon as it's stopped still shows the gate's timeout, in gate_status and on stderr", async () => {
+    let asked = 0;
+    let stopped = 0;
+    const fn: JudgeFn = (request) => new Promise<JudgeVerdict>((_, reject) => {
+      asked++;
+      request.signal.addEventListener('abort', () => { stopped++; reject(new DOMException('This operation was aborted', 'AbortError')); });
+    });
+    const { gate, wakes } = makeGate(writeConfig('abort-aware-timeout.json', JUDGED), { judge: fn, judgeTimeoutMs: 50 });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      gate.evaluate(chat('hello'));
+      await until(() => wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
+    assert.ok(logged.some((line) => line.includes('the reply judge failed (the judge took more than 50 ms)')), JSON.stringify(logged));
+    assert.deepEqual({ asked, stopped }, { asked: 1, stopped: 1 }, 'the judge was asked once, and the gate stopped it');
     gate.dispose();
   });
 
@@ -649,7 +740,7 @@ describe('judge rules: timing', () => {
     assert.strictEqual(wakes.length, 0);
     const state = gate.getStatus().policies[0]!.judgeState!;
     assert.deepStrictEqual(state.verdicts, { reply: 0, wait: 0, error: 1 });
-    assert.strictEqual(state.last?.reason, 'provider down');
+    assert.strictEqual(state.last?.reason, 'the call failed', "an error the framework didn't write is shown in its words");
     judge.answer({ reply: false, reason: 'nothing for the agent' });
     gate.dispose();
   });

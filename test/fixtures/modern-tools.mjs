@@ -6,10 +6,12 @@ import { fromJsonSchema, McpServer } from '@modelcontextprotocol/server';
 const obj = (properties = {}) => fromJsonSchema({ type: 'object', properties });
 
 /**
- * @param {{ log?: (line: string) => void, eventsFile?: string }} [opts]
+ * @param {{ log?: (line: string) => void, eventsFile?: string, supportedProtocolVersions?: string[] }} [opts]
  * `eventsFile` (optional) receives one line per notable server-side event
  * (`slow-start`, `slow-aborted`, `slow-finished`) so a test can observe what
  * the server saw, independently of what the client reports.
+ * `supportedProtocolVersions` (optional) limits the revisions a 2025
+ * `initialize` can settle on, so a test chooses the one it serves.
  */
 export function createServer(opts = {}) {
   const note = (line) => {
@@ -18,7 +20,10 @@ export function createServer(opts = {}) {
   };
   const server = new McpServer(
     { name: 'modern-fixture', version: '1.0.0' },
-    { capabilities: { tools: { listChanged: true } } },
+    {
+      capabilities: { tools: { listChanged: true } },
+      ...(opts.supportedProtocolVersions ? { supportedProtocolVersions: opts.supportedProtocolVersions } : {}),
+    },
   );
   server.registerTool('echo', { description: 'Echo text back', inputSchema: obj({ text: { type: 'string' } }) },
     async (args) => ({ content: [{ type: 'text', text: `echo:${args.text}` }] }));

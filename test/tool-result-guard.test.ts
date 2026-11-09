@@ -16,6 +16,7 @@ import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { JsStore } from '@animalabs/chronicle';
+import { NOTICE_TAG } from '../src/notice-tags.js';
 
 /**
  * A stream message's channel as the test records it. Each delivery hands its
@@ -1345,7 +1346,7 @@ test('a staged batch omitted by compilation does not claim the refusal; autoRewi
     assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
     assert.equal(h.membrane.requests.length, 3, 'ordinary refusal rewind retry must run');
     const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
-    assert.match(JSON.stringify(messages), /\[refusal-rewind\]/);
+    assert.ok(JSON.stringify(messages).includes(`[${NOTICE_TAG.refusalRewind}]`));
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     assert.ok(audit.some((r) => r.type === 'withheld' && r.reason === 'unsubmitted'));
   } finally { await h.framework.stop(); }
@@ -1373,7 +1374,7 @@ test('a refusal on the next turn after endTurn uses ordinary refusal handling', 
     await h.run();
     await h.run();
     const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
-    assert.match(JSON.stringify(messages), /\[refusal-rewind\]/, 'autoRewind must not be suppressed');
+    assert.ok(JSON.stringify(messages).includes(`[${NOTICE_TAG.refusalRewind}]`), 'autoRewind must not be suppressed');
     assert.equal(h.membrane.requests.length, 3);
   } finally { await h.framework.stop(); }
 });
@@ -1547,7 +1548,7 @@ test('an aborted stream settles its submitted batch; the next turn neither resub
     await h.run();
     assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/, 'old originals must not be resubmitted');
     const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
-    assert.match(JSON.stringify(messages), /\[refusal-rewind\]/, 'ordinary autoRewind must run');
+    assert.ok(JSON.stringify(messages).includes(`[${NOTICE_TAG.refusalRewind}]`), 'ordinary autoRewind must run');
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     assert.ok(audit.some((r) => r.type === 'withheld' && r.reason === 'aborted'));
   } finally { await h.framework.stop(); }
@@ -2526,7 +2527,7 @@ for (const how of ['an uncaused error', 'an abort whose reason is error', 'the c
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
     assert.match(outcome, how === 'the completion watchdog' ? /^rejected: Ephemeral agent "ephemeral" stalled/
-      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: error/, 'the run ends as expected');
+      : how === 'an uncaused error' ? /^rejected: the model call failed \(auth\)$/ : /^rejected: Stream aborted: error/, 'the run ends as expected');
     assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
     const audit = await ephemeralBatchAudit(h.base);
     assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
@@ -2571,7 +2572,7 @@ for (const shape of ['a budget restart', 'an error retry'] as const) {
       assert.equal(starts, 2, 'the new start was tried');
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
-    assert.match(outcome, /^rejected: key revoked at the new start/, "the run ends with the new start's error");
+    assert.match(outcome, /^rejected: the model call failed \(auth\)$/, "the run ends with the new start's error");
     assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
     const audit = await ephemeralBatchAudit(h.base);
     assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
