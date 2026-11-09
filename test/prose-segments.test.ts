@@ -103,6 +103,18 @@ test('withoutRoundsProse drops a round\'s text by its place: the text before its
   assert.deepEqual(splitProseSegments(withoutRoundsProse(content, new Set([0, 1]))), ['SAME', 'LAST']);
 });
 
+test('withoutRoundsProse keeps a round\'s text after its call with that round when a notice follows it', () => {
+  // A round already started by a call doesn't end at a notice: the text
+  // between the call and its result is still the round's.
+  const notice = { type: 'tool_notice', content: 'refused' } as unknown as ContentBlock;
+  const content: ContentBlock[] = [
+    toolUse('t1'), textBlock('PRIVATE REASONING'), notice, toolResult('t1'),
+    textBlock('LAST'),
+  ];
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(content, new Set([0]))), ['LAST']);
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(content, new Set())), ['PRIVATE REASONING', 'LAST']);
+});
+
 test('withoutRoundsProse leaves prose an all-refused attempt or a notice ends: it is no round\'s', () => {
   const attempt = { type: 'tool_attempt', rawXml: '<invoke name="x">' } as unknown as ContentBlock;
   const notice = { type: 'tool_notice', content: 'refused' } as unknown as ContentBlock;
