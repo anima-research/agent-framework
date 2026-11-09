@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane, SystemChangeContent } from '@animalabs/membrane';
+import type { Membrane } from '@animalabs/membrane';
 import type { Module, EventResponse } from './module.js';
 import type { AgentConfig, InferenceRequest } from './agent.js';
 import type { ProcessEvent } from './events.js';
@@ -116,8 +116,8 @@ export type ProviderHoldHook = (
   error: Error, agentName: string, context: ProviderHoldContext,
 ) => ProviderHold | undefined;
 
-/** An effort level (Anthropic's `output_config.effort`), as membrane's `SystemChangeContent` carries one. */
-export type EffortLevel = NonNullable<SystemChangeContent['effort']>;
+/** An effort level (Anthropic's `output_config.effort`). */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface FrameworkConfig {
   /**
@@ -359,9 +359,15 @@ export interface FrameworkConfig {
    * turn has written its row.
    *
    * While this is set, an agent whose `providerParams` sets
-   * `output_config.effort` is refused where it's created. The host's `Membrane`
-   * must be a release whose `SystemChangeContent` carries `effort`: an older
-   * copy, installed beside this package's, leaves effort rows out unsent.
+   * `output_config.effort` is refused where it's created.
+   *
+   * Effort rows need membrane 0.10.0 or later, which exports
+   * `SYSTEM_CHANGE_EFFORT`. With an earlier membrane installed, every request
+   * goes as after a refusal: the live level on top and no rows. A change of
+   * level then costs the prompt cache as it did through `providerParams`. This
+   * is read from this package's copy of membrane. A host `Membrane` from an
+   * older copy, installed beside it, leaves effort rows out unsent.
+   *
    * Unset, effort is the host's, through `providerParams`, as before.
    */
   effort?: EffortLevel | ((agent: { name: string; model: string }) => EffortLevel | undefined);

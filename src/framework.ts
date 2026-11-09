@@ -229,7 +229,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { effortOf, type EffortPlan } from './effort.js';
+import { effortOf, MEMBRANE_SENDS_EFFORT_ROWS, type EffortPlan } from './effort.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, suppressedRow, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -9718,7 +9718,7 @@ export class AgentFramework {
     const setting = this.effortSetting;
     if (setting === undefined) return undefined;
     const live = typeof setting === 'function' ? setting({ name: agent.name, model: agent.model }) : setting;
-    if (this.effortRowsRefused.has(agent.name)) return { rows: false, ...(live !== undefined ? { topLevel: live } : {}) };
+    if (!MEMBRANE_SENDS_EFFORT_ROWS || this.effortRowsRefused.has(agent.name)) return { rows: false, ...(live !== undefined ? { topLevel: live } : {}) };
     const record = this.readEffortBase(agent.name);
     const kept = record?.model === agent.model ? record.effort : undefined;
     const base = live === undefined ? 'none' : kept ?? live;

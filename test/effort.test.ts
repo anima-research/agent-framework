@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as membrane from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
@@ -18,6 +19,11 @@ import { HistoryModule } from '../src/modules/history/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 type Level = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/** Membrane sends an effort-only `system_change` from the release that exports `SYSTEM_CHANGE_EFFORT` (0.10.0). */
+const ROWS = (membrane as unknown as Record<string, unknown>).SYSTEM_CHANGE_EFFORT === true;
+/** For a test of effort rows: skipped where the installed membrane sends none, as on CI's 0.8 and 0.9 floor legs. */
+const NEEDS_ROWS = ROWS ? false : 'the installed membrane exports no SYSTEM_CHANGE_EFFORT, so it sends no effort rows';
 
 const effortBlock = (effort: Level) => ({ type: 'system_change', effort }) as unknown as ContentBlock;
 const isEffortBlock = (b: ContentBlock) => b.type === 'system_change' && (b as { effort?: unknown }).effort !== undefined;
@@ -179,7 +185,7 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
-  it('sends a change as one row right after the new input, under the same top level, and in place from then on', async () => {
+  it('sends a change as one row right after the new input, under the same top level, and in place from then on', { skip: NEEDS_ROWS }, async () => {
     try {
       let live: Level = 'high';
       const { framework, provider, turn } = await resident({ effort: () => live });
@@ -202,7 +208,7 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
-  it('holds a change made where the request doesn\'t end on new input until the next input', async () => {
+  it('holds a change made where the request doesn\'t end on new input until the next input', { skip: NEEDS_ROWS }, async () => {
     try {
       let live: Level = 'high';
       const { provider, turn, poke } = await resident({ effort: () => live });
@@ -219,7 +225,7 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
-  it('holds a change on a request that ends on [Continue] after the agent\'s own stored context injection', async () => {
+  it('holds a change on a request that ends on [Continue] after the agent\'s own stored context injection', { skip: NEEDS_ROWS }, async () => {
     try {
       let live: Level = 'high';
       const { provider, turn, poke } = await resident({ effort: () => live, input: new InjectingInput() });
@@ -235,7 +241,7 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
-  it('sends no top level and no row while the function answers undefined, and a level after that travels as a row', async () => {
+  it('sends no top level and no row while the function answers undefined, and a level after that travels as a row', { skip: NEEDS_ROWS }, async () => {
     try {
       let live: Level | undefined = 'high';
       const { framework, provider, turn } = await resident({ effort: () => live });
@@ -257,7 +263,7 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
-  it('keeps the base across a restart', async () => {
+  it('keeps the base across a restart', { skip: NEEDS_ROWS }, async () => {
     try {
       const dir = mkdtempSync(join(tmpdir(), 'af-effort-restart-'));
       dirs.push(dir);
@@ -280,6 +286,23 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
       await turn('Two.');
       assert.deepEqual(provider.calls.map(topLevel), ['medium', 'medium'], 'the host\'s own providerParams, as given');
       assert.deepEqual(effortRows(provider.calls[1]!).map((r) => r.effort), ['low']);
+    } finally { await cleanup(); }
+  });
+});
+
+describe('FrameworkConfig.effort: a membrane that sends no effort rows', { skip: ROWS && 'the installed membrane exports SYSTEM_CHANGE_EFFORT' }, () => {
+  it('sends the live effort on top at each request, and stores and sends no row', async () => {
+    try {
+      let live: Level | undefined = 'high';
+      const { framework, provider, turn } = await resident({ effort: () => live });
+      await turn('One.');
+      live = 'low';
+      await turn('Two.');
+      live = undefined;
+      await turn('Three.');
+      assert.deepEqual(provider.calls.map(topLevel), ['high', 'low', undefined]);
+      assert.deepEqual(provider.calls.map(effortRows), [[], [], []]);
+      assert.equal(storedEffortRows(framework).length, 0);
     } finally { await cleanup(); }
   });
 });
@@ -319,7 +342,7 @@ describe('FrameworkConfig.effort: every agent', () => {
     } finally { await cleanup(); }
   });
 
-  it('gives a derived agent on its parent\'s model the parent\'s base, so it sends what the parent sends', async () => {
+  it('gives a derived agent on its parent\'s model the parent\'s base, so it sends what the parent sends', { skip: NEEDS_ROWS }, async () => {
     try {
       let live: Level = 'high';
       const { framework, provider, turn } = await resident({ effort: () => live });
@@ -362,7 +385,7 @@ describe('FrameworkConfig.effort: every agent', () => {
   });
 });
 
-describe('FrameworkConfig.effort: a model that refuses effort rows', () => {
+describe('FrameworkConfig.effort: a model that refuses effort rows', { skip: NEEDS_ROWS }, () => {
   it('retries a marked refusal of a request carrying a row at once, without rows and with the live effort on top', async () => {
     try {
       let live: Level = 'high';
@@ -463,7 +486,7 @@ describe('FrameworkConfig.effort: a model that refuses effort rows', () => {
   });
 });
 
-describe('FrameworkConfig.effort: previews and the direct API', () => {
+describe('FrameworkConfig.effort: previews and the direct API', { skip: NEEDS_ROWS }, () => {
   it('previews the row a start would write, unstored, under the base', async () => {
     try {
       let live: Level = 'high';
@@ -558,7 +581,7 @@ describe('the history tool and effort rows', () => {
 });
 
 
-describe('FrameworkConfig.effort: two agents on one store', () => {
+describe('FrameworkConfig.effort: two agents on one store', { skip: NEEDS_ROWS }, () => {
   async function pair() {
     const dir = mkdtempSync(join(tmpdir(), 'af-effort-two-'));
     dirs.push(dir);

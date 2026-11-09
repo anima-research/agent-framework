@@ -3,6 +3,7 @@
   - A different level goes as one effort-only `system_change` row, stored under `'system'` directly after the new user input whose reply it governs. Where a request doesn't end on new user input, the change waits for the next.
   - `undefined` sends no top-level effort and leaves effort rows out of the request. It starts a base of none, and a level after it goes as a row.
   - When membrane refuses a request's effort rows (`systemChangeRefused`), the request goes again at once, with no rows and the live level on top, and that agent's requests go so until the process ends.
+  - Rows need membrane 0.10.0, which exports `SYSTEM_CHANGE_EFFORT`. With membrane 0.8 or 0.9 installed, every request goes that way from the start, so a change of level costs the prompt cache as it did through `providerParams`.
   - A preview shows the row a start would write, and the direct API sends what a turn would, writing no row.
   - While it's set, an agent whose `providerParams` sets `output_config.effort` is refused where it's created.
 - The history tool shows an effort row as `[effort: <level> from here]`.
