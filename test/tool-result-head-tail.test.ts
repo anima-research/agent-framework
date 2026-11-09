@@ -315,6 +315,24 @@ describe('the copies with no file keep head and tail (truncateForHistory)', () =
     }
   });
 
+  it('starts the tail past a reference stub its share would split, whatever the reference\'s type', () => {
+    const stub = '[ref_1_ab3d] ' + 'notes '.repeat(20) + '— text/plain, 1.2KB claimed — from tool result';
+    const text = 'a'.repeat(2000) + '\n' + stub + '\n' + 'z'.repeat(10);
+    const start = text.indexOf(stub);
+    const end = start + stub.length;
+    let inStub = 0;
+    let inId = 0;
+    for (let cap = 20; cap <= 600; cap++) {
+      const raw = text.length - (cap - Math.floor(cap * 0.6));
+      if (!(start < raw && raw < end)) continue;
+      inStub++;
+      if (raw < start + '[ref_1_ab3d]'.length) inId++;
+      const { e } = headMarkerTail(truncateForHistory(text, cap), text);
+      assert.ok(!(start < e && e < end), `cap ${cap}: the tail starts outside the stub (raw ${raw - start} into it, kept from ${e - start})`);
+    }
+    assert.ok(inStub > 100 && inId > 0, `premise: the tail's share starts inside the stub, its id included (${inStub}, ${inId})`);
+  });
+
   it('keeps an over-cap error text\'s last line on the history path', () => {
     const error = lines(1000, 'err');
     const text = nonErrorResultText({ error }, 2000);
