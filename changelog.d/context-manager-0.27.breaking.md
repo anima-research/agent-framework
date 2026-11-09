@@ -9,9 +9,11 @@
   strategy the host builds runs its own copy's code. A fresh install gets
   context-manager 0.27.0 and membrane 0.10.1, unless the host's own range
   holds membrane lower, and a lockfile's membrane 0.8.0 or 0.9.0 is still
-  admitted. Requests go out through the membrane the host passes, so
-  membrane's changes, which its changelog for 0.10.0 and 0.10.1 lists, come
-  with the host's own. context-manager's changelog for 0.26.0 and 0.27.0
+  admitted. Requests go out through the membrane the host passes. A host
+  that declares membrane sends through its own. One that doesn't imports
+  the copy this range installs, so a fresh install moves its requests from
+  membrane 0.9.0 to 0.10.1, with the changes membrane's changelog for
+  0.10.0 and 0.10.1 lists. context-manager's changelog for 0.26.0 and 0.27.0
   lists its changes. One reaches what agent-framework's own copy does:
   where a later tool call reuses an earlier call's id,
   `stripUnpairedToolBlocks`, which the framework runs on a fork's seed, now
