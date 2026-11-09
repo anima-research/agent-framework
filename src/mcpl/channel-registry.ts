@@ -1096,6 +1096,9 @@ interface ChannelRegistryOptions {
     outcome?: 'failed' | 'unknown';
     /** Bounded display of the connector's structured error data, when present. */
     detail?: string;
+    /** Set when the turn had no channel and the reason names the channels
+     *  its batch came from. */
+    byDesign?: true;
   }) => void;
   /**
    * Announces either a durable subscription-policy admission (before its
@@ -1484,6 +1487,11 @@ export class ChannelRegistry {
     const reach = this.serverReach(serverId);
     if (reach !== 'up') return new ChannelLifecycleError(unreachableClause(serverId, reach), 'unreachable', reach);
     return new ChannelLifecycleError(`this host isn't permitted to open or close the "${serverId}" server's channels`, 'not-permitted');
+  }
+
+  private publishingServer(serverId: string): McplServerConnection | undefined {
+    const server = this.serverRegistry.getServer(serverId);
+    return server && CapabilityGrant.of(server).has('channels.publish') ? server : undefined;
   }
 
   /**
@@ -6207,12 +6215,12 @@ export class ChannelRegistry {
     if (isInboundOnly(entry)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(entry), at: at() };
     }
-    const server = this.serverRegistry.getServer(entry.serverId);
+    const server = this.publishingServer(entry.serverId);
     // §14.1: channels/publish requires channels.publish in the grant. The
     // host not sending is the enforcement, here and at the last check, and
     // the server's state words the refusal (sendRefusal).
     const ungranted = (): PublishOutcome => ({ status: 'failed', destination, reason: this.sendRefusal(entry.serverId), at: at() });
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+    if (!server) return ungranted();
 
     const prevented = (err: unknown): PublishOutcome => ({
       status: 'failed', destination, reason: lifecycleClause(err) + refusalRemedy(err), at: at(),
@@ -6374,12 +6382,15 @@ export class ChannelRegistry {
     locus: ChannelRef | null,
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
-     *  An `unknown` outcome still gets its marker. */
-    opts?: { heldOnFailure?: boolean },
+     *  An `unknown` outcome still gets its marker. `cameFrom`: with no
+     *  locus, the channels the turn's batch came from, each with how the
+     *  agent is shown it; the failure's reason names them, and how to reply
+     *  in those registered that take speech. */
+    opts?: { heldOnFailure?: boolean; cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<PublishOutcome> {
     // `logged` is what the log line and the trace say, where it isn't the
-    // agent's reason (the two no-locus reasons below).
-    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason): PublishOutcome => {
+    // agent's reason (the three no-locus reasons below).
+    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason, byDesign = false): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
       const channelId = channel?.channelId ?? null;
       const detail = outcome.detail !== undefined ? connectorText(outcome.detail) : undefined;
@@ -6399,17 +6410,19 @@ export class ChannelRegistry {
         this.onRouteFailure?.({
           conversationId, channelId, ...(channel ? { serverId: channel.serverId } : {}),
           reason, textLen: text.length, text, outcome: status, ...(detail !== undefined ? { detail } : {}),
+          ...(byDesign ? { byDesign: true as const } : {}),
         });
       }
       return outcome;
     };
 
-    // These two reasons are the only ones whose log line and trace keep the
+    // These three reasons are the only ones whose log line and trace keep the
     // operator's words rather than the agent's: connectome-host's
     // connectome-doctor reads the last [routeSpeech] line for "no locus". Keep
-    // "no locus" in both logged texts. Each names no tool: whether one the
+    // "no locus" in each logged text. Each names no tool: whether one the
     // agent may call could post the words isn't known here, and the notice
-    // calls it a routing or configuration situation.
+    // calls it a routing or configuration situation, or for a turn whose
+    // batch named the channels it came from a routing one (byDesign).
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
@@ -6429,6 +6442,32 @@ export class ChannelRegistry {
       // global inbound ever seen) — the agent was told routing posts its
       // prose to no channel; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
+      const from = opts?.cameFrom ?? [];
+      if (from.length > 0) {
+        const list = (names: readonly string[]) =>
+          names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+        const closed: string[] = [];
+        const open: Array<{ channel: ChannelRef; shown: string }> = [];
+        for (const came of from) {
+          const entry = this.entryAt(came.channel);
+          if (!entry) closed.push(`${came.shown} isn't registered with this host now, so this host has no channel there to send to`);
+          else if (isInboundOnly(entry)) closed.push(`${came.shown} is ${inboundOnlyReason(entry)}`);
+          else if (!this.publishingServer(entry.serverId)) {
+            const reach = this.serverReach(entry.serverId);
+            closed.push(reach === 'connecting' || reach === 'down'
+              ? `${came.shown} can't take a send: ${unreachableClause(entry.serverId, reach)}, so to reply there, send your reply to that channel explicitly once it's back`
+              : `${came.shown} can't take a send: ${this.sendRefusal(entry.serverId)}`);
+          } else open.push(came);
+        }
+        const reply = open.length === 0 ? ''
+          : open.length === from.length
+            ? `; to reply ${from.length === 1 ? 'there' : 'in one of them'}, send your reply to that channel explicitly`
+            : `; to reply in ${open.length === 1 ? open[0].shown : `one of ${list(open.map((c) => c.shown))}`}, send your reply to that channel explicitly`;
+        const reason = `this turn came from ${list(from.map((c) => c.shown))}, and no channel was chosen for its reply` +
+          `${reply}${closed.map((c) => `; ${c}`).join('')}`;
+        return fail(null, reason, { status: 'failed', reason, at: Date.now() },
+          "turn has no locus (no channel was chosen for its batch's reply)", true);
+      }
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';
       return fail(null, reason, { status: 'failed', reason, at: Date.now() },
@@ -6463,8 +6502,9 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locus: ChannelRef | null,
+    opts?: { cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
-    const outcome = await this.deliverSpeech(conversationId, text, locus);
+    const outcome = await this.deliverSpeech(conversationId, text, locus, opts);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,
@@ -6623,8 +6663,8 @@ export class ChannelRegistry {
 
     // The same refusal, in the same words, as plain speech's (sendRefusal),
     // whose server state is the reason's: nothing awaits between the two.
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) {
+    const server = this.publishingServer(entry.serverId);
+    if (!server) {
       if (seen) {
         const reach = this.serverReach(entry.serverId);
         seen.refusal = reach === 'up' ? 'not-permitted' : `server-${reach}`;

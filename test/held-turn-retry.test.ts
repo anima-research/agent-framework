@@ -1088,6 +1088,12 @@ async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membra
     for (const resolve of gate.idleWaiters.splice(0)) resolve();
     await waitFor(fw, () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length === 1, 'the merged start held again');
     assert.equal(membrane.primary, 2);
+    const start = internal.providerAccelerationCooldowns.get('resident')!.heldRequests[0] as unknown as Record<string | symbol, unknown>;
+    const symbols = Object.getOwnPropertySymbols(start);
+    const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+    const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+    const leader = (start[batchKey] as Array<Record<string | symbol, unknown>>).find((member) => (member[retryKey] === true) === (leads === 'retry'));
+    assert.ok(leader && identityKeys.every((key) => JSON.stringify(leader[key]) === JSON.stringify(start[key])), `premise: the merged start is led by its ${leads}`);
   }
   return () => {
     if (how === 'parked') {
@@ -1131,6 +1137,10 @@ function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<str
   const mark = rearm && Object.getOwnPropertySymbols(rearm).find((key) => key.description === 'rearmed' && rearm[key] === true);
   assert.ok(mark, 'premise: the probe was re-armed into the hold');
   return mark;
+}
+
+function routingChannels(internal: unknown): string {
+  return JSON.stringify((internal as { turnRouting: Map<string, { wakeChannels?: unknown }> }).turnRouting.get('resident')?.wakeChannels ?? []);
 }
 
 test("a held turn's retry the hold folds into an equal held wake gives that wake the turn's carry", async (t) => {
@@ -1357,6 +1367,83 @@ test("a held merged start's release gives its first member none of the other mem
       const routing = (internal as unknown as { turnRouting: Map<string, { openingMessages?: string[] }> }).turnRouting.get('resident');
       assert.ok(routing?.openingMessages?.includes('zz-kept'), `premise: the first member's message: ${JSON.stringify(routing?.openingMessages)}`);
       assert.ok(!routing?.openingMessages?.includes('zz-dropped'), `the dropped member's message: ${JSON.stringify(routing?.openingMessages)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a gate wake the hold folds into a held turn's merged retry names its batch's channels to the turn when the retry is released", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:folded' }] };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      assert.ok(routingChannels(internal).includes('discord:g:folded'), `the folded wake's channel: ${routingChannels(internal)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held gate wake that an equal merged start folds into names its batch's channels to the turn when the start is released", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:held-first' }] };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
+      assert.equal(held.length, 1, 'premise: the hold folds the merged start into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      assert.ok(routingChannels(internal).includes('discord:g:held-first'), `the held wake's channel: ${routingChannels(internal)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held merged start's release gives its first member none of the other members' channels, so a member the read check drops leaves its channel off the turn", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const start = internal.providerAccelerationCooldowns.get('resident')!.heldRequests[0] as unknown as Record<string | symbol, unknown>;
+      const symbols = Object.getOwnPropertySymbols(start);
+      const retryKey = symbols.find((key) => key.description === 'turn-retry')!;
+      const batchKey = symbols.find((key) => key.description === 'merged-batch')!;
+      const members = start[batchKey] as Array<Record<string | symbol, unknown>>;
+      const first = members[0]!;
+      const other = members.find((member) => member !== first)!;
+      assert.equal(first[retryKey], true, "premise: the batch's first member is the turn's retry");
+      const kept = { serverId: 'discord', channelId: 'discord:g:kept' };
+      const dropped = { serverId: 'discord', channelId: 'discord:g:dropped' };
+      first.wakeChannels = [kept];
+      other.wakeChannels = [dropped];
+      other.readsRow = 'zz-no-such-message';
+      start.wakeChannels = [kept, dropped];
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      assert.ok(log.lines.some((line) => line.startsWith('[wake] resident: dropped 1 wake(s)')), `premise: the read check dropped the other member: ${log.lines.join('\n')}`);
+      assert.equal(routingChannels(internal), JSON.stringify([kept]));
     } finally { await fw.stop(); log.restore(); }
   });
 });
@@ -1643,6 +1730,111 @@ test("a merged start held where an equal request is already held keeps its wakes
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
       const back = internal.pendingRequests.filter((r) => r.agentName === 'resident');
       assert.equal(back.length, 1, 'the wake merged into the start is put back');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+for (const routing of ["holds a later batch's channels in its routing", 'has no channel', 'has a locus'] as const) test(routing === 'has a locus'
+  ? "an exhausted turn's re-arm, of a turn a channel_open gave a locus whose routing holds its batches' channels, carries every channel its routing holds"
+  : `an exhausted turn's re-arm, of a turn with no locus that ${routing}, carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its last start's"}`, async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const first = { serverId: 'discord', channelId: 'discord:g:first' };
+      const later = { serverId: 'discord', channelId: 'discord:g:later' };
+      const trigger = { agentName: 'resident', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [later],
+        ...(routing === 'has no channel' ? { channelId: 'zz-own', channelServerId: 'zz-srv' } : {}) };
+      const opened = { serverId: 'discord', channelId: 'discord:g:opened' };
+      const turn = routing === 'has no channel' ? { noChannel: true, wakeChannels: [later] }
+        : routing === 'has a locus' ? { locus: opened, wakeChannels: [first, later] }
+          : { wakeChannels: [first, later] };
+      (internal as unknown as { rearmExhaustedTurn(...args: unknown[]): void })
+        .rearmExhaustedTurn(fw.getAgent('resident'), new Error('zz-exhausted'), trigger, true, turn, true);
+      const held = (internal.providerAccelerationCooldowns.get('resident')?.heldRequests ?? []) as unknown as Array<Record<string | symbol, unknown>>;
+      const rearm = held.find((r) => Object.getOwnPropertySymbols(r).some((key) => key.description === 'rearmed' && r[key] === true));
+      assert.ok(rearm, 'premise: the turn is re-armed into a hold');
+      assert.deepEqual(rearm.wakeChannels, routing === 'has no channel' ? undefined : [first, later]);
+      const retry = (internal as unknown as { turnRetryOf(trigger: unknown, routing: unknown): { wakeChannels?: unknown } }).turnRetryOf(trigger, { ...turn, locus: first });
+      assert.deepEqual(retry.wakeChannels, routing === 'has no channel' ? undefined : [first, later], "the retry of a turn with a locus carries its routing's channels, not its trigger's");
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+const serverError = (request: NormalizedRequest) => new MembraneError({
+  type: 'server', retryable: true, httpStatus: 500, message: 'zz internal error', rawError: { status: 500 }, rawRequest: request,
+});
+const retrySites = [
+  { site: "a stated wait's hold", failure: (request: NormalizedRequest) => rateLimited(60_000, request), held: true },
+  { site: "an acceleration hold", failure: (request: NormalizedRequest) => new MembraneError({
+    type: 'rate_limit', retryable: true, httpStatus: 429,
+    message: "zz this organization's acceleration limit was reached", rawError: { status: 429 }, rawRequest: request,
+  }), held: true },
+  { site: "its stream's error retry", failure: serverError, held: false },
+  { site: "its start's error retry", failure: serverError, failsAt: 'setup', held: false },
+  { site: "a conversation agent's stated-wait hold", failure: (request: NormalizedRequest) => rateLimited(60_000, request), held: true, fork: true },
+  { site: "a conversation agent's hold for a wait recorded during its compile", held: true, fork: true, compileWait: true },
+] as const;
+
+for (const [index, at] of retrySites.entries()) for (const routing of index === 0 ? ["holds a later batch's channels in its routing", 'has no channel'] as const : ["holds a later batch's channels in its routing"] as const) test(`${at.site}: the retry of a turn with no locus that ${routing} carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its start's"}`, async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const log = silence();
+    const first = { serverId: 'discord', channelId: 'discord:g:first' };
+    const later = { serverId: 'discord', channelId: 'discord:g:later' };
+    let turnRouting: Map<string, { wakeChannels?: unknown; noChannel?: true; locus?: unknown }> | undefined;
+    let written = false;
+    const write = (): void => {
+      const turn = turnRouting?.get('resident');
+      if (!turn || turn.locus !== undefined) return;
+      if (routing === 'has no channel') turn.noChannel = true;
+      else turn.wakeChannels = [first, later];
+      written = true;
+    };
+    const membrane = 'failure' in at
+      ? new ScriptedMembrane(new Set([1]), (request) => { write(); return at.failure(request); }, 'failsAt' in at ? at.failsAt : 'event')
+      : new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    turnRouting = (internal as unknown as { turnRouting: typeof turnRouting }).turnRouting;
+    const triggers: Array<Record<string | symbol, unknown> | undefined> = [];
+    const start = internal.startAgentStream.bind(internal);
+    t.mock.method(internal, 'startAgentStream', (agent: unknown, trigger: Record<string | symbol, unknown> | undefined, ...rest: unknown[]) => {
+      triggers.push(trigger);
+      return (start as (...args: unknown[]) => Promise<void>)(agent, trigger, ...rest);
+    });
+    try {
+      const agent = fw.getAgent('resident')!;
+      agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-message' }]);
+      const wake = { agentName: 'resident', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [later] };
+      if ('fork' in at) {
+        bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
+        if ('compileWait' in at) {
+          const compile = agent.startStreamWithInjections.bind(agent);
+          agent.startStreamWithInjections = (async (...args: Parameters<typeof compile>) => {
+            const made = await compile(...args);
+            write();
+            internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz wait during the compile');
+            return made;
+          }) as typeof compile;
+        }
+        void internal.startAgentStream(agent, wake);
+      } else {
+        internal.pendingRequests.push(wake as unknown as Request);
+      }
+      const isRetry = (r: Record<string | symbol, unknown> | undefined) => !!r && Object.getOwnPropertySymbols(r).some((key) => key.description === 'turn-retry' && r[key] === true);
+      let retry: Record<string | symbol, unknown> | undefined;
+      if (at.held) {
+        await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the turn held');
+        retry = (internal.providerAccelerationCooldowns.get('resident')!.heldRequests as unknown as Array<Record<string | symbol, unknown>>).find(isRetry);
+      } else {
+        await waitFor(fw, () => membrane.primary >= 2, 'the retry, sent');
+        retry = triggers.find(isRetry);
+      }
+      assert.ok(retry, `premise: the turn's retry: ${log.lines.join('\n')}`);
+      assert.ok(written, "premise: the turn's routing was there, with no locus, at its call");
+      assert.deepEqual(retry.wakeChannels, routing === 'has no channel' ? undefined : [first, later]);
     } finally { await fw.stop(); log.restore(); }
   });
 });
