@@ -1194,7 +1194,7 @@ describe('present while acting', () => {
     };
     const open: Routing = {
       locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set([destinationKey(stub('discord:guild:portables'))]), wasIn: [],
-      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, keptForPrivacy: 0, arrivals: [],
       addressedElsewhere: new Set(), turnId: 1,
     };
     internals.turnRouting.set('assistant', open);

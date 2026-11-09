@@ -109,7 +109,7 @@ describe('tune-out, all-except scope', () => {
       await f.framework.runUntilIdle();
       await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-still in work')), 'the speech went out');
       assert.equal(f.published.find((p) => JSON.stringify(p).includes('zz-still in work'))!.channelId, 'work');
-      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel: a heartbeat's, or any turn while a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or is the newest message you've had, or on a turn that continues one where that held."));
+      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel: a heartbeat's, or any turn while a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or is the newest message there, or on a turn that continues one where that held."));
       assert.ok(told, "the focus result says this turn's speech stays in work");
     } finally { await f.close(); }
   });
@@ -703,7 +703,7 @@ describe('a private turn and the focus', () => {
   const look = (id: string) => createMockResponse([{ type: 'tool_use', id, name: 'probe--look', input: {} }] as ContentBlock[], 'tool_use');
 
   for (const mode of ['locus', 'hybrid', 'locked'] as const) for (const rule of ['delivery', 'latest-inbound'] as const) {
-    it(`${mode}, ${rule}: a private turn tells a server no channel it speaks in and no message it answers`, async () => {
+    it(`${mode}, ${rule}: the channel context a private turn's server is given names no channel it speaks in and no message it answers`, async () => {
       const probe = contextProbe();
       const f = await fixture({
         framework: { modules: [new SurfaceModule(), probe.module], speech: { locus: rule } } as Partial<FrameworkConfig>,
@@ -732,7 +732,7 @@ describe('a private turn and the focus', () => {
     });
   }
 
-  it("a conversation fork's private turn tells a server no channel, its home included, and no message it answers", async () => {
+  it("the channel context a conversation fork's private turn's server is given names no channel, its home included, and no message it answers", async () => {
     const probe = contextProbe();
     // A fork takes no untargeted inbound, so the surface names it.
     const surface = new SurfaceModule(['agent']);

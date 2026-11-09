@@ -218,8 +218,8 @@ describe('locked prose routing', () => {
     const primers = windowTexts(framework).filter((t) => t.startsWith('[prose-routing]'));
     assert.deepEqual(primers, [
       '[prose-routing] Locked routing: your plain speech goes to discord:g:main, on every turn, until you move it with prose_locus, ' +
-        'except while a message from a surface with no channel (such as a console, the TUI or an API call) is unanswered or is the ' +
-        "newest message you've had, or on a turn that continues one where that held: then it goes to no channel. " +
+        'except while a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered or is the ' +
+        "newest message there, or on a turn that continues one where that held: then it goes to no channel. " +
         'The channel a message comes from no longer moves it; other channels need an explicit send tool.',
     ]);
     assert.ok(!windowTexts(framework).some((t) => t.startsWith('[routing]')), 'no locus announcements');
@@ -772,7 +772,7 @@ describe('locked prose routing', () => {
     const internals = framework as unknown as {
       routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: unknown): Promise<unknown>;
     };
-    const routing = { turnId: 1, locked: true, heldForMove: true, locus: { serverId: 'stub', channelId: 'discord:g:ops' }, wasIn: [], engaged: new Set(), deliveries: [], drafts: [] as unknown[], suppressed: 0, keptPrivate: 0 };
+    const routing = { turnId: 1, locked: true, heldForMove: true, locus: { serverId: 'stub', channelId: 'discord:g:ops' }, wasIn: [], engaged: new Set(), deliveries: [], drafts: [] as unknown[], suppressed: 0, keptPrivate: 0, keptForPrivacy: 0 };
     const outcome = await internals.routeLocusSpeech(framework.getAgent('assistant'), { routing, notice: 'later' }, 'A later stream, live.', routing.locus);
     assert.equal(outcome, null);
     assert.deepEqual(routed, [], 'not posted at the new lock');

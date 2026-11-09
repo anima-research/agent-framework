@@ -790,12 +790,12 @@ describe('explicit prose routing', () => {
 
   type RoutingState = {
     pin?: ChannelRef; hybridHold?: 'private' | 'failed';
-    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number;
+    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number; keptForPrivacy: number;
     triggerChannel?: ChannelRef; locus?: ChannelRef; engaged: Set<string>; wasIn: ChannelRef[]; arrivals: Array<{ messageId: string; channel: ChannelRef }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
-    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0,
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, keptForPrivacy: 0,
     engaged: new Set(), wasIn: [], arrivals: [], ...fields,
   });
 

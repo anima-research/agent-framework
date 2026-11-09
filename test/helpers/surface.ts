@@ -24,13 +24,19 @@ export const surfaceMessage = (content: string, source = 'tui') =>
 export class ActModule implements Module {
   readonly name = 'probe';
   readonly acts: Array<() => unknown> = [];
+  readonly errors: unknown[] = [];
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'act', description: 'Act', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
-    await this.acts.shift()?.();
+    try {
+      await this.acts.shift()?.();
+    } catch (error) {
+      this.errors.push(error);
+      throw error;
+    }
     return { success: true, data: 'acted' };
   }
   async onProcess(): Promise<EventResponse> { return {}; }
