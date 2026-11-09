@@ -1,3 +1,5 @@
+import { isReasoningLoss } from './reasoning-loss.js';
+export { residentViewFilter, subconsciousViewFilter } from './context-options.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -11478,10 +11480,12 @@ export class AgentFramework {
           store: this.store,
           namespace,
           isolate: true,
+          viewFilter: (message) => !isReasoningLoss(message.metadata),
           strategy: config.strategy ?? new PassthroughStrategy(),
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
         });
+        this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
         ownSlot = { namespace };
       }
       // Either manager is the run's to release (main's manager release), the derived one included.
@@ -11891,7 +11895,8 @@ export class AgentFramework {
    * The returned manager uses a passthrough strategy, so nothing is
    * folded: its compile is the agent's window as the agent's view shows it
    * (the rows the window holds, through its view filter), and in legacy
-   * mode, where the window is the record, the record so. getAllMessages()
+   * mode, where the window is the record, the record so. These compiled
+   * views omit legacy reasoning-loss notices. getAllMessages()
    * lists the record. An ended agent's context is the real one — treat it as
    * read-only unless you mean to change what a later resume starts from.
    */
@@ -12015,9 +12020,9 @@ export class AgentFramework {
    * and what it observes (context-options.ts): a resident's, on the
    * residents' slot, or for an isolated agent that watches that slot, the
    * residents' view when its edge leaves held traffic out, and the
-   * subconscious's when it shows it. Undefined for an isolated agent that
+   * subconscious's when it shows it. For an isolated agent that
    * watches no residents' slot on its branch (a worker, a conversation
-   * fork), whose context was opened with no filter.
+   * fork), whose view excludes only legacy reasoning-loss notices.
    */
   private liveViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
     if (record.ownSlot?.namespace === null) return residentViewFilter(record.name);
@@ -12025,7 +12030,7 @@ export class AgentFramework {
       const slot = this.registry.observedSlotOf(edge);
       return slot !== undefined && slot.branch === undefined && sameSlot(slot, RESIDENTS_SLOT);
     });
-    if (residents.length === 0) return undefined;
+    if (residents.length === 0) return (message) => !isReasoningLoss(message.metadata);
     return residents.some((edge) => edge.includeHeld === true) ? subconsciousViewFilter(record.name) : residentViewFilter(record.name);
   }
 
@@ -12052,7 +12057,7 @@ export class AgentFramework {
    * (deriveSharedContext): what the agent its chain of derivations started
    * from sees (liveViewFilterOf), and the stored injections of each agent in
    * the chain, which carry that agent's name and would otherwise read as
-   * another's. Undefined when the owner's context has no filter.
+   * another's. Legacy notices remain excluded even for an own injection.
    */
   private derivedViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
     const owner = this.viewOwnerOf(record);
@@ -12067,7 +12072,8 @@ export class AgentFramework {
       current = parent;
     }
     if (names.length === 0) return ownerSees;
-    return (message) => ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name));
+    return (message) => !isReasoningLoss(message.metadata)
+      && (ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name)));
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -12114,13 +12120,11 @@ export class AgentFramework {
     // reads through it, and is recorded beside the manager (storeSees), so
     // main's checks of whether an agent sees a row (agentSees: a tool
     // boundary's injection, an arrival, a reader of an unread message) ask
-    // what its compile shows. A source with no view recorded has no filter
-    // (an isolated run's): it sees every row, so its fork keeps none, and
-    // sees its own.
+    // what its compile shows. The global legacy-notice exclusion applies
+    // even when the source has no additional view recorded.
     const sourceSees = this.storeSees.get(source);
-    const sees = sourceSees
-      ? (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name)
-      : undefined;
+    const sees = (metadata: unknown): boolean => !isReasoningLoss(metadata)
+      && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name));
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -12130,10 +12134,10 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+      viewFilter: (message) => sees(message.metadata),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    if (sees) this.storeSees.set(contextManager, sees);
+    this.storeSees.set(contextManager, sees);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
@@ -20153,6 +20157,7 @@ export class AgentFramework {
         store: this.store,
         namespace: `conversations/${name}`,
         isolate: true,
+        viewFilter: (message) => !isReasoningLoss(message.metadata),
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
         // Provider cooldown ownership belongs to the persistent resident only;
@@ -20163,6 +20168,7 @@ export class AgentFramework {
       });
       release.manager = contextManager;
       this.trackManager(contextManager);
+      this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
 
       // Seed with the template's compiled context, renaming the template
       // participant so the fork reads its inheritance as its own history.
@@ -25062,7 +25068,7 @@ export class AgentFramework {
 
   private agentSees(agent: Agent, metadata: unknown): boolean {
     const sees = this.storeSees.get(agent.getContextManager());
-    return !sees || sees(metadata);
+    return !isReasoningLoss(metadata) && (!sees || sees(metadata));
   }
 
   /**
@@ -40940,8 +40946,9 @@ export class AgentFramework {
   /**
    * Whether `agent`'s view leaves suppressed rows out, asked of the view
    * itself (storeSees): every resident's, the subconscious's and a view
-   * derived from one does; an isolated agent's own store has no view filter,
-   * so a row stamped there would render.
+   * derived from one does. An isolated agent's own view excludes legacy
+   * reasoning-loss notices, not suppressed rows, so a suppressed row stamped
+   * there would render.
    */
   private viewHidesSuppressed(agent: Agent | undefined): boolean {
     if (!agent) return false;

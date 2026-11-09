@@ -152,6 +152,25 @@ A turn keeps the messages it opened with whole: at a start that opens a turn, th
 
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
+#### Legacy reasoning-loss notices
+
+Rows marked with both `metadata.system === true` and
+`metadata.kind === 'reasoning-loss'` are omitted from the agent's compiled
+context and compression inputs only. Stored history is unchanged: history
+`extract`, `search` and around-message lookup still return these notices
+verbatim, and tool output or previously written summaries can reintroduce their
+text. Selection never matches notice text.
+
+Hosts opening the same stores should use the package's
+`residentViewFilter(message, agentName)` or
+`subconsciousViewFilter(message, agentName)` rather than copy the view rules.
+On context-manager releases up to at least 0.25.1, a hidden first source can place that
+summary after newer messages; a hidden first or last source makes it permanently
+unmergeable and absent from history overview until anima-research/context-manager#369 or equivalent lands. The release that raises the context-manager dependency floor to a version
+containing that fix should remove this migration limit and the migration test
+`todo`. See the
+[release note](changelog.d/973-reasoning-loss.fixed.md).
+
 ### Persistence
 
 All state is persisted in a [Chronicle](https://github.com/antra-tess/chronicle) store:
