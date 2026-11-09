@@ -13,7 +13,8 @@
 
 import { NOTICE_TAG } from '../notice-tags.js';
 import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-text.js';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { SuppressScripts, type SuppressScriptEvent } from './suppress-scripts.js';
@@ -5092,22 +5093,29 @@ export class EventGate {
       if (raw === null || typeof raw !== 'object' || raw.version !== 1 || !Array.isArray(raw.selfWakes)) {
         throw new Error('not a version 1 wake journal');
       }
-      const selfWakes = raw.selfWakes.filter((entry) => {
+      // An entry's note is the agent's own words: a skipped entry is named
+      // by its place and its keys, not quoted.
+      const describe = (entry: unknown): string => entry && typeof entry === 'object'
+        ? `keys ${Object.keys(entry as object).join(', ') || '(none)'}`
+        : `a ${entry === null ? 'null' : typeof entry}`;
+      const selfWakes = raw.selfWakes.filter((entry, i) => {
         const valid = validWakeIntent(entry, false);
-        if (!valid) console.error(`[gate] wake journal: skipping an invalid self-wake entry: ${cutToFit(JSON.stringify(entry), 200)}`);
+        if (!valid) console.error(`[gate] wake journal: skipping self-wake entry ${i}, which isn't one the gate can read (${describe(entry)})`);
         return valid;
       }) as PersistedWakeIntent[];
       let sleep: PersistedWakeIntent | undefined;
       if (raw.sleep !== undefined) {
         if (validWakeIntent(raw.sleep, true)) sleep = raw.sleep;
-        else console.error(`[gate] wake journal: skipping an invalid sleep entry: ${cutToFit(JSON.stringify(raw.sleep), 200)}`);
+        else console.error(`[gate] wake journal: skipping the sleep entry, which isn't one the gate can read (${describe(raw.sleep)})`);
       }
       return { version: 1, ...(sleep ? { sleep } : {}), selfWakes };
     } catch (error) {
-      const quarantine = `${this.wakeStatePath}.corrupt-${this.now()}`;
+      // One copy is kept for a look, the latest: a journal that keeps
+      // breaking doesn't fill the disk with copies.
+      const quarantine = `${this.wakeStatePath}.corrupt`;
       try {
         renameSync(this.wakeStatePath, quarantine);
-        console.error(`[gate] wake journal unreadable, set aside as ${quarantine}: ${errorText(error)}`);
+        console.error(`[gate] wake journal unreadable, set aside as ${quarantine} (replacing an earlier copy, if any): ${errorText(error)}`);
       } catch (renameError) {
         console.error(`[gate] wake journal unreadable (${errorText(error)}), and setting it aside failed: ${errorText(renameError)}`);
       }
@@ -5134,8 +5142,17 @@ export class EventGate {
       })),
     };
     mkdirSync(dirname(this.wakeStatePath), { recursive: true });
-    const tmp = `${this.wakeStatePath}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+    // A name of this writer's own, and the bytes on disk before the rename:
+    // a `durable: true` answered to the agent means the journal survives a
+    // power loss, not only a crash.
+    const tmp = `${this.wakeStatePath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+    const fd = openSync(tmp, 'w', 0o600);
+    try {
+      writeSync(fd, JSON.stringify(state, null, 2) + '\n');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, this.wakeStatePath);
   }
 

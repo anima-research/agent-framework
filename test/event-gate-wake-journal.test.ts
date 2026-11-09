@@ -17,7 +17,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventGate } from '../src/gate/event-gate.js';
 
@@ -308,7 +308,7 @@ describe('EventGate wake journal', () => {
       assert.strictEqual(inferenceRequests.length, 0);
       assert.strictEqual(gate.getSleepState(), null);
       assert.ok(!existsSync(gate.wakeJournalPath));
-      assert.ok(readdirSync(TMP_DIR).some((f) => f.startsWith('gate.wake-intents.json.corrupt-')));
+      assert.ok(existsSync(join(TMP_DIR, 'gate.wake-intents.json.corrupt')));
       assert.ok(logged.some((l) => /wake journal unreadable, set aside as/.test(l)));
       gate.dispose();
     } finally {
