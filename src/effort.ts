@@ -1,6 +1,6 @@
 import * as membrane from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
-import type { CompileResult, MessageId } from '@animalabs/context-manager';
+import type { CompileResult, ContextManager, MessageId } from '@animalabs/context-manager';
 import type { EffortLevel } from './types/framework.js';
 
 /** Membrane sends an effort-only `system_change` from the release that exports `SYSTEM_CHANGE_EFFORT` (0.10.0); an earlier one leaves it out unsent. */
@@ -33,19 +33,13 @@ export function effortRowOf(metadata: unknown): string | undefined {
   return typeof of === 'string' ? of : undefined;
 }
 
-/** Where a stored row's metadata is read: a context manager's store, else its window. */
-export interface EffortMarkSource {
-  getMessage(id: MessageId): { metadata?: unknown } | null;
-  getPresentedMessages?(): ReadonlyArray<{ id: MessageId; metadata?: unknown }>;
-}
-
 /**
  * For a compile of `cm`, the marks of each compiled message's stored rows (effortRowOf of each, one per row the
  * compile's provenance names; none where it names none). A row of a slot merged into the view isn't in the store,
  * so it's read from the window. A row the store can't read just now is told to `unread`, and counts as unmarked.
  */
 export function effortMarksOf(
-  cm: EffortMarkSource,
+  cm: Pick<ContextManager, 'getMessage'> & Partial<Pick<ContextManager, 'getPresentedMessages'>>,
   result: Pick<CompileResult, 'provenance'>,
   unread: (id: MessageId, error: unknown) => void,
 ): (i: number) => Array<string | undefined> {
