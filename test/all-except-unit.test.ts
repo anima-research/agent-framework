@@ -30,6 +30,7 @@ function harness(held: { stored?: Held[]; kept?: Held[]; writesHeld?: () => bool
   const anchors: number[] = [];
   const registry = {
     getTuneOutState: () => null,
+    tuneOutsOnRecord: () => [],
     // Each channel is shown by its id where no other server registers it,
     // and with its server where two do (general, on disc and slack).
     nameShown: (ref: { serverId: string; channelId: string }) => (ref.channelId === 'general' ? `${ref.channelId} (${ref.serverId})` : ref.channelId),
