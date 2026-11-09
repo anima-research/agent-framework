@@ -174,6 +174,16 @@ for (const [name, why] of [['', 'the call the block gave no name to'], ['probe--
   });
 }
 
+test("a call named utils with a reason is refused with the block's reason, not utils' removal", async () => {
+  const h = await harness();
+  try {
+    const results = await h.turn([marked(BLOCK, 'utils', {}, REASON)]);
+    assert.deepEqual(h.effects, []);
+    assert.equal(results[0]!.isError, true);
+    assert.ok(results[0]!.content.endsWith(`: ${REASON}. ${RESEND}`), results[0]!.content);
+  } finally { await h.close(); }
+});
+
 test('for an agent with allowedTools, a call cut off with no reason to a tool the agent may not call gets the allowedTools refusal', async () => {
   const h = await harness({ allowedTools: ['probe--move'] });
   try {
@@ -189,6 +199,7 @@ test('a call marked with a reason is refused even when its text is JSON null', a
   try {
     const results = await h.turn([marked('null', 'probe--move', {}, REASON)]);
     assert.deepEqual(h.effects, []);
+    assert.equal(results[0]!.isError, true);
     assert.equal(results[0]!.content, `Nothing was done: probe--move didn't run, because the function_calls block it was in isn't well-formed: ${REASON}. ${RESEND}`);
   } finally { await h.close(); }
 });
@@ -374,6 +385,17 @@ test("for an agent with allowedTools, a call with a reason through executeToolCa
     assert.equal(result.success, false);
     assert.ok((result.error ?? '').endsWith(`: ${REASON}. ${RESEND}`), result.error);
     assert.equal(h.effects.length, 0);
+  } finally { await h.close(); }
+});
+
+test("a call named utils with a reason through executeToolCall fails with the block's reason, not utils' removal", async () => {
+  const h = await harness();
+  try {
+    const result = await h.framework.executeToolCall({
+      id: 'programmatic', name: 'utils', input: {}, unparseableInput: BLOCK, unparseableReason: REASON, callerAgentName: 'assistant',
+    });
+    assert.equal(result.success, false);
+    assert.ok((result.error ?? '').endsWith(`: ${REASON}. ${RESEND}`), result.error);
   } finally { await h.close(); }
 });
 

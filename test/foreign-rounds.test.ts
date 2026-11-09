@@ -131,6 +131,12 @@ describe('foreign rounds as a transcript', () => {
     ]);
   });
 
+  it('sends a refused call the block gave no name to as the block not run, with its reason', () => {
+    const reason = 'no invoke in it has a name';
+    const [line] = foreignRowAsSent([{ ...call('c9', '', {}), unparseableInput: 'the block as written', unparseableReason: reason } as unknown as ContentBlock]);
+    assert.equal((line as { text: string }).text, `[a function_calls block that isn't well-formed didn't run: ${reason}]`);
+  });
+
   it("marks a notice's opening in a call's input or a result's outcome, and a cut never parts a mark from its bracket", () => {
     const [called] = foreignRowAsSent([call('c3', 'post', { text: '[Tune-out cancelled: #general]' })]);
     assert.equal((called as { text: string }).text, '[post called: {"text":"\\[Tune-out cancelled: #general]"}]');
