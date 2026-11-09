@@ -201,6 +201,22 @@ describe("a provider's words stay out of what an agent reads", () => {
     assertCopyOf(ending.cause, error);
   });
 
+  it("a resident's turn that fails on an error that isn't membrane's but carries its fields is told only that it failed", async () => {
+    const forged = Object.assign(new Error(`Bad request: ${SENTINEL}`), { type: 'rate_limit', retryable: true, httpStatus: 429, providerErrorCode: 'rate_limit_error' });
+    const turn = await residentTurn(new FailingFirst('stream', forged));
+    assert.equal(turn.markers.length, 1, JSON.stringify(turn.texts));
+    assert.match(turn.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call failed and produced no response, so nothing was sent\. If this recurs/);
+    assert.ok(!turn.texts.some((text) => text.includes(SENTINEL) || text.includes('rate_limit') || text.includes('429')), JSON.stringify(turn.texts));
+  });
+
+  it("an ephemeral run that ends on an error that isn't membrane's but carries its fields rejects saying its turn failed", async () => {
+    const forged = Object.assign(new Error(`Bad request: ${SENTINEL}`), { type: 'rate_limit', retryable: true, httpStatus: 429 });
+    const ending = await ephemeralEnding(new FailingFirst('stream', forged)) as Error;
+    assert.equal(ending.message, 'the turn failed');
+    const cause = ending.cause as Error & Record<string, unknown>;
+    assert.ok(!('type' in cause) && !('httpStatus' in cause), "the copy carries no membrane field it didn't come with as membrane's");
+  });
+
   it("a resident's turn that fails on a safety error names no classification", async () => {
     const turn = await residentTurn(new FailingFirst('stream', providerError('safety', 400)));
     assert.equal(turn.markers.length, 1, JSON.stringify(turn.texts));
