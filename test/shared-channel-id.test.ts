@@ -1640,7 +1640,7 @@ async function until(condition: () => boolean, what: string, ms = 60_000): Promi
   }
 }
 
-type ToolResult = { success: boolean; data?: unknown; error?: string };
+type ToolResult = { success: boolean; data?: unknown; error?: string; isError?: boolean };
 
 /** The tool results the framework pushes, by call id, kept from its queue. */
 function toolResults(t: TestContext, framework: AgentFramework): Map<string, ToolResult> {
@@ -1979,6 +1979,7 @@ test("a fork's channel_publish with a channelId that isn't a string is refused a
     dispatch('scout', { id, name: 'channel_publish', input });
     await until(() => results.has(id), `the ${id} publish`);
     assert.equal(results.get(id)?.success, false, `${id}: ${JSON.stringify(results.get(id))}`);
+    assert.equal(results.get(id)?.isError, true, `${id}: the refusal reaches the model as an error`);
     assert.match(results.get(id)?.error ?? '', /^Nothing changed: channel_publish's channelId must be a string\./);
   }
   assert.deepEqual(f.calls.filter((c) => c.includes('publish')), [], 'nothing was published');
