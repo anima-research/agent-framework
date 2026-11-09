@@ -179,8 +179,11 @@ test("a resident whose turn a stated wait holds for its retry is mid-turn: not d
       const ctx = fw.getAgent('resident')!.getContextManager();
       const before = ctx.queryMessages({}).messages.map((m) => m.id);
       const first = ctx.queryMessages({}).messages.find((m) => JSON.stringify(m.content).includes('zz-first'))!;
-      const { cooldownUntil } = (fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownUntil: number | null } }> })
-        .agents.find((a) => a.name === 'resident')!.providerAdmission;
+      const entry = (fw.healthSnapshot() as { agents: Array<{ name: string; turnAlive: boolean; retrying: unknown; providerAdmission: { cooldownUntil: number | null } }> })
+        .agents.find((a) => a.name === 'resident')!;
+      assert.equal(entry.turnAlive, true, 'the held turn is alive in healthSnapshot');
+      assert.equal(entry.retrying, null, "a hold's retry isn't an error policy's wait; providerAdmission shows the hold");
+      const { cooldownUntil } = entry.providerAdmission;
       const until = new Date(cooldownUntil!).toISOString();
       await assert.rejects(fw.rollbackToMessage('resident', { messageId: first.id }), (error: Error & { code?: string }) => {
         assert.equal(error.code, 'agent-busy');

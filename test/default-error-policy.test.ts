@@ -890,6 +890,23 @@ test('a policy that says nothing of the retry is shown with the try it leads to 
   assert.deepEqual(Object.keys(health[0]!.retrying as object).sort(), ['nextTry', 'since', 'until']);
 });
 
+test("a policy's maxTries that isn't a positive whole number isn't shown", async (t: TestContext) => {
+  for (const maxTries of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, 2.5]) {
+    const membrane = new FlakyMembrane(1);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
+    const fw = await makeFramework(t, membrane, {
+      maxRetries: 1,
+      onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 200, maxTries } : { retry: false }),
+    });
+    const { waits, health } = watchWaits(fw);
+    fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+    await idle(fw);
+    assert.equal(waits.length, 1, `one wait under maxTries ${maxTries}`);
+    assert.equal('maxTries' in waits[0]!, false, `inference:waiting leaves out maxTries ${maxTries}`);
+    assert.equal('maxTries' in (health[0]!.retrying as object), false, `healthSnapshot leaves out maxTries ${maxTries}`);
+  }
+});
+
 test('a stop during the wait ends it, and healthSnapshot no longer says the turn is retrying', async (t: TestContext) => {
   const membrane = new FlakyMembrane(1);
   const fw = await makeFramework(t, membrane, {
