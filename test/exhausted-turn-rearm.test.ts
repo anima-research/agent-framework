@@ -383,7 +383,7 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
     const stalled = await stalledByMembrane(t);
     const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled), failsAt);
     assert.deepEqual(openingOf.get(stalled)?.map((e) => (e as { type: string }).type), [],
-      "membrane 0.8.0's stalled stream emits nothing before its cut, and the stall replays that");
+      "membrane 0.8.0's and 0.9.0's stalled streams emit nothing before their cut, and the stall replays that");
     const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 300, 900] });
     stderr.length = 0;
     r.say('zz-question');

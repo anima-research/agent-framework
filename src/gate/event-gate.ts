@@ -22,6 +22,8 @@ import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, rec
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
+import { failureWords } from '../failure-text.js';
+import { JudgeFailure } from './reply-judge.js';
 import { isSystemNotice } from '../mcpl/tags.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -46,6 +48,7 @@ import type {
   JudgeVerdict,
   UpcomingWake,
 } from './types.js';
+import { appendAll } from '../append-all.js';
 
 // Re-export types consumers need
 export type {
@@ -1742,7 +1745,7 @@ function readConfig(
       };
     }
   }
-  for (const rule of rules) sentences.push(...readingSentences(rule.reading, rule.outcome));
+  for (const rule of rules) appendAll(sentences, readingSentences(rule.reading, rule.outcome));
   // A list with no rules, or none the gate reads, where no sentence above said it has none.
   if (notUsed !== undefined && !sentences.some((said) => said.includes(notUsed))) {
     sentences.push(`${File} has no rules${rules.length > 0 ? ' but ones the gate leaves out' : ''}, so ${notUsedWhy}.`);
@@ -2179,9 +2182,15 @@ export function formatShadowWarning(w: ShadowWarning): string {
     + `A scope on ${later} naming the event types it's for clears this note.`;
 }
 
+function judgeFailureWords(err: unknown): string {
+  if (err instanceof JudgeFailure) return err.message;
+  return err instanceof Error ? failureWords(err, 'the call failed') : 'the call failed';
+}
+
 /** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
 function errorText(err: unknown): string {
   try {
+    if (err instanceof JudgeFailure && err.detail !== undefined) return `${err.message} (${err.detail})`;
     return err instanceof Error ? err.message : String(err);
   } catch {
     return 'a value that could not be printed';
@@ -4323,7 +4332,7 @@ export class EventGate {
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
     if (deciding) {
-      deciding.queued.push(...events);
+      appendAll(deciding.queued, events);
       this.capJudgeEvents(deciding.queued);
       return;
     }
@@ -4342,8 +4351,8 @@ export class EventGate {
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
+        reject(new JudgeFailure(`the judge took more than ${this.judgeTimeoutMs} ms`));
         abort.abort();
-        reject(new Error(`the judge took more than ${this.judgeTimeoutMs} ms`));
       }, this.judgeTimeoutMs);
       // Never keep the process alive on the judge's account.
       state.timer.unref?.();
@@ -4376,7 +4385,7 @@ export class EventGate {
   private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
     const held = this.judgeHeld.get(policyName);
     if (held) {
-      held.events.push(...events);
+      appendAll(held.events, events);
       held.judge = judge;
       this.capJudgeEvents(held.events);
     } else {
@@ -4502,7 +4511,7 @@ export class EventGate {
     }
     const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
     const reason = failed
-      ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
+      ? (err !== undefined ? judgeFailureWords(err) : 'the judge gave no verdict')
       : typeof verdict.reason === 'string' ? verdict.reason : '';
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0 } };
     record.verdicts[outcome]++;
@@ -4524,7 +4533,7 @@ export class EventGate {
     const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
     if (failed) {
       console.error(
-        `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${reason}), so its batch of ${state.events.length} `
+        `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${err !== undefined ? errorText(err) : reason}), so its batch of ${state.events.length} `
         + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
     }

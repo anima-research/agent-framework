@@ -32,6 +32,7 @@ import { keyOf, type ChangeSet, type ToolPresence } from './tool-presence.js';
 import { checkArgs, jsonText, renderToolDefinition, type HintedTool } from './tool-signature.js';
 import { McplRequestError } from './server-connection.js';
 import { BUILTIN_TOOLSET, type HostPresentation } from '../host-presentation.js';
+import { appendAll } from '../append-all.js';
 
 /** The namespace a reminder's stored injection carries. */
 export const TOOLSETS_REMINDER_NAMESPACE = 'mcpl-toolsets';
@@ -516,7 +517,7 @@ export class ToolsetsModule implements Module {
         return said;
       })
       : [];
-    lines.push(...unread);
+    appendAll(lines, unread);
     return lines.length ? textResult(`${result.data}\n${lines.join('\n')}`) : result;
   }
 

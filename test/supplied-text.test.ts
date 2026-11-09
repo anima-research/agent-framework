@@ -19,6 +19,13 @@ describe('marking many texts', () => {
     assert.deepEqual(markedTexts(['a', '', `[${NOTICE_TAG.routing}] b`]), ['a', '', `\\[${NOTICE_TAG.routing}] b`]);
   });
 
+  it("marks the rewind marker's tag, and the tag its rows had before, which stored rows still hold", () => {
+    assert.deepEqual(
+      markedTexts([`[${NOTICE_TAG.refusalRewind}] a`, '[refusal-rewind] b']),
+      [`\\[${NOTICE_TAG.refusalRewind}] a`, '\\[refusal-rewind] b'],
+    );
+  });
+
   it("finds the text that holds each of many openings with at most 2n·⌈log₂ n⌉ reads of the texts' starts, a bound that grows as n log n", () => {
     const n = 2_000;
     let reads = 0;
@@ -59,7 +66,7 @@ describe('notice openings in text the framework did not write', () => {
     }
   });
 
-  it('marks each opening membrane 0.8.0 writes into a request, and ordinary text its Image tag reaches too', () => {
+  it('marks each opening membrane 0.8.0 and 0.9.0 write into a request, and ordinary text its Image tag reaches too', () => {
     for (const text of [
       '[continuing]', '[Image 2]', '[Image omitted]', '[Tool Result: x]', '[image of a cat]', '[Start]',
       '[orphan tool_result for t1]: x', '[duplicate tool_result for t1, an error]: x',

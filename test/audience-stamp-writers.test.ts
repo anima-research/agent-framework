@@ -451,6 +451,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.noteInferenceExhausted': { count: 1, when: 'end', what: "an exhausted turn's [inference-failed] marker" },
   'framework.ts AgentFramework.settleDeliberateCancel': { count: 1, when: 'held-back', what: "a stop's [turn-interrupted] marker, held back once the stream no longer owns the agent" },
   'framework.ts AgentFramework.sweepExpiredConversations': { count: 1, when: 'held-back', what: "a fork's closure prompt, held back while a turn of the fork's is alive" },
+  'framework.ts AgentFramework.storeBudgetHoldNote': { count: 1, when: 'held-back', what: "a budget wait's note at its release, held back while a turn of the agent's is alive" },
   // #844's design question 1: a notice about the agent's own speech, so an
   // undo takes it with the turn. Written mid-round, before the boundary
   // whose stream hears it, so it is held back while the turn is alive.

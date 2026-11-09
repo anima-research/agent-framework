@@ -839,7 +839,11 @@ describe('runEphemeralToCompletion settle signal', () => {
       const { agent, contextManager } = await createEphemeral(framework);
       const run = runStartedEphemeral(framework, agent, contextManager);
 
-      await assert.rejects(run, /final failure/);
+      await assert.rejects(run, (rejection: Error) => {
+        assert.strictEqual(rejection.message, 'the turn failed');
+        assert.strictEqual((rejection.cause as Error | undefined)?.message, 'final failure', 'the final failure is its cause');
+        return true;
+      });
       assert.strictEqual(membrane.calls.length, 2, 'the retry attempt should run before settling');
       assert.strictEqual(framework.getAgent(agent.name), null);
     } finally {
