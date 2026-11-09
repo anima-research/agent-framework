@@ -8,7 +8,8 @@ export type { ApiEvent } from './api/index.js';
 export { HealthModule } from './health/index.js';
 export type { HealthModuleConfig } from './health/index.js';
 
-export { HistoryModule } from './history/index.js';
+export { HistoryModule, type HistoryModuleOptions } from './history/index.js';
+export type { SemanticIndexConfig } from './history/semantic.js';
 
 export { WorkspaceModule, WorkspaceReadError } from './workspace/index.js';
 export type { WorkspaceReadErrorCode, WorkspaceReadStage, WorkspaceDiskReadResult, ReadFileFromDiskOptions } from './workspace/index.js';
@@ -20,6 +21,7 @@ export type {
   ReadInput,
   WriteInput,
   EditInput,
+  EditManyInput,
   DeleteInput,
   LsInput,
   GlobInput,
@@ -29,7 +31,7 @@ export type {
   SyncInput,
 } from './workspace/index.js';
 
-export { DiscordModule, DiscordJsClient } from './discord/index.js';
+export { DiscordModule, DiscordJsClient, DiscordRefusal } from './discord/index.js';
 export type { DiscordJsClientConfig } from './discord/index.js';
 export type {
   DiscordModuleConfig,

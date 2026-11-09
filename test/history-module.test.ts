@@ -77,6 +77,25 @@ function buildStub(messages: StoredMessage[], opts: StubOptions = {}): { cm: Con
       const limit = args.limit ?? filtered.length;
       return { messages: filtered.slice(offset, offset + limit), matchedCount };
     },
+    // Time-only native query (search's candidate window and extract's
+    // aroundId use it for timestamp-ordered edges). Real contract:
+    // timestamp-ordered, `reverse` supported, matchedCount = PAGE size.
+    queryMessagesByTime(args: { fromMs?: number; toMs?: number; limit?: number; offset?: number; reverse?: boolean }): IndexedMessageQueryResult {
+      calls.push({ method: 'queryMessagesByTime', args });
+      if (opts.throwUnsupported) return unsupported();
+      let filtered = messages
+        .filter((m) => {
+          const ts = m.timestamp.getTime();
+          if (args.fromMs !== undefined && ts < args.fromMs) return false;
+          if (args.toMs !== undefined && ts > args.toMs) return false;
+          return true;
+        })
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+      if (args.reverse) filtered = filtered.reverse();
+      const offset = args.offset ?? 0;
+      const page = filtered.slice(offset, args.limit === undefined ? undefined : offset + args.limit);
+      return { messages: page, matchedCount: page.length };
+    },
     getChannelMessageCounts(): ChannelCount[] {
       calls.push({ method: 'getChannelMessageCounts', args: undefined });
       if (opts.throwUnsupported) return unsupported();
@@ -181,7 +200,7 @@ describe('HistoryModule', () => {
       const result = await h.handleToolCall(call('stats', { from: 'not-a-date' }));
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /Invalid ISO 8601 date/);
+      assert.match(result.error ?? '', /isn't an ISO 8601 date/);
     });
 
     it('surfaces the capability-absent error as a clean tool error, not a crash', async () => {
@@ -232,13 +251,17 @@ describe('HistoryModule', () => {
     });
 
     it('caps limit at the hard maximum before it reaches context-manager', async () => {
-      const { cm, calls } = buildStub(FIXTURE);
+      // More messages than the hard cap of 200, which the tool's schema states.
+      const many = Array.from({ length: 250 }, (_, i) => msg(`n${i}`, 1000 + i, 'User', [textBlock(`line ${i}`)], 'c1'));
+      const { cm } = buildStub(many);
       const h = new HistoryModule();
       h.bind(cm);
 
-      await h.handleToolCall(call('extract', { limit: 999999 }));
-      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
-      assert.equal((queryCall?.args as { limit?: number }).limit, 200);
+      const result = await h.handleToolCall(call('extract', { limit: 999999 }));
+      const data = result.data as { returned: number; hasMore: boolean; messages: unknown[] };
+      assert.equal(data.messages.length, 200, 'a page holds at most the hard cap');
+      assert.equal(data.returned, 200);
+      assert.equal(data.hasMore, true, 'and says there are more');
     });
 
     it('clamps an out-of-u32-range offset to the native ceiling instead of passing it through to wrap (reviewer repro)', async () => {
@@ -345,7 +368,9 @@ describe('HistoryModule', () => {
       h.bind(cm);
 
       const start = Date.now();
-      const result = await h.handleToolCall(call('search', { query: '(a+)+$', regex: true, maxScan: 1 }));
+      // A long one, so the refusal's quote of it is cut at 80 UTF-16 units, as every quote of a call's value is.
+      const pattern = `(a+)+$|${'q'.repeat(100)}`;
+      const result = await h.handleToolCall(call('search', { query: pattern, regex: true, maxScan: 1 }));
       const elapsed = Date.now() - start;
 
       // Returns well within a bounded time (module deadline is 2s; generous
@@ -357,7 +382,13 @@ describe('HistoryModule', () => {
       // indistinguishable from "no matches found", which is a lie.
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /timed out/i);
+      // The whole refusal, as the agent reads it.
+      assert.equal(
+        result.error,
+        `The search stopped, and returned nothing: matching the regular expression "(a+)+$|${'q'.repeat(72)}… against up to 1 `
+          + 'message took longer than 2000 ms, as a pattern that backtracks heavily can. Try a simpler pattern, '
+          + 'set "regex" to false to search for the text as written, or lower "maxScan".',
+      );
     });
 
     it('a normal regex against the same kind of input still matches correctly (worker path is not just failing everything)', async () => {
@@ -379,7 +410,7 @@ describe('HistoryModule', () => {
       const result = await h.handleToolCall(call('search', { query: '(unclosed', regex: true }));
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /Invalid regex/);
+      assert.match(result.error ?? '', /isn't a valid regular expression/);
     });
 
     it('reports truncated:true up front when the candidate window exceeds maxScan', async () => {
@@ -419,6 +450,235 @@ describe('HistoryModule', () => {
     });
   });
 
+  describe("an agent's words sent through a speech tool (#524)", () => {
+    const sent: StoredMessage[] = [
+      msg('s1', 1000, 'Glassy', [{ type: 'tool_use', id: 'a', name: 'telegram--send_message', input: { chat_id: 42, message: 'the meeting moved to Thursday' } }], 'c1'),
+      msg('s2', 2000, 'Glassy', [{ type: 'tool_use', id: 'b', name: 'telegram--reply_to_message', input: { chat_id: 42, message_id: 7, text: 'yes, Thursday at noon' } }], 'c1'),
+      msg('s3', 3000, 'Glassy', [{ type: 'tool_use', id: 'c', name: 'telegram--send_file', input: { chat_id: 42, file_path: '/tmp/minutes-0612.pdf', caption: 'the minutes from today' } }], 'c1'),
+      msg('s4', 4000, 'Glassy', [{ type: 'tool_use', id: 'd', name: 'telegram--edit_message', input: { chat_id: 42, message_id: 8, new_text: 'Thursday at one, not noon' } }], 'c1'),
+      msg('s5', 5000, 'Glassy', [{ type: 'tool_use', id: 'e', name: 'discord--send_message', input: { channelId: 'room', content: 'posted in the room' } }], 'c1'),
+      msg('s6', 6000, 'Glassy', [{ type: 'tool_use', id: 'f', name: 'channel_publish', input: { channelId: 'room', content: 'published to the room' } }], 'c1'),
+      msg('s7', 7000, 'Glassy', [{ type: 'tool_use', id: 'g', name: 'think', input: { content: 'a private note about Thursday' } }], 'c1'),
+      msg('s8', 8000, 'Glassy', [{ type: 'tool_use', id: 'h', name: 'telegram--send_scheduled_message', input: { chat_id: 42, message: 'a reminder that the report is due', schedule_date: '2026-11-02T09:00:00Z' } }], 'c1'),
+      msg('s9', 9000, 'Glassy', [{ type: 'tool_use', id: 'i', name: 'telegram--create_poll', input: { chat_id: 42, question: 'which room suits everyone?', options: ['the library', 'the hall'] } }], 'c1'),
+      msg('s10', 10000, 'Glassy', [{ type: 'tool_use', id: 'j', name: 'slack--reply_message', input: { channelId: 'C1', messageId: '1.2', content: 'replying in the thread' } }], 'c1'),
+      msg('s11', 11000, 'Glassy', [{ type: 'tool_use', id: 'k', name: 'slack--send_dm', input: { userId: 'U1', content: 'a word to one person' } }], 'c1'),
+      msg('s12', 12000, 'Glassy', [{ type: 'tool_use', id: 'l', name: 'slack--edit_message', input: { channelId: 'C1', messageId: '1.3', content: 'corrected in place' } }], 'c1'),
+      msg('s13', 13000, 'Glassy', [{ type: 'tool_use', id: 'm', name: 'channel_publish', input: { channelId: 'room', content: '  ', text: 'never posted' } }], 'c1'),
+      msg('s14', 14000, 'Glassy', [{ type: 'tool_use', id: 'n', name: 'discord--send_message' } as unknown as ContentBlock], 'c1'),
+      msg('s15', 15000, 'Glassy', [{ type: 'tool_use', id: 'o', input: { content: 'a call with no name' } } as unknown as ContentBlock], 'c1'),
+      msg('s16', 16000, 'Glassy', [{ type: 'tool_use', id: 'p', name: 'channel_publish', input: { channelId: 'room', content: null, text: 'a null content falls through to text' } }], 'c1'),
+      msg('s17', 17000, 'Glassy', [{ type: 'tool_use', id: 'q', name: 'world--say', input: { text: 'hello from the plaza', spoken: false } }], 'c1'),
+      msg('s18', 18000, 'Glassy', [{ type: 'tool_use', id: 'r', name: 'world--whisper', input: { to: 'p-7', text: 'meet me by the fountain' } }], 'c1'),
+      msg('s19', 19000, 'Glassy', [{ type: 'tool_use', id: 's', name: 'telegram--send_file', input: { chat_id: 42, file_path: '/tmp/agenda-0613.pdf' } }], 'c1'),
+      msg('s20', 20000, 'Glassy', [{ type: 'tool_use', id: 't', name: 'channel_publish', input: { channelId: 'room', content: '', text: 'never posted either' } }], 'c1'),
+    ];
+    const bound = () => {
+      const { cm } = buildStub(sent);
+      const h = new HistoryModule();
+      h.bind(cm);
+      return h;
+    };
+    const ids = async (h: HistoryModule, input: Record<string, unknown>) => {
+      const result = await h.handleToolCall(call('search', input));
+      assert.equal(result.success, true, result.error);
+      return (result.data as { matches: Array<{ id: string }> }).matches.map((m) => m.id);
+    };
+
+    it('search finds what was said through each one, under its own argument name', async () => {
+      const h = bound();
+      assert.deepEqual(await ids(h, { query: 'moved to Thursday' }), ['s1']);
+      assert.deepEqual(await ids(h, { query: 'Thursday at noon' }), ['s2']);
+      assert.deepEqual(await ids(h, { query: 'minutes from today' }), ['s3']);
+      assert.deepEqual(await ids(h, { query: 'at one, not noon' }), ['s4']);
+      assert.deepEqual(await ids(h, { query: 'posted in the room' }), ['s5']);
+      assert.deepEqual(await ids(h, { query: 'published to the room' }), ['s6']);
+      assert.deepEqual(await ids(h, { query: 'report is due' }), ['s8']);
+      assert.deepEqual(await ids(h, { query: 'suits everyone' }), ['s9']);
+      assert.deepEqual(await ids(h, { query: 'in the thread' }), ['s10']);
+      assert.deepEqual(await ids(h, { query: 'to one person' }), ['s11']);
+      assert.deepEqual(await ids(h, { query: 'corrected in place' }), ['s12']);
+      assert.deepEqual(await ids(h, { query: 'falls through to text' }), ['s16']);
+      assert.deepEqual(await ids(h, { query: 'from the plaza' }), ['s17']);
+      assert.deepEqual(await ids(h, { query: 'by the fountain' }), ['s18']);
+      assert.deepEqual(await ids(h, { query: 'minutes-0612' }), [], "a send's file path isn't searched");
+      assert.deepEqual(await ids(h, { query: 'agenda-0613' }), [], "a file sent alone isn't searched by its path");
+      assert.deepEqual(await ids(h, { query: 'private note' }), [], "a private tool's words aren't searched");
+      assert.deepEqual(await ids(h, { query: 'Thursday at (noon|one)', regex: true }), ['s2', 's4']);
+    });
+
+    it("search finds a send by its server's name for the tool", async () => {
+      assert.deepEqual(await ids(bound(), { query: 'telegram--send_message' }), ['s1']);
+      assert.deepEqual(await ids(bound(), { query: 'slack--send_dm' }), ['s11']);
+    });
+
+    it('search finds them under the agent as author', async () => {
+      assert.deepEqual(await ids(bound(), { query: 'Thursday', author: ['Glassy'] }), ['s1', 's2', 's4']);
+    });
+
+    it('extract shows each one as its name and its words, and a call with no words, no input or no name as before', async () => {
+      const result = await bound().handleToolCall(call('extract', { channelId: 'c1', format: 'text' }));
+      assert.equal(result.success, true, result.error);
+      const shown = (result.data as { messages: Array<{ content: string }> }).messages.map((m) => m.content);
+      assert.deepEqual(shown, [
+        '[telegram--send_message] the meeting moved to Thursday',
+        '[telegram--reply_to_message] yes, Thursday at noon',
+        '[telegram--send_file] the minutes from today',
+        '[telegram--edit_message] Thursday at one, not noon',
+        '[discord--send_message] posted in the room',
+        '[channel_publish] published to the room',
+        '[tool_use: think]',
+        '[telegram--send_scheduled_message] a reminder that the report is due',
+        '[telegram--create_poll] which room suits everyone?',
+        '[slack--reply_message] replying in the thread',
+        '[slack--send_dm] a word to one person',
+        '[slack--edit_message] corrected in place',
+        '[tool_use: channel_publish]',
+        '[tool_use: discord--send_message]',
+        '[tool_use: undefined]',
+        '[channel_publish] a null content falls through to text',
+        '[world--say] hello from the plaza',
+        '[world--whisper] meet me by the fountain',
+        '[tool_use: telegram--send_file]',
+        '[tool_use: channel_publish]',
+      ]);
+    });
+  });
+
+  describe("a speech tool's `text` and Slack's upload_file, after review (#524)", () => {
+    const sent: StoredMessage[] = [
+      msg('t1', 1000, 'Glassy', [{ type: 'tool_use', id: 'a', name: 'fixture--send_message', input: { channelId: 'room', text: 'sent through a text argument' } }], 'c1'),
+      msg('t2', 2000, 'Glassy', [{ type: 'tool_use', id: 'b', name: 'fixture--reply_message', input: { channelId: 'room', messageId: '1', text: 'replied through a text argument' } }], 'c1'),
+      msg('t3', 3000, 'Glassy', [{ type: 'tool_use', id: 'c', name: 'fixture--send_dm', input: { userId: 'u', text: 'a direct word as text' } }], 'c1'),
+      msg('t4', 4000, 'Glassy', [{ type: 'tool_use', id: 'd', name: 'fixture--edit_message', input: { channelId: 'room', messageId: '2', text: 'edited through text' } }], 'c1'),
+      msg('t5', 5000, 'Glassy', [{ type: 'tool_use', id: 'e', name: 'slack--send_message', input: { channelId: 'C1', content: 'what content holds', text: 'what text holds' } }], 'c1'),
+      msg('t7', 5500, 'Glassy', [{ type: 'tool_result', toolUseId: 'e', toolName: 'slack--send_message', content: 'not_in_channel', isError: true }], 'c1'),
+      msg('t6', 6000, 'Glassy', [{ type: 'tool_use', id: 'f', name: 'slack--upload_file', input: { channelId: 'C1', filename: 'positions.csv', content: 'symbol,qty', comment: 'the positions for Friday' } }], 'c1'),
+      msg('t8', 8000, 'Glassy', [{ type: 'tool_result', toolUseId: 'f', toolName: 'slack--upload_file', content: 'uploaded' }], 'c1'),
+    ];
+    const bound = () => {
+      const { cm } = buildStub(sent);
+      const h = new HistoryModule();
+      h.bind(cm);
+      return h;
+    };
+    const ids = async (h: HistoryModule, input: Record<string, unknown>) => {
+      const result = await h.handleToolCall(call('search', input));
+      assert.equal(result.success, true, result.error);
+      return (result.data as { matches: Array<{ id: string }> }).matches.map((m) => m.id);
+    };
+
+    it("search finds a send that carries its words as `text`, and reads the first of a row's arguments that's there", async () => {
+      const h = bound();
+      assert.deepEqual(await ids(h, { query: 'through a text argument' }), ['t1', 't2']);
+      assert.deepEqual(await ids(h, { query: 'direct word as text' }), ['t3']);
+      assert.deepEqual(await ids(h, { query: 'edited through text' }), ['t4']);
+      assert.deepEqual(await ids(h, { query: 'what content holds' }), ['t5']);
+      assert.deepEqual(await ids(h, { query: 'what text holds' }), [], 'content comes first, so text is not read beside it');
+    });
+
+    it("search finds an upload_file by its comment, not by the file it carries", async () => {
+      const h = bound();
+      assert.deepEqual(await ids(h, { query: 'positions for Friday' }), ['t6']);
+      assert.deepEqual(await ids(h, { query: 'symbol,qty' }), [], "the file's contents aren't searched");
+    });
+
+    it("search and regex search mark a send whose result, stored after it, failed, on the send's own label, and not one whose result succeeded", async () => {
+      const h = bound();
+      const snippets = async (input: Record<string, unknown>) => {
+        const result = await h.handleToolCall(call('search', input));
+        assert.equal(result.success, true, result.error);
+        return (result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]);
+      };
+      assert.deepEqual(await snippets({ query: 'what content holds' }), [['t5', '[slack--send_message, error] what content holds']]);
+      assert.deepEqual(await snippets({ query: 'content h[a-z]+s', regex: true }), [['t5', '[slack--send_message, error] what content holds']]);
+      assert.deepEqual(await snippets({ query: 'positions for Friday' }), [['t6', '[slack--upload_file] the positions for Friday']]);
+      assert.deepEqual(await snippets({ query: 'through a text argument' }), [
+        ['t1', '[fixture--send_message] sent through a text argument'],
+        ['t2', '[fixture--reply_message] replied through a text argument'],
+      ], 'a send with no result stored after it is shown as it was');
+    });
+
+    it('extract shows each by its words, a send whose result failed as an error on its own label too, and a failed result as an error', async () => {
+      const result = await bound().handleToolCall(call('extract', { channelId: 'c1', format: 'text' }));
+      assert.equal(result.success, true, result.error);
+      const shown = (result.data as { messages: Array<{ content: string }> }).messages.map((m) => m.content);
+      assert.deepEqual(shown, [
+        '[fixture--send_message] sent through a text argument',
+        '[fixture--reply_message] replied through a text argument',
+        '[fixture--send_dm] a direct word as text',
+        '[fixture--edit_message] edited through text',
+        '[slack--send_message, error] what content holds',
+        '[tool_result: slack--send_message, error]',
+        '[slack--upload_file] the positions for Friday',
+        '[tool_result: slack--upload_file]',
+      ]);
+    });
+
+    it("a match deep in a send's words shows the send's label first, marked when its result failed, then the words around the match", async () => {
+      const long = (lead: string) => `${'a'.repeat(100)} ${lead} at the end`;
+      const store: StoredMessage[] = [
+        msg('l1', 1000, 'Glassy', [{ type: 'tool_use', id: 'x', name: 'fixture--send_message', input: { channelId: 'room', text: long('needle') } }], 'c1'),
+        msg('l2', 1001, 'Glassy', [{ type: 'tool_result', toolUseId: 'x', toolName: 'fixture--send_message', content: 'Missing Access', isError: true }], 'c1'),
+        msg('l3', 2000, 'Glassy', [{ type: 'tool_use', id: 'y', name: 'fixture--send_message', input: { channelId: 'room', text: long('pin') } }], 'c1'),
+        msg('l4', 2001, 'Glassy', [{ type: 'tool_result', toolUseId: 'y', toolName: 'fixture--send_message', content: 'sent' }], 'c1'),
+      ];
+      const { cm } = buildStub(store);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const snippets = async (input: Record<string, unknown>) => {
+        const result = await h.handleToolCall(call('search', input));
+        assert.equal(result.success, true, result.error);
+        return (result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]);
+      };
+      const cut = `…${'a'.repeat(79)}`;
+      assert.deepEqual(await snippets({ query: 'needle at the end' }), [['l1', `[fixture--send_message, error] ${cut} needle at the end`]]);
+      assert.deepEqual(await snippets({ query: 'needle a[t]', regex: true }), [['l1', `[fixture--send_message, error] ${cut} needle at the end`]]);
+      assert.deepEqual(await snippets({ query: 'pin at the end' }), [['l3', `[fixture--send_message] ${'…'}${'a'.repeat(79)} pin at the end`]]);
+    });
+
+    it("a zero-length regex match at the end of a send's words takes the message's window, and a match ending there keeps the send's label", async () => {
+      const store: StoredMessage[] = [
+        msg('z1', 1000, 'Glassy', [
+          { type: 'tool_use', id: 'z', name: 'fixture--send_message', input: { channelId: 'room', text: 'hello there' } },
+          { type: 'tool_result', toolUseId: 'z', toolName: 'fixture--send_message', content: 'sent' },
+        ], 'c1'),
+      ];
+      const { cm } = buildStub(store);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const snippets = async (query: string) => {
+        const result = await h.handleToolCall(call('search', { query, regex: true }));
+        assert.equal(result.success, true, result.error);
+        return (result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]);
+      };
+      assert.deepEqual(await snippets('(?= \\[tool_result)'), [['z1', '[fixture--send_message] hello there [tool_result: fixture--send_message]']]);
+      assert.deepEqual(await snippets('there(?= \\[tool_result)'), [['z1', '[fixture--send_message] hello there']]);
+    });
+
+    it("reads a send's result across its own body's shards and the results after it, and stops at a message of any other kind", async () => {
+      const shard = (m: StoredMessage, group: string, index: number): StoredMessage => ({ ...m, bodyGroupId: group, shardIndex: index, shardCount: 2 }) as StoredMessage;
+      const store: StoredMessage[] = [
+        shard(msg('s1', 1000, 'Glassy', [{ type: 'tool_use', id: 'p', name: 'fixture--send_message', input: { channelId: 'room', text: 'a sharded send' } }], 'c1'), 'g1', 0),
+        shard(msg('s2', 1000, 'Glassy', [textBlock(' and the rest of its body')], 'c1'), 'g1', 1),
+        msg('s3', 1000, 'Glassy', [{ type: 'tool_result', toolUseId: 'q', toolName: 'other--lookup', content: 'found' }], 'c1'),
+        msg('s4', 1001, 'Glassy', [{ type: 'tool_result', toolUseId: 'p', toolName: 'fixture--send_message', content: 'Missing Access', isError: true }], 'c1'),
+        msg('s5', 2000, 'Glassy', [{ type: 'tool_use', id: 'r', name: 'fixture--send_message', input: { channelId: 'room', text: 'a send with a word between' } }], 'c1'),
+        msg('s6', 2000, 'Ann', [textBlock('a word between the send and its result')], 'c1'),
+        msg('s7', 2001, 'Glassy', [{ type: 'tool_result', toolUseId: 'r', toolName: 'fixture--send_message', content: 'Missing Access', isError: true }], 'c1'),
+      ];
+      const { cm } = buildStub(store);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const result = await h.handleToolCall(call('search', { query: 'a sharded send|a send with a word between', regex: true }));
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual((result.data as { matches: Array<{ id: string; snippet: string }> }).matches.map((m) => [m.id, m.snippet]), [
+        ['s1', '[fixture--send_message, error] a sharded send'],
+        ['s5', '[fixture--send_message] a send with a word between'],
+      ]);
+    });
+  });
+
   describe('pagination input validation', () => {
     // Math.min(value, max) alone only enforces an UPPER bound —
     // Math.min(-1, 200) is -1, not clamped up to anything — so a negative
@@ -438,6 +698,8 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('extract', { limit: value }));
+        // The refusal quotes the value as given: Infinity and NaN as themselves, not as JSON's null.
+        assert.ok(result.error?.includes(`"limit" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0, 'must reject before ever calling context-manager');
@@ -448,6 +710,7 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('extract', { offset: value }));
+        assert.ok(result.error?.includes(`"offset" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0);
@@ -458,6 +721,7 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('search', { query: 'm', limit: value }));
+        assert.ok(result.error?.includes(`"limit" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0);
@@ -468,6 +732,7 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('search', { query: 'm', maxScan: value }));
+        assert.ok(result.error?.includes(`"maxScan" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0);
@@ -594,7 +859,7 @@ describe('HistoryModule', () => {
       const result = await h.handleToolCall(call('extract', { channelId: '#c1-labl' })); // typo
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /No channel history found/i);
+      assert.match(result.error ?? '', /no channel history matches/i);
       assert.match(result.error ?? '', /#c1-label/); // the suggestion made it into the error
     });
 
@@ -655,7 +920,7 @@ describe('HistoryModule', () => {
           assert.equal(result.isError, true);
           assert.match(
             result.error ?? '',
-            /No channel history found/i,
+            /no channel history matches/i,
             `${toolName}(${mention}) should surface the clean resolution error`,
           );
         }
@@ -676,12 +941,13 @@ describe('HistoryModule', () => {
     });
   });
 
-  it('rejects tool calls before bind()', async () => {
+  it('rejects tool calls before bind()', async (t) => {
+    t.mock.method(console, 'error', () => {});
     const h = new HistoryModule();
     const result = await h.handleToolCall(call('stats', {}));
     assert.equal(result.success, false);
     assert.equal(result.isError, true);
-    assert.match(result.error ?? '', /not bound/);
+    assert.match(result.error ?? '', /hasn't finished setting up the history module/);
   });
 
   it('rejects an unknown tool name', async () => {
@@ -691,6 +957,7 @@ describe('HistoryModule', () => {
     const result = await h.handleToolCall(call('bogus', {}));
     assert.equal(result.success, false);
     assert.equal(result.isError, true);
-    assert.match(result.error ?? '', /Unknown tool/);
+    assert.match(result.error ?? '', /There's no tool "history--bogus"/);
+    assert.equal(result.refused, undefined);
   });
 });

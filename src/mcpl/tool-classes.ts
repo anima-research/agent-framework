@@ -21,6 +21,7 @@
  */
 
 import { globMatch } from './tool-glob.js';
+import { logValue } from './log-value.js';
 
 export const TOOL_CLASSES = [
   'comms',
@@ -86,8 +87,11 @@ export const BUILTIN_TOOL_CLASSES: Readonly<Record<string, readonly ToolClass[]>
   wake: ['control'],
   wake_add_rule: ['control'],
   wake_remove_rule: ['control'],
+  wake_accept_suggestions: ['control'],
+  wake_decline: ['control'],
   event_tags: ['control'],
   prose_help: ['control'],
+  prose_locus: ['control'],
   // Files and blobs in the agent's own stores.
   save_recent_image: ['files'],
   read_image: ['files'],
@@ -116,7 +120,7 @@ export function parseDeclaredClasses(meta: unknown, toolName = '(unnamed)'): Too
   const raw = (meta as Record<string, unknown>)[TOOL_CLASS_META_KEY];
   if (raw === undefined) return undefined;
   if (!Array.isArray(raw)) {
-    console.error(`[mcpl] ${toolName}: _meta["${TOOL_CLASS_META_KEY}"] is not an array — treated as unclassed`);
+    console.error(`[mcpl] ${logValue(toolName)}: _meta["${TOOL_CLASS_META_KEY}"] is not an array — treated as unclassed`);
     return undefined;
   }
   const out: ToolClass[] = [];
@@ -124,7 +128,7 @@ export function parseDeclaredClasses(meta: unknown, toolName = '(unnamed)'): Too
     if (isToolClass(value)) {
       if (!out.includes(value)) out.push(value);
     } else {
-      console.error(`[mcpl] ${toolName}: unknown tool class ${JSON.stringify(value)} ignored (RFC-008 §3)`);
+      console.error(`[mcpl] ${logValue(toolName)}: unknown tool class ${logValue(value)} ignored (RFC-008 §3)`);
     }
   }
   return out.length > 0 ? out : undefined;

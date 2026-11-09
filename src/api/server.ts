@@ -12,6 +12,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
 import { ResumeBlockedError } from '../framework.js';
+import { isReleaseModel } from '../provider-waits.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
   ApiServerConfig,
@@ -77,7 +78,20 @@ export class ApiServer {
   private wss: WebSocketServer | null = null;
   private httpServer: ReturnType<typeof createServer> | null = null;
   private clients: Set<WebSocket> = new Set();
-  private currentBranch = 'main';
+  /** The store's branch as last read: what the API reports once the store has closed. */
+  private lastKnownBranch = 'main';
+
+  /**
+   * The store's current branch, read from the store while it's open. A cached
+   * name would go stale behind any move the API server didn't make itself (a
+   * rollback, a host's switch), and behind a switch whose move comes after
+   * its call returns, as one does once running maintenance has finished.
+   */
+  private get currentBranch(): string {
+    const store = this.framework.getStore();
+    if (!store.isClosed()) this.lastKnownBranch = store.currentBranch().name;
+    return this.lastKnownBranch;
+  }
 
   /** Map from client to their subscription IDs */
   private clientSubscriptions: Map<WebSocket, Set<string>> = new Map();
@@ -420,6 +434,37 @@ export class ApiServer {
       case 'host.maintenanceTick':
         this.requireAdminToken(params);
         return this.framework.maintenanceTick();
+      // A provider's stated retry-after is honoured across restarts; this is
+      // the explicit operator override (recorded, so a restart keeps it).
+      case 'host.releaseProviderWait': {
+        this.requireAdminToken(params);
+        const p = (params ?? {}) as { agentName?: unknown; model?: unknown; requester?: unknown };
+        if (typeof p.agentName !== 'string' || p.agentName === '') throw new Error('agentName is required');
+        // Only an omitted model, or '*', releases every model: a malformed one
+        // is refused before anything changes, never widened.
+        const model = p.model;
+        if (!isReleaseModel(model)) throw new Error("model must be a model name, or '*' (or omitted) for every model");
+        // A requester over this surface names itself, so the record says
+        // where the name came from ('api:<name>'), and it can't pass for a
+        // host command's requester.
+        return {
+          released: this.framework.releaseProviderWait(
+            p.agentName,
+            model,
+            typeof p.requester === 'string' && p.requester !== '' ? `api:${p.requester}` : 'api',
+          ),
+        };
+      }
+      // A read, like host.status: the admin token gates the verbs that change
+      // something. (The HTTP /hostmode read takes it because that response is
+      // readable cross-origin; this surface checks the origin.)
+      case 'host.providerWaits': {
+        const agentName = params?.agentName;
+        if (agentName !== undefined && typeof agentName !== 'string') {
+          throw new Error('agentName must be an agent name, or omitted for every agent');
+        }
+        return { waits: this.framework.providerWaitSnapshot(agentName) };
+      }
 
       default:
         throw new Error(`Unknown command: ${command}`);
@@ -444,6 +489,16 @@ export class ApiServer {
     if (!params.participant || !params.content) {
       throw new Error('participant and content are required');
     }
+    // ApiModule stores the participant as a name, and the message as one text
+    // block, which context-manager refuses unless its text is a string. So a
+    // participant or content that isn't text is refused here, where the
+    // caller hears it, rather than at dispatch.
+    if (typeof params.participant !== 'string') {
+      throw new Error('participant must be text');
+    }
+    if (typeof params.content !== 'string') {
+      throw new Error('content must be text');
+    }
 
     // Push api:message event for the ApiModule to handle
     this.framework.pushEvent({
@@ -465,7 +520,10 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    const { messages } = await contextManager.compile();
+    // A dry run: listed, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for (see
+    // Agent.compileWithInjections for what a dry run still leaves).
+    const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
     const offset = params?.offset ?? 0;
@@ -536,26 +594,29 @@ export class ApiServer {
       throw new Error('name is required');
     }
 
-    const store = this.framework.getStore();
-    const previousBranch = this.currentBranch;
+    const from = this.currentBranch;
 
-    store.switchBranch(params.name);
-    this.currentBranch = params.name;
-
-    // Reversible Discord awareness markers are part of the branch projection.
-    // Do not acknowledge the switch until add/remove operations were attempted.
-    await this.framework.syncDiscordAwarenessMarkers();
-
-    // Materialize config files from the new branch
-    const ws = this.framework.getModule('workspace');
-    if (ws && 'materializeMount' in ws) {
-      await (ws as any).materializeMount('_config');
+    // The framework switches the store and re-materializes the config mount;
+    // a branch switch adds or removes no Discord awareness marks. It refuses
+    // during a live turn or once stop() has begun, and stop() waits for one
+    // already running. It moves the store once any maintenance already
+    // running has finished, so the move can come after this call returns.
+    // It writes the switch to the operator log as a checkout over this
+    // surface.
+    // The event names this switch's own move, from the branch read here to
+    // the one it was asked for: another switch can move the store again
+    // before this one continues.
+    let switched = false;
+    try {
+      await this.framework.switchBranch(params.name, { requester: { via: 'api' } });
+      switched = true;
+    } finally {
+      // A later step can fail after the store has moved: clients still hear
+      // where it went. A refusal moved nothing, so there's nothing to tell.
+      if (switched || (this.currentBranch === params.name && params.name !== from)) {
+        this.broadcast('branch:switched', { from, to: params.name });
+      }
     }
-
-    this.broadcast('branch:switched', {
-      from: previousBranch,
-      to: params.name,
-    });
 
     return { switched: true };
   }
@@ -594,18 +655,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.undoLastTurn(params.agentName);
-
-    if (result.undone) {
-      this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'undo',
-      });
-    }
-
+    const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
+    await settled;
     return result;
   }
 
@@ -614,18 +665,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.redo(params.agentName);
-
-    if (result.redone) {
-      this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'redo',
-      });
-    }
-
+    const { settled, ...result } = this.framework.redo(params.agentName);
+    await settled;
     return result;
   }
 
@@ -666,10 +707,21 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
+    // A dry run: shown, never sent, so it persists no fold resolutions and
+    // queues none of the compression its fold plan calls for, at a
+    // hypothetical budget least of all (see Agent.compileWithInjections for
+    // what a dry run still leaves). Under the autobiographical strategy, a
+    // budget the context can't fit still throws: a dry run skips only
+    // context-manager's post-pick check, and an adaptive fold plan that
+    // doesn't fit then overruns at the middle's emission. Windowed
+    // passthrough's newest message alone is the one window that comes back
+    // larger than the budget.
     const { messages } = await contextManager.compile(
       params.maxTokens
         ? { maxTokens: params.maxTokens, reserveForResponse: 4096 }
-        : undefined
+        : undefined,
+      undefined,
+      { dryRun: true },
     );
 
     return { context: messages };

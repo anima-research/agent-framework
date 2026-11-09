@@ -1,17 +1,25 @@
+import type { ThinkingBindingEntry } from '@animalabs/membrane';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
-import type { SessionUsage } from '../usage/types.js';
+import type { UsageUpdatedEvent } from '../usage/types.js';
+import type { DraftReason } from '../prose-drafts.js';
+import type { MessageSlotRef } from '../dendrite/types.js';
+import type { PresentationOccasion } from '../presentation.js';
+import type { RecipeChanges } from '../gate/recipe-reconcile.js';
+import type { DesiredChannelState } from '../mcpl/channel-registry.js';
+import type { PushEventResult } from '../mcpl/types.js';
+import type { CoalescingAudit } from '../mcpl/push-coalescer.js';
 
 /**
  * Base for all trace events.
  * TraceEvents are observability-only — they NEVER drive logic.
  */
-export interface TraceEventBase {
+export type TraceEventBase = {
   /** When this trace was emitted */
   timestamp: number;
   /** Optional correlation ID for distributed tracing */
   traceId?: string;
-}
+};
 
 /**
  * Observability events emitted by the framework.
@@ -32,8 +40,22 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'process:completed';
       processEvent: ProcessEvent;
+      /** The modules' responses that applied: one refused for malformed
+       *  content is left out, and named by process:response-refused. */
       responses: ModuleProcessResponse[];
       durationMs: number;
+    })
+  /** A module's process response held content context-manager won't store,
+   *  in a message it adds or an edit it makes, and was refused whole before
+   *  any response to the event applied. `where` names the first such message
+   *  or edit in the response, such as `addMessages[1]`, and `places` is
+   *  malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'process:response-refused';
+      moduleName: string;
+      eventType: string;
+      where: string;
+      places: string[];
     })
 
   // Inference lifecycle
@@ -41,17 +63,34 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
-       * turn's plain prose will be routed to. Omitted for turns with no locus
-       * (heartbeats with no default channel). Observability only, like every
-       * trace field; lets external taps (e.g. a TTS relay) tag the whole
-       * activation with its channel without re-deriving routing.
+       * The turn's locus as this stream starts (locus and hybrid mode): where
+       * its unprefixed plain prose is published, unless a hybrid `>>>`
+       * destination takes it, or a re-pin or a `channel_open` moves the locus
+       * later in the turn. Omitted for a turn with no locus: explicit and
+       * disabled mode, a silent turn, and a heartbeat with no default
+       * channel. Observability only, like every trace field; lets external
+       * taps (e.g. a TTS relay) tag the whole activation with its channel
+       * without re-deriving routing.
        */
       channelId?: string;
+      /**
+       * The server that registers `channelId`, given with it. Two MCPL
+       * servers may register one channel id, so a tap that posts back to the
+       * turn's channel, such as a host telling it the turn failed, passes this
+       * server with the id. The streaming traces, `inference:tokens` and
+       * `inference:content_block`, carry the id alone.
+       */
+      serverId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
       silent?: boolean;
     })
   | (TraceEventBase & {
+      /**
+       * The model answered and the turn ended: with the stream's final
+       * response, or with a tool result carrying `endTurn`, which
+       * `inference:turn_ended` then follows. `tokenUsage` is the stream's
+       * usage, cumulative across its rounds.
+       */
       type: 'inference:completed';
       agentName: string;
       durationMs: number;
@@ -60,26 +99,62 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:aborted';
       agentName: string;
+      /** How long this start of the turn ran; after a context-budget restart, from the restart. */
       durationMs: number;
+      /**
+       * Why the turn ended unfinished: the reason its canceller gave
+       * `abortInference` or `Agent.cancelStream` (`'user'` when it gave
+       * none), `'shutdown'` for a turn `stop()` cancelled,
+       * `'quiesce_abandoned'` for a turn an operator quiesce abandoned, or,
+       * for a turn dropped before it sent anything (its agent replaced or
+       * removed, or the framework stopping or restarted), a sentence saying
+       * which.
+       */
       reason?: string;
     })
   | (TraceEventBase & {
       type: 'inference:failed';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
+      /** Bounded like `error`. */
       stack?: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A turn waiting out its error policy's delay before a retry says so:
+       * as the wait begins, with when it is due to end, and again every 60
+       * seconds while it lasts, while its agent is the one registered under
+       * its name, and never after the wait ends (its time coming, a stop, or
+       * an abort). The failure being retried is the `inference:failed` just
+       * before it. A host watching for agents gone quiet can tell a waiting
+       * one from a stuck one by it.
+       */
+      type: 'inference:waiting';
+      agentName: string;
+      /** When the wait is due to end (epoch ms): it counts down by its
+       *  timers, so a stalled event loop can end it later. Absent for a wait
+       *  too long for a date. */
+      until?: number;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
       /** Whether membrane classified the failure as retryable (observability). */
       retryable?: boolean;
       /**
-       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length').
-       * The poison-history breaker fires only on 'invalid_request'.
+       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length'),
+       * at most 128 characters. The poison-history breaker fires only on
+       * 'invalid_request' at HTTP 400, 413 or 422 or with no status, and on
+       * 'context_length' at 413 (shedMayHelp).
        */
       errorType?: string;
+      /** The provider's HTTP status, when the failure carried one. */
+      httpStatus?: number;
+      /** The provider's own error code, when it sent one (at most 128 characters). */
+      providerErrorCode?: string;
     })
 
   // Streaming inference lifecycle
@@ -95,7 +170,19 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel its typing shows, where the start's wake
+       *  came from, or, at a start whose wake names none, such as a budget
+       *  restart, the one the turn already shows. Disabled mode, and a silent
+       *  turn in any mode: none, though the turn may show typing, since its
+       *  text is never sent to a channel. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -110,7 +197,19 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel its typing shows, where the start's wake
+       *  came from, or, at a start whose wake names none, such as a budget
+       *  restart, the one the turn already shows. Disabled mode, and a silent
+       *  turn in any mode: none, though the turn may show typing, since its
+       *  text is never sent to a channel. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -122,6 +221,20 @@ export type TraceEvent =
       type: 'inference:usage';
       agentName: string;
       tokenUsage: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
+      /**
+       * The provider's report on the signed thinking of the call this event
+       * closes (membrane's `RoundReport.thinking`): blocks it dropped before
+       * the model saw them, and blocks it showed the model anyway because the
+       * check isn't enforced. `tokenUsage` beside it is the stream's running
+       * total, not this call's. The provider reports them for a request that
+       * carried the binding control, whoever asked for it:
+       * `thinkingBinding.dropBlock`, or a thinking config the host sends
+       * itself. Present only when the report names any block.
+       */
+      thinking?: {
+        dropped: ThinkingBindingEntry[];
+        mismatchAllowed: ThinkingBindingEntry[];
+      };
     })
   | (TraceEventBase & {
       type: 'inference:stream_resumed';
@@ -139,6 +252,66 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:turn_ended';
       agentName: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * Prose that delivery published, sent once the publish succeeds: the
+       * outgoing stream's chunk (MCPL Spec 14.3 `channels/outgoing/chunk`),
+       * emitted whether or not the channel's server takes the stream. It
+       * carries only what was published, so a consumer that speaks or shows
+       * it, such as a voice relay, never gets text that delivery withholds (a
+       * `skip_reply`, a silencing send, a private `think`, a hold, a bounce,
+       * a draft) or a publish the server didn't confirm (`delivered: true`):
+       * one refused before sending, one that threw, timed out or got an
+       * error answer, one the server reported undelivered
+       * (`delivered: false`), and one whose reply leaves `delivered` out.
+       * `inference:tokens` stays the model's text as it is written (held, as
+       * before, while a tool-result guard's batch is pending). A later
+       * publish to the same destination, a server and its channel, by the
+       * same stream opens with a paragraph break (`\n\n`), so a
+       * destination's chunks joined in `index` order are its text, its
+       * messages kept apart.
+       * `mcpl:speech-routed` also reports speech publishes, with no stream
+       * id, index or end, each once delivered: deliverSpeech's, the `sleep`
+       * tool's announcement among them, and a subconscious's
+       * `speak_in_channel`'s. A relay that voices the agent's prose takes
+       * this trace, with `inference:published_complete`, and not
+       * `mcpl:speech-routed` as well, and takes each message's id from its
+       * `messageId` to edit what it voiced.
+       */
+      type: 'inference:published';
+      agentName: string;
+      /** The server the prose is published to, and its channel there: two
+       *  servers' channels with the same id are two destinations. */
+      serverId: string;
+      channelId: string;
+      /** The stream's id, shared with its `channels/outgoing/*` notifications. */
+      inferenceId: string;
+      /** Increases by one per chunk of the stream, across its channels. */
+      index: number;
+      text: string;
+      /** The id the channel's server returned for this chunk's publish
+       *  (`ChannelsPublishResult.messageId`); absent when it returned none.
+       *  Each chunk is one publish, so each carries its own. */
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A stream's end for one destination it published to, a server and
+       * its channel, emitted on every exit path once the stream has ended
+       * and its deliveries have run, or, when the host stops, before its
+       * connections close: `text` is everything its `inference:published`
+       * chunks carried there by then, and none follows it. Like those
+       * chunks, it's emitted whether or not that server takes the stream,
+       * or registers the channel still; the MCPL
+       * `channels/outgoing/complete` goes to the server only when it does.
+       */
+      type: 'inference:published_complete';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      inferenceId: string;
+      text: string;
     })
 
   // Tool lifecycle
@@ -161,6 +334,7 @@ export type TraceEvent =
       module: string;
       tool: string;
       callId: string;
+      durationMs?: number;
       error: string;
       stack?: string;
     })
@@ -173,10 +347,21 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * A writable workspace existed but the oversized-result spill write
-       * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
+       * A module's onToolBatchComplete threw or outlasted its bound; the
+       * round went on without it.
+       */
+      type: 'module:batch_hook_failed';
+      agentName: string;
+      module: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * The workspace had a writable mount without an include, where spills
+       * go, but the oversized-result spill write failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
        * retained. Distinct from the no-workspace fallback, which is silent
-       * by design (nothing unexpected happened).
+       * by design (nothing unexpected happened), whether the setup has no
+       * writable mount or every writable mount has an include, as configured.
        */
       type: 'tool:spill_failed';
       label: string;
@@ -206,6 +391,10 @@ export type TraceEvent =
     })
 
   // Message lifecycle
+  /** A message stored, with its stored id. A write kept in memory first (a
+   *  live surgery's hold, or the wait for its agent's context manager to be
+   *  re-initialized) is traced once, as a release stores it, with source
+   *  `surgery-release`; its arrival isn't traced. */
   | (TraceEventBase & {
       type: 'message:added';
       messageId: string;
@@ -217,14 +406,182 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
-  /** RFC-006 coalescing decision record (received / displaced / removed /
-   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+  /** A write kept in memory until a live surgery's release (source
+   *  `surgery-release`) whose store threw there: none of it was stored, or,
+   *  with `mayBeStored`, context-manager couldn't tell what of it landed (the
+   *  first row it names as stored is traced as `message:added`, as a stored
+   *  write is). `external` is the address the write's metadata gave it, for
+   *  the module that wrote it
+   *  (the Discord module ends its record of a create with no row). The
+   *  agent's writes lost at a release are told of once besides, by an ops
+   *  alert of kind `store-held-lost`. */
+  | (TraceEventBase & {
+      type: 'message:lost';
+      source: string;
+      agentName: string;
+      external?: { source: string; id: string };
+      mayBeStored?: true;
+    })
+  /** A push/event refused at the MCPL boundary: visibly-empty content
+   *  (`empty-content`, answered -32602, with no `field` or `detail`), or a
+   *  coalesced occurrence the host refused. A refused occurrence's reason
+   *  follows the code the producer was answered with: `coalesce-invalid` when
+   *  the occurrence was the producer's to fix (-32602 malformed; -32017 or
+   *  -32023 for a channel not permitted or not registered), `coalesce-failed`
+   *  when the host itself failed (-32000, -32603). Its trace carries the
+   *  error's message in `detail`, and the failing `field` when the error
+   *  names one, and `channelId` when the push is refused for its channel
+   *  (-32017, -32023), so each refusal names its channel even while repeats
+   *  of its line are held back. An `eventId` that is missing or isn't a
+   *  string is traced as `''`. A push refused for its feature set, or as a
+   *  duplicate, gets a `[push-event-rejected]` line and no trace. */
+  | (TraceEventBase & {
+      type: 'mcpl:push-event-rejected';
+      serverId: string;
+      eventId: string;
+      featureSet: string;
+      reason: string;
+      field?: string;
+      channelId?: string;
+      detail?: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:push_event';
+      serverId: string;
+      eventId: string;
+      featureSet: string;
+      coalesce?: PushEventResult['coalesce'];
+    })
+  /** A channels/incoming message refused at the MCPL boundary: an
+   *  unregistered channel (`unknown-channel`, §14.5), visibly-empty content
+   *  (`empty-content`), or a coalesced item the host refused
+   *  (`coalesce-invalid` / `coalesce-failed`, with `detail`, and `field` when
+   *  the error names one, as for a push). A coalesced item refused with
+   *  -32602 (malformed) is answered `coalesce_invalid`, and one refused
+   *  otherwise (-32000, or an internal error) with the error's own message.
+   *  `messageId` is set whenever the message carries one. An uncoalesced
+   *  message without a channelId or messageId is answered `invalid
+   *  channel/message identity`, with no line and no trace. */
+  | (TraceEventBase & {
+      type: 'mcpl:channel-incoming-rejected';
+      serverId: string;
+      channelId: string;
+      messageId?: string;
+      reason: string;
+      field?: string;
+      detail?: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channels-register';
+      serverId: string;
+      channelIds: string[];
+      count: number;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channels-changed';
+      serverId: string;
+      /** The `id` of each descriptor in the notification's `added`, rejected ones included, as the server sent it: not validated, so a malformed descriptor's might not be a string. */
+      added: string[];
+      /** The notification's `removed`, as the server sent it: not validated, so a channel the server names by a number arrives as that number. */
+      removed: string[];
+      /** As `added`, for the notification's `updated`. */
+      updated: string[];
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channels-incoming';
+      serverId: string;
+      messageCount: number;
+      /** The distinct `channelId`s of the batch's messages, rejected ones included, as the server sent them: not validated, so a malformed message's might not be a string. */
+      channelIds: string[];
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-descriptor-rejected';
+      serverId: string;
+      channelId?: string;
+      reason: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-lazy-registered';
+      serverId: string;
+      channelId: string;
+      label: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-opened-by-send';
+      serverId: string;
+      channelId: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-open-failed';
+      serverId: string;
+      channelId: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-open-substituted';
+      serverId: string;
+      channelId: string;
+      answeredFor: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-reconcile-failed';
+      serverId: string;
+      channelId: string;
+      desired?: DesiredChannelState;
+      attempts?: number;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-reconcile-skipped';
+      serverId: string;
+      reason: string;
+    })
+  /** MCPL content that context-manager won't store, because it doesn't
+   *  match ContentBlock, reached the store/wake site and was refused there:
+   *  no row, no wake. `places` is malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'mcpl:malformed-content-refused';
+      lane: 'push' | 'channel';
+      serverId: string;
+      places: string[];
+      eventId?: string;
+      channelId?: string;
+      messageId?: string;
+    })
+  /** MCPL content with nothing model-visible reached the store/wake site
+   *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */
+  | (TraceEventBase & {
+      type: 'mcpl:empty-content-dropped';
+      lane: 'push' | 'channel';
+      serverId: string;
+      eventId?: string;
+      channelId?: string;
+      messageId?: string;
+    })
+  /** RFC-006 coalescing decision record, by `kind`.
+   *  A late-render whose push/render had already timed out, its fallback
+   *  materialized, is recorded by the connection's wiring rather than the
+   *  coalescer: it names `serverId`, `featureSet`, `key` and, for a
+   *  channel-scoped subject, `channelId` instead of `subject`, carries a late
+   *  JSON-RPC error as `error` (`[code] message`, bounded), and its `eventId`
+   *  links it to the batch's render-failed. */
+  | (TraceEventBase & { type: 'mcpl:coalescing' } & CoalescingAudit)
   | (TraceEventBase & {
       type: 'mcpl:coalescing';
-      kind: string;
-      subject?: string;
+      kind: 'late-render';
+      serverId: string;
       eventId?: string;
-      [key: string]: unknown;
+      featureSet?: string;
+      key?: string;
+      channelId?: string;
+      discarded: true;
+      error?: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:coalescing';
+      kind: 'turn-withdrawn';
+      agentName: string;
+      subjects: string[];
     })
 
   // EventGate lifecycle
@@ -246,9 +603,42 @@ export type TraceEvent =
       eventCount: number;
     })
   | (TraceEventBase & {
+      /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
+       *  `reply` or `wait` as the judge answered, `error` when it failed,
+       *  timed out or answered nothing usable; `woke` is whether the batch
+       *  then woke the agent (an error does by the host's onError).
+       *  The judge's reason is in the agent's gate_status, not here: it's
+       *  written from the agent's context. */
+      type: 'gate:judge-verdict';
+      policyName: string;
+      verdict: 'reply' | 'wait' | 'error';
+      woke: boolean;
+      eventCount: number;
+      durationMs: number;
+      model?: string;
+      inputTokens?: number;
+      cacheReadTokens?: number;
+      outputTokens?: number;
+    })
+  | (TraceEventBase & {
+      /** A batched wake's turn started without its `[Gate: …]` line (the
+       *  gate hands the line to the wake when its message is the newest at
+       *  the fire, EventGate isNewestEntry, and the turn's start decides).
+       *  `reason`: `newest`, on the delivery agent's start the message was
+       *  still the newest entry in the window; `held`, the host was
+       *  quiesced, so no line could be written then. */
+      type: 'gate:wake-line-omitted';
+      reason: 'newest' | 'held';
+      policyNames: string[];
+      eventType: string;
+      channelId?: string;
+    })
+  | (TraceEventBase & {
       type: 'gate:config-reloaded';
       configPath: string;
       policyCount: number;
+      removedPolicies?: string[];
+      stateClearedPolicies?: string[];
     })
   | (TraceEventBase & {
       type: 'gate:decision';
@@ -258,30 +648,69 @@ export type TraceEvent =
       matchedPolicy: string | null;
       trigger: boolean;
       behavior: string;
+      observed?: string[];
+    })
+  /** A periodic review of what suppress rules hid ran (gate/suppression-review.ts); `delivered` when the agent was told. */
+  | (TraceEventBase & {
+      type: 'gate:suppression-review';
+      agentName: string;
+      fromMs: number;
+      toMs: number;
+      total: number;
+      flagged: number;
+      delivered: boolean;
+      rules: Array<{ rule: string; suppressed: number; read: number; verdict: 'fits' | 'flagged' | 'error' | 'unjudged'; flagged: number }>;
+    })
+  /** A suppress rule took an event: its row is stored and never rendered (EventGate.noteSuppressed). */
+  | (TraceEventBase & {
+      type: 'gate:suppressed';
+      policyName: string;
+      eventType: string;
+      serverId?: string;
+      channelId?: string;
+    })
+  | (TraceEventBase & Fields<RecipeChanges> & {
+      type: 'gate:config-reconciled';
+      configPath: string;
+      addedPolicies: string[];
+    })
+  | (TraceEventBase & {
+      type: 'gate:policy-added';
+      configPath: string;
+      policyName: string;
+      replaced: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'gate:policy-removed';
+      configPath: string;
+      policyName: string;
+    })
+  | (TraceEventBase & {
+      type: 'gate:shadow-warnings';
+      reason: string;
+      warnings: string[];
+    })
+  /** Wake onboarding offered a server's suggestions after an undecided event
+   *  (gate/wake-onboarding.ts): `policy` let it go by (null: the default). */
+  | (TraceEventBase & {
+      type: 'gate:onboarding-offered';
+      serverId: string;
+      digest: string;
+      policy: string | null;
+      rules: number;
+      wake: boolean;
+    })
+  /** The agent answered an offer: rules accepted (the names written), or declined. */
+  | (TraceEventBase & {
+      type: 'gate:onboarding-decided';
+      serverId: string;
+      digest: string;
+      state: 'accepted' | 'declined';
+      rules: string[];
     })
 
   // Usage lifecycle
-  | (TraceEventBase & {
-      type: 'usage:updated';
-      totals: SessionUsage;
-      agentName: string;
-      inferenceCount: number;
-    })
-
-  // Undo/redo lifecycle
-  | (TraceEventBase & {
-      type: 'undo:completed';
-      agentName: string;
-      turnIndex: number;
-      fromBranch: string;
-      toBranch: string;
-    })
-  | (TraceEventBase & {
-      type: 'redo:completed';
-      agentName: string;
-      fromBranch: string;
-      toBranch: string;
-    })
+  | (TraceEventBase & Fields<UsageUpdatedEvent>)
 
   // Operator-initiated mutation (rollback/suppress/undo/hide/settings/quiesce…).
   // Mirrors the durable operator-actions.jsonl record so live UIs see the
@@ -308,6 +737,8 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:conversation-spawned';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       generation: number;
       template: string;
@@ -315,22 +746,30 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:conversation-spawn-failed';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       error: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-unrouted';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       messageId: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-binding-orphaned';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-closed';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       reason: 'idle-ttl';
     })
@@ -338,16 +777,21 @@ export type TraceEvent =
       type: 'mcpl:conversation-disposed';
       agentName: string;
       channelId?: string;
+      /** The home channel's server, beside its channelId. */
+      serverId?: string;
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
-  // for the posted message (when the MCPL server reports one). Together they
-  // give external taps the (channelId, messageId, text) tuple needed to edit
-  // a just-posted message, e.g. a TTS interruption truncating a reply to the
-  // words actually voiced.
+  // for the posted message (on routeSpeech's traces, when the MCPL server
+  // reports one). Together they give external taps the (channelId,
+  // messageId, text) tuple needed to edit a just-posted message, e.g. a TTS
+  // interruption truncating a reply to the words actually voiced.
   | (TraceEventBase & {
       type: 'mcpl:speech-routed';
       /** Agent / conversation whose speech was routed. */
@@ -358,17 +802,27 @@ export type TraceEvent =
       textLen: number;
       /** The routed prose segment, verbatim. */
       text: string;
-      /** Surface message id (e.g. Discord message id), when reported. */
+      /** Surface message id (e.g. Discord message id), when reported, on
+       *  routeSpeech's traces. speak_in_channel's carry none. */
       messageId?: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:speech-route-failed';
       /** Agent / conversation whose speech failed to route. */
       conversationId: string;
+      /** The channel's server, where the destination, or the caller, named
+       *  one: a channel id is unique only within one server. */
+      serverId?: string;
       /** Empty string when the failure was "no locus at all". */
       channelId: string;
       reason: string;
       textLen: number;
+      /** `failed`: nothing was posted; `unknown`: the request was dispatched
+       *  and no valid receipt came back, so it may have been. */
+      outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -382,10 +836,6 @@ export type TraceEvent =
       toolUseId: string;
       isError: boolean;
       durationMs: number;
-      /** The pair was queued behind a turn that replaced the puppet's
-       *  reservation (provider-admission re-entry) instead of stored
-       *  directly; it lands at that turn's end flush. */
-      deferred?: boolean;
     })
 
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
@@ -395,6 +845,12 @@ export type TraceEvent =
       type: 'mcpl:server-connect-failed';
       serverId: string;
       error: string;
+      /** The last of the server's stderr, when its handshake failed by its
+       *  transport closing, a transport error or its timeout and it had
+       *  written any: the server's own text, which `error` never carries. A
+       *  transport that failed its handshake was never wired, so its lines
+       *  never reached `mcpl:server-stderr`. */
+      stderrTail?: string;
       /** Ordinal of the failed attempt: 0 is the initial connect, N is the Nth background retry. */
       attempt: number;
       /** True when a background reconnect loop will keep retrying. */
@@ -422,6 +878,12 @@ export type TraceEvent =
       code: number | null;
       /** Signal that terminated the child, if any. */
       signal: string | null;
+      /** Why the transport closed, in its own words, such as `child process
+       *  exited, and this host had stopped using the server's stdio (write
+       *  EPIPE)` or `closed by host`; null when it gave none, or when its
+       *  reason is a WebSocket server's own close text, which stays off the
+       *  trace. */
+      reason: string | null;
       /** True when a background reconnect loop will revive the connection. */
       willReconnect: boolean;
     })
@@ -430,10 +892,139 @@ export type TraceEvent =
       serverId: string;
       error: string;
     })
+  // Configuration that is accepted but silently does nothing. Each mirrors
+  // a console line, so hosts that keep per-server logs from the trace bus
+  // see it too.
+  | (TraceEventBase & {
+      /** §5.3/§6.7: the server refused the host's policy Request. */
+      type: 'mcpl:policy-refused';
+      serverId: string;
+      /** The initial policy at connect, or the re-negotiation after a manifest change. */
+      phase: 'initial' | 'manifest-change';
+      reason: string | null;
+      /** `close`: the host closed the connection. `mcp-only`: the grant
+       *  stays empty and only plain MCP tools work. */
+      fallback: 'close' | 'mcp-only';
+    })
+  | (TraceEventBase & {
+      /** §6.4 derivation disabled a declared feature set. */
+      type: 'mcpl:feature-set-disabled';
+      serverId: string;
+      featureSet: string;
+      /** `invalid_uses`: `uses` absent, empty or unrecognized.
+       *  `missing_capabilities`: `uses` names capabilities the grant lacks. */
+      reason: 'invalid_uses' | 'missing_capabilities';
+      /** True when config selected the set (enabledFeatureSets omitted or
+       *  matching it, and not disabledFeatureSets): derivation overrode it. */
+      selectedByConfig: boolean;
+      /** invalid_uses: the unrecognized entries (empty when `uses` was absent or empty). */
+      unrecognized?: string[];
+      /** missing_capabilities: the capability paths the grant lacks. */
+      missing?: string[];
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:inference_start';
+      serverId: string;
+      featureSet: string;
+      model: string;
+      stream: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:inference_complete';
+      serverId: string;
+      model: string;
+      actualModel?: string;
+      inputTokens: number;
+      outputTokens: number;
+      streamed: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:inference_fail';
+      serverId: string;
+      model: string | null;
+      error: string;
+      streamed: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:state_registered';
+      serverId: string;
+      featureSet: string;
+      hostState: boolean;
+      rollback: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:checkpoint_recorded';
+      serverId: string;
+      featureSet: string;
+      checkpoint: string;
+      parent: string | null;
+      hasData: boolean;
+      hasPatch: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:state_rollback';
+      serverId: string;
+      featureSet: string;
+      checkpoint: string;
+    })
+  | (TraceEventBase & {
+      /** An operator tool-name pattern matches no model-facing tool. Emitted
+       *  once per pattern, after the servers it could name have listed. */
+      type: 'mcpl:tool-pattern-unmatched';
+      /** `toolClassOverrides`, `toolLifecycle.observe.tools` or `toolLifecycle.inputs.tools`. */
+      setting: string;
+      /** The server whose toolLifecycle config holds the pattern. */
+      serverId?: string;
+      pattern: string;
+      /** The pattern rewritten under the server's actual tool prefix. */
+      suggestion?: string;
+      hint: string;
+    })
+  | (TraceEventBase & {
+      /** An inbound RPC request/notification handler failed: it threw or
+       *  rejected, or it resolved after a reply write of its own failed or
+       *  after it tried to answer a second time. */
+      type: 'mcpl:request-handler-error';
+      serverId: string;
+      /** Connection event name, e.g. channels-register or push-event. */
+      event: string;
+      /** The request's id when it is a number, or a string id bounded as the
+       *  other texts here are: control, format and line-separator characters
+       *  replaced, and cut after 500 code points, with "…" marking the cut.
+       *  Absent for a notification, for a request whose id is neither, and
+       *  for a request form of mcpl/manifestChanged or
+       *  notifications/tools/list_changed, which is answered as it's admitted
+       *  and then handled as the notification is. */
+      requestId?: string | number;
+      /** Whether a reply write of the handler's returned: true once one
+       *  did. On a connection that had already closed, that write dropped
+       *  the reply, as the connection then drops every reply, so nothing
+       *  reached the server. A write that throws, as one that can't be
+       *  encoded does, sends nothing. When it's false and the responder
+       *  can send an error reply (it has respondError), the host sent -32603
+       *  "Internal error" itself, or -32000 while it stops, unless
+       *  `responseError` says that reply failed. A connection that has
+       *  already closed drops that reply, as it drops every reply, with no
+       *  `responseError`. */
+      responseAttempted: boolean;
+      /** The handler's own error when it threw or rejected; otherwise the
+       *  reply write that failed and that it swallowed, or that it tried to
+       *  answer a second time. */
+      error: string;
+      /** A reply write that failed, when the handler then failed with an
+       *  error of its own (which is `error`). */
+      responseFailure?: string;
+      /** What the handler tried to send after a reply was already attempted:
+       *  refused, never written. A result, or an error reply with its code
+       *  and (bounded) message. */
+      refusedResponse?: { kind: 'result' } | { kind: 'error'; code: number; message: string };
+      /** Failure while trying to send the internal-error response. */
+      responseError?: string;
+    })
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
-      /** The JSON-RPC id of the late response whose pending request already timed out. */
+      /** The JSON-RPC id of the late response, whose request had already timed out or been ended by its transport's close. */
       responseId: string | number;
       /** Original request method when retained for mandatory-deadline visibility. */
       method?: string;
@@ -441,6 +1032,8 @@ export type TraceEvent =
       hadState: boolean;
       /** True when the dropped response carried a server-managed `checkpoint`. */
       hadCheckpoint: boolean;
+      /** A late JSON-RPC error, as `[code] message`, bounded. */
+      error?: string;
     })
 
   // Ops / fleet observability. Everything the framework's opsAlert() escalates
@@ -454,8 +1047,10 @@ export type TraceEvent =
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
+      /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record). */
+      /** Kind-specific structured payload (mirrors the failures.log record),
+       *  bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 
@@ -471,7 +1066,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included, or a turn whose stream's cancel threw with no check ahead, so that its stream goes on. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {
@@ -485,9 +1080,501 @@ export type TraceEvent =
       type: 'host:quiesced_boot';
       reason?: string;
       since?: number;
+    })
+
+  | (TraceEventBase & {
+      type: 'tune-out:entered';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      reader: boolean;
+      expiresAtMs?: number;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:cancelled';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      reason: string;
+      wakeCount: number;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:announced';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      kind: 'entered' | 'released';
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:announce-failed';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      kind: 'entered' | 'released';
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:ack-failed';
+      serverId: string;
+      channelId: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:timer-failed';
+      timer: 'wake' | 'cadence' | 'expiry';
+      serverId: string;
+      channelId: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:wake-budget-paused';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope: 'all-except';
+      wakeCount: number;
+      maxWakes: number;
+    })
+  /**
+   * A tune-out's cancel asked for while writes were held in memory, queued
+   * for the release and its retry, taken off the queue with what it was for
+   * left undone. `hold-ended`: the hold of the epoch it was asked for
+   * (`epochId`) ended without it, so it ends nothing, and no later hold
+   * there (`currentEpochId`, the one in force when it was dropped, if one
+   * was). `note-undelivered`: its hold ended, by another cancel or by its
+   * own run, and delivering the note it carried failed (`error`).
+   * `stopped`: the host stopped while it waited, its hold still in force,
+   * which the next boot resumes without running it. `superseded`: it was
+   * asked for while an earlier cancel of the same hold ran, and joined that
+   * one when it was queued again, whose note stands.
+   * `noteLost`: it carried a reader's note, which is not delivered, or,
+   * with `noteMayBeStored`, may be stored after all: the store couldn't tell
+   * whether its write landed (`error` says what it couldn't read), as the
+   * author's notice then says it may be lost. Its
+   * author is told so in its own context where the author still exists,
+   * and a reader fork that has ended is not, the loss reaching no one
+   * (`tune-out:note-loss-untold`, `author-gone`). The persistent
+   * subconscious is told by the next boot where the host stopped, and,
+   * where another cancel ended the hold, in that cancel's release, which
+   * its window holds, rather than in a notice of its own. `noteAuthor`, whose note
+   * it was, the name it would have been delivered under (the persistent
+   * subconscious's, or the reader fork's that left it), where one is known.
+   * For the all-except hold (`scope`), the channel is its excepted one.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:deferred-cancel-dropped';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      reason: 'hold-ended' | 'note-undelivered' | 'stopped' | 'superseded';
+      currentEpochId?: string;
+      noteLost: boolean;
+      noteMayBeStored?: true;
+      noteAuthor?: string;
+      error?: string;
+    })
+  /**
+   * At boot, a hold on record (`epochId`; the all-except hold with `scope`,
+   * its channel the excepted one) that the last stop's stamp
+   * (`tune-out/<primary>/stop-stamp`) doesn't cover: the host crashed, or
+   * the store refused the stop's writes. `found`, from that run's rows:
+   * `ran`, a release of that epoch was stored after the cancel was asked,
+   * its end not recorded; `delivered`, a waiting cancel's note was written
+   * to the resident, with no release since; `asked`, the subconscious's
+   * own call of that cancel, answered as waiting, is in its window;
+   * `unknown`, nothing says whether a cancel waited. The persistent
+   * subconscious (`noteAuthor`) is told which, by a loss notice kept and
+   * tried again as the others are (`tune-out:note-loss-untold` where its
+   * write fails). Not traced: a hold no stamp covers because none was ever
+   * written (a first start on a version that stamps its stops), one whose
+   * release already told a waiting note's loss, one whose loss the stop
+   * kept, and one already told as much.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:stop-unrecorded';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      noteAuthor: string;
+      found: 'delivered' | 'ran' | 'asked' | 'unknown';
+    })
+  /**
+   * The notice telling a lost note's author (`noteAuthor`) of the loss (a
+   * `tune-out:deferred-cancel-dropped` with `noteLost`) was not written.
+   * `write-failed`: writing it threw (`error`). It is kept, and tried again
+   * whenever held writes are stored and every 60 s while none are, until it
+   * is written. One for the persistent subconscious is kept in the store
+   * too, so a stop leaves it there and the next boot tries it again; a
+   * reader fork's is dropped at a stop. This traces its first failure only,
+   * a later boot's included, and each later one is logged. `author-gone`:
+   * the framework wrote nothing, as no agent of that name is registered (a
+   * reader fork whose run has ended): the loss reaches no one, and the
+   * notice is not kept. For the all-except hold (`scope`), the channel is
+   * its excepted one.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:note-loss-untold';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      noteAuthor: string;
+      reason: 'write-failed' | 'author-gone';
+      error?: string;
+    })
+
+  /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-prose-delivered';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      chars: number;
+    })
+
+  /** Bounded work the host's stop() cut off: left live for the next boot to end as `host-restart`. */
+  | (TraceEventBase & {
+      type: 'dendrite:agent-interrupted';
+      agentName: string;
+      kind: string;
+      incarnation: number;
+      reason: 'host-stop';
+    })
+
+  /** A tune-out reader fork was derived for one invocation (subconscious.reader: 'forks'). */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-fork';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
+      /** Held messages the fork was handed. */
+      held: number;
+    })
+
+  /**
+   * A tune-out reader fork threw: its framing, its derive or its run. One
+   * that failed before it reported gives its held messages back to the
+   * channel's backlog while the epoch still holds the channel (`returned`
+   * counts them), so the next reader for the channel is handed them.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-fork-failed';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
+      error: string;
+      /** Whether the fork had reported through `deliver_summary` before it failed. */
+      reported: boolean;
+      returned: number;
+    })
+
+  /**
+   * The persistent subconscious's window start was set by index ordinal
+   * (#291): `fixed`, a tune-out's start fixed once no row the subconscious
+   * is owed stored before the start was out of its window, and kept for its
+   * epochs; `clamped`, a kept start (`kept`) past its window's index length
+   * on the store's branch now (one a rollback made shorter), set at the
+   * length instead.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:subconscious-window';
+      agentName: string;
+      /** The tune-outs that start there. */
+      epochIds: string[];
+      how: 'fixed' | 'clamped';
+      /** The ordinal the window starts at now. */
+      ordinal: number;
+      /** For `clamped`, the ordinal kept for them. */
+      kept?: number;
+    })
+
+  // Dendrite: agent registry and lifecycle.
+  // `agent-created` is the creation event: it names the kind of agent, what
+  // ends it, and what happens to it when its spawner ends, for whatever a
+  // host records or decides on them.
+  | (TraceEventBase & {
+      type: 'dendrite:agent-created';
+      agentName: string;
+      kind: string;
+      /** Whose weights; `inherit.from` is whose context. */
+      model?: string;
+      incarnation: number;
+      lifetime: import('../dendrite/types.js').AgentLifetime;
+      spawnedBy?: string;
+      onParentEnd?: import('../dendrite/types.js').ParentEndPolicy;
+      resultTo?: import('../dendrite/types.js').ResultRoute;
+      inherit?: import('../dendrite/types.js').ContextInheritance;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-ended';
+      agentName: string;
+      kind: string;
+      incarnation: number;
+      reason: string;
+      by?: string;
+      /** The agent that spawned it, when its record names one. */
+      spawnedBy?: string;
+    })
+  | (TraceEventBase & {
+      /** The last event a replay of create()'s traces delivers when the
+       *  buffer kept only their first 1,000: how many came after. */
+      type: 'dendrite:early-traces-dropped';
+      dropped: number;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-orphaned';
+      agentName: string;
+      formerParent: string;
+      reason: string;
+      /** Agents offered as a new parent, nearest first. */
+      candidates: string[];
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-reparented';
+      agentName: string;
+      parent: string;
+      by?: string;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:activation-cancelled';
+      agentName: string;
+      by?: string;
+      reason?: string;
+    })
+  /** The message entered the recipient's store (not merely held for it). */
+  | (TraceEventBase & {
+      type: 'dendrite:mail-delivered';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+    })
+  /** Held in memory behind a live surgery (the operator's switch awaited),
+   *  or kept for a recipient whose context manager refuses its work after a
+   *  failed re-initialization; `mail-delivered` follows when a release
+   *  stores it. */
+  | (TraceEventBase & {
+      type: 'dendrite:mail-deferred';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:mail-held';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+      reason: string;
+    })
+  /**
+   * The admission stage's decision for one inbound event (Dendrite §D):
+   * who may receive it, whether it is held (the epoch id) or delivered,
+   * whether it may wake them, and the gate's verdict.
+   */
+  | (TraceEventBase & {
+      type: 'admission:decided';
+      lane: 'channel' | 'push';
+      serverId: string;
+      channelId?: string;
+      messageId: string;
+      recipients: string[];
+      held: string | null;
+      /** The suppress rule that took the event, when one did. */
+      suppressed?: string;
+      wake: boolean;
+      gatePass: boolean;
+    })
+  /** Batched gate events dropped at delivery because their channel is held now. */
+  | (TraceEventBase & {
+      type: 'gate:held-dropped';
+      dropped: number;
+      channels: Array<string | undefined>;
+    })
+  // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
+  // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
+  // own coverage is interrupted for that acceptance.
+  | (TraceEventBase & {
+      type: 'inbound:observer-failed';
+      /** Envelope kind of the acceptance the observer failed on. */
+      kind: 'channel' | 'unscoped' | 'surface';
+      error: string;
+    })
+
+  // The presentation index (#291, src/presentation.ts): which stored rows
+  // each agent's window holds, in the order its requests carried them.
+  | (TraceEventBase & {
+      /**
+       * Rows entered an agent's window (context-manager's presentRows), at
+       * one of its presentation points (`occasion`): `count` bodies, a
+       * sharded one counted once. At `rebase`, the store's branch moved to a
+       * branch with no window for the agent, and its window there was
+       * written down: `count` is the bodies it holds.
+       */
+      type: 'presentation:presented';
+      agentName: string;
+      occasion: PresentationOccasion;
+      count: number;
+      /** At a tool boundary: the first row that couldn't join the live
+       *  stream (a tool block, or a row named as the agent), where the rows
+       *  presented there stop. It and the rows after it wait for the turn's
+       *  end. */
+      cutAt?: string;
+      /** How many of them carry no audience stamp (stored by a host's
+       *  writer that doesn't stamp), presented to the slot's owners and
+       *  its observers. */
+      unstamped?: number;
+    })
+  | (TraceEventBase & {
+      /** An agent's own rows that were stored and not in its window, found
+       *  when the agent was taken on or at boot, were presented to it. */
+      type: 'presentation:repaired';
+      agentName: string;
+      count: number;
+    })
+  | (TraceEventBase & {
+      /**
+       * A row was stamped for agents of which none reads the slot it is
+       * stored in (`deliveredTo`'s), so no window presents it by its
+       * audience. It is stored as named, never widened: observers of the
+       * slot see it only as their edge shows it.
+       */
+      type: 'presentation:unreadable-audience';
+      messageId?: string;
+      audience: string[];
+      slot: MessageSlotRef;
+      deliveredTo: string;
+    })
+  | (TraceEventBase & {
+      /** A presentation failed; the rows it didn't present stay out of the
+       *  agent's window for its next presentation point. At a fresh turn's
+       *  start (`turn-start`, `assembly`), the start fails too. With
+       *  `legacy`, the agent was left unpresented (legacy mode) until a
+       *  later move of the store's branch: its window the whole record as
+       *  before the index, or, where its strategy couldn't follow a move to
+       *  a branch that holds a window, that window, writes for it waiting in
+       *  memory: at `adopt`, its window couldn't be
+       *  written down (another version's index format, or a failed write);
+       *  at `rebase`, after the store's branch moved, its window couldn't be
+       *  written down on the new branch, or its context's strategy couldn't
+       *  follow the move (`error` says which). The framework logs that and
+       *  raises an ops alert (`presentation-legacy`). Without it, at
+       *  `adopt` or `rebase`, presenting the agent's own rows failed, or
+       *  taking out the rows the write-down took in that aren't the
+       *  agent's did, which is tried again at its next turn start or point
+       *  at rest. */
+      type: 'presentation:failed';
+      agentName: string;
+      occasion: PresentationOccasion;
+      error: string;
+      /** The rows the presentation named that didn't enter the window,
+       *  each body by the id that names it, where they are known (a write
+       *  of the window that failed). Absent where a read failed before the
+       *  rows could be named. */
+      messageIds?: string[];
+      /** Set where the failure left the agent in legacy mode. */
+      legacy?: true;
+    })
+  | (TraceEventBase & {
+      /** At a tool boundary's hand-off, the newest rows of the agent's
+       *  window weren't the rows the stream was about to be given, in that
+       *  order. The stream's later rounds are noted as unvouched, so their
+       *  thinking is left out at the next compile rather than refused. */
+      type: 'presentation:hand-off-mismatch';
+      agentName: string;
+      expected: string[];
+      tail: string[];
+    })
+  | (TraceEventBase & {
+      /**
+       * Rows were taken out of an agent's window. Every reason but `shed`
+       * and `elsewhere` is a removal from the record made through another
+       * agent's context, which context-manager tombstones in that context's
+       * window only: the rows it removed leave this agent's window too, each
+       * at its own place, so no other row's place moves (`hide`, `suppress` on its
+       * fork, a coalescer's `coalescer`, a module's `module`, a suppression
+       * a start finished, `resume`, and a refusal rewind's shed from a
+       * window that is still the record, `rewind`), or that no live context
+       * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
+       * inference failure's shed on a presented window: the rows leave the
+       * agent's own window as an undone turn's do, and stay in the record.
+       * `elsewhere` is a window written down from the shared record when the
+       * agent was taken on, or after a branch move: the rows it took in that
+       * carry an audience stamp and aren't the agent's (another agent's own
+       * rows, mail stamped for others, a held row) leave it, and stay in the
+       * record (decision 1).
+       */
+      type: 'presentation:retracted';
+      agentName: string;
+      messageIds: string[];
+      reason: PresentationRetractReason;
+    })
+  | (TraceEventBase & {
+      /** An undo or a redo on the presentation index, counted in bodies.
+       *  An undo's `retracted` is the bodies from the turn's checkpoint on
+       *  that left the agent's window, the turn's own and what arrived
+       *  after it, and it carries no `represented`. A redo's
+       *  `retracted` is the rows that entered the window after the undo, and
+       *  any of the undo's own still in it after an undo cut short, which
+       *  left so the redone rows come back after their prefix; its
+       *  `represented` is the undone rows presented again. No branch
+       *  moved. */
+      type: 'window:undone';
+      agentName: string;
+      retracted: number;
+      represented?: number;
+    })
+
+  // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
+  // instead of sent; a resident's explicit resend; a deliberate dismissal.
+  | (TraceEventBase & {
+      type: 'prose:drafts-held';
+      agentName: string;
+      reason: DraftReason;
+      draftIds: string[];
+      textLen: number;
+    })
+  | (TraceEventBase & {
+      type: 'prose:draft-resent';
+      agentName: string;
+      draftId: string;
+      status: 'delivered' | 'failed' | 'unknown';
+      serverId: string;
+      channelId: string;
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'prose:drafts-dismissed';
+      agentName: string;
+      draftIds: string[];
     });
+
+/** Why rows left an agent's window (`presentation:retracted`). */
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere';
 
 /**
  * Listener for trace events.
  */
 export type TraceEventListener = (event: TraceEvent) => void;
+
+/**
+ * A trace as raised, before `emitTrace` stamps its `timestamp`: one of the
+ * union's members without that field.
+ */
+export type TraceEventInput = WithoutTimestamp<TraceEvent>;
+
+type Fields<Shape> = { [Key in keyof Shape]: Shape[Key] };
+
+type WithoutTimestamp<Event> = Event extends unknown
+  ? { [Key in keyof Event as Key extends 'timestamp' ? never : Key]: Event[Key] }
+  : never;

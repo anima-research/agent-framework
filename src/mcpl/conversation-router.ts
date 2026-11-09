@@ -16,10 +16,10 @@
  * - Everything else is left unrouted and dropped by the framework — the
  *   trunk is a dormant template, not a listener.
  *
- * Bindings expire after an idle TTL. Expiry runs a final closure turn on the
- * fork (see framework wiring) and unbinds; the next qualifying message on
- * that channel spawns a *fresh* fork (generation + 1) from the current
- * trunk, so handbook/template updates propagate between engagements.
+ * Bindings expire after an idle TTL. Expiry unbinds the channel and runs a
+ * final closure turn on the fork (see framework wiring); the next qualifying
+ * message on that channel spawns a *fresh* fork (generation + 1) from the
+ * current trunk, so handbook/template updates propagate between engagements.
  *
  * The binding table is in-memory — bindings are re-established by the next
  * qualifying message after a restart. The generation counters, by contrast,
@@ -27,10 +27,18 @@
  * a restarted host must NOT reuse generation 1's agent name, or it would
  * reopen the previous engagement's Chronicle namespace and re-seed the
  * template context on top of the old history.
+ *
+ * DEPRECATED (anima-research/agent-framework#235): per-channel conversation
+ * routing is being retired. Behavior is unchanged for now; the framework
+ * logs one `[deprecated]` line when it is configured. Removal is a
+ * follow-up.
  */
 
+import { NOTICE_TAG } from '../notice-tags.js';
+import { createHash } from 'node:crypto';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ChannelDescriptor } from './types.js';
+import { destinationKey, type ChannelRef } from './channel-registry.js';
 
 // ============================================================================
 // Config & types
@@ -49,6 +57,20 @@ export type TriggerRule = 'always' | 'mention';
  * inferring on every message of a four-human group DM is a firehose). */
 export type ChannelKind = 'dm' | 'groupDm' | 'channel';
 
+/** Logged once by the framework when `FrameworkConfig.conversations` is set. */
+export const CONVERSATION_ROUTING_DEPRECATION_NOTICE =
+  'Per-channel conversation routing (FrameworkConfig.conversations) is deprecated and will ' +
+  'be removed in a future release. Its \'mention\' bind/trigger rule reads ' +
+  'metadata.mentioned, which not every channel server sets (discord-mcpl does not), so on ' +
+  'such channels an @-mention neither binds a fork nor triggers a bound one. Routing still ' +
+  'works for now. See anima-research/agent-framework#235.';
+
+/**
+ * @deprecated Per-channel conversation routing is deprecated and will be
+ * removed (anima-research/agent-framework#235). Its 'mention' bind/trigger
+ * rule reads `metadata.mentioned`, which not every channel server sets.
+ * Behavior is unchanged for now.
+ */
 export interface ConversationRouterConfig {
   /** Agent whose context seeds new forks (the "trunk"/warm checkpoint). */
   templateAgent: string;
@@ -61,7 +83,15 @@ export interface ConversationRouterConfig {
    * Defaults: dm 'always', groupDm 'mention', channel 'mention'. */
   trigger?: { dm?: TriggerRule; groupDm?: TriggerRule; channel?: TriggerRule };
 
-  /** Idle time before a binding expires and the fork is closed. Default 12h. */
+  /**
+   * Idle time before a binding expires and the fork is closed. Default 12h.
+   *
+   * Expiry is checked at most about once a minute, so the sweep usually
+   * notices an expired binding up to ~60s after the TTL elapses. That is the
+   * usual extra delay, not a deadline for closing the fork: the closure turn
+   * can be delayed further (e.g. while the host is quiesced, it stays queued
+   * until resume).
+   */
   idleTtlMs?: number;
 
   /** Final system-initiated user message sent to a fork on expiry. */
@@ -80,6 +110,9 @@ export interface ConversationRouterConfig {
 
 export interface ConversationBinding {
   channelId: string;
+  /** The channel's server: channel ids are unique only within one server's
+   *  connection (MCPL §14.2), so each server's channel has its own binding. */
+  serverId: string;
   agentName: string;
   /** Engagement counter per channel — fresh forks get a new generation. */
   generation: number;
@@ -91,12 +124,14 @@ export interface ConversationBinding {
  * framework so the router stays free of event-shape knowledge. */
 export interface IncomingMessageFacts {
   channelId: string;
+  /** The MCPL server the channel belongs to. A spawned fork's name hashes it
+   *  with the channel id (see forkAgentName); left out, `null` stands in for
+   *  it there. */
+  serverId?: string;
   /** Personal mention of the bot (metadata.mentioned from the adapter). */
   mentioned: boolean;
   /** Channel classification (see classifyChannel). */
   kind: ChannelKind;
-  /** Clock injection for tests; defaults to Date.now(). */
-  now?: number;
 }
 
 export type RoutingDecision =
@@ -110,7 +145,7 @@ export type RoutingDecision =
 const DEFAULT_IDLE_TTL_MS = 12 * 60 * 60 * 1000;
 
 export const DEFAULT_CLOSURE_PROMPT =
-  '[system] This engagement is closing due to inactivity. Finalize your ' +
+  `[${NOTICE_TAG.system}] This engagement is closing due to inactivity. Finalize your ` +
   'work: post any promised results to the channel and record outstanding ' +
   'threads as unresolved. Do not ask follow-up questions.';
 
@@ -118,14 +153,24 @@ export const DEFAULT_CLOSURE_PROMPT =
 // ConversationRouter
 // ============================================================================
 
+/**
+ * @deprecated Per-channel conversation routing is deprecated and will be
+ * removed (anima-research/agent-framework#235). Behavior is unchanged for
+ * now; the framework logs one `[deprecated]` line when it constructs a
+ * router from `FrameworkConfig.conversations`.
+ */
 export class ConversationRouter {
   private config: ConversationRouterConfig;
 
-  /** Active bindings, keyed by channelId. */
+  /** Active bindings, keyed by the channel's server and id (destinationKey):
+   *  two servers' channels with one id are two conversations. */
   private bindings = new Map<string, ConversationBinding>();
 
-  /** Engagement counter per channel — survives unbind, so a re-bound channel
-   * gets a distinct fork agent name. */
+  /** Engagement counter per channel id — survives unbind, so a re-bound
+   * channel gets a distinct fork agent name. Kept by bare id, as it's
+   * persisted: two servers sharing an id share a counter, which still never
+   * repeats a name, and their forks' names differ anyway, since each hashes
+   * its server (forkAgentName). */
   private generations = new Map<string, number>();
 
   constructor(config: ConversationRouterConfig) {
@@ -149,17 +194,15 @@ export class ConversationRouter {
   }
 
   /**
-   * Decide where an incoming message goes. Pure read except for refreshing
-   * lastActivity on an existing binding — a 'spawn' decision does NOT create
-   * the binding; the framework calls bind() after the fork agent actually
-   * exists, so a failed spawn doesn't leave a dangling route.
+   * Decide where an incoming message goes without changing router state.
+   * The framework calls bind() after a fork exists and touch() after a
+   * message is delivered. Queries and failed deliveries leave idle clocks
+   * unchanged; a failed spawn doesn't leave a dangling route.
    */
   route(facts: IncomingMessageFacts): RoutingDecision {
-    const now = facts.now ?? Date.now();
-    const existing = this.bindings.get(facts.channelId);
+    const existing = this.bindings.get(bindingKey({ serverId: facts.serverId ?? '', channelId: facts.channelId }));
 
     if (existing) {
-      existing.lastActivity = now;
       return {
         kind: 'existing',
         agentName: existing.agentName,
@@ -179,7 +222,7 @@ export class ConversationRouter {
     const generation = (this.generations.get(facts.channelId) ?? 0) + 1;
     return {
       kind: 'spawn',
-      agentName: this.forkAgentName(facts.channelId, generation),
+      agentName: forkAgentName(this.config.agentPrefix ?? 'conversation', facts.serverId, facts.channelId, generation),
       generation,
       trigger: this.shouldTrigger(facts),
     };
@@ -189,31 +232,44 @@ export class ConversationRouter {
    * Record a binding after the framework successfully spawned the fork.
    * Returns the new binding.
    */
-  bind(channelId: string, agentName: string, generation: number, now = Date.now()): ConversationBinding {
-    this.generations.set(channelId, generation);
+  bind(channel: ChannelRef, agentName: string, generation: number, now = Date.now()): ConversationBinding {
+    // The counter is kept by bare id, and two servers' spawns on one id run
+    // beside each other, so a bind can finish after a later spawn's: the
+    // counter keeps the higher, or the next spawn would propose a fork name
+    // already used.
+    this.generations.set(channel.channelId, Math.max(this.generations.get(channel.channelId) ?? 0, generation));
     const binding: ConversationBinding = {
-      channelId,
+      channelId: channel.channelId,
+      serverId: channel.serverId,
       agentName,
       generation,
       boundAt: now,
       lastActivity: now,
     };
-    this.bindings.set(channelId, binding);
+    this.bindings.set(bindingKey(channel), binding);
     return binding;
   }
 
-  unbind(channelId: string): void {
-    this.bindings.delete(channelId);
+  /** Record delivered activity on an existing binding. Does not bind a
+   * channel or advance its generation. Call after successful delivery, not
+   * when previewing a route. The optional clock supports deterministic use. */
+  touch(channel: ChannelRef, now = Date.now()): void {
+    const binding = this.bindings.get(bindingKey(channel));
+    if (binding) binding.lastActivity = now;
   }
 
-  getBinding(channelId: string): ConversationBinding | undefined {
-    return this.bindings.get(channelId);
+  unbind(channel: ChannelRef): void {
+    this.bindings.delete(bindingKey(channel));
+  }
+
+  getBinding(channel: ChannelRef): ConversationBinding | undefined {
+    return this.bindings.get(bindingKey(channel));
   }
 
   /** Reverse lookup: the channel an agent is bound to, if any. */
-  channelForAgent(agentName: string): string | undefined {
+  channelForAgent(agentName: string): ChannelRef | undefined {
     for (const binding of this.bindings.values()) {
-      if (binding.agentName === agentName) return binding.channelId;
+      if (binding.agentName === agentName) return { serverId: binding.serverId, channelId: binding.channelId };
     }
     return undefined;
   }
@@ -222,8 +278,10 @@ export class ConversationRouter {
     return Array.from(this.bindings.values());
   }
 
-  /** Bindings whose idle TTL has elapsed. Does not unbind — the framework
-   * runs the closure turn first, then calls unbind(). */
+  /** Bindings whose idle TTL has elapsed. Does not unbind: the framework
+   * unbinds each one first, so the channel's next message goes to a newer
+   * fork, or nowhere, and then runs the old fork's closure turn
+   * (sweepExpiredConversations). */
   expired(now = Date.now()): ConversationBinding[] {
     const ttl = this.idleTtlMs;
     return this.getBindings().filter((b) => now - b.lastActivity >= ttl);
@@ -259,7 +317,10 @@ export class ConversationRouter {
     return Object.fromEntries(this.generations);
   }
 
-  /** Restore persisted engagement counters (see exportGenerations). */
+  /** Raise each channel's engagement counter to at least the given
+   * generation, never lowering one: the persisted counters at startup (see
+   * exportGenerations), or a spawn's generation whose fork ended before the
+   * spawn could bind it. */
   hydrateGenerations(generations: Record<string, number>): void {
     for (const [channelId, generation] of Object.entries(generations)) {
       if (typeof generation === 'number' && generation > (this.generations.get(channelId) ?? 0)) {
@@ -273,12 +334,32 @@ export class ConversationRouter {
       ?? (facts.kind === 'dm' ? 'always' : 'mention');
     return rule === 'always' || facts.mentioned;
   }
+}
 
-  /** `conversation-slack-C123-g2` — agent names double as Chronicle
-   * namespace components, so the channel id is sanitized. */
-  private forkAgentName(channelId: string, generation: number): string {
-    const prefix = this.config.agentPrefix ?? 'conversation';
-    const safe = channelId.replace(/[^A-Za-z0-9_-]+/g, '-');
-    return `${prefix}-${safe}-g${generation}`;
-  }
+/** The readable part of a fork's name stops here: uniqueness rides on the hash. */
+const FORK_NAME_READABLE_MAX = 64;
+
+/** A binding's key: its channel's server and id (destinationKey). */
+function bindingKey(channel: ChannelRef): string {
+  return destinationKey(channel);
+}
+
+/**
+ * A fork's agent name: `<prefix>-<readable>-g<generation>-<hash>`, such as
+ * `conversation-C123-g2-e08e564271867d16` for Slack's channel `C123` on the
+ * server `slack`. Agent names double as context-manager namespace components,
+ * so the readable part is the channel id with each run of characters other
+ * than letters, digits, `_` and `-` replaced by `-`, cut to 64 characters.
+ * Different ids can read alike (`foo bar`, `foo-bar`), so the hash is the first
+ * 64 bits of a SHA-256 of `JSON.stringify([serverId, channelId])`, where an
+ * absent server id is written as `null`: two channels' forks share a name, and
+ * with it a namespace, only if those 64 bits collide. The hash is fixed-length
+ * and last, so a name's parts read back unambiguously, and a pattern over its
+ * readable part and `-g`, such as `conversation-C123-g*`, matches each
+ * generation's fork.
+ */
+export function forkAgentName(prefix: string, serverId: string | undefined, channelId: string, generation: number): string {
+  const readable = channelId.replace(/[^A-Za-z0-9_-]+/g, '-').slice(0, FORK_NAME_READABLE_MAX);
+  const hash = createHash('sha256').update(JSON.stringify([serverId, channelId])).digest('hex').slice(0, 16);
+  return `${prefix}-${readable}-g${generation}-${hash}`;
 }

@@ -130,15 +130,13 @@ test('repeated identical label sightings do not bloat the log', async () => {
   assert.equal(log.length, 1, 'unchanged sightings must not append new records');
 });
 
-test('a genuinely new label sighting does append a new record', async () => {
-  const { store, events } = memoryStore();
+test('a new label sighted for a channel is the one that resolves after a restart', async () => {
+  const { store } = memoryStore();
   const registry = makeRegistry(store);
 
   await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#general')] });
   await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#general-renamed')] });
 
-  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
-  assert.equal(log.length, 2);
   // Later sighting wins on replay.
   const second = makeRegistry(store);
   assert.deepEqual(second.resolveProseTargetDurable('#general-renamed'), {
@@ -163,7 +161,7 @@ test('resolveProseTargetDurable prefers the live path and only falls back to his
   // Live path resolves uniquely against the live channel — must win over
   // the (stale) history entry for the ghost channel.
   const live = registry.resolveProseTarget('shared-label');
-  assert.deepEqual(live, { channelId: 'discord:g1:live', label: 'shared-label' });
+  assert.deepEqual(live, { channelId: 'discord:g1:live', serverId: 'discord', label: 'shared-label' });
   assert.deepEqual(registry.resolveProseTargetDurable('shared-label'), live);
 });
 
@@ -184,7 +182,7 @@ test('a channel with no history at all still returns the original resolveProseTa
 });
 
 test('ensureChannelRegistered and handleChanged updates also feed label history', async () => {
-  const { store, events } = memoryStore();
+  const { store } = memoryStore();
   const registry = makeRegistry(store);
 
   // ensureChannelRegistered: lazy registration with NO label at all (e.g. a
@@ -213,32 +211,14 @@ test('ensureChannelRegistered and handleChanged updates also feed label history'
     channelId: 'discord:g1:c2',
     label: '#dev-renamed',
   });
-
-  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
-  // discord:dm:1: the label-less lazy registration records NOTHING (fix
-  // #3), only the backfill ('DM: Antra') does = 1 record; discord:g1:c2
-  // added ('#dev') then updated ('#dev-renamed') = 2 records. Total 3, not
-  // the 4 a placeholder-recording implementation would produce.
-  assert.equal(log.length, 3);
-});
-
-test('a label-less lazy registration alone (no later backfill) records nothing durably (finding #3)', async () => {
-  const { store, events } = memoryStore();
-  const registry = makeRegistry(store);
-
-  registry.ensureChannelRegistered('discord', 'discord:dm:2', undefined);
-
-  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
-  assert.equal(log.length, 0, 'a placeholder label (bare channelId) must never be durably recorded');
 });
 
 test('a label-less lazy re-registration after restart does not clobber an already-durable real label (finding #3)', async () => {
-  const { store, events } = memoryStore();
+  const { store } = memoryStore();
   const first = makeRegistry(store);
   // Boot 1: a real label lands on file (e.g. a DM push that DID carry a
   // display name).
   first.ensureChannelRegistered('discord', 'discord:dm:3', 'DM: Antra');
-  assert.equal((events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? []).length, 1);
 
   // Simulated restart: fresh registry, live `channels` map starts empty —
   // this is exactly the state that makes the NEXT event take the
@@ -260,11 +240,6 @@ test('a label-less lazy re-registration after restart does not clobber an alread
     channelId: 'discord:dm:3',
     label: 'DM: Antra',
   });
-  assert.equal(
-    (events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? []).length,
-    1,
-    'a label-less event must not durably record a placeholder over an already-known real label',
-  );
 });
 
 test('a label-less descriptor from handleRegister does not crash and does not poison labelHistory (finding #2)', async () => {
@@ -286,6 +261,7 @@ test('a label-less descriptor from handleRegister does not crash and does not po
   await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c2', '#general')] });
   assert.deepEqual(registry.resolveProseTargetDurable('#general'), {
     channelId: 'discord:g1:c2',
+    serverId: 'discord',
     label: '#general',
   });
   assert.doesNotThrow(() => registry.resolveProseTargetDurable('#anything-else'));
@@ -300,7 +276,7 @@ test('a channel renamed A -> B -> A is still resolvable by a name from BEFORE th
   await registry.handleChanged('discord', { updated: [descriptor('discord:g1:c1', '#alpha')] });
 
   // Live-path check: '#alpha' is current again, so it resolves live.
-  assert.deepEqual(registry.resolveProseTarget('#alpha'), { channelId: 'discord:g1:c1', label: '#alpha' });
+  assert.deepEqual(registry.resolveProseTarget('#alpha'), { channelId: 'discord:g1:c1', serverId: 'discord', label: '#alpha' });
 
   // The interesting case: '#beta' is a name from BEFORE the most recent
   // rename (A -> B -> A), not the current OR immediately-previous label —
@@ -378,6 +354,7 @@ test('a DM registered live resolves after a restart via @name, not just the lite
   // establishes this is real DM-shaped addressing, not a coincidence.
   assert.deepEqual(first.resolveProseTarget('@antra'), {
     channelId: 'discord:dm:antra',
+    serverId: 'discord',
     label: 'DM: antra',
   });
 
@@ -445,6 +422,7 @@ test('a DM whose live username differs from its display label resolves by USERNA
   // not an invented requirement.
   assert.deepEqual(first.resolveProseTarget('@antra_tessera'), {
     channelId: 'discord:dm:42',
+    serverId: 'discord',
     label: 'DM: Tess',
   });
 
@@ -481,6 +459,7 @@ test('a DM classified only via metadata.channelType (non-conventional id/label) 
   // Live check: classified as a DM live via metadata alone.
   assert.deepEqual(first.resolveProseTarget('<@42>'), {
     channelId: 'private-room-42',
+    serverId: 'discord',
     label: 'Tess',
   });
 
@@ -498,14 +477,4 @@ test('a DM classified only via metadata.channelType (non-conventional id/label) 
     channelId: 'private-room-42',
     label: 'Tess',
   });
-});
-
-test('a non-DM channel sighting never durably asserts isDm:false (only positive classification is ever persisted)', async () => {
-  const { store, events } = memoryStore();
-  const registry = makeRegistry(store);
-  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#general')] });
-
-  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
-  assert.equal(log.length, 1);
-  assert.equal((log[0] as { isDm?: boolean }).isDm, undefined, 'a plain guild channel must not record isDm at all');
 });

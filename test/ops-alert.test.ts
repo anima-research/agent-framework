@@ -33,7 +33,8 @@ function makeHarness() {
 
   // Capture traces.
   const traces: any[] = [];
-  fw.traceListeners = [(e: any) => traces.push(e)];
+  fw.traceListeners = [];
+  fw.onTrace((e: any) => traces.push(e));
 
   // Capture webhook posts.
   const posts: Array<{ url: string; body: any }> = [];

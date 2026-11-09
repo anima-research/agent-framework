@@ -1,8 +1,8 @@
 /**
  * Operator action log — a durable, append-only JSONL record of every
  * operator-initiated mutation of a live resident: branch rollbacks, message
- * suppressions, undo/redo/hide, unstick/nudge, runtime-settings changes,
- * host quiesce/resume. One file per store, next to the chronicle
+ * suppressions, branch checkouts (switchBranch), undo/redo/hide,
+ * unstick/nudge, runtime-settings changes, host quiesce/resume. One file per store, next to the chronicle
  * (`<storePath>/operator-actions.jsonl`), so it travels with backups and
  * survives host restarts the way `repair-receipts.jsonl` and
  * `watchdog-wedge.jsonl` do.
@@ -32,7 +32,7 @@ export interface OperatorRequester {
 export interface OperatorLogEntry {
   /** ISO-8601 wall-clock time of the record. */
   at: string;
-  /** Action kind, e.g. 'rollback', 'suppress', 'undo', 'hide', 'quiesce'. */
+  /** Action kind, e.g. 'rollback', 'suppress', 'checkout', 'undo-turn', 'hide', 'quiesce'. */
   kind: string;
   /** Agent the action targeted (absent for host-wide actions). */
   agent?: string;
@@ -116,6 +116,97 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
   return ids.length > OPERATOR_LOG_ID_CAP
     ? { ids: ids.slice(0, OPERATOR_LOG_ID_CAP), count: ids.length, truncated: true }
     : { ids, count: ids.length };
+}
+
+/**
+ * Facts every surgery marker receipt carries, whatever happened: the
+ * publication scope chosen (`none` unless the operator chose marks), how many
+ * removed addressable Discord messages the choice leaves unmarked (outside its
+ * scope or its authorized refs; whether the chosen ones are scheduled is the
+ * receipt's `status`), and how many authorized refs it did not remove (a
+ * delayed application whose anchor no longer covered them; their marks are
+ * never widened to anything else).
+ */
+export interface SurgeryMarkerFacts {
+  scope: 'none' | 'addressed' | 'all';
+  unmarked: number;
+  notRemoved: number;
+}
+
+/**
+ * What a live surgery did about Discord awareness marks, reported apart from
+ * the body change itself. A surgery that returns has applied its body change;
+ * this says only whether marks were scheduled:
+ *
+ * - `none` — no marks were requested (the default), or none of the removed
+ *   messages fell within the chosen scope and authorized refs. It says
+ *   nothing about whether Discord messages were removed: `unmarked` counts
+ *   the addressable ones left unmarked, the surgery's `removedRefs` list
+ *   every one, and the operator log's `discordRefs` counts them.
+ * - `queued` — one add request per mark is recorded, and delivered when its
+ *   route is up: a pass starts at once unless the host is stopping, and a
+ *   later one (a reconnect, a tools-list change or the next start) takes
+ *   what remains. If a delivery pass fails, the requests stay recorded and
+ *   the `discord-awareness-delivery` ops alert says so. The same alert names
+ *   the marks a pass, or a start, gave up on: refused by Discord for good,
+ *   or after three unconfirmed attempts. It is not a delivery claim: what
+ *   Discord answers is kept in the awareness ledger.
+ * - `not-scheduled` — the body change landed, but recording the batch as
+ *   active failed, or it was never recorded: none of its marks will be
+ *   delivered. `error` says why, and whether the batch was retired or stays
+ *   prepared for a start to retire.
+ */
+export type SurgeryMarkerReceipt = SurgeryMarkerFacts & (
+  | { status: 'none'; queued: 0 }
+  | { status: 'queued'; queued: number; batchId: string }
+  | { status: 'not-scheduled'; queued: 0; error: string }
+);
+
+/** What a surgery would remove and which messages each marks scope covers. */
+export interface SurgeryMarksPreview {
+  messagesRemoved: number;
+  /** Removed messages that carry a Discord address at all. */
+  addressable: number;
+  /**
+   * Of the messages removed, how many no live agent is shown (#291): no
+   * window holds them (stored and never presented to an agent, or taken out
+   * of every window since), or only windows whose view leaves them out (a
+   * row a tune-out holds, which a window written down from the record
+   * holds). Their marks tell Discord of messages no agent was being shown.
+   * A message that may be in a window that couldn't be read isn't counted,
+   * and is logged. Set only when the agent's context is presented.
+   */
+  neverPresented?: number;
+  /**
+   * For a rollback on a presented window: the rows after the target in the
+   * agent's window that the branch cut keeps in the record (stored before
+   * the write that presented the target, presented after it). They leave
+   * the window as arrived and not presented, and enter it again at the
+   * agent's next turn start, after what its window holds then; nothing at
+   * rest presents them before it (rollbackToMessage). An own row of the
+   * agent's among them re-enters at the surgery's release. The hold is in
+   * memory, so a restart before then presents them at its pass at rest.
+   * Not removed, so not counted in `messagesRemoved`, and not marked. Set
+   * only then.
+   */
+  returnedToArrivals?: number;
+  /**
+   * For a rollback on a presented window: the rows after the target in the
+   * agent's window that the write presenting the target presented too (a
+   * batch). The cut is at that write, so they stay in the window after the
+   * target. Not removed, so not counted in `messagesRemoved`, and not
+   * marked: a suppression, or, for those with a Discord message id, a hide
+   * by it, takes them out.
+   * Set only then.
+   */
+  keptInWindowAfterTarget?: number;
+  emoji: string;
+  scopes: Record<'addressed' | 'all', {
+    count: number;
+    channels: Array<{ channelId: string; count: number }>;
+    /** Pass back as `marks.refs` to bind the choice to exactly these. */
+    refs: Array<{ serverId: string; channelId: string; messageId: string }>;
+  }>;
 }
 
 /** Thrown by live surgery methods when a request cannot be honored. `code`

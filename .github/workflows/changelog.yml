@@ -23,15 +23,16 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           changed=$(git diff --name-only "$base...$head")
-          # Fragments must be *added* — a deleted or renamed fragment also
+          # Fragments must be added or edited: a change may land its entry by
+          # editing a pending fragment. A deleted or renamed fragment also
           # appears in --name-only and must not satisfy the check.
-          added=$(git diff --name-only --diff-filter=A "$base...$head")
+          added_or_edited=$(git diff --name-only --diff-filter=AM "$base...$head")
           echo "Changed files:"
           echo "$changed"
           if echo "$changed" | grep -q '^src/' \
-             && ! echo "$added" | grep -Eq '^changelog\.d/[^/]+\.(breaking|added|changed|fixed)\.md$' \
+             && ! echo "$added_or_edited" | grep -Eq '^changelog\.d/[^/]+\.(breaking|added|changed|fixed)\.md$' \
              && ! echo "$changed" | grep -qx 'CHANGELOG.md'; then
-            echo "::error::This PR touches src/ but carries no changelog entry. Add a fragment changelog.d/<slug>.<breaking|added|changed|fixed>.md (see CONTRIBUTING.md), or apply the 'no-changelog' label if the change is internal-only."
+            echo "::error::This PR touches src/ but carries no changelog entry. Add a fragment changelog.d/<slug>.<breaking|added|changed|fixed>.md or edit a pending one (see CONTRIBUTING.md), or apply the 'no-changelog' label if the change is internal-only."
             exit 1
           fi
           echo "OK"
