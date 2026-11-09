@@ -231,7 +231,9 @@ export interface Module {
    *
    * The call is synchronous, and routing goes on when it returns, so showing
    * a piece has to be a write that doesn't wait, such as a socket write that
-   * isn't awaited. A module that throws names no place, as `{}` does.
+   * isn't awaited. A module that throws names no place, as `{}` does, and
+   * so does one that returns a promise, whose rejection is logged as a
+   * throw is.
    *
    * A piece with `final: true` comes after the turn's `inference:completed`
    * trace and before the agent's next `inference:started`.

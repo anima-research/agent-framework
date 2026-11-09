@@ -769,6 +769,12 @@ export class ModuleRegistry {
       let place: string | undefined;
       try {
         const answer = hook.call(module, agentName, text, context);
+        if (typeof (answer as { then?: unknown } | null | undefined)?.then === 'function') {
+          (answer as PromiseLike<unknown>).then(undefined, (error: unknown) => {
+            console.error(`Speech-routed module ${module.name} (agent ${agentName}) error:`, error);
+          });
+          continue;
+        }
         place = speechPlace((answer as { sentTo?: unknown } | null | undefined)?.sentTo);
       } catch (error) {
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) error:`, error);

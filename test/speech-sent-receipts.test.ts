@@ -1289,6 +1289,23 @@ describe('plain speech a module says it showed', () => {
     assert.equal(receipt(f), `[delivered] plain speech → room · sent to ${SENT_TO}`);
   });
 
+  it("a module whose hook returns a promise that rejects names no place, and its error is logged as a throw's is", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.onSpeechRouted = (agent, text, context) => {
+      surface.asked.push({ agent, text, context });
+      return Promise.reject(new Error('zz-rejected'));
+    };
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f);
+    assert.equal(surface.asked.length, 1, 'premise: it was asked');
+    assert.equal(notices(f).length, 1, texts(f).join('\n'));
+    assert.ok(errors.includes('Speech-routed module console (agent resident) error: Error: zz-rejected'), errors.join('\n'));
+  });
+
   it("a module whose hook returns a promise names no place, and routing doesn't wait for it", async () => {
     const surface = new Surface();
     let settled = false;
