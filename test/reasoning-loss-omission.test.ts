@@ -20,6 +20,15 @@ class MarkedPrefix extends PassthroughStrategy {
   }
 }
 const flags = { system: true, kind: 'reasoning-loss' };
+// Upstream #291 makes presentation mandatory. These legacy-store fixtures
+// deliberately put every row (notices included) in the window, so only the
+// view filter can omit one; an unpresented notice must not mask a regression.
+const presentAll = (cm: ContextManager) => cm.presentRows(cm.getUnpresentedMessages().map(m => m.id));
+const addPresented = (cm: ContextManager, participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => {
+  const id = cm.addMessage(participant, content, metadata);
+  presentAll(cm);
+  return id;
+};
 async function fixture(conversations = false, settings: Partial<AgentConfig> = {}, membrane = new MockMembrane(), modules: Module[] = [], subconscious = false) {
   const dir = mkdtempSync(join(tmpdir(), 'af-reasoning-loss-'));
   const framework = await AgentFramework.create({
@@ -32,7 +41,12 @@ async function fixture(conversations = false, settings: Partial<AgentConfig> = {
   await framework.start();
   const agent = framework.getAgent('assistant')!;
   const cm = agent.getContextManager();
-  const add = (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => cm.addMessage(participant, content, metadata);
+  const add = (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => {
+    const id = addPresented(cm, participant, content, metadata);
+    const reader = framework.getAgent('Subconscious');
+    if (reader) presentAll(reader.getContextManager());
+    return id;
+  };
   const request = () => agent.buildActivationRequest([]);
   return { framework, agent, cm, add, request, membrane, storePath: join(dir, 'store') };
 }
@@ -162,8 +176,8 @@ it('conversation-template inheritance omits notices before metadata is lost, wit
   assert.deepEqual(x.membrane.calls[0]!.messages.slice(0, expected.length).map(m => m.content), expected);
   assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
   assert.equal(JSON.stringify(await x.request()), before);
-  child.getContextManager().addMessage('user', [text('child notice')], flags);
-  child.getContextManager().addMessage('user', [text('child quote')]);
+  addPresented(child.getContextManager(), 'user', [text('child notice')], flags);
+  addPresented(child.getContextManager(), 'user', [text('child quote')]);
   const next = await child.buildActivationRequest([]);
   assert.ok(!JSON.stringify(next.messages).includes('child notice'), 'conversation contexts filter their own new rows too');
   assert.ok(JSON.stringify(next.messages).includes('child quote'));
@@ -193,10 +207,11 @@ it('strips signed thinking minted under the legacy notice prefix before sending 
   const legacy = await ContextManager.open({ store: x.framework.getStore(), namespace: 'agents/assistant', strategy: new MarkedPrefix() });
   cleanups.push(async () => { legacy.close(); });
   const old = new Agent({ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', thinkingBinding: { binds: true, dropBlock: true } }, legacy, x.membrane.asMembrane());
-  legacy.addMessage('user', [text('before')]);
-  legacy.addMessage('user', [text(notice)], flags);
+  addPresented(legacy, 'user', [text('before')]);
+  addPresented(legacy, 'user', [text(notice)], flags);
   const start = await old.startStream([]);
   const reply = old.addAssistantResponse([{ type: 'thinking', thinking: 'private', signature: 'signed' }, text('reply')])!;
+  presentAll(legacy);
   assert.equal(start.noteRequestSent!([reply]), true);
   const original = await old.buildActivationRequest([]);
   assert.ok(original.messages.some(m => m.content.some(b => b.type === 'thinking')), 'legacy prefix really retained the signature');
@@ -239,17 +254,18 @@ it('excludes real sharded notices from selection and auxiliary compression witho
   assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
 });
 
-it('stores genuine deferred notices but never injects them at the next tool boundary', async () => {
+it('stores mid-turn notices immediately but never injects them at the next tool boundary', async () => {
   let framework: AgentFramework;
-  let queued = 0;
+  let storedDuringTool = 0;
   const module: Module = {
     name: 'defer', async start() {}, async stop() {},
     getTools: () => [{ name: 'step', description: 'step', inputSchema: { type: 'object', properties: {} } }],
     async handleToolCall() {
-      const before = (framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length;
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      const before = cm.getAllMessages().length;
       (framework as unknown as { addMessage(p: string, c: ContentBlock[], m?: Record<string, unknown>): void }).addMessage('user', [text(notice)], flags);
       (framework as unknown as { addMessage(p: string, c: ContentBlock[], m?: Record<string, unknown>): void }).addMessage('user', [text(notice)]);
-      queued = (framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length - before;
+      storedDuringTool = cm.getAllMessages().length - before;
       return { success: true, data: 'ok' };
     },
     async onProcess(event) { return event.type === 'external-message' ? { addMessages: [{ participant: 'user', content: [text('start')] }], requestInference: true } : {}; },
@@ -260,10 +276,10 @@ it('stores genuine deferred notices but never injects them at the next tool boun
   x.membrane.pushResponse(createMockResponse([text('reply')]));
   framework.pushEvent({ type: 'external-message', source: 'test' } as ProcessEvent);
   await framework.runUntilIdle();
-  assert.equal(queued, 2, 'both writes were really queued during the tool call');
+  assert.equal(storedDuringTool, 2, 'upstream stores both writes immediately during the tool call');
   const stored = x.cm.getAllMessages().filter(m => m.metadata?.kind === 'reasoning-loss');
   assert.equal(stored.length, 1);
-  assert.equal(typeof stored[0]!.metadata?.deferredWriteId, 'string');
+  assert.equal(stored[0]!.metadata?.deferredWriteId, undefined, 'new writes no longer use the legacy deferred queue');
   const injected = x.membrane.lastStream!.receivedToolResultOptions.flatMap(o => o?.injectedMessages ?? []);
   assert.equal(injected.filter(m => JSON.stringify(m.content).includes(notice)).length, 1, 'only the unflagged identical quote is injected');
   assert.equal((await x.request()).messages.filter(m => JSON.stringify(m.content).includes(notice)).length, 1);
@@ -287,8 +303,8 @@ it('applies the same exclusion to an isolated ephemeral context', async () => {
   const x = await fixture();
   const isolated = await x.framework.createEphemeralAgent({ name: 'isolated', model: 'test-model', systemPrompt: 'Test.' });
   cleanups.push(async () => isolated.cleanup());
-  isolated.contextManager.addMessage('user', [text('before')]);
-  isolated.contextManager.addMessage('user', [text(notice)], flags);
+  addPresented(isolated.contextManager, 'user', [text('before')]);
+  addPresented(isolated.contextManager, 'user', [text(notice)], flags);
   assert.deepEqual((await isolated.agent.buildActivationRequest([])).messages.map(m => m.content), [[text('before')]]);
   assert.equal((await isolated.agent.compileContext()).messages.length, 1);
 });
@@ -329,14 +345,14 @@ it('omits stored notices when an ended isolated agent resumes', async () => {
   const config = { model: 'test-model', systemPrompt: 'Test.' };
   const first = await x.framework.createEphemeralAgent({ name: 'isolated', ...config });
   cleanups.push(async () => first.cleanup());
-  first.contextManager.addMessage('user', [text('before')]);
-  first.contextManager.addMessage('user', [text(notice)], flags);
-  first.contextManager.addMessage('user', [text('after')]);
+  addPresented(first.contextManager, 'user', [text('before')]);
+  addPresented(first.contextManager, 'user', [text(notice)], flags);
+  addPresented(first.contextManager, 'user', [text('after')]);
   x.membrane.pushResponse(createMockResponse([text('first reply')]));
   await x.framework.runEphemeralToCompletion(first.agent, first.contextManager);
   const ended = x.framework.getAgentRecord('isolated')!;
   assert.equal(ended.ended?.reason, 'completed');
-  assert.equal(ended.readsSharedSlot, false);
+  assert.equal(ended.ownSlot?.namespace, 'subagent/isolated');
   const resumed = await x.framework.resumeAgent('isolated', config);
   cleanups.push(async () => resumed.cleanup());
   assert.ok(resumed.contextManager.getAllMessages().some(m => m.metadata?.kind === 'reasoning-loss'),
@@ -356,9 +372,9 @@ it('omits stored notices when a shared child of an isolated parent resumes', asy
   const config = { model: 'test-model', systemPrompt: 'Test.' };
   const parent = await x.framework.createEphemeralAgent({ name: 'isolated-parent', ...config });
   cleanups.push(async () => parent.cleanup());
-  parent.contextManager.addMessage('user', [text('before')]);
-  parent.contextManager.addMessage('user', [text(notice)], flags);
-  parent.contextManager.addMessage('user', [text('after')]);
+  addPresented(parent.contextManager, 'user', [text('before')]);
+  addPresented(parent.contextManager, 'user', [text(notice)], flags);
+  addPresented(parent.contextManager, 'user', [text('after')]);
   x.membrane.pushResponse(waitCall('parent'));
   x.membrane.pushResponse(say('parent reply'));
   const parentRun = x.framework.runEphemeralToCompletion(parent.agent, parent.contextManager);
@@ -406,7 +422,7 @@ it('omits persisted notices from a reopened resident after a framework restart',
   cleanups.push(async () => restarted.stop());
   const ended = restarted.getAgentRecord('assistant')!;
   assert.ok(ended.ended);
-  assert.equal(ended.readsSharedSlot, true);
+  assert.equal(ended.ownSlot?.namespace, null);
   assert.equal(restarted.getAgent('assistant'), null);
   const reopened = await restarted.inspectAgentContext('assistant');
   cleanups.push(async () => { reopened.close(); });
@@ -448,6 +464,10 @@ it('exports the composed resident and subconscious views actually applied by the
   assert.deepEqual(metadata.map(isReasoningLoss), [true, false, false, false, false, false, false, false]);
   const expected = (view: (message: typeof rows[number], name: string) => boolean, name: string) =>
     rows.filter(row => view(row, name)).map(row => row.content);
+  assert.deepEqual(rows.filter(residentView('assistant')).map(row => row.content), expected(residentView, 'assistant'),
+    'upstream curried and PR direct-call exports use the same resident predicate');
+  assert.deepEqual(rows.filter(subconsciousView('Subconscious')).map(row => row.content), expected(subconsciousView, 'Subconscious'),
+    'both subconscious call forms use the same predicate');
   assert.deepEqual((await x.request()).messages.map(m => m.content), expected(residentView, 'assistant'));
   const subconscious = x.framework.getAgent('Subconscious')!;
   assert.deepEqual((await subconscious.buildActivationRequest([])).messages.map(m => m.content),
@@ -472,13 +492,13 @@ it('migration: reopening legacy summaries preserves setup and stored history', a
   const legacy = await ContextManager.open({ path: storePath, namespace: 'agents/assistant',
     strategy: strategy(), membrane: membrane.asMembrane() });
   cleanups.push(async () => { legacy.close(); });
-  const noticeId = legacy.addMessage('user', [text(notice)], flags);
-  for (let i = 0; i < 3; i++) legacy.addMessage(i % 2 ? 'assistant' : 'user', [text('old conversation '.repeat(30))]);
+  const noticeId = addPresented(legacy, 'user', [text(notice)], flags);
+  for (let i = 0; i < 3; i++) addPresented(legacy, i % 2 ? 'assistant' : 'user', [text('old conversation '.repeat(30))]);
   for (let i = 0; i < 100 && (!legacy.getSummariesInRange({}).length || !legacy.isReady()); i++) await legacy.tick();
   const summaries = legacy.getSummariesInRange({});
   assert.equal(summaries.length, 1, 'real unfiltered compression persisted a summary');
   assert.equal(summaries[0]!.firstMessageId, noticeId, 'the notice really is the first source');
-  legacy.addMessage('user', [text('newer raw message')]);
+  addPresented(legacy, 'user', [text('newer raw message')]);
   const stored = structuredClone(legacy.getAllMessages());
   legacy.close();
   const framework = await AgentFramework.create({
@@ -498,7 +518,7 @@ it('migration: reopening legacy summaries preserves setup and stored history', a
       'The hidden-endpoint defect changed: once the dependency floor includes anima-research/context-manager#369, remove the migration limit and the todo below.');
   });
   await t.test('a summary with a hidden first source precedes newer messages and remains in overview', {
-    todo: 'anima-research/context-manager#369 or equivalent: hidden summary endpoints are unresolved on 0.24.2',
+    todo: 'anima-research/context-manager#369 or equivalent: hidden summary endpoints are unresolved on 0.25.1',
   }, () => {
     assert.ok(summaryPrecedesNewer,
       'anima-research/context-manager#369: an old summary must precede newer raw messages even when its first source is hidden');

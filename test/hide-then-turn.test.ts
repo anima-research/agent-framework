@@ -61,8 +61,12 @@ async function turnAfterRemoving(
   framework.onTrace((e) => traces.push(e));
   try {
     const cm = framework.getAgent('scout')!.getContextManager();
+    // Written straight to the context manager, each message enters the
+    // window at a point (#291), where the preview and the turn read it.
+    const present = (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf.bind(framework);
     for (const [i, text] of ['zz-m1', 'zz-m2', 'zz-m3'].entries()) {
       cm.addMessage('user', [{ type: 'text', text }], { messageId: `d${i + 1}`, channelId: 'zz-channel' });
+      present(framework.getAgent('scout'));
     }
     const internalIdOf = (externalId: string): string => String(cm.getAllMessages().find((m) =>
       (m.metadata as { messageId?: unknown } | undefined)?.messageId === externalId)!.id);

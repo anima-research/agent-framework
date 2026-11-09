@@ -49,6 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
+import { persistentReaderName, tuneOutHeldWords, tuneOutNoReaderAnswer, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
 import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
@@ -276,8 +277,8 @@ function desiredStateRecord(item: unknown): {
 
 /**
  * The desired state `store`'s lifecycle log records for `channelId` on
- * `serverId`, for a reader with no registry yet, as a serving boot's
- * deferred-write flush is, before initializeMcpl: the last decision wins, as
+ * `serverId`, for a reader with no registry yet, as the boot's import of an
+ * earlier release's queued writes is, before initializeMcpl: the last decision wins, as
  * the registry's replay reads it (getDesiredState answers once there is a
  * registry). undefined when no decision names it.
  */
@@ -731,6 +732,34 @@ function channelOnServer(ref: ChannelRef): string {
   return `${quotedValue(ref.channelId)} on server ${quotedValue(ref.serverId)}`;
 }
 
+/** A channel_close's lead where its channel's server no longer registers it. */
+function noLongerRegistered(ref: ChannelRef): string {
+  return `Server ${quotedValue(ref.serverId)} no longer registers channel ${quotedValue(ref.channelId)}, so no close was recorded or sent.`;
+}
+
+/** What a channel_close's bare name reached besides the channel it closed
+ *  (ChannelRegistry.focusNamedBare): each by its id and server, which the
+ *  bare name leaves out, and the channelId and serverId a call closes it
+ *  with: its own id, which needn't be the name the call gave (a focus on
+ *  `b:room` beside server b's `room`), so naming the server alone, the
+ *  name kept, is no channel there. */
+function notClosedText(refs: readonly ChannelRef[]): string {
+  const names = refs.map(channelOnServer);
+  const call = (ref: ChannelRef) => `channelId ${quotedValue(ref.channelId)} and serverId ${quotedValue(ref.serverId)}`;
+  return refs.length === 1
+    ? `Channel ${names[0]} was not closed: to close it, call again with ${call(refs[0]!)}.`
+    : `Channels ${names.slice(0, -1).join(', ')} and ${names.at(-1)} were not closed: to close one, call again with ` +
+      `${refs.slice(0, -1).map(call).join(', with ')}, or with ${call(refs.at(-1)!)}.`;
+}
+
+/** A tool result with a sentence added: a success's after its note (or as
+ *  its note), a failure's after its error. */
+function withSentence(result: ToolResult, sentence: string): ToolResult {
+  if (!result.success) return { ...result, error: result.error ? `${result.error} ${sentence}` : sentence };
+  const data = (result.data ?? {}) as Record<string, unknown>;
+  return { ...result, data: { ...data, note: typeof data.note === 'string' ? `${data.note} ${sentence}` : sentence } };
+}
+
 const CHANNEL_ON_SERVER_AT_END = /("(?:[^"\\]|\\.)*") on server ("(?:[^"\\]|\\.)*")$/;
 
 /**
@@ -1012,16 +1041,31 @@ interface ChannelRegistryOptions {
    * this is ends through the cancel flow (release the backlog, record the
    * end) before the lifecycle state flips to closed. A
    * tuned-out channel's close is refused before this (its cancel ends it).
-   * Returns what it ended, in a sentence the close's answer adds when the
-   * close itself isn't recorded.
+   * `unregistered`: the close names the channel after its server stopped
+   * registering it, so no close is recorded or sent (handleToolClose).
+   * Returns, where a hold excepts the channel, what became of that hold:
+   * a function that says it in a sentence, read when the close's answer is
+   * built, after its transport's round-trip, so the answer says what holds
+   * when it arrives (a release that waited may have run by then). The
+   * answer carries it whatever became of the close: as `note` on a success,
+   * after the error on a failure. Throws, with the answer's text, when the
+   * hold's release fails; one that ended the hold before it failed says so.
    */
-  onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  onToolClose?: ToolCloseHook;
   /**
    * The channel unprefixed speech lands in while an all-except hold is
    * active (its exception), else null. Consulted after a fork's home and
    * the turn's own delivery, before the legacy fallback.
    */
   focusChannelResolver?: () => ChannelRef | null;
+  /**
+   * Who reads a tuned-out channel's traffic (the framework's reader: the
+   * persistent subconscious by its name, or reader forks), for the texts
+   * that tell an agent where a tuned-out channel's messages go. Left out,
+   * the texts name the persistent reader by its default name
+   * (persistentReaderName): there is no hold without a reader (0.33.0).
+   */
+  tuneOutReader?: () => TuneOutReader;
   /**
    * Called when a text-only turn's speech was not delivered to its
    * conversational locus (`failed`), or may not have been (`unknown`), for
@@ -1049,6 +1093,9 @@ interface ChannelRegistryOptions {
     outcome?: 'failed' | 'unknown';
     /** Bounded display of the connector's structured error data, when present. */
     detail?: string;
+    /** Set when the turn had no channel and the reason names the channels
+     *  its batch came from. */
+    byDesign?: true;
   }) => void;
   /**
    * Announces either a durable subscription-policy admission (before its
@@ -1091,15 +1138,29 @@ interface ChannelRegistryOptions {
    * message across ALL channels (markers aside) and misroutes a reply to
    * whichever channel last spoke under concurrency (item-3 redux). The
    * framework keeps both on the live turn's routing state and exposes them
-   * here. For a heartbeat / no-trigger turn it resolves to undefined until the
-   * turn's locus is resolved, so that
-   * resolution takes the global fallback, which the turn then keeps.
-   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
-   * `defaultPublishChannel`. Null where the turn deliberately has no channel,
-   * as one woken for a channel id two servers register, given without its
-   * server: that takes no fallback either.
+   * here. For a no-trigger turn it resolves to undefined until the turn's
+   * locus is resolved, so that resolution takes the global fallback, which the
+   * turn then keeps. Consulted AFTER `homeChannelResolver` (a fork's home
+   * always wins), BEFORE the global fallback. Null where the turn deliberately
+   * has no channel, as a heartbeat's turn, or one woken for a channel id two
+   * servers register, given without its server: that takes no fallback
+   * either.
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
+  /**
+   * FrameworkConfig.unpromptedChannel: where a turn that takes it
+   * (takesUnpromptedChannel) and has no home and no channel of its own is
+   * placed, within the process-global fallback, after an all-except hold's
+   * channel (sharedFallback). A name, as entriesNamed reads one.
+   */
+  unpromptedChannel?: string;
+  /**
+   * Whether the conversation's current turn takes `unpromptedChannel` where it
+   * has no channel of its own: the framework answers true only for a turn
+   * the agent's own timer started, as FrameworkConfig.unpromptedChannel
+   * says. Absent, every turn does.
+   */
+  takesUnpromptedChannel?: (conversationId: string) => boolean;
   /**
    * Whether the agent's current turn has no channel of its own — a
    * heartbeat's, or one woken for a channel that names none — so it replies
@@ -1136,6 +1197,33 @@ interface ChannelRegistryOptions {
 // ============================================================================
 // ChannelRegistry
 // ============================================================================
+
+/** A channel_close call's input (ChannelRegistry.handleToolClose). */
+type ToolCloseInput = {
+  channelId: string;
+  serverId?: string;
+  /** Machine callers name their decision source ('subscription-gc',
+   *  'housekeeping') so the durable record carries honest provenance.
+   *  Honored ONLY for module-origin dispatch — tool input is untrusted,
+   *  so a model-origin call carrying this field is still recorded as
+   *  'agent-tool' (the resident may close their own channel; they may
+   *  not attribute the act to housekeeping). A module-origin call
+   *  without it is the module's own close, MODULE_CLOSE_SOURCE. */
+  source?: string;
+  /** A machine close aimed at an explicitly-opened channel is refused
+   *  unless the caller certifies an explicit idle lease (a configured
+   *  per-channel budget is consent to close at that budget). A tuned-out
+   *  channel is refused even so, since its tune-out's cancel is what
+   *  ends it. Module origin only, like `source`. */
+  overrideExplicitOpen?: boolean;
+};
+
+/** ChannelRegistryOptions.onToolClose: a tool close's end of the all-except hold that excepts its channel. */
+export type ToolCloseHook = (
+  serverId: string,
+  channelId: string,
+  opts?: { unregistered?: true },
+) => (() => string) | undefined;
 
 /**
  * Who is actually making a channel tool call, as established by the
@@ -1196,8 +1284,9 @@ export class ChannelRegistry {
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private readonly latestInboundLocus: boolean;
-  private onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  private onToolClose?: ToolCloseHook;
   private focusChannelResolver?: () => ChannelRef | null;
+  private readonly tuneOutReaderFn?: () => TuneOutReader;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
@@ -1210,6 +1299,9 @@ export class ChannelRegistry {
   private channellessTurn?: (agentName: string) => boolean;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
+  private unpromptedChannel?: string;
+  private unpromptedChannelWarned = false;
+  private takesUnpromptedChannel?: (conversationId: string) => boolean;
   private store?: JsStore;
 
   /**
@@ -1411,6 +1503,11 @@ export class ChannelRegistry {
     return new ChannelLifecycleError(`this host isn't permitted to open or close the "${serverId}" server's channels`, 'not-permitted');
   }
 
+  private publishingServer(serverId: string): McplServerConnection | undefined {
+    const server = this.serverRegistry.getServer(serverId);
+    return server && CapabilityGrant.of(server).has('channels.publish') ? server : undefined;
+  }
+
   /**
    * Why a send to this server's channels is refused before anything goes
    * out, as one clause with what works from there, for a caller that found
@@ -1489,17 +1586,17 @@ export class ChannelRegistry {
         (reach === 'gone' ? ' If you need the server back, ask whoever runs this host.' : '') +
         (failure === undefined ? ` ${withStop(lifecycleClause(err))}` : '');
     }
-    // A tune-out sends the channel's messages to the subconscious, and
+    // A tune-out holds the channel's messages for its reader, if any, and
     // channel_open refuses a tuned-out channel.
     if (action === 'open' ? now !== 'open' : now !== 'closed') {
       if (action === 'open' && now === 'tuned-out') {
-        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_open doesn't ` +
+        return `Channel ${channel} was tuned out meanwhile: its messages ${this.tuneOutHeld()}, and channel_open doesn't ` +
           `change that. ${this.tuneOutEndText(current)}`;
       }
       // channel_close refuses a tuned-out channel too, so calling it again
       // isn't the way: the tune-out's cancel is, and it delivers the backlog.
       if (action === 'close' && now === 'tuned-out') {
-        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn't ` +
+        return `Channel ${channel} was tuned out meanwhile: its messages ${this.tuneOutHeld()}, and channel_close doesn't ` +
           `change that. ${this.tuneOutEndText(current, 'channel_close')}`;
       }
       // The later decision's own work settles the transport, and its call
@@ -1605,6 +1702,18 @@ export class ChannelRegistry {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
     this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
+      if (tool.name === 'channel_publish') {
+        if (options?.unpromptedChannel === undefined || options.eventGatePresent !== true) return tool;
+        return {
+          ...tool,
+          description: tool.description
+            .replace(
+              'otherwise, while a focus holds, the channel it keeps.',
+              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn\'t routed), the channel this host names for such turns.',
+            )
+            .replace('A turn with no channel of its own, such as', 'A turn with no channel by design, such as'),
+        };
+      }
       if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
       const schema = tool.inputSchema as {
         type: 'object';
@@ -1630,12 +1739,15 @@ export class ChannelRegistry {
     this.latestInboundLocus = options?.latestInboundLocus === true;
     this.onToolClose = options?.onToolClose;
     this.focusChannelResolver = options?.focusChannelResolver;
+    this.tuneOutReaderFn = options?.tuneOutReader;
     this.onRouteFailure = options?.onRouteFailure;
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.channellessTurn = options?.channellessTurn;
     this.takesGlobalFallback = options?.takesGlobalFallback;
+    this.unpromptedChannel = options?.unpromptedChannel;
+    this.takesUnpromptedChannel = options?.takesUnpromptedChannel;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
     this.initializeLifecycleStore();
@@ -2469,15 +2581,7 @@ export class ChannelRegistry {
         }, origin?.kind === 'agent' ? origin.own : undefined);
 
       case 'channel_close':
-        return this.handleToolClose(
-          input as {
-            channelId: string;
-            serverId?: string;
-            source?: string;
-            overrideExplicitOpen?: boolean;
-          },
-          origin,
-        );
+        return this.handleToolClose(input as ToolCloseInput, origin);
 
       case 'channel_decline':
         return this.handleToolDecline(input as {
@@ -2562,7 +2666,9 @@ export class ChannelRegistry {
     // declared it inbound-only, since speech isn't posted there): a conversation
     // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
-    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none).
+    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none), with
+    // the configured unprompted channel in it where the turn takes it: the
+    // channel channel_publish naming none publishes to, in every prose mode.
     // Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
@@ -2573,9 +2679,11 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): not the
     // all-except hold's channel, not the latest inbound message's channel as
     // its outgoing one, nor that message as the one it is replying to.
-    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback();
+    const fallback = (): ChannelRef | null => agentName !== undefined
+      ? this.globalFallbackFor(agentName, () => this.configuredUnprompted(agentName))
+      : this.sharedFallback();
     // A turn that deliberately has no channel (null) takes no fallback.
-    const outgoing = home ?? (active !== undefined ? active : fallback);
+    const outgoing = home ?? (active !== undefined ? active : fallback());
 
     const context: ChannelContext = {};
 
@@ -3174,7 +3282,7 @@ export class ChannelRegistry {
 
   /**
    * Make a tuned-out channel's transport match its tune-out, which keeps it
-   * open so its traffic reaches the subconscious (TuneOutParams). The
+   * open so its traffic reaches its reader, or is held (TuneOutParams). The
    * tune-out is recorded first (enterTuneOut), and this writes no decision,
    * so the tune-out stands whatever becomes of the open. Lifecycle work
    * queued for the channel goes first, until none is left, since each
@@ -3186,8 +3294,8 @@ export class ChannelRegistry {
    * tune-out as open), and the answer waits for the work queued after it
    * too, such as a registration that came back, and comes from the state
    * that work leaves. Returns nothing where the transport is open, or, for
-   * tune_out's answer, why the channel's messages don't or may not reach the
-   * subconscious yet and when they will, or that the tune-out isn't in
+   * tune_out's answer, why the channel's messages don't or may not reach its
+   * reader yet, or be received, and when they will, or that the tune-out isn't in
    * effect any more. A call while this tune-out's open is in flight, as a
    * repeated tune_out makes, gets that open's answer rather than send
    * another.
@@ -3260,9 +3368,10 @@ export class ChannelRegistry {
     // that took effect would have its traffic diverted. `again` where calling
     // tune_out again tries the open now: the channel is registered here and
     // its server up.
-    const notYet = (later: string, why: string, again = false): string => withStop(
-      `The tune-out is recorded, but its messages may not reach the subconscious until this host opens the channel, ` +
-      `which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
+    // Where no reader runs, each answer is that alone (tuneOutNoReaderAnswer).
+    const notYet = (later: string, why: string, again = false): string => tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
+      `The tune-out is recorded, but its messages ${this.tuneOutReach('may not reach')} until this host opens the ` +
+      `channel, which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
     );
     const nextRegistration = `when the "${serverId}" server next registers this channel, if this host may open and ` +
       'close its channels then';
@@ -3294,18 +3403,18 @@ export class ChannelRegistry {
       // established.
       const reach = this.serverReach(serverId);
       if (reach !== 'up') {
-        return withStop(
-          `The tune-out is recorded, but its messages don't reach the subconscious until the "${serverId}" server is ` +
-          `connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
+        return tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? withStop(
+          `The tune-out is recorded, but its messages ${this.tuneOutReach("don't reach")} until the "${serverId}" server ` +
+          `is connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
           (reach === 'gone' ? unreachableRemedy(reach) : ''),
         );
       }
       const transportOpen = this.tuneOutReadsOpen(entry);
       if (!this.directsLifecycle(serverId)) {
         return transportOpen ? undefined
-          : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
-            'subconscious only as that server sends them, and calling tune_out again won\'t change that. If you need ' +
-            'this host to open it, ask whoever runs this host.';
+          : tuneOutNoReaderAnswer(this.tuneOutReaderNow()) ?? `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages ` +
+            `${this.tuneOutReach('reach')} only as that server sends them, and calling tune_out again won't change ` +
+            'that. If you need this host to open it, ask whoever runs this host.';
       }
       if (!entry) return missing;
       // A flag a close that may have taken effect left gets an open.
@@ -4067,6 +4176,21 @@ export class ChannelRegistry {
     return channelOnServer(ref);
   }
 
+  /** The reader of a tuned-out channel's traffic, as the host says (tuneOutReader), or the default persistent reader. */
+  private tuneOutReaderNow(): TuneOutReader {
+    return this.tuneOutReaderFn?.() ?? { kind: 'persistent', name: persistentReaderName({}) };
+  }
+
+  /** What a tuned-out channel's messages are, after "its messages" (tuneOutHeldWords). */
+  private tuneOutHeld(): string {
+    return tuneOutHeldWords(this.tuneOutReaderNow());
+  }
+
+  /** Whether a tuned-out channel's messages get to its reader, after "its messages" (tuneOutReachWords). */
+  private tuneOutReach(form: Parameters<typeof tuneOutReachWords>[1]): string {
+    return tuneOutReachWords(this.tuneOutReaderNow(), form);
+  }
+
   /**
    * A tool's refusal of a tuned-out channel, whose decision is the tune-out:
    * its cancel is what ends it (tuneOutEndText), and a decision recorded over
@@ -4078,7 +4202,7 @@ export class ChannelRegistry {
       success: false,
       isError: true,
       error:
-        `Channel ${this.quotedShown(refOf(entry))} is tuned out: its messages go to the subconscious, and ${tool} ` +
+        `Channel ${this.quotedShown(refOf(entry))} is tuned out: its messages ${this.tuneOutHeld()}, and ${tool} ` +
         `doesn't change that. ${this.tuneOutEndText(entry, tool)}`,
       data: { refusal: 'tuned-out', channelId: entry.descriptor.id, serverId: entry.serverId },
     };
@@ -4099,7 +4223,7 @@ export class ChannelRegistry {
     return entry ? this.tuneOutEndText(entry) : undefined;
   }
 
-  private tuneOutEndText(entry: ChannelEntry, tool?: string): string {
+  private tuneOutEndText(entry: ChannelEntry, tool?: string, closeWith?: string): string {
     const close = tool === 'channel_close';
     // A name is written as a literal tune_out's channelId takes back
     // (quotedValue, main's #852); one no name picks alone, by its id and
@@ -4109,7 +4233,7 @@ export class ChannelRegistry {
       ? `channelId ${quotedValue(name)}`
       : `channelId ${quotedValue(entry.descriptor.id)}, serverId ${JSON.stringify(entry.serverId)}`;
     return `Call tune_out with ${names} and mode "cancel" for it to resume normal ` +
-      `attention; cancelling delivers the diverted backlog${close ? ', and channel_close closes it after that.' : '.'}`;
+      `attention; cancelling delivers the diverted backlog${close ? `, and channel_close${closeWith ? ` with ${closeWith}` : ''} closes it after that.` : '.'}`;
   }
 
   /**
@@ -5189,36 +5313,38 @@ export class ChannelRegistry {
     }
   }
 
-  private async handleToolClose(
-    input: {
-      channelId: string;
-      serverId?: string;
-      /** Machine callers name their decision source ('subscription-gc',
-       *  'housekeeping') so the durable record carries honest provenance.
-       *  Honored ONLY for module-origin dispatch — tool input is untrusted,
-       *  so a model-origin call carrying this field is still recorded as
-       *  'agent-tool' (the resident may close their own channel; they may
-       *  not attribute the act to housekeeping). A module-origin call
-       *  without it is the module's own close, MODULE_CLOSE_SOURCE. */
-      source?: string;
-      /** A machine close aimed at an explicitly-opened channel is refused
-       *  unless the caller certifies an explicit idle lease (a configured
-       *  per-channel budget is consent to close at that budget). A tuned-out
-       *  channel is refused even so, since its tune-out's cancel is what
-       *  ends it. Module origin only, like `source`. */
-      overrideExplicitOpen?: boolean;
-    },
-    origin?: ChannelToolOrigin,
-  ): Promise<ToolResult> {
-    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, origin?.kind === 'agent' ? origin.own : undefined);
-    const entry = resolved.entry;
-    if (!entry) {
-      return {
-        success: false,
-        error: resolved.error,
-        isError: true,
-      };
+  private async handleToolClose(input: ToolCloseInput, origin?: ChannelToolOrigin): Promise<ToolResult> {
+    const own = origin?.kind === 'agent' ? origin.own : undefined;
+    // An agent's bare name for the channel the all-except hold excepts means
+    // that channel (focusNamedBare), whether its server still registers it
+    // or not: another server's channel with the id, which the name would
+    // reach otherwise, isn't closed, and the answer says so. A module's
+    // close resolves its name as any other: housekeeping doesn't end the
+    // resident's focus.
+    const focused = origin?.kind === 'module' ? undefined : this.focusNamedBare(input.channelId, input.serverId, own);
+    if (focused && 'refusal' in focused) return { success: false, error: focused.refusal, isError: true };
+    if (focused) {
+      const entry = this.entryAt(focused.focus);
+      const result = entry
+        ? await this.closeToolEntry(entry, input, origin)
+        : this.unregisteredFocusClose(focused.focus) ?? { success: false, error: noLongerRegistered(focused.focus), isError: true };
+      return focused.notClosed ? withSentence(result, focused.notClosed) : result;
     }
+    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, own);
+    if (resolved.entry) return this.closeToolEntry(resolved.entry, input, origin);
+    // The name, with its serverId or as the turn's own channel, means the
+    // channel the all-except hold excepts, which its server no longer
+    // registers (unregisteredFocusNamed). A module's close of such a name is
+    // refused as any name no channel answers to.
+    const gone = origin?.kind === 'module' ? undefined : this.unregisteredFocusNamed(input.channelId, input.serverId, own);
+    return (gone && this.unregisteredFocusClose(gone)) || { success: false, error: resolved.error, isError: true };
+  }
+
+  /**
+   * A tool close of the channel `entry`, which its name resolved to
+   * (handleToolClose).
+   */
+  private async closeToolEntry(entry: ChannelEntry, input: ToolCloseInput, origin?: ChannelToolOrigin): Promise<ToolResult> {
     // From here, the channel's own id, whichever name the call gave for it
     // (a server-qualified one included).
     input = { ...input, channelId: entry.descriptor.id };
@@ -5252,19 +5378,21 @@ export class ChannelRegistry {
       // Closed already, perhaps only by default: the agent's close is still
       // its decision, and is recorded as one (setDesiredState), so a later
       // registration's lift of a default leaves the channel closed.
-      const ended = this.onToolClose?.(entry.serverId, input.channelId);
+      const hook = this.toolCloseHook(refOf(entry));
+      if ('error' in hook) return { success: false, error: hook.error, isError: true };
+      const ended = hook.text;
       try {
         this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
       } catch (err) {
         return {
           success: false,
-          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended}` : ''}`,
+          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended()}` : ''}`,
           isError: true,
         };
       }
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed' },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed', ...(ended ? { note: ended() } : {}) },
       };
     }
 
@@ -5304,15 +5432,22 @@ export class ChannelRegistry {
     // A hold around this channel — the all-except scope it is the excepted
     // channel of — ends through the cancel flow: backlog released, end
     // recorded, never by overwriting state (#232 gap 9).
-    const ended = this.onToolClose?.(entry.serverId, input.channelId);
+    const hook = this.toolCloseHook(refOf(entry));
+    if ('error' in hook) return { success: false, error: hook.error, isError: true };
+    const ended = hook.text;
 
     // A decision the log refused changed nothing for the channel, and the
-    // answer says so, and what the hook ended all the same.
+    // answer says so, and what the hook ended all the same. Every answer
+    // carries the hook's sentence, a success's as `note`: whether the close
+    // went through says nothing of the focus, whose end may wait (an
+    // operator's change to the store in progress). The sentence is read as
+    // the answer is built, after the transport's round-trip, during which a
+    // release that waited may have run.
+    const withEnded = (text: string): string => (ended ? `${text} ${ended()}` : text);
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     } catch (err) {
-      const text = this.lifecycleFailureText('close', entry, unrecordedDecision(err));
-      return { success: false, error: ended ? `${text} ${ended}` : text, isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, unrecordedDecision(err))), isError: true };
     }
     // This channel's typing, not every channel with its id (stopTyping's
     // fan-out of a bare name).
@@ -5321,7 +5456,7 @@ export class ChannelRegistry {
     // Refused now, the close stays recorded for the server's next
     // registration, and the text says so.
     if (!this.directsLifecycle(entry.serverId)) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, this.lifecycleRefusal(entry.serverId)), isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, this.lifecycleRefusal(entry.serverId))), isError: true };
     }
 
     try {
@@ -5330,11 +5465,163 @@ export class ChannelRegistry {
       if (applied.open || now !== 'closed') throw new ChannelLifecycleError(supersededClause('close', now), 'superseded');
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed' },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed', ...(ended ? { note: ended() } : {}) },
       };
     } catch (err) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, err), isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, err)), isError: true };
     }
+  }
+
+  /**
+   * The tool-close hook (onToolClose) for a channel, its throw taken as the
+   * answer's text: a release of the hold that failed is the close's answer,
+   * as the registry's other failures are, never a rejected call.
+   */
+  private toolCloseHook(ref: ChannelRef, opts?: { unregistered?: true }): { text?: () => string } | { error: string } {
+    try {
+      return { text: this.onToolClose?.(ref.serverId, ref.channelId, opts) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * A close naming the channel the all-except hold excepts, which its server
+   * no longer registers: the close has nothing left to close, and the hold
+   * nothing left to speak into, so it ends as a close of the registered
+   * channel ends it, what it held released, and the answer says so, as a
+   * failure, since no close ran. Undefined where no hold excepts the channel
+   * (onToolClose answers nothing).
+   */
+  private unregisteredFocusClose(gone: ChannelRef): ToolResult | undefined {
+    const lead = noLongerRegistered(gone);
+    const ended = this.toolCloseHook(gone, { unregistered: true });
+    if ('error' in ended) return { success: false, error: `${lead} ${ended.error}`, isError: true };
+    if (ended.text) return { success: false, error: `${lead} ${ended.text()}`, isError: true };
+    return undefined;
+  }
+
+  /**
+   * The channel the all-except hold excepts (focusChannelResolver), where a
+   * channel_close names it by its id or its server-qualified name alone: no
+   * serverId, and no channel of the calling turn's own answering to the name
+   * (ownChannelNamed, which a turn's name means first). Such a name means
+   * the hold's channel, registered or not, and not another server's channel
+   * with the id, as when the hold's channel's server stopped registering it
+   * and another server registered the id: that one is closed only by a close
+   * that names its server. With it, where other registered channels answer
+   * to the name, the sentence saying they weren't closed (`notClosed`).
+   *
+   * Where the name is the hold channel's and a channel of the calling turn's
+   * own, another channel, answers to it too, the name means neither: a
+   * resident repeating a close that failed before its focus ended, in a turn
+   * that has since opened another server's channel with the id, would
+   * otherwise close that channel and leave the focus in force. That close is
+   * refused, naming both (`refusal`, focusOrOwnRefusal), and a close naming
+   * either's server reaches it. A turn's name for the hold's channel itself,
+   * and a name the turn's channels on more than one server answer to
+   * (ownNeitherRefusal), resolve as any other.
+   *
+   * Undefined where no hold is in force, where the name isn't the hold
+   * channel's, and where the hold's record can't be read, which leaves the
+   * name to resolve as any other (resolveToolChannelEntry).
+   *
+   * Another channel the name reaches that has a tune-out of its own is
+   * refused by a close until that tune-out is cancelled (tunedOutRefusal),
+   * so its sentence says it is tuned out, and names the cancel first, then
+   * the close by its id and server.
+   */
+  private focusNamedBare(
+    name: string,
+    serverId: string | undefined,
+    own: readonly ChannelRef[] | undefined,
+  ): { focus: ChannelRef; notClosed?: string } | { refusal: string } | undefined {
+    if (serverId) return undefined;
+    const mine = this.ownChannelNamed(name, own);
+    if (mine && 'neither' in mine) return undefined;
+    let focus: ChannelRef | null | undefined;
+    try {
+      focus = this.focusChannelResolver?.();
+    } catch {
+      return undefined;
+    }
+    if (!focus || (name !== focus.channelId && name !== qualifiedChannelName(focus))) return undefined;
+    if (mine) return sameChannel(mine.channel, focus) ? undefined : { refusal: this.focusOrOwnRefusal(name, focus, mine.channel, own) };
+    const held = focus;
+    const others = this.entriesNamed(name).filter((entry) => !sameChannel(refOf(entry), held));
+    const tunedOut = others.filter((entry) => this.getDesiredState(entry.serverId, entry.descriptor.id) === 'tuned-out');
+    const closable = others.filter((entry) => !tunedOut.includes(entry)).map(refOf);
+    const sentences = [
+      ...(closable.length > 0 ? [notClosedText(closable)] : []),
+      ...tunedOut.map((entry) => {
+        const ref = refOf(entry);
+        return `Channel ${channelOnServer(ref)} was not closed: it is tuned out, and a close doesn't change that. ` +
+          this.tuneOutEndText(entry, 'channel_close', `channelId ${quotedValue(ref.channelId)} and serverId ${quotedValue(ref.serverId)}`);
+      }),
+    ];
+    return { focus: held, ...(sentences.length > 0 ? { notClosed: sentences.join(' ') } : {}) };
+  }
+
+  /**
+   * The refusal of a channel_close's bare name (focusNamedBare) that both the
+   * channel the all-except hold excepts (`focus`) and another channel of the
+   * calling turn's own (`mine`, ownChannelNamed) answer to, each named by
+   * what reaches it alone. The hold's channel is reached by its
+   * server-qualified name, registered or not (focusNamedBare), unless a
+   * channel of the turn's answers to that too; the turn's channel as a
+   * refusal of the turn's names shows it (ownCandidates), unless another
+   * channel of the turn's has its qualified name for its id. A serverId goes
+   * with the channel's own id, so it's offered only where the name is the id
+   * of both, for the hold's server (registered or not, the close reaches its
+   * channel: unregisteredFocusNamed) and for the turn's channel's where that
+   * server still registers it. Where the name is the hold channel's
+   * server-qualified name, which another of the turn's channels has for its
+   * id, the hold's channel is reached by its id and server.
+   */
+  private focusOrOwnRefusal(name: string, focus: ChannelRef, mine: ChannelRef, own: readonly ChannelRef[] | undefined): string {
+    const qualified = qualifiedChannelName(focus);
+    const focusReaches = this.ownChannelNamed(qualified, own) === undefined;
+    const [theirs] = this.ownCandidates([mine]);
+    // The turn's channel's name, as the focus's: a bare id answers to the
+    // turn's own channels first, so one of them with that id catches it.
+    const theirsReaches = theirs!.reaches && this.ownChannelNamed(theirs!.text, own) === undefined;
+    const parts = [
+      { text: focusReaches ? quotedValue(qualified) : channelOnServer(focus), reaches: focusReaches },
+      { text: theirsReaches ? quotedValue(theirs!.text) : theirs!.reaches ? channelOnServer(mine) : theirs!.text, reaches: theirsReaches },
+    ];
+    const named = parts.filter((p) => p.reaches).map((p) => p.text);
+    const byName = named.length === 2 ? 'channelId set to one of them' : named.length === 1 ? `channelId ${named[0]}` : '';
+    const servers = name === focus.channelId ? [focus.serverId, ...(this.entryAt(mine) ? [mine.serverId] : [])] : [];
+    const byServer = servers.length > 0 ? `serverId set to ${servers.map((id) => JSON.stringify(id)).join(' or ')}` : '';
+    const how = [byName, byServer].filter((h) => h !== '').join(', or with ');
+    const focusRoute = name !== focus.channelId && !focusReaches
+      ? ` For the channel the focus excepts, call again with channelId ${quotedValue(focus.channelId)} and serverId ${JSON.stringify(focus.serverId)}.`
+      : '';
+    return `Channel ${JSON.stringify(name)} names both the channel the all-except focus excepts (${parts[0]!.text}) ` +
+      `and this turn's channel (${parts[1]!.text}), so nothing ran.${how ? ` Call again with ${how}.` : ''}${focusRoute}`;
+  }
+
+  /**
+   * The channel the all-except hold excepts (focusChannelResolver), where a
+   * channel tool's name with a serverId, or the calling turn's own channel's
+   * name, means it though its server no longer registers it: with a
+   * serverId, that server's channel with the id; inside the calling turn,
+   * the turn's own channel the name answers to by its id (ownChannelNamed).
+   * A name given alone is focusNamedBare's. Undefined where no hold is in
+   * force, where its channel is still registered, and where the hold's
+   * record can't be read, which leaves the name's refusal as it was.
+   */
+  private unregisteredFocusNamed(name: string, serverId: string | undefined, own: readonly ChannelRef[] | undefined): ChannelRef | undefined {
+    let focus: ChannelRef | null | undefined;
+    try {
+      focus = this.focusChannelResolver?.();
+    } catch {
+      return undefined;
+    }
+    if (!focus || this.entryAt(focus)) return undefined;
+    if (serverId) return sameChannel(focus, { serverId, channelId: name }) ? focus : undefined;
+    const mine = this.ownChannelNamed(name, own);
+    return mine && 'channel' in mine && sameChannel(mine.channel, focus) ? focus : undefined;
   }
 
   private async handleToolDecline(input: {
@@ -5532,8 +5819,8 @@ export class ChannelRegistry {
               `diverted, and then call channel_close.${serverBack}`
             : `. If you still want it closed, call channel_close.${serverBack}`;
       closeError = decided === 'tuned-out'
-        ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ` +
-          `the subconscious${step}`
+        ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages ` +
+          `${this.tuneOutHeld()}${step}`
         : `The decline is recorded, but a later decision to open the channel replaced it, and that decision stands${step}`;
     } else if (closed) {
       // Closed for certain, whatever became of the decline's own close: one
@@ -5778,7 +6065,8 @@ export class ChannelRegistry {
   }
 
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default), with its server. Public so a multi-segment
+   *  process-global default, with the configured unprompted channel in it
+   *  where the turn takes it), with its server. Public so a multi-segment
    *  caller can snapshot it ONCE and pin every segment to it via
    *  routeSpeech's locus. */
   resolveLocus(conversationId: string): ChannelRef | null {
@@ -5786,7 +6074,33 @@ export class ChannelRegistry {
     if (home) return home;
     // A turn that deliberately has no channel (null) takes no fallback.
     const active = this.activeChannelResolver?.(conversationId);
-    return active !== undefined ? active : this.globalFallbackFor(conversationId);
+    return active !== undefined
+      ? active
+      : this.globalFallbackFor(conversationId, () => this.configuredUnprompted(conversationId));
+  }
+
+  private configuredUnprompted(conversationId: string | undefined): ChannelRef | null {
+    if (!this.unpromptedChannel) return null;
+    if (conversationId !== undefined && this.takesUnpromptedChannel?.(conversationId) === false) return null;
+    const named = this.entriesNamed(this.unpromptedChannel);
+    if (named.length === 1 && !isInboundOnly(named[0]!)) {
+      this.unpromptedChannelWarned = false;
+      return refOf(named[0]!);
+    }
+    if (!this.unpromptedChannelWarned) {
+      this.unpromptedChannelWarned = true;
+      const why = named.length === 0
+        ? 'names no registered channel'
+        : named.length === 1
+          ? 'names a channel its server declared inbound-only'
+          : `names ${named.length} registered channels (name one with its server, as "serverId:channelId")`;
+      console.error(
+        `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn the agent's own timer starts `
+          + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. '
+          + 'Not logged again until a turn has used it.',
+      );
+    }
+    return null;
   }
 
   /**
@@ -5795,19 +6109,21 @@ export class ChannelRegistry {
    * result, so neither the all-except hold's channel nor the latest inbound
    * message's is ever its destination.
    */
-  private globalFallbackFor(conversationId: string): ChannelRef | null {
-    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback();
+  private globalFallbackFor(conversationId: string, unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback(unprompted);
   }
 
   /**
    * What every conversation that takes the global fallback falls back to when
    * neither a home channel nor its own delivery names one: the all-except
-   * hold's channel while one is open, else the latest delivered inbound
-   * channel under the legacy locus rule, else none — the prose stays private
-   * (architecture channel §3 carve-out, 2026-10-06).
+   * hold's channel while one is open, else, for a turn's locus, the
+   * configured unprompted channel where the turn takes it (resolveLocus),
+   * else the latest delivered inbound channel under the legacy locus rule,
+   * else none — the prose stays private (architecture channel §3 carve-out,
+   * 2026-10-06).
    */
-  private sharedFallback(): ChannelRef | null {
-    return this.focusChannelResolver?.() ?? this.fallbackLocus();
+  private sharedFallback(unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.focusChannelResolver?.() ?? unprompted?.() ?? this.fallbackLocus();
   }
 
   private fallbackLocus(): ChannelRef | null {
@@ -5960,12 +6276,12 @@ export class ChannelRegistry {
     if (isInboundOnly(entry)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(entry), at: at() };
     }
-    const server = this.serverRegistry.getServer(entry.serverId);
+    const server = this.publishingServer(entry.serverId);
     // §14.1: channels/publish requires channels.publish in the grant. The
     // host not sending is the enforcement, here and at the last check, and
     // the server's state words the refusal (sendRefusal).
     const ungranted = (): PublishOutcome => ({ status: 'failed', destination, reason: this.sendRefusal(entry.serverId), at: at() });
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+    if (!server) return ungranted();
 
     const prevented = (err: unknown): PublishOutcome => ({
       status: 'failed', destination, reason: lifecycleClause(err) + refusalRemedy(err), at: at(),
@@ -6128,12 +6444,15 @@ export class ChannelRegistry {
     locus: ChannelRef | null,
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
-     *  An `unknown` outcome still gets its marker. */
-    opts?: { heldOnFailure?: boolean },
+     *  An `unknown` outcome still gets its marker. `cameFrom`: with no
+     *  locus, the channels the turn's batch came from, each with how the
+     *  agent is shown it; the failure's reason names them, and how to reply
+     *  in those registered that take speech. */
+    opts?: { heldOnFailure?: boolean; cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<PublishOutcome> {
     // `logged` is what the log line and the trace say, where it isn't the
-    // agent's reason (the two no-locus reasons below).
-    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason): PublishOutcome => {
+    // agent's reason (the three no-locus reasons below).
+    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason, byDesign = false): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
       const channelId = channel?.channelId ?? null;
       const detail = outcome.detail !== undefined ? connectorText(outcome.detail) : undefined;
@@ -6153,17 +6472,19 @@ export class ChannelRegistry {
         this.onRouteFailure?.({
           conversationId, channelId, ...(channel ? { serverId: channel.serverId } : {}),
           reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}),
+          ...(byDesign ? { byDesign: true as const } : {}),
         });
       }
       return outcome;
     };
 
-    // These two reasons are the only ones whose log line and trace keep the
+    // These three reasons are the only ones whose log line and trace keep the
     // operator's words rather than the agent's: connectome-host's
     // connectome-doctor reads the last [routeSpeech] line for "no locus". Keep
-    // "no locus" in both logged texts. Each names no tool: whether one the
+    // "no locus" in each logged text. Each names no tool: whether one the
     // agent may call could post the words isn't known here, and the notice
-    // calls it a routing or configuration situation.
+    // calls it a routing or configuration situation, or for a turn whose
+    // batch named the channels it came from a routing one (byDesign).
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
@@ -6183,6 +6504,32 @@ export class ChannelRegistry {
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
+      const from = opts?.cameFrom ?? [];
+      if (from.length > 0) {
+        const list = (names: readonly string[]) =>
+          names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+        const closed: string[] = [];
+        const open: Array<{ channel: ChannelRef; shown: string }> = [];
+        for (const came of from) {
+          const entry = this.entryAt(came.channel);
+          if (!entry) closed.push(`${came.shown} isn't registered with this host now, so this host has no channel there to send to`);
+          else if (isInboundOnly(entry)) closed.push(`${came.shown} is ${inboundOnlyReason(entry)}`);
+          else if (!this.publishingServer(entry.serverId)) {
+            const reach = this.serverReach(entry.serverId);
+            closed.push(reach === 'connecting' || reach === 'down'
+              ? `${came.shown} can't take a send: ${unreachableClause(entry.serverId, reach)}, so to reply there, send your reply to that channel explicitly once it's back`
+              : `${came.shown} can't take a send: ${this.sendRefusal(entry.serverId)}`);
+          } else open.push(came);
+        }
+        const reply = open.length === 0 ? ''
+          : open.length === from.length
+            ? `; to reply ${from.length === 1 ? 'there' : 'in one of them'}, send your reply to that channel explicitly`
+            : `; to reply in ${open.length === 1 ? open[0].shown : `one of ${list(open.map((c) => c.shown))}`}, send your reply to that channel explicitly`;
+        const reason = `this turn came from ${list(from.map((c) => c.shown))}, and no channel was chosen for its reply` +
+          `${reply}${closed.map((c) => `; ${c}`).join('')}`;
+        return fail(null, reason, { status: 'failed', reason, at: Date.now() },
+          "turn has no locus (no channel was chosen for its batch's reply)", true);
+      }
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';
       return fail(null, reason, { status: 'failed', reason, at: Date.now() },
@@ -6217,8 +6564,9 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locus: ChannelRef | null,
+    opts?: { cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
-    const outcome = await this.deliverSpeech(conversationId, text, locus);
+    const outcome = await this.deliverSpeech(conversationId, text, locus, opts);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,
@@ -6377,8 +6725,8 @@ export class ChannelRegistry {
 
     // The same refusal, in the same words, as plain speech's (sendRefusal),
     // whose server state is the reason's: nothing awaits between the two.
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) {
+    const server = this.publishingServer(entry.serverId);
+    if (!server) {
       if (seen) {
         const reach = this.serverReach(entry.serverId);
         seen.refusal = reach === 'up' ? 'not-permitted' : `server-${reach}`;
