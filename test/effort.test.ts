@@ -565,7 +565,7 @@ describe('FrameworkConfig.effort: every agent', () => {
 });
 
 describe('FrameworkConfig.effort: a model that refuses effort rows', { skip: NEEDS_ROWS }, () => {
-  it('retries a marked refusal of a request carrying a row at once, without rows and with the live effort on top', async () => {
+  it('retries a marked refusal of a request carrying a row at once, without rows and with the live effort on top, and takes back the row its start stored', async () => {
     try {
       let live: Level = 'high';
       const errorPolicy = new RecordingPolicy();
@@ -582,6 +582,7 @@ describe('FrameworkConfig.effort: a model that refuses effort rows', { skip: NEE
       assert.equal(topLevel(retry), 'low', 'and the live effort on top');
       assert.deepEqual(errorPolicy.asked, [], 'the error policy wasn\'t asked');
       assert.deepEqual(exhausted, [], 'the turn didn\'t fail');
+      assert.equal(storedEffortRows(framework).length, 0, 'the row its start stored, which no request sent, is taken back');
 
       await turn('Three.');
       const later = provider.calls[3]!;
@@ -590,7 +591,7 @@ describe('FrameworkConfig.effort: a model that refuses effort rows', { skip: NEE
       live = 'medium';
       await turn('Four.');
       assert.equal(topLevel(provider.calls[4]!), 'medium', 'a change goes on top');
-      assert.equal(storedEffortRows(framework).length, 1, 'and writes no row');
+      assert.equal(storedEffortRows(framework).length, 0, 'and writes no row');
     } finally { await cleanup(); }
   });
 
