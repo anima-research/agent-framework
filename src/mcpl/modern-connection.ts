@@ -1316,7 +1316,7 @@ export class ModernMcpConnection extends EventEmitter {
       this.reconnectAttempts = 0;
       this.restarting = true;
       this.emit('close', { reason: `the server ${SESSION_END[cause]}; a new one is starting` });
-      void this.restartSession(cause);
+      void this.attemptReconnect(cause);
       return;
     }
     const attempt = Math.max(1, this.reconnectAttempts);
@@ -1327,27 +1327,6 @@ export class ModernMcpConnection extends EventEmitter {
     this.emit('reconnect-failed', { error: `MCP server "${this.id}" ${SESSION_END[cause]} ${when}`, attempt });
     this.emit('close', { reason: `the server ${SESSION_END[cause]} ${when}` });
     this.scheduleReconnect();
-  }
-
-  private async restartSession(cause: keyof typeof SESSION_END): Promise<void> {
-    try {
-      await this.open();
-    } catch (error) {
-      this.restarting = false;
-      if (this.closedByHost) return;
-      const permanent = error instanceof McplProtocolVersionError;
-      const reconnecting = this.reconnectEnabled;
-      if (permanent) this.reconnectEnabled = false;
-      this.reconnectAttempts = 2;
-      this.emit('reconnect-failed', { error: (error as Error).message, attempt: 1, ...(permanent ? { permanent: true } : {}) });
-      if (!reconnecting) this.emit('close', { reason: `the server ${SESSION_END[cause]}, and a new one could not start` });
-      this.scheduleReconnect();
-      return;
-    }
-    this.restarting = false;
-    if (!this.session) return;
-    console.error(`MCP server "${this.id}" ${SESSION_END[cause]}; a new one started`);
-    this.emit('reconnect', { attempts: 1 });
   }
 
   private streamReopened(session: Session): void {
@@ -1416,24 +1395,35 @@ export class ModernMcpConnection extends EventEmitter {
     }, this.backoffDelay(this.reconnectAttempts));
   }
 
-  private async attemptReconnect(): Promise<void> {
+  /**
+   * With `restart`, the session the server ended is replaced at once,
+   * whatever `reconnect` says, and a failure is attempt 1 of a reconnect.
+   * Without `reconnect`, that failure also closes the connection for good.
+   */
+  private async attemptReconnect(restart?: keyof typeof SESSION_END): Promise<void> {
     if (!this.willReconnect || this.session) return;
     const attempt = Math.max(1, this.reconnectAttempts);
     try {
       await this.open();
+      if (restart) this.restarting = false;
       if (!this.session) return;
-      console.error(`MCP server "${this.id}" reconnected`);
+      console.error(restart ? `MCP server "${this.id}" ${SESSION_END[restart]}; a new one started` : `MCP server "${this.id}" reconnected`);
       this.emit('reconnect', { attempts: attempt });
     } catch (error) {
+      if (restart) this.restarting = false;
       if (this.closedByHost) return;
+      const reconnecting = this.reconnectEnabled;
       this.reconnectAttempts = attempt + 1;
       const stderrTail = stderrTailOf(error);
-      const failed = (message: string, permanent?: true) => this.emit('reconnect-failed', {
-        error: message,
-        ...(stderrTail === undefined ? {} : { stderrTail }),
-        attempt,
-        ...(permanent ? { permanent } : {}),
-      });
+      const failed = (message: string, permanent?: true) => {
+        this.emit('reconnect-failed', {
+          error: message,
+          ...(stderrTail === undefined ? {} : { stderrTail }),
+          attempt,
+          ...(permanent ? { permanent } : {}),
+        });
+        if (restart && !reconnecting && !this.session) this.emit('close', { reason: `the server ${SESSION_END[restart]}, and a new one could not start` });
+      };
       const halted = this.unreapedFailure();
       if (halted) {
         failed(`${(error as Error).message}; ${halted}`, true);

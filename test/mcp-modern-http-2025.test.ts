@@ -1247,6 +1247,26 @@ for (const reconnect of [true, false]) {
   });
 }
 
+test('a \'reconnect\' listener that throws after a restart without reconnect is a failed reconnect, and the connection, which is up, isn\'t closed', async () => {
+  const fixture = await start2025({ versions: ['2025-06-18'] });
+  const connection = await connect(fixture, { reconnect: false, reconnectIntervalMs: 50, reconnectMaxIntervalMs: 1000 });
+  await connection.listTools();
+  await outlive(50);
+  const events: string[] = [];
+  connection.on('close', () => events.push('close'));
+  connection.on('reconnect-failed', (f: { attempt: number }) => events.push(`reconnect-failed ${f.attempt}`));
+  connection.on('reconnect', () => {
+    events.push('reconnect');
+    throw new Error('a listener that throws');
+  });
+  await fixture.forget(false);
+  await connection.callTool('echo', {}).catch(() => {});
+  await until(() => events.includes('reconnect-failed 1'), 'the thrown listener reported');
+  await sleep(100);
+  assert.deepEqual(events, ['close', 'reconnect', 'reconnect-failed 1']);
+  assert.equal(connection.isConnected, true);
+});
+
 test('an answered session\'s end counts failed connects afresh: a later session that ends unanswered is attempt 1', async () => {
   const fixture = await start2025({ versions: ['2025-06-18'] });
   const connection = await connect(fixture, { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
