@@ -30,7 +30,7 @@ interface Compression {
   ticks: number; compiles: number; refusals: number; refusing: boolean;
   fitAt: number; readyAt: number; refuseFrom: number;
   calls: boolean;
-  progress: number; stalled: boolean; snapshot: boolean;
+  progress: number; summaries: number; stalled: boolean; snapshot: boolean;
   onRefusal?: () => void;
   snapshotThrows?: boolean;
   snapshotOther?: boolean;
@@ -42,7 +42,7 @@ async function withCompression<T>(state: Partial<Compression>, run: (c: Compress
   const c: Compression = {
     ticks: 0, compiles: 0, refusals: 0, refusing: false,
     fitAt: Infinity, readyAt: state.readyAt ?? state.fitAt ?? Infinity, refuseFrom: 1,
-    calls: false, progress: 0, stalled: !state.calls, snapshot: true, ...state,
+    calls: false, progress: 0, summaries: 0, stalled: !state.calls, snapshot: true, ...state,
   };
   const progressPatched = new Map<object, unknown>();
   for (const strategy of [AutobiographicalStrategy.prototype, PassthroughStrategy.prototype, WindowedPassthroughStrategy.prototype] as Array<{ getProgressSnapshot?: unknown }>) {
@@ -52,7 +52,7 @@ async function withCompression<T>(state: Partial<Compression>, run: (c: Compress
         if (c.snapshotThrows) throw new Error('zz the snapshot could not be read');
         if (c.snapshotOther) return { completed: c.progress };
         if (c.snapshotBigInt) return { chunksCompressed: BigInt(c.progress) };
-        return { chunksCompressed: c.progress, summaryCounts: { l1: c.progress, l2: 0, l3: 0 } };
+        return { chunksCompressed: c.progress, summaryCounts: { l1: c.progress + c.summaries, l2: 0, l3: 0 } };
       }
       : undefined;
   }
@@ -496,7 +496,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.snapshotThrows = false;
         t.internal.releaseBudgetHoldsOnEvidence();
         assert.ok(t.internal.budgetHolds.has('prime'), 'a snapshot that reads is no progress by itself');
-        c.progress++;
+        c.summaries++;
         c.fitAt = c.ticks;
         t.internal.releaseBudgetHoldsOnEvidence();
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'the summary released it');
@@ -1425,6 +1425,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         const wake = (reason: string) => ({ agentName: 'prime', reason, source: 'test', timestamp: Date.now() });
         t.internal.budgetHolds.get('prime')!.wakes.push({ ...wake('zz-merged'), [mark]: [wake('zz-a'), wake('zz-b')] } as never);
         assert.equal(t.framework.getHostModeStatus().gatedRequests, 3, 'the waiting turn, and the two wakes merged in the request it keeps');
+        assert.equal(t.hold()?.heldRequests, 3, "and the agent's health counts them the same way");
       } finally {
         await t.close();
       }
@@ -2579,7 +2580,7 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
     });
   });
 
-  it('lets an undo run, ending the held continuation first, and nothing runs on the undone window', async () => {
+  it('lets an undo run, ending the held continuation, and nothing runs on the undone window', async () => {
     await withCompression({}, async (c) => {
       const t = await heldContinuation(c);
       try {

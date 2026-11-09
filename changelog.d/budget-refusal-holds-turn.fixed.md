@@ -21,10 +21,11 @@
   - **When it runs:** while no surgery holds the store and the host isn't
     quiesced, the waiting requests are queued again once something
     the refused compile depends on has changed: compression has made
-    progress (a summary written since the wait began, or, for a strategy
-    with no progress snapshot, a call that landed), compression has nothing
-    left pending, a surgery's release or a completed undo, the agent's
-    budget or live context settings have changed, or a quiesce has ended.
+    progress (a summary written since the refused compile started, or,
+    for a strategy with no progress snapshot, a call that landed),
+    compression has nothing left pending, a surgery's release or a
+    completed undo, the agent's budget or live context settings have
+    changed, or a quiesce has ended.
     Their start's own compile is the check. Refused again while compression
     is pending, they wait again, the note counting from the first wait's
     start, and each such start traces its own `inference:started` and
