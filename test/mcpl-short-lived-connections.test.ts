@@ -181,6 +181,30 @@ for (const engine of ['legacy', 'modern'] as const) {
     assert.equal(halted.failed().length, 3, 'two short ends, then the halt');
   });
 
+  test(`${engine}: a launch found unreapable while its connection is still short-lived halts once, with no short-lived report of that end`, { timeout: 60_000 }, async (t) => {
+    const scratch = scratchDir('halted-short');
+    const halted = await started(t, server(engine, 'halted', scratch), scratch);
+    await endConnection(halted, 0, 0);
+    await endConnection(halted, 1, 1);
+    await waitFor('reconnect 2', () => halted.reconnected().length >= 2);
+    const connection = connectionOf(halted.framework, engine, 'halted') as unknown as {
+      willReconnect: boolean;
+      transport: { emit(event: 'unreaped', failure: Error): void };
+      session: { generation: number };
+      handleLost(generation: number, reason: string, unreaped?: Error): void;
+    };
+    if (engine === 'legacy') connection.transport.emit('unreaped', new Error('it outlived SIGKILL'));
+    else connection.handleLost(connection.session.generation, 'its stdio pipe failed', new Error('it outlived SIGKILL'));
+    await waitFor('the halt', () => halted.failed().some((event) => event.willRetry === false));
+    assert.equal(connection.willReconnect, false);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const halt = halted.failed().at(-1)!;
+    assert.equal(halt.willRetry, false);
+    assert.equal(halt.attempt, 3);
+    assert.equal(halted.failed().length, 3, 'two short ends, then the halt, with no short-lived report of the third end');
+    assert.equal(halted.launches().length, 3, 'nothing launched after the halt');
+  });
+
   test(`${engine}: a reconnect that fails before its handshake prints a line per attempt`, { timeout: 60_000 }, async (t) => {
     const scratch = scratchDir('stays-down');
     const token = 'sk-0123456789abcdef0123';
@@ -296,11 +320,26 @@ for (const [label, fields] of [
   });
 }
 
-test('a restart to a reconnect interval of 0 is refused before the running server is torn down', { timeout: 30_000 }, async (t) => {
-  const scratch = scratchDir('restart');
+for (const engine of ['legacy', 'modern'] as const) {
+  test(`${engine}: a restart to a reconnect interval of 0 is refused before the running server is torn down`, { timeout: 30_000 }, async (t) => {
+    const scratch = scratchDir('restart');
+    const { reconnect: _reconnect, reconnectIntervalMs: _interval, ...config } = server(engine, 'live', scratch);
+    const live = await started(t, config, scratch);
+    await waitFor('launch 0', () => live.launches().length >= 1);
+    await assert.rejects(live.framework.restartMcplServer('live', { ...config, reconnect: true, reconnectIntervalMs: 0 }), /"live".*reconnectIntervalMs.*\(got 0\)/);
+    assert.equal(live.launches().length, 1);
+    assert.doesNotThrow(() => process.kill(live.launches()[0]!.pid, 0), 'the running server was torn down');
+  });
+}
+
+test('connectMcplServer refuses a reconnect interval of 0, on either engine, before it launches anything', { timeout: 30_000 }, async (t) => {
+  const scratch = scratchDir('connect');
   const { reconnect: _reconnect, reconnectIntervalMs: _interval, ...config } = server('legacy', 'live', scratch);
   const live = await started(t, config, scratch);
-  await assert.rejects(live.framework.restartMcplServer('live', { ...config, reconnect: true, reconnectIntervalMs: 0 }), /"live".*reconnectIntervalMs.*\(got 0\)/);
-  assert.equal(live.launches().length, 1);
-  assert.doesNotThrow(() => process.kill(live.launches()[0]!.pid, 0), 'the running server was torn down');
+  await waitFor('launch 0', () => live.launches().length >= 1);
+  for (const engine of ['legacy', 'modern'] as const) {
+    const id = `added-${engine}`;
+    await assert.rejects(live.framework.connectMcplServer({ ...server(engine, id, scratch), reconnectIntervalMs: 0 }), new RegExp(`"${id}".*reconnectIntervalMs.*\\(got 0\\)`));
+  }
+  assert.equal(live.launches().length, 1, 'nothing launched for either');
 });
