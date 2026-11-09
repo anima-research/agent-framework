@@ -6,7 +6,10 @@
   requests, and the refusal's type and figures, or `null`.
   `presentation:retracted` gains the reason `unsent-injection`, for the
   context injections no request carried, which leave the agent's window as
-  a turn starts waiting.
+  a turn starts waiting. `Agent` gains `unsentInjectionRows()`, the ids of
+  its stored injections no request has carried, and two methods marked
+  `@internal` for the framework's budget holds, `contextSettingsChanges()`
+  and `markUnsentPoint()`.
 - **Hosts and operators:** a waiting turn raises a `context-refusal` ops
   alert, saying it waits for compression, once however often it waits
   again: as it starts waiting, or, where a listener of `inference:held`

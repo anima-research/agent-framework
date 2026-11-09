@@ -7401,7 +7401,7 @@ export class AgentFramework {
     checkpoint: RecordedTurnCheckpoint | undefined,
     routing: TurnRouting,
     baseline: BudgetHoldBaseline | undefined,
-    endStart: () => void,
+    closeWindow: () => void,
   ): boolean {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return false;
@@ -7416,8 +7416,6 @@ export class AgentFramework {
         return false;
       }
     }
-    this.retractUnsentInjections(agent);
-    if (!this.running || this.providerAdmissionClosed || this.agents.get(agent.name) !== agent) return false;
     const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
@@ -7443,12 +7441,14 @@ export class AgentFramework {
       actual: typeof figures.actual === 'number' ? figures.actual : undefined,
       managerCalls: 0,
       callsAtHold: 0,
+      ...(wait.alerted ? { alerted: true } : {}),
       progressAtHold: baseline ? baseline.progress : this.compressionProgressOf(agent),
       settingsAtHold: baseline ? baseline.settings : agent.contextSettingsChanges(),
     };
     this.budgetHolds.set(agent.name, hold);
     this.startBudgetHoldRecheck(agent, hold);
-    endStart();
+    closeWindow();
+    const endGate = () => this.eventGate?.onInferenceEnded(agent.name);
     this.emitTrace({
       type: 'inference:held',
       agentName: agent.name,
@@ -7459,10 +7459,13 @@ export class AgentFramework {
       since: hold.startedAt,
       heldRequests: 1,
     });
-    if (this.budgetHolds.get(agent.name) !== hold) return true;
-    hold.alerted = true;
+    if (this.budgetHolds.get(agent.name) !== hold) {
+      endGate();
+      return true;
+    }
     if (!wait.alerted) {
       wait.alerted = true;
+      hold.alerted = true;
       this.opsAlert('context-refusal', agent.name, this.budgetHoldOpenText(hold), {
         skipLog: true,
         key: String(hold.waitSince),
@@ -7473,7 +7476,14 @@ export class AgentFramework {
           ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
         },
       });
+      if (this.budgetHolds.get(agent.name) !== hold) {
+        endGate();
+        return true;
+      }
     }
+    endGate();
+    if (this.budgetHolds.get(agent.name) !== hold) return true;
+    this.retractUnsentInjections(agent);
     if (this.budgetHolds.get(agent.name) !== hold) return true;
     const readiness = this.contextReadiness(agent.getContextManager());
     const compression = 'pending' in readiness && readiness.pending ? ` Compression: ${boundFailureText(readiness.pending)}` : '';
@@ -7665,11 +7675,12 @@ export class AgentFramework {
     const hold = this.budgetHolds?.get(agentName);
     if (!hold) return false;
     this.budgetHolds.delete(agentName);
-    const left = hold.wakes;
+    clearInterval(hold.recheck);
+    hold.recheck = undefined;
+    if (wakes === 'back') this.pendingRequests.push(...hold.wakes);
     hold.wakes = [];
     try {
       this.endHeldTurn(agentName, hold.turn, drop);
-      if (wakes === 'back') this.pendingRequests.push(...left);
     } finally {
       this.finishBudgetHold(agentName, hold, 'stopped');
     }
@@ -7688,12 +7699,13 @@ export class AgentFramework {
   }
 
   private dropHeldTurn(agentName: string, hold: BudgetHold, why: string): void {
-    const left = hold.wakes;
     this.budgetHolds.delete(agentName);
+    clearInterval(hold.recheck);
+    hold.recheck = undefined;
+    this.pendingRequests.push(...hold.wakes);
     hold.wakes = [];
     try {
       this.endHeldTurn(agentName, hold.turn, { kind: 'dropped', why, reason: BUDGET_HELD_TURN_REMOVED });
-      this.pendingRequests.push(...left);
     } finally {
       this.finishBudgetHold(agentName, hold, 'removed');
     }
@@ -7724,14 +7736,14 @@ export class AgentFramework {
     if (row === undefined || !this.rowLeftWindow(agent, row)) return false;
     const batch = mergedBatch(trigger!);
     if (batch) this.pendingRequests.push(...batch.filter((r) => budgetWaitOf(r) === undefined));
-    this.endContinuedTurn(agent.name, { kind: 'dropped', why: 'a surgery or an undo removed what its held turn stood on', reason: BUDGET_HELD_TURN_REMOVED }, true);
+    this.endContinuedTurn(agent.name, { kind: 'dropped', why: 'what its held turn stood on was removed', reason: BUDGET_HELD_TURN_REMOVED }, true);
     return true;
   }
 
   private checkBudgetHoldsAfterWindowChange(only?: string, release = true): void {
     for (const [agentName, hold] of [...(this.budgetHolds?.entries() ?? [])]) {
       const agent = this.agents.get(agentName);
-      if (!agent || (only !== undefined && agentName !== only)) continue;
+      if (!agent || (only !== undefined && agentName !== only) || this.budgetHolds?.get(agentName) !== hold) continue;
       const wakes = hold.wakes.filter((wake) => wake.readsRow === undefined || !this.rowGone(agent, wake.readsRow));
       if (wakes.length < hold.wakes.length) {
         console.error(`[budget-hold] agent=${agentName}: ${hold.wakes.length - wakes.length} held wake(s) dropped, their rows removed`);
@@ -10395,7 +10407,6 @@ export class AgentFramework {
       // window of each agent with no turn alive now; a draining turn's is
       // presented at its own points.
       for (const agent of [...this.agents.values()]) this.presentAtEndOf(agent);
-      this.releaseBudgetHolds();
       this.persistHostMode(null);
       this.hostModeRecordMayBeQuiesced = false;
     } finally {
@@ -10418,6 +10429,7 @@ export class AgentFramework {
       console.error(this.queue?.isClosed
         ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
         : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
+      this.releaseBudgetHolds();
     }
     return this.getHostModeStatus();
   }
@@ -16268,6 +16280,7 @@ export class AgentFramework {
       }
       this.emitTrace({ type: 'window:undone', agentName, retracted: 0 });
       record(window);
+      this.checkBudgetHoldsAfterWindowChange(agentName);
       return { undone: true, turnIndex: checkpoint.turnIndex, fromBranch: branch, toBranch: branch, window };
     }
     const entry: RedoEntry = {
@@ -16294,10 +16307,10 @@ export class AgentFramework {
       // Cut short with rows out: the entry stays for a redo, the checkpoint
       // for another undo, which takes out what is still in the window past it.
       entry.window.lengthAfterUndo = cm.indexLength();
-      this.checkBudgetHoldsAfterWindowChange(agentName, false);
       const reason = error instanceof Error ? error.message : String(error);
       this.emitTrace({ type: 'window:undone', agentName, retracted: left });
       record({ retracted: left, represented: 0 }, reason);
+      this.checkBudgetHoldsAfterWindowChange(agentName, false);
       throw new OperatorActionError(
         'failed',
         `Undo of ${agentName}'s turn ${checkpoint.turnIndex} was cut short: ${left} of the ${tail.length} rows it takes out of the window left it ` +
@@ -16306,7 +16319,6 @@ export class AgentFramework {
       );
     }
     entry.window.lengthAfterUndo = cm.indexLength();
-    this.checkBudgetHoldsAfterWindowChange(agentName);
     const window = { retracted: tail.length, represented: 0 };
     try {
       this.saveTurnCheckpoints(agentName, checkpoints);
@@ -16322,6 +16334,7 @@ export class AgentFramework {
       const reason = error instanceof Error ? error.message : String(error);
       this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
       record(window, reason);
+      this.checkBudgetHoldsAfterWindowChange(agentName, false);
       const rows = tail.length === 1 ? '1 row' : `${tail.length} rows`;
       throw new OperatorActionError(
         'failed',
@@ -16332,6 +16345,7 @@ export class AgentFramework {
     }
     this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
     record(window);
+    this.checkBudgetHoldsAfterWindowChange(agentName);
     return { undone: true, turnIndex: checkpoint.turnIndex, fromBranch: branch, toBranch: branch, window };
   }
 
@@ -21019,8 +21033,8 @@ export class AgentFramework {
 
     // Fallback reaper: a closing fork whose closure inference never ran
     // (request dropped as stale, inference policy veto) would otherwise stay
-    // registered forever. No turn, no active stream and no pending request =
-    // done. A turn holds its token from dequeue, through its hooks and
+    // registered forever. No turn, no active stream, no pending request, no
+    // closure wake waiting and no budget hold = done. A turn holds its token from dequeue, through its hooks and
     // compile, before its stream registers, so a fork mid-compile is busy;
     // and a turn is alive while its continuation or a provider hold's retry
     // of it is on its way (hasTurn), so a closure turn held for its retry
@@ -28431,8 +28445,9 @@ export class AgentFramework {
 
       const retry = trigger && withTurnCarry(trigger, carry);
       const asTransient = this.takeAsTransient(agent.name, err, trigger);
-      if (this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, compileBaseline,
-        () => this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing))) return false;
+      if (this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, compileBaseline, () => {
+        if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+      })) return false;
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.

@@ -10,16 +10,18 @@
     undo, a redo or a puppet call is admitted, a quiesce drains at once, and
     the wait holds no place in the event gate. `getHostModeStatus()`'s
     `gatedRequests` counts the waiting turn and the wakes that joined it.
-    Wakes that arrive join the wait. For a turn's first start, their messages enter the agent's window
-    as they arrive, and the released start answers them all. For a turn
-    already under way (a budget restart's continuation, or a retry), they
-    stay out of its request and run as a turn of their own after it.
+    Wakes that arrive join the wait. For a turn's first start, their
+    messages enter the agent's window as they arrive, and the released
+    start answers them all, as a retry a provider hold kept answers those
+    that joined it. For a budget restart's continuation or a tool-result
+    guard's retry, they stay out of its request and run as a turn of their
+    own after it.
   - **When it runs:** while no surgery holds the store and the host isn't
     quiesced, the waiting requests are queued again once something
     the refused compile depends on has changed: compression has made
     progress (a summary written since the wait began, or, for a strategy
     with no progress snapshot, a call that landed), compression has nothing
-    left pending, a surgery or an undo has changed the window, the agent's
+    left pending, a surgery's release or a completed undo, the agent's
     budget or live context settings have changed, or a quiesce has ended.
     Their start's own compile is the check. Refused again while compression
     is pending, they wait again, the note counting from the first wait's
@@ -37,7 +39,8 @@
     earlier release's note included, and the released start stores them as
     it would without the wait. A routing notice the refused start stored
     stays, so its arrivals stay announced, and an undo of the released turn
-    leaves it.
+    leaves it, unless the turn was a budget restart's continuation or a
+    tool-result guard's retry, which store it after the turn's checkpoint.
   - **No time limit:** a turn can wait as long as compression stays
     pending.
     A waiting turn lives in memory, so a restart drops it, and the agent
@@ -46,7 +49,9 @@
     context didn't fit its budget (100,201 tokens against 48,568) when a
     turn came to start. That turn waited 7 min." in the agent's window, as
     the agent's own stored context injection, counting from the first wait's
-    start to the release. The released start reads it where it was stored,
+    start to the release, entering the window at once or, while a turn of
+    the agent's is alive, at its next presentation point. The released start
+    reads it where it was stored,
     so the next request starts with the same messages and a reply keeps its
     thinking, and later requests read it as history, which the strategy
     folds like any row. A failed write is logged, and the turn runs without

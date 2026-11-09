@@ -164,8 +164,10 @@ export type TraceEvent =
        * something the refused compile depends on has changed (compression's
        * progress, nothing left pending, a surgery or an undo, the agent's
        * budget or live context settings, or a quiesce's end), the hold ends,
-       * its note is stored in the agent's window, and the held requests are
-       * queued. Their start's own compile is the check: refused again while
+       * the held requests are queued, and its note is stored as the agent's
+       * own row, entering its window at once or, while a turn of the agent's
+       * is alive, at its next presentation point; a failed write stores
+       * none. Their start's own compile is the check: refused again while
        * compression is pending, it waits in a new hold, with a new
        * `inference:held`. `inference:hold_ended` follows each, once. An
        * ephemeral run's start, and one before the framework's `start()`,

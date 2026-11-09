@@ -174,6 +174,8 @@ interface Internal {
   redoStacks: Map<string, unknown[]>;
   turnCounters: Map<string, number>;
   getTurnCheckpoints(agentName: string): Array<{ turnIndex: number }>;
+  checkBudgetHoldsAfterWindowChange(only?: string, release?: boolean): void;
+  readHostMode(): { quiesced: boolean } | null;
   saveTurnCheckpoints(agentName: string, checkpoints: Array<{ turnIndex: number }>): void;
   cancelCoalescedWakes(subject: string): void;
   holdProviderAcceleration(agent: unknown, error: Error): boolean;
@@ -254,6 +256,7 @@ async function resident(options: {
   gate?: boolean;
   policyRetries?: number;
   policyDelayMs?: number;
+  secondAgent?: boolean;
   policy?: { shouldInfer(agentName: string, requests: Array<Record<string, unknown>>): boolean };
   strategy?: unknown;
 } = {}) {
@@ -276,7 +279,7 @@ async function resident(options: {
       ...(options.restart ? { allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 } : {}),
       ...(options.binds ? { thinkingBinding: { binds: true, dropBlock: false } } : {}),
       ...(options.strategy ? { strategy: options.strategy } : {}),
-    }],
+    }, ...(options.secondAgent ? [{ name: 'second', model: 'test-model', systemPrompt: 'You are second.' }] : [])],
     modules: [options.restart ? new BlobToolModule() : inbox, ...(options.modules ?? [])],
     syncIntervalMs: 0,
     maintenanceIntervalMs: options.maintenanceIntervalMs ?? 50,
@@ -541,6 +544,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         const released = requestText(t.turnCalls().at(-1));
         assert.ok(released.includes('lesson three'), 'the released request has the new injection');
         assert.ok(!released.includes('lesson two'), 'and not the one no request carried');
+        assert.ok(await pollUntil(() => !t.internal.hasTurn('prime')), 'the turn ended');
         assert.equal(t.framework.undoLastTurn('prime').undone, true);
         assert.ok(!t.windowText().includes('lesson three') && !t.windowText().includes('lesson two'), 'the undo took the turn\'s injection with it');
       } finally {
@@ -923,7 +927,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it('an undo cut short drops what it took out but releases no wait', async () => {
+  it('an undo cut short releases no wait', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
       t.internal.budgetHoldRecheckMs = 60_000;
@@ -1001,6 +1005,374 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.equal(c.refusals, 2, 'the first refusal went to the error policy, and its retry was refused and waits');
       } finally {
         internal.dropTurnCheckpoint = drop;
+        await t.close();
+      }
+    });
+  });
+
+  it('a stop a listener of the retraction makes with abortInference() ends the waiting turn, as any stop of a wait does', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      let n = 0;
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'], context: () => `status ${n++}` });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let stopped: boolean | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'presentation:retracted' && (e as { reason?: unknown }).reason === 'unsent-injection' && stopped === undefined) stopped = t.framework.abortInference('prime', 'zz-stop');
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => stopped !== undefined), 'the refused start retracted its injection');
+        assert.equal(stopped, true, 'the stop was taken');
+        assert.equal(t.internal.budgetHolds.has('prime'), false, 'no wait is left for the stopped turn');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+        await t.framework.runUntilIdle();
+        assert.ok(!t.stored().includes('Answered go'), 'the stopped turn never runs');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("an undo's wait checks come after its checkpoints are saved", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let seen: number[] | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:hold_ended' && (e as { outcome?: string }).outcome === 'released' && !seen) seen = t.internal.getTurnCheckpoints('prime').map((cp) => cp.turnIndex);
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'heartbeat', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const before = t.internal.getTurnCheckpoints('prime').map((cp) => cp.turnIndex);
+        assert.ok((t.framework.undoLastTurn('prime') as { undone: boolean }).undone, 'the undo took the completed turn');
+        assert.deepEqual({ before, atRelease: seen }, { before: [0], atRelease: [] }, 'the release saw the saved checkpoints');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('an undo that finishes one cut short releases the waits it leaves', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'heartbeat', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'a wake that reads no row waits');
+        const cm = t.cm();
+        const retract = cm.retractRows.bind(cm);
+        cm.retractRows = ((...args: Parameters<typeof cm.retractRows>) => {
+          retract(...args);
+          throw new Error('zz the retraction failed after its rows left');
+        }) as typeof cm.retractRows;
+        assert.throws(() => t.framework.undoLastTurn('prime'), /cut short/);
+        cm.retractRows = retract;
+        assert.equal(t.of('inference:hold_ended').length, 0, 'the cut-short undo released nothing');
+        assert.ok((t.framework.undoLastTurn('prime') as { undone: boolean }).undone, 'the next undo finished it');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released'], 'and released the wait it left');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a listener of a resume's release that quiesces leaves the host quiesced in memory and in its record", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let quiescing: Promise<unknown> | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:hold_ended' && (e as { outcome?: string }).outcome === 'released' && !quiescing) {
+          quiescing = t.framework.quiesce({ timeoutMs: 2_000 }).catch((error: unknown) => `refused: ${String(error)}`);
+        }
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        await t.framework.quiesce({ timeoutMs: 2_000 });
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.resume();
+        const outcome = await quiescing;
+        assert.deepEqual({ memory: t.internal.quiesced, record: t.internal.readHostMode()?.quiesced === true, outcome: typeof outcome === 'string' ? outcome : 'quiesced' },
+          { memory: true, record: true, outcome: 'quiesced' });
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a stop by a listener of a re-held wait clears the alert its first hold raised', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let held = 0;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:held' && ++held === 2) t.framework.abortInference('prime', 'zz-stop');
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.alerts('context-refusal').length === 1), 'the first hold raised its alert');
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => held === 2 && !t.internal.budgetHolds.has('prime')), 'refused again, its second hold was stopped');
+        assert.equal(t.alerts('context-refusal-clear').length, 1, 'the stop cleared the alert that went out');
+        assert.equal(t.alerts('context-refusal').length, 1, 'and raised no second open');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a listener of a dropped wait's end finds its joined wakes back in the queue", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let queued: boolean | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:aborted' && queued === undefined && t.of('inference:held').length > 0) queued = t.internal.pendingRequests.some((r) => r.reason === 'external-message');
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('later');
+        assert.ok(await pollUntil(() => t.stored().includes('later')));
+        await t.internal.processInferenceRequests();
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.equal(queued, true, 'the wake that joined it was queued before the turn ended');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a surgery's sweep finishes only a wait that is still its agent's", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 1 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, secondAgent: true });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        for (const agentName of ['prime', 'second']) t.internal.pendingRequests.push({ agentName, reason: 'heartbeat', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => t.internal.budgetHolds.has('prime') && t.internal.budgetHolds.has('second')), 'both agents wait');
+        for (const hold of t.internal.budgetHolds.values()) (hold as unknown as { standsOn: string[] }).standsOn = ['zz-a-row-no-store-has'];
+        const [first, other] = [...t.internal.budgetHolds.keys()];
+        let stopped = false;
+        t.framework.onTrace((e) => {
+          if (e.type === 'inference:aborted' && e.agentName === first && !stopped) {
+            stopped = true;
+            t.framework.abortInference(other!, 'zz-stop');
+          }
+        });
+        t.internal.checkBudgetHoldsAfterWindowChange();
+        assert.ok(stopped, "the first wait's drop ran its listener");
+        const ended = t.of('inference:hold_ended').filter((e) => e.agentName === other);
+        assert.deepEqual(ended.map((e) => e.outcome), ['stopped'], 'the other wait ended once, by its stop');
+        assert.equal(t.of('inference:aborted').filter((e) => e.agentName === other).length, 1, 'with one inference:aborted');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a message that joins a provider-held retry waiting for compression is answered by that retry, as on main for a provider hold', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: Infinity }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered go', 'Answered MID'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        const stream = t.membrane.streamYielding.bind(t.membrane);
+        let limited = false;
+        t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
+          if (limited) return stream(request, options);
+          limited = true;
+          c.refuseFrom = c.compiles + 1;
+          c.readyAt = Infinity;
+          t.membrane.calls.push(request);
+          return errorStream(providerLimit());
+        };
+        t.send('go');
+        assert.ok(await pollUntil(() => (t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) > 0), 'parked');
+        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'its provider-held retry waits for compression');
+        t.send('MID');
+        assert.ok(await pollUntil(() => t.stored().includes('MID')));
+        const calls = t.turnCalls().length;
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered go')));
+        await t.framework.runUntilIdle();
+        const after = t.turnCalls().slice(calls);
+        assert.equal(after.length, 1, 'one turn ran');
+        assert.ok(JSON.stringify(after[0]).includes('MID'), 'and its request read the arrival');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a stop reached from the gate's flush comes after the wait is announced, and clears its alert", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'], gate: true });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        const gate = t.internal.eventGate as unknown as { onInferenceEnded(name: string): void };
+        const ended = gate.onInferenceEnded.bind(gate);
+        let stopped = false;
+        gate.onInferenceEnded = (name: string) => {
+          ended(name);
+          if (name === 'prime' && !stopped && t.internal.budgetHolds.has('prime')) {
+            stopped = true;
+            t.framework.abortInference('prime', 'zz-stop');
+          }
+        };
+        t.send('go');
+        assert.ok(await pollUntil(() => stopped), "the gate's flush reached a stop while the turn waited");
+        const types = t.traces.map((e) => e.type);
+        assert.ok(types.indexOf('inference:held') >= 0 && types.indexOf('inference:held') < types.indexOf('inference:hold_ended'), 'announced before it ended');
+        assert.equal(t.alerts('context-refusal-clear').length, 1, 'and its alert cleared');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a surgery's drop of a waiting turn queues its joined wakes before the turn's end is traced", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let queued: boolean | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:aborted' && queued === undefined && t.of('inference:held').length > 0) queued = t.internal.pendingRequests.some((r) => r.reason === 'heartbeat');
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'heartbeat', source: 'test', timestamp: Date.now() });
+        await t.internal.processInferenceRequests();
+        await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        assert.equal(queued, true, 'the wake that joined it was queued before the turn ended');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("an undo whose checkpoint save fails drops a wait whose row it took out after its own trace", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let afterUndone: boolean | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:hold_ended' && afterUndone === undefined) afterUndone = t.of('window:undone').length > 0;
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const save = t.internal.saveTurnCheckpoints.bind(t.internal);
+        t.internal.saveTurnCheckpoints = () => { throw new Error('zz the checkpoint list could not be saved'); };
+        assert.throws(() => t.framework.undoLastTurn('prime'), /saving its checkpoints failed/);
+        t.internal.saveTurnCheckpoints = save;
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed'], 'the wait whose row left was dropped');
+        assert.equal(afterUndone, true, "after the undo's own trace");
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('an undo whose checkpoint save fails releases no wait', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'heartbeat', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const save = t.internal.saveTurnCheckpoints.bind(t.internal);
+        t.internal.saveTurnCheckpoints = () => { throw new Error('zz the checkpoint list could not be saved'); };
+        assert.throws(() => t.framework.undoLastTurn('prime'), /saving its checkpoints failed/);
+        t.internal.saveTurnCheckpoints = save;
+        assert.equal(t.of('inference:hold_ended').length, 0, 'nothing released it');
+        assert.ok(t.internal.budgetHolds.has('prime'), 'the wait goes on');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("an undo cut short drops a wait whose row it took out after its own trace", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let afterUndone: boolean | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:hold_ended' && afterUndone === undefined) afterUndone = t.of('window:undone').length > 0;
+      });
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const cm = t.cm();
+        const retract = cm.retractRows.bind(cm);
+        let calls = 0;
+        cm.retractRows = ((...args: Parameters<typeof cm.retractRows>) => {
+          retract(...args);
+          if (++calls === 2) throw new Error('zz the retraction failed after its rows left');
+        }) as typeof cm.retractRows;
+        assert.throws(() => t.framework.undoLastTurn('prime'), /cut short/);
+        cm.retractRows = retract;
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed'], 'the wait whose row left was dropped');
+        assert.equal(afterUndone, true, "after the undo's own trace");
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a resume whose record write throws still ends the waits it holds", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const internal = t.internal as unknown as { persistHostMode(mode: unknown): void };
+      const persist = internal.persistHostMode;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        await t.framework.quiesce({ timeoutMs: 2_000 });
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        internal.persistHostMode = function (this: unknown, mode: unknown) {
+          if (mode === null) throw new Error('zz the host-mode record could not be written');
+          return persist.call(this, mode);
+        };
+        await assert.rejects(t.framework.resume(), /could not be written/);
+        internal.persistHostMode = persist;
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released'], 'the wait ended all the same');
+      } finally {
+        internal.persistHostMode = persist;
         await t.close();
       }
     });
@@ -1595,6 +1967,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.stored().includes('newer')));
         await t.internal.processInferenceRequests();
         assert.ok(t.internal.pendingRequests.includes(held as Record<string, unknown>), 'the newer wake did not absorb it');
+        assert.ok(t.internal.pendingRequests.some((r) => r !== held && r.agentName === 'prime'), 'and the newer wake waits beside it');
         await t.framework.resume();
         assert.ok(await pollUntil(() => t.stored().includes('Answered both')));
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
@@ -1680,15 +2053,19 @@ describe('a turn refused for budget while compression is pending waits idle, and
   });
 
   it('a released start that fails for another reason takes that error\'s path, as a start with no wait does', async () => {
-    await withCompression({ fitAt: 2 }, async (c) => {
-      const t = await resident();
+    await withCompression({ fitAt: Infinity }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0 });
+      t.internal.budgetHoldRecheckMs = 60_000;
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         c.failNext = new Error('zz store unavailable');
-        c.fitAt = 0;
-        c.readyAt = 0;
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
         assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit')), "the error policy's retry runs it");
+        assert.equal(c.failNext, undefined, 'the released start met the error');
+        assert.ok(t.of('inference:failed').some((e) => String(e.error).includes('zz store unavailable')), 'and failed on it');
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released']);
         assert.deepEqual(t.alerts('context-refusal-clear'), []);
       } finally {
@@ -1719,7 +2096,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
   });
 });
 
-describe("the hold's note is stored at its release, where every later request reads it", () => {
+describe("the hold's note is stored at its release, where its turn's request reads it", () => {
   const thinking = (answer: string) => createMockResponse([
     { type: 'thinking', thinking: `reasoning for ${answer}`, signature: `sig-${answer}` } as ContentBlock, text(answer)]);
 
@@ -1895,7 +2272,7 @@ describe("the hold's note is stored at its release, where every later request re
     });
   });
 
-  it('stores a row for each of two holds whose notes read the same', async () => {
+  it('stores a row for each of two holds whose notes read the same but for their figures', async () => {
     await withCompression({ stalled: true }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Answered one', 'Answered two'] });
       t.internal.budgetHoldRecheckMs = 60_000;
