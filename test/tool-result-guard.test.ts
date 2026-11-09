@@ -15,6 +15,7 @@ import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
+import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { JsStore } from '@animalabs/chronicle';
 
 /**
@@ -2078,8 +2079,8 @@ test('#281: a withheld result over the inline cap is written as stored, and its 
     const withheld = await h.workspace.readBinary(path);
     assert.ok('data' in withheld);
     const text = (withheld as { data: Buffer }).data.toString('utf8');
-    // The data is a string, stored as it is: 405 characters.
-    assert.match(text, /^long-x{95}\n\n\[truncated — showing 100 of 405 chars; full content: workspace file /,
+    // The data is a string, stored as it is: 405 characters, its head and tail kept.
+    assert.match(text, /^long-x{55}\n\n\[truncated — chars 60 to 365 of 405 elided here; full content: workspace file [^\n]*\]\nx{40}$/,
       'the withheld file holds the capped text, as stored');
     const whole = /full content: workspace file (work\/tool-results\/[^\s\]"]+\.txt)/.exec(text)?.[1];
     assert.ok(whole && whole !== path, `its note names the file with the whole output: ${text}`);
@@ -3460,6 +3461,12 @@ test('#277: a write for a branch that waits for its mount while the branch chang
 const LISTS = ' Kept from its result: ';
 /** The file lists a stub kept, parsed; undefined when it kept none. */
 const keptLists = (stub: string) => stub.includes(LISTS) ? JSON.parse(stub.slice(stub.indexOf(LISTS) + LISTS.length)) : undefined;
+const keptCut = (whole: string, cap: number) => {
+  const head = Math.floor(cap * 0.6);
+  const tailStart = whole.length - (cap - head);
+  return `${whole.slice(0, head)} [cut: chars ${head} to ${tailStart} of these fields' ${whole.length} elided here; `
+    + `the whole result is where this note says] ${whole.slice(tailStart)}`;
+};
 const toolUse = (id: string, name: string, input: Record<string, unknown> = {}) =>
   createMockResponse([{ type: 'tool_use', id, name, input }], 'tool_use');
 
@@ -3507,14 +3514,15 @@ test('#277: a result keeps the fields its tool marked, in the order marked, cut 
   assert.ok(whole.length > 1000);
   // The note says what was cut and where the rest is, not "original was N",
   // which would read as the whole result's size.
-  assert.equal(cut, `${whole.slice(0, 1000)} [cut: 1000 of these fields' ${whole.length} characters; ` +
-    'the whole result is where this note says]');
+  assert.equal(cut, `${whole.slice(0, 600)} [cut: chars 600 to ${whole.length - 400} of these fields' ${whole.length} elided here; ` +
+    `the whole result is where this note says] ${whole.slice(-400)}`);
   // A cut never leaves half a surrogate pair.
-  // '{"name":"' is 9 characters and each emoji 2, so a cap of 14 falls inside the third.
-  const emoji = keptWhenWithheld({ success: true, data: { name: '\u{1F600}'.repeat(10) }, keepWhenWithheld: ['name'] }, 14)!;
+  // '{"name":"' is 9 characters and each emoji 2, so at a cap of 17 the head's
+  // share, 10, ends inside the first, and the tail's, 7, starts inside the eighth.
+  const emoji = keptWhenWithheld({ success: true, data: { name: '\u{1F600}'.repeat(10) }, keepWhenWithheld: ['name'] }, 17)!;
   const loneSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
   assert.doesNotMatch(emoji, loneSurrogate, `well-formed: ${JSON.stringify(emoji)}`);
-  assert.match(emoji, /^\{"name":"\u{1F600}\u{1F600} \[cut: 13 of these fields' 31 characters;/u);
+  assert.equal(emoji, `{"name":" [cut: chars 9 to 25 of these fields' 31 elided here; the whole result is where this note says] \u{1F600}\u{1F600}"}`);
 });
 
 test('#277: a withheld batch keeps what each marked result listed; an unmarked one keeps nothing, and its file has everything', async () => {
@@ -3568,8 +3576,7 @@ test('#277: with no writable workspace the stub still keeps the file lists, cut 
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
     const whole = JSON.stringify({ written });
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut: 1000 of these fields' ` +
-      `${whole.length} characters; the whole result is where this note says]`);
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${keptCut(whole, 1000)}`);
   } finally { await h.framework.stop(); }
 });
 
@@ -3587,10 +3594,9 @@ test("#277: a withheld round's stubs share their message's bound, each keeping i
     await h.run();
     const stubs = toolResults(h.framework).map((block) => String(block.content));
     // Two results share the bound of 4000, so each stub keeps 2000 less the
-    // notice's room of 640: 1360 characters of its fields.
+    // notice's room of its fields.
     const whole = JSON.stringify({ written });
-    assert.deepEqual(stubs, [marked, marked].map(() => `${AUDIT_STUB}${LISTS}${whole.slice(0, 1360)} [cut: 1360 of these fields' ` +
-      `${whole.length} characters; the whole result is where this note says]`));
+    assert.deepEqual(stubs, [marked, marked].map(() => `${AUDIT_STUB}${LISTS}${keptCut(whole, 2000 - TOOL_RESULT_NOTICE_ROOM)}`));
     const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
     assert.ok(total <= 4000, `the stubs are ${total} characters together`);
   } finally { await h.framework.stop(); }
@@ -3605,10 +3611,9 @@ test("#277: a withheld result alone under a bound keeps its fields cut within th
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
     // The bound of 4000 clamps the cap to 4000, and the stub keeps 4000 less
-    // the notice's room of 640: 3360 characters of its fields.
+    // the notice's room of its fields.
     const whole = JSON.stringify({ written });
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 3360)} [cut: 3360 of these fields' ` +
-      `${whole.length} characters; the whole result is where this note says]`);
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${keptCut(whole, 4000 - TOOL_RESULT_NOTICE_ROOM)}`);
     assert.ok(stub.length <= 4000, `the stub is ${stub.length} characters`);
   } finally { await h.framework.stop(); }
 });
@@ -3628,8 +3633,7 @@ test("#277: a withheld result alone whose bound leaves room for its cap and the 
     // room, so the stub keeps its fields to the cap.
     const stub = String(toolResults(h.framework)[0].content);
     const whole = JSON.stringify({ written });
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut: 1000 of these fields' ` +
-      `${whole.length} characters; the whole result is where this note says]`);
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${keptCut(whole, 1000)}`);
   } finally { await h.framework.stop(); }
 });
 
@@ -3653,11 +3657,11 @@ test("#277: a withheld round whose results fit the bound still cuts its stubs' f
     // arithmetic puts the cut, and say so.
     const head = `${AUDIT_STUB}${LISTS}`;
     assert.ok(stubs[0]!.startsWith(head), stubs[0]);
-    const cut = / \[cut: (\d+) of these fields' (\d+) characters; the whole result is where this note says\]$/.exec(stubs[0]!);
+    const cut = / \[cut: chars (\d+) to (\d+) of these fields' (\d+) elided here; the whole result is where this note says\] /.exec(stubs[0]!);
     assert.ok(cut, stubs[0]);
-    const kept = Number(cut[1]);
-    assert.ok(kept > 0 && kept < whole.length && Number(cut[2]) === whole.length, cut[0]);
-    assert.equal(stubs[0]!.slice(head.length, stubs[0]!.length - cut[0].length), whole.slice(0, kept), 'the fields kept, up to the cut');
+    const [kept, tailStart] = [Number(cut[1]), Number(cut[2])];
+    assert.ok(kept > 0 && tailStart > kept && tailStart < whole.length && Number(cut[3]) === whole.length, cut[0]);
+    assert.equal(stubs[0], `${head}${whole.slice(0, kept)}${cut[0]}${whole.slice(tailStart)}`, 'the fields kept, head and tail around the cut');
     assert.equal(stubs[1], `${AUDIT_STUB}${LISTS}${JSON.stringify({ written: ['one.txt'] })}`);
     const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
     assert.ok(total <= 4000, `the stubs are ${total} characters together`);
@@ -3683,9 +3687,7 @@ test('#277: direct API: a withheld result keeps its file lists, cut at the house
     const stub = String(toolResults(h.framework)[0].content);
     const whole = JSON.stringify({ written });
     assert.ok(whole.length > DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)}` +
-      ` [cut: ${DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS} of these fields' ${whole.length} characters; ` +
-      'the whole result is where this note says]');
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${keptCut(whole, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)}`);
   } finally { await h.framework.stop(); }
 });
 

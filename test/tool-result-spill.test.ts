@@ -171,6 +171,12 @@ async function waitForStoredToolResult(
   return null;
 }
 
+function keptChars(stored: string, after = /(?:)/): number {
+  const at = new RegExp(`chars (\\d+) to (\\d+) of (\\d+) elided here${after.source}`).exec(stored);
+  assert.ok(at, `a marker naming what it elides: ${stored.slice(0, 120)} … ${stored.slice(-300)}`);
+  return Number(at[1]) + Number(at[3]) - Number(at[2]);
+}
+
 /** Effective-cap provenance through the framework's own settings extension. */
 function capProvenance(framework: AgentFramework): Record<string, unknown> {
   const extensions = (framework as unknown as {
@@ -202,7 +208,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
       assert.ok(stored.content.length < CAPPED, `inline copy must be near the cap, got ${stored.content.length}`);
-      assert.match(stored.content, /showing 24000 of \d+ chars; full content: workspace file files\/tool-results\//);
+      assert.strictEqual(keptChars(stored.content, /; full content: workspace file files\/tool-results\//), 24000);
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars, null);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 24000);
@@ -229,7 +235,7 @@ describe('tool-result spill completion (issue #89)', () => {
     try {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /showing 12000 of \d+ chars/);
+      assert.strictEqual(keptChars(stored.content), 12000);
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 12_000);
       assert.strictEqual(prov.tool_result_inline_max_chars_source, 'framework-config');
@@ -326,7 +332,7 @@ describe('tool-result spill completion (issue #89)', () => {
         const stored = await waitForStoredToolResult(h.framework);
         assert.ok(stored);
         assert.doesNotMatch(stored.content, /re-indented|not retained/);
-        const command = stored.content.match(/Page with workspace--read (\{[^\n]*?\});/);
+        const command = stored.content.match(/workspace--read (\{[^\n]*?\}),/);
         assert.ok(command, 'notice supplies a concrete bounded read');
         const input = JSON.parse(command[1]) as { path: string; offsetChars: number; limitChars: number };
         const file = await h.workspace!.readBinary(input.path);
@@ -337,6 +343,8 @@ describe('tool-result spill completion (issue #89)', () => {
             'old formatting would have lost this result');
         }
 
+        const from = input.offsetChars;
+        assert.ok(from > 0 && stored.content.startsWith(body.slice(0, from)), 'the read starts where the kept head ends');
         let recovered = '';
         let pages = 0;
         while (true) {
@@ -345,7 +353,7 @@ describe('tool-result spill completion (issue #89)', () => {
           });
           assert.strictEqual(result.success, true, result.error);
           const page = result.structured as { content: string; offsetChars: number; nextOffsetChars: number | null };
-          assert.strictEqual(page.offsetChars, recovered.length);
+          assert.strictEqual(page.offsetChars, from + recovered.length);
           assert.ok(page.content.length > 0);
           // Exercise the actual stored/live spill policy on each read result.
           const storage = await (h.framework as unknown as {
@@ -371,7 +379,7 @@ describe('tool-result spill completion (issue #89)', () => {
           assert.ok(pages <= body.length, 'paging must terminate');
         }
         assert.ok(pages > 1);
-        assert.strictEqual(recovered, body, 'all original text remains reachable, without token changes');
+        assert.strictEqual(body.slice(0, from) + recovered, body, 'all original text remains reachable, without token changes');
       } finally {
         await h.framework.stop();
         rmSync(h.tempDir, { recursive: true, force: true });
@@ -567,7 +575,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
       assert.ok(stored.content.length < CAPPED, 'inline copy must be capped');
-      assert.match(stored.content, /no writable workspace mount without an include, full content not retained/);
+      assert.match(stored.content, /no writable workspace mount without an include, the middle was not retained/);
       assert.doesNotMatch(stored.content, /workspace file/);
     } finally {
       await h.framework.stop();
@@ -645,7 +653,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
       assert.match(stored.content, /spill to workspace file files\/tool-results\/\S+\.txt FAILED \(/);
-      assert.match(stored.content, /content over the cap was not retained/);
+      assert.match(stored.content, /FAILED \([^\n]*\); the middle was not retained\]/);
       assert.doesNotMatch(stored.content, /no writable workspace/);
       assert.strictEqual(traces.length, 1, 'exactly one tool:spill_failed trace expected');
       assert.strictEqual(traces[0].contentLength, 60_011);
@@ -697,7 +705,7 @@ describe('tool-result spill completion (issue #89)', () => {
       // The cap is the strategy's bound, so the head moves back to leave the
       // notice its room: the stored copy, notice included, fits the bound.
       assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
-      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
+      assert.strictEqual(keptChars(stored.content) + 1, 4000 - TOOL_RESULT_NOTICE_ROOM, 'head, the tail\'s line break and tail fill the room the notice leaves');
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4000);
       assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default');
@@ -778,7 +786,7 @@ describe('tool-result spill completion (issue #89)', () => {
       // The cap is the strategy's bound, so the head moves back to leave the
       // notice its room: the stored copy, notice included, fits the bound.
       assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
-      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
+      assert.strictEqual(keptChars(stored.content) + 1, 4000 - TOOL_RESULT_NOTICE_ROOM, 'head, the tail\'s line break and tail fill the room the notice leaves');
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

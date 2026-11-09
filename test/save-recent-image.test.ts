@@ -18,11 +18,12 @@
  * Second review round (#140) added three more representations of the same
  * failure, each pinned below:
  *   6. truncation/spill keeps the image slots the resident saw, and keeps
- *      none they didn't see: a result carrying images keeps past its cut
- *      the image slots its live copy showed, the newest 64 of them that fit
- *      the readers' bound, saying how many it left out; a text result,
- *      whose live copy is its stored text, keeps none past the cut; and no
- *      cut ends in part of a slot (#403).
+ *      none they didn't see: a cut keeps its head and its tail with the
+ *      slots in them, and a result carrying images keeps from its elided
+ *      middle the image slots its live copy showed, the newest 64 of them
+ *      that fit the readers' bound, saying how many it left out; a text
+ *      result, whose live copy is its stored text, keeps none from its
+ *      elided middle; and no cut ends in part of a slot (#403).
  *   7. a save dispatched in the same batch as the snapshot waits for it.
  *   8. refs are namespaced per ledger — a stale ref resolves to nothing,
  *      and a direct `ref` is saved through its occurrence in context.
@@ -57,13 +58,20 @@ import {
   TOOL_IMAGE_REF_RE,
   ToolImageLedger,
   cutStoredToolResult,
-  formatKeptImageSlots,
   formatToolImagePlaceholder,
   normalizeMediaType,
   parseImagePlaceholders,
+  storedCutText,
   type ShownRanges,
 } from '../src/tool-image-ledger.js';
 import { toolResultDataToHistoryString, truncateForHistory, type HistoryBlockSpan } from '../src/tool-result-history.js';
+
+const capForHead = (head: number) => {
+  let cap = Math.ceil(head / 0.6);
+  while (Math.floor(cap * 0.6) < head) cap++;
+  assert.strictEqual(Math.floor(cap * 0.6), head, `a cap whose head's share is ${head}`);
+  return cap;
+};
 import {
   INLINE_WITHHELD_TEXT,
   REFERENCE_STUB_MAX_CHARS,
@@ -99,33 +107,38 @@ const LONG_TEXT = 'line of scan output\n'.repeat(1500);
 const attachmentLine = (i: number): string => (i % 2 === 0
   ? `[ref_${i.toString(36)}_ab3d] item${i}.png — image/png, ~10KB claimed — attachment on channel message — fetch with fetch_reference`
   : `[ref_${i.toString(36)}_ab3d] item${i}.txt — text/plain, ~10KB claimed — attachment on channel message — fetch with fetch_reference`);
-/** 3,000 characters of channel text, then 200 attachment lines, 100 of them
- *  images: all past the smallest allowed inline cap. */
-const LISTING = ['x'.repeat(3000), ...Array.from({ length: 200 }, (_, i) => attachmentLine(i))].join('\n');
+/** 3,000 characters of channel text, 200 attachment lines, 100 of them
+ *  images, then 1,000 more: every line in the middle the smallest allowed
+ *  inline cap elides. */
+const LISTING = ['x'.repeat(3000), ...Array.from({ length: 200 }, (_, i) => attachmentLine(i)), 'x'.repeat(1000)].join('\n');
 /** 100 referenced frames, each image-typed and named for its number. */
 const FRAMES = Array.from({ length: 100 }, (_, i) => ({
   type: 'image', uri: `https://cam.example/sri-frame-${i}.png`, name: `frame-${i}.png`, mimeType: 'image/png', sizeBytes: 1200,
 }));
 /** A caption after a picture, quoting two attachment lines: the first within
- *  the smallest allowed inline cap (1000) of its own block, the second past it. */
-const CAPTION = `caption\n${attachmentLine(0)}\n${'y'.repeat(1200)}\n${attachmentLine(2)}`;
-/** A caption whose own cap (1000) falls 49 characters into a quoted
- *  reference line, after the placeholder that line quotes. */
-const QUOTING_CAPTION = `${'y'.repeat(950)}\n[ref_7_ab3d] quoting [image: image/png, 68B] — image/png, ~1KB claimed — from tool result — fetch with fetch_reference`;
+ *  the head the smallest allowed inline cap (1000) keeps of its own block,
+ *  the second in the middle it elides. */
+const CAPTION = `caption\n${attachmentLine(0)}\n${'y'.repeat(1200)}\n${attachmentLine(2)}\n${'y'.repeat(1000)}`;
+/** A caption whose own head's share at a cap of 1000 (600) falls 49
+ *  characters into a quoted reference line, after the placeholder that line
+ *  quotes, with more caption past the tail's share after it. */
+const QUOTING_CAPTION = `${'y'.repeat(550)}\n[ref_7_ab3d] quoting [image: image/png, 68B] — image/png, ~1KB claimed — from tool result — fetch with fetch_reference\n${'y'.repeat(1000)}`;
 /** A quoted line shaped like a stub, too long to be a slot whole, that shows
  *  an image type early. */
 const QUOTED_LINE = `[ref_9_ab3d] quoted — image/png ${'z'.repeat(1500)}`;
-/** Text results whose inline cap (1000) falls inside a stub-shaped line: an
- *  attachment line, after its type; the quoted line, 499 characters in; and
- *  the quoted line from the text's start, 1000 characters in. */
+/** Text results whose head's share at an inline cap of 1200 (720) falls
+ *  inside a stub-shaped line: an attachment line, after its type; the quoted
+ *  line, 499 characters in; and the quoted line from the text's start, 720
+ *  characters in. Each ends in more than the tail's share of filler. */
 const SPLIT_TEXTS = {
-  split_stub: `${'x'.repeat(900)}\n${attachmentLine(0)}`,
-  split_quoted: `${'x'.repeat(500)}\n${QUOTED_LINE}`,
+  split_stub: `${'x'.repeat(619)}\n${attachmentLine(0)}\n${'x'.repeat(600)}`,
+  split_quoted: `${'x'.repeat(220)}\n${QUOTED_LINE}`,
   giant_line: QUOTED_LINE,
 } as const;
-/** A text result with an attachment line inside its cap (1000) but past the
- *  head a bound of 1000 leaves it, with room for the notice. */
-const MID_SLOT_TEXT = `${'x'.repeat(500)}\n${attachmentLine(0)}\n${'x'.repeat(1000)}`;
+/** A text result with an attachment line inside the head its cap (1000)
+ *  keeps, but past the head a bound of 1000 leaves it beside the notice's
+ *  room. */
+const MID_SLOT_TEXT = `${'x'.repeat(300)}\n${attachmentLine(0)}\n${'x'.repeat(1000)}`;
 /** A text result within a cap of 1000, with an attachment line past what a
  *  bound of 1200 leaves the head beside the notice's room. */
 const NEAR_SLOT_TEXT = `${'x'.repeat(700)}\n${attachmentLine(0)}\n${'x'.repeat(100)}`;
@@ -162,9 +175,9 @@ class SnapModule implements Module {
       { name: 'snap_contradiction', description: 'RFC-005 vector-2 image.', inputSchema: schema },
       { name: 'snap_uri', description: 'RFC-005 reference image.', inputSchema: schema },
       { name: 'listing', description: 'A channel listing, as text.', inputSchema: schema },
-      { name: 'listing_parts', description: 'Channel text, then an attachment line, as two text blocks.', inputSchema: schema },
+      { name: 'listing_parts', description: 'Channel text, an attachment line, then more channel text, as three text blocks.', inputSchema: schema },
       { name: 'snap_listing', description: 'A channel listing, then a picture.', inputSchema: schema },
-      { name: 'snap_frames', description: 'A scan, 100 referenced frames, then a picture.', inputSchema: schema },
+      { name: 'snap_frames', description: 'A scan, 100 referenced frames, a picture, then more scan.', inputSchema: schema },
       { name: 'snap_captioned', description: 'A scan, a picture, then a caption.', inputSchema: schema },
       { name: 'snap_mystery', description: 'A picture beside a block of no known shape.', inputSchema: schema },
       { name: 'snap_quoting', description: 'A picture, then a caption quoting a reference line.', inputSchema: schema },
@@ -206,11 +219,11 @@ class SnapModule implements Module {
       case 'listing':
         return { success: true, data: [{ type: 'text', text: LISTING }] };
       case 'listing_parts':
-        return { success: true, data: [{ type: 'text', text: 'x'.repeat(1500) }, { type: 'text', text: attachmentLine(0) }] };
+        return { success: true, data: [{ type: 'text', text: 'x'.repeat(1500) }, { type: 'text', text: attachmentLine(0) }, { type: 'text', text: 'x'.repeat(1500) }] };
       case 'snap_listing':
         return { success: true, data: [{ type: 'text', text: LISTING }, png] };
       case 'snap_frames':
-        return { success: true, data: [{ type: 'text', text: 'x'.repeat(1500) }, ...FRAMES, png] };
+        return { success: true, data: [{ type: 'text', text: 'x'.repeat(1500) }, ...FRAMES, png, { type: 'text', text: 'z'.repeat(1500) }] };
       case 'snap_captioned':
         return { success: true, data: [{ type: 'text', text: 'x'.repeat(1500) }, png, { type: 'text', text: CAPTION }] };
       case 'snap_mystery':
@@ -218,7 +231,7 @@ class SnapModule implements Module {
         // its live copy is its JSON, as stored.
         return {
           success: true,
-          data: [png, { type: 'text', text: `${'x'.repeat(1500)}\n[image: image/png, 68B]` }, { type: 'mystery' }],
+          data: [png, { type: 'text', text: `${'x'.repeat(1500)}\n[image: image/png, 68B]\n${'x'.repeat(1000)}` }, { type: 'mystery' }],
         };
       case 'snap_quoting':
         return { success: true, data: [png, { type: 'text', text: QUOTING_CAPTION }] };
@@ -1126,11 +1139,12 @@ describe('save_recent_image provenance (issue #104)', () => {
     });
     try {
       const stored = await waitForToolResult(h.framework, 'call_long');
-      assert.match(stored.content, /\[truncated — showing \d+ of \d+ chars/);
-      assert.match(stored.content, /1 image slot\(s\) fell past the cut/);
+      assert.match(stored.content, /\[truncated — chars \d+ to \d+ of \d+ elided here/);
+      assert.doesNotMatch(stored.content, /image slot\(s\)/, 'no slot in the elided middle');
       const slots = parseImagePlaceholders(stored.content);
       assert.strictEqual(slots.length, 1, `exactly one slot survives the cut: ${stored.content.slice(-300)}`);
       assert.strictEqual(slots[0]!.kind === 'inline' ? slots[0]!.ref : null, refOf(h, 1));
+      assert.ok(stored.content.endsWith(`\n${slots[0]!.text}`), 'the kept tail holds it where it was');
 
       const receipt = saved(await waitForToolResult(h.framework, 'call_save'));
       assert.strictEqual(receipt[0]!.toolCallId, 'call_long');
@@ -1172,7 +1186,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it('a text result is cut at the cap with no image slot kept past it: its live copy is that text (#403)', async () => {
+  it('a text result is cut at the cap with no image slot kept from its elided middle: its live copy is that text (#403)', async () => {
     const h = await startTurn({
       prefix: 'sri-text-cut-',
       toolResultInlineMaxChars: 1000,
@@ -1187,13 +1201,13 @@ describe('save_recent_image provenance (issue #104)', () => {
     });
     try {
       const stored = await waitForToolResult(h.framework, 'call_listing');
-      assert.strictEqual(stored.content.slice(0, 1000), LISTING.slice(0, 1000), 'the head is the first 1000 characters');
-      assert.match(stored.content.slice(1000), /^\n\n\[truncated — showing 1000 of \d+ chars; full content: workspace file [^\]]+\]$/);
+      assert.strictEqual(stored.content.slice(0, 600), LISTING.slice(0, 600), 'the head is the first 600 characters');
+      assert.match(stored.content.slice(600), /^\n\n\[truncated — chars 600 to \d+ of \d+ elided here; full content: workspace file [^\]]+\]\nx{400}$/);
       // A content array of text blocks alone is a text result too: its live
       // copy is its stored text, not its blocks each cut at the cap.
       const parts = await waitForToolResult(h.framework, 'call_parts');
-      assert.match(parts.content.slice(1000), /^\n\n\[truncated — showing 1000 of 1611 chars; full content: workspace file [^\]]+\]$/);
-      // The image-typed lines past each cut were never shown, so none
+      assert.match(parts.content.slice(600), /^\n\n\[truncated — chars 600 to 2712 of 3112 elided here; full content: workspace file [^\]]+\]\nx{400}$/);
+      // The image-typed lines in each elided middle were never shown, so none
       // counts: index 0 is the older GIF.
       const gif = saved(await waitForToolResult(h.framework, 'call_save'));
       assert.strictEqual(gif[0]!.source, 'attachment');
@@ -1204,7 +1218,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it('a result carrying an image keeps past its cut only the image slots its live copy showed (#403)', async () => {
+  it('a result carrying an image keeps from its elided middle only the image slots its live copy showed (#403)', async () => {
     const h = await startTurn({
       prefix: 'sri-image-cut-',
       toolResultInlineMaxChars: 1000,
@@ -1217,9 +1231,10 @@ describe('save_recent_image provenance (issue #104)', () => {
     });
     try {
       const stored = await waitForToolResult(h.framework, 'call_snap_listing');
-      // The live copy showed the listing up to the cap, all filler, and the
-      // snapshot: of the slots past the cut, it showed only the snapshot's.
-      assert.match(stored.content, /\n\[1 image slot\(s\) fell past the cut; kept here in order so save_recent_image still counts them:\]\n\[image: image\/png, /);
+      // The live copy showed the listing's head and tail, all filler, and the
+      // snapshot, which the stored copy's tail holds: of the slots in its
+      // elided middle, it showed none.
+      assert.doesNotMatch(stored.content, /image slot\(s\)/);
       assert.deepStrictEqual(parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)), [refOf(h, 1)]);
       assert.doesNotMatch(stored.content, /\[ref_/);
       // Index 0 is the snapshot and index 1 the older GIF, as a resident
@@ -1236,7 +1251,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it(`a result carrying an image keeps the newest ${MAX_KEPT_IMAGE_SLOTS} of the image slots its live copy showed past its cut`, async () => {
+  it(`a result carrying an image keeps the newest ${MAX_KEPT_IMAGE_SLOTS} of the image slots its live copy showed in its elided middle`, async () => {
     const h = await startTurn({
       prefix: 'sri-frames-cut-',
       toolResultInlineMaxChars: 1000,
@@ -1250,8 +1265,8 @@ describe('save_recent_image provenance (issue #104)', () => {
     try {
       const stored = await waitForToolResult(h.framework, 'call_frames');
       // The live copy showed every frame's stub whole, and the snapshot,
-      // whatever the scan's length: 101 slots past the cut.
-      assert.match(stored.content, /\n\[101 image slot\(s\) fell past the cut\. The last 64 are kept here in order so save_recent_image still counts them; the 37 before them are left out, and it doesn't count them:\]\n/);
+      // whatever the scans' lengths: 101 slots in the elided middle.
+      assert.match(stored.content, /\n\[101 image slot\(s\) were in the elided middle\. The last 64 are kept here in order so save_recent_image still counts them; the 37 before them are left out, and it doesn't count them:\]\n/);
       assert.deepStrictEqual(
         parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : /frame-(\d+)\.png/.exec(s.text)?.[1])),
         [...Array.from({ length: 63 }, (_, n) => String(37 + n)), refOf(h, 1)],
@@ -1284,18 +1299,15 @@ describe('save_recent_image provenance (issue #104)', () => {
     });
     try {
       const snap = saved(await waitForToolResult(h.framework, 'call_save_snap'));
-      // The caption's cap falls inside its quoted reference line, after the
-      // placeholder the line quotes. The live copy's cut moves back to the
-      // line's start, so the resident saw the picture and the caption up to
-      // that line, and no part of it.
+      // The caption's head share falls inside its quoted reference line,
+      // after the placeholder the line quotes. The live copy's cut moves back
+      // to the line's start, so the resident saw the picture, the caption up
+      // to that line and its tail, and no part of the line.
       const [round] = h.membrane.lastStream!.receivedToolResults as Array<Array<{ toolUseId: string; content: unknown }>>;
       const live = round!.find((r) => r.toolUseId === 'call_quoting')!.content as Array<{ type: string; text?: string }>;
       assert.deepStrictEqual(live.map((b) => b.type), ['image', 'text']);
       const caption = live[1]!.text!;
-      assert.ok(
-        caption.startsWith(`${'y'.repeat(950)}\n\n\n[truncated — original was ${QUOTING_CAPTION.length} chars`),
-        caption.slice(940, 1010),
-      );
+      assert.match(caption, /^y{550}\n\n\n\[truncated — chars \d+ to \d+ of \d+ elided here[^\n]*\]\ny{400}$/, caption.slice(540, 640));
       assert.doesNotMatch(caption, /\[ref_|\[image:/);
       // The stored copy counts what the live copy showed: index 0 is the
       // picture, and index 1 the older GIF.
@@ -1312,7 +1324,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it('at an inline cap shorter than a reference stub, the stub the live copy showed whole is kept past the cut', async () => {
+  it('at an inline cap shorter than a reference stub, the stub the live copy showed whole is kept from the elided middle', async () => {
     const h = await startTurn({
       prefix: 'sri-small-cap-',
       inlineCap: 100,
@@ -1331,7 +1343,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const slots = parseImagePlaceholders(stored.content);
       assert.deepStrictEqual(slots.map((s) => s.kind), ['inline', 'reference'], stored.content);
       assert.ok(slots[1]!.text.length > 100, 'the stub is longer than the cap');
-      assert.match(stored.content, /\n\[1 image slot\(s\) fell past the cut; kept here in order so save_recent_image still counts them:\]\n\[ref_/);
+      assert.match(stored.content, /\n\[1 image slot\(s\) were in the elided middle; kept here in order so save_recent_image still counts them:\]\n\[ref_/);
       // Index 0 is the reference, index 1 the picture, index 2 the older GIF.
       // (Receipts are cut at this cap too, so the files say what was saved.)
       await waitForToolResult(h.framework, 'call_save_png');
@@ -1344,7 +1356,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it("past its cut, a result carrying an image keeps a later block's slot its live copy showed, and none it cut away", async () => {
+  it("from its elided middle, a result carrying an image keeps a later block's slot its live copy showed, and none it cut away", async () => {
     const h = await startTurn({
       prefix: 'sri-captioned-cut-',
       toolResultInlineMaxChars: 1000,
@@ -1359,7 +1371,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const stored = await waitForToolResult(h.framework, 'call_captioned');
       // The stored text is cut in the scan. The live copy cut each text block
       // at the cap on its own: it showed the snapshot and the caption's first
-      // attachment line, and cut the caption before its second.
+      // attachment line, and elided the caption's second.
       assert.deepStrictEqual(
         parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)),
         [refOf(h, 1), attachmentLine(0)],
@@ -1393,10 +1405,10 @@ describe('save_recent_image provenance (issue #104)', () => {
     });
     try {
       const stored = await waitForToolResult(h.framework, 'call_captioned');
-      // The cap is the bound, so the head moves back until the notice and the
-      // kept slots fit after it: a reader's cut at the bound loses none.
+      // The cap is the bound, so head and tail shrink until the notice and the
+      // kept slots fit beside them: a reader's cut at the bound loses none.
       assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
-      assert.match(stored.content, /\n\n\[truncated — showing \d+ of \d+ chars; full content: workspace file [^\]]+\]\n\[2 image slot\(s\) fell past the cut; /);
+      assert.match(stored.content, /\n\n\[truncated — chars \d+ to \d+ of \d+ elided here; full content: workspace file [^\]]+\]\n\[2 image slot\(s\) were in the elided middle; /);
       assert.deepStrictEqual(
         parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)),
         [refOf(h, 1), attachmentLine(0)],
@@ -1415,7 +1427,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it('a result whose array the converters give up on keeps nothing past its cut: its live copy is its stored text', async () => {
+  it('a result whose array the converters give up on keeps nothing from its elided middle: its live copy is its stored text', async () => {
     const h = await startTurn({
       prefix: 'sri-mystery-cut-',
       toolResultInlineMaxChars: 1000,
@@ -1431,9 +1443,10 @@ describe('save_recent_image provenance (issue #104)', () => {
     try {
       const stored = await waitForToolResult(h.framework, 'call_mystery');
       // Stored, and shown, as its JSON cut at the cap: the placeholder its
-      // text quotes past the cap was never shown, before the commit or after.
+      // text quotes in the elided middle was never shown, before the commit
+      // or after.
       assert.match(stored.content, /^\[\{"type":"image","data":"/);
-      assert.doesNotMatch(stored.content, /fell past the cut/);
+      assert.doesNotMatch(stored.content, /image slot\(s\)/);
       assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
       for (const id of ['call_save_batch', 'call_save_after']) {
         const receipt = saved(await waitForToolResult(h.framework, id));
@@ -1452,7 +1465,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     const names = Object.keys(SPLIT_TEXTS) as Array<keyof typeof SPLIT_TEXTS>;
     const h = await startTurn({
       prefix: 'sri-split-cut-',
-      toolResultInlineMaxChars: 1000,
+      toolResultInlineMaxChars: 1200,
       responses: [
         ...names.map((name) => [call(`call_${name}`, name), saveCall(`call_save_${name}`, { path: `files/${name}.gif`, index: 0 })]),
         [saveCall('call_save_after', { path: 'files/after.gif', index: 0 })],
@@ -1460,16 +1473,16 @@ describe('save_recent_image provenance (issue #104)', () => {
       ],
     });
     try {
-      // A cut inside the attachment line, or 499 characters into the quoted
-      // line, moves back to the line's start. 1000 characters into the quoted
-      // line, the part before the cut can't be a slot, and the cut stays.
-      const heads: Record<keyof typeof SPLIT_TEXTS, number> = { split_stub: 901, split_quoted: 501, giant_line: 1000 };
+      // A head cut inside the attachment line, or 499 characters into the
+      // quoted line, moves back to the line's start. 720 characters into the
+      // quoted line, the part before the cut can't be a slot, and it stays.
+      const heads: Record<keyof typeof SPLIT_TEXTS, number> = { split_stub: 620, split_quoted: 221, giant_line: 720 };
       for (const name of names) {
         const stored = await waitForToolResult(h.framework, `call_${name}`);
         const text = SPLIT_TEXTS[name];
         assert.strictEqual(stored.content.slice(0, heads[name]), text.slice(0, heads[name]), name);
         assert.ok(
-          stored.content.slice(heads[name]).startsWith(`\n\n[truncated — showing ${heads[name]} of ${text.length} chars; `),
+          stored.content.slice(heads[name]).startsWith(`\n\n[truncated — chars ${heads[name]} to `),
           `${name}: ${stored.content.slice(heads[name], heads[name] + 80)}`,
         );
         assert.deepStrictEqual(parseImagePlaceholders(stored.content), [], name);
@@ -1496,12 +1509,12 @@ describe('save_recent_image provenance (issue #104)', () => {
     });
     try {
       // Each block is within the cap, so the live copy showed the snapshot and
-      // every line. Cut at the cap, the stored copy would pass the bound; the
-      // head moves back past the snapshot and the listing, and each of their
-      // slots is kept after the notice, the copy still within the bound.
+      // every line. Cut at the cap, the stored copy would pass the bound; head
+      // and tail shrink, and each slot they leave out is kept after the
+      // notice, the copy still within the bound.
       const stored = await waitForToolResult(h.framework, 'call_listed');
       assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
-      assert.match(stored.content, /^x+\n\n\[truncated — showing \d+ of \d+ chars; full content: workspace file [^\]]+\]\n\[13 image slot\(s\) fell past the cut; /);
+      assert.match(stored.content, /^x+\n\n\[truncated — chars \d+ to \d+ of \d+ elided here; full content: workspace file [^\]]+\]\n\[\d+ image slot\(s\) were in the elided middle; /);
       assert.deepStrictEqual(
         parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)),
         [refOf(h, 1), ...Array.from({ length: 12 }, (_, i) => attachmentLine(2 * i))],
@@ -1520,13 +1533,15 @@ describe('save_recent_image provenance (issue #104)', () => {
       responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
     });
     try {
-      // The cap of 3000 is under the bound less the notice's room (3360), but
-      // the 13 kept slots take more than the 360 between them, so the head
-      // moves back below the cap, as it would under any higher cap.
+      // The cap of 3000 is under the bound less the notice's room (3280), but
+      // the kept slots take more than the 280 between them, so head and tail
+      // shrink below the cap, as they would under any higher cap.
       const stored = await waitForToolResult(h.framework, 'call_listed');
-      const head = /^x*/.exec(stored.content)![0];
-      assert.ok(head.length < 3000, `the head is ${head.length} characters`);
-      assert.match(stored.content, /\[13 image slot\(s\) fell past the cut; /);
+      const at = /chars (\d+) to (\d+) of (\d+) elided here/.exec(stored.content);
+      assert.ok(at, stored.content.slice(0, 300));
+      const kept = Number(at[1]) + Number(at[3]) - Number(at[2]);
+      assert.ok(kept < 3000, `head and tail keep ${kept} characters`);
+      assert.match(stored.content, /\[\d+ image slot\(s\) were in the elided middle; /);
       assert.doesNotMatch(stored.content, /raise the inline cap/);
     } finally {
       await h.framework.stop();
@@ -1542,7 +1557,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
     });
     try {
-      // The 13 slots the live copy showed take more than the 860 characters
+      // The 13 slots the live copy showed take more than the 780 characters
       // the bound leaves beside the notice, so the head is empty and the
       // oldest slots are left out until the rest fit.
       const stored = await waitForToolResult(h.framework, 'call_listed');
@@ -1551,7 +1566,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const kept = parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text));
       assert.ok(kept.length > 0 && kept.length < all.length, `${kept.length} slots kept`);
       assert.deepStrictEqual(kept, all.slice(-kept.length), 'the newest slots, in order');
-      assert.ok(stored.content.includes(`[13 image slot(s) fell past the cut. The last ${kept.length} are kept here in order so save_recent_image still counts them; the ${13 - kept.length} before them are left out, and it doesn't count them:]`), stored.content.slice(-400));
+      assert.ok(stored.content.includes(`[13 image slot(s) were in the elided middle. The last ${kept.length} are kept here in order so save_recent_image still counts them; the ${13 - kept.length} before them are left out, and it doesn't count them:]`), stored.content.slice(-400));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
@@ -1573,9 +1588,9 @@ describe('save_recent_image provenance (issue #104)', () => {
       ],
     });
     try {
-      // The cap would keep the attachment line, at 501; the bound moves the
-      // head back before it, alone or beside the save, and a text result
-      // keeps nothing past its cut.
+      // The cap would keep the attachment line, at 301, in its head; the
+      // bound shrinks the head before it, alone or beside the save, and a
+      // text result keeps nothing from its elided middle.
       const stored = await waitForToolResult(h.framework, 'call_mid');
       assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
       assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
@@ -1606,9 +1621,9 @@ describe('save_recent_image provenance (issue #104)', () => {
       ],
     });
     try {
-      // Alone, the result keeps the attachment line, at 501, in a head cut at
+      // Alone, the result keeps the attachment line, at 301, in a head cut at
       // the cap, and the round would fit. Beside the save its share is 1000,
-      // whose fit leaves a head of 360, before the line. The two ways differ,
+      // whose fit leaves a head of 167, before the line. The two ways differ,
       // so the save counts by the share and marks the round, which is then
       // stored by it: the stored copy holds no slot, and index 0 is the GIF.
       const stored = await waitForToolResult(h.framework, 'call_mid');
@@ -1672,7 +1687,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       // round, which is then stored by it.
       const stored = await waitForToolResult(h.framework, 'call_captioned');
       assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
-      assert.match(stored.content, /\n\[2 image slot\(s\) fell past the cut and are left out, and save_recent_image doesn't count them\.\]$/);
+      assert.match(stored.content, /\n\[2 image slot\(s\) in the elided middle are left out, and save_recent_image doesn't count them\.\]$/);
       // So the save, counted before the commit, takes index 0 as the older
       // GIF, not a slot the stored copy doesn't hold.
       const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
@@ -1882,13 +1897,13 @@ describe('save_recent_image provenance (issue #104)', () => {
       prefix: 'sri-same-batch-cut-',
       toolResultInlineMaxChars: 1000,
       responses: [
-        // A text result: none of its image-typed lines past the cut counts.
+        // A text result: none of its image-typed lines in its elided middle counts.
         [listingCall('call_listing', 'listing'), saveCall('call_save_text', { path: 'files/text.gif', index: 0 })],
-        // A result carrying an image: of the slots past its cut, only the
-        // snapshot's counts, the one its live copy showed.
+        // A result carrying an image: of its slots, only the snapshot's
+        // counts, the one its live copy showed, in its tail.
         [listingCall('call_snap_listing', 'snap_listing'), saveCall('call_save_image', { path: 'files/image.gif', index: 1 })],
-        // One whose live copy showed 101 slots past its cut: the newest 64
-        // count, then the snapshot above.
+        // One whose live copy showed 101 slots in its elided middle: the
+        // newest 64 count, then the snapshot above.
         [
           listingCall('call_frames', 'snap_frames'),
           saveCall('call_save_frames', { path: 'files/frames.gif', index: MAX_KEPT_IMAGE_SLOTS + 1 }),
@@ -2486,63 +2501,80 @@ describe('ToolImageLedger', () => {
     assert.strictEqual(reported.length, 1);
   });
 
-  it('a cut never splits a slot, and keeps past it only the image slots its live copy showed', () => {
+  it('a cut never splits a slot, and keeps from its elided middle only the image slots its live copy showed', () => {
     const png = '[image: image/png, ~12KB, ref img_abc123_1]';
     const stub = '[ref_1_ab3d] cam.png — image/jpeg, 1.2MB claimed — from tool result — fetch with fetch_reference';
     const gif = '[image: image/gif, 4B, ref img_abc123_2]';
-    const text = `head text\n${png}\nmiddle text that is long enough\n${stub}\ntail\n${gif}`;
+    const text = `head text\n${png}\nmiddle text that is long enough\n${stub}\ntail\n${gif}\n${'f'.repeat(400)}`;
     const all: ShownRanges = [[0, text.length]];
-    const notice = '\n\n[truncated — original was N chars]';
+    const notice = '\n\n[truncated — chars H to E of M elided here]';
     const slotsOf = (s: string): string[] => parseImagePlaceholders(s).map((p) => p.text);
-    // Cut exactly at the start of the middle text: png stays, stub + gif move.
+    const tailOf = (cap: number) => text.slice(text.length - (cap - Math.floor(cap * 0.6)));
+    // Head's share exactly at the start of the middle text: png stays, stub + gif move.
     const cut1 = text.indexOf('middle');
-    assert.deepStrictEqual(cutStoredToolResult(text, cut1, all), { head: text.slice(0, cut1), kept: [stub, gif], fell: 2 });
-    // Cut inside the stub line, in its id or past its type: the cut moves back
-    // to the line's start.
+    const cap1 = capForHead(cut1);
+    assert.deepStrictEqual(cutStoredToolResult(text, cap1, all), { head: text.slice(0, cut1), tail: tailOf(cap1), kept: [stub, gif], fell: 2 });
+    // Head's share inside the stub line, in its id or past its type: the cut
+    // moves back to the line's start.
     for (const inside of ['_ab3d', '1.2MB']) {
+      const cap = capForHead(text.indexOf(inside));
       assert.deepStrictEqual(
-        cutStoredToolResult(text, text.indexOf(inside), all),
-        { head: text.slice(0, text.indexOf(stub)), kept: [stub, gif], fell: 2 },
+        cutStoredToolResult(text, cap, all),
+        { head: text.slice(0, text.indexOf(stub)), tail: tailOf(cap), kept: [stub, gif], fell: 2 },
         inside,
       );
     }
-    // Cut inside the png placeholder: the cut moves back to its start.
-    assert.deepStrictEqual(cutStoredToolResult(text, text.indexOf('~12KB'), all), { head: 'head text\n', kept: [png, stub, gif], fell: 3 });
-    // Wherever the cut falls, the head holds whole slots only, and with the
-    // kept ones they are exactly the text's, in order. A live copy that was
-    // this text has the same head, and nothing past it.
-    for (let cut = 1; cut < text.length; cut++) {
-      const cutShown = cutStoredToolResult(text, cut, all);
-      const whole = parseImagePlaceholders(text).filter((p) => p.offset + p.text.length <= cutShown.head.length);
-      assert.deepStrictEqual(slotsOf(cutShown.head + notice), whole.map((p) => p.text), `head at ${cut}`);
-      assert.deepStrictEqual(slotsOf(cutShown.head + notice + formatKeptImageSlots(cutShown)), slotsOf(text), `cut at ${cut}`);
-      assert.deepStrictEqual(cutStoredToolResult(text, cut, null), { head: cutShown.head, kept: [], fell: 0 }, `as text at ${cut}`);
+    // Head's share inside the png placeholder: the cut moves back to its start.
+    const capPng = capForHead(text.indexOf('~12KB'));
+    assert.deepStrictEqual(cutStoredToolResult(text, capPng, all), { head: 'head text\n', tail: tailOf(capPng), kept: [png, stub, gif], fell: 3 });
+    // At every cap, of the text and of the text without its filler, neither
+    // end falls inside a slot, the head holds whole slots only, and with the
+    // kept ones and the tail's they are exactly the text's, in order. A live
+    // copy that was this text has the same head and tail, and nothing kept
+    // between.
+    for (const source of [text, text.slice(0, text.lastIndexOf('\n'))]) {
+      for (let cap = 1; cap < source.length; cap++) {
+        const cutShown = cutStoredToolResult(source, cap, [[0, source.length]]);
+        const tailStart = source.length - cutShown.tail.length;
+        for (const p of parseImagePlaceholders(source)) {
+          const end = p.offset + p.text.length;
+          assert.ok(!(p.offset < cutShown.head.length && cutShown.head.length < end) && !(p.offset < tailStart && tailStart < end),
+            `neither end inside ${p.text} at ${cap}`);
+        }
+        const whole = parseImagePlaceholders(source).filter((p) => p.offset + p.text.length <= cutShown.head.length);
+        assert.deepStrictEqual(slotsOf(cutShown.head + notice), whole.map((p) => p.text), `head at ${cap}`);
+        assert.deepStrictEqual(slotsOf(storedCutText(cutShown, notice)), slotsOf(source), `cut at ${cap}`);
+        assert.deepStrictEqual(cutStoredToolResult(source, cap, null), { ...cutShown, kept: [], fell: 0 }, `as text at ${cap}`);
+      }
     }
     // Only a slot lying wholly within what the live copy showed is kept: a
     // range ending before the gif, and one ending inside the stub.
-    assert.deepStrictEqual(cutStoredToolResult(text, cut1, [[0, text.indexOf('\ntail')]]), { head: text.slice(0, cut1), kept: [stub], fell: 1 });
+    assert.deepStrictEqual(cutStoredToolResult(text, cap1, [[0, text.indexOf('\ntail')]]), { head: text.slice(0, cut1), tail: tailOf(cap1), kept: [stub], fell: 1 });
     assert.deepStrictEqual(
-      cutStoredToolResult(text, cut1, [[0, text.indexOf('1.2MB')], [text.indexOf(gif), text.length]]),
-      { head: text.slice(0, cut1), kept: [gif], fell: 1 },
+      cutStoredToolResult(text, cap1, [[0, text.indexOf('1.2MB')], [text.indexOf(gif), text.length]]),
+      { head: text.slice(0, cut1), tail: tailOf(cap1), kept: [gif], fell: 1 },
     );
     // A slot wholly between two ranges, before one inside the second: the
     // walk passes the gap without passing the range after it.
     assert.deepStrictEqual(
-      cutStoredToolResult(text, cut1, [[0, text.indexOf(stub)], [text.indexOf('tail'), text.length]]),
-      { head: text.slice(0, cut1), kept: [gif], fell: 1 },
+      cutStoredToolResult(text, cap1, [[0, text.indexOf(stub)], [text.indexOf('tail'), text.length]]),
+      { head: text.slice(0, cut1), tail: tailOf(cap1), kept: [gif], fell: 1 },
     );
     // Ranges that touch, with a slot starting where the first ends: the
     // second holds it.
     assert.deepStrictEqual(
-      cutStoredToolResult(text, cut1, [[0, text.indexOf(gif)], [text.indexOf(gif), text.length]]),
-      { head: text.slice(0, cut1), kept: [stub, gif], fell: 2 },
+      cutStoredToolResult(text, cap1, [[0, text.indexOf(gif)], [text.indexOf(gif), text.length]]),
+      { head: text.slice(0, cut1), tail: tailOf(cap1), kept: [stub, gif], fell: 2 },
     );
     // Every reader of the generic history truncation reads it as text: it
-    // cuts as the stored copy cuts, and keeps nothing past the cut.
-    assert.strictEqual(truncateForHistory(text, cut1), `${text.slice(0, cut1)}\n\n[truncated — original was ${text.length} chars]`);
+    // cuts as the stored copy cuts, and keeps nothing from the middle.
+    const elidedTo = (cap: number) => text.length - tailOf(cap).length;
+    assert.strictEqual(truncateForHistory(text, cap1),
+      `${text.slice(0, cut1)}\n\n[truncated — chars ${cut1} to ${elidedTo(cap1)} of ${text.length} elided here]\n${tailOf(cap1)}`);
+    const capType = capForHead(text.indexOf('1.2MB'));
     assert.strictEqual(
-      truncateForHistory(text, text.indexOf('1.2MB')),
-      `${text.slice(0, text.indexOf(stub))}\n\n[truncated — original was ${text.length} chars]`,
+      truncateForHistory(text, capType),
+      `${text.slice(0, text.indexOf(stub))}\n\n[truncated — chars ${text.indexOf(stub)} to ${elidedTo(capType)} of ${text.length} elided here]\n${tailOf(capType)}`,
     );
   });
 
@@ -2551,36 +2583,38 @@ describe('ToolImageLedger', () => {
     const start = text.indexOf(QUOTED_LINE);
     assert.deepStrictEqual(parseImagePlaceholders(text), [], 'the quoted line is no slot whole');
     for (const before of [1, 20, REFERENCE_STUB_MAX_CHARS]) {
-      assert.strictEqual(cutStoredToolResult(text, start + before, null).head, 'intro\n', `${before} before the cut`);
+      assert.strictEqual(cutStoredToolResult(text, capForHead(start + before), null).head, 'intro\n', `${before} before the cut`);
     }
     // A character more, and that part is too long to parse as a slot: the cut
     // stays where it fell.
-    const giant = cutStoredToolResult(text, start + REFERENCE_STUB_MAX_CHARS + 1, null);
+    const giant = cutStoredToolResult(text, capForHead(start + REFERENCE_STUB_MAX_CHARS + 1), null);
     assert.strictEqual(giant.head, text.slice(0, start + REFERENCE_STUB_MAX_CHARS + 1));
     assert.deepStrictEqual(parseImagePlaceholders(`${giant.head}\n\n[truncated]`), []);
     // A line begins where the parser begins one, after a carriage return too.
-    const cr = `intro\nnote\r[ref_9_ab3d] cam.png — image/png, 1KB claimed — from tool result — fetch with fetch_reference\nafter`;
+    const cr = `intro\nnote${'.'.repeat(100)}\r[ref_9_ab3d] cam.png — image/png, 1KB claimed — from tool result — fetch with fetch_reference\nafter${'.'.repeat(300)}`;
     assert.strictEqual(parseImagePlaceholders(cr).length, 1);
-    assert.strictEqual(cutStoredToolResult(cr, cr.indexOf('1KB'), null).head, cr.slice(0, cr.indexOf('[ref_9')));
+    assert.strictEqual(cutStoredToolResult(cr, capForHead(cr.indexOf('1KB')), null).head, cr.slice(0, cr.indexOf('[ref_9')));
   });
 
   it('a cut never splits a surrogate pair, and moves back from where it can fall', () => {
     const astral = '\u{1F600}'; // two UTF-16 code units
     // In plain text, a cap between the pair's two units cuts before the pair.
-    const plain = `${'a'.repeat(9)}${astral}after`;
-    assert.strictEqual(cutStoredToolResult(plain, 10, null).head, 'a'.repeat(9));
-    assert.strictEqual(truncateForHistory(plain, 10), `${'a'.repeat(9)}\n\n[truncated — original was ${plain.length} chars]`);
+    const plain = `${'a'.repeat(9)}${astral}${'after'.repeat(4)}`;
+    const cap = capForHead(10);
+    const tailStart = plain.length - (cap - 10);
+    assert.strictEqual(cutStoredToolResult(plain, cap, null).head, 'a'.repeat(9));
+    assert.strictEqual(truncateForHistory(plain, cap), `${'a'.repeat(9)}\n\n[truncated — chars 9 to ${tailStart} of ${plain.length} elided here]\n${plain.slice(tailStart)}`);
     // A quoted stub-shaped line, too long to be a slot, whose pair sits at
     // its REFERENCE_STUB_MAX_CHARS-th unit: a cap between the pair's units
     // cuts before it, with REFERENCE_STUB_MAX_CHARS of the line before the
     // cut, a part that could read as a slot, so the cut moves back to the
     // line's start.
     const prefix = '[ref_9_ab3d] quoted — image/png ';
-    const line = `${prefix}${'z'.repeat(REFERENCE_STUB_MAX_CHARS - prefix.length)}${astral}${'z'.repeat(100)}`;
+    const line = `${prefix}${'z'.repeat(REFERENCE_STUB_MAX_CHARS - prefix.length)}${astral}${'z'.repeat(800)}`;
     const text = `intro\n${line}\nafter`;
     const start = text.indexOf(line);
     assert.deepStrictEqual(parseImagePlaceholders(text), [], 'the quoted line is no slot whole');
-    const cut = cutStoredToolResult(text, start + REFERENCE_STUB_MAX_CHARS + 1, null);
+    const cut = cutStoredToolResult(text, capForHead(start + REFERENCE_STUB_MAX_CHARS + 1), null);
     assert.strictEqual(cut.head, 'intro\n');
     assert.deepStrictEqual(parseImagePlaceholders(`${cut.head}\n\n[truncated]`), []);
   });

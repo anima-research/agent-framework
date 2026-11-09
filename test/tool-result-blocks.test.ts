@@ -151,11 +151,12 @@ describe("a protocol result's content (dataIsContent)", () => {
     assert.deepEqual((live as Array<{ type: string; text?: string }>).map((b) => b.text ?? b.type), stored.split('\n').map((line, i) => (i === 0 ? 'image' : line)));
   });
 
-  it('cuts a text block at the cap in the live copy, and shows each marker whole', () => {
+  it('cuts a text block at the cap to its head and tail in the live copy, and shows each marker whole', () => {
     const long = { type: 'text', text: 'z'.repeat(500) };
     const { live } = copies({ success: true, data: [IMAGE, long, AUDIO], dataIsContent: true }, 100);
     const [, text, marker] = live as Array<{ type: string; text: string }>;
-    assert.match(text.text, /^z{100}\n\n\[truncated — original was 500 chars\]$/);
+    const start = '[image: image/png, 9B]\n'.length;
+    assert.match(text.text, new RegExp(`^z{60}\\n\\n\\[truncated — chars ${start + 60} to ${start + 460} of \\d+ elided here\\]\\nz{40}$`));
     assert.equal(marker.text, AUDIO_TEXT);
   });
 
@@ -168,7 +169,7 @@ describe("a protocol result's content (dataIsContent)", () => {
     const { stored, live } = copies({ success: true, data: [IMAGE, TEXT, ...links], dataIsContent: true }, 2000);
     assert.equal(live, stored);
     assert.match(stored, /^\[image: image\/png, 9B\]\nzz-text\n\[resource link "0\.csv": /);
-    assert.match(stored, /\[truncated — original was \d+ chars\]$/);
+    assert.match(stored, /\n\n\[truncated — chars \d+ to \d+ of \d+ elided here\]\n[^\n]*5\.csv[^\n]*$/);
     assert.ok(stored.length < 2100, String(stored.length));
     // Within the cap, they go beside the image as before.
     const few = copies({ success: true, data: [IMAGE, TEXT, links[0]], dataIsContent: true }, 2000).live;
@@ -179,7 +180,8 @@ describe("a protocol result's content (dataIsContent)", () => {
     const { stored, live } = copies({ success: true, data: [IMAGE, ...Array.from({ length: 30 }, () => AUDIO)], dataIsContent: true }, 1000);
     assert.ok(AUDIO_TEXT.length * 30 > 1000);
     assert.equal(live, stored);
-    assert.match(stored, /\[truncated — original was \d+ chars\]$/);
+    assert.match(stored, /\n\n\[truncated — chars \d+ to \d+ of \d+ elided here\]\n/);
+    assert.ok(stored.endsWith(AUDIO_TEXT), stored.slice(-200));
     const few = copies({ success: true, data: [IMAGE, AUDIO, AUDIO], dataIsContent: true }, 1000).live as Array<{ type: string; text?: string }>;
     assert.deepEqual(few.map((b) => b.text ?? b.type), ['image', AUDIO_TEXT, AUDIO_TEXT]);
   });
@@ -967,7 +969,7 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     const long = embedded({ mimeType: 'text/plain', text: 'z'.repeat(500) });
     const cut = copies({ success: true, data: [IMAGE, long], dataIsContent: true }, 100).live as Array<{ type: string; text?: string }>;
     assert.equal(cut[0]!.type, 'image');
-    assert.match(cut[1]!.text!, /^z{100}\n\n\[truncated — original was 500 chars\]$/);
+    assert.match(cut[1]!.text!, /^z{60}\n\n\[truncated — chars \d+ to \d+ of \d+ elided here\]\nz{40}$/);
   });
 
   it("counts as shown in a render result's block check where its contents are, and not where they aren't", () => {
@@ -1095,16 +1097,17 @@ describe('dataIsContent travels with the result', () => {
     assert.equal(reads, 1);
   });
 
-  it("through a model's round, an image past the stored copy's cut keeps no slot there when the live copy is the stored text", async () => {
-    // With the links before the image passing the cap, the model reads the
-    // stored text, cut before the image's placeholder: no slot of it is kept
-    // past the cut, since the model never saw it.
+  it("through a model's round, an image in the stored copy's elided middle keeps no slot there when the live copy is the stored text", async () => {
+    // With the links around the image passing the cap, the model reads the
+    // stored text, whose middle holds the image's placeholder: no slot of it
+    // is kept, since the model never saw it.
     const links = Array.from({ length: 30 }, (_, i) =>
       ({ type: 'resource_link', uri: `https://zz-files.example/${'p'.repeat(1000)}/${i}.csv`, name: `${i}.csv` }));
-    const { wire, stored } = await answerModelCall({ success: true, data: [TEXT, ...links, IMAGE], dataIsContent: true });
+    const { wire, stored } = await answerModelCall({ success: true, data: [TEXT, ...links.slice(0, 15), IMAGE, ...links.slice(15)], dataIsContent: true });
     assert.equal(wire, stored);
     const [text] = JSON.parse(stored) as string[];
-    assert.ok(!text!.includes('fell past the cut'), text!.slice(-400));
+    assert.match(text!, /29\.csv[^\n]*$/, 'the tail is kept');
+    assert.ok(!text!.includes('image slot(s)'), text!.slice(-400));
     assert.ok(!/\[image: image\/png/.test(text!), text!.slice(-400));
   });
 
@@ -1621,7 +1624,7 @@ describe('one answer for every block of a result', () => {
     // What the stored pass decided, whatever the registry says now.
     const live = fw.toMembraneToolResult('zz', result, 1000, {
       text: 'zz-stored', filePath: null,
-      live: [{ kind: 'image', data: PNG, mimeType: 'image/png' }, { kind: 'link', text: 'zz-as-the-stored-pass-wrote-it' }],
+      live: { blocks: [{ kind: 'image', data: PNG, mimeType: 'image/png' }, { kind: 'link', text: 'zz-as-the-stored-pass-wrote-it' }], spans: [] },
     }).content as Array<{ type: string; text?: string }>;
     assert.deepEqual(live.map((b) => b.text ?? b.type), ['image', 'zz-as-the-stored-pass-wrote-it']);
     // And where it decided the stored text, that's the live copy.
@@ -1948,9 +1951,9 @@ describe('one answer for every block of a result', () => {
     const withImage = { id: 'zz-share-image', name: 'zz_tool', input: {}, result: { success: true, data: [IMAGE, { type: 'text', text: 'i'.repeat(400) }], dataIsContent: true } };
     const plain = { id: 'zz-share-text', name: 'zz_tool', input: {}, result: { success: true, data: 't'.repeat(400) } };
     const { spilled } = await fw.buildStoredToolResultContent('zz-agent', [withImage, plain], 24_000, 600);
-    const stored = spilled.get(withImage.id) as { text: string; live: Array<{ kind: string }> | null };
+    const stored = spilled.get(withImage.id) as { text: string; live: { blocks: Array<{ kind: string }> } | null };
     assert.ok(stored.text.length < 500, `stored by its share: ${stored.text.length}`);
-    assert.deepEqual(stored.live?.map((block) => block.kind), ['image', 'text']);
+    assert.deepEqual(stored.live?.blocks.map((block) => block.kind), ['image', 'text']);
   });
 
   it("goes natively from the stored pass with links and markers exactly at the cap, and as its stored text one past it", async () => {

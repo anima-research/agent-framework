@@ -50,6 +50,7 @@ class CannedToolModule implements Module {
 
 /** 6,000 characters in 60 lines, so a cut shows where it fell. */
 const PAYLOAD = Array.from({ length: 60 }, (_, i) => `line ${String(i).padStart(2, '0')} ${'x'.repeat(91)}`).join('\n');
+const LAST_LINE = PAYLOAD.slice(PAYLOAD.lastIndexOf('\n') + 1);
 
 type Content = Array<{ type: string; content?: unknown }>;
 const toolResultTexts = (messages: unknown): string[] => {
@@ -161,7 +162,12 @@ test("a resident's own bound clamps its cap, and the stored copy, notice include
     assert.equal(cap.tool_result_inline_max_chars_effective, 4000);
     assert.equal(cap.tool_result_inline_max_chars_clamped_by, 'strategy-bound');
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
-    assert.match(stored, new RegExp(`^"?line 00 [^]*\\n\\n\\[truncated — showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars; full content: workspace file files/tool-results/`));
+    assert.match(stored, /^"?line 00 [^]*\n\n\[truncated — chars \d+ to \d+ of \d+ elided here; full content: workspace file files\/tool-results\//);
+    const at = /chars (\d+) to (\d+) of (\d+) elided here/.exec(stored)!;
+    const kept = Number(at[1]) + Number(at[3]) - Number(at[2]);
+    const room = 4000 - TOOL_RESULT_NOTICE_ROOM - 1;
+    assert.ok(kept <= room && kept > room - 2 * LAST_LINE.length - 2, `it keeps ${kept} of the ${room} beside the notice, each end at a line break`);
+    assert.ok(stored.endsWith(LAST_LINE), stored.slice(-200));
     // The bound holds the cap down, so raising it can't show more.
     assert.doesNotMatch(stored, /raise the inline cap/);
     assert.equal(await shownTo('solo'), stored, 'the resident is shown the stored copy whole, its notice included');
@@ -213,19 +219,20 @@ test("a turn's results that fit one message's bound together are each stored as 
 test('without a writable workspace, the stored copy fits the smallest reader\'s bound, its notice saying nothing kept the rest', async () => {
   await withResidents({ agents: [{ name: 'scout', maxMessageTokens: 10_000 }, { name: 'ward', maxMessageTokens: 1000 }] }, async ({ stored, shownTo }) => {
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
-    assert.match(stored, /\n\n\[truncated — original was \d+ chars; no writable workspace mount without an include, full content not retained\]$/);
+    assert.match(stored, /\n\n\[truncated — chars \d+ to \d+ of \d+ elided here; no writable workspace mount without an include, the middle was not retained\]\n/);
+    assert.ok(stored.endsWith(LAST_LINE), stored.slice(-200));
     // scout's own round, shown to scout alone (#291; once ward was shown it).
     assert.equal(await shownTo('scout'), stored);
   });
 });
 
-test('a cap that leaves the notice its room under the bound keeps its head at the cap', async () => {
+test('a cap that leaves the notice its room under the bound keeps its head and tail at the cap', async () => {
   // A bound of 40000, above the 24000 default: nothing threatens the notice.
   const payload = 'y'.repeat(30_000);
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 10_000 }], mount: 'files', payload }, async ({ stored, shownTo }) => {
-    assert.equal(stored.indexOf('\n\n[truncated'), 24000, 'the head is the cap');
-    assert.match(stored, /Or raise the inline cap via agent_settings update tool_result_inline_max_chars\.\]$/);
-    assert.match(stored, /\n\n\[truncated — showing 24000 of \d+ chars; full content: workspace file files\/tool-results\//);
+    assert.equal(stored.indexOf('\n\n[truncated'), 14_400, 'the head is 60% of the cap');
+    assert.match(stored, /Or raise the inline cap via agent_settings update tool_result_inline_max_chars\.\]\ny{9600}$/, 'and the tail the rest');
+    assert.match(stored, /\n\n\[truncated — chars 14400 to 20400 of 30000 elided here; full content: workspace file files\/tool-results\//);
     assert.equal(await shownTo('solo'), stored);
   });
 });
@@ -278,7 +285,8 @@ test("a script's wake, spilled past the cap, fits the readers' bound with its no
     const stored = wake.content[0]!.text!;
     assert.ok(stored.length <= 4000, `the stored wake is ${stored.length} characters`);
     assert.ok(stored.startsWith('[script s1-test] Woke you with wake_agent()'), stored.slice(0, 80));
-    assert.match(stored, /\[truncated — showing \d+ of \d+ chars; full content: workspace file files\/tool-results\/\S+\. [^\]]*keeping limitChars\.\]$/);
+    assert.match(stored, /\[truncated — chars \d+ to \d+ of \d+ elided here; full content: workspace file files\/tool-results\/\S+\. [^\]]*until it is null or at least \d+\.\]\n/);
+    assert.ok(stored.endsWith('w"}'), stored.slice(-200));
     // The wake's own file, which no other result in the turn names.
     assert.ok(stored.includes('files/tool-results/script-wake-test.txt'), stored.slice(-300));
     const shown = JSON.stringify((await framework.previewActivation('solo')).messages);
@@ -296,17 +304,17 @@ test("the puppet's call stores its result within the readers' bound, notice incl
     assert.ok(block, "the puppet's result is stored");
     const stored = String(block.content);
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
-    assert.match(stored, /\[truncated — showing \d+ of \d+ chars; full content: workspace file files\/tool-results\/\S+\. /);
+    assert.match(stored, /\[truncated — chars \d+ to \d+ of \d+ elided here; full content: workspace file files\/tool-results\/\S+\. /);
   });
 });
 
 test("a cap the bound's fit already holds the head under gets no offer to raise it, since a higher cap would show no more", async () => {
-  // A bound of 4000 leaves a head of at most 4000 less the notice's room, so
-  // a cap of 3800 and one of 4000 keep the same head.
+  // A bound of 4000 leaves head and tail at most 4000 less the notice's room,
+  // so a cap of 3800 and one of 4000 keep the same.
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', inlineMaxChars: 3800 }, async ({ framework, stored }) => {
     assert.equal(capProvenance(framework, 'solo').tool_result_inline_max_chars_effective, 3800);
     assert.ok(stored.length <= 4000, `the stored copy is ${stored.length} characters`);
-    assert.match(stored, /\[truncated — showing \d+ of \d+ chars; full content: workspace file files\/tool-results\/\S+\. /);
+    assert.match(stored, /\[truncated — chars \d+ to \d+ of \d+ elided here; full content: workspace file files\/tool-results\/\S+\. /);
     assert.doesNotMatch(stored, /raise the inline cap/);
   });
 });
@@ -325,7 +333,7 @@ test("a result between the cap and the bound is offered a higher cap, which woul
   // The 3,900 characters are stored as they are: past the cap of 3,800, and
   // within the bound of 4,000.
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', inlineMaxChars: 3800, payload: 'y'.repeat(3900) }, async ({ stored }) => {
-    assert.match(stored, /\[truncated — showing \d+ of 3900 chars; full content: workspace file files\/tool-results\/\S+\. /);
+    assert.match(stored, /\[truncated — chars \d+ to \d+ of 3900 elided here; full content: workspace file files\/tool-results\/\S+\. /);
     assert.match(stored, /raise the inline cap/);
   });
 });
@@ -342,7 +350,7 @@ test("a turn that fits its bound with each result at its least keeps every notic
     assert.deepEqual(storedAll.slice(0, 15), payloads.slice(0, 15), 'each short result is stored whole');
     const total = storedAll.reduce((sum, text) => sum + text.length, 0);
     assert.ok(total <= 4000, `the turn's results are ${total} characters together`);
-    assert.match(storedAll[15]!, /^\n\n\[truncated — showing 0 of \d+ chars; full content: workspace file f\/tool-results\/\S+\.txt\. Page with workspace--read \{.*\}; use nextOffsetChars as offsetChars until null, keeping limitChars\.\]$/);
+    assert.match(storedAll[15]!, /^\n\n\[truncated — chars 0 to (\d+) of \1 elided here; full content: workspace file f\/tool-results\/\S+\.txt\. Read them with workspace--read \{.*\}, then again with nextOffsetChars as offsetChars and the same limitChars, until it is null or at least \1\.\]$/);
     // Under a share below the notice's room, the page is still sized to the cap.
     const page = /"path":("[^"]+"),"offsetChars":0,"limitChars":(\d+)\}/.exec(storedAll[15]!)!;
     assertPageForLaterRead(Number(page[2]), page[1]!, 250);
@@ -362,7 +370,7 @@ test('a result no longer than the notice that would replace it is stored whole, 
     assert.deepEqual(storedAll.slice(0, 10), payloads.slice(0, 10));
     assert.deepEqual(storedAll.slice(12, 19), payloads.slice(12, 19));
     for (const text of storedAll.slice(10, 12)) {
-      assert.match(text, /^\n\n\[truncated — showing 0 of 400 chars; full content: workspace file f\/tool-results\/\S+\.txt\. /);
+      assert.match(text, /^\n\n\[truncated — chars 0 to 400 of 400 elided here; full content: workspace file f\/tool-results\/\S+\.txt\. /);
       assert.ok(text.length < 400, `stored as its notice, ${text.length} characters`);
     }
     assert.deepEqual(writes.map((label) => label.replace(/^.*-call_/, 'call_')), ['call_fetch_20', 'call_fetch_11', 'call_fetch_12'],
@@ -373,15 +381,15 @@ test('a result no longer than the notice that would replace it is stored whole, 
 
 test('without a writable workspace, a result no longer than the notice saying nothing kept the rest is stored whole', async () => {
   // Forty results at 4,000, which the long one passes: a share of 100. A
-  // result of 110 characters is shorter than the notice that says nothing
-  // kept the rest, one of 113 is as long as it, and one of 130 is longer.
-  const payloads = [...Array.from({ length: 19 }, () => 'a'.repeat(110)), 'l'.repeat(113), 'j'.repeat(130), 'k'.repeat(130), ...Array.from({ length: 17 }, () => 'e'.repeat(5)), PAYLOAD];
+  // result of 123 characters is shorter than the notice that says nothing
+  // kept the rest, one of 126 is as long as it, and one of 143 is longer.
+  const payloads = [...Array.from({ length: 19 }, () => 'a'.repeat(123)), 'l'.repeat(126), 'j'.repeat(143), 'k'.repeat(143), ...Array.from({ length: 17 }, () => 'e'.repeat(5)), PAYLOAD];
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], payloads }, async ({ storedAll, shownAllTo }) => {
     assert.equal(storedAll.length, 40);
-    assert.equal(storedAll[20]!.length, 113, 'premise: the notice is as long as the 113-character result');
+    assert.equal(storedAll[20]!.length, 126, 'premise: the notice is as long as the 126-character result');
     assert.deepEqual(storedAll.slice(0, 20), payloads.slice(0, 20));
     for (const text of storedAll.slice(20, 22)) {
-      assert.equal(text, '\n\n[truncated — original was 130 chars; no writable workspace mount without an include, full content not retained]');
+      assert.equal(text, '\n\n[truncated — chars 0 to 143 of 143 elided here; no writable workspace mount without an include, the middle was not retained]');
     }
     assert.deepEqual(await shownAllTo('solo'), storedAll);
   });
@@ -392,7 +400,7 @@ test("a notice's paging advice is sized to the cap a later read of the file gets
   // the file later comes back alone in its own turn, under the cap of 4,000.
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', payloads: [PAYLOAD, PAYLOAD, PAYLOAD, PAYLOAD] }, async ({ storedAll }) => {
     for (const text of storedAll) {
-      const m = /Page with workspace--read (\{"path":("[^"]+"),"offsetChars":0,"limitChars":(\d+)\})/.exec(text);
+      const m = /workspace--read (\{"path":("[^"]+"),"offsetChars":\d+,"limitChars":(\d+)\})/.exec(text);
       assert.ok(m, text.slice(-300));
       assertPageForLaterRead(Number(m[3]), m[2]!, 1000);
     }
@@ -410,7 +418,7 @@ test('a result whose spill write fails, with a notice no shorter than the result
   const payloads = [...Array.from({ length: 10 }, () => 'g'.repeat(320)), ...Array.from({ length: 9 }, () => 'e'.repeat(5)), PAYLOAD];
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'f', payloads, beforeStart: failWrites }, async ({ storedAll }) => {
     assert.deepEqual(storedAll.slice(0, 19), payloads.slice(0, 19));
-    assert.match(storedAll[19]!, /FAILED \(e+\); content over the cap was not retained\]$/);
+    assert.match(storedAll[19]!, /FAILED \(e+\); the middle was not retained\]$/);
   });
 });
 
@@ -420,7 +428,7 @@ test('a result alone in its turn past a bound smaller than its notice is still s
   // keeps the rest. Keeping a result no longer than its notice whole is for a
   // share of a turn's bound, not a reader's own.
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 50 }], mount: 'f', payload: 'm'.repeat(250) }, async ({ stored, workspace }) => {
-    const notice = /^\n\n\[truncated — showing 0 of 250 chars; full content: workspace file (f\/tool-results\/\S+\.txt)\. /.exec(stored);
+    const notice = /^\n\n\[truncated — chars 0 to 250 of 250 elided here; full content: workspace file (f\/tool-results\/\S+\.txt)\. /.exec(stored);
     assert.ok(notice, stored);
     const file = await workspace!.readBinary(notice[1]!);
     assert.equal((file as { data: Buffer }).data.toString('utf8'), 'm'.repeat(250), 'the file it names holds the whole result');

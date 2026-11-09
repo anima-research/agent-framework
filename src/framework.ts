@@ -191,11 +191,12 @@ import {
   TOOL_IMAGE_REF_RE,
   ToolImageLedger,
   cutStoredToolResultToFit,
-  formatKeptImageSlots,
   parseImagePlaceholders,
   sha256Hex,
+  storedCutText,
   storedImageSlots,
-  toolResultCutAt,
+  elidedChars,
+  toolResultHeadTail,
   toolResultShare,
   type ParsedImagePlaceholder,
   type ShownRanges,
@@ -636,7 +637,12 @@ function extractChannelIdFromToolResult(
 interface StoredToolResult {
   text: string;
   filePath: string | null;
-  live: ToolResultBlock[] | null;
+  live: LiveBlocks | null;
+}
+
+interface LiveBlocks {
+  blocks: ToolResultBlock[];
+  spans: HistoryBlockSpan[];
 }
 
 /**
@@ -31577,9 +31583,10 @@ export class AgentFramework {
    * never hit the agent in the face with a huge blob, never silently destroy
    * it either. Content over the inline cap is materialized to a workspace
    * file (readable with the agent's own tools — deterministic name, kept
-   * until the workspace owner deletes it) and replaced by a truncated head +
-   * a trailing file reference. Falls back to EXPLICIT plain truncation when
-   * there is no read-write mount without an include. Cap resolution lives in
+   * until the workspace owner deletes it) and replaced by its head and tail,
+   * with a notice between them naming the elided chars and the file. Falls
+   * back to EXPLICIT plain truncation when there is no read-write mount
+   * without an include. Cap resolution lives in
    * resolveToolResultInlineCap; callers pass the resolved cap.
    */
   /**
@@ -31612,7 +31619,7 @@ export class AgentFramework {
     // stored under its share (toolResultShare). A result carrying an image
     // keeps its live copy cut at the cap; any other's live copy is its stored
     // text.
-    const alone = new Map<string, { text: string; shown: ShownRanges | null; live: ToolResultBlock[] | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
+    const alone = new Map<string, { text: string; shown: ShownRanges | null; live: LiveBlocks | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
     for (const tc of toolResults) {
       const { text, shown, live } = this.storedToolResultText(agentName, tc, maxChars);
       alone.set(tc.id, { text, shown, live, stored: await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown, bound) });
@@ -31657,15 +31664,15 @@ export class AgentFramework {
    * array carrying an inline image whose links and markers fit the cap
    * together (goesNative). Then `live` holds the blocks this text was made
    * from, which toMembraneToolResult sends as native blocks (nativeContent),
-   * showing each image, stub and marker whole and each text block up to where
-   * it cuts that block at the cap (`maxChars`, toolResultCutAt), so those are
-   * the ranges of the text it showed.
+   * showing each image, stub and marker whole and each text block's head and
+   * tail where it cuts that block at the cap (`maxChars`, toolResultHeadTail),
+   * so those are the ranges of the text it showed.
    */
   private storedToolResultText(
     agentName: string,
     tc: CompletedToolCall,
     maxChars: number | undefined,
-  ): { text: string; shown: ShownRanges | null; live: ToolResultBlock[] | null } {
+  ): { text: string; shown: ShownRanges | null; live: LiveBlocks | null } {
     if (tc.result.isError) return { text: (tc.result.error ?? 'Unknown error').toWellFormed(), shown: null, live: null };
     const ledger = this.toolImageLedgerFor(agentName);
     let blocks = null as HistoryBlockSpan[] | null;
@@ -31684,11 +31691,15 @@ export class AgentFramework {
     if (!blocks || !classified || !goesNative(blocks.map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
       return { text, shown: null, live: null };
     }
+    const spans: HistoryBlockSpan[] = blocks;
     return {
       text,
-      shown: blocks.map(({ kind, start, end }): [number, number] =>
-        [start, kind === 'text' && maxChars ? start + toolResultCutAt(text.slice(start, end), maxChars) : end]),
-      live: classified,
+      shown: spans.flatMap(({ kind, start, end }): Array<[number, number]> => {
+        if (kind !== 'text' || !maxChars) return [[start, end]];
+        const { headEnd, tailStart } = toolResultHeadTail(text.slice(start, end), maxChars);
+        return tailStart < end - start ? [[start, start + headEnd], [start + tailStart, end]] : [[start, start + headEnd]];
+      }),
+      live: { blocks: classified, spans },
     };
   }
 
@@ -31821,18 +31832,18 @@ export class AgentFramework {
   }
 
   /** How to read a tool result's file back a page at a time, with each page
-   *  sized to come back within `cap`, and, where `canRaise`, that raising
-   *  the inline cap would show more: where a cap at the readers' bound would
-   *  keep a longer head, or the whole result. */
-  private spillPageAdvice(path: string, cap: number, canRaise: boolean): string {
+   *  sized to come back within `cap`, from `from` until `to`, and, where
+   *  `canRaise`, that raising the inline cap would show more: where a cap at
+   *  the readers' bound would keep more of it, or the whole result. */
+  private spillPageAdvice(path: string, cap: number, canRaise: boolean, from: number, to: number): string {
     // A page is held to the cap as its text measures it, each code unit one
     // character (the workspace's read-page.ts). Leave room for the page's
     // fields and notes, and a possible extra code unit at a surrogate-pair
     // boundary.
     const pageOverhead = path.length + 256;
     const readLimit = Math.max(1, Math.min(2000, cap - pageOverhead - 1));
-    return `Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-      + 'use nextOffsetChars as offsetChars until null, keeping limitChars.'
+    return `Read them with workspace--read ${JSON.stringify({ path, offsetChars: from, limitChars: readLimit })}, `
+      + `then again with nextOffsetChars as offsetChars and the same limitChars, until it is null or at least ${to}.`
       + (canRaise ? ' Or raise the inline cap via agent_settings update tool_result_inline_max_chars.' : '');
   }
 
@@ -31861,60 +31872,62 @@ export class AgentFramework {
     // images. When the live wire delivered them beside the text, whatever
     // its length, an image slot dropped by the cut is an image the resident
     // saw that the index would silently slide past (issue #104), so the
-    // newest slots past the cut that the live copy showed are re-appended
-    // after the notice. Otherwise the live copy is this text, and nothing
-    // past the cut is kept (#403). The stored copy, notice and kept slots
-    // included, fits `bound`, the most a reader's strategy keeps of it,
-    // where `bound` leaves the notice its room, so no reader's cut takes the
-    // notice (cutStoredToolResultToFit), and the spill notices name the head
-    // they kept. Under a share too small for that, a cut keeps no head and
-    // stores its notice alone, and a text no longer than that notice is
-    // stored whole, with no file written: each result at its least.
+    // newest slots in the elided middle that the live copy showed are
+    // re-appended after the notice, before the tail. Otherwise the live copy
+    // is this text, and nothing in the middle is kept (#403). The stored
+    // copy, notice and kept slots included, fits `bound`, the most a reader's
+    // strategy keeps of it, where `bound` leaves the notice its room, so no
+    // reader's cut takes the notice (cutStoredToolResultToFit), and the spill
+    // notices name the chars they elide. Under a share too small for that, a
+    // cut keeps neither head nor tail and stores its notice alone, and a text
+    // no longer than that notice is stored whole, with no file written: each
+    // result at its least.
     const readCap = share?.readCap ?? cap;
     const cut = cutStoredToolResultToFit(content, cap, shown, bound,
       share ? this.spillNoticeLength(label, content, shown, bound, readCap) : undefined);
     if (cut.head === content) return { text: content, filePath: null };
-    const { head } = cut;
-    const kept = formatKeptImageSlots(cut);
 
     if (written === undefined) written = await this.writeToolResultFile(label, content);
-    const notice = this.spillNotice(head.length, content, shown, bound, readCap, written);
+    const notice = this.spillNotice({ head: cut.head.length, tail: cut.tail.length }, content, shown, bound, readCap, written);
     // The notice was measured as a written file's reads. A write that failed
     // keeps nothing, and its notice, naming the failure, can be longer: under
-    // a share, a cut that keeps no head and would store no less than the
-    // text is stored as the text itself, where the text holds no image slot.
-    // One that does is stored as it was measured, cut, since save_recent_image
-    // counted it so before the write.
-    if (share && head.length === 0 && notice.length >= content.length && parseImagePlaceholders(content).length === 0) {
+    // a share, a cut that keeps neither head nor tail and would store no less
+    // than the text is stored as the text itself, where the text holds no
+    // image slot. One that does is stored as it was measured, cut, since
+    // save_recent_image counted it so before the write.
+    if (share && cut.head.length + cut.tail.length === 0 && notice.length >= content.length && parseImagePlaceholders(content).length === 0) {
       return { text: content, filePath: null, written };
     }
-    return { text: head + notice + kept, filePath: written && written.error === undefined ? written.path : null, written };
+    return { text: storedCutText(cut, notice), filePath: written && written.error === undefined ? written.path : null, written };
   }
 
   /**
-   * The notice a cut copy carries after its head (spillOrTruncate): the file
-   * holding the whole result and how to read it back, or why there is none.
+   * The notice a cut copy carries between its head and its tail
+   * (spillOrTruncate): the chars it elides, and the file holding the whole
+   * result and how to read them back, or why there is none.
    */
-  private spillNotice(headLength: number, content: string, shown: ShownRanges | null, bound: number | undefined,
+  private spillNotice(kept: { head: number; tail: number }, content: string, shown: ShownRanges | null, bound: number | undefined,
     readCap: number, written: SpillWrite): string {
+    const to = content.length - kept.tail;
+    const elided = `${NOTICE_TAG.truncated} — ${elidedChars(kept.head, to, content.length)}`;
     if (written && written.error === undefined) {
-      const canRaise = bound === undefined || cutStoredToolResultToFit(content, bound, shown, bound).head.length > headLength;
-      return `\n\n[${NOTICE_TAG.truncated} — showing ${headLength} of ${content.length} chars; full content: workspace file ${written.path}`
-        + `. ${this.spillPageAdvice(written.path, readCap, canRaise)}]`;
+      const atBound = bound === undefined ? undefined : cutStoredToolResultToFit(content, bound, shown, bound);
+      const canRaise = atBound === undefined || atBound.head.length + atBound.tail.length > kept.head + kept.tail;
+      return `\n\n[${elided}; full content: workspace file ${written.path}`
+        + `. ${this.spillPageAdvice(written.path, readCap, canRaise, kept.head, to)}]`;
     }
     if (written) {
       // A workspace was there and the write FAILED — say that, loudly and
       // distinctly. Telling the agent "no writable workspace" would teach
       // them their residence lacks a capability it actually has.
-      return `\n\n[${NOTICE_TAG.truncated} — showing ${headLength} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
-        + ` (${written.error}); content over the cap was not retained]`;
+      return `\n\n[${elided}; spill to workspace file ${written.path} FAILED (${written.error}); the middle was not retained]`;
     }
-    return `\n\n[${NOTICE_TAG.truncated} — original was ${content.length} chars; ${this.noFileMountText()}, full content not retained]`;
+    return `\n\n[${elided}; ${this.noFileMountText()}, the middle was not retained]`;
   }
 
   /**
-   * The length of the notice a cut of `content` that keeps no head would
-   * carry, before any file is written, as it reads once its file is
+   * The length of the notice a cut of `content` that keeps neither head nor
+   * tail would carry, before any file is written, as it reads once its file is
    * (toolResultFilePlace, where any earlier cut of the text wrote it too), so
    * the cut and save_recent_image's count of the result before it measure
    * alike. For keeping whole, under a share, a text no longer than its notice
@@ -31924,7 +31937,7 @@ export class AgentFramework {
   private spillNoticeLength(label: string, content: string, shown: ShownRanges | null, bound: number | undefined,
     readCap: number): number {
     const place = this.toolResultFilePlace(label);
-    return this.spillNotice(0, content, shown, bound, readCap, place ? { path: place.path } : null).length;
+    return this.spillNotice({ head: 0, tail: 0 }, content, shown, bound, readCap, place ? { path: place.path } : null).length;
   }
 
   /**
@@ -32375,7 +32388,7 @@ export class AgentFramework {
     let classified = null as ToolResultBlock[] | null;
     const text = nonErrorResultText(afResult, maxChars, { toolName, onBlocks: (s, b) => { spans = s; classified = b; } });
     if (spans && classified && goesNative((spans as HistoryBlockSpan[]).map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
-      return { toolUseId: callId, content: this.nativeContent(classified, maxChars, null), isError: false };
+      return { toolUseId: callId, content: this.nativeContent({ blocks: classified, spans }, maxChars, null), isError: false };
     }
     return { toolUseId: callId, content: text, isError: false };
   }
@@ -32385,32 +32398,37 @@ export class AgentFramework {
    * ToolResultContentBlock[], for a caller that found they go natively: at
    * least one image, with links and markers that fit the cap together
    * (goesNative), which this doesn't check. Each image as itself, each text block
-   * cut at the cap, and every other block whole, as the text the stored copy
-   * shows for it. `maxChars`, when provided, caps each text block so an image
-   * inlined beside an enormous text payload can't blow the context. A block
-   * is cut as the stored copy is at that cap (toolResultCutAt), never inside a
-   * slot, so the stored copy can keep exactly the slots this showed (#403);
-   * under a readers' bound the stored copy's cut can come earlier
-   * (cutStoredToolResultToFit). Each text is already well formed, as the
-   * stored copy's is (toolResultBlocks).
+   * cut at the cap to its head and tail, and every other block whole, as the
+   * text the stored copy shows for it. `maxChars`, when provided, caps each
+   * text block so an image inlined beside an enormous text payload can't blow
+   * the context. A block is cut as the stored copy is at that cap
+   * (toolResultHeadTail), never inside a slot, so the stored copy can keep
+   * exactly the slots this showed (#403); under a readers' bound the stored
+   * copy's cut can keep less (cutStoredToolResultToFit). A cut block's notice
+   * names the chars it elides by their offsets in the result's text, which
+   * are its spill file's where one was written. Each text is already well
+   * formed, as the stored copy's is (toolResultBlocks).
    */
   private nativeContent(
-    blocks: ToolResultBlock[],
+    live: LiveBlocks,
     maxChars: number | undefined,
     /** Spill file written by the history path — referenced from truncation
      *  notices so an image-adjacent giant text block stays recoverable. */
     spillPath: string | null,
   ): ToolResultContentBlock[] {
-    return blocks.map((block): ToolResultContentBlock => {
+    const length = live.spans.at(-1)?.end ?? 0;
+    return live.blocks.map((block, i): ToolResultContentBlock => {
       if (block.kind === 'image') {
         return { type: 'image', source: { type: 'base64', data: block.data, mediaType: block.mimeType } };
       }
       let text = block.text;
       if (block.kind === 'text' && maxChars && text.length > maxChars) {
-        text = text.slice(0, toolResultCutAt(text, maxChars))
-          + '\n\n[truncated — original was ' + text.length + ' chars'
+        const { headEnd, tailStart } = toolResultHeadTail(text, maxChars);
+        const start = live.spans[i]!.start;
+        text = `${text.slice(0, headEnd)}\n\n[${NOTICE_TAG.truncated} — ${elidedChars(start + headEnd, start + tailStart, length)}`
           + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
-          + ']';
+          + ']'
+          + (tailStart < text.length ? `\n${text.slice(tailStart)}` : '');
       }
       return { type: 'text', text };
     });
@@ -40209,7 +40227,7 @@ export class AgentFramework {
               this.rememberAnnouncedLocus(agentName, opened);
               const inboundOnlyServer = this.channelRegistry?.inboundOnlyServer(opened);
               // The routing word comes first, ahead of any backscroll, so a
-              // result cut to its head for being long keeps it.
+              // result cut for being long keeps it in its head.
               result = {
                 ...result,
                 data: {

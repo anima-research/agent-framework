@@ -290,48 +290,46 @@ export function parseImagePlaceholders(text: string): ParsedImagePlaceholder[] {
 }
 
 /**
- * The most image slots a stored copy keeps past its cut: a bound on what it
- * carries there, set at the ledger's entry limit, the most images it holds
- * bytes for. Serializing a result retains its images in order before their
+ * The most image slots a stored copy keeps from its elided middle: a bound
+ * on what it carries there, set at the ledger's entry limit, the most images
+ * it holds bytes for. Serializing a result retains its images in order before their
  * placeholders are written, and every agent's ledger is built with the
  * defaults, so once a result is stored a save can reach bytes for at most
  * its newest DEFAULT_TOOL_IMAGE_LEDGER_MAX_ENTRIES images, fewer when the
  * ledger's limit on held characters binds first, and an inline image older
  * than those can only fail. Image stubs and quoted placeholders count toward
- * the bound too, so where they follow a result's images past the cut, the
+ * the bound too, so where they follow a result's images in the middle, the
  * newest slots kept can leave out an image whose bytes the ledger still
  * holds.
  */
 export const MAX_KEPT_IMAGE_SLOTS = DEFAULT_TOOL_IMAGE_LEDGER_MAX_ENTRIES;
 
 /** The ranges `[start, end)` of a tool result's text that its live copy
- *  showed beside its images: each text block up to where the live copy cut it
- *  at the inline cap (toolResultCutAt), and every other block whole. They
- *  come in text order and never overlap, as the blocks do, and
+ *  showed beside its images: each text block's head and tail where the live
+ *  copy cut it at the inline cap (toolResultHeadTail), and every other block
+ *  whole. They come in text order and never overlap, as the blocks do, and
  *  cutStoredToolResult relies on that. */
 export type ShownRanges = ReadonlyArray<readonly [number, number]>;
 
 /** A tool result's stored copy, cut at its inline cap. */
 export interface StoredCut {
-  /** The text before the cut. */
+  /** The text before the elided middle. */
   head: string;
-  /** The image slots past the cut that the stored copy re-appends after its
-   *  truncation notice, in text order: the newest MAX_KEPT_IMAGE_SLOTS of
-   *  those the live copy showed, or under a readers' bound the newest of
-   *  those that fit it, down to none (cutStoredToolResultToFit). */
+  /** The text after it. */
+  tail: string;
+  /** The image slots in the elided middle that the stored copy re-appends
+   *  after its truncation notice, before the tail, in text order: the newest
+   *  MAX_KEPT_IMAGE_SLOTS of those the live copy showed, or under a readers'
+   *  bound the newest of those that fit it, down to none
+   *  (cutStoredToolResultToFit). */
   kept: string[];
-  /** How many image slots past the cut the live copy showed. */
+  /** How many image slots in the elided middle the live copy showed. */
   fell: number;
 }
 
 /**
- * Where a tool result's text longer than `cap` is cut: by its stored copy
- * (cutStoredToolResult), by history's own truncation (truncateForHistory),
- * and by its live copy, for each text block beside an image
- * (toMembraneToolResult's nativeContent, framework.ts), so at one cap the
- * stored copy and the live copy cut alike. Under a readers' bound the stored
- * copy's cut can come earlier (cutStoredToolResultToFit). The text's length
- * when it isn't longer than `cap`.
+ * Where the head of a text longer than `cap` ends (toolResultHeadTail). The
+ * text's length when it isn't longer than `cap`.
  *
  * The cut is made at the cap, or before it when the cap would split a
  * surrogate pair (safeSlice's rule), and that is where the moves back are
@@ -342,7 +340,7 @@ export interface StoredCut {
  * never ends in part of one. A longer part, which can't parse as a slot,
  * stays before the cut. Each move back lands on a `[`, so it splits no pair.
  */
-export function toolResultCutAt(text: string, cap: number): number {
+function toolResultCutAt(text: string, cap: number): number {
   if (text.length <= cap) return text.length;
   let cutAt = safeSlice(text, 0, cap).length;
   // Neither grammar crosses a newline, so only the line holding the cut can
@@ -362,64 +360,124 @@ export function toolResultCutAt(text: string, cap: number): number {
 }
 
 /**
+ * Where a text longer than `cap` keeps its head and its tail: the head is
+ * `[0, headEnd)` and the tail `[tailStart, length)`, at most `cap` together.
+ * The head takes 60% of the cap, rounded down and at least one character,
+ * cut by toolResultCutAt, and the tail the rest. An end that splits a line
+ * moves to a line break when one lies within half its share: the head back
+ * to just after the last, the tail forward to just after the first. An end
+ * that falls at a line break keeps its whole line. The tail never starts on
+ * the second half of a surrogate pair, nor inside an image slot or a
+ * reference stub of any type, which it moves past, so a slot or a stub lies
+ * wholly in the head, the elided middle or the tail. Nor does a tail that
+ * starts mid-line start with a line in the stub's grammar, which on a line
+ * of its own would read as a stub the text never had: it steps one on. A
+ * text within the cap is all head; a cap of 0 or less keeps nothing.
+ */
+export function toolResultHeadTail(text: string, cap: number): { headEnd: number; tailStart: number } {
+  if (text.length <= cap) return { headEnd: text.length, tailStart: text.length };
+  if (cap <= 0) return { headEnd: 0, tailStart: text.length };
+  const headChars = Math.max(1, Math.floor(cap * 0.6));
+  const tailChars = cap - headChars;
+  let headEnd = toolResultCutAt(text, headChars);
+  if (text[headEnd] !== '\n') {
+    const lastNewline = text.lastIndexOf('\n', headEnd - 1);
+    if (lastNewline !== -1 && headEnd - (lastNewline + 1) < headChars / 2) headEnd = lastNewline + 1;
+  }
+  if (tailChars <= 0) return { headEnd, tailStart: text.length };
+  let tailStart = text.length - tailChars;
+  const unit = text.charCodeAt(tailStart);
+  if (unit >= 0xdc00 && unit <= 0xdfff) tailStart++;
+  if (text[tailStart - 1] === '\n') return { headEnd, tailStart };
+  const firstNewline = text.indexOf('\n', tailStart);
+  if (firstNewline !== -1 && firstNewline - tailStart < tailChars / 2) return { headEnd, tailStart: firstNewline + 1 };
+  const lineStart = text.lastIndexOf('\n', tailStart - 1) + 1;
+  const line = text.slice(lineStart, firstNewline === -1 ? text.length : firstNewline);
+  for (const m of line.matchAll(PLACEHOLDER_RE)) {
+    const start = lineStart + (m.index ?? 0);
+    if (start < tailStart && start + m[0].length > tailStart) tailStart = start + m[0].length;
+  }
+  for (const m of line.matchAll(REFERENCE_STUB_RE)) {
+    const start = lineStart + (m.index ?? 0);
+    if (m[0].length <= REFERENCE_STUB_MAX_CHARS && start < tailStart && start + m[0].length > tailStart) tailStart = start + m[0].length;
+  }
+  const lineEnd = text.indexOf('\n', tailStart);
+  const first = text.slice(tailStart, lineEnd === -1 ? text.length : lineEnd);
+  if (first.length <= REFERENCE_STUB_MAX_CHARS && [...first.matchAll(REFERENCE_STUB_RE)].length > 0) tailStart++;
+  return { headEnd, tailStart };
+}
+
+/** What a cut copy's notice says it elides: chars `from` to `to` of the whole's `total`. */
+export function elidedChars(from: number, to: number, total: number, whose = ''): string {
+  return `chars ${from} to ${to} of ${whose}${total} elided here`;
+}
+
+/**
  * Cut a tool result's text at its inline `cap` as its stored copy keeps it
- * (toolResultCutAt): the stored copy keeps what the live copy showed. A text
- * within the cap is all head, with nothing kept after it.
+ * (toolResultHeadTail): the stored copy keeps what the live copy showed. A
+ * text within the cap is all head, with nothing kept after it.
  *
  * `shown` is what the live copy showed beside the stored text: null when the
  * live copy was the text itself, as for every result that carried no inline
  * image, or whose links and markers came to more than the cap together, so
  * goesNative said no.
- * Then what the cut keeps is exactly what the resident saw, and nothing past
- * it is kept (#403). A result whose live copy went to the model as native
- * blocks (framework.ts) sent every image whatever the text's length, so its stored text is the only
- * place save_recent_image's inventory finds them, and a slot dropped by the
- * cut would be an image the resident saw that the index slides past (#104).
- * The image slots past the cut that lie wholly within what the live copy
- * showed are kept, the newest MAX_KEPT_IMAGE_SLOTS of them, since the
- * inventory counts from the end.
+ * Then what the cut keeps is exactly what the resident saw, and nothing in
+ * the elided middle is kept (#403). A result whose live copy went to the
+ * model as native blocks (framework.ts) sent every image whatever the text's
+ * length, so its stored text is the only place save_recent_image's inventory
+ * finds them, and a slot dropped by the cut would be an image the resident
+ * saw that the index slides past (#104). The image slots in the middle that
+ * lie wholly within what the live copy showed are kept, the newest
+ * MAX_KEPT_IMAGE_SLOTS of them, since the inventory counts from the end.
  */
 export function cutStoredToolResult(text: string, cap: number, shown: ShownRanges | null): StoredCut {
-  const cutAt = toolResultCutAt(text, cap);
-  const head = text.slice(0, cutAt);
-  if (shown === null) return { head, kept: [], fell: 0 };
+  const { headEnd, tailStart } = toolResultHeadTail(text, cap);
+  const head = text.slice(0, headEnd);
+  const tail = text.slice(tailStart);
+  if (shown === null) return { head, tail, kept: [], fell: 0 };
   // The slots and the ranges both come in text order, so one pass walks
   // them together: a range that ends where a slot starts, or before, holds
   // no later slot either.
-  const past: ParsedImagePlaceholder[] = [];
+  const middle: ParsedImagePlaceholder[] = [];
   let r = 0;
   for (const slot of parseImagePlaceholders(text)) {
-    if (slot.offset < cutAt) continue;
+    if (slot.offset < headEnd || slot.offset >= tailStart) continue;
     while (r < shown.length && shown[r]![1] <= slot.offset) r++;
     const range = shown[r];
-    if (range && slot.offset >= range[0] && slot.offset + slot.text.length <= range[1]) past.push(slot);
+    if (range && slot.offset >= range[0] && slot.offset + slot.text.length <= range[1]) middle.push(slot);
   }
-  return { head, kept: past.slice(-MAX_KEPT_IMAGE_SLOTS).map((slot) => slot.text), fell: past.length };
+  return { head, tail, kept: middle.slice(-MAX_KEPT_IMAGE_SLOTS).map((slot) => slot.text), fell: middle.length };
 }
 
 /** What a stored copy re-appends after its truncation notice: the kept
  *  slots, each on its own line so a reference stub stays parseable, under a
- *  note saying how many fell past the cut, and how many of those were left
- *  out and aren't counted, all of them where none fit the bound
- *  (cutStoredToolResultToFit). Empty when none fell past the cut. */
-export function formatKeptImageSlots(cut: StoredCut): string {
+ *  note saying how many were in the elided middle, and how many of those were
+ *  left out and aren't counted, all of them where none fit the bound
+ *  (cutStoredToolResultToFit). Empty when none were. */
+function formatKeptImageSlots(cut: StoredCut): string {
   if (cut.fell === 0) return '';
   if (cut.kept.length === 0) {
-    return `\n[${cut.fell} image slot(s) fell past the cut and are left out, and save_recent_image doesn't count them.]`;
+    return `\n[${cut.fell} image slot(s) in the elided middle are left out, and save_recent_image doesn't count them.]`;
   }
   const leftOut = cut.fell - cut.kept.length;
   const note = leftOut === 0
-    ? `${cut.fell} image slot(s) fell past the cut; kept here in order so save_recent_image still counts them:`
-    : `${cut.fell} image slot(s) fell past the cut. The last ${cut.kept.length} are kept here in order so `
+    ? `${cut.fell} image slot(s) were in the elided middle; kept here in order so save_recent_image still counts them:`
+    : `${cut.fell} image slot(s) were in the elided middle. The last ${cut.kept.length} are kept here in order so `
       + `save_recent_image still counts them; the ${leftOut} before them are left out, and it doesn't count them:`;
   return `\n[${note}]\n${cut.kept.join('\n')}`;
 }
 
+/** A cut's stored text: its head, `notice`, the kept slots and its tail, the
+ *  tail on a line of its own. */
+export function storedCutText(cut: StoredCut, notice: string): string {
+  return cut.head + notice + formatKeptImageSlots(cut) + (cut.tail ? `\n${cut.tail}` : '');
+}
+
 /** The most a stored copy's truncation notice takes (spillOrTruncate,
  *  framework.ts): the spill notice names its file twice, once in its paging
- *  advice, and fits this on a path from a mount name of up to about seventy
- *  characters. */
-export const TOOL_RESULT_NOTICE_ROOM = 640;
+ *  advice, and fits this on a path from a mount name of up to seventy
+ *  characters, with nine-digit offsets. */
+export const TOOL_RESULT_NOTICE_ROOM = 720;
 
 /**
  * A result's cap and bound when its message holds `n` results. A reader's
@@ -453,22 +511,22 @@ export function toolResultShare(cap: number, bound: number | undefined, n: numbe
 /**
  * Cut a tool result's text at `cap` as cutStoredToolResult does, unless its
  * stored copy would then pass `bound`, the most a reader's strategy keeps of
- * it (toolResultShare): the head, room for the notice after it, and the kept
- * slots after that (formatKeptImageSlots). A strategy cuts a longer message
- * from its end, and with it the notice that holds the way to the rest, so
- * there the head moves back until the copy fits. The kept slots grow as the
- * head moves back, so the cut is found again until head and slots fit or the
- * head is empty. Slots that alone pass the room keep the newest that fit,
- * the rest left out and uncounted, as past MAX_KEPT_IMAGE_SLOTS. A bound
- * under the notice's room can't hold the notice. With no bound, or where the
- * cut at the cap already fits, the cut is cutStoredToolResult's.
+ * it (toolResultShare): room for the notice, and the head, kept slots and
+ * tail (storedCutText). A strategy cuts a longer message from its end, and
+ * with it the notice that holds the way to the rest, so there head and tail
+ * shrink together until the copy fits. The kept slots grow as they shrink, so
+ * the cut is found again until it fits or keeps neither head nor tail. Slots
+ * that alone pass the room keep the newest that fit, the rest left out and
+ * uncounted, as past MAX_KEPT_IMAGE_SLOTS. A bound under the notice's room
+ * can't hold the notice. With no bound, or where the cut at the cap already
+ * fits, the cut is cutStoredToolResult's.
  *
  * `notice`, given where `bound` is a text's share of one turn's bound, is the
- * length of the notice a cut that keeps no head would carry
+ * length of the notice a cut that keeps neither head nor tail would carry
  * (spillNoticeLength). A text no longer than what that cut would store in
  * its place, the notice and, where it keeps no slot, the note on the slots it
  * leaves out, is kept whole: a cut would only lengthen it. Only a cut that
- * keeps no head can meet that, since one that keeps a head is cut past the
+ * keeps neither can meet that, since one that keeps either is cut past the
  * notice's room. A cut that keeps slots is measured by its notice alone, as
  * the slots it keeps are the text's own.
  */
@@ -476,28 +534,28 @@ export function cutStoredToolResultToFit(text: string, cap: number, shown: Shown
   let cut = cutStoredToolResult(text, cap, shown);
   if (bound === undefined || text.length <= cap) return cut;
   const room = bound - TOOL_RESULT_NOTICE_ROOM;
-  while (cut.head.length > 0 && cut.head.length + formatKeptImageSlots(cut).length > room) {
-    cut = cutStoredToolResult(text, Math.max(0, room - formatKeptImageSlots(cut).length), shown);
+  for (let keeps = storedCutText(cut, '').length; cut.head.length + cut.tail.length > 0 && keeps > room; keeps = storedCutText(cut, '').length) {
+    cut = cutStoredToolResult(text, Math.max(0, room - (keeps - cut.head.length - cut.tail.length)), shown);
   }
   while (cut.kept.length > 0 && formatKeptImageSlots(cut).length > room) cut = { ...cut, kept: cut.kept.slice(1) };
-  if (notice !== undefined && cut.head.length === 0
+  if (notice !== undefined && cut.head.length + cut.tail.length === 0
     && text.length <= notice + (cut.kept.length === 0 ? formatKeptImageSlots(cut).length : 0)) {
-    return { head: text, kept: [], fell: 0 };
+    return { head: text, tail: '', kept: [], fell: 0 };
   }
   return cut;
 }
 
 /**
  * The image slots a tool result's stored copy holds: its text's, or, when the
- * text is longer than `cap`, those the cut keeps, in head and after the
- * notice (cutStoredToolResultToFit, under the readers' `bound`). The notice
+ * text is longer than `cap`, those the cut keeps, in head, after the notice
+ * and in tail (cutStoredToolResultToFit, under the readers' `bound`). The notice
  * itself holds none. For counting a result before its stored copy is
  * written, as it will count after, so `notice` is the one spillOrTruncate
  * gives the cut (spillNoticeLength).
  */
 export function storedImageSlots(text: string, cap: number, shown: ShownRanges | null, bound: number | undefined, notice?: number): ParsedImagePlaceholder[] {
   const cut = cutStoredToolResultToFit(text, cap, shown, bound, notice);
-  return parseImagePlaceholders(cut.head + formatKeptImageSlots(cut));
+  return parseImagePlaceholders(storedCutText(cut, ''));
 }
 
 export function sha256Hex(bytes: Buffer): string {

@@ -185,7 +185,7 @@ export function describeCodeExecution(s: IsolateSettings): ToolDefinition {
       '{"action": "wait", "script_id": ...} waits again, {"action": "stop", "script_id": ...} stops it, and {"action": "list"} lists your scripts. ' +
       `Each return shows what the script wrote since the previous one: its first ${chars(headChars)} and last ${chars(tailChars)} characters, with a count of what was dropped between them. ` +
       "A return longer than your inline cap for tool results (tool_result_inline_max_chars in agent_settings) has its output's first and last parts cut alike to fit; " +
-      "if the rest of the return leaves the output no room, the return is cut there as any long tool result is, keeping its start. " +
+      "if the rest of the return leaves the output no room, the return is cut there as any long tool result is, keeping its start and its end. " +
       "You may leave a script running past your turn, unless the host names another agent as its primary agent, whose scripts alone outlive a turn: " +
       'a yield says when yours will be stopped at your turn\'s end. ' +
       `A script left running can wake you with await wake_agent(payload), a payload of at most ${formatBytes(MAX_WAKE_PAYLOAD_BYTES)} of JSON, ` +
