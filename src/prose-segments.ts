@@ -11,9 +11,9 @@
  * yields each contiguous run of text — the segments a surface should deliver as
  * separate, ordered messages. Contiguous text blocks merge into one segment;
  * `tool_use` / `tool_result` blocks are segment boundaries, as are XML tool
- * mode's `tool_attempt` / `tool_notice` (a refused attempt and the harness's
- * notice end a round just as a call and its results do); empty or
- * whitespace-only runs are dropped.
+ * mode's `tool_attempt` / `tool_notice`; empty or whitespace-only runs are
+ * dropped. (Whose round a run belongs to is withoutRoundsProse's question,
+ * and there a notice ends text only before a round's first call.)
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -63,7 +63,12 @@ export function splitProseRuns(content: readonly ContentBlock[]): string[] {
  * calls of one round (their `tool_use` blocks come before any result) stay
  * one round, and a round is found by its place, whatever its text holds.
  * An all-refused XML attempt (`tool_attempt`, answered by a `tool_notice`) was
- * no round, so the text before either block is no round's and stays.
+ * no round, so the text before either block is no round's and stays; once a
+ * round has named a call, its text up to its results stays its own, a notice
+ * between them or not. A round refused in part reads by its blocks' order:
+ * text before a refused attempt that comes ahead of the accepted call is no
+ * round's. No membrane writes these blocks yet (membrane#101 closed), so that
+ * case is left as the order says.
  * Other rounds' text, every non-text block and the text after the last round
  * stay.
  */
@@ -74,6 +79,9 @@ export function withoutRoundsProse(
   const dropped = new Set<number>();
   let round = 0;
   let afterResults = false;
+  // Whether this round has named a call yet: a notice inside a started round
+  // doesn't end the round's text, its result does.
+  let called = false;
   // The text since the last boundary: whose it is shows at what ends it.
   let unclaimed: number[] = [];
   const claim = (): void => {
@@ -90,10 +98,16 @@ export function withoutRoundsProse(
     if (afterResults) {
       round++;
       afterResults = false;
+      called = false;
     }
-    if (type === 'tool_attempt' || type === 'tool_notice') unclaimed = [];
-    else if (type === 'tool_use') claim();
-    else if (type === 'text') unclaimed.push(at);
+    if (type === 'tool_attempt' || type === 'tool_notice') {
+      if (!called) unclaimed = [];
+    } else if (type === 'tool_use') {
+      claim();
+      called = true;
+    } else if (type === 'text') {
+      unclaimed.push(at);
+    }
   });
   claim();
   return content.filter((_, at) => !dropped.has(at));
