@@ -15571,7 +15571,7 @@ export class AgentFramework {
     let failures: ManagerReinitFailure[] = [];
     try {
       this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
-      this.tuneOutCoordinator?.branchMoved();
+      this.tuneOutCoordinator?.branchMoved(sameBranch);
       if (!sameBranch) this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
       // The agent the move was made through initialized its own manager,

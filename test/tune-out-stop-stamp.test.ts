@@ -1415,6 +1415,29 @@ test("after a branch move, a look reads the last looks of the branch moved to, s
   } finally { h.stopAll(); }
 }));
 
+test("a recovery onto the branch the store was on keeps a look a refused write of the last looks held only in memory", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    const LOOKS = 'tune-out/scout/last-looks';
+    const look = (c: TuneOutCoordinator, epochId: string, channelId: string): void =>
+      (c as unknown as { markLook(epochId: string, serverId: string, channelId: string): void }).markLook(epochId, 'editor', channelId);
+    const noisy = JSON.stringify(['editor', 'noisy']);
+    const loud = JSON.stringify(['editor', 'loud']);
+    const e = h.hold();
+    h.states.set(LOOKS, { [e]: { [noisy]: 5 } });
+    const c = h.boot();
+    h.refuse.add(LOOKS);
+    look(c, e, 'noisy');
+    const refused = h.state.seq;
+    assert.deepEqual(h.states.get(LOOKS), { [e]: { [noisy]: 5 } }, 'premise: the write was refused, so the look is in memory alone');
+    h.refuse.delete(LOOKS);
+    (c as unknown as { branchMoved(sameBranch?: boolean): void }).branchMoved(true);
+    look(c, e, 'loud');
+    assert.deepEqual(h.states.get(LOOKS), { [e]: { [noisy]: refused, [loud]: h.state.seq } },
+      'the next write carries the look the refused one held');
+  } finally { h.stopAll(); }
+}));
+
 test("review 2 #43: after a branch move, the loss record written there keeps the notices that branch kept", () => quiet(() => {
   const h = stampSetup();
   try {

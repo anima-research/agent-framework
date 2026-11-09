@@ -3196,11 +3196,14 @@ export class TuneOutCoordinator {
    * made here, before the marker, and the last stop's bound is judged by
    * the destination's record (carriedNeeded). The subconscious's last
    * looks are read again too, so the next look reads the destination's
-   * record (lastLooks). Never throws.
+   * record (lastLooks), unless `sameBranch` says the store switched to the
+   * branch it was on, as a refusing manager's recovery does: no branch
+   * moved, and the cache keeps any look a refused write held only there.
+   * Never throws.
    */
-  branchMoved(): void {
+  branchMoved(sameBranch = false): void {
     if (this.stopped) return;
-    this.lastLooksCache = undefined;
+    if (!sameBranch) this.lastLooksCache = undefined;
     try {
       const branch = this.branchNow();
       if (branch !== undefined && this.runStarts.has(branch)) {
