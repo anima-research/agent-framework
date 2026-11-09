@@ -2914,6 +2914,22 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
+  it("hybrid: a turn's receipt gives each held draft its own reason", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn(rounds([text('beside the send\n>>>#nowhere lost words'), explicitSend('s1')]));
+      const byText = new Map(h.drafts().map((d) => [d.text, d]));
+      const sent = byText.get('beside the send');
+      const bounce = byText.get('lost words');
+      assert.deepEqual([sent?.reason, bounce?.reason], ['explicit-send', 'bounced'], `premise: one draft of each reason: ${JSON.stringify(h.drafts().map((d) => [d.text, d.reason]))}`);
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!;
+      assert.match(receipt, new RegExp(`held as drafts .*${sent!.id} \\(explicit send in its turn\\)`));
+      assert.match(receipt, new RegExp(`held as drafts .*${bounce!.id} \\(routing prefix bounced\\)`));
+    } finally {
+      await h.close();
+    }
+  });
+
   it('hybrid: beside a send, {{unsent}} holds the whole message it would have published, a bare one keeps the bounce as the one draft, and >>>skip_reply {{unsent}} still sets it aside', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
     try {
@@ -4838,6 +4854,8 @@ describe('the held-draft notice written mid-turn', () => {
 
 describe("an explicit send's result says what it holds", () => {
   const PLACE = `#room \\(Guild One\\) \\(${ROOM}\\)`;
+  const FROM_ROUND = ', from this round on, is held as drafts until a new message reaches you or this turn ends, except in a round that keeps its speech private\\.';
+  const TURN = ' this turn is held as drafts until a new message reaches you or this turn ends, except in a round that keeps its speech private\\.';
   const resultOf = (h: Awaited<ReturnType<typeof harness>>, id: string): string => {
     const block = h.messages().flatMap((m) => m.content)
       .find((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === id) as { content?: unknown } | undefined;
@@ -4848,18 +4866,20 @@ describe("an explicit send's result says what it holds", () => {
     return JSON.stringify(content);
   };
 
-  it('native: a send to a place says the plain speech there, this round included, is held until a new message or the turn ends', async () => {
+  it('native: a send to a place says the plain speech there, from this round on, is held until a new message or the turn ends, after its own answer\'s fields', async () => {
     const h = await harness();
     try {
       await h.turn([createMockResponse([text('sent it.'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
       assert.equal(h.drafts()[0]?.text, 'sent it.', 'premise: the line beside the send is held');
-      assert.match(resultOf(h, 's1'), new RegExp(`"routing": ?"Your plain speech to ${PLACE}, this round's included, is held as drafts until a new message reaches you or this turn ends\\."`));
+      const answer = JSON.parse(resultOf(h, 's1')) as Record<string, unknown>;
+      assert.match(String(answer.routing), new RegExp(`^Your plain speech to ${PLACE}${FROM_ROUND}$`));
+      assert.ok(Object.keys(answer).length > 1 && Object.keys(answer).at(-1) === 'routing', `the publish's own answer keeps its fields, and the line follows them: ${Object.keys(answer).join(', ')}`);
     } finally {
       await h.close();
     }
   });
 
-  it("XML: a send to a place says the turn's plain speech there, earlier rounds included, is held", async () => {
+  it("XML: a send to a place says the turn's plain speech there is held, except in a round that keeps its speech private", async () => {
     const h = await harness({ xml: true });
     try {
       await h.turn([
@@ -4867,7 +4887,7 @@ describe("an explicit send's result says what it holds", () => {
         { ...createMockResponse([text('Narration before the send.'), explicitSend('s1'), text('And after it.')]), toolCalls: [] },
       ]);
       assert.equal(h.drafts().length, 2, 'premise: both rounds\' speech is held');
-      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE} this turn, earlier rounds included, is held as drafts until a new message reaches you or this turn ends\\.`));
+      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE}${TURN}`));
     } finally {
       await h.close();
     }
@@ -4879,7 +4899,7 @@ describe("an explicit send's result says what it holds", () => {
     try {
       await h.turn([createMockResponse([text('done, messaged them.'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
       assert.equal(h.drafts()[0]?.text, 'done, messaged them.', 'premise: the line is held');
-      assert.match(resultOf(h, 's1'), /The framework can't tell where this posted \(its answer named no channel the framework reads\), so your plain speech anywhere, this round's included, is held as drafts until a new message reaches you or this turn ends\./);
+      assert.match(resultOf(h, 's1'), new RegExp(`^sent\\nThe framework can't tell where this posted \\(its answer named no channel the framework reads\\), so your plain speech anywhere${FROM_ROUND}$`), "the line follows the send's own answer");
     } finally {
       await h.close();
     }
@@ -4891,7 +4911,7 @@ describe("an explicit send's result says what it holds", () => {
     try {
       await h.turn([createMockResponse([text('done, messaged them.'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
       assert.equal(h.drafts()[0]?.text, 'done, messaged them.', 'premise: the line is held');
-      assert.match(resultOf(h, 's1'), /Discord refused part 2\. Attempted destination: \S+\nThe framework can't tell whether or where this posted \(it answered with an error\), so your plain speech anywhere, this round's included, is held as drafts until a new message reaches you or this turn ends\./);
+      assert.match(resultOf(h, 's1'), /Discord refused part 2\. Attempted destination: \S+\nThe framework can't tell whether or where this posted \(it answered with an error\), so your plain speech anywhere, from this round on, is held as drafts until a new message reaches you or this turn ends, except in a round that keeps its speech private\./);
     } finally {
       await h.close();
     }
@@ -4943,10 +4963,7 @@ describe("an explicit send's result says what it holds", () => {
     }
   });
 
-  const AFTER = 'after this round is held as drafts until a new message reaches you or this turn ends\\.';
-  const EXCEPT_REFUSED = 'this turn, except in a round where your skip_reply was refused, is held as drafts until a new message reaches you or this turn ends\\.';
-
-  it("a drafts resend's result says what it holds, as any send's does: with no other send, what comes after its round", async () => {
+  it("a drafts resend's result says what it holds, as any send's does, after the resend's own answer", async () => {
     const h = await harness({ sendTool: true });
     await h.sendMode('no-channel');
     try {
@@ -4955,19 +4972,18 @@ describe("an explicit send's result says what it holds", () => {
       assert.ok(held, 'premise: a draft is held');
       await h.turn([createMockResponse([text('resending it now'), drafts('r1', { action: 'resend', draftIds: [held!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
       assert.ok(!h.drafts().some((d) => d.text === 'resending it now'), "premise: a resend with no other send keeps its round's narration, holding none");
-      assert.match(resultOf(h, 'r1'), new RegExp(`Your plain speech to ${PLACE} ${AFTER}`));
-      assert.doesNotMatch(resultOf(h, 'r1'), /"routing"/, "the line follows the resend's answer as its own text, not as a field of it");
+      assert.match(resultOf(h, 'r1'), new RegExp(`^${held!.id}: delivered to ${PLACE}, message \\S+\\.\\nYour plain speech to ${PLACE}${FROM_ROUND}$`), "the resend's own answer, then the line");
     } finally {
       await h.close();
     }
   });
 
-  it("native: a send beside a same-round private think, or a refused wake, names what comes after this round", async () => {
+  it("native: a send beside a same-round private think, or a refused wake, gives the same line, whose exception covers its own round", async () => {
     const think = await harness({ agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
     try {
       await think.turn([createMockResponse([text('beside a private think'), call('t1', 'think', { thought: 'hmm' }), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
       assert.deepEqual(think.drafts(), [], 'premise: the private think keeps the round\'s prose, holding none');
-      assert.match(resultOf(think, 's1'), new RegExp(`Your plain speech to ${PLACE} ${AFTER}`));
+      assert.match(resultOf(think, 's1'), new RegExp(`Your plain speech to ${PLACE}${FROM_ROUND}`));
     } finally {
       await think.close();
     }
@@ -4979,7 +4995,7 @@ describe("an explicit send's result says what it holds", () => {
       ]);
       assert.match(wake.toolResults()[0]!, /no wake was set/, 'premise: the wake was refused');
       assert.deepEqual(wake.drafts(), [], 'premise: the refused wake keeps its round\'s prose, holding none');
-      assert.match(resultOf(wake, 's1'), new RegExp(`Your plain speech to ${PLACE} ${AFTER}`));
+      assert.match(resultOf(wake, 's1'), new RegExp(`Your plain speech to ${PLACE}${FROM_ROUND}`));
     } finally {
       await wake.close();
     }
@@ -5008,7 +5024,7 @@ describe("an explicit send's result says what it holds", () => {
         { ...createMockResponse([text('Private, beside the refused wake.'), wake, done('w1'), text('Beside the send.'), explicitSend('s1'), done('s1'), text('After the send.')]), toolCalls: [] },
       ]);
       assert.deepEqual(h.drafts().reverse().map((d) => d.text), ['Beside the send.', 'After the send.'], 'premise: the refused round stays private, and the send\'s rounds are held');
-      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE} ${EXCEPT_REFUSED}`));
+      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE}${TURN}`));
     } finally {
       await h.close();
     }
@@ -5021,13 +5037,13 @@ describe("an explicit send's result says what it holds", () => {
         { ...createMockResponse([text('Beside the refused wake and the send.'), wake, explicitSend('s1'), done('w1'), done('s1'), text('After the send.')]), toolCalls: [] },
       ]);
       assert.deepEqual(same.drafts().map((d) => d.text), ['After the send.'], "premise: the send's own round stays private beside its refused wake, and what follows is held");
-      assert.match(resultOf(same, 's1'), new RegExp(`Your plain speech to ${PLACE} ${EXCEPT_REFUSED}`));
+      assert.match(resultOf(same, 's1'), new RegExp(`Your plain speech to ${PLACE}${TURN}`));
     } finally {
       await same.close();
     }
   });
 
-  it("XML: an earlier round beside a private think is held at the turn's end, so the line's earlier rounds hold", async () => {
+  it("XML: an earlier round beside a private think is held at the turn's end, as the line's turn says", async () => {
     const h = await harness({ xml: true, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
     try {
       const think = call('t1', 'think', { thought: 'hmm' });
@@ -5038,7 +5054,7 @@ describe("an explicit send's result says what it holds", () => {
         { ...createMockResponse([text('Beside a private think.'), think, done('t1'), text('Beside the send.'), explicitSend('s1'), done('s1'), text('After the send.')]), toolCalls: [] },
       ]);
       assert.deepEqual(h.drafts().reverse().map((d) => d.text), ['Beside a private think.', 'Beside the send.', 'After the send.'], "premise: on the XML path a private think keeps no round's prose, so all three are held");
-      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE} this turn, earlier rounds included, is held as drafts until a new message reaches you or this turn ends\\.`));
+      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE}${TURN}`));
     } finally {
       await h.close();
     }
@@ -5057,7 +5073,7 @@ describe("an explicit send's result says what it holds", () => {
       async onProcess(): Promise<EventResponse> { return {}; }
     }
     const say = (id: string) => call(id, 'world--say', { text: 'hello' });
-    const ANYWHERE = "so your plain speech anywhere, this round's included, is held as drafts until a new message reaches you or this turn ends\\.";
+    const ANYWHERE = `so your plain speech anywhere${FROM_ROUND}`;
 
     it('an answer with no data and no error is the line itself', async () => {
       const h = await harness({ modules: [new SayModule({ success: true })] });
