@@ -671,11 +671,11 @@ test('a failed maintenance pass logs and alerts a bounded reason', async () => {
   assert.match(assertBoundedStrings(bare.rawArgs, '[context-maintenance] pass failed:'), /pass failed: \{"code":"zz_bare"\}$/);
 });
 
-test('emitTrace: listeners get bounded error and stack; the marker still learns the full length', () => {
+test('emitTrace: listeners get bounded error, stack and shown reason; the marker still learns the full length', () => {
   const { fw, traces, markers, restore } = makeHarness();
   const error = `Bad request: ${echo()}`;
   try {
-    fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error, retryable: false, errorType: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request' });
+    fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error, shownReason: error, retryable: false, errorType: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request' });
     fw.emitTrace({ type: 'inference:failed', agentName: 'cairn', error, stack: `Error: ${error}\n    at zz (zz.js:1:1)` });
     // Any event's error string, including failure events added later.
     fw.emitTrace({ type: 'module:batch_hook_failed', agentName: 'cairn', module: 'zz', error });
@@ -686,6 +686,9 @@ test('emitTrace: listeners get bounded error and stack; the marker still learns 
     assert.ok(event.error.length <= 2_000, `${event.type} error is ${event.error.length} chars`);
     if (event.stack) assert.ok(event.stack.length <= 2_000);
   }
+  const shown = traces.find((t) => t.type === 'inference:exhausted')!.shownReason as string;
+  assert.ok(shown.length <= 2_000, `shownReason is ${shown.length} chars`);
+  assert.ok(markers[0].text.includes(` of ${error.length} characters omitted]`), 'the note cut the whole reason');
   assert.equal(markers[0].meta.reasonChars, error.length);
   assert.equal(markers[0].meta.httpStatus, 400);
   assert.equal(markers[0].meta.providerErrorCode, 'zz_bad_request');

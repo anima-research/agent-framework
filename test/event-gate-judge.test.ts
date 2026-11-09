@@ -2,6 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { MembraneError } from '@animalabs/membrane';
 import { EventGate } from '../src/gate/event-gate.js';
 import type { GateConfig, GateEventInfo, JudgeFn, JudgeRequest, JudgeVerdict } from '../src/gate/types.js';
 import type { ToolDefinition } from '../src/types/index.js';
@@ -446,12 +447,53 @@ describe('judge rules: timing', () => {
     } finally {
       console.error = original;
     }
-    assert.ok(gate.getStatus().errors.some((e) => e.includes('failed its last 3 requests') && e.includes('400 model not found')));
+    assert.ok(gate.getStatus().errors.some((e) => e.includes('failed its last 3 requests (the newest: the call failed)')), JSON.stringify(gate.getStatus().errors));
+    assert.ok(!gate.getStatus().errors.some((e) => e.includes('400 model not found')), "gate_status doesn't quote an error the framework didn't write");
     gate.evaluate(chat('ok'));
     await until(() => judge.waiting() === 1, 'the judge is asked');
     judge.answer({ reply: false, reason: 'fine' });
     await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the verdict');
     assert.ok(!gate.getStatus().errors.some((e) => e.includes('failed its last')));
+    gate.dispose();
+  });
+
+  it("a judge that fails on a provider's error shows the framework's words in gate_status, and stderr keeps the provider's", async () => {
+    const SENTINEL = 'zz-provider-words-7f3a';
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('provider-words.json', JUDGED), { judge: judge.fn });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        gate.evaluate(chat(`m${i}`));
+        await until(() => judge.waiting() === 1, 'the judge is asked');
+        judge.fail(new MembraneError({ type: 'server', retryable: true, httpStatus: 529, message: `Overloaded: ${SENTINEL}`, rawError: undefined }));
+        await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === i + 1, 'the failure counted');
+      }
+    } finally {
+      console.error = original;
+    }
+    const status = gate.getStatus();
+    assert.strictEqual(status.policies[0]!.judgeState!.last!.reason, 'the model call failed (server, HTTP 529)');
+    assert.ok(status.errors.some((e) => e.includes('failed its last 3 requests (the newest: the model call failed (server, HTTP 529))')), JSON.stringify(status.errors));
+    assert.ok(!JSON.stringify(status).includes(SENTINEL), JSON.stringify(status));
+    assert.ok(logged.some((line) => line.includes(SENTINEL)), "stderr keeps the provider's words");
+    gate.dispose();
+  });
+
+  it("a judge the gate times out shows the gate's own words in gate_status", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('timeout-words.json', JUDGED), { judge: judge.fn, judgeTimeoutMs: 50 });
+    const original = console.error;
+    console.error = () => {};
+    try {
+      gate.evaluate(chat('hello'));
+      await until(() => wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
     gate.dispose();
   });
 
@@ -500,7 +542,7 @@ describe('judge rules: timing', () => {
     assert.strictEqual(wakes.length, 0);
     const state = gate.getStatus().policies[0]!.judgeState!;
     assert.deepStrictEqual(state.verdicts, { reply: 0, wait: 0, error: 1 });
-    assert.strictEqual(state.last?.reason, 'provider down');
+    assert.strictEqual(state.last?.reason, 'the call failed', "an error the framework didn't write is shown in its words");
     judge.answer({ reply: false, reason: 'nothing for the agent' });
     gate.dispose();
   });

@@ -9,6 +9,8 @@ import { OverBudgetError } from '@animalabs/context-manager';
 import type { ErrorPolicy, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { HealthModule } from '../src/modules/health/index.js';
+import type { JsStore } from '@animalabs/chronicle';
 
 const SENTINEL = 'zz-provider-words-7f3a';
 
@@ -126,6 +128,21 @@ async function residentTurn(membrane: MockMembrane): Promise<{ texts: string[]; 
   });
 }
 
+async function healthAfterTurn(membrane: MockMembrane): Promise<{ shown: unknown[]; logged: unknown[] }> {
+  return withFramework(membrane, true, async (fw) => {
+    fw.start();
+    fw.pushEvent({ type: 'external-message', source: 'test', content: 'Hello?', metadata: {} } as unknown as ProcessEvent);
+    await fw.runUntilIdle();
+    const health = new HealthModule({ timeZone: 'UTC' });
+    health.bind(fw, {} as JsStore);
+    const result = await health.handleToolCall({ id: 'h1', name: 'snapshot', input: { includeSubagents: false, includeTokens: false } } as unknown as ToolCall);
+    assert.equal(result.success, true, String(result.error));
+    const shown = (result.data as { inferences: { recentErrors: Array<{ error: unknown }> } }).inferences.recentErrors.map((e) => e.error);
+    const logged = fw.queryInferenceLogs({ limit: 20 }).entries.map((e) => (e.summary ?? e.entry).error);
+    return { shown, logged };
+  });
+}
+
 async function ephemeralEnding(membrane: MockMembrane): Promise<unknown> {
   return withFramework(membrane, false, async (fw) => {
     const created = await fw.createEphemeralAgent({ name: 'helper', model: 'test-model', systemPrompt: 'Do the task.' });
@@ -147,6 +164,18 @@ describe("a provider's words stay out of what an agent reads", () => {
         '(e.g. drop an oversized attachment or an unsupported setting).');
       assert.ok(!turn.texts.some((text) => text.includes(SENTINEL)), JSON.stringify(turn.texts));
       assert.ok(turn.stderr.some((line) => line.startsWith('[inference-failed]') && line.includes(SENTINEL)), 'stderr keeps the provider\'s words');
+    });
+
+    it(`health--snapshot lists a turn that failed on a provider's error (${site}) in the framework's words, and the inference log keeps the provider's`, async () => {
+      const { shown, logged } = await healthAfterTurn(new FailingFirst(site, providerError()));
+      if (site === 'start') {
+        assert.deepEqual(shown, [], 'a call that fails before its stream exists writes no inference-log entry');
+        return;
+      }
+      assert.ok(shown.length >= 1, JSON.stringify(shown));
+      for (const error of shown) assert.match(String(error), /the model call failed \(invalid_request, HTTP 400\)$/);
+      assert.ok(!shown.some((error) => String(error).includes(SENTINEL)), JSON.stringify(shown));
+      assert.ok(logged.some((error) => String(error).includes(SENTINEL)), "the inference log keeps the provider's words");
     });
 
     it(`an ephemeral run that ends on a provider's error (${site}) rejects in the framework's words, with a copy of the error as its cause`, async () => {
