@@ -486,7 +486,7 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     const t = await turn(['error408']);
     assert.equal(t.requests, 3);
     assert.equal(t.markers.length, 1);
-    assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call timed out \(timeout, HTTP 408\) and produced no response, so nothing was sent\. Reason: /);
+    assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call timed out \(timeout, HTTP 408\) and produced no response, so nothing was sent\. If a reply/);
     assert.doesNotMatch(t.markers[0]!, /made again/);
     assert.match(t.markers[0]!, /\. If a reply is still owed from that turn, you can give it now\.$/);
   });
