@@ -4944,16 +4944,17 @@ export class EventGate {
     }
   }
 
-  /** End sleep immediately. Returns true if the agent was asleep. */
+  /** End sleep immediately. Returns true if the agent was asleep. The
+   *  journal is written whether or not a sleep was set, so a `wake` called
+   *  again after one whose write failed takes the stale sleep out. */
   clearSleep(): boolean {
     const wasAsleep = this.sleepUntil > this.now();
-    const hadIntent = this.sleepUntil > 0;
     this.sleepUntil = 0;
     this.sleepArmedAt = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
-    if (hadIntent) this.tryPersistWakeState('clearing a sleep');
+    this.tryPersistWakeState('clearing a sleep');
     return wasAsleep;
   }
 
