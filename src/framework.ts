@@ -22845,14 +22845,13 @@ export class AgentFramework {
   };
 
   private static readonly HOLD_CLAIM_TEXT: Record<HoldClaim, string> = {
-    'from-round': ', from this round on,',
-    turn: ' this turn',
+    'from-round': ', from this round on, is held as drafts until a new message reaches you or this turn ends,',
+    turn: ' this turn is held as drafts until this turn ends,',
   };
 
   private sendHoldLine(reach: SendReach, claim: HoldClaim): string | undefined {
     if (reach.kind === 'nowhere') return undefined;
-    const held = `${AgentFramework.HOLD_CLAIM_TEXT[claim]} is held as drafts until a new message reaches you or this turn ends, ` +
-      'except in a round that keeps its speech private.';
+    const held = `${AgentFramework.HOLD_CLAIM_TEXT[claim]} except in a round that keeps its speech private.`;
     if (reach.kind === 'channel') return `Your plain speech to ${this.channelShown(reach.to)}${held}`;
     if (reach.why === 'no-answer') return undefined;
     return `The framework can't tell ${reach.why === 'error' ? 'whether or where' : 'where'} this posted (${AgentFramework.UNKNOWN_REACH_TEXT[reach.why]}), ` +
@@ -28966,7 +28965,7 @@ export class AgentFramework {
               // the calls of every script its code_execution calls watch while
               // it waits, one whose code names no routing tool included.
               const sends = new Map<string, SendReach | undefined>(sendCallIds.map((id) => [id, undefined]));
-              const claim = holdClaimOf(roundCalls, liveRound);
+              const claim = holdClaimOf(roundCalls, liveProseRouting);
               const answered = (): RoundCall[] => [
                 ...roundCalls.map((c, i) => (sends.has(calls[i]!.id) ? { ...c, reach: sends.get(calls[i]!.id) } : c)),
                 ...[...round.scripts.values()].flat(),
