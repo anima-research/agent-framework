@@ -518,7 +518,9 @@ describe('XML tools: a response that ends at the output limit inside a tool-call
   it("counts an XML round cut off with a private think once, under disabled routing", async () => {
     const run = await turn('xml', [XML_EAST_ROUND, xmlThinkCut('Musing to myself.')], { proseRouting: 'disabled', sameRoundThinkTextPolicy: 'private' });
     assert.deepEqual(run.routed, []);
-    assert.match(receipts(run)[0] ?? '', /\bplain-speech segment\(s\) kept in the transcript/, receipts(run).join(' | '));
+    // Three: the east round's words, the think round's, and the words after
+    // its block, before the output limit. Counted once each.
+    assert.match(receipts(run)[0] ?? '', /\b3 plain-speech segment\(s\) kept in the transcript/, receipts(run).join(' | '));
     assert.equal(run.requests.length, 3);
   });
 
