@@ -14,7 +14,7 @@
   `overloaded`; one longer than 128 characters is shown as its start and end around a note of how much was left out)
   and `maxTries` (the most tries that class allows, the first included, shown only as a positive whole number). They
   are shown, not acted on. A turn re-armed after it ran out of tries ends at its second deadline expiry with no
-  completed round between them, whatever `maxTries` says. `DefaultErrorPolicy` always fills `retryClass` with the
-  class it decided by, and fills `maxTries` when that class's schedule has a bound (`maxAttempts: null` leaves it
-  out). An `overloaded` failure under settings with no overloaded schedule takes `retryable`'s, as membrane does. A
-  policy that leaves both out is shown with the try number alone.
+  completed round, transient failure or message said to it between them, whatever `maxTries` says.
+  `DefaultErrorPolicy` always fills `retryClass` with the class it decided by, and fills `maxTries` when that class's
+  schedule has a bound (`maxAttempts: null` leaves it out). An `overloaded` failure under settings with no overloaded
+  schedule takes `retryable`'s, as membrane does. A policy that leaves both out is shown with the try number alone.

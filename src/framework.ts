@@ -2949,8 +2949,8 @@ interface TurnRetryWait {
   nextTry?: number;
   /** The most tries the policy allows (ErrorAction.maxTries), when it says
    *  so as a positive whole number. A turn re-armed after it ran out of tries
-   *  ends at its second deadline expiry with no completed round between them,
-   *  whatever this says. */
+   *  ends at its second deadline expiry with no completed round, transient
+   *  failure or message said to it between them, whatever this says. */
   maxTries?: number;
   /** What the policy retries the failure as (ErrorAction.retryClass), such as
    *  `overloaded`, when it says. A longer one than 128 characters is shown
