@@ -949,9 +949,10 @@ export interface McplContextInjection {
   namespace: string;
 
   /**
-   * Where to inject. `beforeUser` is deprecated (agent-framework#171): it
-   * moves each time a newer user message arrives. Use `afterUser`, which is
-   * stored where it lands.
+   * Where to inject. `beforeUser` is deprecated (agent-framework#171): it's
+   * placed again at every compile before the newest user message, or at the
+   * window's end where there is none, so it moves whenever that place does.
+   * Use `afterUser`, which is stored where it lands.
    */
   position: 'system' | 'beforeUser' | 'afterUser';
 
