@@ -43,7 +43,10 @@
   quoted: `Your plain speech "<opening>" (<n> chars) had no channel to go to
   …`, where it said "Your previous reply (<n> chars)". A long piece's opening
   is cut at the last word within 40 characters, or inside a first word longer
-  than that, and marked "…".
+  than that, and marked "…". A refusal rewind, `/unstick` or an inference
+  failure's shed that sets the speech aside sets aside with it the notice
+  next to it that quotes its opening, which the notice's metadata carries as
+  `opening`, so the speech's words aren't sent again.
 - **Residents:** the `[routing]` notice for a turn with no channel that isn't
   locked reads "Your
   plain speech currently has no channel, so routing posts it to no channel.",

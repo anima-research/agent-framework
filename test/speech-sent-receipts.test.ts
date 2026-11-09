@@ -1646,6 +1646,30 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(openingTexts(surface, rerun!), ['hello there']);
   });
 
+  it("a rewind that sets aside a reply no channel took sets aside the notice that quotes it, so the retry is sent neither", async () => {
+    const surface = new Surface();
+    surface.answer = 'none';
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f, 'hello there');
+    assert.ok(notices(f).some((n) => n.includes('Hi there.')), `premise: the notice quotes the reply: ${notices(f).join('\n')}`);
+    membrane.pushResponse({ ...createMockResponse([{ type: 'text', text: 'I would rather not.' }], 'refusal'), toolCalls: [] } as NormalizedResponse);
+    let starts = 0;
+    f.onTrace((event) => {
+      if (event.type === 'inference:started' && ++starts === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Unstuck reply.' }]));
+    });
+    const accepted = await (f as unknown as { handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean }> })
+      .handleHostCommand('test-server', { command: 'unstick', agentName: 'resident' });
+    assert.equal(accepted.ok, true, 'premise: the unstick was accepted');
+    await f.runUntilIdle();
+    assert.equal(starts, 2, 'premise: the unstick was refused once and retried');
+    const sent = JSON.stringify(membrane.calls.at(-1)!.messages);
+    assert.match(sent, /\[refusal-rewind\]/, 'premise: the last request is the retry after the rewind');
+    assert.doesNotMatch(sent, /Hi there/, "the retry carries neither the set-aside reply nor its notice's quote");
+    assert.match(sent, /hello there/, 'what came before stays');
+  });
+
   it("an inference failure's rewind queues its retry with the messages of the turn it stands in for", async () => {
     const surface = new Surface();
     const f = await host([surface], new MockMembrane());

@@ -1648,6 +1648,33 @@ function speechOpening(text: string): string {
   return `${word > 0 ? cut.slice(0, word) : cut}…`;
 }
 
+function noticesQuoting(
+  all: readonly StoredMessage[],
+  from: number,
+  to: number,
+  speaker: string,
+  passedOver: (m: StoredMessage) => boolean,
+): number[] {
+  const spoken = all.slice(from, to + 1)
+    .filter((m) => m.participant === speaker && Array.isArray(m.content))
+    .map((m) => (m.content as ContentBlock[])
+      .filter((b) => b.type === 'text')
+      .map((b) => (b as ContentBlock & { type: 'text' }).text)
+      .join('\n')
+      .replace(/\s+/g, ' '));
+  if (spoken.length === 0) return [];
+  const quotes = (m: StoredMessage): boolean => {
+    const meta = (m.metadata ?? {}) as { kind?: unknown; opening?: unknown };
+    if (meta.kind !== 'discord-send-failed' || typeof meta.opening !== 'string' || meta.opening === '') return false;
+    const quoted = meta.opening.endsWith('…') ? meta.opening.slice(0, -1) : meta.opening;
+    return spoken.some((text) => text.includes(quoted));
+  };
+  const found: number[] = [];
+  for (let i = from - 1; i >= 0 && passedOver(all[i]!); i--) if (quotes(all[i]!)) found.push(i);
+  for (let i = to + 1; i < all.length && passedOver(all[i]!); i++) if (quotes(all[i]!)) found.push(i);
+  return found;
+}
+
 function notFinal(round: ProseRound): ProseRound {
   const { final: _final, ...rest } = round;
   return rest;
@@ -14446,6 +14473,10 @@ export class AgentFramework {
    *
    * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
    * the shed after inference exhaustion (quarantinePoisonedHistory).
+   *
+   * A no-channel notice next to the exchange, with only rows passed over
+   * between them, goes with it when the opening it quotes (its `opening`)
+   * is in the exchange's own speech.
    */
   private shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): RewindRecord | null {
     const cm = agent.getContextManager();
@@ -14545,6 +14576,17 @@ export class AgentFramework {
       descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
+    const quoting = noticesQuoting(all, from, idx, agent.name, passedOver);
+    if (quoting.length > 0) {
+      const position = new Map(all.map((m, i) => [m.id, i]));
+      for (const at of quoting) {
+        const notice = bodyRangeIn(all, at);
+        appendAll(removedIds, all.slice(notice.from, notice.to + 1).map((m) => m.id));
+        heads.push(all[notice.from]!.id);
+      }
+      removedIds.sort((a, b) => position.get(b)! - position.get(a)!);
+      heads.sort((a, b) => position.get(a)! - position.get(b)!);
+    }
     if (windowed) {
       // One call for the whole exchange, so it is never half applied.
       cm.retractRows(heads, { undone: true });
@@ -14553,6 +14595,10 @@ export class AgentFramework {
     }
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
+    for (const at of quoting) {
+      const notice = bodyRangeIn(all, at);
+      removeStoredMessages(cm, all[notice.from], all[notice.to]);
+    }
     this.retractRemovedElsewhere(cm, removedIds, 'rewind');
     return { descriptor, removedIds };
   }
@@ -35799,9 +35845,11 @@ export class AgentFramework {
             // never influences routing. The channel is named by its label when
             // the registry has one (channelForNotice).
             const where = this.channelForNotice(channelId !== null && serverId !== undefined ? { serverId, channelId } : null);
+            const opening = words === undefined ? '' : speechOpening(words);
             const metadata: MessageMetadata = {
               system: true, kind: 'discord-send-failed', channelId: channelId ?? '', ...(serverId !== undefined ? { serverId } : {}), reason, textLen,
               ...(outcome ? { outcome } : {}), ...(detail !== undefined ? { detail } : {}),
+              ...(!channelId && opening ? { opening } : {}),
             };
             if (!this.agents.has(conversationId)) {
               // Released before its delivery failed: no window left to read it.
@@ -35815,7 +35863,6 @@ export class AgentFramework {
             // the real situation; the machine-readable `kind` is kept stable
             // for downstream consumers (gate intents, surfaces) that key on
             // it.
-            const opening = words === undefined ? '' : speechOpening(words);
             const text = channelId
               ? (outcome === 'unknown'
                 // A request went out and no valid receipt came back: it may
