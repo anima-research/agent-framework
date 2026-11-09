@@ -2283,8 +2283,6 @@ describe('plain speech a module says it showed', () => {
     const cooldowns = internals(f).providerAccelerationCooldowns;
     try {
       cooldowns.set('resident', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'test hold', failures: 1 });
-      // The silent push's messages stand for those a quiesce's park writes
-      // onto a silent push that absorbed a plain one.
       const push = (message: string, silent: boolean) => ({
         agentName: 'resident', reason: 'mcpl:push-event', source: 'discord', timestamp: now, addressed: false,
         ...(silent ? { suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } } : {}),
@@ -2367,8 +2365,6 @@ describe('plain speech a module says it showed', () => {
       quarantinePoisonedHistory(agent: unknown, reason: string): void;
       presentAtEndOf(agent: unknown): void;
     };
-    // The rewind sheds from the agent's window, so the row is presented
-    // there first, as a turn's end would present it.
     i.presentAtEndOf(agent);
     i.routingOf('resident').openingMessages = ['m-opening'];
     i.quarantinePoisonedHistory(agent, 'the provider refused the request');

@@ -6351,8 +6351,7 @@ export class AgentFramework {
     });
     // A stopped host must never hang behind its own cooldown.
     step(() => this.cancelProviderAdmission());
-    // An open logical turn doesn't survive a stop. Its asks are abandoned
-    // once its agent's stream has settled, below.
+    // An open logical turn doesn't survive a stop.
     const endedTurns = [...this.openLogical];
     this.openLogical.clear();
 
@@ -6416,11 +6415,10 @@ export class AgentFramework {
       return [...all].map(([promise, label]) => ({ label, promise }));
     };
 
-    // Wait for all stream iteration handles to settle. An agent whose handle
-    // hasn't settled yet may still write its turn's receipt (stillStreaming,
-    // below). Its activeStreams entry alone doesn't say that a stream is
-    // still running: a restart whose compile failed after taking the stream
-    // id leaves the old frame's entry, which that frame no longer owns.
+    // Wait for all stream iteration handles to settle. An agent's
+    // activeStreams entry alone doesn't say that a stream is still running:
+    // a restart whose compile failed after taking the stream id leaves the
+    // old frame's entry, which that frame no longer owns.
     const stillStreaming = new Set<string>();
     for (const [name, stream] of this.activeStreams) {
       stillStreaming.add(name);
@@ -6437,10 +6435,6 @@ export class AgentFramework {
     const waited = withLeftovers('stream', streams.filter(({ name }) => !uncancelled.has(name)));
     leaveRunning(streams.filter(({ name }) => uncancelled.has(name)), 'stream');
     await waitFor(waited, 'stream');
-    // A turn the stop ended writes no receipt now, so a place a module names
-    // for its speech is logged as for one that ended without a receipt. A
-    // receipt written while the stop waited has already taken its asks. An
-    // agent's stream still running may yet write one, so its turn keeps them.
     for (const [name, routing] of endedTurns) {
       if (!stillStreaming.has(name)) step(() => this.abandonSpeechAsks(name, routing));
     }
