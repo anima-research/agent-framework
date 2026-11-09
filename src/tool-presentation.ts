@@ -3,6 +3,7 @@ import { constants, fchmodSync, closeSync, fstatSync, lstatSync, openSync, readS
 import { closestNames } from './closest-names.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import type { ToolDefinition, ToolResult } from './types/events.js';
+import { appendAll } from './append-all.js';
 
 export interface ToolPresentationConfig {
   /** Absolute path to shared editable JSON. Missing file means no overrides. */
@@ -378,9 +379,13 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
     lines.push(`### ${source}`, '');
     for (const entry of entries) {
       const start = lines.length + 1;
-      lines.push(`#### ${entry.name} (${entry.visible?'visible':'hidden'})`, '',
-        ...entry.description.split('\n'), '', `Description from: ${entry.descriptionSource ?? 'installed component'}`, '', `Schema: ${JSON.stringify(entry.inputSchema)}`);
-      if(entry.description!==entry.originalDescription) lines.push('', 'Original description:', ...entry.originalDescription.split('\n'));
+      lines.push(`#### ${entry.name} (${entry.visible?'visible':'hidden'})`, '');
+      appendAll(lines, entry.description.split('\n'));
+      lines.push('', `Description from: ${entry.descriptionSource ?? 'installed component'}`, '', `Schema: ${JSON.stringify(entry.inputSchema)}`);
+      if(entry.description!==entry.originalDescription) {
+        lines.push('', 'Original description:');
+        appendAll(lines, entry.originalDescription.split('\n'));
+      }
       lines.push('');
       lines[index.get(entry.name)!] = `- [${entry.visible?'visible':'hidden'}] ${entry.name} — details: offset ${start}, limit ${lines.length-start+1}`;
     }
