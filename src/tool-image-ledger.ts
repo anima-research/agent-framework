@@ -369,8 +369,10 @@ function toolResultCutAt(text: string, cap: number): number {
  * that falls at a line break keeps its whole line. The tail never starts on
  * the second half of a surrogate pair, nor inside an image slot or a
  * reference stub of any type, which it moves past, so a slot or a stub lies
- * wholly in the head, the elided middle or the tail. A text within the cap
- * is all head; a cap of 0 or less keeps nothing.
+ * wholly in the head, the elided middle or the tail. Nor does a tail that
+ * starts mid-line start with a line in the stub's grammar, which on a line
+ * of its own would read as a stub the text never had: it steps one on. A
+ * text within the cap is all head; a cap of 0 or less keeps nothing.
  */
 export function toolResultHeadTail(text: string, cap: number): { headEnd: number; tailStart: number } {
   if (text.length <= cap) return { headEnd: text.length, tailStart: text.length };
@@ -399,6 +401,9 @@ export function toolResultHeadTail(text: string, cap: number): { headEnd: number
     const start = lineStart + (m.index ?? 0);
     if (m[0].length <= REFERENCE_STUB_MAX_CHARS && start < tailStart && start + m[0].length > tailStart) tailStart = start + m[0].length;
   }
+  const lineEnd = text.indexOf('\n', tailStart);
+  const first = text.slice(tailStart, lineEnd === -1 ? text.length : lineEnd);
+  if (first.length <= REFERENCE_STUB_MAX_CHARS && [...first.matchAll(REFERENCE_STUB_RE)].length > 0) tailStart++;
   return { headEnd, tailStart };
 }
 
