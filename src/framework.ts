@@ -14928,14 +14928,12 @@ export class AgentFramework {
         channelId: params.channelId ?? '',
       });
       this.refusalRewinds.set(agentName, 0);
-      const opening = this.turnRouting?.get(agentName)?.openingMessages;
-      this.pendingRequests.push({
+      this.pendingRequests.push(this.markFollowOn({
         agentName,
         reason: 'unstick',
         source: 'framework',
         timestamp: Date.now(),
-        ...(opening ? { openingMessages: [...opening] } : {}),
-      });
+      }, this.turnRouting?.get(agentName), 'new turn'));
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,

@@ -267,6 +267,26 @@ describe('batched wake routing', () => {
     await ambientBatchHasNoLocus(rig, [ROOM, GENERAL, ROOM], ['room', 'general']);
   });
 
+  it("an operator's unstick of a turn an ambient batch woke is told the batch's channel", async () => {
+    const fw = rig.framework();
+    rig.membrane().pushResponse({ ...createMockResponse([{ type: 'text', text: 'I would rather not.' }], 'refusal'), toolCalls: [] } as ReturnType<typeof createMockResponse>);
+    incoming(ROOM, 'ambient', 'message 1');
+    await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
+    await fw.runUntilIdle();
+    rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'unstuck words' }]));
+    const accepted = await (fw as unknown as { handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> })
+      .handleHostCommand('discord', { command: 'unstick', agentName: 'scout' });
+    assert.equal(accepted.ok, true, `premise: the unstick was accepted: ${accepted.error}`);
+    await waitFor(() => rig.membrane().calls.length >= 2, "the unstick's run started");
+    await fw.runUntilIdle();
+    assert.deepEqual(publishes(), []);
+    const texts = fw.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+    const notices = texts.filter((t) => t.startsWith('[send-undeliverable] Your plain speech "unstuck words"'));
+    assert.equal(notices.length, 1, JSON.stringify(texts));
+    assertNamesBatchChannels(notices[0]!, ['room'], 'unstuck words'.length);
+  });
+
   it("a sleep's announcement in a turn from two channels is told those channels", async () => {
     const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'sleep-1', name: 'sleep', input: { seconds: 60 } }], 'tool_use'));
