@@ -513,6 +513,10 @@ export interface GateEventInfo {
    *  events share one line. Absent for an untargeted event, whose batch wakes
    *  every agent getAgentNames lists. */
   recipients?: readonly string[];
+  /** Set by the framework on a silent heartbeat tick's event, which stores
+   *  nothing: a batch's line leaves it out, and a batch of ticks alone wakes
+   *  as the tick (WakeProvenance.silentHeartbeat). */
+  silentHeartbeat?: { eventId: string; serverId: string };
   /**
    * Set when the framework asked whether the event is suppressed before it
    * asked about its wake (decideSuppression), so a suppress rule that

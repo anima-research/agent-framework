@@ -159,6 +159,8 @@ interface PendingEvent {
   eventId?: string;
   /** GateEventInfo.recipients. */
   recipients?: readonly string[];
+  /** GateEventInfo.silentHeartbeat. */
+  silentHeartbeat?: { eventId: string; serverId: string };
 }
 
 /** Where the host put a message the gate wrote: the agent whose window it
@@ -232,6 +234,10 @@ export interface WakeProvenance {
    *  window, not telemetry: it carries the channel's name as the agent is
    *  shown it. */
   line?: WakeLine;
+  /** A batch of silent heartbeat ticks alone wakes as its newest tick: the
+   *  framework makes the wake a silent heartbeat, prose suppressed, as the
+   *  tick's own wake is when the gate lets it through at once. */
+  silentHeartbeat?: { eventId: string; serverId: string };
 }
 
 interface DebounceState {
@@ -4090,6 +4096,7 @@ export class EventGate {
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
       ...(info.recipients !== undefined ? { recipients: [...info.recipients] } : {}),
+      ...(info.silentHeartbeat !== undefined ? { silentHeartbeat: { ...info.silentHeartbeat } } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -4207,7 +4214,19 @@ export class EventGate {
     });
   }
 
-  private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {
+  private deliverBatch(batch: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {
+    // A silent tick stored nothing, so the line has nothing of it to name. A
+    // batch of ticks alone wakes as its newest tick; beside any other event,
+    // the wake is that event's, ordinary, as a tick's merged wake is.
+    const events = batch.filter((e) => e.silentHeartbeat === undefined);
+    if (events.length === 0) {
+      const silentHeartbeat = batch[batch.length - 1]!.silentHeartbeat;
+      for (const agentName of woken) {
+        this.requestInferenceFn(agentName, 'heartbeat', 'heartbeat', { silentHeartbeat });
+        woke?.push(agentName);
+      }
+      return;
+    }
     const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL

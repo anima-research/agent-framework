@@ -5597,6 +5597,8 @@ export class AgentFramework {
             // The batch's line, when the gate left it to the turn's start
             // (beginAgentTurn decides it: placeWakeLines).
             ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
+            // A batch of silent ticks alone wakes as the tick (deliverHeartbeat).
+            ...(provenance?.silentHeartbeat ? { suppressProse: true, silentHeartbeat: provenance.silentHeartbeat } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
@@ -6847,6 +6849,13 @@ export class AgentFramework {
         ...(wake.silent ? { silent: true } : {}),
       },
       tags: [],
+      // A silent tick's batch wakes as the tick, and wakes the agents its
+      // direct wake does, not every agent the gate wakes, such as a
+      // conversation fork.
+      ...(wake.silent ? {
+        recipients: this.heartbeatTargets(),
+        silentHeartbeat: { eventId: wake.eventId, serverId: 'heartbeat' },
+      } : {}),
     };
   }
 
