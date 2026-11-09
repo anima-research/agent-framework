@@ -10,7 +10,7 @@ import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
-async function harness() {
+async function harness(opts: { allowedTools?: string[] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-input-unparseable-'));
   const membrane = new MockMembrane();
   const effects: ToolCall[] = [];
@@ -34,7 +34,7 @@ async function harness() {
   };
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'Test' }],
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'Test', ...(opts.allowedTools ? { allowedTools: opts.allowedTools } : {}) }],
     modules: [module], syncIntervalMs: 0, codeExecution: { enabled: true },
   });
   const traces: Array<Record<string, unknown>> = [];
@@ -162,6 +162,18 @@ test('a block membrane refuses with no invoke it could name is answered without 
   } finally { await h.close(); }
 });
 
+for (const [name, why] of [['', 'the call the block gave no name to'], ['probe--look', 'a call to a tool the agent may not call']] as const) {
+  test(`for an agent with allowedTools, ${why} is refused with the block's reason`, async () => {
+    const h = await harness({ allowedTools: ['probe--move'] });
+    try {
+      const results = await h.turn([marked(BLOCK, name, {}, REASON)]);
+      assert.deepEqual(h.effects, []);
+      assert.equal(results[0]!.isError, true);
+      assert.ok(results[0]!.content.endsWith(`: ${REASON}. ${RESEND}`), results[0]!.content);
+    } finally { await h.close(); }
+  });
+}
+
 test('a call marked with a reason is refused even when its text is JSON null', async () => {
   const h = await harness();
   try {
@@ -177,20 +189,6 @@ test('a call marked with an empty reason gets the refusal its text gets', async 
     const results = await h.turn([marked(refusals[0]!.marker, 'probe--move', {}, '')]);
     assert.deepEqual(h.effects, []);
     assert.equal(results[0]!.content, refusals[0]!.says);
-  } finally { await h.close(); }
-});
-
-test('in XML tool mode, the stored round keeps each refused call with its marker and its reason', async () => {
-  const h = await harness();
-  try {
-    const call = marked(BLOCK, 'probe--move', {}, REASON);
-    asTurnWithNoLiveRound(h.membrane, call);
-    await h.turn([call]);
-    const stored = h.framework.getAgent('assistant')!.getContextManager().getAllMessages()
-      .flatMap((m) => m.content)
-      .filter((b) => b.type === 'tool_use')
-      .map((b) => b as { id: string; unparseableInput?: string; unparseableReason?: string });
-    assert.deepEqual(stored.map((b) => [b.id, b.unparseableInput, b.unparseableReason]), [['call-1', BLOCK, REASON]]);
   } finally { await h.close(); }
 });
 
@@ -354,6 +352,18 @@ test('a marked call through executeToolCall is a failure before the tool runs', 
     });
     assert.equal(ran.success, true);
     assert.deepEqual(h.effects.map((call) => call.input), [{}], 'a null-marked call runs with no arguments');
+  } finally { await h.close(); }
+});
+
+test("for an agent with allowedTools, a call with a reason through executeToolCall fails with the block's reason", async () => {
+  const h = await harness({ allowedTools: ['probe--move'] });
+  try {
+    const result = await h.framework.executeToolCall({
+      id: 'programmatic', name: 'probe--look', input: {}, unparseableInput: BLOCK, unparseableReason: REASON, callerAgentName: 'assistant',
+    });
+    assert.equal(result.success, false);
+    assert.ok((result.error ?? '').endsWith(`: ${REASON}. ${RESEND}`), result.error);
+    assert.equal(h.effects.length, 0);
   } finally { await h.close(); }
 });
 

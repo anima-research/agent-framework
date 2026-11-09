@@ -3144,6 +3144,27 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
+  it("XML tool mode: each call of a refused block keeps its marker and reason in the stored history, across a restart", async () => {
+    const h = await harness({ xml: true });
+    try {
+      const listed = refusedBlock('b1', 'channel_list');
+      const posted = refusedBlock('b2', 'channel_publish');
+      await h.turn([
+        createMockResponse([listed, posted], 'tool_use'),
+        { ...createMockResponse([listed, posted, result('b1'), result('b2')]), toolCalls: [] },
+      ]);
+      await h.restart();
+      const stored = h.messages().flatMap((m) => m.content).filter((b) => b.type === 'tool_use')
+        .map((b) => b as { id: string; unparseableInput?: string; unparseableReason?: string });
+      assert.deepEqual(stored.map((b) => [b.id, b.unparseableInput, b.unparseableReason]), [
+        ['b1', 'the block as written', 'an invoke has no closing tag'],
+        ['b2', 'the block as written', 'an invoke has no closing tag'],
+      ]);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('locus, XML tool mode: a refused block whose skip_reply is not its first call keeps its round private and silences nothing after it', async () => {
     const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'locus' }] });
     try {
