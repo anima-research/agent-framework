@@ -4383,12 +4383,13 @@ export class EventGate {
    * The gate's own timers that will wake `agentNames` with no new event, for
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
-   * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires, or only may, where each of its events has a message of its
-   * own whose write was placed for each of `agentNames`, since a host that
-   * reads WakeProvenance.writes starts no turn for an agent that has read and
-   * answered every one; a judge rule's goes to the judge, so it only may). A batch,
-   * and a sleep with no agent named, reach the gate's recipients alone.
+   * batches of rules other than `exceptPolicy`. A debounce's batch wakes the
+   * agent when it fires. It only may where each of `agentNames` is given none
+   * of its events, or each event delivery gives that agent has a message of its
+   * own whose write was placed for it. A host that reads WakeProvenance.writes
+   * starts no turn for an agent that has read and answered every one. A judge
+   * rule's batch goes to the judge, so it only may. A batch, and a sleep with
+   * no agent named, reach the gate's recipients alone.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
