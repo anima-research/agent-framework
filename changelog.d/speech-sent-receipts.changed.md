@@ -8,9 +8,8 @@
   whose speech went to a channel also has its receipt name where a module
   showed the speech, beside the channel; one whose channel post failed names
   that place in its receipt, and the failed post keeps its own notice. An
-  ephemeral run that a tool ends writes no receipt, as before, and a place a
-  module names for its speech is logged instead. This
-  holds under prose routing by locus, hybrid and locked, for each tool round's
+  ephemeral run that a tool ends writes no receipt, as before. This holds
+  under prose routing by locus, hybrid and locked, for each tool round's
   prose as it routes and for the final reply.
 - **Hosts:** a routed piece of speech with no channel that a module says it
   showed logs `[routeSpeech] <agent>: turn has no channel; <n> chars shown by
