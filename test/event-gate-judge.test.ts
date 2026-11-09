@@ -985,6 +985,15 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
+  it("tells the judge of a pending debounced batch split by recipient: an agent given none of its events doesn't make the wake certain", () => {
+    const { gate } = makeGate(writeConfig('upcoming-split-none.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+    }));
+    gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [false], "the other agent is given no event, so delivery doesn't wake it");
+    gate.dispose();
+  });
+
   it("tells the judge of a pending debounced batch split by recipient: one agent's event with no write wakes that agent", () => {
     const { gate } = makeGate(writeConfig('upcoming-split-unwritten.json', {
       policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],

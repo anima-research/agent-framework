@@ -314,9 +314,11 @@ describe('a debounced batch of targeted messages', () => {
   const wakeRoutes = (internals: Internals) => (batchWakes(internals) as Array<{ agentName: string; channelId?: string }>)
     .map((r) => [r.agentName, r.channelId]).sort();
   const gateLinesIn = (framework: AgentFramework, name: string) => windowTexts(framework, name).filter((t) => t.includes('[Gate:'));
+  /** The request `name`'s turn sent, by its system prompt. */
+  const requestOf = (membrane: MockMembrane, name: string) => JSON.stringify(membrane.calls.find((call) => JSON.stringify(call).includes(`You are ${name}.`)) ?? null);
 
   it("messages for two co-residents in one batch: each is woken for her own, routed to her own channel, with no line in either window", async () => {
-    const { framework, internals, dir } = await boot();
+    const { framework, internals, dir, membrane } = await boot();
     try {
       await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-a1', 'scout, a word', { targetAgents: ['scout'] }));
       await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b1', 'mira, a word', { targetAgents: ['mira'] }));
@@ -326,6 +328,15 @@ describe('a debounced batch of targeted messages', () => {
       assert.deepEqual(wakeRoutes(internals), [['mira', ROOM_B], ['scout', ROOM_A]], "each wake is routed to her own message's channel");
       assert.deepEqual(gateLinesIn(framework, 'scout'), []);
       assert.deepEqual(gateLinesIn(framework, 'mira'), []);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+      // Each start decides its line, so the case waits for both requests.
+      void framework.runUntilIdle();
+      await waitFor(() => membrane.calls.length === 2, 'both starts to send their requests');
+      for (const text of ['scout, a word', 'scout, another']) assert.ok(requestOf(membrane, 'scout').includes(text), `premise: scout's request holds "${text}"`);
+      for (const text of ['mira, a word', 'mira, another']) assert.ok(requestOf(membrane, 'mira').includes(text), `premise: mira's request holds "${text}"`);
+      assert.deepEqual(gateLinesIn(framework, 'scout'), [], 'no line at her start');
+      assert.deepEqual(gateLinesIn(framework, 'mira'), [], 'no line at her start');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -333,7 +344,7 @@ describe('a debounced batch of targeted messages', () => {
   });
 
   it('a batch with a message for no one in particular and one for mira: scout is routed by the first alone, mira by both, with no line in either window', async () => {
-    const { framework, internals, dir } = await boot();
+    const { framework, internals, dir, membrane } = await boot();
     try {
       await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-u1', 'hello, all', {}));
       await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b1', 'mira, a word', { targetAgents: ['mira'] }));
@@ -341,6 +352,15 @@ describe('a debounced batch of targeted messages', () => {
       assert.deepEqual(wakeRoutes(internals), [['mira', ROOM_B], ['scout', ROOM_A]], 'scout is routed to the message he may see');
       assert.deepEqual(gateLinesIn(framework, 'scout'), []);
       assert.deepEqual(gateLinesIn(framework, 'mira'), []);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+      // Each start decides its line, so the case waits for both requests.
+      void framework.runUntilIdle();
+      await waitFor(() => membrane.calls.length === 2, 'both starts to send their requests');
+      assert.ok(requestOf(membrane, 'scout').includes('hello, all'), "premise: scout's request holds the message for all");
+      for (const text of ['hello, all', 'mira, a word']) assert.ok(requestOf(membrane, 'mira').includes(text), `premise: mira's request holds "${text}"`);
+      assert.deepEqual(gateLinesIn(framework, 'scout'), [], 'no line at his start');
+      assert.deepEqual(gateLinesIn(framework, 'mira'), [], 'no line at her start');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -460,7 +480,7 @@ describe('a debounced batch of targeted messages', () => {
   });
 
   it('two messages for a co-resident wake her alone, with no line in any window', async () => {
-    const { framework, internals, dir } = await boot();
+    const { framework, internals, dir, membrane } = await boot();
     try {
       await internals.handleMcplChannelIncoming(forMira('m-t1', 'mira, a word'));
       await internals.handleMcplChannelIncoming(forMira('m-t2', 'mira, another'));
@@ -469,6 +489,12 @@ describe('a debounced batch of targeted messages', () => {
       assert.deepEqual(gateRows(framework), []);
       assert.ok(!windowTexts(framework, 'mira').some((t) => t.includes('[Gate:')));
       assert.ok(!windowTexts(framework, 'scout').some((t) => t.includes('[Gate:')));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+      await framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 1, 'premise: her turn ran');
+      for (const text of ['mira, a word', 'mira, another']) assert.ok(requestOf(membrane, 'mira').includes(text), `premise: her request holds "${text}"`);
+      assert.deepEqual(gateRows(framework), [], 'no line at her start');
+      assert.ok(!windowTexts(framework, 'mira').some((t) => t.includes('[Gate:')), 'none in her window');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

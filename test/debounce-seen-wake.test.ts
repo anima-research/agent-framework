@@ -1087,6 +1087,40 @@ describe("what the judge is told of the framework's queued wakes", () => {
     } finally { await f.close(); }
   });
 
+  it('a queued start merged from several wakes is a maybe when the scheduler could drop each of them, and certain otherwise', async () => {
+    const { f } = await judged(true);
+    try {
+      const internal = f.framework as unknown as Internal & {
+        startAgentStream(...args: unknown[]): Promise<unknown>;
+        processInferenceRequests(): Promise<void>;
+      };
+      // The framework's mark of a start merged from several wakes, read off a real merge.
+      const start = internal.startAgentStream;
+      let MERGED: symbol | undefined;
+      internal.startAgentStream = async function (this: unknown, ...args: unknown[]) {
+        const trigger = args[1];
+        if (trigger && typeof trigger === 'object') MERGED ??= Object.getOwnPropertySymbols(trigger).find((s) => s.description === 'merged-batch');
+        return start.apply(this, args);
+      };
+      try {
+        internal.pendingRequests.push(
+          { agentName: 'agent', reason: 'zz-a', source: 'test', timestamp: Date.now() },
+          { agentName: 'agent', reason: 'zz-b', source: 'test', timestamp: Date.now() },
+        );
+        await internal.processInferenceRequests();
+      } finally {
+        internal.startAgentStream = start;
+      }
+      assert.ok(MERGED, 'premise: a merged start, for its mark');
+      const mark: symbol = MERGED;
+      await f.framework.runUntilIdle();
+      const member = (reads: Record<string, unknown>) => ({ agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), ...reads });
+      const merged = (...members: Array<Record<string, unknown>>) => ({ [mark]: members.map(member) });
+      assert.deepEqual(told(internal, [merged({ readsRows: [{ row: 'row-1' }] }, { readsRows: [{ row: 'row-2' }] })]), [false], 'each merged wake could be dropped');
+      assert.deepEqual(told(internal, [merged({ readsRows: [{ row: 'row-1' }] }, {})]), [true], 'beside a merged wake it can never drop');
+    } finally { await f.close(); }
+  });
+
   it('a turn a provider cooldown holds is a maybe when the scheduler could drop each held request, and certain otherwise', async () => {
     const { f } = await judged(true);
     try {

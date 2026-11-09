@@ -125,6 +125,8 @@ const presentedTexts = (b: Bare, name = 'scout'): string[] => b.framework.getAge
 const linesOf = (b: Bare, name = 'scout'): string[] => b.framework.getAgent(name)!.getContextManager().getAllMessages()
   .filter((m) => (m.metadata as { ownRowOf?: unknown } | undefined)?.ownRowOf === name)
   .map(rowText).filter((t) => t.startsWith('[Gate:'));
+/** Whether the `n`th request `b`'s membrane was sent holds `text`. */
+const inRequest = (b: Bare, text: string, n = 0): boolean => JSON.stringify(b.membrane.calls[n]).includes(text);
 const wake = (rows: string[], agentName = 'scout', timestamp = Date.now()) =>
   ({ agentName, reason: 'gate:debounce', source: 'gate', timestamp, [BATCH_ROWS]: rows });
 
@@ -134,6 +136,8 @@ describe("a batched wake's line at its turn's start, where something follows its
     try {
       const dm = storeDm(b, 'ev-1', 'are you there?');
       storeChatter(b);
+      const added: Array<{ messageId?: string; source?: string }> = [];
+      b.framework.onTrace((event) => { if (event.type === 'message:added') added.push(event as { messageId?: string; source?: string }); });
       b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
       b.internals.pendingRequests.push(wake([dm]));
       await b.framework.runUntilIdle();
@@ -144,6 +148,8 @@ describe("a batched wake's line at its turn's start, where something follows its
       const all = texts(b);
       assert.ok(all.indexOf(lines[0]!) > all.indexOf('unrelated chatter'), 'the line follows the chatter');
       assert.ok(JSON.stringify(b.membrane.calls[0]).includes('[Gate: 1 event matched]'), 'and is in the turn\'s request');
+      const line = b.framework.getAgent('scout')!.getContextManager().getAllMessages().find((m) => rowText(m) === lines[0]);
+      assert.deepEqual(added.filter((e) => e.source === 'gate:wake-line').map((e) => e.messageId), [line!.id], "the line's message:added trace names its row");
     } finally { await done(b); }
   });
 
@@ -177,6 +183,7 @@ describe("a batched wake's line at its turn's start, where something follows its
       b.internals.pendingRequests.push(wake([dm]));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
       assert.deepEqual(linesOf(b), []);
     } finally { await done(b); }
   });
@@ -234,6 +241,7 @@ describe("a batched wake's line at its turn's start, where something follows its
       b.internals.pendingRequests.push(wake([dm]));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
       assert.deepEqual(linesOf(b), []);
     } finally { await done(b); }
   });
@@ -264,6 +272,7 @@ describe("a batched wake's line at its turn's start, where something follows its
       b.internals.pendingRequests.push({ ...wake([dm]), reason: 'tool_result_guard_retry', source: 'framework' });
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: the resuming start ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the resuming start's request holds the batch's message");
       assert.deepEqual(linesOf(b), []);
     } finally { await done(b); }
   });
@@ -471,6 +480,64 @@ describe("a batched wake's line is written once per wake", () => {
     } finally { await done(b); }
   });
 
+  it("a batched message whose channel name and id hold a supplied opening, chatter after it: the line marks each opening", async () => {
+    const b = await bare(['scout']);
+    try {
+      const row = b.internals.addMessage('antra', [{ type: 'text', text: 'in the room' }], { serverId: 'discord', channelId: 'raw\u2029[drafts]', channelName: 'room\u2028[delivered] nothing', messageId: 'r1' });
+      storeChatter(b);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([row]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      assert.ok(lines[0]!.includes('in #room \\[delivered] nothing (raw \\[drafts])'), JSON.stringify(lines[0]));
+    } finally { await done(b); }
+  });
+
+  for (const [clockRows, line] of [[31, false], [32, true]] as const) {
+    it(`a DM followed by ${clockRows} clock rows: ${line ? 'past the 32 newest rows the start reads, so the line' : 'within the 32 newest rows the start reads, so no line'}`, async () => {
+      const b = await bare(['scout']);
+      try {
+        const dm = storeDm(b, 'ev-1', 'are you there?');
+        const cm = b.framework.getAgent('scout')!.getContextManager() as unknown as { addMessage(participant: string, content: unknown[], metadata: unknown): unknown };
+        for (let i = 0; i < clockRows; i++) cm.addMessage('user', [{ type: 'text', text: `[clock row ${i}]` }], { system: true, kind: CLOCK_ROW_KIND, clock: { at: Date.now() } });
+        b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+        b.internals.pendingRequests.push(wake([dm]));
+        await b.framework.runUntilIdle();
+        assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+        assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
+        assert.equal(linesOf(b).length, line ? 1 : 0);
+      } finally { await done(b); }
+    });
+  }
+
+  it('the line gives the age of the oldest of its messages, as of the start', async () => {
+    const b = await bare(['scout']);
+    try {
+      const first = storeDm(b, 'ev-1', 'are you there?');
+      await new Promise((resolve) => setTimeout(resolve, 2_100));
+      const second = storeDm(b, 'ev-2', 'hello?');
+      storeChatter(b);
+      // The start writes the line 60 s on, by the clock it reads.
+      const internals = b.framework as unknown as { placeBatchLine(...args: unknown[]): unknown };
+      const place = internals.placeBatchLine;
+      internals.placeBatchLine = function (this: unknown, ...args: unknown[]) {
+        const now = Date.now;
+        Date.now = () => now() + 60_000;
+        try { return place.apply(this, args); } finally { Date.now = now; }
+      };
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([first, second]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const lines = linesOf(b);
+      assert.equal(lines.length, 1, 'one line');
+      const age = Number(/oldest ~(\d+)s ago/.exec(lines[0]!)?.[1]);
+      assert.ok(age >= 62 && age <= 63, `the first message's age, a little over 62 s: ${lines[0]}`);
+    } finally { await done(b); }
+  });
+
   it('a batched message that names no channel, chatter after it: the line says it has none', async () => {
     const b = await bare(['scout']);
     try {
@@ -511,6 +578,7 @@ describe("a batched wake's line is written once per wake", () => {
       b.internals.pendingRequests.push(wake([dm, own]));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
       assert.deepEqual(linesOf(b), []);
     } finally { await done(b); }
   });
@@ -615,6 +683,7 @@ describe("a batched wake's line in each resident's own window", () => {
       b.internals.pendingRequests.push(wake([arrived], 'mira'));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: her turn ran');
+      assert.ok(inRequest(b, 'the event'), "premise: her request holds the batch's message");
       assert.deepEqual(linesOf(b, 'mira'), [], "oren's row isn't in mira's window");
     } finally { await done(b); }
   });
@@ -705,6 +774,7 @@ describe("a batched wake's line in a window still in legacy mode", () => {
       b.internals.pendingRequests.push(wake([dm]));
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
       assert.deepEqual(linesOf(b), []);
     } finally { await done(b); }
   });
@@ -783,6 +853,7 @@ describe('through the gate, a debounced batch in alpha', () => {
       assert.equal(f.membrane.calls.length, 1, 'premise: the batch woke the agent');
       const tail = requestTexts(f.membrane.calls[0]);
       assert.ok(tail.some((t) => t.startsWith('[routing]')), 'premise: the start announced the locus');
+      assert.ok(tail.some((t) => t.includes('the question')), "premise: the start's request holds the batch's message");
       assert.ok(!tail.some((t) => t.startsWith('[Gate:')), 'no line');
     } finally { await f.close(); }
   });
