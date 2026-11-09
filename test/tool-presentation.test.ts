@@ -271,6 +271,20 @@ test('the catalogue opens on what the resident hid, each with its source and the
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
+test('a hidden tool whose installed description has more lines than a call takes as arguments still renders in the hidden section',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-long-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const long=Array.from({length:200_000},(_,i)=>`line ${i}`).join('\n');
+  const tools=[{name:'long--tool',description:long,inputSchema:{type:'object' as const}},...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:{'long--tool':{visible:false}}}));
+  const lines=renderCatalogue(p.resolve(tools)).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (1)'), indexAt=lines.indexOf('## Index by source');
+  assert.ok(hiddenAt>0 && indexAt>hiddenAt,`hidden section at ${hiddenAt}, index at ${indexAt}`);
+  assert.equal(lines.slice(hiddenAt,indexAt).filter(line=>line.startsWith('> line ')).length,200_000);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
 test('a hidden tool with no override and no configured default shows its installed description in the hidden section',()=>{
  const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-installed-'));
  try {

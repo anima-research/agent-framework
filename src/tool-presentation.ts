@@ -380,7 +380,11 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
   const hidden = snapshot.entries.filter(e => !e.visible);
   if (hidden.length) {
     lines.push(`## Hidden (${hidden.length})`, '');
-    for (const entry of hidden) lines.push(`### ${entry.name} (${entry.source})`, '', ...entry.description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).map(line => line ? `> ${line}` : '>'), '');
+    for (const entry of hidden) {
+      lines.push(`### ${entry.name} (${entry.source})`, '');
+      appendAll(lines, entry.description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).map(line => line ? `> ${line}` : '>'));
+      lines.push('');
+    }
   }
   lines[indexLineAt] = `Index by source: line ${lines.length + 1}.`;
   lines.push('## Index by source', '');
