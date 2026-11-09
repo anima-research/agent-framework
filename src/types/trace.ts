@@ -136,9 +136,12 @@ export type TraceEvent =
        *  timers, so a stalled event loop can end it later. Absent for a wait
        *  too long for a date. */
       until?: number;
-      /** The try the wait leads to, the turn's first send counting as 1 (a
-       *  deadline's retries count that call's expiries, as the policy does).
-       *  Absent from a framework before this field. */
+      /** The try the wait leads to, as the error policy counts tries
+       *  against `maxTries`: each failed start counts, sent or not, the count
+       *  starts over when a provider hold queues the turn again, and a
+       *  deadline's retries count that call's expiries. The policy's place in
+       *  its schedule, not a count of sends. Absent from a framework before
+       *  this field. */
       nextTry?: number;
       /** The most tries the error policy allows (ErrorAction.maxTries), when it says. */
       maxTries?: number;

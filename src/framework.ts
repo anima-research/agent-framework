@@ -2940,9 +2940,12 @@ interface TurnRetryWait {
   /** When it is due to end (epoch ms), as `inference:waiting` says it.
    *  Absent for a wait too long for a date. */
   until?: number;
-  /** The try the wait leads to, counting the turn's first send as 1. A
-   *  deadline's retries count that call's expiries instead, as the policy
-   *  does. Absent only from a wait started without it. */
+  /** The try the wait leads to, as the error policy counts tries (against
+   *  `maxTries`): each failed start counts, whether or not it reached the
+   *  provider; a provider hold that queues the turn again starts the count
+   *  over; a deadline's retries count that call's expiries. So it is the
+   *  policy's place in its schedule, not a count of sends. Absent only from a
+   *  wait started without it. */
   nextTry?: number;
   /** The most tries the policy allows (ErrorAction.maxTries), when it says. */
   maxTries?: number;
@@ -4343,8 +4346,10 @@ export class AgentFramework {
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
   private retryWaitWakers = new Set<() => void>();
   /** Each agent's error-policy retry wait in progress, for healthSnapshot():
-   *  while it lasts the agent's state reads `idle` though its turn is alive. */
-  private turnRetryWaits = new Map<string, TurnRetryWait>();
+   *  while it lasts the agent's state reads `idle` though its turn is alive.
+   *  Keyed by the Agent, not its name: an agent registered under a removed
+   *  one's name doesn't inherit its wait. */
+  private turnRetryWaits = new WeakMap<Agent, TurnRetryWait>();
   private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   private providerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
@@ -7442,7 +7447,7 @@ export class AgentFramework {
       ...(action?.retry && typeof action.retryClass === 'string' ? { retryClass: boundFailureText(action.retryClass, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
     };
     const record: TurnRetryWait = { since, ...(until <= MAX_DATE_MS ? { until } : {}), ...shown };
-    this.turnRetryWaits.set(agent.name, record);
+    this.turnRetryWaits.set(agent, record);
     // stop() wakes this step through retryWaitWakers and ends the rest by
     // closing admission; the window's waker ends the rest itself.
     let ended = false;
@@ -7475,8 +7480,7 @@ export class AgentFramework {
       }
     } finally {
       wakers.delete(wake);
-      // Only this wait's record: a replaced agent's turn may have begun one of its own.
-      if (this.turnRetryWaits.get(agent.name) === record) this.turnRetryWaits.delete(agent.name);
+      if (this.turnRetryWaits.get(agent) === record) this.turnRetryWaits.delete(agent);
     }
   }
 
@@ -27936,15 +27940,16 @@ export class AgentFramework {
       }
 
       const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+      // The earlier failures the policy counts, which the wait's nextTry follows.
+      const policyAttempt = cuts ?? attempt;
       const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(routing) || (isDeadlineExpiry(err) && !asTransient)))
-        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
       if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
       else this.deadlineCuts.delete(agent.name);
       if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
-        // The policy counted `cuts ?? attempt` earlier failures; the wait leads to the try after this one.
-        await this.waitForRetry(action.delayMs, checkWindow, agent, { nextTry: (cuts ?? attempt) + 2, action });
+        await this.waitForRetry(action.delayMs, checkWindow, agent, { nextTry: policyAttempt + 2, action });
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
           // it, and a stop kept for the turn goes with it. The turn ends as
@@ -29883,8 +29888,10 @@ export class AgentFramework {
             }
 
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+            // The earlier failures the policy counts, which the wait's nextTry follows.
+            const policyAttempt = cuts ?? attempt;
             const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
-              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
@@ -29896,8 +29903,7 @@ export class AgentFramework {
               const retryWindow: CheckWindow = { abandoned: false };
               this.checkAhead.set(agent, retryWindow);
               // A policy's delay can be a provider's retry-after: wait all of it.
-              // The policy counted `cuts ?? attempt` earlier failures; the wait leads to the try after this one.
-              await this.waitForRetry(action.delayMs, retryWindow, agent, { nextTry: (cuts ?? attempt) + 2, action });
+              await this.waitForRetry(action.delayMs, retryWindow, agent, { nextTry: policyAttempt + 2, action });
               if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
@@ -34741,7 +34747,10 @@ export class AgentFramework {
         /** A turn of the agent's is alive (its continuation on its way, as the scheduler reads it), whatever `status` says. */
         turnAlive: this.hasTurn(name),
         /** The turn's wait for its error policy's next try, or null: see TurnRetryWait. */
-        retrying: this.turnRetryWaits?.get(name) ?? null,
+        retrying: (() => {
+          const wait = this.turnRetryWaits?.get(agent);
+          return wait ? { ...wait } : null;
+        })(),
         consecutiveInferenceFailures: this.consecutiveInferenceFailures.get(name) ?? 0,
         providerAdmission: (() => {
           const gate = this.providerGates?.get(name);

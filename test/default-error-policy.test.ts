@@ -850,6 +850,7 @@ test("while a turn waits out its policy's delay, healthSnapshot says it is retry
   fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
   await idle(fw);
   assert.equal(waits.length, 2, 'two waits, one after each failure');
+  assert.equal(health.length, waits.length, 'a snapshot was read as each wait began (a throw in the listener would leave none)');
   assert.deepEqual(waits.map((w) => w.nextTry), [2, 3], 'each leads to the try after the one that failed');
   for (const w of waits) {
     assert.equal(w.maxTries, 13);
@@ -896,11 +897,17 @@ test('a stop during the wait ends it, and healthSnapshot no longer says the turn
     onInferenceError: () => ({ retry: true, delayMs: 60_000, retryClass: 'overloaded', maxTries: 13 }),
   });
   let stopped: Promise<void> | undefined;
-  fw.onTrace((e) => { if (e.type === 'inference:waiting' && !stopped) stopped = fw.stop(); });
+  let during: unknown;
+  fw.onTrace((e) => {
+    if (e.type !== 'inference:waiting' || stopped) return;
+    during = (fw.healthSnapshot().agents as Array<Record<string, unknown>>).find((a) => a.name === 'resident')!.retrying;
+    stopped = fw.stop();
+  });
   fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
   void fw.runUntilIdle().catch(() => {});
   for (let i = 0; i < 200 && !stopped; i++) await new Promise((r) => setTimeout(r, 25));
   assert.ok(stopped, 'the wait began');
+  assert.equal((during as Record<string, unknown> | null)?.nextTry, 2, 'it said it was retrying before the stop');
   await stopped;
   const agents = fw.healthSnapshot().agents as Array<Record<string, unknown>>;
   for (const a of agents) assert.equal(a.retrying, null);
@@ -928,4 +935,43 @@ test('a retry on the start path, before any stream, says which try is next and w
   assert.equal(waits[0]!.maxTries, (MEMBRANE_RETRY_SETTINGS as RetrySettings).overloaded!.maxAttempts, 'the tries of the settings it was given');
   assert.equal((health[0]!.retrying as Record<string, unknown>).nextTry, 2);
   assert.equal(health[0]!.turnAlive, true);
+});
+
+test("a 529 sent mid-stream as an error event is shown as the default policy retries it: overloaded, with its settings' tries", async (t: TestContext) => {
+  const membrane = new EventOnceMembrane(err({ type: 'server', retryable: true, httpStatus: 529, message: 'overloaded_error' }));
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-overload' }]));
+  const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
+  const { waits, health } = watchWaits(fw);
+  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+  await idle(fw);
+  assert.equal(waits.length >= 1, true, 'the turn waited to retry');
+  assert.equal(waits[0]!.retryClass, 'overloaded');
+  assert.equal(waits[0]!.maxTries, (MEMBRANE_RETRY_SETTINGS as RetrySettings).overloaded!.maxAttempts);
+  assert.equal(waits[0]!.nextTry, 2);
+  assert.equal((health[0]!.retrying as Record<string, unknown>).retryClass, 'overloaded');
+});
+
+test("an agent registered under the name of one that is waiting doesn't show that wait", async (t: TestContext) => {
+  const membrane = new FlakyMembrane(1);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
+  const fw = await makeFramework(t, membrane, {
+    maxRetries: 1,
+    onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 500, retryClass: 'overloaded' } : { retry: false }),
+  });
+  const agents = (fw as unknown as { agents: Map<string, unknown> }).agents;
+  const residentOf = () => (fw.healthSnapshot().agents as Array<Record<string, unknown>>).find((a) => a.name === 'resident')!;
+  let replaced: unknown;
+  let restored: unknown;
+  fw.onTrace((e) => {
+    if (e.type !== 'inference:waiting' || replaced !== undefined) return;
+    const real = agents.get('resident');
+    agents.set('resident', Object.create(real as object));
+    replaced = residentOf().retrying;
+    agents.set('resident', real);
+    restored = residentOf().retrying;
+  });
+  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+  await idle(fw);
+  assert.equal(replaced, null, 'the agent under the name has no wait of its own');
+  assert.equal((restored as Record<string, unknown>).retryClass, 'overloaded', "the waiting agent's own entry shows it");
 });
