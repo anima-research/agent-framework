@@ -1,28 +1,4 @@
-/**
- * Placing a context injection at `beforeUser` is deprecated
- * (anima-research/agent-framework#171), from a module's `gatherContext()` and
- * from an MCPL server's `context/beforeInference` alike. `compile()` places it
- * again before the newest user message at every compile, so it moves: the
- * request misses the cache from there on, and it can split a tool call from
- * its result, since tool results are stored as user messages. Use
- * `afterUser`, which is stored where it lands (stored-injections.ts).
- *
- * The other positions stay supported:
- *
- *   - A `system` injection goes into the system prompt. A change to its text
- *     misses the cache from the system prompt on, and the conversation
- *     doesn't store it.
- *   - An `afterUser` injection a module sets `placedEachCompile` on is placed
- *     again at each start, so it moves, with the same cache cost as
- *     `beforeUser`, and on a model that binds a reply's thinking to
- *     everything before it, every reply after its old place loses its
- *     thinking. It's for text that must stay near the end, such as
- *     instructions.
- *
- * Nothing changes in how injections are applied. Each module and MCPL server
- * whose collected injections include a `beforeUser` one is named once on
- * stderr, so remaining uses are visible.
- */
+/** A `beforeUser` context injection is deprecated (anima-research/agent-framework#171). */
 
 export const CONTEXT_INJECTION_DEPRECATION_NOTICE =
   'Placing a context injection at beforeUser is deprecated (anima-research/agent-framework#171). ' +

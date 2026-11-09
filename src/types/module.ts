@@ -53,7 +53,7 @@ export interface MessageQuery {
  * request misses the cache from there on, and it can split a tool call from
  * its result. A `system` one goes into the system prompt: a change to its
  * text misses the cache from the system prompt on, and the conversation
- * doesn't store it. (See context-injection-deprecation.ts.)
+ * doesn't store it.
  */
 export type ModuleContextInjection = ContextInjection & { placedEachCompile?: true };
 
