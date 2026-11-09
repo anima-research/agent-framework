@@ -2152,8 +2152,7 @@ export class Agent {
     // no content. The Anthropic API rejects empty text blocks with 400
     // "messages: text content blocks must be non-empty"; when such a block
     // reaches a live activation request the agent cannot complete ANY turn
-    // ([inference-failed] on every attempt) until the offending message ages
-    // out of the window. Empty text blocks occur naturally: tool-only turns,
+    // until the offending message ages out of the window. Empty text blocks occur naturally: tool-only turns,
     // delivery-failure placeholders, silent/skip turns. Non-text blocks pass
     // through unchanged, so tool pairing is unaffected. (Field-observed
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
@@ -2549,16 +2548,15 @@ export class Agent {
     // in the latest assistant message cannot be modified", unrecoverable by
     // retry (labclaude, 2026-07-27: hard down ~4h on exactly this pair).
     //
-    // Refused turns are surfaced by the refusal path (stderr, failures.log,
-    // the [inference-failed] notice); the store does not also need a
-    // content-free artifact of them. Loud, never silent.
+    // Refused turns are surfaced by the refusal path; the store does not
+    // also need a content-free artifact of them. Loud, never silent.
     if (content.length > 0 && content.every(
       (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
     )) {
       console.error(
         `[assistant-persist] agent=${this.name}: refusing to store a thinking-only assistant ` +
-        `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
-        `output. See the refusal/inference-failed record for why.`,
+        `message (${content.length} block(s), no text and no tool_use). If it was refused, see ` +
+        `its [inference-refusal] line and failures.log record.`,
       );
       return undefined;
     }
