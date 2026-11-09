@@ -46,6 +46,15 @@ import { safeSlice } from '../safe-slice.js';
 import { SKIPPED, normalizeLineBreaks, oneLine, quotedValue } from '../supplied-text.js';
 import type { FailedLastTurn, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
+export class JudgeFailure extends Error {
+  readonly detail?: string;
+  constructor(message: string, detail?: string) {
+    super(message);
+    this.name = 'JudgeFailure';
+    if (detail !== undefined) this.detail = detail;
+  }
+}
+
 /** The judge's model when the host names none. */
 export const DEFAULT_JUDGE_MODEL = 'claude-haiku-5-5';
 /** The judge's input budget when the host names none: under Haiku 5.5's 100K price line, with margin. */
@@ -446,10 +455,10 @@ export class ReplyJudge {
   private async build(
     request: JudgeRequest, agentName: string | undefined, now: number | undefined, atRatio?: number, fresh = false,
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
-    if (!agentName) throw new Error('no agent to judge for');
-    if (request.signal.aborted) throw new Error('the judge was stopped before its request');
+    if (!agentName) throw new JudgeFailure('no agent to judge for');
+    if (request.signal.aborted) throw new JudgeFailure('the judge was stopped before its request');
     const preview = await this.preview(agentName);
-    if (request.signal.aborted) throw new Error('the judge was stopped before its request');
+    if (request.signal.aborted) throw new JudgeFailure('the judge was stopped before its request');
 
     let pending: UpcomingWake[] | Promise<UpcomingWake[]> | undefined;
     try {
@@ -469,7 +478,7 @@ export class ReplyJudge {
     } catch {
       extra = [];
     }
-    if (request.signal.aborted) throw new Error('the judge was stopped before its request');
+    if (request.signal.aborted) throw new JudgeFailure('the judge was stopped before its request');
     const upcoming = [...(request.upcomingWakes ?? []), ...extra];
     const ratio = atRatio ?? this.charsPerToken;
 
@@ -626,7 +635,7 @@ export class ReplyJudge {
       const held = this.refusal?.(built.agentName, this.model);
       if (held) throw held;
       built = await this.build(request, agentName, undefined, MIN_CHARS_PER_TOKEN, true);
-      if (request.signal.aborted) throw new Error('the judge was stopped before its request');
+      if (request.signal.aborted) throw new JudgeFailure('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request on rule ${quotedValue(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
         + `was refused as too long, so the batch is asked once more at ${MIN_CHARS_PER_TOKEN} character a token`,
@@ -650,7 +659,7 @@ export class ReplyJudge {
     const verdict = parseVerdict(text);
     if (!verdict) {
       const stop = response.stopReason;
-      throw new Error(`the judge's answer held no verdict (stop: ${stop}${text ? `, text: ${JSON.stringify(cut(text, 120))}` : ''})`);
+      throw new JudgeFailure("the judge's answer held no verdict", `stop: ${stop}${text ? `, text: ${JSON.stringify(cut(text, 120))}` : ''}`);
     }
     return {
       ...verdict,

@@ -1,3 +1,5 @@
+import { isReasoningLoss } from './reasoning-loss.js';
+export { residentViewFilter, subconsciousViewFilter } from './context-options.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -13,7 +15,8 @@ import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, Yie
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
+import { boundFailureText, compileRefusalType, failureWords, FAILURE_TEXT_MAX_CHARS, houseReason, isMembraneError, PROVIDER_ERROR_CODE_MAX_CHARS } from './failure-text.js';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 // Not named imports from context-manager: 0.24.0 has neither, and a named
 // import of either would fail this package's load there before create()
 // could name the release it needs.
@@ -2616,8 +2619,9 @@ export class ProviderWaitNotSleptError extends Error {
   constructor(
     message: string,
     readonly retryAfterMs: number,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = 'ProviderWaitNotSleptError';
   }
 }
@@ -3096,17 +3100,6 @@ const WAITING_TRACE_EVERY_MS = 60_000;
  *  waits in a row hold one turn longer than this (noteStatedWaitRun,
  *  endStatedWaitRun). */
 const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
-/**
- * A MembraneError, from this framework's copy of membrane or from another: the
- * host supplies the Membrane instance (config.membrane), so with two copies
- * installed its errors are instances of a class this framework's `instanceof`
- * doesn't match. Recognised by name as well, as context-manager's errors are;
- * its fields are the same, so callers still check each one's type.
- */
-function isMembraneError(error: unknown): error is MembraneError {
-  return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
-}
-
 /**
  * agent-framework#734. Membrane's own streams send a retryable failure as an
  * `error` event and send nothing after their terminal event. A stream of
@@ -3614,44 +3607,16 @@ const SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES = Buffer.byteLength(
 const scriptResultMaxChars = (memoryMaxBytes: number): number =>
   Math.max(0, Math.floor((Math.min(maxResultBytes(memoryMaxBytes), bufferConstants.MAX_STRING_LENGTH) - SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES) / 6));
 
-/**
- * Longest failure text the inference-failure pipeline writes to one sink: the
- * reason in the exhaustion stderr line, a field of a logs/failures.log record,
- * an ops alert's message, the inference log's `error`, and a trace event's
- * `error` and `stack`. A failure's text is whatever its source put in
- * `Error.message`, and a provider can echo the entire rejected request there
- * (one OpenAI-compatible 400 echoed ~1.7 MB). The sinks with shorter bounds
- * name them below, and every cut goes through boundFailureText. This bound
- * doesn't depend on membrane bounding its own errors.
- */
-const FAILURE_TEXT_MAX_CHARS = 2_000;
-/** Longest failure reason written into an agent's own context (the
- *  `[inference-failed]` marker): enough for a provider's explanation, not a
- *  self-dump the agent then carries in every later request. */
+/** Longest failure reason in the `[inference-failed]` marker: the reason its
+ *  text gives, and the excerpt its metadata keeps. */
 const FAILURE_MARKER_REASON_MAX_CHARS = 600;
-/** Longest failure reason in the rewind marker, also the agent's own context:
- *  enough to identify the failure class without a wall of provider JSON. */
+/** Longest failure reason the rewind marker's metadata keeps as its category. */
 const REWIND_MARKER_REASON_MAX_CHARS = 160;
 /** Longest failure reason in an agent's status (`lastInference.lastError`) and
  *  in the compile-refused ops alert. */
 const FAILURE_SUMMARY_MAX_CHARS = 300;
 /** Longest alert message posted to the ops webhook. */
 const OPS_WEBHOOK_MESSAGE_MAX_CHARS = 500;
-/** Longest provider error code recorded verbatim; real codes are short tokens.
- *  A failure's name and type are bounded the same way. */
-const PROVIDER_ERROR_CODE_MAX_CHARS = 128;
-
-const isHighSurrogate = (text: string, index: number): boolean => {
-  const code = text.charCodeAt(index);
-  return code >= 0xd800 && code <= 0xdbff;
-};
-const isLowSurrogate = (text: string, index: number): boolean => {
-  const code = text.charCodeAt(index);
-  return code >= 0xdc00 && code <= 0xdfff;
-};
-/** Whether a cut before `index` would separate the halves of a surrogate pair. */
-const splitsPair = (text: string, index: number): boolean =>
-  index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
 
 /**
  * Whether an MCPL server's child ended the way a server ends when it's asked
@@ -3676,26 +3641,6 @@ function endedAsAsked(ended: { code?: number | null; signal?: string | null; pip
 function closeWords(reason: string | null | undefined, code: number | null | undefined, signal: string | null | undefined): string {
   const how = [reason ?? null, code != null ? `code ${code}` : null, signal ? `signal ${signal}` : null].filter((part) => part !== null);
   return how.length > 0 ? ` (${how.join(', ')})` : '';
-}
-
-/**
- * `text` when it fits within `max` characters; otherwise its head and tail
- * around a marker stating how many of how many characters were omitted, the
- * whole within `max`. A cut that would separate a surrogate pair moves toward
- * omission, so the result never holds half of a pair the text held whole, and
- * bounding bounded text returns it as is. Each sink cuts the whole text, so
- * its marker states the whole length.
- */
-function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): string {
-  if (text.length <= max) return text;
-  const markerLength = ` …[${text.length} of ${text.length} characters omitted]… `.length;
-  const budget = Math.max(0, max - markerLength);
-  const tailLength = Math.floor(budget / 4);
-  let headEnd = budget - tailLength;
-  if (splitsPair(text, headEnd)) headEnd--;
-  let tailStart = text.length - tailLength;
-  if (splitsPair(text, tailStart)) tailStart++;
-  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
 }
 
 export function opsWebhookText(message: string): string {
@@ -3768,6 +3713,33 @@ const UNDESCRIBED_FAILURE = `[${NOTICE_TAG.undescribedFailure}]`;
 
 function failureShown(text: string): string {
   return text === UNDESCRIBED_FAILURE ? text : suppliedValue(text);
+}
+
+function failedEntry(prefix: string, err: Error): { error: string; errorWords: string } {
+  return { error: `${prefix}${err.message}`, errorWords: `${prefix}${failureWords(err)}` };
+}
+
+function shownReasonOf(err: Error): { shownReason?: string } {
+  const own = houseReason(err);
+  return own === undefined ? {} : { shownReason: own };
+}
+
+function boundedCause(err: Error): Error {
+  const cause = new Error(boundFailureText(String(err.message)));
+  cause.name = boundFailureText(String(err.name), PROVIDER_ERROR_CODE_MAX_CHARS);
+  cause.stack = boundFailureText(String(err.stack ?? `${cause.name}: ${cause.message}`));
+  if (isMembraneError(err)) {
+    const fields = err as Error & { type?: unknown; retryable?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryAfterMs?: unknown };
+    const code = boundProviderErrorCode(fields.providerErrorCode);
+    Object.assign(cause, {
+      ...(typeof fields.type === 'string' ? { type: boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
+      ...(typeof fields.retryable === 'boolean' ? { retryable: fields.retryable } : {}),
+      ...(typeof fields.httpStatus === 'number' ? { httpStatus: fields.httpStatus } : {}),
+      ...(code !== undefined ? { providerErrorCode: code } : {}),
+      ...(typeof fields.retryAfterMs === 'number' ? { retryAfterMs: fields.retryAfterMs } : {}),
+    });
+  }
+  return cause;
 }
 
 /**
@@ -4987,7 +4959,8 @@ export class AgentFramework {
   private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
-  /** Modern-MCP (2026-07-28) servers, by id; read through modernServers().
+  /** Modern-MCP servers (2026-07-28, or a 2025 revision over HTTP), by id;
+   *  read through modernServers().
    *  They are kept apart from the MCPL registry on purpose: they have no
    *  grant, planes or server→host traffic, so the MCPL machinery (quiesce's
    *  plane pauses, policy) never sees them. They take part
@@ -7374,14 +7347,14 @@ export class AgentFramework {
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
     if (Number.isNaN(stated)) {
       return {
-        error: `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+        error: `${failureWords(error)} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
           `stated wait of ${cap} or less, so it ends now)`,
         statedWaitMs: Number.NaN,
       };
     }
     const asked = Number.isFinite(stated) ? `${Math.ceil(stated / 1000)} s` : 'longer than can be represented';
     return {
-      error: `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
+      error: `${failureWords(error)} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
         `longer than ${cap}, so it ends now)`,
       statedWaitMs: stated,
     };
@@ -8440,6 +8413,7 @@ export class AgentFramework {
       log({
         success: false,
         error: `Stream cancelled (${reason})`,
+        errorWords: `Stream cancelled (${reason})`,
         request: compiledRequest ?? { note: 'streaming request aborted' },
         durationMs,
       });
@@ -8520,6 +8494,7 @@ export class AgentFramework {
       log({
         success: false,
         error: `Stream aborted: ${kind}`,
+        errorWords: `Stream aborted: ${kind}`,
         request: compiledRequest ?? { note: `streaming request aborted by ${kind}` },
         durationMs,
       });
@@ -11499,10 +11474,12 @@ export class AgentFramework {
           store: this.store,
           namespace,
           isolate: true,
+          viewFilter: (message) => !isReasoningLoss(message.metadata),
           strategy: config.strategy ?? new PassthroughStrategy(),
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
         });
+        this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
         ownSlot = { namespace };
       }
       // Either manager is the run's to release (main's manager release), the derived one included.
@@ -11912,7 +11889,8 @@ export class AgentFramework {
    * The returned manager uses a passthrough strategy, so nothing is
    * folded: its compile is the agent's window as the agent's view shows it
    * (the rows the window holds, through its view filter), and in legacy
-   * mode, where the window is the record, the record so. getAllMessages()
+   * mode, where the window is the record, the record so. These compiled
+   * views omit legacy reasoning-loss notices. getAllMessages()
    * lists the record. An ended agent's context is the real one — treat it as
    * read-only unless you mean to change what a later resume starts from.
    */
@@ -12036,9 +12014,9 @@ export class AgentFramework {
    * and what it observes (context-options.ts): a resident's, on the
    * residents' slot, or for an isolated agent that watches that slot, the
    * residents' view when its edge leaves held traffic out, and the
-   * subconscious's when it shows it. Undefined for an isolated agent that
+   * subconscious's when it shows it. For an isolated agent that
    * watches no residents' slot on its branch (a worker, a conversation
-   * fork), whose context was opened with no filter.
+   * fork), whose view excludes only legacy reasoning-loss notices.
    */
   private liveViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
     if (record.ownSlot?.namespace === null) return residentViewFilter(record.name);
@@ -12046,7 +12024,7 @@ export class AgentFramework {
       const slot = this.registry.observedSlotOf(edge);
       return slot !== undefined && slot.branch === undefined && sameSlot(slot, RESIDENTS_SLOT);
     });
-    if (residents.length === 0) return undefined;
+    if (residents.length === 0) return (message) => !isReasoningLoss(message.metadata);
     return residents.some((edge) => edge.includeHeld === true) ? subconsciousViewFilter(record.name) : residentViewFilter(record.name);
   }
 
@@ -12073,7 +12051,7 @@ export class AgentFramework {
    * (deriveSharedContext): what the agent its chain of derivations started
    * from sees (liveViewFilterOf), and the stored injections of each agent in
    * the chain, which carry that agent's name and would otherwise read as
-   * another's. Undefined when the owner's context has no filter.
+   * another's. Legacy notices remain excluded even for an own injection.
    */
   private derivedViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
     const owner = this.viewOwnerOf(record);
@@ -12088,7 +12066,8 @@ export class AgentFramework {
       current = parent;
     }
     if (names.length === 0) return ownerSees;
-    return (message) => ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name));
+    return (message) => !isReasoningLoss(message.metadata)
+      && (ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name)));
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -12135,13 +12114,11 @@ export class AgentFramework {
     // reads through it, and is recorded beside the manager (storeSees), so
     // main's checks of whether an agent sees a row (agentSees: a tool
     // boundary's injection, an arrival, a reader of an unread message) ask
-    // what its compile shows. A source with no view recorded has no filter
-    // (an isolated run's): it sees every row, so its fork keeps none, and
-    // sees its own.
+    // what its compile shows. The global legacy-notice exclusion applies
+    // even when the source has no additional view recorded.
     const sourceSees = this.storeSees.get(source);
-    const sees = sourceSees
-      ? (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name)
-      : undefined;
+    const sees = (metadata: unknown): boolean => !isReasoningLoss(metadata)
+      && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name));
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -12151,10 +12128,10 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+      viewFilter: (message) => sees(message.metadata),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    if (sees) this.storeSees.set(contextManager, sees);
+    this.storeSees.set(contextManager, sees);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
@@ -13365,7 +13342,7 @@ export class AgentFramework {
 
   private failTurn(
     agent: Agent,
-    settle: { failure: { error: string; statedWaitMs?: number }; closes: TurnRouting | undefined; stream?: TurnRouting } | undefined,
+    settle: { failure: { error: string; statedWaitMs?: number; cause?: Error }; closes: TurnRouting | undefined; stream?: TurnRouting } | undefined,
     trace?: Omit<Extract<TraceEventInput, { type: 'inference:exhausted' }>, 'type' | 'agentName'>,
   ): void {
     if (settle) this.settleAgent(agent.name, { stopReason: 'exhausted', speech: '', ...settle.failure }, settle.closes, settle.stream);
@@ -13384,6 +13361,7 @@ export class AgentFramework {
       stopReason: AgentSettleResult['stopReason'];
       speech: string;
       error?: string;
+      cause?: Error;
       /** An ephemeral run that ended rather than sleep the provider's stated
        *  wait: that wait (statedWaitNotSlept). */
       statedWaitMs?: number;
@@ -13427,9 +13405,10 @@ export class AgentFramework {
     if (outcome.stopReason === 'exhausted') {
       // The caller may log or relay the message, which can echo the whole request.
       const message = boundFailureText(outcome.error ?? 'Unknown error');
+      const options = outcome.cause !== undefined ? { cause: boundedCause(outcome.cause) } : undefined;
       run.settle.reject(outcome.statedWaitMs === undefined
-        ? new Error(message)
-        : new ProviderWaitNotSleptError(message, outcome.statedWaitMs));
+        ? new Error(message, options)
+        : new ProviderWaitNotSleptError(message, outcome.statedWaitMs, options));
       return;
     }
     run.settle.resolve({
@@ -13448,7 +13427,19 @@ export class AgentFramework {
    * Rejects with ProviderWaitNotSleptError when the run ends rather than sleep
    * a retryable failure's stated wait longer than the framework's ten-minute
    * cap, or one it can't represent, and with a plain Error for any other
-   * ending, a stated wait its error policy declines among them.
+   * ending, a stated wait its error policy declines among them. A failed
+   * turn's rejection never carries a provider's message: a provider's failure
+   * is told by membrane's type and the HTTP status, a safety failure only as
+   * a request that couldn't be completed, a progress bound's cut, a stream's
+   * abort and context-manager's refusal of a compile in their own words, and
+   * any other failure as the turn failing. Where an error ended the turn, the
+   * rejection's `cause` is a bounded copy of it: a plain `Error` with its
+   * `name`, its message and stack cut to 2,000 characters, and, from a
+   * MembraneError, its `type`, `retryable`, `httpStatus`, `providerErrorCode`
+   * and `retryAfterMs`, which a host reads by name. It carries no `rawError`
+   * or `rawRequest`, and `instanceof MembraneError` doesn't hold on it. Its
+   * message and stack are the failure's own, a provider's words included, for
+   * classifying the failure and for logs, and aren't for showing to an agent.
    *
    * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
    * The task message should already be in the context manager.
@@ -14559,17 +14550,10 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const ep = this.rewindEpisode.get(agent.name);
     const count = (ep?.count ?? 0) + 1;
-    const why = cause === 'refusal'
-      ? `the model refused on them (content filter: ${failureShown(category)}). Their content is ` +
-        `not reproduced here (so this note can't re-trigger the filter); the ` +
-        `originals remain in the raw record`
-      : `the model API kept refusing the requests that carried them (${failureShown(category)}), ` +
-        `so that the conversation could go on. Their content is not reproduced ` +
-        `here (so this note can't trigger the same refusal); the originals remain ` +
-        `in the raw record`;
     const text =
       `[${NOTICE_TAG.refusalRewind}] The ${count} most recent turn(s) were set aside because ` +
-      `${why}. You are clear to continue — if you ` +
+      `the requests that carried them couldn't be completed. Their content isn't shown here, ` +
+      `and the originals remain in the raw record. You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
@@ -14617,10 +14601,10 @@ export class AgentFramework {
       : '';
     const content = success
       ? `🔧 Unstuck **${agentName}** — shed ${n} turn(s); the model responded.${list}`
-      : `⚠️ Couldn't unstick **${agentName}** — still refusing after ${n} rewind(s)` +
-        `${category ? ` (category=${category})` : ''}.${list}`;
+      : `⚠️ Couldn't unstick **${agentName}** — its requests still couldn't be completed after ${n} rewind(s).${list}`;
     console.error(
-      `[unstick] agent=${agentName} ${success ? 'succeeded' : 'gave up'} after ${n} rewind(s)`,
+      `[unstick] agent=${agentName} ${success ? 'succeeded' : 'gave up'} after ${n} rewind(s)` +
+        `${category ? ` category=${logValue(category)}` : ''}`,
     );
     if (s.channelId) void this.postToChannel(s.serverId, s.channelId, content);
   }
@@ -15309,6 +15293,7 @@ export class AgentFramework {
             requestId: entry.requestId,
             success: entry.success,
             error: entry.error,
+            errorWords: entry.errorWords,
             durationMs: entry.durationMs,
             tokenUsage: entry.tokenUsage,
             stopReason: entry.stopReason,
@@ -15655,7 +15640,7 @@ export class AgentFramework {
     let failures: ManagerReinitFailure[] = [];
     try {
       this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
-      this.tuneOutCoordinator?.branchMoved();
+      this.tuneOutCoordinator?.branchMoved(sameBranch);
       if (!sameBranch) this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
       // The agent the move was made through initialized its own manager,
@@ -20189,6 +20174,7 @@ export class AgentFramework {
         store: this.store,
         namespace: `conversations/${name}`,
         isolate: true,
+        viewFilter: (message) => !isReasoningLoss(message.metadata),
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
         // Provider cooldown ownership belongs to the persistent resident only;
@@ -20199,6 +20185,7 @@ export class AgentFramework {
       });
       release.manager = contextManager;
       this.trackManager(contextManager);
+      this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
 
       // Seed with the template's compiled context, renaming the template
       // participant so the fork reads its inheritance as its own history.
@@ -22648,7 +22635,7 @@ export class AgentFramework {
    */
   private publishInputWithTurnLocus(input: unknown, agentName: string, callingTurn: TurnRouting | undefined): unknown {
     const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
-    if (typeof given === 'string') return input;
+    if (given !== undefined && given !== null) return input;
     // A locked turn's default is its lock, or none: never what the registry
     // resolves now, which reads the agent's latest routing (a silent start's).
     const locus = callingTurn
@@ -25099,7 +25086,7 @@ export class AgentFramework {
 
   private agentSees(agent: Agent, metadata: unknown): boolean {
     const sees = this.storeSees.get(agent.getContextManager());
-    return !sees || sees(metadata);
+    return !isReasoningLoss(metadata) && (!sees || sees(metadata));
   }
 
   /**
@@ -26924,8 +26911,9 @@ export class AgentFramework {
       // the next start opens a turn of its own rather than continuing this
       // one's routing, and an ephemeral run fails with the error rather than
       // waiting out its watchdog. A silent start has no part in an open turn.
+      const err = error instanceof Error ? error : new Error(String(error));
       this.failTurn(agent, trigger?.suppressProse ? undefined : {
-        failure: { error: error instanceof Error ? error.message : String(error) }, closes: this.openLogical.get(agent.name),
+        failure: { error: failureWords(err), cause: err }, closes: this.openLogical.get(agent.name),
       });
       this.endStatedWaitRun(agent.name);
       // The agent's window at the event gate ends here too, while this start
@@ -28073,10 +28061,11 @@ export class AgentFramework {
         // settles it, and no other start's.
         if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.failTurn(agent, {
-          failure: statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message },
+          failure: { ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }), cause: err },
           closes: routing,
         }, {
           error: err.message,
+          ...shownReasonOf(err),
           // Drives the poison-history breaker (shedMayHelp: an
           // `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
           // `context_length` at 413, suggests the provider refused the
@@ -29071,7 +29060,7 @@ export class AgentFramework {
                 this.noteRefusal(agent.name, category, tokenUsage);
                 countUsage(abandoned);
                 logStream({
-                  success: false, error: 'Tool output withheld by the guard',
+                  success: false, error: 'Tool output withheld by the guard', errorWords: 'Tool output withheld by the guard',
                   request: compiledRequest ?? {}, response, durationMs, tokenUsage, stopReason: 'refusal',
                 });
                 console.error(`[tool-result-guard] agent=${agent.name} withheld ${withheld.length} result(s); retrying inference`);
@@ -29933,7 +29922,7 @@ export class AgentFramework {
 
             logStream({
               success: false,
-              error: err.message,
+              ...failedEntry('', err),
               request: compiledRequest ?? { note: 'streaming request failed' },
               durationMs,
             });
@@ -30018,11 +30007,12 @@ export class AgentFramework {
               this.noteFailedTurnEnd(agent, streamRouting);
               if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.failTurn(agent, {
-                failure: statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message },
+                failure: { ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }), cause: err },
                 closes: this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined,
                 stream: streamRouting,
               }, {
                 error: err.message,
+                ...shownReasonOf(err),
                 // Drives the poison-history breaker. `retryable` is kept for
                 // observability, but the breaker gates on
                 // shedMayHelp(errorType, httpStatus): only an `invalid_request`
@@ -30101,7 +30091,7 @@ export class AgentFramework {
                 this.abandonAgentScripts(agent.name, `stream aborted (${reason})`, streamRouting);
                 agent.reset();
                 this.noteFailedTurnEnd(agent, streamRouting);
-                this.failTurn(agent, { failure: { error: terminal }, closes: streamRouting }, { error: terminal });
+                this.failTurn(agent, { failure: { error: terminal }, closes: streamRouting }, { error: terminal, shownReason: terminal });
                 this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
                 // inference log so future investigations can attribute the
@@ -30110,6 +30100,7 @@ export class AgentFramework {
                 logStream({
                   success: false,
                   error: terminal,
+                  errorWords: terminal,
                   request: compiledRequest ?? { note: 'streaming request aborted' },
                   durationMs,
                 });
@@ -30383,7 +30374,7 @@ export class AgentFramework {
         // ends here (endFailureAtStop).
         this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
         logStream({ success: false,
-          error: `Provider acceleration cooldown: ${err.message}`,
+          ...failedEntry('Provider acceleration cooldown: ', err),
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abandonAgentScripts(agent.name, 'provider acceleration cooldown', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -30397,7 +30388,7 @@ export class AgentFramework {
       if (statedWait === 'held') {
         this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
         logStream({ success: false,
-          error: `Provider wait: ${err.message}`,
+          ...failedEntry('Provider wait: ', err),
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abandonAgentScripts(agent.name, 'provider wait', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -30406,16 +30397,16 @@ export class AgentFramework {
       this.noteFailedTurnEnd(agent, streamRouting);
       if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.failTurn(agent, {
-        failure: statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message },
+        failure: { ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }), cause: err },
         closes: streamRouting,
-      }, { error: err.message, ...this.classifyInferenceError(err) });
+      }, { error: err.message, ...shownReasonOf(err), ...this.classifyInferenceError(err) });
       this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
       logStream({
         success: false,
-        error: `Stream threw: ${err.message}`,
+        ...failedEntry('Stream threw: ', err),
         request: compiledRequest ?? { note: 'streaming request threw' },
         durationMs,
       });
@@ -30439,13 +30430,15 @@ export class AgentFramework {
         if (countedUsage && !usageLogged) {
           const replaced = this.agents.get(agent.name) !== agent;
           const superseded = generationLost || agent.streamId !== myStreamId;
+          const ended = replaced
+            ? 'Stream abandoned: its agent was disposed or replaced'
+            : superseded
+              ? 'Stream superseded: a newer stream of the agent took over'
+              : 'Stream ended without a final response';
           logStream({
             success: false,
-            error: replaced
-              ? 'Stream abandoned: its agent was disposed or replaced'
-              : superseded
-                ? 'Stream superseded: a newer stream of the agent took over'
-                : 'Stream ended without a final response',
+            error: ended,
+            errorWords: ended,
             request: compiledRequest ?? { note: 'streaming request' },
             durationMs: Date.now() - startTime,
             tokenUsage: tokenUsageOf(countedUsage),
@@ -32563,6 +32556,7 @@ export class AgentFramework {
     // The failure text is stored inline in every record; the request that
     // produced it is already stored separately as a blob.
     if (typeof entryToStore.error === 'string') entryToStore.error = boundFailureText(entryToStore.error);
+    if (typeof entryToStore.errorWords === 'string') entryToStore.errorWords = boundFailureText(entryToStore.errorWords);
 
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
@@ -32792,19 +32786,21 @@ export class AgentFramework {
 
   /**
    * Why this host refuses a skip_reply call, as the model will read it, or
-   * undefined when it doesn't (skipReplyWakeRefusal): without an EventGate,
-   * any wake_in_seconds; with one, a wake_in_seconds that isn't a number of
-   * seconds. Only when the channel registry handles skip_reply. The dispatch
-   * that refuses the call reads it here, and so does the turn's bookkeeping of
-   * a refused round (roundCallOf), for the model's calls and a script's calls
-   * that reach the host while a call of the round watches it: the silence
-   * before it, which comes back after its round, and in XML mode which round's
-   * prose stays private. A skip_reply round's own prose stays private by the
-   * tool's name, refused or not.
+   * undefined when it doesn't: a reason that isn't a string
+   * (ChannelRegistry.nonStringRefusal), or (skipReplyWakeRefusal) without an
+   * EventGate, any wake_in_seconds, and with one, a wake_in_seconds that isn't
+   * a number of seconds. Only when the channel registry handles skip_reply.
+   * The dispatch that refuses the call reads it here, and so does the turn's
+   * bookkeeping of a refused round (roundCallOf), for the model's calls and a
+   * script's calls that reach the host while a call of the round watches it:
+   * the silence before it, which comes back after its round, and in XML mode
+   * which round's prose stays private. A skip_reply round's own prose stays
+   * private by the tool's name, refused or not.
    */
   private skipReplyRefusal(call: { name?: string; input?: unknown }): string | undefined {
     if (call.name !== 'skip_reply' || !this.channelRegistry) return undefined;
-    return skipReplyWakeRefusal(readSkipReplyWake(call.input), !!this.eventGate);
+    return this.channelRegistry.nonStringRefusal('skip_reply', call.input)?.error
+      ?? skipReplyWakeRefusal(readSkipReplyWake(call.input), !!this.eventGate);
   }
 
   private refusesSelfWake(call: { name?: string; input?: unknown }): boolean {
@@ -32815,8 +32811,8 @@ export class AgentFramework {
    * A call as its round's routing counts it, made directly, or by a script
    * and reaching the host while a run or wait call of the round watches it
    * (ScriptRound). A skip_reply refused, because the agent's allowedTools
-   * doesn't name it, because its arguments are refused (markedInputRefusal)
-   * or because this host can't set the wake it asks for, is
+   * doesn't name it, because its arguments are refused (markedInputRefusal),
+   * or because this host refuses its arguments (skipReplyRefusal), is
    * marked refused: it keeps its own round private and silences nothing after
    * it. A refusal withholds the call's effect, not the model's choice to keep
    * its words private. Any other call the list refuses posted nothing, so it
@@ -33067,7 +33063,7 @@ export class AgentFramework {
           const error = this.skipReplyRefusal(enrichedCall);
           if (error !== undefined) {
             const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
-            console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
+            console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(error)}`);
             const result = this.refusedResult(agentName, enrichedCall.id, error);
             this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
             this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
@@ -34671,6 +34667,7 @@ export class AgentFramework {
         {
           httpStatus: event.httpStatus as number | undefined,
           providerErrorCode: event.providerErrorCode as string | undefined,
+          shownReason: event.shownReason as string | undefined,
         },
       );
     } else if (event.type === 'inference:completed') {
@@ -34733,6 +34730,7 @@ export class AgentFramework {
     const bounded = traceEvent as unknown as Record<string, unknown>;
     if (typeof bounded.error === 'string') bounded.error = boundFailureText(bounded.error);
     if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
+    if (typeof bounded.shownReason === 'string') bounded.shownReason = boundFailureText(bounded.shownReason);
 
     if (this.earlyTraces) {
       if (this.earlyTraces.length < 1000) this.earlyTraces.push(traceEvent);
@@ -35133,17 +35131,8 @@ export class AgentFramework {
         ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
       };
     }
-    if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
-      return { errorType: 'over_budget' };
-    }
-    // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
-    // 2026-07-26): a compile REFUSES rather than shipping a context with
-    // silently-dropped messages. Recovery is identical to over_budget — kick
-    // the compression drain so summaries cover the un-represented span.
-    if (err instanceof UncoveredDropError || err.name === 'UncoveredDropError') {
-      return { errorType: 'context_refusal' };
-    }
-    return {};
+    const refusal = compileRefusalType(err);
+    return refusal !== undefined ? { errorType: refusal } : {};
   }
 
   /**
@@ -35162,7 +35151,7 @@ export class AgentFramework {
     rawReason: string,
     retryable?: boolean,
     rawErrorType?: string,
-    detail?: { httpStatus?: number; providerErrorCode?: string },
+    detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string },
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
@@ -35174,10 +35163,12 @@ export class AgentFramework {
     // sink below gets an excerpt cut from the whole reason at its own bound
     // (boundFailureText, so its marker states the whole length): the stderr
     // line, failures.log and the hard-down alert FAILURE_TEXT_MAX_CHARS, the
-    // [inference-failed] marker FAILURE_MARKER_REASON_MAX_CHARS, the status's
-    // lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS, and
-    // the rewind marker REWIND_MARKER_REASON_MAX_CHARS. The classification
-    // travels as structured fields beside the text.
+    // [inference-failed] marker's metadata FAILURE_MARKER_REASON_MAX_CHARS, the
+    // status's lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS,
+    // and the rewind marker's metadata REWIND_MARKER_REASON_MAX_CHARS. The
+    // classification travels as structured fields beside the text. The
+    // [inference-failed] marker's text quotes only `shownReason`, which holds
+    // no provider's text, and the rewind marker's quotes no reason.
     //
     // A reason that isn't a string (the stream paths always pass a message)
     // is described rather than allowed to throw before anything is recorded.
@@ -35225,9 +35216,12 @@ export class AgentFramework {
     const agent = this.agents.get(agentName);
     if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
-      const causeParts = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+      const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
       const cause = timedOut && causeParts.length === 1 ? '' : causeParts.join(', ');
+      const shownText = typeof detail?.shownReason === 'string'
+        ? failureShown(boundFailureText(detail.shownReason, FAILURE_MARKER_REASON_MAX_CHARS)) : undefined;
+      const shown = shownText !== undefined ? ` Reason: ${shownText}${/[.!?]$/.test(shownText) ? '' : '.'}` : '';
       try {
         storeOwnRow(
           agent,
@@ -35242,11 +35236,11 @@ export class AgentFramework {
                   `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
                   `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
                   `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
-                  `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''} Reason: `
+                  `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}`
                 : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
                   `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
-                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''} Reason: `) +
-              `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
+                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''}`) +
+              `${shown} ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
@@ -38021,8 +38015,9 @@ export class AgentFramework {
     closedTab: boolean;
     retrying: boolean;
     /** Which engine serves it: `legacy` (MCP 2024-11-05 + MCPL) or `modern`
-     *  (MCP 2026-07-28), as its configuration selects; null when the
-     *  configuration names no usable transport (see `refused`). */
+     *  (the SDK's client: MCP 2026-07-28, or over HTTP a 2025 revision), as
+     *  its configuration selects; null when the configuration names no
+     *  usable transport (see `refused`). */
     family: 'legacy' | 'modern' | null;
     /** The MCP revision its last handshake established; null until one has. */
     protocolVersion: string | null;
@@ -40080,6 +40075,11 @@ export class AgentFramework {
         return;
       }
       if (call.name === 'channel_publish' || call.name === 'channel_close') {
+        const refusal = this.channelRegistry?.nonStringRefusal(call.name, call.input);
+        if (refusal) {
+          reject(refusal.error!);
+          return;
+        }
         const input = (call.input ?? {}) as { channelId?: string; serverId?: string };
         // An empty serverId is read as none given, as the channel tools and
         // channelNamed read it.
@@ -40953,8 +40953,9 @@ export class AgentFramework {
   /**
    * Whether `agent`'s view leaves suppressed rows out, asked of the view
    * itself (storeSees): every resident's, the subconscious's and a view
-   * derived from one does; an isolated agent's own store has no view filter,
-   * so a row stamped there would render.
+   * derived from one does. An isolated agent's own view excludes legacy
+   * reasoning-loss notices, not suppressed rows, so a suppressed row stamped
+   * there would render.
    */
   private viewHidesSuppressed(agent: Agent | undefined): boolean {
     if (!agent) return false;

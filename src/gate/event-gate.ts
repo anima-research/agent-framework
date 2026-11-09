@@ -22,6 +22,8 @@ import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, rec
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
+import { failureWords } from '../failure-text.js';
+import { JudgeFailure } from './reply-judge.js';
 import { isSystemNotice } from '../mcpl/tags.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -262,7 +264,7 @@ interface JudgingState {
 interface HeldForJudge {
   events: PendingEvent[];
   judge: JudgeConfig;
-  refusal?: { hold: string; until?: number };
+  refusal?: { until?: number };
   refusedBefore?: true;
 }
 
@@ -2188,9 +2190,15 @@ export function formatShadowWarning(w: ShadowWarning): string {
     + `A scope on ${later} naming the event types it's for clears this note.`;
 }
 
+function judgeFailureWords(err: unknown): string {
+  if (err instanceof JudgeFailure) return err.message;
+  return err instanceof Error ? failureWords(err, 'the call failed') : 'the call failed';
+}
+
 /** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
 function errorText(err: unknown): string {
   try {
+    if (err instanceof JudgeFailure && err.detail !== undefined) return `${err.message} (${err.detail})`;
     return err instanceof Error ? err.message : String(err);
   } catch {
     return 'a value that could not be printed';
@@ -4376,7 +4384,7 @@ export class EventGate {
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
-        reject(new Error(`the judge took more than ${this.judgeTimeoutMs} ms`));
+        reject(new JudgeFailure(`the judge took more than ${this.judgeTimeoutMs} ms`));
         abort.abort();
       }, this.judgeTimeoutMs);
       // Never keep the process alive on the judge's account.
@@ -4410,7 +4418,7 @@ export class EventGate {
    *  runs and the host isn't quiesced, and, held for a refusal, until the
    *  refusal's stated end, a release or its rule's next batch, merged with
    *  what the rule already holds. */
-  private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig, refusal?: { hold: string; until?: number }): void {
+  private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig, refusal?: { until?: number }): void {
     const held = this.judgeHeld.get(policyName);
     if (held) {
       appendAll(held.events, events);
@@ -4581,7 +4589,7 @@ export class EventGate {
     }
     const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
     const reason = failed
-      ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
+      ? (err !== undefined ? judgeFailureWords(err) : 'the judge gave no verdict')
       : typeof verdict.reason === 'string' ? verdict.reason : '';
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, refused: 0 } };
     record.verdicts[outcome]++;
@@ -4603,7 +4611,7 @@ export class EventGate {
     const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
     if (failed) {
       console.error(
-        `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${reason}), so its batch of ${state.events.length} `
+        `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${err !== undefined ? errorText(err) : reason}), so its batch of ${state.events.length} `
         + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : 'is dropped without waking the agent'} (judge onError "${this.judgeOnError}")`,
       );
     }
@@ -4637,7 +4645,7 @@ export class EventGate {
     const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
     const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
     const dropsBefore = this.droppedJudgeEvents;
-    if (!wakes) this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge, state.released ? undefined : { hold, ...(until !== undefined && until > now ? { until } : {}) });
+    if (!wakes) this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge, state.released ? undefined : { ...(until !== undefined && until > now ? { until } : {}) });
     const told = wakes || !state.refusedBefore;
     const dropped = this.droppedJudgeEvents - dropsBefore;
     const n = state.events.length;
@@ -4661,7 +4669,7 @@ export class EventGate {
   private recordRefusal(policyName: string, n: number, hold: string, durationMs: number, woke: boolean, until: number | undefined, traced: boolean): void {
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, refused: 0 } };
     record.verdicts.refused++;
-    record.last = { at: Date.now(), verdict: 'refused', reason: hold, eventCount: n, durationMs };
+    record.last = { at: Date.now(), verdict: 'refused', reason: 'the framework refused to send the call', eventCount: n, durationMs };
     if (this.config.policies.some((p) => p.name === policyName)) this.judgeRecords.set(policyName, record);
     if (!traced) return;
     this.emitTrace({
@@ -5316,7 +5324,7 @@ export class EventGate {
       if (!refusal) continue;
       const until = refusal.until !== undefined ? ` until ${new Date(refusal.until).toISOString()}` : '';
       const n = held.events.length;
-      notices.push(`Rule ${quotedValue(name)}'s reply judge call was refused (${refusal.hold})${until}: ${n} ${n === 1 ? 'event' : 'events'} held for the judge.`);
+      notices.push(`Rule ${quotedValue(name)}'s reply judge call was refused${until}: ${n} ${n === 1 ? 'event' : 'events'} held for the judge.`);
     }
     return notices.length > 0 ? notices.join(' ') : null;
   }

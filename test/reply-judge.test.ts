@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { MembraneError } from '@animalabs/membrane';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, judgeSystemPrompt, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
+import { JudgeFailure, ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, judgeSystemPrompt, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { FailedLastTurn, JudgeRequest, UpcomingWake } from '../src/gate/types.js';
 import { oneLine, quotedValue } from '../src/supplied-text.js';
 
@@ -309,6 +309,17 @@ describe('reply judge: verdicts', () => {
       membraneFor: () => membrane, chooseAgent: (n) => n[0], preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
     });
     await assert.rejects(judge.judge(judgeRequest()), /no verdict/);
+  });
+
+  it("names an answer with no verdict in the framework's words, keeping its stop and text apart for the log", async () => {
+    const { membrane } = fakeMembrane('zz-judge-words-7f3a I would rather not say.');
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0], preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+    });
+    const failure = await judge.judge(judgeRequest()).then(() => assert.fail('the judge should fail'), (e: unknown) => e);
+    assert.ok(failure instanceof JudgeFailure, String(failure));
+    assert.equal(failure.message, "the judge's answer held no verdict");
+    assert.equal(failure.detail, 'stop: end_turn, text: "zz-judge-words-7f3a I would rather not say."');
   });
 });
 
