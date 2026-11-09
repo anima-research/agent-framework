@@ -1,7 +1,7 @@
 /**
  * An agent's effort, from `FrameworkConfig.effort`: a level, or a function of the agent's name and model asked at
  * each request. The request's top-level `output_config.effort` stays the agent's base, and a change travels as one
- * effort-only `system_change` row stored directly after new user input, so the prompt cache before it still holds.
+ * effort-only `system_change` row stored after new user input, and after any context injections the start stores, so the prompt cache before it still holds.
  * A test that sends a request reads what the provider was handed, through a real context-manager compile.
  */
 import { describe, it } from 'node:test';
@@ -675,6 +675,24 @@ describe('FrameworkConfig.effort: previews and the direct API', { skip: NEEDS_RO
       const each = indexOfText(preview, 'Each compile.');
       assert.ok(note >= 0 && each >= 0, 'premise: the preview holds both');
       assert.equal(note, each - 1, 'the stored injection goes just ahead of the one placed each compile');
+    } finally { await cleanup(); }
+  });
+
+  it('previews no appended effort row that a start would leave out: a context injection that is one, under a set plan', async () => {
+    try {
+      // An injection stored at each start whose content is an effort-only system change, new each time.
+      class EffortInjection extends InputModule {
+        private gathered = 0;
+        async gatherContext(): Promise<ModuleContextInjection[]> {
+          return [{ namespace: 'tune', position: 'afterUser', content: [effortBlock(++this.gathered % 2 === 1 ? 'max' : 'low')] }];
+        }
+      }
+      const { framework, provider, turn } = await resident({ effort: 'high', input: new EffortInjection() });
+      await turn('One.');
+      assert.equal(storedEffortRows(framework).length, 1, 'premise: the start stored the injection');
+      assert.deepEqual(effortRows(provider.calls[0]!), [], 'premise: and its request left it out, as a host\'s row under a set plan');
+      const preview = await framework.previewActivation('agent', { injections: true });
+      assert.deepEqual(effortRows(preview), [], 'the preview leaves out the injection it would store');
     } finally { await cleanup(); }
   });
 
