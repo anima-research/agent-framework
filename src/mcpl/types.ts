@@ -22,7 +22,8 @@
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
   method: string;
-  id?: string | number;
+  /** A request's id; null is allowed, though JSON-RPC 2.0 discourages it. */
+  id?: string | number | null;
   params?: Record<string, unknown>;
 }
 
@@ -31,7 +32,8 @@ export interface JsonRpcRequest {
  */
 export interface JsonRpcResponse {
   jsonrpc: '2.0';
-  id: string | number;
+  /** The request's id, or null when the request's own couldn't be read. */
+  id: string | number | null;
   result?: unknown;
   error?: JsonRpcError;
 }
@@ -265,8 +267,9 @@ export interface McplServerConfig {
    * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
    *   binding. The host dials it and runs the same newline-delimited JSON-RPC
    *   as over stdio.
-   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
-   *   Streamable HTTP.
+   * - `http://` or `https://` is a modern MCP server over Streamable HTTP.
+   *   Its revision is negotiated at each connect: 2026-07-28 when the server
+   *   offers it, and otherwise 2025-11-25, 2025-06-18 or 2025-03-26.
    */
   url?: string;
 
@@ -426,14 +429,34 @@ export interface McplServerConfig {
    * Only `true` turns it on, and null counts as not set. `create()`,
    * `connectMcplServer` and `restartMcplServer` refuse any other value, such
    * as a quoted "false".
+   *
+   * A modern server reached over HTTP at a 2025 revision can hold a session
+   * for this client. When the server ends it (HTTP 404), or stops serving its
+   * revision or its streams as a server upgraded to 2026-07-28 does, after it
+   * has answered a request, a new session starts at once whether or not this
+   * is set: the connection emits 'close' while its `willReconnect` reads
+   * true, then 'reconnect'. If that new session can't start, this setting
+   * decides, as for any lost connection, and a revision verdict stops it for
+   * good, as on any reconnect; without this setting, a second 'close', while
+   * `willReconnect` reads false, says the server is gone. An answered session
+   * that ends less than `reconnectIntervalMs` after it started gets a new
+   * one at once only if the last session restarted that way had lived that
+   * long, or there was none. A second such young end in a row, and a session
+   * that ends before it has answered, count as a failed connect, and follow
+   * this setting.
    */
   reconnect?: boolean;
 
   /**
    * Base interval between reconnection attempts in milliseconds.
    * The actual delay doubles with each consecutive failure (with ±25% jitter)
-   * up to `reconnectMaxIntervalMs`, and resets after a successful handshake.
-   * Default: 5000 (5 seconds).
+   * up to `reconnectMaxIntervalMs`, and resets after a successful handshake
+   * (for a modern server's 2025 session over HTTP, once that session's end
+   * starts a new one at once). Over HTTP the same backoff paces a modern
+   * server's streams: a dropped stream's first try waits the server's
+   * `retry` hint when it sent one above 0, and the backoff's first step
+   * otherwise, and a try after a failed one waits the longer of the hint
+   * and the doubling backoff. Default: 5000 (5 seconds).
    */
   reconnectIntervalMs?: number;
 
@@ -596,6 +619,10 @@ export interface FeatureSetDeclaration {
     coreTags?: string[];
     tags?: Record<string, unknown>;
     keyed?: Record<string, unknown>;
+    /** Ordered suggested rules (RFC-001 §5.1). Advisory: applied only on
+     *  acceptance (§5.2), which wake onboarding asks the agent for. */
+    suggestedTreatment?: unknown[];
+    /** @deprecated RFC-001 revision 1's name for suggestedTreatment; still read. */
     defaultTreatment?: unknown[];
     open?: boolean;
   };

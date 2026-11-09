@@ -93,11 +93,7 @@ jobs:
         run: npm run build
 
       - name: Test
-        run: |
-          AF_TEST_CONCURRENCY=$(node -p "2 * require('node:os').cpus().length")
-          echo "cores: $(node -p "require('node:os').cpus().length") (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
-          export AF_TEST_CONCURRENCY
-          npm test
+        run: node scripts/test-as-ci.mjs
 
       # npm test runs with --test-force-exit, which hides async work a test
       # leaves running, such as a late arrival after stop() ("Queue is
@@ -105,7 +101,8 @@ jobs:
       # later PR's qualification. They get npm test's --test-timeout too:
       # under Node 22.12 it fails a file whose leftover work keeps it alive, by
       # name.
-      - name: Test unforced (work in flight at stop)
+      - &test-unforced
+        name: Test unforced (work in flight at stop)
         run: node --test --test-timeout=600000 dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js
 
       # A Node diagnostic report lists the whole environment, values included.
@@ -113,11 +110,70 @@ jobs:
       # from plain `git status`, so without this step a regression would write
       # dumps nobody sees (#697 R1-3). Covers both test steps above, the
       # unforced one included.
-      - name: No Node diagnostic reports written
+      - &no-diagnostic-reports
+        name: No Node diagnostic reports written
         if: always()
         run: |
           found=$(find . -name 'report.*.json' -not -path './node_modules/*')
           if [ -n "$found" ]; then echo "Node diagnostic reports were written (they list the environment):"; echo "$found"; exit 1; fi
+
+  floor-legs:
+    name: Dependency floors to test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      legs: ${{ steps.plan.outputs.legs }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22.12.0'
+
+      - name: Plan the legs
+        id: plan
+        run: node scripts/install-dependency-floors.mjs plan >> "$GITHUB_OUTPUT"
+
+  floors:
+    name: Build & Test at dependency floors (${{ matrix.leg.name }})
+    needs: floor-legs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.floor-legs.outputs.legs) }}
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22.12.0'
+
+      - name: Install each dependency at this leg's floor
+        env:
+          LEG: ${{ toJSON(matrix.leg) }}
+        run: node scripts/install-dependency-floors.mjs install
+
+      - name: Installed at the floors
+        run: npm ls --depth=0
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: node scripts/test-as-ci.mjs
+
+      - *test-unforced
+
+      - *no-diagnostic-reports
 
   install-and-start:
     name: Install & start (${{ matrix.os }}, node ${{ matrix.node }})

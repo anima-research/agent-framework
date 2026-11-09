@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { ContextManager } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, InferenceRequest, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import type { ModuleContextInjection } from '../src/types/module.js';
@@ -136,9 +137,11 @@ interface Harness {
   until(cond: () => boolean, what: string): Promise<void>;
   queued(body: string): boolean;
   stored(body: string): boolean;
+  inWindow(body: string): boolean;
   wake(request: Omit<InferenceRequest, 'agentName'>): void;
   endTurn(): Promise<void>;
   storeFor(agentName: string, body: string): ReturnType<ModuleContext['addMessage']>;
+  storeForResidents(body: string): ReturnType<ModuleContext['addMessage']>;
   remove(id: ReturnType<ModuleContext['addMessage']>): void;
 }
 
@@ -160,6 +163,8 @@ async function turn(options: {
   residents?: boolean;
   gather?: (h: Harness, agentName: string, n: number) => void;
   beforeEnd?: (h: Harness) => Promise<void>;
+  afterEnd?: (h: Harness) => void;
+  budgetHold?: { during: (h: Harness, framework: AgentFramework) => Promise<void>; fit: () => void };
 }): Promise<Turn> {
   const dir = mkdtempSync(join(tmpdir(), 'af-continuing-start-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -200,9 +205,10 @@ async function turn(options: {
   const internals = framework as unknown as {
     channelRegistry: { listChannelsRaw(): unknown[] };
     activeTurnTokens: Map<string, unknown>;
-    deferredMessages: unknown[];
     pendingRequests: InferenceRequest[];
     providerAccelerationCooldowns: Map<string, { until: number }>;
+    budgetHolds: Map<string, unknown>;
+    releaseBudgetHold(agentName: string): void;
     openLogical: Map<string, unknown>;
     releaseProviderAccelerationCooldown(agentName: string): void;
     proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> };
@@ -221,14 +227,27 @@ async function turn(options: {
     incoming: (messageId, body, mode = 'addressed') =>
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: ROOM, messageId, mode, text: body }) + '\n'),
     until,
-    queued: (body) => JSON.stringify(internals.deferredMessages).includes(body),
+    // #291: no queue holds a message that arrives while scout's turn is
+    // alive. It is stored at once and stays out of scout's window until
+    // scout's next presentation point, which is what main's queue held it
+    // for: stored, and not yet in the window.
+    queued: (body) => {
+      const cm = framework.getAgent('scout')!.getContextManager();
+      return cm.getAllMessages().some((m) => JSON.stringify(m.content).includes(body) && cm.windowStatusOf(m.id) !== 'in');
+    },
     stored: (body) => JSON.stringify(framework.getAgent('scout')!.getContextManager().getAllMessages()).includes(body),
+    inWindow: (body) => {
+      const cm = framework.getAgent('scout')!.getContextManager();
+      return cm.getAllMessages().some((m) => JSON.stringify(m.content).includes(body) && cm.windowStatusOf(m.id) === 'in');
+    },
     wake: (request) => internals.pendingRequests.push({ agentName: 'scout', ...request } as InferenceRequest),
     endTurn: async () => { internals.openLogical.delete('scout'); },
     storeFor: (agentName, body) => {
       assert.ok(!internals.activeTurnTokens.has(agentName), `${agentName} has no turn alive, so the write is stored`);
       return gate.ctx!.addMessage('user', [text(body)], undefined, { forAgent: agentName });
     },
+    // A write that names no agent: for every resident that takes untargeted inbound in the slot (#291).
+    storeForResidents: (body) => gate.ctx!.addMessage('user', [text(body)]),
     remove: (id) => gate.ctx!.removeMessage(id),
   };
   if (options.gather) gate.onGather = (agentName, n) => options.gather!(h, agentName, n);
@@ -248,6 +267,12 @@ async function turn(options: {
       gate.release();
     }
     if (options.beforeEnd) await options.beforeEnd(h);
+    if (options.budgetHold) {
+      await until(() => internals.budgetHolds?.has('scout'), 'the budget hold');
+      await options.budgetHold.during(h, framework);
+      options.budgetHold.fit();
+      internals.releaseBudgetHold('scout');
+    }
     if (hold) {
       await until(() => internals.providerAccelerationCooldowns.has('scout'), 'the provider hold');
       if (hold.during) await hold.during(h);
@@ -255,8 +280,9 @@ async function turn(options: {
       internals.releaseProviderAccelerationCooldown('scout');
     }
     await until(() => streams >= 2 && !internals.activeTurnTokens.has('scout') && internals.pendingRequests.length === 0
-      && !internals.providerAccelerationCooldowns.has('scout'), 'the turn to end');
+      && !internals.providerAccelerationCooldowns.has('scout') && !internals.budgetHolds?.has('scout'), 'the turn to end');
     await framework.runUntilIdle();
+    options.afterEnd?.(h);
     return {
       publishes: lines().filter((l) => l.event === 'publish').map((l) => [l.channelId, l.text]),
       drafts: internals.proseDrafts.open('scout').map((d) => [d.text, d.reason]),
@@ -316,6 +342,41 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
       assert.equal(run.requests.length, 2, 'the stream restarted');
       assert.deepEqual(run.publishes, []);
       assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
+    });
+
+    it(`${proseRouting}: a context-budget restart that waits for compression through a suppression of a row it doesn't stand on keeps the line its stream writes held`, async () => {
+      const proto = ContextManager.prototype as unknown as Record<'compile' | 'isReady', (...args: unknown[]) => unknown>;
+      const original = { compile: proto.compile, isReady: proto.isReady };
+      let compiles = 0;
+      let fit = false;
+      proto.compile = async function (this: unknown, ...args: unknown[]) {
+        if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun !== true && ++compiles >= 2 && !fit) {
+          throw Object.assign(new Error('Compile plan would exceed hard budget'), { name: 'OverBudgetError', budget: 1_000, actual: 2_000 });
+        }
+        return original.compile.apply(this, args);
+      };
+      proto.isReady = function () { return fit; };
+      try {
+        let suppressed = false;
+        const run = await turn({
+          proseRouting, maxStreamTokens: 20,
+          stream: (n) => (n === 1 ? new MockYieldingStream([SEND, overBudget(), createMockResponse([text(FINAL)])], true) : final()),
+          budgetHold: {
+            during: async (h, framework) => {
+              const id = h.storeFor('scout', CHATTER);
+              await framework.suppressMessages('scout', { messageIds: [String(id)] });
+              suppressed = true;
+            },
+            fit: () => { fit = true; },
+          },
+        });
+        assert.ok(suppressed, 'the surgery was admitted while the continuation waited');
+        assert.equal(run.requests.length, 2, 'the continuation ran');
+        assert.deepEqual(run.publishes, [], 'no second post');
+        assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
+      } finally {
+        Object.assign(proto, original);
+      }
     });
 
     it(`${proseRouting}: the provider hold's retry that reads a message sent during the hold answers it in the room`, async () => {
@@ -450,23 +511,53 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
     assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
   });
 
+  // #291: a row is for the agents its audience names. main stores this
+  // message for `other` and scout reads it in the slot they share; here a
+  // write for `other` alone is elsewhere to scout (next case), so the
+  // message both residents' windows get is one that names no agent, stored
+  // in their slot for both. It reaches scout's window at the boundary the
+  // gated tool's result passes, while the failed stream runs.
   it("a message another resident's window gets while the failed stream runs clears the hold for the retry that reads it", async () => {
     const run = await turn({
-      proseRouting: 'locus', residents: true, whileGated: async (h) => { h.storeFor('other', CHATTER); },
+      proseRouting: 'locus', residents: true, whileGated: async (h) => { h.storeForResidents(CHATTER); },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
     });
     assert.ok(read(run.requests[1], CHATTER), 'the retry read the message');
     answered(run);
   });
 
-  it("a message stored while the retry gathers its context clears the hold for the compile that reads it", async () => {
+  it("a message for another resident alone isn't scout's to read: the retry doesn't read it, and the line it writes stays held", async () => {
+    const run = await turn({
+      proseRouting: 'locus', residents: true, whileGated: async (h) => { h.storeFor('other', CHATTER); },
+      stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
+      afterEnd: (h) => {
+        assert.ok(h.stored(CHATTER), 'premise: the message is stored');
+        assert.ok(!h.inWindow(CHATTER), "and isn't in scout's window once the turn ends");
+      },
+    });
+    assert.ok(!read(run.requests[1], CHATTER), "the message is other's");
+    assert.deepEqual(run.publishes, []);
+    assert.ok(heldAsSend(run, REPLY), JSON.stringify(run.drafts));
+  });
+
+  // #291: an errorPolicy retry continues the turn and presents nothing that
+  // arrived since the turn began (presentAtStart's 'turn-start' is a fresh
+  // start's), so a message stored while it gathers its context, one for
+  // both residents included, is out of its compile and waits for scout's
+  // next presentation point. main's retry compiled the shared slot, which
+  // held it.
+  // The rule is the same: the hold stands until a request carries a new
+  // message, and this one carried none.
+  it("a message stored while the retry gathers its context waits for the turn's end: the compile doesn't read it, and the hold stands", async () => {
     const run = await turn({
       proseRouting: 'locus', residents: true,
-      gather: (h, agentName, n) => { if (agentName === 'scout' && n === 2) h.storeFor('other', CHATTER); },
+      gather: (h, agentName, n) => { if (agentName === 'scout' && n === 2) h.storeForResidents(CHATTER); },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
+      afterEnd: (h) => { assert.ok(h.inWindow(CHATTER), "it enters scout's window once the turn ends"); },
     });
-    assert.ok(read(run.requests[1], CHATTER), 'the retry read the message');
-    answered(run);
+    assert.ok(!read(run.requests[1], CHATTER), "the retry's compile doesn't carry it");
+    assert.deepEqual(run.publishes, []);
+    assert.ok(heldAsSend(run, REPLY), JSON.stringify(run.drafts));
   });
 
   it('a held retry that answers a new message and sends again keeps that send\'s hold through its own retry', async () => {
@@ -493,7 +584,9 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
   it('a message removed unread before the held retry starts leaves the line held', async () => {
     const run = await turn({
       proseRouting: 'locus', residents: true, hold: { error: 'provider unavailable', during: async (h) => {
-        h.remove(h.storeFor('other', CHATTER));
+        const id = h.storeForResidents(CHATTER);
+        assert.ok(id, 'premise: stored for both residents');
+        h.remove(id);
       } },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : final()),
     });

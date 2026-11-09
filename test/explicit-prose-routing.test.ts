@@ -1053,7 +1053,7 @@ describe('explicit prose routing', () => {
       trigger(framework);
       await until(() => turns() > after && naming().length > 0, 'a later turn to name it');
       assert.equal(naming().length, 1);
-      assert.match(naming()[0]!, /no recent notice on this branch names/);
+      assert.match(naming()[0]!, /no recent notice in your context names/);
     });
   });
 
@@ -1414,7 +1414,7 @@ describe('explicit prose routing', () => {
       const later = draftsOf(framework).open('assistant').find((d) => d.text === 'carrying on');
       assert.ok(later, "the later compile's unprefixed text is held under the turn's hold");
       assert.ok(receipts[0]!.includes(later.id), `and the receipt names that draft as well: ${receipts[0]}`);
-      assert.ok(!texts.some((t) => t.includes('that no recent notice on this branch names')), 'the catch-up left the draft to the receipt');
+      assert.ok(!texts.some((t) => t.includes('that no recent notice in your context names')), 'the catch-up left the draft to the receipt');
       assert.equal(internals.openLogical.has('assistant'), false, 'the logical turn settled');
     } finally {
       await framework.stop();
@@ -1440,7 +1440,7 @@ describe('explicit prose routing', () => {
       assert.ok(late, 'the late envelope bounced into a draft');
       const texts = context(framework).texts;
       assert.ok(texts.some((t) => t.startsWith('[prose-routing]') && t.includes(late.id)), 'its bounce notice names it');
-      assert.ok(!texts.some((t) => t.includes('that no recent notice on this branch names')), "the catch-up doesn't name it again");
+      assert.ok(!texts.some((t) => t.includes('that no recent notice in your context names')), "the catch-up doesn't name it again");
       assert.ok((store.get('assistant', late.id)?.noticedIn ?? []).length > 0, 'it is recorded as noticed');
     });
   });
@@ -1479,6 +1479,43 @@ describe('explicit prose routing', () => {
       } as ProcessEvent);
       assert.ok(internals.pendingRequests.some((r) => r.reason === 'tool_results_ready'), 'the fallback scheduled the re-inference');
       assert.equal(internals.openLogical.get('assistant'), origin, 'without settling the turn it continues');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("the non-streaming fallback's re-inference carries a batch turn's channels", async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      routingOf(name: string): RoutingState;
+      openLogical: Map<string, unknown>;
+      pendingRequests: InferenceRequest[];
+      handleProcessEvent(event: ProcessEvent): Promise<void>;
+    };
+    const origin = internals.routingOf('assistant');
+    origin.continuation = true;
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    (origin as unknown as { wakeChannels?: unknown }).wakeChannels = [room];
+    internals.openLogical.set('assistant', origin);
+    const response = createMockResponse([
+      { type: 'tool_use', id: 'unstreamed-one', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    try {
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'Take the direct inference path.' }]);
+      await agent.runInference(framework.getAllTools());
+      assert.equal(agent.state.status, 'waiting_for_tools');
+      assert.equal((agent.state as { stream?: unknown }).stream, undefined, 'the direct API has no yielding stream');
+      agent.addAssistantResponse(response.content);
+      await internals.handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'unstreamed-one',
+        result: { success: true, data: { ok: true } },
+      } as ProcessEvent);
+      const reinference = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
+      assert.ok(reinference, 'premise: the fallback scheduled the re-inference');
+      assert.deepEqual(reinference.wakeChannels, [room]);
     } finally {
       await framework.stop();
     }
@@ -2471,8 +2508,11 @@ describe('explicit prose routing', () => {
       ] as ContentBlock[], 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]));
     });
-    const deferred = () => (framework as unknown as { deferredMessages: Array<{ content: Array<{ text?: string }> }> })
-      .deferredMessages.filter((m) => m.content.some((b) => b.text === CAFE_NOTE));
+    // Since #291 the note is stored at once and waits outside the window,
+    // where this test once found it in the deferral queue.
+    const stored = () => windowTexts(framework).filter((t) => t === CAFE_NOTE);
+    const presented = () => framework.getAgent('assistant')!.getContextManager().getPresentedMessages()
+      .flatMap((m) => m.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])));
 
     // A failure lets the held post and move go and stops the framework, so the file still ends.
     try {
@@ -2486,11 +2526,11 @@ describe('explicit prose routing', () => {
       }
       assert.equal(module.calls.length, 2, "the next turn's move is running");
       releaseCafe();
-      for (const end = Date.now() + 5000; deferred().length === 0 && Date.now() < end;) {
+      for (const end = Date.now() + 5000; stored().length === 0 && Date.now() < end;) {
         await new Promise<void>((resolve) => setTimeout(resolve, 5));
       }
-      assert.equal(deferred().length, 1, 'the note is due, and held');
-      assert.ok(!windowTexts(framework).includes(CAFE_NOTE), "it isn't written while that turn's move runs");
+      assert.equal(stored().length, 1, 'the note is due, and stored');
+      assert.ok(!presented().includes(CAFE_NOTE), "it isn't in the window while that turn's move runs");
       releaseMove();
       await idle;
 

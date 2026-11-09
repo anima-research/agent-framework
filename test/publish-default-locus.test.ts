@@ -9,7 +9,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import { createMockResponse, HeldStream } from './helpers/mock-membrane.js';
-import { registerOpen, incoming, MENTION } from './helpers/admission.js';
+import { registerOpen, incoming, MENTION, SUB } from './helpers/admission.js';
 
 const until = async (cond: () => boolean, what: string) => {
   for (let i = 0; i < 100 && !cond(); i++) await new Promise((r) => setTimeout(r, 20));
@@ -37,8 +37,27 @@ describe('channel_publish without channelId', () => {
     } finally { await f.close(); }
   });
 
+  it('a channelId written as a number is refused, not read as left out', async () => {
+    const f = await fixture();
+    try {
+      await registerOpen(f, 'work');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      const input = JSON.parse('{"channelId":1437820485836259419,"content":"zz-number"}') as Record<string, unknown>;
+      f.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'p1', name: 'channel_publish', input }], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => !!publishOf(f, 'done') || !!publishOf(f, 'zz-number'), 'the turn spoke');
+      assert.equal(publishOf(f, 'zz-number'), undefined, 'nothing was posted at the locus for a number channelId');
+      const answered = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .some((m) => JSON.stringify(m.content).includes("Nothing changed: channel_publish's channelId must be a string, and this call gave a number."));
+      assert.ok(answered, 'the refusal says the channelId must be a string');
+    } finally { await f.close(); }
+  });
+
   it("a call made outside the turn takes none of the turn's channels: after a turn woken in work it's refused, and under a focus it goes to the excepted channel", async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+    const f = await fixture({ framework: { subconscious: SUB } as never });
     try {
       await registerOpen(f, 'work', 'other');
       const before = await f.framework.executeToolCall({ id: 'p0', name: 'channel_publish', input: { content: 'zz-script-0' }, callerAgentName: 'agent' } as never);
@@ -62,7 +81,7 @@ describe('channel_publish without channelId', () => {
   });
 
   it("a host's call carrying an open channelless turn's id meets the turn's rule: refused, though a focus holds another channel", async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+    const f = await fixture({ framework: { subconscious: SUB } as never });
     try {
       await registerOpen(f, 'work');
       const coordinator = (f.framework as unknown as { tuneOutCoordinator: { enterAllExcept(ref: unknown, opts: unknown, source: string): { ok: boolean } } }).tuneOutCoordinator;
