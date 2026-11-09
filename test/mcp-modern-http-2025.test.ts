@@ -1435,6 +1435,26 @@ test('after stopReconnecting(), a session the server ends isn\'t started again: 
   assert.equal(initializes(fixture).length, 1, 'no new session');
 });
 
+test('stopReconnecting() from a \'close\' listener as a session the server ended starts again: nothing new is dialed', async () => {
+  const fixture = await start2025({ versions: ['2025-06-18'] });
+  const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await connection.listTools();
+  await outlive(20);
+  const events: string[] = [];
+  connection.on('close', () => {
+    events.push(`close willReconnect=${connection.willReconnect}`);
+    connection.stopReconnecting();
+  });
+  for (const name of ['reconnect', 'reconnect-failed']) connection.on(name, () => events.push(name));
+  await fixture.forget(false);
+  await assert.rejects(connection.callTool('echo', {}));
+  await until(() => events.length > 0, 'the close');
+  await sleep(100);
+  assert.deepEqual(events, ['close willReconnect=true']);
+  assert.equal(connection.willReconnect, false);
+  assert.equal(initializes(fixture).length, 1, 'no new session');
+});
+
 for (const kind of ['restart', 'reconnect'] as const) {
   test(`after stopReconnecting(), a ${kind === 'restart' ? 'new session starting at once in place of one the server ended' : 'reconnect after a failed connect'} that is still connecting doesn't come up, and its session is let go`, async (t) => {
     t.mock.method(Math, 'random', () => 0.5);

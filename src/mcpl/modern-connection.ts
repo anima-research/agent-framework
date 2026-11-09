@@ -742,6 +742,7 @@ export class ModernMcpConnection extends EventEmitter {
    */
   stopReconnecting(): void {
     this.reconnectEnabled = false;
+    this.restarting = false;
     this.stopped = true;
   }
 
