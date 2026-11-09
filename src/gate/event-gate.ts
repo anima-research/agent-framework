@@ -256,6 +256,7 @@ interface JudgingState {
    *  decided: delivered with it on reply, judged afresh on wait. */
   queued: PendingEvent[];
   refusedBefore?: true;
+  released?: true;
 }
 
 interface HeldForJudge {
@@ -4407,13 +4408,18 @@ export class EventGate {
 
   /** Hold a batch for the judge until no turn changing the context it reads
    *  runs and the host isn't quiesced, and, held for a refusal, until the
-   *  refusal's stated end or a release, merged with what the rule already holds. */
+   *  refusal's stated end, a release or its rule's next batch, merged with
+   *  what the rule already holds. */
   private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig, refusal?: { hold: string; until?: number }): void {
     const held = this.judgeHeld.get(policyName);
     if (held) {
       appendAll(held.events, events);
       held.judge = judge;
       this.capJudgeEvents(held.events);
+      if (!refusal && events.length > 0) {
+        delete held.refusal;
+        this.clearJudgeRefusalTimer(policyName);
+      }
     } else {
       const fresh = [...events];
       this.capJudgeEvents(fresh);
@@ -4557,8 +4563,9 @@ export class EventGate {
    * (held for a turn that started meanwhile, as fireDebounce holds one). Wait:
    * nothing is delivered, and batches that fired meanwhile go to the judge
    * afresh. A judge that failed, timed out or answered nothing usable decides
-   * by onError: "wake" delivers, "skip" doesn't. Each verdict is traced and
-   * counted for gate_status, and a failure is logged.
+   * by onError: "wake" delivers, "skip" doesn't. Each verdict is counted for
+   * gate_status and traced, but for a held batch's later refusals, and a
+   * failure is logged.
    */
   private finishJudging(policyName: string, state: JudgingState, verdict: JudgeVerdict | undefined, err?: unknown): void {
     // A verdict for a batch the gate let go of (dispose() clears what the
@@ -4630,7 +4637,7 @@ export class EventGate {
     const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
     const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
     const dropsBefore = this.droppedJudgeEvents;
-    if (!wakes) this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge, { hold, ...(until !== undefined && until > now ? { until } : {}) });
+    if (!wakes) this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge, state.released ? undefined : { hold, ...(until !== undefined && until > now ? { until } : {}) });
     const told = wakes || !state.refusedBefore;
     const dropped = this.droppedJudgeEvents - dropsBefore;
     const n = state.events.length;
@@ -4645,6 +4652,10 @@ export class EventGate {
     }
     if (wakes) this.deliverOrBuffer(policyName, [...state.events, ...state.queued]);
     this.recordRefusal(policyName, n, hold, durationMs, wakes, until, told);
+    if (!wakes && state.released) {
+      this.judgeHeld.get(policyName)!.refusedBefore = true;
+      this.flushJudgeHeldIfClear();
+    }
   }
 
   private recordRefusal(policyName: string, n: number, hold: string, durationMs: number, woke: boolean, until: number | undefined, traced: boolean): void {
@@ -4706,7 +4717,10 @@ export class EventGate {
       delete held.refusedBefore;
       this.clearJudgeRefusalTimer(policyName);
     }
-    for (const state of this.judging.values()) delete state.refusedBefore;
+    for (const state of this.judging.values()) {
+      delete state.refusedBefore;
+      state.released = true;
+    }
     this.flushJudgeHeldIfClear();
   }
 

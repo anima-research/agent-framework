@@ -877,7 +877,9 @@ test('auxiliary admission: the wait a refused call states is the one its single 
       }
       assert.ok(refused instanceof MembraneError);
       const stated = refused.retryAfterMs;
-      assert.ok(readAt.some((at) => at !== undefined && stated === until - at), `stated ${stated}, read at ${JSON.stringify(readAt)}, until ${until}`);
+      const timed = readAt.filter((at) => at !== undefined);
+      assert.strictEqual(timed.length, 1, `one timed reading: ${JSON.stringify(readAt)}`);
+      assert.strictEqual(stated, until - timed[0]!, `stated ${stated}, read at ${JSON.stringify(readAt)}, until ${until}`);
     } finally { await fw.stop(); log.restore(); }
   });
 });

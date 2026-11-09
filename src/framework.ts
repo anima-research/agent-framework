@@ -12763,11 +12763,11 @@ export class AgentFramework {
     if (cooldown) {
       clearTimeout(cooldown.timer);
       this.providerAccelerationCooldowns.delete(name);
-      this.eventGate?.providerCallsReleased();
       console.error(`[provider-wait] agent=${name} ended while held` +
         `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
         `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
     }
+    this.eventGate?.providerCallsReleased();
     // main's per-name turn state goes too (#846's re-arm count and run of
     // stated waits, #840's exhausted turn), so a name bound again (a
     // channel's next conversation, a resume) starts afresh; a run of stated
@@ -13363,10 +13363,6 @@ export class AgentFramework {
     pin.agent.unpinTurnInputs(pin.id);
   }
 
-  /** End a turn exhausted: settle it, mark it the agent's failed last turn
-   *  for the reply judge (lastStartFailed), and trace it. A silent start that
-   *  throws before its stream marks it without settling, since it has no part
-   *  in an open turn. */
   private failTurn(
     agent: Agent,
     settle: { failure: { error: string; statedWaitMs?: number }; closes: TurnRouting | undefined; stream?: TurnRouting } | undefined,

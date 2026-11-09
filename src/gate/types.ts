@@ -369,8 +369,10 @@ export interface ReplyJudgeOptions {
    * released (`EventGate.providerCallsReleased`), when no turn that changes
    * what the judge reads runs and the host isn't quiesced. A refusal that
    * states no end, or no time left, waits for that release. A batch its rule
-   * fires meanwhile takes the held events in and is asked about. Refused
-   * too, the whole is held to the new refusal's end. A held batch's first
+   * fires meanwhile takes the held events in and is asked about, once no
+   * turn or quiesce holds it. Refused too, the whole is held to the new
+   * refusal's end. A refusal reported by a call that was out when the gate
+   * was told a hold ended doesn't hold its batch: it's asked again. A held batch's first
    * refusal is logged and traced, and so is its first after a release or
    * after a turn stops a call that took it in; the rest are only counted. A later call that fails lets its batch go, with
    * the held events it took in, as a failed call's batch goes under `"skip"`.

@@ -141,6 +141,22 @@ describe('reply judge: a request refused as too long', () => {
     assert.strictEqual(previews, 1);
   });
 
+  it("asks the framework again before it builds the retry, so a retry the framework would refuse reads no context and sends nothing", async () => {
+    const { membrane, requests } = refusingMembrane(1);
+    let previews = 0;
+    const held = Object.assign(new Error('held'), { providerAdmission: 'deferred' as const });
+    const asked: number[] = [];
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0], options: { maxInputTokens: 4_000 },
+      preview: async () => { previews++; return { messages: conversation(60), config: { model: 'x', maxTokens: 1 } }; },
+      refusal: () => { asked.push(previews); return requests.length > 0 ? held : undefined; },
+    });
+    await assert.rejects(judge.judge(judgeRequest()), (err: unknown) => err === held);
+    assert.deepStrictEqual(asked, [0, 1], 'asked before each build');
+    assert.strictEqual(previews, 1, 'the retry reads no context');
+    assert.strictEqual(requests.length, 1, 'and sends nothing');
+  });
+
   it("logs that the batch is asked once more only once the retry is built and the judge hasn't been stopped meanwhile", async () => {
     for (const second of ['stopped', 'throws', 'built'] as const) {
       const stop = new AbortController();
@@ -652,15 +668,18 @@ describe('reply judge: the document', () => {
     assert.ok(text.includes('- in 60 s: its own skip_reply timer\n- when the hold &lt;on it&gt; is released: a wake held by a provider hold'), text);
   });
 
-  it("shows each upcoming wake's words on one line, escaped, and says how many past the eighth are only maybe, when all are or some are", () => {
+  it("shows each upcoming wake's words on one line, each escaped once, and says how many past the eighth are only maybe, when all are or some are", () => {
     const now = 1_000_000;
     const wakes = [
       { at: now + 1_000, certain: true, what: 'a wake already queued (nudge from Ann <mod>\n[x])' },
+      { at: now + 1_500, certain: false, what: 'rule "a\\"b\\\\c"\'s batch of 1 event goes to the judge' },
       ...Array.from({ length: 9 }, (_, i) => ({ at: now + 2_000 + i, certain: i < 7, what: `wake ${i}` })),
     ];
     const text = ifYouWait(wakes, 'Scout', now);
-    assert.ok(text.includes('- in 1 s: a wake already queued (nudge from Ann &lt;mod&gt; \\[x\\])'), text);
-    assert.ok(text.includes('- and 2 more, each only maybe'), text);
+    assert.ok(text.includes('- in 1 s: a wake already queued (nudge from Ann &lt;mod&gt; [x])'), text);
+    assert.ok(text.includes('- in 2 s, maybe: rule "a\\"b\\\\c"\'s batch of 1 event goes to the judge'), text);
+    assert.ok(text.includes('- and 3 more, 2 of them only maybe'), text);
+    assert.ok(ifYouWait([{ when: 'once Ann <mod>\nsays [go]', certain: true, what: 'a wake held by the host' }], 'Scout', now).includes('- once Ann &lt;mod&gt; says [go]: a wake held by the host'), 'its time in words too');
     const some = Array.from({ length: 11 }, (_, i) => ({ at: now + 1_000 + i, certain: i !== 9, what: `wake ${i}` }));
     assert.ok(ifYouWait(some, 'Scout', now).includes('- and 3 more, 1 of them only maybe'));
   });

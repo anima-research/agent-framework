@@ -94,9 +94,10 @@ export interface ReplyJudgeDeps {
   membraneFor: (agentName: string) => Membrane;
   /** Whether the framework would refuse the judge's call on `model` for the
    *  agent now, as `membraneFor`'s call would: the refusal to throw, or
-   *  undefined. Asked before the agent's context is read, so a refused call
-   *  reads nothing; the membrane's call still refuses one whose hold began
-   *  since. Left out, the context is read and the call alone refuses. */
+   *  undefined. Asked before the agent's context is read, and again before a
+   *  request refused as too long is rebuilt, so a call it refuses then reads
+   *  nothing; the membrane's call still refuses one whose hold began since.
+   *  Left out, the context is read and the call alone refuses. */
   refusal?: (agentName: string, model: string) => Error | undefined;
   options?: ReplyJudgeOptions;
   /** Which of the batch's agents the judge reads the context of. */
@@ -287,7 +288,7 @@ export function failedTurnLine(failed: FailedLastTurn, wakes: readonly UpcomingW
  */
 export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number, failed?: FailedLastTurn): string {
   const sorted = soonestFirst(wakes, now);
-  const listed = sorted.slice(0, 8).map((w) => `- ${w.when !== undefined ? field(w.when) : inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${field(w.what)}`);
+  const listed = sorted.slice(0, 8).map((w) => `- ${w.when !== undefined ? escapeText(oneLine(w.when)) : inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${escapeText(oneLine(w.what))}`);
   const rest = sorted.slice(8);
   const maybe = rest.filter((w) => !w.certain).length;
   const more = rest.length > 0 ? [`- and ${rest.length} more${maybe > 0 ? `, ${maybe === rest.length ? 'each' : `${maybe} of them`} only maybe` : ''}`] : [];
@@ -622,6 +623,8 @@ export class ReplyJudge {
       if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= MIN_CHARS_PER_TOKEN) throw err;
       this.anchors.delete(built.agentName);
       const refused = built;
+      const held = this.refusal?.(built.agentName, this.model);
+      if (held) throw held;
       built = await this.build(request, agentName, undefined, MIN_CHARS_PER_TOKEN, true);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
