@@ -54,6 +54,10 @@ export interface InboundEnvelope {
   /** What the gate sees: the text and the metadata shape it has always matched on. */
   gateContent: string;
   gateMetadata: Record<string, unknown>;
+  /** Set where the framework has decided the event is a silent heartbeat
+   *  tick (isSilentHeartbeatMarker): the gate sees it as one
+   *  (GateEventInfo.silentHeartbeat). */
+  silentHeartbeat?: { eventId: string; serverId: string };
 }
 
 export interface HoldRecord {

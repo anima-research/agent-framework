@@ -167,6 +167,37 @@ describe('a silent tick batched by a gate rule', () => {
     }
   });
 
+  it("from the heartbeat-mcpl server, batched alone, wakes as the tick, and only the agents its direct wake reaches", async () => {
+    const module = new M();
+    const f = await fixture({
+      server: { id: 'heartbeat', enabledFeatureSets: ['heartbeat'] },
+      featureSets: { heartbeat: { description: 'heartbeat', uses: ['pushEvents'] } },
+      framework: {
+        modules: [module],
+        gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
+      },
+    });
+    const fw = internals(f);
+    fw.registry.register(conversationForkSpec('agent-conv-1', { template: 'agent', homeChannel: { serverId: 'heartbeat', channelId: 'home' }, idleTtlMs: 60_000 }));
+    fw.agents.set('agent-conv-1', fw.agents.get('agent'));
+    try {
+      await f.send('push/event', {
+        featureSet: 'heartbeat', eventId: 'hb1', timestamp: new Date().toISOString(),
+        origin: { source: 'heartbeat', reason: 'schedule', silent: true }, payload: { content: [] },
+      });
+      await f.framework.runUntilIdle();
+      fire(f);
+      assert.deepEqual(fw.pendingRequests.map((r) => [r.agentName, r.suppressProse, r.silentHeartbeat]),
+        [['agent', true, { eventId: 'hb1', serverId: 'heartbeat' }]]);
+      assert.ok(!f.context().includes('[Gate: '), 'no [Gate:] line');
+    } finally {
+      fw.pendingRequests.splice(0);
+      fw.registry.end('agent-conv-1', 'stopped');
+      fw.agents.delete('agent-conv-1');
+      await f.close();
+    }
+  });
+
   it('wakes the agents the heartbeat wakes, not a conversation fork the gate also wakes', async () => {
     const { f } = await batching();
     const fw = internals(f);

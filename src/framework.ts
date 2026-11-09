@@ -21880,6 +21880,7 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(event.tags ? { tags: event.tags } : {}),
       },
+      ...(silentHeartbeat ? { silentHeartbeat: { eventId: event.eventId, serverId: event.serverId } } : {}),
     }, event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {});
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
@@ -41021,6 +41022,14 @@ export class AgentFramework {
       metadata: e.gateMetadata,
       tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
       ...(e.targetAgents !== undefined ? { recipients: e.targetAgents.filter((name) => this.agents.has(name)) } : {}),
+      // A silent tick's batch wakes as the tick, and only the agents its
+      // direct wake reaches, as the framework's own heartbeat's tick does
+      // (heartbeatGateEvent).
+      ...(e.silentHeartbeat !== undefined ? {
+        silentHeartbeat: e.silentHeartbeat,
+        ...(e.targetAgents === undefined
+          ? { recipients: this.registry.untargetedRecipients().filter((name) => this.agents.has(name)) } : {}),
+      } : {}),
       ...(asked ? { suppressionAsked: true } : {}),
       ...(opts.folds ? { folds: true as const } : {}),
     });
