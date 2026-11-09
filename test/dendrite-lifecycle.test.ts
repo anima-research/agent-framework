@@ -501,6 +501,69 @@ describe('Dendrite lifecycle', () => {
     assert.ok(traces.some((t) => t.type === 'dendrite:mail-held' && t.mailId === delivery.mailId));
   });
 
+  it("wakes the first candidate when an orphan's result is held, and the turn it starts reads the notice", async () => {
+    const framework = await boot();
+    framework.start();
+    const pending = () => (framework as unknown as {
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; readsRow?: string }>;
+    }).pendingRequests;
+
+    const boss = await startBlocked(framework, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const job = await startBlocked(
+      framework,
+      'job',
+      'g-job',
+      workerSpec('job', { spawnedBy: 'boss', resultTo: { to: 'boss', as: 'message' } }),
+      'job result',
+    );
+    framework.stopAgent('boss', { by: 'mira' });
+    await boss.settled;
+    gates.release('g-job');
+    assert.ok((await job.settled).ok);
+    await until(() => pending().every((r) => r.agentName !== 'oren') && framework.getAgent('oren')!.state.status === 'idle', 'what woke oren before the result to run');
+    const turnsBefore = membrane.callsFor('oren').length;
+    membrane.script('oren', say('noted'));
+
+    const delivery = framework.deliverAgentResult('job', [{ type: 'text', text: 'job result' }]);
+    assert.equal(delivery.delivered, false, 'the result is held');
+    const notice = framework.getAgent('oren')!.getContextManager().getAllMessages()
+      .find((m) => (m.metadata as { dendrite?: { event?: string } } | undefined)?.dendrite?.event === 'result-held');
+    assert.ok(notice, 'oren is told the result is held');
+    assert.deepEqual(
+      pending().filter((r) => r.agentName === 'oren').map((r) => [r.reason, r.source, r.readsRow]),
+      [['agent-result-held:job', 'dendrite', notice.id]],
+      'the notice wakes oren, for the row it wrote',
+    );
+
+    await until(() => membrane.callsFor('oren').length > turnsBefore, 'the wake to start a turn of oren');
+    const request = JSON.stringify(membrane.callsFor('oren').at(-1)!.messages);
+    assert.ok(request.includes('reparenting \\"job\\" to you delivers it'), "the turn's request carries the notice");
+    assert.deepEqual(framework.listHeldMail().map((m) => [m.from.agent, m.heldBecause]), [['job', 'recipient-gone']], 'the result stays held until an adopt');
+  });
+
+  it("asks no wake for a held result's notice when the host turned orphan announcements off", async () => {
+    const framework = await boot({ dendrite: { announceOrphans: false } } as Partial<Parameters<typeof AgentFramework.create>[0]>);
+    framework.start();
+    const pending = () => (framework as unknown as { pendingRequests: Array<{ agentName: string; reason: string }> }).pendingRequests;
+    const boss = await startBlocked(framework, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const job = await startBlocked(
+      framework,
+      'job',
+      'g-job',
+      workerSpec('job', { spawnedBy: 'boss', resultTo: { to: 'boss', as: 'message' } }),
+      'job result',
+    );
+    framework.stopAgent('boss', { by: 'mira' });
+    await boss.settled;
+    gates.release('g-job');
+    assert.ok((await job.settled).ok);
+    assert.equal(framework.getAgentRecord('job')?.orphaned?.candidates[0], 'oren', 'oren is its first candidate');
+    const delivery = framework.deliverAgentResult('job', [{ type: 'text', text: 'job result' }]);
+    assert.equal(delivery.delivered, false);
+    assert.equal(textsIn(framework, 'oren').filter((m) => m.metadata.kind === 'agent-lifecycle').length, 0, 'no notice');
+    assert.equal(pending().filter((r) => r.reason === 'agent-result-held:job').length, 0, 'and no wake');
+  });
+
   it('reparenting a running orphan reroutes its result to the new parent, once', async () => {
     const framework = await boot();
     framework.start();
@@ -987,6 +1050,35 @@ describe('Dendrite restart', () => {
     assert.deepEqual(wakesOf(second), [['mira', 'agent-message:job', 'dendrite']]);
     membrane.script('mira', say('read it'));
     await miraReads(second, 'a word mid-turn');
+  });
+
+  it("wakes an orphan's candidate again after a crash for a held result's notice still out of her window", async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    await blockedJob(first, gates1, 'boss', workerSpec('boss', { spawnedBy: 'mira' }));
+    await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'boss', resultTo: { to: 'boss', as: 'message' } }));
+    await miraMidTurn(first, gates1);
+    first.stopAgent('boss', { by: 'test' });
+    gates1.release('job');
+    await until(() => first.getAgentRecord('job')?.ended !== undefined, 'job to end');
+
+    const delivery = first.deliverAgentResult('job', [{ type: 'text', text: 'held across the crash' }]);
+    assert.equal(delivery.delivered, false, 'held: its recipient has ended');
+    const notice = first.getAgent('mira')!.getContextManager().getAllMessages()
+      .find((m) => (m.metadata as { dendrite?: { event?: string } } | undefined)?.dendrite?.event === 'result-held');
+    assert.ok(notice, 'mira is told while her turn runs');
+    assert.equal(first.getAgent('mira')!.getContextManager().ordinalOf(notice.id), undefined, 'out of her window until it ends');
+
+    const heldWakes = (framework: AgentFramework) => wakesOf(framework).filter(([, reason]) => reason.startsWith('agent-result-held:'));
+    const second = await process(new GateModule());
+    assert.deepEqual(heldWakes(second), [['mira', 'agent-result-held:job', 'dendrite']], 'the wake the crash lost is asked again');
+    membrane.script('mira', say('read it'));
+    await miraReads(second, 'to you delivers it');
+
+    const third = await process(new GateModule());
+    assert.deepEqual(heldWakes(third), [], 'in her window since: no wake a second time');
+    assert.deepEqual(third.listHeldMail().map((m) => [m.from.agent, m.heldBecause]), [['job', 'recipient-gone']], 'the result is still held for an adopt');
   });
 
   // AF #844 bot review 3, finding 37: mail its sender asked to wake no one
