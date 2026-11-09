@@ -152,6 +152,25 @@ A turn keeps the messages it opened with whole: at a start that opens a turn, th
 
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
+#### Legacy reasoning-loss notices
+
+Rows marked with both `metadata.system === true` and
+`metadata.kind === 'reasoning-loss'` are omitted from the agent's compiled
+context and compression inputs only. Stored history is unchanged: history
+`extract`, `search` and around-message lookup still return these notices
+verbatim, and tool output or previously written summaries can reintroduce their
+text. Selection never matches notice text.
+
+Hosts opening the same stores should use the package's
+`residentViewFilter(message, agentName)` or
+`subconsciousViewFilter(message, agentName)` rather than copy the view rules.
+On context-manager releases up to at least 0.25.1, a hidden first source can place that
+summary after newer messages; a hidden first or last source makes it permanently
+unmergeable and absent from history overview until anima-research/context-manager#369 or equivalent lands. The release that raises the context-manager dependency floor to a version
+containing that fix should remove this migration limit and the migration test
+`todo`. See the
+[release note](changelog.d/973-reasoning-loss.fixed.md).
+
 ### Persistence
 
 All state is persisted in a [Chronicle](https://github.com/antra-tess/chronicle) store:
@@ -307,18 +326,19 @@ A pattern that matches no tool is reported once, as a console line and an
 A pattern that could name a server's tools is not judged until that server
 has listed them, so late connects and reconnects don't cause early reports.
 
-#### Modern MCP servers (2026-07-28)
+#### Modern MCP servers
 
-The same `mcplServers` list also takes servers that speak modern MCP
-(revision `2026-07-28`), reached through the official SDK client. The
-configuration chooses the family, and nothing is probed:
+The same `mcplServers` list also takes servers that speak modern MCP,
+reached through the official SDK client: revision `2026-07-28`, and over
+HTTP the 2025 revisions too. The configuration chooses the family, and a
+stdio server speaks `2026-07-28` alone:
 
 | Configuration | Family | Transport |
 |---|---|---|
 | `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket (`token` / `accessProvider` as `?token=`, or as bearer with `tokenTransport: 'header'`) |
-| `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
+| `url: 'http://…'` / `'https://…'` | modern MCP (`2026-07-28`, `2025-11-25`, `2025-06-18` or `2025-03-26`, negotiated) | Streamable HTTP (`token` / `accessProvider` as bearer) |
 | `command` | MCPL | stdio |
-| `command` + `protocol: 'modern'` | modern MCP | stdio |
+| `command` + `protocol: 'modern'` | modern MCP (`2026-07-28`) | stdio |
 
 ```typescript
 {
@@ -418,6 +438,114 @@ server that refuses `2024-11-05` with `-32022` fails with
 revisions the server says it supports ("none listed" for an empty list), or its error text when it sends no list,
 and when the list includes `2026-07-28` it says to configure the server with
 `protocol: 'modern'` (stdio) or reach it over http(s).
+
+Over HTTP the revision is negotiated at each connect. The client asks
+`server/discover` first and connects at `2026-07-28` when the server offers
+it. A server that doesn't gets the 2025 `initialize` handshake, which asks
+for `2025-11-25` and accepts `2025-11-25`, `2025-06-18` or `2025-03-26` in
+the answer.
+`listMcplServers()` shows the revision it settles on as `protocolVersion`,
+and its `family` stays `modern`. On a 2025 revision:
+- List changes arrive on the session's standalone stream, which is kept
+  open while the session lives, whether or not the server issues a session
+  id, unless the server answers its first open with a status that won't
+  pass: a 405, which says it offers no stream, a 501 or 505, a 4xx other
+  than 408, 409 and 429, or a redirect the SDK doesn't follow, such as one
+  off the server's origin. With a `token` or `accessProvider` set, a 401
+  first gets one more try, after the SDK refreshes the credential.
+  Such an open isn't tried again, and the session's list changes don't
+  arrive. A failure to open it that may pass is reported as the
+  connection's `error` and tried again, and a stream that drops is
+  reopened: the first try waits the server's `retry` hint, or the first
+  step of the connection's backoff when it gave none or a hint of 0, and a
+  try after a failed one waits the longer of the hint and the connection's
+  backoff.
+  Its first open, once the connection is up, and a reopen that missed what
+  came meanwhile each relist the tools of a server that announces list
+  changes, since a change announced while no stream was open never
+  arrives.
+- A request's stream that the server closes after a priming event is
+  resumed for as long as the request lives. Its cancellation at the
+  deadline stops the resume too. A stream cut again before it carried a
+  new event id can't be resumed: the SDK sends its resume without the id
+  (modelcontextprotocol/typescript-sdk#2499), which the server can't match
+  to the call's stream, so the call doesn't get its answer, and fails as
+  `no-response`, at the latest at its deadline.
+  A call whose stream ends unanswered with nothing to resume from fails
+  then, as `no-response`, not at its deadline.
+- The server ends the session by answering 404 to a request that carried
+  its id (except the stream's first open, whose 404 can also mean the
+  server has no GET route). A call whose POST met the 404 fails as
+  `error-response` with `data.httpStatus` 404, and isn't replayed. A call
+  whose stream the server's restart cut is `no-response`, since the server
+  may have run it. A session that had answered a request gets a new one at
+  once, whatever `reconnect` says: the connection emits `close` while its
+  `willReconnect` reads true, then `reconnect`, and the framework keeps the
+  server and its tools and relists. If the new session can't start,
+  `reconnect` decides, as for any lost connection, and a revision verdict
+  stops it for good, as on any reconnect. Without `reconnect`, that failure
+  emits a second `close`, while `willReconnect` reads false: the server is
+  gone. An answered session that ended less than the base interval
+  (`reconnectIntervalMs`) after it started gets a new one at once only if
+  the last session restarted that way had lived the interval, or there was
+  none: a server restarted once soon after a connect costs a restart, not
+  the server. A second such young end in a row is a failed connect, as is
+  a session's end before it answered anything: it emits `reconnect-failed`
+  and `close`, and follows `reconnect` with a growing backoff. So a load
+  balancer without sticky sessions, or a rolling upgrade that lands a
+  connect on an old node and its requests on a new one, shows up as a
+  failing server, with the framework's alert at the fifth attempt, when its
+  sessions end within the interval. A deployment whose sessions each live
+  longer restarts at most once an interval, and each restart costs the
+  calls in flight: the client can't tell a balancer that moves a session's
+  requests from a server that restarts. Once the framework's `stop()` has
+  begun, an ended session isn't started again, and a new one already
+  connecting doesn't come up.
+- A server that moves to `2026-07-28` in place is followed, since the
+  session's end brings a new connect, which negotiates afresh. Two more
+  answers end a 2025 session, with a session id or without: a 400 carrying
+  JSON-RPC `-32022` to any request, as the SDK's 2026 handler answers 2025
+  traffic it refuses (`legacy: 'reject'`), and a 405 to a GET for one of
+  the session's streams after the server had served it (the standalone
+  stream's reopen, or a request stream's resume with its event id), as that
+  handler answers a 2025 session it serves statelessly (its default). A call
+  refused with `-32022` fails as `error-response` with the server's data,
+  its code in the host's log, and isn't replayed. Its words say the server
+  refused the session's revision, so the request didn't run, and whether
+  this host is reconnecting. A server that keeps serving a 2025 revision
+  statelessly to a connection that never had a standalone stream isn't
+  followed, unless its upgrade cut a call's stream, whose resume with its
+  event id then meets the 405: that connection stays on 2025 until its next
+  connect.
+- Each session the server holds by its id is ended with a `DELETE` when the
+  connection lets it go, waiting at most 3 s: at `close()`, and so `stop()`
+  or a disconnect, a connect in flight included, and when a connect fails
+  after its `initialize` was answered. A session the server let go, with a
+  404, a `-32022` or such a 405, gets none.
+
+On `2026-07-28` too, a dropped stream's retries follow that timing. They
+stop after two failed tries, the SDK's default, on every stream: a listen
+stream that can't be resumed is reopened, with a relist, and a call whose
+stream can't be resumed fails then, as `no-response`, rather than at its
+deadline.
+
+A server over HTTP that this client can't negotiate a revision with fails
+with `McplProtocolVersionError`, naming what each side speaks, and is not
+retried: the SDK's own refusal, after which it negotiates no further (a
+`-32022` whose list names a revision from `2026-07-28` on that this client
+doesn't speak, even if the list also names a 2025 revision it does, which
+the message then says); a discovery or `-32022` error that lists no
+revision in common, once the server has also refused the `initialize`
+tried after it (`rejected`); or an `initialize` answered with a revision
+the 2025 handshake doesn't accept, or with none (`mismatch`). `2026-07-28` is
+negotiated through `server/discover` alone, so it isn't accepted from
+`initialize`. An `initialize` that fails without an answer, such as a
+timeout, is no verdict, and is retried as any failed connect is. The
+error's `offeredRevisions` lists the revisions this client offered, and
+`offered` is the first of them. `2024-11-05` isn't one of them over HTTP:
+its HTTP binding was HTTP+SSE, another transport. Over stdio, a discovery
+answer that lists revisions without `2026-07-28` is a verdict too, even one
+the SDK can't read as a DiscoverResult.
 
 Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it; with `tokenTransport: 'header'` it sets none), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command and arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. A JSON-RPC tool answer's result passes through as sent. No error a host's own call gets, whether thrown, rejected with or in an error answer's data, carries a credential this filtering replaces, whoever wrote its words: a server's words are redacted, then bounded, where an error is built from them, the strings in an error answer's data are redacted, and an error a library raised, such as a failed modern connect's, is handed on as its name and its redacted words alone. A stdio child that couldn't be started is refused with Node's words redacted, stopping before Node's quote of a value it refused at once, and a cause that keeps Node's error's name, those words and its `code`. With a configuration that can't be read, the server's words and data are withheld. A failed handshake's `stderrTail` is the end of the server's stderr, with every credential of up to 14,336 characters that reaches into it replaced whole. A number in an error answer's data is matched as JavaScript reads it, so one with more significant digits than a double holds has lost its last digits before it's matched. A close's or a cleanup's failure carries the transports' own words, a child's pid, its server's id and the wait it was given. A connection's events are inputs to the framework's records, which redact them.
 
@@ -785,7 +913,7 @@ A model call that stops making progress is cut, so an agent isn't held by a prov
 - **A resident's streamed call**, and an MCPL server's streamed inference request, get membrane's progress bounds where the adapter's stream reports content (`AnthropicAdapter`, `BedrockAdapter`). Before content, a call ends 60 s after its send, or, once a thinking block has started, at the later of that and the block's allowance, its `max_tokens` at 87 tokens a second. Once content has begun, it ends after 150 s without a provider event, or after the block's allowance when the last event was a thinking block's start and the allowance is longer. Membrane's README gives the rules whole.
 - **Every streamed call the framework makes** also gets a flat bound from its last provider event: the larger of a setup term plus that allowance and 1,862 s (`FLAT_MINIMUM_MS`). The setup term is the larger of the before-content and between-events bounds, 150 s by default. So on an adapter with progress bounds the flat bound never runs out first. On one without, such as `OpenAICompatibleAdapter`, it's the only progress bound, and an SSE keepalive comment doesn't restart it, though a data frame that parses as an event does, a provider's own ping object included.
 - **A whole non-streamed call**, a compression's, the reply judge's, or an MCPL server's non-streamed inference request, ends the setup term plus its allowance after its send, or, when it names no `max_tokens`, at the larger of the setup term and the flat minimum, unless its caller passed a `progressTimeoutMs` of its own. Its caller gets the `timeout` error. The event gate's own 20 s judge timeout ends the reply judge's call first at the defaults. Context-manager takes a cut compression call as a transient failure: the lane pauses and tries again, so compression that never lands within its bound shows as a lane that keeps pausing, not as a failed turn, and is a reason to raise the bound. On an adapter whose `complete()` streams under the hood, such as membrane's OpenAI Responses adapter in subscription mode, membrane renews the bound at each parsed provider event, so there it runs from the last event, as a stream's flat bound does.
-- **A turn's call a bound cuts** fails as a `timeout`, and `DefaultErrorPolicy` gives it one fresh call, 1 s later, whatever other failures its turn had, except in a turn sent again after its retries ran out, before one of its rounds has run or had its tool calls cut off, whose failures get no retries. A fresh call that's cut too, with no other failure between, ends the turn, and its `[inference-failed]` note says the call timed out, that the call was made again and timed out again, and the reason. For a bound's cut the reason names the bound that ran out and the host's setting for it. A deadline expiry membrane throws (the Anthropic adapter's own watchdogs, the SDK's request timeout, a runtime's fetch timeout on a silent connection) counts the same toward the fresh call and the turn's end, and its reason is its own message, which names no setting. A bound's cut isn't `retryable`, so a host's own `errorPolicy` that retries only retryable errors gives it no fresh call; an expiry membrane throws stays `retryable`, as membrane made it.
+- **A turn's call a bound cuts** fails as a `timeout`, and `DefaultErrorPolicy` gives it one fresh call, 1 s later, whatever other failures its turn had, except in a turn sent again after its retries ran out, before one of its rounds has run or had its tool calls cut off, whose failures get no retries. A fresh call that's cut too, with no other failure between, ends the turn, and its `[inference-failed]` note says the call timed out, that the call was made again and timed out again, and, for a bound's cut, the reason, which names the bound that ran out and the host's setting for it. A deadline expiry membrane throws (the Anthropic adapter's own watchdogs, the SDK's request timeout, a runtime's fetch timeout on a silent connection) counts the same toward the fresh call and the turn's end, and its note gives no reason: the note gives one only for a bound's cut, a stream's abort or context-manager's refusal of a compile. A bound's cut isn't `retryable`, so a host's own `errorPolicy` that retries only retryable errors gives it no fresh call; an expiry membrane throws stays `retryable`, as membrane made it.
 - **A stream that keeps sending content** isn't ended by any of these, since content is progress.
 
 These bounds don't replace the deadlines below them: a silent connection still meets the runtime's own fetch timeout (360 s on Bun 1.4.4) and, on `AnthropicAdapter`, the adapter's 600 s first-event and idle watchdogs, so on a silent connection a bound raised past those is met by them first.
@@ -819,7 +947,7 @@ The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, whic
 
 A turn whose stream is cancelled this way, or by `agent.cancelStream()`, ends as a stop, whether the stream reports the cancel as `aborted`, as an `error`, or by just closing: one `inference:aborted` carrying the caller's reason (`user` when none was given), a `[turn-interrupted]` note in the agent's context, and never `inference:exhausted`, which is for failed inferences. A stream that membrane aborts on its own, at a deadline or on an error (reason `timeout` or `error`), is a failed inference. `stop()` and an operator's quiesce abandon end a turn as a stop too, with their own reasons, `shutdown` and `quiesce_abandoned`, and write no note, except the `[speech-not-posted]` notice when the turn's rounds left speech unposted (XML tool mode, or a membrane without `roundContent`; see below). A stopped stream still writes its inference-log row, with `success: false`.
 
-A caller's stop and an operator's quiesce abandon also reach a turn that has no live stream: one running its modules' `gatherContext`, its MCPL hooks or its compile, one waiting to retry a failed inference or compile (`abortInference()` and an operator's abandon end the wait, and a stop through `Agent.cancelStream()` waits for it to run out), and one whose tool-result guard is waiting to retry after a refusal, which holds only the round's finished stream. The turn ends at its next check, before it sends anything more, as a stop on a live stream ends it, and a turn whose compile fails after the stop ends at the failure, before a provider hold, the error policy's retry or `inference:exhausted`. A caller's stop leaves the note saying the turn was stopped before it sent anything or before it finished, and an operator's abandon leaves none, except the `[speech-not-posted]` notice when the turn's rounds left speech unposted. `abortInference()` returns `true` for such a turn. In the guard's wait, `stop()` ends the turn as a stop with reason `shutdown`, and an operator's abandon ends it as the abandon, even when a caller's stop came first; with both, it ends as `stop()`'s. `stop()` drops a turn in its hooks, its compile or a wait to retry before it sends anything, as before, and drops one whose compile fails while it runs, once a caller's stop has reached it, rather than ending it as that stop. While the failure of a turn's stream is reported (`inference:failed`), the agent no longer holds that stream, so `abortInference()` from a listener reports `false`. A failure to build a turn's request is reported while the turn's check is still ahead, so there `abortInference()` reports `true`, and the turn ends at that check. A caller's stop made where no check of a turn is ahead stops nothing, and doesn't end the agent's next turn: while the agent is idle, while a turn finishes its last delivery, and while a non-streaming turn's tool results wait to start the turn's next call. A turn whose continuation (a budget restart's, or a tool-result guard's retry) waits to start, or whose failed call a provider-capacity hold or a provider's stated wait keeps for its retry, is ended by `abortInference()`, by an operator's quiesce abandon and by `stop()`: the continuation or retry is dropped, and the turn ends with the caller's reason, `quiesce_abandoned` or `shutdown`. After `abortInference()` or an abandon, wakes that arrived meanwhile still run (after the abandon, once the host resumes): those a hold keeps beside the retry, and those the scheduler merged into the retry's or the continuation's start before that start began, which the stop or the abandon puts back in the queue. A stop through `Agent.cancelStream()` stops nothing there.
+A caller's stop and an operator's quiesce abandon also reach a turn that has no live stream: one running its modules' `gatherContext`, its MCPL hooks or its compile, one waiting to retry a failed inference or compile (`abortInference()` and an operator's abandon end the wait, and a stop through `Agent.cancelStream()` waits for it to run out), and one whose tool-result guard is waiting to retry after a refusal, which holds only the round's finished stream. The turn ends at its next check, before it sends anything more, as a stop on a live stream ends it, and a turn whose compile fails after the stop ends at the failure, before a provider hold, the error policy's retry or `inference:exhausted`. A caller's stop leaves the note saying the turn was stopped before it sent anything or before it finished, and an operator's abandon leaves none, except the `[speech-not-posted]` notice when the turn's rounds left speech unposted. `abortInference()` returns `true` for such a turn. In the guard's wait, `stop()` ends the turn as a stop with reason `shutdown`, and an operator's abandon ends it as the abandon, even when a caller's stop came first; with both, it ends as `stop()`'s. `stop()` drops a turn in its hooks, its compile or a wait to retry before it sends anything, as before, and drops one whose compile fails while it runs, once a caller's stop has reached it, rather than ending it as that stop. While the failure of a turn's stream is reported (`inference:failed`), the agent no longer holds that stream, so `abortInference()` from a listener reports `false`. A failure to build a turn's request is reported while the turn's check is still ahead, so there `abortInference()` reports `true`, and the turn ends at that check. A caller's stop made where no check of a turn is ahead stops nothing, and doesn't end the agent's next turn: while the agent is idle, except for a turn a budget hold keeps (below), while a turn finishes its last delivery, and while a non-streaming turn's tool results wait to start the turn's next call. A turn whose continuation (a budget restart's, or a tool-result guard's retry) waits to start, or whose failed call a provider-capacity hold or a provider's stated wait keeps for its retry, is ended by `abortInference()`, by an operator's quiesce abandon and by `stop()`: the continuation or retry is dropped, and the turn ends with the caller's reason, `quiesce_abandoned` or `shutdown`. After `abortInference()` or an abandon, wakes that arrived meanwhile still run (after the abandon, once the host resumes): those a hold keeps beside the retry, and those the scheduler merged into the retry's or the continuation's start before that start began, which the stop or the abandon puts back in the queue. A stop through `Agent.cancelStream()` stops nothing there. A turn a budget hold keeps waiting for compression is idle: `abortInference()` and `stop()` end it with one `inference:aborted`, and after `abortInference()` the wakes that joined it go back in the queue; a quiesce has nothing of it to abandon. Once released, a first start is a queued wake until its start begins, which `abortInference()` leaves to run, and a continuation is a queued continuation, which it ends.
 
 In XML tool mode, or with a membrane that gives a tool round no `roundContent`, such a round's speech reaches a channel only when its stream completes. When the stream ends any other way (a failure, a stop, a tool that ends the turn, an error policy's retry, a context-budget or tool-result-guard restart, a quiesce abandon or `stop()`), the rounds' words are already in the agent's context, and a `[speech-not-posted]` notice tells the agent that nothing it wrote before its tool calls in those rounds was posted, so it can send what should go out again. It's written once for those rounds: where the turn ends, or before a retry's or a restart's request is sent. A turn its own `skip_reply` ends, a silent turn, a round still waiting on its tools when its stream ends (which never reaches the context) and the rounds of a stream that completes get none. In XML tool mode with thinking on, a round whose text was only thinking gets the notice too, since the framework has only the round's raw text there. A failed turn's `[inference-failed]` note says that its earlier rounds ran when any round reached the context with its results, and that a round's tool calls were started and may have taken effect when any of its streams ended before that round's results came back; a caller's stop says the latter in its `[turn-interrupted]` note too. A turn that fails, or that a caller stops, writes no `[delivered]` receipt, so when its rounds' plain speech was delivered live (native tool mode, in locus or hybrid routing), its `[inference-failed]` note, or the stop's `[turn-interrupted]` note, says that speech was handed on for delivery as written and that no `[delivered]` line was written for it. When some of its speech was still being routed as the turn ended, the note also says it may yet be posted and to check the channel before sending it again. A delivery that finished undelivered gets neither: a channel delivery's `[discord-send-failed]` note, or a refused `>>>` envelope's bounce, already says what happened. A quiesce abandon and `stop()` write neither note.
 

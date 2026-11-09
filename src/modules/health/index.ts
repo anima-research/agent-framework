@@ -188,7 +188,7 @@ export class HealthModule implements Module {
         timestamp: safeZoned(s.timestamp),
         agentName: s.agentName,
         success: s.success,
-        error: s.error,
+        error: s.errorWords,
         requestId: s.requestId,
         tokenUsage: s.tokenUsage,
       };
@@ -201,7 +201,7 @@ export class HealthModule implements Module {
       .map((s) => ({
         timestamp: s.timestamp,
         agentName: s.agentName,
-        error: typeof s.error === 'string' ? safeSlice(s.error, 0, 400) : s.error,
+        error: typeof s.error === 'string' ? safeSlice(s.error, 0, 400) : null,
         requestId: s.requestId,
       }));
 

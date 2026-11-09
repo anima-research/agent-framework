@@ -35,6 +35,7 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+import { appendAll } from './append-all.js';
 
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
@@ -112,6 +113,11 @@ export interface StartStreamResult {
    *  far in sent order, with this request's head (context-manager's `noteRequestSent`). Present only where the
    *  model binds its thinking and the context manager keeps a record it can be told of. */
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
+  /** Tells the context manager which stored bodies' thinking the provider dropped from a call of this stream, by the
+   *  ids `placeDrops` gives for a `reply` drop, with the compile the stream was built from (context-manager's
+   *  `noteThinkingDropped`), so, once the context manager takes the note, its record leaves them without their
+   *  thinking from the next compile on. Present only where `noteRequestSent` is. */
+  noteThinkingDropped?: (messageIds: readonly MessageId[]) => boolean;
   /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
    *  Absent when the compile reports no provenance. */
   carriedBodies?: ReadonlySet<MessageId>;
@@ -435,6 +441,7 @@ export class Agent {
    * the next change.
    */
   private liveBudgetEpoch = 0;
+  private contextSettingsChangeCount = 0;
   /**
    * Counts changes of the descent (each arm of one, the same target included,
    * a reset, a cancel, a settle). A settle proves its target only to a
@@ -696,7 +703,19 @@ export class Agent {
     if (typeof manager.updateHotContextSettings !== 'function') {
       throw new Error('The active context strategy does not support live context settings');
     }
-    return manager.updateHotContextSettings(update);
+    const settings = (s: HotContextSettingsStatus | null) =>
+      JSON.stringify([s?.tailTokens, s?.transitionPaceTokens, s?.preparedWindowTokens]);
+    const before = settings(this.getHotContextSettings());
+    const status = manager.updateHotContextSettings(update);
+    if (settings(status) !== before) this.contextSettingsChangeCount++;
+    return status;
+  }
+
+  /** How many times the live budget, its descent target or the hot context
+   *  settings have changed.
+   *  @internal For the framework's budget holds; not a host API. */
+  contextSettingsChanges(): number {
+    return this.contextSettingsChangeCount;
   }
 
   getRuntimeSettings(): AgentRuntimeSettingsSnapshot {
@@ -763,6 +782,7 @@ export class Agent {
   private setContextBudget(budget: number | undefined, target: number | undefined, armed = false): void {
     if (budget !== this.contextBudgetTokens) this.liveBudgetEpoch++;
     if (armed || target !== this.contextBudgetTargetTokens) this.descentEpoch++;
+    if (budget !== this.contextBudgetTokens || target !== this.contextBudgetTargetTokens) this.contextSettingsChangeCount++;
     this.contextBudgetTokens = budget;
     this.contextBudgetTargetTokens = target;
   }
@@ -802,7 +822,7 @@ export class Agent {
       return await this.compileAtLiveBudgetNoting(compile, started);
     } finally {
       this.compilesRunning.delete(started);
-      const earliest = Math.min(...this.compilesRunning);
+      const earliest = [...this.compilesRunning].reduce((min, start) => Math.min(min, start), Infinity);
       for (const [budget, start] of this.latestEndedStart) {
         if (start < earliest) this.latestEndedStart.delete(budget);
       }
@@ -1582,8 +1602,8 @@ export class Agent {
   /**
    * A host's hook, called with each committing compile's `thinkingStrip` (never a dry run's) and the key of the
    * branch it read (`branchKey`), as the compile returns, whether or not its request is then sent, since the
-   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets none
-   * of its own, and tells the agent nothing of a strip.
+   * context manager's binding record takes the strip either way. One that throws is logged. It is observational only;
+   * the framework does not write agent-facing reasoning-loss notices.
    */
   onThinkingStrip?: (strip: ThinkingStrip, branch: string) => void;
 
@@ -1611,12 +1631,9 @@ export class Agent {
   unsentInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
     let newest: { contentHash: string; parts: number; held: Set<number> } | undefined;
     try {
-      const branch = branchKey(this.contextManager.currentBranchRef());
-      const since = this.unsentSince.get(branch);
+      const since = this.unsentSince.get(branchKey(this.contextManager.currentBranchRef()));
       if (since === undefined) {
-        const count = this.contextManager.getMessageCount();
-        const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-        this.unsentSince.set(branch, top);
+        this.markUnsentPoint();
         return undefined;
       }
       scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
@@ -1650,6 +1667,42 @@ export class Agent {
       if (!newest) return undefined;
     }
     return newest && { contentHash: newest.contentHash, whole: newest.held.size === newest.parts };
+  }
+
+  /** Set the unsent point where it isn't set, as a start's plan does: a row
+   *  stored after it counts as in no request until a compile built to send.
+   *  @internal For the framework's budget holds; not a host API. */
+  markUnsentPoint(): void {
+    const branch = branchKey(this.contextManager.currentBranchRef());
+    if (this.unsentSince.has(branch)) return;
+    const count = this.contextManager.getMessageCount();
+    const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
+    this.unsentSince.set(branch, top);
+  }
+
+  /** The ids of this agent's stored injections, of every namespace, stored
+   *  on its branch since its last compile built to send and in its window
+   *  where it's presented, in the record's order, a sharded body's first
+   *  shard first: the rows unsentInjection counts, which no request has
+   *  carried. Reads only, so an unset point gives none. */
+  unsentInjectionRows(): MessageId[] {
+    const ids: MessageId[] = [];
+    const since = this.unsentSince.get(branchKey(this.contextManager.currentBranchRef()));
+    if (since === undefined) return ids;
+    const presented = this.contextManager.windowMode?.() === 'presented';
+    scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
+      const span = Math.min(end, 64);
+      const { messages } = this.contextManager.getMessageWindow(end - span, span, { resolveBlobs: false });
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const row = messages[i]!;
+        if (row.sequence <= since) break scan;
+        if (storedInjectionMarkOf(row.metadata)?.agent !== this.name) continue;
+        if (presented && this.contextManager.windowStatusOf(row.id) !== 'in') continue;
+        ids.push(row.id);
+      }
+      end -= span;
+    }
+    return ids.reverse();
   }
 
   /** Record which of this agent's stored injections a compile built to send
@@ -1925,7 +1978,7 @@ export class Agent {
       // inferring, sends the same ones.
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
-      messages.push(...unguardedResults);
+      appendAll(messages, unguardedResults);
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
@@ -2268,9 +2321,10 @@ export class Agent {
     return { ...own, blockBinding: { prefixMismatchBehavior: 'drop_block' } };
   }
 
-  /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given:
-   *  where the agent's model binds its thinking (context-manager's `noteRequestSent`). */
-  private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent'> {
+  /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given,
+   *  and which stored bodies' thinking the provider dropped: where the agent's model binds its thinking
+   *  (context-manager's `noteRequestSent` and `noteThinkingDropped`). */
+  private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent' | 'noteThinkingDropped'> {
     const identity = binding.identity;
     // Each note names the compile the stream was built from, so a note can't vouch for this stream under a record a
     // later committing compile with binds wrote. A compile that reports no provenance gives the stream nothing to name, and the
@@ -2278,7 +2332,10 @@ export class Agent {
     const compileId = compiled.provenance?.compileId;
     if (!identity || compileId === undefined) return {};
     const cm = this.contextManager;
-    return { noteRequestSent: (rows) => cm.noteRequestSent(rows, identity, compileId) };
+    return {
+      noteRequestSent: (rows) => cm.noteRequestSent(rows, identity, compileId),
+      noteThinkingDropped: (messageIds) => cm.noteThinkingDropped(messageIds, compileId),
+    };
   }
 
   /**

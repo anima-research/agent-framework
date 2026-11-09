@@ -17,6 +17,7 @@ import { AgentFramework } from '../src/index.js';
 import { storableToolResult } from '../src/module-registry.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { MembraneError } from '@animalabs/membrane';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import { captureTimers, fireTimer, type CapturedTimer } from './helpers/capture-timers.js';
 
@@ -819,6 +820,35 @@ describe('code_execution through the framework', () => {
       assert.notEqual(turn, 'every', "the failed stream's own turn, not every turn of its agent's");
     });
   });
+
+  for (const thrown of [false, true]) {
+    it(`a turn that ends on a provider's error${thrown ? ' thrown from its stream' : ''} tells its scripts what failed in the framework's words, not the provider's`, async () => {
+      const SENTINEL = 'zz-provider-words-7f3a';
+      const error = new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, message: `Bad request: ${SENTINEL}`, rawError: undefined });
+      const membrane = new MockMembrane();
+      membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+        membrane.calls.push(request);
+        const stream = new ProviderErrorStream(error);
+        if (thrown) stream[Symbol.asyncIterator] = async function* (): AsyncGenerator<StreamEvent> { throw error; };
+        return stream;
+      };
+      const errorPolicy: ErrorPolicy = { maxRetries: 0, onInferenceError: (): ErrorAction => ({ retry: false }) };
+      await withFramework('ce-provider-words-', { membrane, errorPolicy }, async (framework) => {
+        const scripts = (framework as unknown as {
+          codeExecution: { scripts: { turnEnded(agent: string, turn: unknown, abandoned: boolean, reason?: string): void } };
+        }).codeExecution.scripts;
+        const turnEnded = scripts.turnEnded.bind(scripts);
+        const reasons: Array<string | undefined> = [];
+        scripts.turnEnded = (agent, turn, abandoned, reason) => {
+          if (agent === 'helper' && abandoned) reasons.push(reason);
+          turnEnded(agent, turn, abandoned, reason);
+        };
+        await assert.rejects(runEphemeral(framework, 'helper'));
+        assert.ok(reasons.includes('the model call failed (invalid_request, HTTP 400)'), JSON.stringify(reasons));
+        assert.ok(!reasons.some((reason) => reason?.includes(SENTINEL)), JSON.stringify(reasons));
+      });
+    });
+  }
 
   it("the Python runner's inputs are refused by name, saying what replaced each", async () => {
     await withFramework('ce-old-', {}, async (framework) => {

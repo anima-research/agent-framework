@@ -69,12 +69,13 @@ describe('chat:system wakes name no channel for the turn', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function makeFramework() {
+  async function makeFramework(gate?: Parameters<typeof AgentFramework.create>[0]['gate']) {
     return AgentFramework.create({
-      storePath: join(tempDir, 'test.chronicle'),
+      storePath: join(tempDir, gate ? 'gated.chronicle' : 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       modules: [],
+      ...(gate ? { gate } : {}),
     });
   }
 
@@ -191,5 +192,37 @@ describe('chat:system wakes name no channel for the turn', () => {
     assert.notEqual(captured.handed?.systemNotice, true,
       'merged again, a start marked as a notice would hide the DM\'s channel from the selection');
     await framework.stop();
+  });
+
+  it('a notice the gate batches stamps its turn as the same notice woken directly does', async () => {
+    const stamp = async (gated: boolean) => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+      const framework = await makeFramework(gated
+        ? { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 50 } }], default: 'skip' } }
+        : undefined);
+      const i = internals(framework);
+      let stamped: InferenceRequest | undefined;
+      const start = i.startAgentStream.bind(framework);
+      i.startAgentStream = async (agent: unknown, trigger?: InferenceRequest) => {
+        const started = start(agent, trigger);
+        stamped = framework.getActiveTurnTrigger('scout');
+        return started;
+      };
+      await i.handleMcplChannelIncoming(incoming(['chat:ambient', 'chat:system'], 'pat joined'));
+      const deadline = Date.now() + 10_000;
+      while (i.pendingRequests.length === 0) {
+        assert.ok(Date.now() < deadline, 'the notice woke the agent');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(i.pendingRequests[0]!.reason, gated ? 'gate:debounce' : 'mcpl:channel-incoming');
+      await i.processInferenceRequests();
+      await framework.runUntilIdle();
+      await framework.stop();
+      assert.ok(stamped, 'the turn exposed its trigger');
+      return { channelId: stamped.channelId, wakeChannelId: stamped.wakeChannelId, counterparty: stamped.counterparty };
+    };
+    const direct = await stamp(false);
+    assert.equal(direct.counterparty, 'eidoverse:user:world', "premise: the direct path keeps the notice's author");
+    assert.deepEqual(await stamp(true), direct);
   });
 });
