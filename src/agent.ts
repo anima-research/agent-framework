@@ -12,6 +12,7 @@ import { carriedBlock, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
+import { EFFORT_ROW_PARTICIPANT, effortChange, effortOf, withTopLevelEffort, type EffortPlan, type EffortPlanner } from './effort.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
@@ -58,6 +59,7 @@ export interface ActivationRequestOptions {
   /** The framework's inferenceBounds, resolved: the stream gets their phase
    *  bounds and flat bound. None when left out. */
   inferenceBounds?: InferenceBounds | null;
+  effort?: EffortPlan;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -1965,6 +1967,7 @@ export class Agent {
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content));
     const assemble = async (): Promise<NormalizedRequest> => {
+      const effort = this.effortPlanner?.('direct');
       const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
       // What it holds of the stored injections is what the agent last saw.
@@ -1972,7 +1975,8 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
+      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(
+        effort?.rows === false ? compiled.messages.filter((m) => effortOf(m.content) === undefined) : compiled.messages)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1983,7 +1987,7 @@ export class Agent {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
         tools: tools.length > 0 ? tools : undefined,
-        ...this.requestSettings(),
+        ...withTopLevelEffort(this.requestSettings(), effort),
         assistantParticipant: this.presentAs,
       };
     };
@@ -2171,6 +2175,11 @@ export class Agent {
     // Each message's place in the compile, or a preview's stand-in (null),
     // for the count of stored rows the request ends on, below.
     let origin: Array<number | null> = messages.map((_, i) => i);
+    if (options.effort?.rows === false) {
+      const kept = messages.map((m) => effortOf(m.content) === undefined);
+      messages = messages.filter((_, i) => kept[i]);
+      origin = origin.filter((_, i) => kept[i]);
+    }
     // A request that's sent says which stored injections the agent now has in
     // view, which the next start's same-content skip reads (stored-injections.ts).
     if (!options.dryRun) this.noteRenderedInjections(compiledResult);
@@ -2274,7 +2283,7 @@ export class Agent {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
       tools: availableTools.length > 0 ? availableTools : undefined,
-      ...this.requestSettings(),
+      ...withTopLevelEffort(this.requestSettings(), options.effort),
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
@@ -2385,7 +2394,15 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
-    return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
+    const effort = this.effortPlanner?.('preview');
+    const appendedMessages = effort?.change
+      ? [...(options.appendedMessages ?? []), { participant: EFFORT_ROW_PARTICIPANT, content: [effortChange(effort.change)] }]
+      : options.appendedMessages;
+    return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, {
+      ...options,
+      ...(appendedMessages ? { appendedMessages } : {}),
+      ...(effort ? { effort } : {}),
+    })).request;
   }
 
   /** Stored rows that follow a request-only turn, memoized on the window's
@@ -2395,6 +2412,7 @@ export class Agent {
    * memo as it was. A context without a window reads the record, the same
    * array as the window's for a single slot that is still the record. */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
+  private effortPlanner?: EffortPlanner;
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
     const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
@@ -2433,6 +2451,8 @@ export class Agent {
     // Retry accepted history edits before assembling a real request. Pure
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
+    const effort = this.effortPlanner?.('turn');
+    if (effort?.change) storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)]);
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
@@ -2475,7 +2495,7 @@ export class Agent {
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
     const { request, continuePrompt, compiled, binding } = await this.toolResultGuard.afterAnnotations(
-      () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
+      () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, { ...options, ...(effort ? { effort } : {}) }));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -2745,6 +2765,11 @@ export class Agent {
   setOwnRowSink(sink: ((ids: readonly MessageId[]) => void) | undefined): void {
     this.ownRowSink = sink;
     this.toolResultGuard.setOwnRowSink(sink);
+  }
+
+  /** @internal The framework's `FrameworkConfig.effort` for this agent's requests (planEffort). */
+  setEffortPlanner(planner: EffortPlanner | undefined): void {
+    this.effortPlanner = planner;
   }
 
   /** Tell the sink of own rows just stored (storeOwnRow calls it, once each add has returned). */

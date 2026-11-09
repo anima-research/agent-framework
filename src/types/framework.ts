@@ -1,5 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
-import type { Membrane } from '@animalabs/membrane';
+import type { Membrane, SystemChangeContent } from '@animalabs/membrane';
 import type { Module, EventResponse } from './module.js';
 import type { AgentConfig, InferenceRequest } from './agent.js';
 import type { ProcessEvent } from './events.js';
@@ -115,6 +115,9 @@ export interface ProviderHoldContext {
 export type ProviderHoldHook = (
   error: Error, agentName: string, context: ProviderHoldContext,
 ) => ProviderHold | undefined;
+
+/** An effort level (Anthropic's `output_config.effort`), as membrane's `SystemChangeContent` carries one. */
+export type EffortLevel = NonNullable<SystemChangeContent['effort']>;
 
 export interface FrameworkConfig {
   /**
@@ -326,6 +329,42 @@ export interface FrameworkConfig {
 
   /** Custom error policy */
   errorPolicy?: ErrorPolicy;
+
+  /**
+   * Each agent's effort (Anthropic's `output_config.effort`): a level for every
+   * agent, or a function the framework asks with an agent's name and model at
+   * each request it assembles for that agent, giving a level, or `undefined`
+   * for none. Derived agents and conversation forks are asked too.
+   *
+   * A request's top-level effort is the agent's base: the level the agent was
+   * first sent at on its model, kept per agent in `framework/state`, so it
+   * survives a restart and moves with a branch switch. A different level
+   * travels as one effort-only `system_change` row, stored under the
+   * participant `'system'` directly after the new user input whose reply it
+   * governs, so the prompt cache before it still holds. A level that changes
+   * where the request doesn't end on new user input (tool results, the agent's
+   * own message) waits for the next. `undefined` sends no top-level effort and
+   * leaves effort rows out of the request. It starts a base of none, and a
+   * level after it travels as a row. A derived agent on its parent's model
+   * starts from the parent's base.
+   *
+   * When membrane refuses an agent's request that carries an effort row, with
+   * `systemChangeRefused`, the request is sent again at once with no effort
+   * rows and the live level as its top-level effort. That agent's requests on
+   * that model go that way until the process ends.
+   *
+   * A preview shows the row a start would write, unstored. The direct API
+   * (`Agent.runInference`) sends what a turn's request would carry and writes
+   * no row, so a level changed since the agent's last turn reaches it once a
+   * turn has written its row.
+   *
+   * While this is set, an agent whose `providerParams` sets
+   * `output_config.effort` is refused where it's created. The host's `Membrane`
+   * must be a release whose `SystemChangeContent` carries `effort`: an older
+   * copy, installed beside this package's, leaves effort rows out unsent.
+   * Unset, effort is the host's, through `providerParams`, as before.
+   */
+  effort?: EffortLevel | ((agent: { name: string; model: string }) => EffortLevel | undefined);
 
   /**
    * How long a model call may go without progress before it is cut. A

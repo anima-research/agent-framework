@@ -2847,6 +2847,8 @@ function blockLabel(block: ContentBlock, failed: ReadonlySet<string> = NO_FAILUR
       return '[audio]';
     case 'video':
       return '[video]';
+    case 'system_change':
+      return block.effort !== undefined ? `[effort: ${block.effort} from here]` : '[system_change]';
     default:
       // Exhaustiveness guard: a future ContentBlock variant falls back to a
       // generic label instead of a compile error at a call site far from here.
