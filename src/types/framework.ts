@@ -338,12 +338,14 @@ export interface FrameworkConfig {
    *
    * A request's top-level effort is the agent's base: the level the agent was
    * first sent at on its model, kept per agent in `framework/state`, so it
-   * survives a restart and moves with a branch switch. A different level
-   * travels as one effort-only `system_change` row, stored under the
-   * participant `'system'` directly after the new user input whose reply it
-   * governs, so the prompt cache before it still holds. A level that changes
-   * where the request doesn't end on new user input (tool results, the agent's
-   * own message) waits for the next. `undefined` sends no top-level effort and
+   * survives a restart and moves with a branch switch. It's kept only for the
+   * model of the agent's latest turn, so going back to an earlier model starts
+   * a new base there at the live level. A different level travels as one
+   * effort-only `system_change` row, stored under the participant `'system'`
+   * directly after the new user input whose reply it governs, so the prompt
+   * cache before it still holds. A level that changes where the request
+   * doesn't end on new user input (tool results, the agent's own message)
+   * waits for the next. `undefined` sends no top-level effort and
    * leaves effort rows out of the request. It starts a base of none, and a
    * level after it travels as a row. A derived agent on its parent's model
    * starts from the parent's base.
@@ -366,7 +368,8 @@ export interface FrameworkConfig {
    * goes as after a refusal: the live level on top and no rows. A change of
    * level then costs the prompt cache as it did through `providerParams`. This
    * is read from this package's copy of membrane. A host `Membrane` from an
-   * older copy, installed beside it, leaves effort rows out unsent.
+   * older copy, installed beside it, leaves effort rows out unsent, so a change
+   * of level never reaches the model.
    *
    * Unset, effort is the host's, through `providerParams`, as before.
    */

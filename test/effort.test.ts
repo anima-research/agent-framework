@@ -278,6 +278,26 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
+  it('keeps a base per branch: a branch made before the base starts its own, and the first branch keeps its base', { skip: NEEDS_ROWS }, async () => {
+    try {
+      let live: Level = 'high';
+      const { framework, provider, turn } = await resident({ effort: () => live });
+      const store = framework.getStore();
+      const main = store.currentBranch().name;
+      store.createBranch('side', main);
+      await turn('One.');
+      live = 'low';
+      await framework.switchBranch('side');
+      await turn('Two.');
+      await framework.switchBranch(main);
+      await turn('Three.');
+      assert.deepEqual(provider.calls.map(topLevel), ['high', 'low', 'high'], 'side starts its base at the live level; main keeps its own');
+      assert.deepEqual(effortRows(provider.calls[1]!), [], 'no row on side, whose base is the live level');
+      const third = provider.calls[2]!;
+      assert.deepEqual(effortRows(third), [{ at: indexOfText(third, 'Three.') + 1, effort: 'low', participant: 'system' }]);
+    } finally { await cleanup(); }
+  });
+
   it('changes nothing without FrameworkConfig.effort: a stored effort row goes as stored, with no top level added', async () => {
     try {
       const { framework, provider, turn } = await resident({ agent: { providerParams: { output_config: { effort: 'medium' } } } });

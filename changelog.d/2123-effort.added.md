@@ -1,5 +1,5 @@
 - `FrameworkConfig.effort` sets each agent's effort (Anthropic's `output_config.effort`): a level for every agent, or a function of an agent's name and model, asked at each request. A change of level no longer starts the prompt cache over.
-  - A request's top-level effort is the agent's base: the level it was first sent at on its model, kept per agent in `framework/state`. A derived agent starts from its parent's.
+  - A request's top-level effort is the agent's base: the level it was first sent at on its model, kept per agent in `framework/state`, only for the model of the agent's latest turn, so going back to an earlier model starts a new base there. A derived agent starts from its parent's.
   - A different level goes as one effort-only `system_change` row, stored under `'system'` directly after the new user input whose reply it governs. Where a request doesn't end on new user input, the change waits for the next.
   - `undefined` sends no top-level effort and leaves effort rows out of the request. It starts a base of none, and a level after it goes as a row.
   - When membrane refuses a request's effort rows (`systemChangeRefused`), the request goes again at once, with no rows and the live level on top, and that agent's requests go so until the process ends.
