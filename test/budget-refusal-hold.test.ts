@@ -164,7 +164,7 @@ class SequentialStreamMembrane extends MockMembrane {
 
 interface Internal {
   budgetHoldRecheckMs: number;
-  budgetHolds: Map<string, { turn?: unknown; startedAt: number; waitSince: number }>;
+  budgetHolds: Map<string, { turn?: unknown; startedAt: number; waitSince: number; wakes: Array<{ reason?: string }> }>;
   quiesced: boolean;
   activeTurnTokens: Map<string, number>;
   pendingRequests: Array<Record<string, unknown>>;
@@ -208,7 +208,6 @@ const providerLimit = () => new MembraneError({
   message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
   rawError: { status: 429 },
 } as ConstructorParameters<typeof MembraneError>[0]);
-/** A start merged from two wakes, run once, for the symbol its merged batch is kept under. */
 async function mergedBatchMark(t: { internal: Internal; cm(): { addMessage(p: string, c: unknown): unknown } }): Promise<symbol> {
   const orig = t.internal.startAgentStream;
   let merged: Record<string, unknown> | undefined;
@@ -229,7 +228,6 @@ async function mergedBatchMark(t: { internal: Internal; cm(): { addMessage(p: st
   assert.ok(merged, 'a merged start, for its mark');
   return symbolNamed(merged, 'merged-batch');
 }
-/** Count each release of an agent's hold from waiting, with whether its strategy was ready then. */
 function watchReleases(framework: unknown, ready: () => boolean): { whileNotReady: number; all: number } {
   const internal = framework as Internal;
   const release = internal.releaseBudgetHold.bind(framework);
@@ -1150,6 +1148,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
         t.send('later');
         assert.ok(await pollUntil(() => t.stored().includes('later')));
         await t.internal.processInferenceRequests();
+        assert.ok(t.internal.budgetHolds.get('prime')!.wakes.some((r) => r.reason === 'external-message'), 'the wake joined the wait');
+        assert.ok(!t.internal.pendingRequests.some((r) => r.reason === 'external-message'), 'and left the queue');
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
         assert.equal(queued, true, 'the wake that joined it was queued before the turn ended');
       } finally {
@@ -1265,6 +1265,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         t.internal.pendingRequests.push({ agentName: 'prime', reason: 'heartbeat', source: 'test', timestamp: Date.now() });
         await t.internal.processInferenceRequests();
+        assert.ok(t.internal.budgetHolds.get('prime')!.wakes.some((r) => r.reason === 'heartbeat'), 'the wake joined the wait');
+        assert.ok(!t.internal.pendingRequests.some((r) => r.reason === 'heartbeat'), 'and left the queue');
         await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
         assert.equal(queued, true, 'the wake that joined it was queued before the turn ended');
@@ -1373,6 +1375,90 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released'], 'the wait ended all the same');
       } finally {
         internal.persistHostMode = persist;
+        await t.close();
+      }
+    });
+  });
+
+  it("an inference:held listener finds the host drained, the refused start's turn token given back", async () => {
+    await withCompression({ fitAt: Infinity }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0 });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      let drained: boolean | undefined;
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:held' && drained === undefined) drained = t.framework.getHostModeStatus().drained;
+      });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        assert.equal(drained, true);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("counts the wakes merged in a request a waiting turn keeps one by one among the gated requests", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        const mark = await mergedBatchMark(t);
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const wake = (reason: string) => ({ agentName: 'prime', reason, source: 'test', timestamp: Date.now() });
+        t.internal.budgetHolds.get('prime')!.wakes.push({ ...wake('zz-merged'), [mark]: [wake('zz-a'), wake('zz-b')] } as never);
+        assert.equal(t.framework.getHostModeStatus().gatedRequests, 3, 'the waiting turn, and the two wakes merged in the request it keeps');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('counts a closure wake merged behind another wake as one its agent waits on', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      try {
+        const mark = await mergedBatchMark(t);
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        const wake = (reason: string) => ({ agentName: 'prime', reason, source: 'test', timestamp: Date.now() });
+        const internal = t.internal as unknown as { closureWaits(name: string): boolean };
+        t.internal.pendingRequests.push({ ...wake('zz-merged'), [mark]: [wake('zz-a'), wake('conversation:closure')] } as never);
+        assert.equal(internal.closureWaits('prime'), true);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a policy retry refused for budget gives back each provider admission its frames took, once', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const internal = t.internal as unknown as { acquirePrimaryProviderGate(name: string): void; releasePrimaryProviderGate(name: string): void };
+      const acquire = internal.acquirePrimaryProviderGate;
+      const release = internal.releasePrimaryProviderGate;
+      const counts = { acquired: 0, released: 0 };
+      internal.acquirePrimaryProviderGate = function (this: unknown, name: string) { if (name === 'prime') counts.acquired++; return acquire.call(this, name); };
+      internal.releasePrimaryProviderGate = function (this: unknown, name: string) { if (name === 'prime') counts.released++; return release.call(this, name); };
+      const stream = t.membrane.streamYielding.bind(t.membrane);
+      let failed = false;
+      t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
+        if (failed) return stream(request, options);
+        failed = true;
+        t.membrane.calls.push(request);
+        return errorStream(new Error('zz the stream failed'));
+      };
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), "the stream failed, and its policy retry's compile was refused and waits");
+        await new Promise((r) => setTimeout(r, 50));
+        assert.ok(counts.acquired >= 1);
+        assert.deepEqual(counts, { acquired: counts.acquired, released: counts.acquired }, 'each admission given back once');
+      } finally {
+        internal.acquirePrimaryProviderGate = acquire;
+        internal.releasePrimaryProviderGate = release;
         await t.close();
       }
     });
@@ -2018,8 +2104,11 @@ describe('a turn refused for budget while compression is pending waits idle, and
       const t = await resident({ maintenanceIntervalMs: 0 });
       t.internal.budgetHoldRecheckMs = 100;
       try {
+        const ticks = c.ticks;
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        assert.ok(await pollUntil(() => c.ticks > ticks && !t.internal.overBudgetDrainInFlight.has('prime')), 'its first drive ticked, and ended');
+        assert.notEqual(t.hold(), null, 'the turn still waits');
         c.fitAt = 0;
         c.readyAt = 0;
         assert.ok(await pollUntil(() => t.stored().includes('Answered once it fit'), 3_000));
@@ -2330,6 +2419,20 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
     c.readyAt = c.ticks;
     t.internal.releaseBudgetHold('prime');
   };
+
+  it('refuses a puppet call while a budget restart waits, and the restart runs once compression makes room', async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c);
+      try {
+        await assert.rejects(t.framework.puppetToolCall('prime', 'canned--fetch', {}), /its turn waits for compression to make room.*abortInference\(\) ends that turn/);
+        assert.ok(t.internal.budgetHolds.has('prime'), 'the turn still waits');
+        fit(c, t);
+        assert.ok(await pollUntil(() => t.stored().includes('Done after the restart')));
+      } finally {
+        await t.close();
+      }
+    });
+  });
 
   it('runs as before with no surgery', async () => {
     await withCompression({}, async (c) => {

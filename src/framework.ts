@@ -1879,17 +1879,20 @@ const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stoppin
  *  was dropped before it started, other than by an abandon or a stop. */
 const CONTINUATION_DROPPED = "a turn's continuation was dropped before it started";
 
-const BUDGET_HELD_TURN_REMOVED = 'a turn waiting for compression was dropped: what it stood on was removed';
+const BUDGET_HELD_TURN_REMOVED = 'a turn that waited for compression was dropped: what it stood on was removed';
 
 /** One frame's window while it holds a turn with no stream and one of its
  *  checks is ahead (AgentFramework.checkAhead). `abandoned` is an operator's
  *  quiesce abandon that reached the turn there, which the frame's check
  *  collects; it goes with the window. `wake`, set while the frame waits to
  *  retry, ends that wait, so the check after it comes at once; called once
- *  the wait is over, it does nothing. */
+ *  the wait is over, it does nothing. `gateReleased` is set when a budget
+ *  hold gave back the frame's provider admission as its window closed, so
+ *  the frame's end doesn't give it back again. */
 interface CheckWindow {
   abandoned: boolean;
   wake?: () => void;
+  gateReleased?: true;
 }
 
 function isTurnContinuation(reason: string): boolean {
@@ -7586,7 +7589,8 @@ export class AgentFramework {
   }
 
   private closureWaits(agentName: string): boolean {
-    const closure = (r: InferenceRequest): boolean => r.agentName === agentName && r.reason === 'conversation:closure';
+    const closure = (r: InferenceRequest): boolean => r.agentName === agentName
+      && (mergedBatch(r) ?? [r]).some((m) => m.reason === 'conversation:closure');
     return this.pendingRequests.some(closure)
       || [...(this.passRequests ?? [])].some((pass) => (pass.get(agentName) ?? []).some(closure))
       || (this.providerAccelerationCooldowns.get(agentName)?.heldRequests ?? []).some(closure)
@@ -10034,7 +10038,8 @@ export class AgentFramework {
         ...[...this.passRequests].flatMap((pass) => [...pass.values()].flat()),
         ...[...this.providerAccelerationCooldowns.values()].flatMap((c) => c.heldRequests),
       ].flatMap((r) => mergedBatch(r) ?? [r]).filter((r) => !passesQuiesce(r)).length
-        + [...(this.budgetHolds?.values() ?? [])].reduce((n, h) => n + 1 + h.wakes.length, 0),
+        + [...(this.budgetHolds?.values() ?? [])].reduce((n, h) =>
+          n + 1 + h.wakes.flatMap((r) => mergedBatch(r) ?? [r]).filter((r) => !passesQuiesce(r)).length, 0),
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
       // Deprecated (#291): no queue is kept. What a live surgery's hold
       // keeps in memory, to land at its release, and what waits in memory
@@ -15104,8 +15109,9 @@ export class AgentFramework {
     /** Agent state at queue time — 'idle' means no turn holds the agent, so
      *  the turn starts on the next scheduler pass unless a provider hold (a
      *  provider's stated wait, or a capacity cooldown) holds it until the hold
-     *  ends, or a start of the agent's that waits for an auxiliary call to
-     *  finish goes first; anything else means it runs after the current turn. */
+     *  ends, or a budget hold keeps it until compression makes room, or a
+     *  start of the agent's that waits for an auxiliary call to finish goes
+     *  first; anything else means it runs after the current turn. */
     agentStatus?: string;
     /** True when the host is quiesced: the wake is PARKED, not running, until resume(). */
     quiesced?: boolean;
@@ -27395,7 +27401,7 @@ export class AgentFramework {
         this.activeTurnTokens.delete(agent.name);
         this.activeTurnTriggers.delete(agent.name);
       }
-      if (!tokenHandedOff && ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
+      if (!tokenHandedOff && ownsProviderGate && !checkWindow.gateReleased) this.releasePrimaryProviderGate(agent.name);
       // A start that ends before its stream exists is its turn's end: what
       // arrived during it enters its window, as at a stream's teardown,
       // unless its turn lives on (a retry on its way). Left out, it would
@@ -28447,6 +28453,14 @@ export class AgentFramework {
       const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, compileBaseline, () => {
         if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+        if (this.activeTurnTokens.get(agent.name) === turnToken) {
+          this.activeTurnTokens.delete(agent.name);
+          this.activeTurnTriggers.delete(agent.name);
+        }
+        if (ownsProviderGate && !checkWindow.gateReleased) {
+          checkWindow.gateReleased = true;
+          this.releasePrimaryProviderGate(agent.name);
+        }
       })) return false;
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
@@ -31159,7 +31173,7 @@ export class AgentFramework {
         `puppet refused: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} — retry when it completes`,
       );
     }
-    if (agent.state.status !== 'idle' || this.hasTurn(agentName)) {
+    if (agent.state.status !== 'idle' || this.hasTurn(agentName) || this.heldContinuation(agentName)) {
       const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
       // A turn a provider hold keeps for its retry has no stream: the refusal
       // names the hold, and how to go on sooner, as surgery's does.
@@ -31167,6 +31181,9 @@ export class AgentFramework {
       throw new Error(held
         ? `puppet refused: agent ${agentName} is idle+turn-alive (${held.says}; requires idle); ` +
           heldTurnWayOn(held.statedWait)
+        : agent.state.status === 'idle' && !this.hasTurn(agentName)
+          ? `puppet refused: agent ${agentName} is idle+turn-alive (its turn waits for compression to make room; ` +
+            'requires idle); abortInference() ends that turn'
         : `puppet refused: agent ${agentName} is ${shown} (requires idle — ` +
           `injecting a turn under an active stream corrupts wire ordering)`,
       );

@@ -182,7 +182,9 @@ export type TraceEvent =
       /** The refused compile's budget and size in tokens, when context-manager gave them. */
       budget?: number;
       actual?: number;
-      /** When the hold started (epoch ms). */
+      /** When this hold started (epoch ms). A wait held again after its
+       *  release starts a new hold; its `context-refusal` alert and the note
+       *  count from the wait's first hold. */
       since: number;
       /** Requests the hold holds as it starts: the refused start's own. */
       heldRequests: number;
@@ -1092,8 +1094,9 @@ export type TraceEvent =
       type: 'ops:alert';
       /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | …
        *  A kind ending in `-clear` ends the alert of the kind before it:
-       *  'context-refusal-clear' is raised when a budget hold ends with its
-       *  turn stopped or removed, so the waiting start doesn't run. */
+       *  'context-refusal-clear' is raised when a budget hold whose wait
+       *  raised 'context-refusal' ends with its turn stopped or removed, so
+       *  the waiting start doesn't run. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
