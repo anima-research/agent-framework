@@ -100,7 +100,38 @@ export interface AgentConfig {
    * and restarts the stream through a fresh compile instead of dispatching a
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
-   * stream has reported its prompt. Unset → no projection; only the
+   * stream has reported its prompt. And every compile that builds a request,
+   * from a turn's first on, is kept within the window as context-manager
+   * prices it: the compile is given the window as context-manager's
+   * `requestLimitTokens`, beside the request's system prompt and tools as
+   * `requestOverhead`, with what the request may send besides the compiled
+   * context as its `messages`: the direct API's tool results ready before
+   * its compile, the tool-result guard's pending originals (priced while a
+   * pending batch's audit is durable, the only time the request sends them,
+   * beside the placeholders the compile also prices, which can only leave
+   * more room than needed), a `prefillUserMessage`, and the turn a
+   * stream's start may end its request on (a silent tick's separator, or
+   * `[Continue]`). So the compiled context, its message injections, those
+   * messages, the system prompt, the tools and the reply the request asks
+   * for (the agent's maxTokens, whatever a caller's budget reserves: the
+   * limit moves by the difference) come within it, and a window they leave
+   * no room in refuses the compile as over budget: the turn ends as
+   * `window_full`, with no compression drain, since no history or budget
+   * makes room there. So does a reply that leaves the window no room by
+   * itself, refused before the compile.
+   * Some of what a request sends is outside that price, and reaches
+   * context-manager only as its calibration takes it in from the provider's
+   * count: the request-only turns rendered again before earlier replies (a
+   * surviving silent tick's separator, 199 characters, 69 tokens by
+   * context-manager's estimator, and 10 characters for each surviving reply
+   * to `[Continue]`), which grow with the ticks the window keeps; another
+   * agent's rounds sent as transcript lines (`setForeignRounds`), which can
+   * cost a little more than the stored rows: about the tool's name and 13
+   * characters a line on a short call or result, and 9 characters for a row
+   * left with nothing; on the direct API, a tool result that becomes ready
+   * during its compile, which only a framework-driven turn on the same agent
+   * can bring; and what membrane adds as it renders the request.
+   * Unset → no projection and no limit on the compile; only the
    * maxStreamTokens restart applies. A value is converted to a number as a
    * comparison converts it, so a string such as "200000" reads as its number;
    * one whose number isn't finite, such as null, reads as unset.
@@ -108,7 +139,9 @@ export interface AgentConfig {
   physicalWindowTokens?: number;
 
   /** Per-agent context compile budget (input tokens). When unset, the
-   *  ContextManager's built-in default (100k) applies. */
+   *  ContextManager's built-in default (100k, reserving 4,000 for the reply)
+   *  applies. With `physicalWindowTokens` set, unset instead gives that
+   *  default's room of 96,000 with the agent's maxTokens reserved on top. */
   contextBudgetTokens?: number;
 
   /**

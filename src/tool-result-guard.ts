@@ -261,10 +261,12 @@ export class ToolResultGuard {
   /** Extra input tokens the pending batch costs on the wire beyond the
    * placeholder the strategy selected against (chars/4 + flat per image,
    * the same heuristic as the physical-window projection). Compilation
-   * reserves this so substituting originals cannot exceed the budget. */
+   * reserves this so substituting originals cannot exceed the budget: none
+   * while the batch's audit isn't durable, when the placeholders go. */
   get pendingWireReserveTokens(): number {
     const pending = this.pending;
-    if (!pending) return 0;
+    // While its audit isn't durable, the placeholders go, which the compile already prices.
+    if (!pending?.durable) return 0;
     let chars = 0;
     let images = 0;
     for (const result of pending.wireResults) {
@@ -276,6 +278,15 @@ export class ToolResultGuard {
       chars -= GUARD_NOTICES[pending.notices.get(result.toolUseId) ?? 'ran'].length;
     }
     return Math.max(0, Math.ceil(chars / 4) + images * 1600);
+  }
+
+  /** The originals a request carries for the pending batch, as prepareRequest substitutes them: none while its
+   *  audit isn't durable, when the placeholders go instead. */
+  get pendingWireBlocks(): ContentBlock[] {
+    if (!this.pending?.durable) return [];
+    return this.pending.wireResults.map((result) => ({
+      type: 'tool_result', toolUseId: result.toolUseId, content: result.content, isError: result.isError,
+    }) as ContentBlock);
   }
 
   /** Ordered storage work, separate from batches awaiting a provider verdict.

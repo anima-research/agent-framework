@@ -121,6 +121,10 @@ export interface StartStreamResult {
   /** The stored bodies the request's compile carried, by each body's first message id (its provenance's raw bodies).
    *  Absent when the compile reports no provenance. */
   carriedBodies?: ReadonlySet<MessageId>;
+  /** What the compile priced beside its window (`requestOverhead`): the request's system prompt and tools, and with a
+   *  window the messages it may send besides the compiled context. The stream's calibration sample is given it, so
+   *  the provider's count is read against what the compile priced. Optional, so a stand-in needn't supply it. */
+  requestOverhead?: RequestOverhead;
 }
 import type {
   ContextManager,
@@ -132,8 +136,10 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  RequestOverhead,
   ThinkingStrip,
 } from '@animalabs/context-manager';
+import { OverBudgetError } from '@animalabs/context-manager';
 import type {
   AgentConfig,
   AutoContinueConfig,
@@ -173,6 +179,21 @@ function wireDigest(value: unknown): string {
 }
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+/** ContextManager.compile's own budget when it's given none. */
+const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT_BUDGET_TOKENS, reserveForResponse: 4_000 };
+
+/**
+ * Whether `error` is context-manager's refusal of a compile whose request limit leaves the context no room beside
+ * the reply's reserve, the system prompt, the tools, the messages the request sends beside its history and the message
+ * injections (`requestAllowanceTokens` at or below 0). No history and no budget makes room there: only less of those,
+ * or a larger window.
+ */
+export function leavesNoRoomInWindow(error: unknown): boolean {
+  if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') return false;
+  const diagnostics = (error as { diagnostics?: { requestLimitTokens?: unknown; requestAllowanceTokens?: unknown } }).diagnostics;
+  return typeof diagnostics?.requestLimitTokens === 'number' && typeof diagnostics.requestAllowanceTokens === 'number'
+    && diagnostics.requestAllowanceTokens <= 0;
+}
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
@@ -663,25 +684,48 @@ export class Agent {
    * before building a request.
    */
   /** Resolve the compile budget: explicit arg wins, else the per-agent
-   * configured context budget (if any), else the ContextManager default. */
+   * configured context budget (if any), else, with a window set, the
+   * ContextManager default's room with maxTokens as the reply's reserve,
+   * else the ContextManager default. */
   private resolveBudget(budget?: TokenBudget): TokenBudget | undefined {
     if (budget) return budget;
-    if (this.contextBudgetTokens === undefined) return undefined;
-    return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
+    if (this.contextBudgetTokens === undefined && this.physicalWindowTokens === undefined) return undefined;
+    return { maxTokens: this.liveBudgetTokens, reserveForResponse: this.maxTokens };
+  }
+
+  /** The budget compiles plan at when none is passed: the live one, else the default, which with a window is
+   * context-manager's default room with the reply's maxTokens on top, as resolveBudget compiles at. */
+  private get liveBudgetTokens(): number {
+    return this.contextBudgetTokens ?? this.defaultBudgetTokens;
+  }
+
+  private get defaultBudgetTokens(): number {
+    if (this.physicalWindowTokens === undefined) return DEFAULT_CONTEXT_BUDGET_TOKENS;
+    return CONTEXT_MANAGER_DEFAULT_BUDGET.maxTokens - CONTEXT_MANAGER_DEFAULT_BUDGET.reserveForResponse + this.maxTokens;
   }
 
   /** Compile budget with the tool-result guard's reservation applied. While
    * a batch is pending the strategy selects against short placeholders, but
-   * prepareRequest substitutes the originals on the wire; reserve their real
+   * once its audit is durable prepareRequest substitutes the originals on
+   * the wire; reserve their real
    * cost so the final request still fits (a budget restart that recompiles
-   * small must not re-inflate past the same window). */
+   * small must not re-inflate past the same window). Without a physical
+   * window the reserve is added to `reserveForResponse`. With one it comes
+   * off `maxTokens` instead, which leaves the same room, so the window's
+   * limit reserves the reply alone and counts the originals once, priced
+   * beside it (requestBounds). So while a batch is pending on an agent with a
+   * window, an over-budget refusal from context-manager's autobiographical
+   * strategy reads `configured=` as the budget less the reserve and
+   * `response reserve=` as the reply alone; its `input budget=` is the same
+   * as without a window. */
   private compileBudget(budget?: TokenBudget): TokenBudget | undefined {
     const resolved = this.resolveBudget(budget);
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
-    // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
-    return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+    const base = resolved ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
+    return this.physicalWindowTokens === undefined
+      ? { ...base, reserveForResponse: base.reserveForResponse + reserve }
+      : { ...base, maxTokens: base.maxTokens - reserve };
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
@@ -715,9 +759,8 @@ export class Agent {
       contextBudgetTokens:
         this.runtimeSettingsOverrides.contextBudgetTokens ??
         this.contextBudgetTargetTokens ??
-        this.contextBudgetTokens ??
-        DEFAULT_CONTEXT_BUDGET_TOKENS,
-      effectiveContextBudgetTokens: this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS,
+        this.liveBudgetTokens,
+      effectiveContextBudgetTokens: this.liveBudgetTokens,
       ...(hot ? { tailTokens: hot.tailTokens } : {}),
       ...(hot?.transitionPaceTokens !== undefined
         ? { transitionPaceTokens: hot.transitionPaceTokens }
@@ -819,14 +862,15 @@ export class Agent {
   private async compileAtLiveBudgetNoting(compile: () => Promise<CompileResult>, started: number): Promise<CompileResult> {
     // The budget this compile plans at, and the descent under way when it
     // started: a change of either while it runs is no part of what it shows.
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const live = this.liveBudgetTokens;
     const epoch = this.liveBudgetEpoch;
     const descent = this.descentEpoch;
     let result: CompileResult;
     try {
       result = await compile();
     } catch (error) {
-      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+      // A refusal for want of room in the window says nothing of the budget, and passes through as it is.
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || leavesNoRoomInWindow(error)) throw error;
       // A refusal shows the budget it planned at doesn't fit, whatever
       // changed while it ran: the record's marker for it is withdrawn, and
       // nothing is credited, unless a compile that started later has already
@@ -888,7 +932,7 @@ export class Agent {
     path: 'immediate' | 'paced' | 'none';
     transition: 'stable' | 'converging';
   } {
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const live = this.liveBudgetTokens;
     const budget = patch?.contextBudgetTokens;
     return {
       liveBudgetTokens: live,
@@ -1022,7 +1066,7 @@ export class Agent {
     }
 
     if (patch.contextBudgetTokens !== undefined) {
-      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      const live = this.liveBudgetTokens;
       if (patch.contextBudgetTokens >= live || patch.immediate) {
         // Increases are always immediate. Decreases take this path only with
         // the explicit `immediate` flag: the next compile plans straight at
@@ -1080,8 +1124,8 @@ export class Agent {
     } = {};
 
     if (reset.has('contextBudgetTokens')) {
-      const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      const configured = this.configuredContextBudgetTokens ?? this.defaultBudgetTokens;
+      const live = this.liveBudgetTokens;
       if (configured < live) {
         const hot = this.getHotContextSettings();
         if (!hot) throw new Error('The active context strategy cannot prepare a smaller window live');
@@ -1126,8 +1170,8 @@ export class Agent {
     if (this.contextBudgetTargetTokens !== undefined) {
       this.updateHotContextSettings({ preparedWindowTokens: null });
       this.setContextBudget(this.contextBudgetTokens, undefined);
-      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      if (live === (this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS)) {
+      const live = this.liveBudgetTokens;
+      if (live === (this.configuredContextBudgetTokens ?? this.defaultBudgetTokens)) {
         delete this.runtimeSettingsOverrides.contextBudgetTokens;
       } else {
         this.runtimeSettingsOverrides.contextBudgetTokens = live;
@@ -1151,7 +1195,7 @@ export class Agent {
     opts?: { provenBudget?: number },
   ): AgentRuntimeSettingsSnapshot {
     if (Object.keys(settings).length === 0) return this.getRuntimeSettings();
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const live = this.liveBudgetTokens;
     const snapshot = this.updateRuntimeSettings(settings);
     if (opts?.provenBudget !== undefined) {
       this.lastCompiledBudget = { budget: opts.provenBudget, fit: true, epoch: this.liveBudgetEpoch };
@@ -1344,7 +1388,7 @@ export class Agent {
     try {
       return await compile();
     } catch (error) {
-      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || !pinned || !this.unpinTurnInputs()) throw error;
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || leavesNoRoomInWindow(error) || !pinned || !this.unpinTurnInputs()) throw error;
       console.error(`[turn-inputs] ${this.name}: the compile refused with the turn's inputs pinned, so they are unpinned and it compiles again`);
       return compile();
     }
@@ -1796,7 +1840,12 @@ export class Agent {
   async compileWithInjections(
     budget?: TokenBudget,
     injections?: ContextInjection[],
-    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } & BindingCompileOptions,
+    opts?: {
+      kvUnifiedImmutablePrefixHash?: string;
+      dryRun?: boolean;
+      requestOverhead?: RequestOverhead;
+      requestLimitTokens?: number;
+    } & BindingCompileOptions,
   ): Promise<CompileResult> {
     // A dry run is a compile that will never be sent. The context manager
     // persists no fold resolutions for it and queues none of the compression
@@ -1906,6 +1955,10 @@ export class Agent {
       this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults, undefined,
         DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     }
+    // Read once: the compile prices them, and the request sends them.
+    const readyMessages = this._state.status === 'ready' && !guardedResults
+      ? this.buildToolResultMessages(this._state.toolResults) : undefined;
+    const readyResults = readyMessages?.map((message) => message.content) ?? [];
 
     // Compile the context (with optional injections) into a request. The
     // guard's refusal retry is assembled the same way, afresh. It is compiled
@@ -1913,32 +1966,44 @@ export class Agent {
     // that began during the compile, and after a stub edit that failed has
     // been retried; one whose store still fails is compiled as the bare
     // notice.
-    let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const binding = this.bindingCompileOptions(tools, (injections ?? [])
+    let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined = readyMessages;
+    const prospectiveSystemInjections = (injections ?? [])
       .filter((injection) => injection.position === 'system')
-      .flatMap((injection) => injection.content));
+      .flatMap((injection) => injection.content);
+    const binding = this.bindingCompileOptions(tools, prospectiveSystemInjections);
+    // What each compile priced beside its window, for the calibration sample its call gives (doInference).
+    const priced = new WeakMap<NormalizedRequest, RequestOverhead>();
     const assemble = async (): Promise<NormalizedRequest> => {
+      let bounds: ReturnType<Agent['requestBounds']> | undefined;
       const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
+        () => {
+          bounds = this.requestBounds(tools, prospectiveSystemInjections, readyResults, budget);
+          return this.compileWithInjections(budget, injections, {
+            ...(binding.thinkingBinding ? binding : {}),
+            ...bounds,
+          });
+        });
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
       const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
-      // Read once, after the first compile, since results may have become
-      // ready while it ran; the refusal retry, assembled while the agent is
-      // inferring, sends the same ones.
+      // Where none were ready before the compile, read once, after the first
+      // compile, since results may have become ready while it ran; the refusal
+      // retry, assembled while the agent is inferring, sends the same ones.
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
       appendAll(messages, unguardedResults);
-      return {
+      const assembled: NormalizedRequest = {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
         tools: tools.length > 0 ? tools : undefined,
         ...this.requestSettings(),
         assistantParticipant: this.presentAs,
       };
+      if (bounds) priced.set(assembled, bounds.requestOverhead);
+      return assembled;
     };
     const request = await assemble();
 
@@ -1953,7 +2018,7 @@ export class Agent {
 
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
-    const inferencePromise = this.doInference(request, abortController.signal, assemble);
+    const inferencePromise = this.doInference(request, abortController.signal, assemble, (sent) => priced.get(sent));
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -2067,7 +2132,10 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions }> {
+  ): Promise<{
+    request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions;
+    requestOverhead: RequestOverhead;
+  }> {
     // Unstored, so they leave for the request here (text-as-stored.ts), the
     // layout hash below included.
     injections = injectionsAsStored(injections);
@@ -2097,17 +2165,15 @@ export class Agent {
         })
       : undefined;
     const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
-    const compiledResult = await this.compileWithInjections(
-      budget,
-      injections,
-      immutablePrefixHash || options.dryRun || binding.thinkingBinding
-        ? {
-            ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
-            ...(options.dryRun ? { dryRun: true } : {}),
-            ...binding,
-          }
-        : undefined,
-    );
+    // The turn the request may end on is priced before the compile can know whether it's sent: the safe side.
+    const trailing = options.silentHeartbeat !== undefined ? silentHeartbeatSeparatorTurn().content : continueTurn().content;
+    const bounds = this.requestBounds(availableTools, prospectiveSystemInjections, [trailing], budget);
+    const compiledResult = await this.compileWithInjections(budget, injections, {
+      ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
+      ...(options.dryRun ? { dryRun: true } : {}),
+      ...binding,
+      ...bounds,
+    });
     let { messages } = compiledResult;
     const { systemInjections } = compiledResult;
     // It counts what the compile selected, so a preview's stand-ins
@@ -2204,8 +2270,10 @@ export class Agent {
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
     let continuePrompt: RequestOnlyPrompt | undefined;
+    let endedOn: NormalizedMessage | undefined;
     if (openingTick) {
-      messages = [...messages, silentHeartbeatSeparatorTurn()];
+      endedOn = silentHeartbeatSeparatorTurn();
+      messages = [...messages, endedOn];
     } else if (endsOnOwnMessage(messages, this.presentAs, injectionTail)) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
@@ -2215,7 +2283,8 @@ export class Agent {
       // them, so the cue stays last: the block isn't taken for what woke
       // the agent. Its reply's promptedBy puts it there in later compiles too,
       // where they can recognise the reply (renderRequestOnlyRows).
-      messages = [...messages, continueTurn()];
+      endedOn = continueTurn();
+      messages = [...messages, endedOn];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
     } else {
       // What the request ends on apart from the stored injections after it,
@@ -2231,7 +2300,12 @@ export class Agent {
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
-    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
+    // What the request sent beside its window: what the compile priced, with the turn it ended on as it went, and
+    // none where it went without one. The provider's count, which the stream's sample is read against, has only that.
+    const { messages: beside = [], ...rest } = bounds.requestOverhead;
+    const sentBeside = [...(endedOn ? [endedOn.content] : []), ...beside.filter((message) => message !== trailing)];
+    const requestOverhead: RequestOverhead = sentBeside.length > 0 ? { ...rest, messages: sentBeside } : rest;
+    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding, requestOverhead };
   }
 
   /**
@@ -2298,6 +2372,46 @@ export class Agent {
    */
   thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
+  }
+
+  private requestBounds(tools: ToolDefinition[], systemInjections: ContentBlock[], beside: ContentBlock[][], budget: TokenBudget | undefined): {
+    requestOverhead: RequestOverhead;
+    requestLimitTokens?: number;
+  } {
+    const requestOverhead: RequestOverhead = { system: this.buildSystemPrompt(systemInjections), tools: tools.length > 0 ? tools : undefined };
+    if (this.physicalWindowTokens === undefined) return { requestOverhead };
+    const pending = this.toolResultGuard.pendingWireBlocks;
+    const messages: ContentBlock[][] = [
+      ...beside,
+      ...(pending.length > 0 ? [pending] : []),
+      ...(this.prefillUserMessage ? [[{ type: 'text', text: this.prefillUserMessage } as ContentBlock]] : []),
+    ];
+    // Every request asks for the agent's maxTokens (requestSettings), and context-manager takes the budget's reply
+    // reserve off the limit. So the limit is moved by the difference, either way: the prompt's room is the window less
+    // the reply the request asks for, whatever the caller reserves.
+    const reserve = this.resolveBudget(budget)?.reserveForResponse ?? this.maxTokens;
+    const requestLimitTokens = this.physicalWindowTokens - this.maxTokens + reserve;
+    // A reply that fills the window by itself leaves no room, whatever the budget reserves. It's refused here, as
+    // context-manager words a refusal no history makes room for, so context-manager is never given a limit it would
+    // refuse as malformed, where a small reserve makes it zero or less.
+    if (this.maxTokens >= this.physicalWindowTokens) {
+      const error = new OverBudgetError({
+        budget: requestLimitTokens,
+        actual: this.maxTokens,
+        stage: 'Request limit',
+        diagnostics: {
+          headTokens: 0, tailTokens: 0, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0, deepestLevelKind: 'unplanned',
+          requestLimitTokens, requestAllowanceTokens: requestLimitTokens - reserve,
+        },
+      });
+      error.message = `The reply of ${this.maxTokens} tokens the request asks for (maxTokens) leaves physicalWindowTokens ` +
+        `of ${this.physicalWindowTokens} no room for anything else`;
+      throw error;
+    }
+    return {
+      requestOverhead: messages.length > 0 ? { ...requestOverhead, messages } : requestOverhead,
+      requestLimitTokens,
+    };
   }
 
   /**
@@ -2427,7 +2541,7 @@ export class Agent {
     // Compiled only once each withheld stub's annotation has finished,
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
-    const { request, continuePrompt, compiled, binding } = await this.toolResultGuard.afterAnnotations(
+    const { request, continuePrompt, compiled, binding, requestOverhead } = await this.toolResultGuard.afterAnnotations(
       () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
@@ -2484,6 +2598,7 @@ export class Agent {
     return {
       stream,
       request,
+      requestOverhead,
       ...(continuePrompt ? { continuePrompt } : {}),
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
@@ -2742,15 +2857,36 @@ export class Agent {
     return false;
   }
 
+  /** A call's usage as its compile's calibration sample (context-manager's `reportRealInputTokens`), read against what
+   *  the compile priced beside its window. The direct API's call has no report of thinking the provider dropped, so
+   *  unlike a stream's, its sample can't be withheld for one. Best-effort, as calibration is. */
+  private reportCompileSample(
+    usage: { inputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number } | undefined,
+    overhead: RequestOverhead | undefined,
+  ): void {
+    if (!usage) return;
+    const total = usage.inputTokens + (usage.cacheCreationTokens ?? 0) + (usage.cacheReadTokens ?? 0);
+    const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown }).getStrategy?.() as
+      | { reportRealInputTokens?: (n: number, overhead?: RequestOverhead) => void }
+      | undefined;
+    try {
+      strategy?.reportRealInputTokens?.(total, overhead);
+    } catch { /* calibration is best-effort */ }
+  }
+
   private async doInference(
     request: NormalizedRequest,
     signal: AbortSignal | undefined,
     /** Compiles the context into a request again, for the guard's retry. */
     reassemble: () => Promise<NormalizedRequest>,
+    /** What a request's compile priced beside its window, for its call's calibration sample. */
+    pricedOverhead: (request: NormalizedRequest) => RequestOverhead | undefined = () => undefined,
   ): Promise<InferenceResult> {
     let response = signal?.aborted
       ? { aborted: true as const, reason: 'user' as const }
       : await this.membrane.stream(request, { signal });
+    // Each compile's one call is its sample, as a stream's first call is.
+    if (!isAbortedResponse(response)) this.reportCompileSample(response.usage, pricedOverhead(request));
     // Usage of a refused attempt abandoned by the guard; it was billed and
     // is added to the retry's usage below rather than overwritten.
     let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
@@ -2768,6 +2904,7 @@ export class Agent {
         response = signal?.aborted
           ? { aborted: true, reason: 'user', partialUsage: response.usage }
           : await this.membrane.stream(retry, { signal });
+        if (!isAbortedResponse(response)) this.reportCompileSample(response.usage, pricedOverhead(retry));
       }
     }
 

@@ -7,10 +7,10 @@
  * doesn't export is a SyntaxError when the module graph is linked, so a
  * named import of either would fail the package's load on 0.24.0 before
  * create() could say which context-manager it needs (it refuses one
- * without a window index, naming ^0.25.0). A namespace import reads an
- * absent name as undefined, and a stand-in takes its place: a class
- * nothing throws, so an `instanceof` against it is false, as it is for
- * every error that release throws.
+ * without a window index, naming the range this package declares). A
+ * namespace import reads an absent name as undefined, and a stand-in takes
+ * its place: a class nothing throws, so an `instanceof` against it is
+ * false, as it is for every error that release throws.
  *
  * Import these two from here, not from '@animalabs/context-manager'
  * (test/presentation-mandatory.test.ts scans for that).

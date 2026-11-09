@@ -104,7 +104,7 @@ import { deferredWritesRefusal, isToolBlockEntry, readPersistedDeferredWrites, t
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
+import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, leavesNoRoomInWindow, type RenderStats } from './agent.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -1006,7 +1006,7 @@ import type {
   ChannelsChangedParams,
   ChannelsIncomingParams,
 } from './mcpl/types.js';
-import type { ContextInjection, ContextStrategy, ThinkingBinding } from '@animalabs/context-manager';
+import type { ContextInjection, ContextStrategy, RequestOverhead, ThinkingBinding } from '@animalabs/context-manager';
 import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
 import { CLOCK_ROW_KIND, clockStampOf, planClock, takesClockBefore } from './clock-rows.js';
 import { firstFreeBranchName } from './branch-names.js';
@@ -3070,6 +3070,11 @@ const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
   '(e.g. drop an oversized attachment or an unsupported setting).';
 const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
+/** What a window_full turn tells the agent, in place of the refusal's figures and FAILURE_ADVICE: nothing in its own
+ *  hands makes room, and who can. */
+const WINDOW_FULL_NOTICE = 'The reply\'s maxTokens, the system prompt, the tools and what the turn sends beside your ' +
+  'history leave the model\'s window no room for the conversation. Trying again won\'t make room; whoever configures ' +
+  'you can, by lowering maxTokens, the system prompt or the tools, or by checking physicalWindowTokens.';
 const MADE_AGAIN = 'The call was made again, and it timed out again.';
 const OVERLOADED_TURN_TRIES = 13;
 const DEADLINE_TURN_TRIES = 2;
@@ -4857,11 +4862,11 @@ export class AgentFramework {
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
   private readonly resumesPending = new Map<string, Agent | undefined>();
-  // context-manager 0.25.1: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3156),
+  // context-manager 0.26.0: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3150),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
-  // (context-manager.ts:4602-4621). So such a released manager is collected
+  // (context-manager.ts:4626-4645). So such a released manager is collected
   // only once nothing of its work can still read the store, and stop()
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
@@ -5170,7 +5175,7 @@ export class AgentFramework {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
           "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
-          'Install @animalabs/context-manager ^0.25.1, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
+          'Install @animalabs/context-manager ^0.26.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
@@ -27798,6 +27803,7 @@ export class AgentFramework {
         noteRequestSent,
         noteThinkingDropped,
         carriedBodies,
+        requestOverhead,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
@@ -27922,6 +27928,7 @@ export class AgentFramework {
             }
           : undefined,
         streamCarry,
+        requestOverhead,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -28093,6 +28100,8 @@ export class AgentFramework {
      *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
     thinkingDrops?: StreamThinkingDrops,
     carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
+    /** What the stream's compile priced beside its window (StartStreamResult's `requestOverhead`), which its sample is given. */
+    requestOverhead?: RequestOverhead,
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
     const startTime = Date.now();
@@ -30176,10 +30185,7 @@ export class AgentFramework {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
               | {
-                  reportRealInputTokens?: (
-                    n: number,
-                    overhead?: Pick<NormalizedRequest, 'system' | 'tools'>,
-                  ) => void;
+                  reportRealInputTokens?: (n: number, overhead?: RequestOverhead) => void;
                   reportKvUnifiedAccepted?: (args: {
                     submissionId: string;
                     acceptedAt?: number;
@@ -30235,9 +30241,11 @@ export class AgentFramework {
             }
             try {
               if (!thinkingDroppedInStream) {
+                // What the compile priced beside its window: with a window, the messages the request sent besides
+                // the compiled context too, which the provider's count includes.
                 strat?.reportRealInputTokens?.(
                   realTotal,
-                  compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined,
+                  requestOverhead ?? (compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined),
                 );
               }
             } catch { /* calibration is best-effort */ }
@@ -35129,6 +35137,10 @@ export class AgentFramework {
         ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
       };
     }
+    // A refusal no history can fix: the window has no room beside the request's overhead and reply.
+    if (leavesNoRoomInWindow(err)) {
+      return { errorType: 'window_full' };
+    }
     if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
     }
@@ -35242,7 +35254,7 @@ export class AgentFramework {
                 : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
                   `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
                   `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''} Reason: `) +
-              `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
+              `${errorType === 'window_full' ? WINDOW_FULL_NOTICE : `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
@@ -35333,6 +35345,19 @@ export class AgentFramework {
         `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${drainState}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
+        { skipLog: true },
+      );
+    }
+    // Folding history can't make room in a window the request's overhead and reply fill, so it kicks no drain.
+    if (errorType === 'window_full') {
+      this.opsAlert(
+        'context-refusal',
+        agentName,
+        'compile refused (window_full). Lower maxTokens, the system prompt, the tools, the message injections or what ' +
+        'the turn sends beside its history, or check physicalWindowTokens against the model\'s window: as ' +
+        'context-manager prices them, those leave physicalWindowTokens no room for the conversation, by the figures the ' +
+        'reason gives. No history or budget makes room there, so no drain kicked. ' +
+        `Reason: ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)}`,
         { skipLog: true },
       );
     }

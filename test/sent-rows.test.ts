@@ -278,14 +278,17 @@ describe('a stream\'s rounds, noted at each tool boundary and at its end', () =>
     assert.deepEqual(notes.map((n) => n.rows), [replies(stored)]);
   });
 
-  for (const [restart, agent] of [
-    ['a budget restart', { maxStreamTokens: 50 }],
-    // The budget is never passed, so only the window can restart the stream: the first call's prompt (100), its
-    // output (10) and the reserve for the next response (100) pass a window of 150, and without the prompt wouldn't.
-    ['a window restart', { maxStreamTokens: 1_000_000, maxTokens: 100, physicalWindowTokens: 150 }],
+  for (const [restart, agent, prompt] of [
+    ['a budget restart', { maxStreamTokens: 50 }, undefined],
+    // The budget is never passed, so only the window can restart the stream: the first call's prompt (2,000), its
+    // output (10) and the reserve for the next response (100) pass a window of 2,000, and without the prompt wouldn't.
+    // The first request itself is within it: the compile keeps it there (requestLimitTokens).
+    ['a window restart', { maxStreamTokens: 1_000_000, maxTokens: 100, physicalWindowTokens: 2_000 }, 2_000],
   ] as const) it(`notes a stream ${restart} ends before the restart's compile, and the restart's own stream after it`, async () => {
+    const first = round('c1', [signed('sig-1'), text('Calling.')]);
+    if (prompt !== undefined) first.usage = { ...first.usage!, inputTokens: prompt };
     const { log, notes, stored, streams } = await turn({
-      agent, scripts: [[round('c1', [signed('sig-1'), text('Calling.')]), final()], [final()]],
+      agent, scripts: [[first, final()], [final()]],
     });
     assert.equal(streams, 2, 'the restart opened a second stream');
     const [reply1, reply2] = replies(stored);

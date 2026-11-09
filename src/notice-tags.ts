@@ -76,9 +76,9 @@ export const NOTICE_TAG = {
 } as const;
 
 /**
- * The bracket openings context-manager 0.25.1 writes into an agent's context
- * outside a tool result or read back from it, the same as 0.23.1 and 0.25.0
- * write, marked as the framework's own are. Its `[truncated — original was`
+ * The bracket openings context-manager 0.26.0 writes into an agent's context
+ * outside a tool result or read back from it, the same as 0.23.1, 0.25.0 and
+ * 0.25.1 write, marked as the framework's own are. Its `[truncated — original was`
  * isn't here: NOTICE_TAG.truncated marks it. Check them against each
  * context-manager release the framework takes.
  */

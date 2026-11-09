@@ -899,7 +899,7 @@ static tools are listed like any server's.
 
 ### Streaming Lifecycle
 
-1. **Start**: Framework calls `agent.startStreamWithInjections()` → `YieldingStream`
+1. **Start**: Framework calls `agent.startStreamWithInjections()` → `YieldingStream`. With `physicalWindowTokens` set, its compile keeps the request within that window as context-manager prices it (context-manager's `requestLimitTokens`), counting the system prompt, tools, reply's `maxTokens` and what it sends besides the compiled context, as `physicalWindowTokens` lists
 2. **Drive**: Framework iterates stream events (tokens, tool-calls, complete, error)
 3. **Tool yield**: Stream yields tool calls → framework dispatches concurrently → collects results
 4. **Resume**: All results in → stream resumes with tool results
