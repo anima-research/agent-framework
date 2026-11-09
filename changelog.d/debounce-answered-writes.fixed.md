@@ -12,15 +12,16 @@
   A request that fails or is aborted answers nothing, though a round of the
   turn that came back before it has answered what that round read. This covers
   MCPL channel messages, those routed to a conversation fork included, and
-  pushes, heartbeat ticks and reminders, and module events whose response
-  stored exactly one message, where neither the event nor the message names a
-  channel and the event isn't console or API input. An event with no message
-  of its own keeps the wake, unless a turn already under way read and answered
-  the batch's line, which quotes it. A judge rule's batch is judged so too
-  where no judge decided it (none wired, or one that failed, timed out or made
-  no call, with `onError: "wake"`), and on a reply verdict, except for an
-  event the gate's `isAnswered` counts as answered when the judge answers.
-  AgentFramework's counts one a request the agent had answered carried,
-  whether or not it had published there, and one whose writer or message is
-  gone, or where it can't tell. Such an event keeps the wake, so the judge's
-  reply stands. A deferred render's batched wake is unchanged.
+  pushes, message-mode heartbeat ticks and reminders, and module events whose
+  response stored exactly one message, where neither the event nor the message
+  names a channel and the event isn't console or API input. An event with no
+  message of its own keeps the wake, unless a turn already under way read and
+  answered the batch's line, which quotes it. A silent heartbeat tick stores
+  nothing and isn't quoted, so it keeps the wake. A judge rule's batch is
+  judged so too where no judge decided it (none wired, or one that failed,
+  timed out or made no call, with `onError: "wake"`), and on a reply verdict,
+  except for an event the gate's `isAnswered` counts as answered when the
+  judge answers. AgentFramework's counts one a request the agent had answered
+  carried, whether or not it had published there, and one whose writer or
+  message is gone, or where it can't tell. Such an event keeps the wake, so
+  the judge's reply stands. A deferred render's batched wake is unchanged.

@@ -1,13 +1,16 @@
 - A debounced batch's `[Gate: …]` line names only the batch's events with no
   message of their own in the window, quoting each, as it did: a module event
   whose response stored no single message, for one. An MCPL channel message or
-  push, a heartbeat tick or reminder, and a module event whose response stored
-  exactly one message, where neither the event nor the message names a channel
-  and the event isn't console or API input, are in the window already and get
-  no line, where they were counted by channel in one ("N messages in #chan
-  (oldest ~Ns ago) — already shown above at arrival; this is a batched wake,
-  not new content"), or, for a batch's one message still the newest entry, in
-  one handed to the turn's start. A batch of such events alone writes no line.
+  push, a message-mode heartbeat tick or a reminder, and a module event whose
+  response stored exactly one message, where neither the event nor the message
+  names a channel and the event isn't console or API input, are in the window
+  already and get no line, where they were counted by channel in one ("N
+  messages in #chan (oldest ~Ns ago) — already shown above at arrival; this is
+  a batched wake, not new content"), or, for a batch's one message still the
+  newest entry, in one handed to the turn's start. A batch of such events alone
+  writes no line. A silent heartbeat tick stores nothing and has no text to
+  quote. It was counted in that line too, as a message already shown, and now
+  gets no line.
   So a debounced reminder whose module stored its text no longer has that text
   quoted again in a line, and under conversation routing the trunk, woken for
   a fork's messages it doesn't hold, no longer gets a line saying they were

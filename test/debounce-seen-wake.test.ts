@@ -168,6 +168,25 @@ describe('debounced writes already read and answered', () => {
     }
   }
 
+  it('a silent heartbeat tick, which stores nothing, gets no line, and its batched wake starts its turn', async () => {
+    const { f, module, start } = await setup(60_000);
+    const wakes = recordWakes(f);
+    try {
+      const { loop } = await start();
+      (f.framework as unknown as { deliverHeartbeat(wake: import('../src/heartbeat/heartbeat.js').HeartbeatWake): void }).deliverHeartbeat(
+        { kind: 'heartbeat', reason: 'schedule', silent: true, text: 'tick prompt', eventId: 'tick' });
+      module.release('first');
+      await loop;
+      assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 0, 'premise: nothing held for inference');
+      assert.ok(!stored(f, 'tick prompt'), 'premise: the silent tick stored nothing');
+      fire(f);
+      await f.framework.runUntilIdle();
+      assert.deepEqual(wakes, [{ agentName: 'agent' }], 'the batch requested its wake, with no writes');
+      assert.equal(f.membrane.calls.length, 2, 'its wake starts its turn');
+      assert.ok(!f.context().includes('[Gate:'), 'no line');
+    } finally { await f.close(); }
+  });
+
   it('a partial batch keeps the event arriving mid-turn after the request was built', async () => {
     const { f, module, streams, start } = await setup(60_000, false, async (f) => {
       await send(f, 'module', 'still unread', 'second');
