@@ -1272,6 +1272,7 @@ describe('private turns: readers, writers and speech (parts 4, 5 and 6)', () => 
         assert.deepEqual(storedText(f, '[send-undeliverable]').map((m) => textOf(m)), [], `${mode}: no failure marker`);
         assert.deepEqual(hidden(f).turnRouting.get('agent')!.drafts, [], `${mode}: no draft kept`);
         assert.deepEqual(storedText(f, 'draft').map((m) => textOf(m)).filter((t) => t.includes('[delivered]')), [], `${mode}: no receipt names a draft`);
+        assert.equal(storedText(f, '1 plain-speech segment(s) kept private').length, 1, `${mode}: the receipt names the answer as kept private`);
       } finally { await f.close(); }
     }
   });
@@ -1361,6 +1362,106 @@ describe("private turns: the wakes a private turn causes (part 7)", () => {
         `premise: the second turn merged the bounce's wake with the room mention's: ${JSON.stringify(batch)}`);
       assert.ok(!has(f, 'zz-unscripted'), 'premise: no third turn ran');
       assert.deepEqual(typing.filter((t) => t.turn === 2), [], `the merged turn showed typing in no channel: ${JSON.stringify(typing)}`);
+    } finally { await f.close(); }
+  });
+});
+
+describe('private turns: what the resident is told', () => {
+  /** The agent's next request makes one tool call, and the request after its result fails. */
+  function failNext(f: F): () => boolean {
+    const scripted = f.membrane.streamYielding.bind(f.membrane);
+    let failed = false;
+    f.membrane.streamYielding = (request, options) => {
+      if (failed || (request as { system?: string }).system?.includes(SUB.systemPrompt)) return scripted(request, options);
+      failed = true;
+      return new (class extends MockYieldingStream {
+        override provideToolResults(results: unknown[], options?: Parameters<MockYieldingStream['provideToolResults']>[1]): void {
+          super.provideToolResults(results, options);
+          const self = this as unknown as { events: StreamEvent[]; _done: boolean; pendingResolve: (() => void) | null };
+          self._done = false;
+          self.events.push({ type: 'error', error: new Error('the provider refused the request') } as unknown as StreamEvent);
+          self.pendingResolve?.();
+        }
+      })([act('a1')], true);
+    };
+    return () => failed;
+  }
+  /** An operator's message whose turn makes one tool call and then fails, so the message stays unanswered. */
+  async function failedPrivateTurn(f: F): Promise<void> {
+    const failed = failNext(f);
+    f.framework.pushEvent(surfaceMessage(SECRET));
+    await f.framework.runUntilIdle();
+    assert.ok(failed(), 'premise: the private turn ran its failing stream');
+    assert.ok(!hidden(f).openLogical.has('agent'), 'premise: the failure ended the private turn');
+  }
+  const noFailureRetry = { errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) } };
+
+  it("a room message after a private turn that failed on its tool round opens a private turn, which is told so where main would have announced the room's channel", async () => {
+    const { f } = await make({ rule: 'delivery', framework: noFailureRetry });
+    try {
+      const notices = () => storedText(f, 'This turn now holds a message from').length;
+      script(f, [say('zz-room answer')]);
+      await failedPrivateTurn(f);
+      assert.equal(notices(), 0, "the private turn's own open had no channel to lose, so it stored no notice");
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => has(f, 'zz-room answer'), 'premise: the room turn spoke');
+      assert.deepEqual(sent(f, 'zz-room answer'), [], "premise: the room turn's speech went to no channel");
+      assert.equal(notices(), 1, 'the room turn, private at its open, was told so');
+      const rows = stored(f);
+      const at = (text: string) => rows.findIndex((m) => textOf(m).includes(text));
+      assert.ok(at('agent, hello') < at('This turn now holds a message from'), "the notice follows the room's message");
+    } finally { await f.close(); }
+  });
+
+  it('two private opens in a row, each woken by a room message while the operator\'s message stays unanswered, are each told so', async () => {
+    const { f } = await make({ rule: 'delivery', framework: noFailureRetry });
+    try {
+      const notices = () => storedText(f, 'This turn now holds a message from').length;
+      script(f, [say('zz-room answer')]);
+      await failedPrivateTurn(f);
+      const failed = failNext(f);
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      assert.ok(failed(), 'premise: the first room turn made its tool call and failed, so the operator\'s message is still unanswered');
+      assert.equal(notices(), 1, 'the first room turn, private at its open, was told so');
+      await incoming(f, 'work', 'w2', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => has(f, 'zz-room answer'), 'premise: the second room turn spoke');
+      assert.deepEqual(sent(f, 'zz-room answer'), [], "premise: the second room turn's speech went to no channel");
+      assert.equal(notices(), 2, 'the second, private at its open too, was told so as well');
+    } finally { await f.close(); }
+  });
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode}: a private turn's plain speech is named in its receipt as kept private, and the receipt's row is traced`, async () => {
+      const { f } = await make({ mode, rule: 'delivery', framework: noFailureRetry });
+      try {
+        const receipts: unknown[] = [];
+        const off = f.framework.onTrace((t) => { if (t.type === 'message:added' && (t as { source?: string }).source === 'delivery-receipt') receipts.push(t); });
+        script(f, [say('zz-room answer')]);
+        await failedPrivateTurn(f);
+        await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+        await f.framework.runUntilIdle();
+        await eventually(() => has(f, 'zz-room answer'), 'premise: the room turn spoke');
+        off();
+        assert.deepEqual(sent(f, 'zz-room answer'), [], "premise: the room turn's speech went to no channel");
+        const kept = storedText(f, 'kept private').map((m) => textOf(m));
+        assert.equal(kept.length, 1, `one receipt names the kept speech: ${JSON.stringify(kept)}`);
+        assert.match(kept[0]!, /1 plain-speech segment\(s\) kept private \(this turn is private\)/);
+        assert.equal(receipts.length, 1, "the receipt's row is traced as a delivery receipt");
+      } finally { await f.close(); }
+    });
+  }
+
+  it("a public turn's receipt is as main's", async () => {
+    const { f } = await make({ rule: 'delivery' });
+    try {
+      script(f, [say('zz-public answer')]);
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => sent(f, 'zz-public answer').length > 0, 'premise: the public turn posted');
+      assert.deepEqual(storedText(f, 'kept private'), [], 'no receipt names kept speech');
     } finally { await f.close(); }
   });
 });
