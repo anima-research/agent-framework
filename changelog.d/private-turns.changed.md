@@ -35,8 +35,9 @@
   its ` !` continuation and a prose bounce's resend, are private too
   (`InferenceRequest.privateCaller`, which the framework sets). So are a
   private turn's re-runs, each of which takes the mark from the turn: a
-  context-budget restart's continuation, a refusal rewind's or `/unstick`'s
-  retry, the poisoned-history rewind's retry, and a re-arm. In a private turn,
+  context-budget restart's continuation, a provider hold's or the error
+  policy's retry, a refusal rewind's or `/unstick`'s retry, the
+  poisoned-history rewind's retry, and a re-arm. In a private turn,
   an envelope's own words go where they would in any turn, and no envelope
   sets a destination for the turn's later words. `channel_publish` naming no
   channel is refused in a private turn, and its refusal says to name the

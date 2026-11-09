@@ -728,12 +728,11 @@ export interface InferenceRequest {
    * call), so the turn it opens speaks in no channel either. True on the
    * framework's own wakes from such a turn (an autoContinue continuation, a
    * bounce's resend wake, a ` !` continuation), on the requests the
-   * framework builds to continue, re-run or re-arm such a turn (a
-   * context-budget restart's continuation, a rewind's retry, a re-arm), and
-   * on a merged batch where any cause has it. A retry that continues the
-   * open turn, such as a provider hold's or the error policy's, copies the
-   * trigger of the start it retries, and carries the field only if that
-   * trigger did. Hosts don't set it.
+   * framework builds to continue, retry, re-run or re-arm such a turn (a
+   * context-budget restart's continuation, a provider hold's or the error
+   * policy's retry, a rewind's retry, a re-arm), on a merged batch where any
+   * cause has it, and on a held request that an equal one carrying it folds
+   * into. Hosts don't set it.
    */
   privateCaller?: true;
   /**
