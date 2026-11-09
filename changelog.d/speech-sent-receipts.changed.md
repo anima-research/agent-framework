@@ -39,7 +39,10 @@
   prose routing, a piece with a channel and an envelope's named target
   included, is neither asked about nor routed under that name, where it was
   routed; each stop is logged with the agent's name and how many characters
-  weren't routed for the replacement. Its tool calls go as before.
+  weren't routed for the replacement. Its tool calls go as before. A module
+  can replace the agent from inside its own hook. Later modules are still
+  asked about the piece in hand, and about a draft hold's later pieces. A
+  piece with a channel is still posted. A piece with no channel isn't.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, except an ephemeral run's, which gets
   none, as before; the notice now names the piece by its opening words,
