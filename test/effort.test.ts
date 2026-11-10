@@ -1221,6 +1221,32 @@ describe('FrameworkConfig.effort: two agents on one store', { skip: NEEDS_ROWS }
     } finally { await cleanup(); }
   });
 
+  it('takes back, at a copy\'s refusal, none of the rows it holds under an observed agent\'s mark', async () => {
+    try {
+      const { framework, provider, live, turn } = await pair({ observes: true });
+      await turn('alpha', 'One.');
+      await turn('beta', 'Two.');
+      live.alpha = 'low';
+      await turn('alpha', 'Three.');
+      // Beta's turn takes in alpha's rows, and its request fails, so no reply of beta's follows them.
+      provider.fail = (request) => (indexOfText(request, 'Four.') >= 0 ? refusal(false) : undefined);
+      await turn('beta', 'Four.');
+      live.copy = 'low';
+      provider.fail = (request) => (indexOfText(request, 'Copy.') >= 0 && effortRows(request).length > 0 ? refusal(true) : undefined);
+      const copy = await framework.deriveAgent({
+        name: 'copy', from: 'beta', mode: 'copy',
+        framing: [{ participant: 'user', content: [{ type: 'text', text: 'Copy.' }] }],
+      });
+      const marks = () => copy.contextManager.getAllMessages().filter((m) => m.content.some(isEffortBlock))
+        .map((m) => (m.metadata as { effortRowOf?: string } | undefined)?.effortRowOf);
+      assert.deepEqual(marks(), ['alpha'], 'premise: the copy holds alpha\'s row, under alpha\'s mark');
+      await framework.runEphemeralToCompletion(copy.agent, copy.contextManager);
+      assert.deepEqual(provider.carrying('Copy.').map((r) => effortRows(r).map((row) => row.effort)), [['low'], []],
+        'premise: the copy\'s own row was refused, and its retry carried none');
+      assert.deepEqual(marks(), ['alpha'], 'the copy\'s own row is taken back, and alpha\'s stays');
+    } finally { await cleanup(); }
+  });
+
   it('sends an agent only its own effort rows, and reads its own as in force', async () => {
     try {
       const { live, turn, last } = await pair();
