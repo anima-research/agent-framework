@@ -155,7 +155,7 @@ jobs:
       # skips a package's own lifecycle scripts for a tarball, so publishing
       # one would also skip prepublishOnly's release-hold check.
       - name: Publish
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag release-0.33
         env:
           # prepublishOnly checks the release holds again, as the build job
           # did, with the same token.
@@ -212,5 +212,5 @@ jobs:
             gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
           else
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-              --notes-file notes.md --verify-tag
+              --notes-file notes.md --verify-tag --latest=false
           fi
