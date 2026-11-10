@@ -17,6 +17,7 @@ import { ContextManager, type ContextInjection } from '@animalabs/context-manage
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, systemChangeMetadata, taskForkSpec, type Agent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
+import { storeOwnRow } from '../src/dendrite/audience.js';
 
 type Internals = {
   storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined;
@@ -28,6 +29,14 @@ const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentB
 const injection = (t: string): ContextInjection => ({ namespace: 'lessons', position: 'afterUser', content: [text(t)] });
 const textOf = (m: { content: unknown }): string =>
   (m.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+const store = (framework: AgentFramework, agent: Agent, participant: string, content: ContentBlock[], metadata?: unknown) => {
+  const id = agent.getContextManager().addMessage(participant, content, metadata as never);
+  (framework as unknown as { presentation: { afterStore(agent: Agent, ids: unknown[]): void } }).presentation.afterStore(agent, [id]);
+  return id;
+};
+const adopt = (framework: AgentFramework, agent: Agent) => (framework as unknown as { adoptPresentation(agent: Agent): void }).adoptPresentation(agent);
+const startOf = (framework: AgentFramework, agent: Agent) =>
+  (framework as unknown as { presentation: { presentAtStart(agent: Agent, occasion: 'turn-start'): unknown } }).presentation.presentAtStart(agent, 'turn-start');
 
 const FRAMING = '[FORK-FRAMING] Count the open issues.';
 const GRANDCHILD = '[GRANDCHILD-FRAMING] Count the closed ones.';
@@ -153,16 +162,17 @@ describe("a shared fork's view", () => {
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
           .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
     const mira = framework.getAgent('mira')!;
-    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
-    mira.getContextManager().addMessage('system', change('mira-tool'), systemChangeMetadata('mira') as never);
-    framework.getAgent('oren')!.getContextManager().addMessage('system', change('oren-tool'), systemChangeMetadata('oren') as never);
+    store(framework, mira, 'user', [text('Please look into the open issues.')]);
+    store(framework, mira, 'system', change('mira-tool'), systemChangeMetadata('mira') as never);
+    store(framework, framework.getAgent('oren')!, 'system', change('oren-tool'), systemChangeMetadata('oren') as never);
     assert.deepEqual(await changeTools(mira.getContextManager()), ['mira-tool'], "the premise: the source's view keeps its own change and leaves out another resident's");
     const fork = await framework.deriveAgent({
       name: 'fork-1',
       from: 'mira',
       framing: [{ participant: 'user', content: [text(FRAMING)] }],
     });
-    fork.contextManager.addMessage('system', change('fork-tool'), systemChangeMetadata('fork-1') as never);
+    adopt(framework, fork.agent);
+    storeOwnRow(fork.agent, 'system', change('fork-tool'), systemChangeMetadata('fork-1') as never);
     assert.deepEqual(await changeTools(fork.contextManager), ['mira-tool', 'fork-tool'], "the fork's compile: its source's change and its own, not another resident's");
     framework.start();
     membrane.script('fork-1', say('fork-1 done'));
@@ -210,14 +220,15 @@ describe("a shared fork of an isolated-slot reader's view", () => {
   it("a fork of the subconscious, reopened after it ends, shows what its live compile showed", async () => {
     const mira = framework.getAgent('mira')!;
     const sub = framework.getAgent('Subconscious')!;
-    mira.getContextManager().addMessage('user', [text('MIRA-SAID')]);
-    mira.getContextManager().addMessage('Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
+    store(framework, mira, 'user', [text('MIRA-SAID')]);
+    store(framework, mira, 'Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
     internals(framework).storeInjections(mira, [injection('MIRA-OWN')]);
     const fork = await framework.deriveAgent({
       name: 'fork-1',
       from: sub.name,
       framing: [{ participant: 'user', content: [text(FRAMING)] }],
     });
+    adopt(framework, fork.agent);
     internals(framework).storeInjections(fork.agent, [injection('FORK-OWN')]);
     const live = await compiled(fork.contextManager);
     assert.ok(live.includes('FORK-OWN'), "the premise: the fork's compile shows its own injection");
@@ -238,9 +249,9 @@ describe("a shared fork of an isolated-slot reader's view", () => {
     const mira = framework.getAgent('mira')!;
     const sub = framework.getAgent('Subconscious')!;
     const suppressed = { suppressed: { rule: 'quiet-bots', eventType: 'chat:message' } };
-    mira.getContextManager().addMessage('user', [text('MIRA-SAID')]);
-    mira.getContextManager().addMessage('Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
-    mira.getContextManager().addMessage('Antra', [text('SUPPRESSED-ROW')], suppressed as never);
+    store(framework, mira, 'user', [text('MIRA-SAID')]);
+    store(framework, mira, 'Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
+    store(framework, mira, 'Antra', [text('SUPPRESSED-ROW')], suppressed as never);
     assert.ok(mira.getContextManager().getAllMessages().some((m) => textOf(m) === 'SUPPRESSED-ROW'), 'the premise: the suppressed row is stored');
     const own = await compiled(sub.getContextManager());
     assert.ok(own.includes('MIRA-SAID') && own.includes('HELD-ROW'), "the premise: the subconscious reads the residents' slot, held rows included");
@@ -290,8 +301,8 @@ describe("a shared child of a resident with former names", () => {
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
           .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
     const mira = framework.getAgent('mira')!;
-    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
-    mira.getContextManager().addMessage('system',
+    store(framework, mira, 'user', [text('Please look into the open issues.')]);
+    store(framework, mira, 'system',
       [{ type: 'system_change', defineTools: [{ name: 'old-tool', description: 'old', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('mira-old') as never);
     const { name: _name, ...spec } = taskForkSpec('job-1', { parent: 'mira', inherit: { mode: 'shared' } });
@@ -315,8 +326,8 @@ describe("a shared child of a resident with former names", () => {
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
           .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
     const mira = framework.getAgent('mira')!;
-    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
-    mira.getContextManager().addMessage('system',
+    store(framework, mira, 'user', [text('Please look into the open issues.')]);
+    store(framework, mira, 'system',
       [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('zed') as never);
     const { name: _name, ...spec } = taskForkSpec('job-2', { parent: 'mira', inherit: { mode: 'shared' } });
@@ -354,8 +365,8 @@ describe("a shared child of a resident with former names", () => {
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
           .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
     const mira = framework.getAgent('mira')!;
-    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
-    mira.getContextManager().addMessage('system',
+    store(framework, mira, 'user', [text('Please look into the open issues.')]);
+    store(framework, mira, 'system',
       [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('zed') as never);
     const { name: _name, ...spec } = taskForkSpec('job-3', { parent: 'mira', inherit: { mode: 'shared' } });
@@ -400,7 +411,7 @@ describe("a resumed 'head' job", () => {
 
   for (const [how, shared] of [['in a namespace of its own', false], ["continuing a resident's context", true]] as const) {
     it(`sends its request beside a host's change rows that alone exceed its budget, ${how}`, async () => {
-      framework.getAgent('mira')!.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+      store(framework, framework.getAgent('mira')!, 'user', [text('Please look into the open issues.')]);
       const { name: _name, ...spec } = taskForkSpec('job', { parent: 'mira', inherit: { mode: 'shared' } });
       const first = await framework.createEphemeralAgent({ name: 'job', ...job } as never, shared ? spec : undefined);
       first.contextManager.addMessage('user', [text('Run once.')]);
@@ -408,9 +419,11 @@ describe("a resumed 'head' job", () => {
       membrane.script('job', say('job done'));
       await framework.runEphemeralToCompletion(first.agent, first.contextManager);
       const resumed = await framework.resumeAgent('job', job as never);
+      adopt(framework, resumed.agent);
       resumed.contextManager.addMessage('system', bulky('h1'));
       resumed.contextManager.addMessage('system', bulky('h2'));
       resumed.contextManager.addMessage('user', [text('Once more.')]);
+      startOf(framework, resumed.agent);
       const request = await resumed.agent.buildActivationRequest([]);
       assert.equal(textOf(request.messages.at(-1)!), 'Once more.');
       assert.ok(!request.messages.some((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change')), 'and no change row');
@@ -450,10 +463,10 @@ describe("a derived agent's change rows, its source's among them", () => {
       maintenanceIntervalMs: 0,
     });
     const mira = framework.getAgent('mira')!;
-    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    store(framework, mira, 'user', [text('Please look into the open issues.')]);
     await mira.buildActivationRequest([]);
-    mira.getContextManager().addMessage('system', change('b'), systemChangeMetadata('mira') as never);
-    mira.getContextManager().addMessage('system', change('o'), systemChangeMetadata('mira-old') as never);
+    store(framework, mira, 'system', change('b'), systemChangeMetadata('mira') as never);
+    store(framework, mira, 'system', change('o'), systemChangeMetadata('mira-old') as never);
   });
   const holdsBoth = (names: string[]) => names.includes('b') && names.includes('o');
   const holdsNeither = (names: string[]) => !names.includes('b') && !names.includes('o');

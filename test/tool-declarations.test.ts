@@ -157,7 +157,7 @@ describe('toolDeclarations', () => {
       content: [{ type: 'system_change', defineTools: [tool('b')] }],
     });
     assert.equal(changeRows(context.rows).length, 1, 'stored where it took effect');
-    assert.deepEqual(changeRows(context.rows)[0]!.metadata, { system: true, kind: 'system-change', agent: 'agent' });
+    assert.deepEqual(changeRows(context.rows)[0]!.metadata, { system: true, kind: 'system-change', agent: 'agent', audience: ['agent'], ownRowOf: 'agent' });
     assert.deepEqual(events.at(-1), { type: 'head:declared', removed: [], defined: ['b'], addedSystem: 0 });
 
     const restarted = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('b'), tool('a')]);

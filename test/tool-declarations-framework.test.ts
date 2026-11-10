@@ -61,8 +61,14 @@ type Assembling = {
   }>;
 };
 
-const say = (agent: Agent, participant: string, text: string) =>
-  agent.getContextManager().addMessage(participant, [{ type: 'text', text } as ContentBlock]);
+const store = (framework: AgentFramework, agent: Agent, participant: string, content: ContentBlock[], metadata?: unknown) => {
+  const id = agent.getContextManager().addMessage(participant, content, metadata as never);
+  (framework as unknown as { presentation: { afterStore(agent: Agent, ids: unknown[]): void } }).presentation.afterStore(agent, [id]);
+  return id;
+};
+const say = (framework: AgentFramework, agent: Agent, participant: string, text: string) =>
+  store(framework, agent, participant, [{ type: 'text', text } as ContentBlock]);
+const adopt = (framework: AgentFramework, agent: Agent) => (framework as unknown as { adoptPresentation(agent: Agent): void }).adoptPresentation(agent);
 
 describe('toolDeclarations in the framework', () => {
   it('keeps each resident\'s system changes its own in the slot they share, and traces them', async () => {
@@ -71,7 +77,7 @@ describe('toolDeclarations in the framework', () => {
       framework.onTrace((event) => { traces.push(event); });
       const alpha = framework.getAgent('alpha')!;
       const beta = framework.getAgent('beta')!;
-      say(alpha, 'user', 'hello, both');
+      say(framework, alpha, 'user', 'hello, both');
       await alpha.buildActivationRequest([tool('a')]);
       await beta.buildActivationRequest([tool('x')]);
 
@@ -99,7 +105,7 @@ describe('toolDeclarations in the framework', () => {
       let before: NormalizedMessage[] = [];
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         before = (await alpha.buildActivationRequest([tool('a'), tool('b')])).messages;
       }, storePath);
@@ -116,12 +122,12 @@ describe('toolDeclarations in the framework', () => {
   it("counts host /undo N in the conversation's messages, taking a change among them with them", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'one');
+      say(framework, alpha, 'user', 'one');
       await alpha.buildActivationRequest([tool('a')]);
-      say(alpha, 'alpha', 'two');
-      say(alpha, 'user', 'three');
+      say(framework, alpha, 'alpha', 'two');
+      say(framework, alpha, 'user', 'three');
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
-      say(alpha, 'alpha', 'four');
+      say(framework, alpha, 'alpha', 'four');
       const host = framework as unknown as { handleHostCommand(server: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> };
       const tooMany = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 4 });
       assert.match(tooMany.error ?? '', /history has 4;/, 'the conversation\'s four messages, the change uncounted');
@@ -143,8 +149,8 @@ describe('toolDeclarations in the framework', () => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
-        alpha.getContextManager().addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+        say(framework, alpha, 'user', 'hello');
+        store(framework, alpha, 'alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
         await alpha.buildActivationRequest([tool('a')]);
         const declared = await alpha.buildActivationRequest([tool('a'), tool('b')]);
         assert.ok(hasThinking(declared.messages), `${JSON.stringify(binding)}: a declared change keeps the thinking before it`);
@@ -172,7 +178,7 @@ describe('toolDeclarations in the framework', () => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         alpha.noteResponseInput(10);
@@ -197,7 +203,7 @@ describe('toolDeclarations in the framework', () => {
   it("builds a declared change's request from the compile that wrote the record, so a note under it is taken, with `binds: true`", async () => {
     await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       const assembled = await (alpha as unknown as Assembling).assembleActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(changesIn(assembled.request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'declared');
@@ -213,7 +219,7 @@ describe('toolDeclarations in the framework', () => {
     try {
       await withFramework([{ ...resident('alpha'), thinkingBinding: binding }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         assert.equal(storedChanges(alpha, 'alpha'), 1, 'the premise: its change row is stored');
@@ -227,7 +233,7 @@ describe('toolDeclarations in the framework', () => {
         const cm = alpha.getContextManager();
         assert.equal(cm.getAllMessages().filter(isChange).length, 0, 'the change row went');
         assert.equal(heads.headDeclarations.read('alpha'), null, 'and its record');
-        const reply = cm.addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+        const reply = store(framework, alpha, 'alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
         assert.equal(cm.noteRequestSent([reply], assembled.binding.identity as never, assembled.compiled.provenance!.compileId!), true);
         const next = await alpha.buildActivationRequest([tool('a'), tool('b')]);
         assert.ok(next.messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking')), 'the reply keeps its thinking at the next compile');
@@ -240,7 +246,7 @@ describe('toolDeclarations in the framework', () => {
   it("compiles again on the head once it takes its own change rows out, kept to its head after a refusal, so a reply after keeps its thinking, with `binds: true`", async () => {
     await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(storedChanges(alpha, 'alpha'), 1, 'the premise: its change row is stored');
@@ -249,7 +255,7 @@ describe('toolDeclarations in the framework', () => {
       assert.deepEqual(changesIn(assembled.request.messages), []);
       const cm = alpha.getContextManager();
       assert.equal(cm.getAllMessages().filter(isChange).length, 0, 'its change row went');
-      const reply = cm.addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+      const reply = store(framework, alpha, 'alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
       assert.equal(cm.noteRequestSent([reply], assembled.binding.identity as never, assembled.compiled.provenance!.compileId!), true);
       const next = await alpha.buildActivationRequest([tool('a'), tool('b')]);
       assert.ok(next.messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking')), 'the reply keeps its thinking at the next compile');
@@ -261,9 +267,9 @@ describe('toolDeclarations in the framework', () => {
     await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
       const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
-      say(alpha, 'user', 'hello');
-      alpha.getContextManager().addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
-      say(alpha, 'user', 'and then');
+      say(framework, alpha, 'user', 'hello');
+      store(framework, alpha, 'alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+      say(framework, alpha, 'user', 'and then');
       assert.ok(hasThinking((await alpha.buildActivationRequest([tool('a')], system('v1'))).messages), 'adopted');
       assert.ok(hasThinking((await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'))).messages), 'a declared change');
       const replaced = await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
@@ -279,9 +285,9 @@ describe('toolDeclarations in the framework', () => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
-        alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('b')] }] as never, systemChangeMetadata('alpha-old') as never);
+        store(framework, alpha, 'system', [{ type: 'system_change', defineTools: [tool('b')] }] as never, systemChangeMetadata('alpha-old') as never);
         const request = await alpha.buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'the change goes out once');
         assert.equal(alpha.getContextManager().getAllMessages().filter((m) => isSystemChangeMessage(m)).length, 1, 'and nothing is declared again');
@@ -292,8 +298,8 @@ describe('toolDeclarations in the framework', () => {
     it("are stamped with change metadata: a host's change row whose metadata names an agent but isn't change metadata stays in every resident's view", async () => {
       await withFramework([resident('alpha'), resident('beta')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
-        alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] }] as never, { agent: 'beta' } as never);
+        say(framework, alpha, 'user', 'hello');
+        store(framework, alpha, 'system', [{ type: 'system_change', defineTools: [tool('h')] }] as never, { agent: 'beta' } as never);
         for (const name of ['alpha', 'beta']) {
           const compiled = await framework.getAgent(name)!.getContextManager().compile(undefined, undefined, { dryRun: true });
           assert.deepEqual(changesIn(compiled.messages), [[{ type: 'system_change', defineTools: [tool('h')] }]], `in ${name}'s view`);
@@ -317,15 +323,16 @@ describe('toolDeclarations in the framework', () => {
     };
     async function forked(framework: AgentFramework, parentConfig: Record<string, unknown>, spec: Omit<AgentSpec, 'name'> | undefined, name: string) {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
       const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: 'You are alpha.', ...parentConfig } as never, spec);
       for (const m of messages) {
-        if (isSystemChangeMessage(m)) child.getContextManager().addMessage(m.participant, m.content, systemChangeMetadata(name) as never);
-        else child.getContextManager().addMessage(m.participant, m.content);
+        if (isSystemChangeMessage(m)) store(framework, child, m.participant, m.content, systemChangeMetadata(name) as never);
+        else store(framework, child, m.participant, m.content);
       }
+      adopt(framework, child);
       return { alpha, child };
     }
 
@@ -344,12 +351,13 @@ describe('toolDeclarations in the framework', () => {
     it("takes its parent's change off a host's shared child's branch once the child moves to a head of its own", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
         const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are the child.' } as never, spec);
         assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
+        adopt(framework, child);
         const request = await child.buildActivationRequest([tool('c')]);
         assert.deepEqual(request.tools, [tool('c')], 'its own head');
         assert.deepEqual(changesIn(request.messages), [], "and none of its parent's declarations");
@@ -371,12 +379,13 @@ describe('toolDeclarations in the framework', () => {
       for (const [parentTools, childTools] of [[[tool('a'), tool('b')], [tool('a')]], [[tool('a')], [tool('a'), tool('b')]]] as const) {
         await withFramework([resident('alpha')], async (framework) => {
           const alpha = framework.getAgent('alpha')!;
-          say(alpha, 'user', 'hello');
+          say(framework, alpha, 'user', 'hello');
           await alpha.buildActivationRequest([...childTools]);
           await alpha.buildActivationRequest([...parentTools]);
           assert.equal(storedChanges(alpha, 'alpha'), 1, "the premise: the parent's change is stored");
           const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
           const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are alpha.' } as never, spec);
+          adopt(framework, child);
           const request = await child.buildActivationRequest([...childTools]);
           assert.deepEqual(readTools(request), childTools.map((t) => t.name).sort(), `with ${parentTools.length} tools on its parent's branch, the model reads the child's own`);
         });
@@ -386,13 +395,14 @@ describe('toolDeclarations in the framework', () => {
     it("shows none of its parent's change rows in a dry move of a host's shared child to a head of its own", async () => {
       await withFramework([{ ...resident('alpha'), selfParticipants: ['alpha-old'] }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
-        alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('o')] }] as never, systemChangeMetadata('alpha-old') as never);
+        store(framework, alpha, 'system', [{ type: 'system_change', defineTools: [tool('o')] }] as never, systemChangeMetadata('alpha-old') as never);
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
         const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are the child.' } as never, spec);
         assert.equal(storedChanges(child, 'alpha') + storedChanges(child, 'alpha-old'), 2, "the premise: the child's branch holds both of its parent's rows");
+        adopt(framework, child);
         const request = await child.buildActivationRequest([tool('c')], undefined, undefined, undefined, { dryRun: true });
         assert.deepEqual(changesIn(request.messages), [], "none of its parent's rows, under either of its names");
         assert.equal(storedChanges(child, 'alpha') + storedChanges(child, 'alpha-old'), 2, 'and a dry run stores nothing');
@@ -402,7 +412,7 @@ describe('toolDeclarations in the framework', () => {
     it("sends its parent's added block once to a host's shared child at a checkpoint (atSequence) with its parent's prompt, tools and block", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         const block = { namespace: 'module', position: 'system' as const, content: [{ type: 'text' as const, text: 'ALPHA ADDED BLOCK' }] };
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a')], [block]);
@@ -412,6 +422,7 @@ describe('toolDeclarations in the framework', () => {
         const { name: _name, ...spec } = taskForkSpec('checkpoint-child', { parent: 'alpha', inherit: { mode: 'shared', atSequence } });
         const { agent: child } = await framework.createEphemeralAgent({ ...resident('checkpoint-child'), systemPrompt: 'You are alpha.' } as never, spec);
         assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
+        adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a')], [block]);
         assert.equal(JSON.stringify({ system: request.system, messages: request.messages }).split('ALPHA ADDED BLOCK').length - 1, 1, 'the block goes out once');
         assert.equal(storedChanges(child, 'alpha'), 0, "its adoption took its parent's change off its branch");
@@ -423,11 +434,12 @@ describe('toolDeclarations in the framework', () => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
         const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(request.tools, [tool('a')], "the parent's recorded head");
         assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], "and the parent's change, once");
@@ -440,12 +452,13 @@ describe('toolDeclarations in the framework', () => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
         const { agent: child } = await framework.createEphemeralAgent({ ...resident('copy-child'), systemPrompt: 'You are alpha.' } as never, inheriting('copy-child', 'alpha'));
-        for (const m of messages) child.getContextManager().addMessage(m.participant, m.content);
+        for (const m of messages) store(framework, child, m.participant, m.content);
+        adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], "the copied change, once");
         assert.deepEqual(traces.filter((t) => (t as { agentName?: string }).agentName === 'copy-child' && t.type === 'head:declared'), [], 'nothing declared again');
@@ -475,13 +488,14 @@ describe('toolDeclarations in the framework', () => {
     it("gives a child nothing from a parent on its head, so it starts as an unseeded child does", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('old')], system: ['You are alpha.'] });
         const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, inheriting('seeded', 'alpha'))).agent;
         const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
-        for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        for (const child of [seeded, unseeded]) store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        for (const child of [seeded, unseeded]) adopt(framework, child);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
         assert.deepEqual([a.tools, a.messages], [b.tools, b.messages]);
       });
@@ -500,13 +514,14 @@ describe('toolDeclarations in the framework', () => {
     it("reads the parent's head as creation begins, so a head the parent moves while the child's context opens costs the child one declaration, never a change carried twice", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, inheriting('child', 'alpha'));
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
         const { agent: child } = await pending;
-        child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(request.tools, [tool('a')], "the parent's head as creation began");
         assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'and the difference declared once');
@@ -516,12 +531,13 @@ describe('toolDeclarations in the framework', () => {
     it("gives a child nothing from an inherit at a checkpoint of the caller's (atSequence), whose head isn't recorded, so it starts as an unseeded child does", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const spec = { ...inheriting('seeded', 'alpha'), inherit: { from: 'alpha', mode: 'copy' as const, atSequence: 1 } };
         const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, spec)).agent;
         const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
-        for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        for (const child of [seeded, unseeded]) store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        for (const child of [seeded, unseeded]) adopt(framework, child);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
         assert.deepEqual([a.tools, a.messages], [b.tools, b.messages]);
       });
@@ -531,7 +547,8 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, inheriting('seeded', 'nobody'))).agent;
         const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
-        for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        for (const child of [seeded, unseeded]) store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        for (const child of [seeded, unseeded]) adopt(framework, child);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
         assert.deepEqual([a.tools, a.messages], [b.tools, b.messages]);
       });
@@ -540,11 +557,12 @@ describe('toolDeclarations in the framework', () => {
     it("declares a shared child's change though the call its parent made it from is still open on the parent's branch", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
-        alpha.getContextManager().addMessage('alpha', [{ type: 'tool_use', id: 'spawn', name: 'a', input: {} } as ContentBlock]);
+        store(framework, alpha, 'alpha', [{ type: 'tool_use', id: 'spawn', name: 'a', input: {} } as ContentBlock]);
         const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha' });
-        say(child, 'user', 'Do the task.');
+        say(framework, child, 'user', 'Do the task.');
+        adopt(framework, child);
         await child.buildActivationRequest([tool('a')]);
         await child.buildActivationRequest([tool('a'), tool('b')]);
         assert.equal(storedChanges(child, 'alpha-child'), 1, "its parent's open call isn't one the child waits on");
@@ -555,7 +573,7 @@ describe('toolDeclarations in the framework', () => {
       it(`a shared child that removes its own change rows ${how} takes its parent's from its own branch, and leaves its parent's context as it was`, async () => {
         await withFramework([resident('alpha')], async (framework) => {
           const alpha = framework.getAgent('alpha')!;
-          say(alpha, 'user', 'hello');
+          say(framework, alpha, 'user', 'hello');
           await alpha.buildActivationRequest([tool('a')]);
           await alpha.buildActivationRequest([tool('a'), tool('b')]);
           const dry = (agent: Agent) => agent.getContextManager().compile(undefined, undefined, { dryRun: true }).then((c) => c.messages);
@@ -564,6 +582,7 @@ describe('toolDeclarations in the framework', () => {
           assert.equal(storedChanges(alpha, 'alpha'), 1, "the premise: the parent's change is stored");
           const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', config });
           assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
+          adopt(framework, child);
           await child.buildActivationRequest([tool('a'), tool('b')]);
           assert.deepEqual(changesIn(await dry(child)), [], "the premise: the child's context holds no change row now, its parent's own taken as its own");
           assert.deepEqual([storedChanges(child, 'alpha'), storedChanges(child, 'alpha-child')], [0, 0], "taken out of the child's branch, not only out of its compile");
@@ -579,10 +598,11 @@ describe('toolDeclarations in the framework', () => {
           const traces: TraceEvent[] = [];
           framework.onTrace((event) => { traces.push(event); });
           const alpha = framework.getAgent('alpha')!;
-          say(alpha, 'user', 'hello');
+          say(framework, alpha, 'user', 'hello');
           await alpha.buildActivationRequest([tool('a')]);
           await alpha.buildActivationRequest([tool('a'), tool('b')]);
           const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', mode });
+          adopt(framework, child);
           const request = await child.buildActivationRequest([tool('a'), tool('b')]);
           assert.deepEqual(request.tools, [tool('a')], "the parent's recorded head");
           assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], "and the parent's change, once");
@@ -595,10 +615,11 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')], system('v1'));
         await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
         const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', mode: 'copy' });
+        adopt(framework, child);
         assert.deepEqual(changesIn((await child.buildActivationRequest([tool('a'), tool('b')], system('v1'))).messages),
           [[{ type: 'system_change', defineTools: [tool('b')] }]], "the premise: the parent's change, copied");
         const moved = await child.buildActivationRequest([tool('a'), tool('b')], system('v2'));
@@ -611,11 +632,11 @@ describe('toolDeclarations in the framework', () => {
   it("reports after host /undo the last conversational message the agent sees, not a change after it", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'one');
+      say(framework, alpha, 'user', 'one');
       await alpha.buildActivationRequest([tool('a')]);
-      say(alpha, 'alpha', 'two');
-      say(alpha, 'user', 'three');
-      say(alpha, 'alpha', 'four');
+      say(framework, alpha, 'alpha', 'two');
+      say(framework, alpha, 'user', 'three');
+      say(framework, alpha, 'alpha', 'four');
       const host = framework as unknown as { handleHostCommand(server: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string; lastVisible?: { participant?: string; preview?: string } | null }> };
       const result = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 1 });
       assert.equal(result.ok, true, result.error);
@@ -627,14 +648,14 @@ describe('toolDeclarations in the framework', () => {
   it("starts a fork from its template's head and changes, and declares only the fork's own difference", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent> };
       const fork = await internals.createConversationAgent('alpha-fork', 'chanA');
       const rows = fork.getContextManager().getAllMessages().filter(isChange);
       assert.equal(rows.length, 1, "the template's change, copied");
-      assert.deepEqual(rows[0]!.metadata, { system: true, kind: 'system-change', agent: 'alpha-fork' }, 'as the fork\'s own');
+      assert.deepEqual(rows[0]!.metadata, { system: true, kind: 'system-change', agent: 'alpha-fork', audience: ['alpha-fork'], ownRowOf: 'alpha-fork' }, 'as the fork\'s own');
       const request = await fork.buildActivationRequest([tool('a'), tool('b'), tool('c')]);
       assert.deepEqual(request.tools, [tool('a')], "the template's head");
       assert.deepEqual(changesIn(request.messages), [
@@ -653,7 +674,7 @@ describe('toolDeclarations in the framework', () => {
   it("reads the template's head as a fork's creation begins, so a head the template moves meanwhile costs the fork one declaration, never a change carried twice", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent>; headDeclarations: { write(name: string, head: unknown): void } };
       const pending = internals.createConversationAgent('alpha-fork', 'chanA');
@@ -669,10 +690,10 @@ describe('toolDeclarations in the framework', () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
       const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')], system('v1'));
       const hostChange = [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[];
-      alpha.getContextManager().addMessage('system', hostChange);
+      store(framework, alpha, 'system', hostChange);
       await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
       const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent> };
       const fork = await internals.createConversationAgent('alpha-fork', 'chanA');
@@ -686,7 +707,7 @@ describe('toolDeclarations in the framework', () => {
   it("hides the residents' changes from the subconscious, which reads their slot", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const subconscious = framework.getAgent('Subconscious')!;
@@ -699,14 +720,14 @@ describe('toolDeclarations in the framework', () => {
   it('leaves a change row out of the poisoned-history shed, which takes turns', async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
-      say(alpha, 'alpha', 'a reply');
-      say(alpha, 'user', 'go on');
+      say(framework, alpha, 'alpha', 'a reply');
+      say(framework, alpha, 'user', 'go on');
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const internals = framework as unknown as { shedNewestTurn(agent: Agent): unknown };
       internals.shedNewestTurn(alpha);
-      const left = alpha.getContextManager().getAllMessages().map((m) => (isChange(m) ? 'change' : (m.content[0] as { text: string }).text));
+      const left = alpha.getContextManager().getPresentedMessages().map((m) => (isChange(m) ? 'change' : (m.content[0] as { text: string }).text));
       assert.ok(left.includes('change'), `the change stayed: ${JSON.stringify(left)}`);
       assert.ok(!left.includes('go on'), 'the newest turn went');
     });
@@ -715,13 +736,13 @@ describe('toolDeclarations in the framework', () => {
   it('passes over a change row a host stored without metadata in the poisoned-history shed, as it does a stamped one', async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
-      say(alpha, 'alpha', 'a reply');
-      say(alpha, 'user', 'go on');
-      alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('x')] } as ContentBlock]);
+      say(framework, alpha, 'user', 'hello');
+      say(framework, alpha, 'alpha', 'a reply');
+      say(framework, alpha, 'user', 'go on');
+      store(framework, alpha, 'system', [{ type: 'system_change', defineTools: [tool('x')] } as ContentBlock]);
       const internals = framework as unknown as { shedNewestTurn(agent: Agent): unknown };
       internals.shedNewestTurn(alpha);
-      const left = alpha.getContextManager().getAllMessages().map((m) => (isChange(m) ? 'change' : (m.content[0] as { text: string }).text));
+      const left = alpha.getContextManager().getPresentedMessages().map((m) => (isChange(m) ? 'change' : (m.content[0] as { text: string }).text));
       assert.deepEqual(left, ['hello', 'a reply', 'change'], 'the newest turn went, and the change stayed');
     });
   });
@@ -731,7 +752,7 @@ describe('toolDeclarations in the framework', () => {
       const alpha = framework.getAgent('alpha')!;
       const beta = framework.getAgent('beta')!;
       const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
-      say(alpha, 'user', 'hello, both');
+      say(framework, alpha, 'user', 'hello, both');
       await alpha.buildActivationRequest([tool('a')]);
       await beta.buildActivationRequest([tool('x')], system('v1'));
       await beta.buildActivationRequest([tool('x'), tool('y')], system('v1'));
@@ -747,10 +768,10 @@ describe('toolDeclarations in the framework', () => {
   it("ends a resident's request kept to its head on its own turn and `[Continue]`, though a host's change row follows the turn", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
-      say(alpha, 'alpha', 'my reply');
-      alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] } as unknown as ContentBlock]);
+      say(framework, alpha, 'alpha', 'my reply');
+      store(framework, alpha, 'system', [{ type: 'system_change', defineTools: [tool('h')] } as unknown as ContentBlock]);
       alpha.keepToHeadUntilBuiltAgain();
       const request = await alpha.buildActivationRequest([tool('a')]);
       assert.deepEqual(request.messages.slice(-2).map((m) => (m.content[0] as { text?: string }).text), ['my reply', '[Continue]']);
@@ -762,12 +783,12 @@ describe('toolDeclarations in the framework', () => {
       const alpha = framework.getAgent('alpha')!;
       const beta = framework.getAgent('beta')!;
       const cm = alpha.getContextManager();
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await beta.buildActivationRequest([tool('x')]);
-      cm.addMessage('alpha', [{ type: 'tool_use', id: 'call-1', name: 'a', input: {} } as ContentBlock]);
+      store(framework, alpha, 'alpha', [{ type: 'tool_use', id: 'call-1', name: 'a', input: {} } as ContentBlock]);
       await beta.buildActivationRequest([tool('x'), tool('y')]);
       assert.equal(cm.getAllMessages().filter(isSystemChangeMessage).length, 0, 'nothing declared while the call waits');
-      cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock]);
+      store(framework, alpha, 'user', [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock]);
       await beta.buildActivationRequest([tool('x'), tool('y')]);
       const all = cm.getAllMessages();
       assert.equal(all.filter(isSystemChangeMessage).length, 1, 'declared once the result is in');
@@ -792,7 +813,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha'), resident('beta')], async (framework) => {
         const internals = framework as unknown as Internals;
         const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')], system('v1'));
         await beta.buildActivationRequest([tool('b')]);
         const betaHead = internals.store.getStateJson('framework/head-declarations/beta');
@@ -807,7 +828,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const internals = framework as unknown as Internals;
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')], system('v1'));
         await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
         const set = internals.store.setStateJson.bind(internals.store);
@@ -837,7 +858,7 @@ describe('toolDeclarations in the framework', () => {
         const register = internals.store.registerState.bind(internals.store);
         internals.store.registerState = (r) => { registered.push(r.id); return register(r); };
         const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await beta.buildActivationRequest([tool('b')]);
         await beta.buildActivationRequest([tool('b'), tool('c')]);
         assert.deepEqual(registered.filter((id) => id.startsWith('framework/head-declarations')), [], 'beta, on its head, registers nothing');
@@ -851,7 +872,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const internals = framework as unknown as Internals;
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const recorded = JSON.parse(JSON.stringify(internals.headDeclarations.read('alpha')));
         assert.deepEqual(await statesWritten(internals.store, async () => internals.headDeclarations.write('alpha', recorded)), []);
@@ -863,7 +884,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const internals = framework as unknown as Internals & { store: { createBranch(n: string, from?: string): unknown; switchBranch(n: string): unknown; currentBranch(): { name: string } } };
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         let reads = 0;
         const get = internals.store.getStateJson.bind(internals.store);
@@ -888,7 +909,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const internals = framework as unknown as Internals & { store: { createBranch(n: string, from?: string): unknown; switchBranch(n: string): unknown; deleteBranch(n: string): void; currentBranch(): { name: string } } };
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const main = internals.store.currentBranch().name;
         internals.store.createBranch('trial', main);
@@ -907,7 +928,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha'), resident('beta')], async (framework) => {
         const internals = framework as unknown as Internals;
         const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await beta.buildActivationRequest([tool('b')]);
         internals.store.setStateJson('framework/head-declarations/alpha', { tools: 'not a list', system: [] });
@@ -931,7 +952,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha'), resident('beta')], async (framework) => {
         const internals = framework as unknown as Internals;
         const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await beta.buildActivationRequest([tool('b')]);
         const get = internals.store.getStateJson.bind(internals.store);
@@ -964,11 +985,11 @@ describe('toolDeclarations in the framework', () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
       const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
-      say(alpha, 'user', 'zero');
+      say(framework, alpha, 'user', 'zero');
       await alpha.buildActivationRequest([tool('a')], system('v1'));
-      say(alpha, 'user', 'one');
-      say(alpha, 'alpha', 'two');
-      say(alpha, 'user', 'three');
+      say(framework, alpha, 'user', 'one');
+      say(framework, alpha, 'alpha', 'two');
+      say(framework, alpha, 'user', 'three');
       await alpha.buildActivationRequest([tool('a')], system('v2'));
       const internals = framework as unknown as { headDeclarations: { read(name: string): { system: string[] } | null } };
       assert.deepEqual(internals.headDeclarations.read('alpha')!.system, ['You are alpha.', 'v2']);
@@ -985,7 +1006,7 @@ describe('toolDeclarations in the framework', () => {
     try {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
       }, storePath);
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
@@ -1028,8 +1049,8 @@ describe('toolDeclarations in the framework', () => {
       assert.ok(derived, 'the invocation derives a fork');
       return derived;
     };
-    const declared = async (alpha: Agent) => {
-      say(alpha, 'user', 'hello');
+    const declared = async (framework: AgentFramework, alpha: Agent) => {
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
     };
@@ -1038,7 +1059,7 @@ describe('toolDeclarations in the framework', () => {
     it("on another model than its principal sends no change row, and the principal's change stays where it was", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        await declared(alpha);
+        await declared(framework, alpha);
         const request = await (await forkOf(framework)).buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(changesIn(request.messages), [], "no change row goes to the other model");
         assert.deepEqual(request.tools, [tool('a'), tool('b')], 'its head carries the tools as they are');
@@ -1048,7 +1069,7 @@ describe('toolDeclarations in the framework', () => {
 
     it("on its principal's own model sends the principal's change as stored", async () => {
       await withFramework([resident('alpha')], async (framework) => {
-        await declared(framework.getAgent('alpha')!);
+        await declared(framework, framework.getAgent('alpha')!);
         const request = await (await forkOf(framework)).buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(changesIn(request.messages), changeB);
         assert.deepEqual(request.tools, [tool('a')], "the principal's recorded head");
@@ -1057,7 +1078,7 @@ describe('toolDeclarations in the framework', () => {
 
     it('of a principal on its head, on its own model, declares on its head too', async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
-        say(framework.getAgent('alpha')!, 'user', 'hello');
+        say(framework, framework.getAgent('alpha')!, 'user', 'hello');
         const fork = await forkOf(framework);
         await fork.buildActivationRequest([tool('a')]);
         const request = await fork.buildActivationRequest([tool('a'), tool('b')]);
@@ -1100,11 +1121,11 @@ describe('toolDeclarations in the framework', () => {
       const alpha = framework.getAgent('alpha')!;
       const beta = framework.getAgent('beta')!;
       const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
-      say(alpha, 'user', 'hello, both');
+      say(framework, alpha, 'user', 'hello, both');
       await alpha.buildActivationRequest([tool('a')], system('v1'));
       await beta.buildActivationRequest([tool('x')]);
       const hostChange = [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[];
-      alpha.getContextManager().addMessage('system', hostChange);
+      store(framework, alpha, 'system', hostChange);
       assert.deepEqual(changesIn((await alpha.buildActivationRequest([tool('a')], system('v1'))).messages), [hostChange], "alpha's request carries the host's row");
       assert.deepEqual(changesIn((await beta.buildActivationRequest([tool('x')])).messages), [hostChange], "and so does beta's");
       const subconscious = await framework.getAgent('Subconscious')!.buildActivationRequest([tool('think')]);
@@ -1124,10 +1145,10 @@ describe('toolDeclarations in the framework', () => {
       const traces: TraceEvent[] = [];
       framework.onTrace((event) => { traces.push(event); });
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       const hostChange = [{ type: 'system_change', addSystem: ['HOST TEXT'] }] as unknown as ContentBlock[];
-      alpha.getContextManager().addMessage('system', hostChange);
+      store(framework, alpha, 'system', hostChange);
       const before = traces.length;
       for (const n of [1, 2]) {
         const request = await alpha.buildActivationRequest([tool('a')]);
@@ -1143,9 +1164,9 @@ describe('toolDeclarations in the framework', () => {
         const alpha = framework.getAgent('alpha')!;
         const store = (framework as unknown as { storeInjections(agent: Agent, injections: unknown[]): unknown });
         const lesson = { namespace: 'lessons', position: 'afterUser', content: [{ type: 'text', text: 'LESSON' }] };
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
-        say(alpha, 'alpha', 'my reply');
+        say(framework, alpha, 'alpha', 'my reply');
         if (order === 'a change, then a stored injection') {
           await alpha.buildActivationRequest([tool('a'), tool('b')]);
           store.storeInjections(alpha, [lesson]);
@@ -1166,10 +1187,10 @@ describe('toolDeclarations in the framework', () => {
   it("ends a resident's request on its own turn on the head, where a host's change row after it is left out, with its [Continue] last", async () => {
     await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
-      say(alpha, 'alpha', 'my reply');
-      alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[]);
+      say(framework, alpha, 'alpha', 'my reply');
+      store(framework, alpha, 'system', [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[]);
       const request = await alpha.buildActivationRequest([tool('a')]);
       const shown = request.messages.map((m) => (isChange(m) ? 'change' : m.content.map((b) => (b as { text?: string }).text ?? '').join('')));
       assert.deepEqual(shown.slice(shown.indexOf('my reply')), ['my reply', '[Continue]']);
@@ -1185,9 +1206,9 @@ describe('toolDeclarations in the framework', () => {
     it("sends a resident's request beside a host's change rows that alone exceed its budget", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', ...tight }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        alpha.getContextManager().addMessage('system', bulky('h1'));
-        alpha.getContextManager().addMessage('system', bulky('h2'));
-        say(alpha, 'user', 'hello');
+        store(framework, alpha, 'system', bulky('h1'));
+        store(framework, alpha, 'system', bulky('h2'));
+        say(framework, alpha, 'user', 'hello');
         const request = await alpha.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'hello');
@@ -1197,9 +1218,10 @@ describe('toolDeclarations in the framework', () => {
     it("sends an isolated ephemeral agent's request beside a host's change rows that alone exceed its budget", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const { agent } = await framework.createEphemeralAgent({ name: 'solo', model: 'test-model', systemPrompt: 'You work alone.', ...tight } as never);
-        agent.getContextManager().addMessage('system', bulky('h1'));
-        agent.getContextManager().addMessage('system', bulky('h2'));
-        say(agent, 'user', 'hello');
+        store(framework, agent, 'system', bulky('h1'));
+        store(framework, agent, 'system', bulky('h2'));
+        say(framework, agent, 'user', 'hello');
+        adopt(framework, agent);
         const request = await agent.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'hello');
@@ -1209,11 +1231,12 @@ describe('toolDeclarations in the framework', () => {
     it("sends a host's shared child's request beside a host's change rows in its parent's context that alone exceed its budget", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        alpha.getContextManager().addMessage('system', bulky('h1'));
-        alpha.getContextManager().addMessage('system', bulky('h2'));
-        say(alpha, 'user', 'hello');
+        store(framework, alpha, 'system', bulky('h1'));
+        store(framework, alpha, 'system', bulky('h2'));
+        say(framework, alpha, 'user', 'hello');
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
         const { agent: child } = await framework.createEphemeralAgent({ name: 'host-child', model: 'test-model', systemPrompt: 'You are alpha.', ...tight } as never, spec);
+        adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'hello');
@@ -1222,11 +1245,11 @@ describe('toolDeclarations in the framework', () => {
 
     it("sends a conversation fork's request beside a host's change rows that alone exceed its budget", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', ...tight }], async (framework) => {
-        say(framework.getAgent('alpha')!, 'user', 'hello');
+        say(framework, framework.getAgent('alpha')!, 'user', 'hello');
         const fork = await internals(framework).createConversationAgent('alpha-fork', 'chanA');
-        fork.getContextManager().addMessage('system', bulky('h1'));
-        fork.getContextManager().addMessage('system', bulky('h2'));
-        say(fork, 'user', 'and you');
+        store(framework, fork, 'system', bulky('h1'));
+        store(framework, fork, 'system', bulky('h2'));
+        say(framework, fork, 'user', 'and you');
         const request = await fork.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'and you');
@@ -1235,10 +1258,11 @@ describe('toolDeclarations in the framework', () => {
 
     it("leaves an 'entries' child of a 'head' conversation fork, which has no view, its own change, declared once", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
-        say(framework.getAgent('alpha')!, 'user', 'hello');
+        say(framework, framework.getAgent('alpha')!, 'user', 'hello');
         await internals(framework).createConversationAgent('alpha-fork', 'chanA');
         const { name: _name, ...spec } = taskForkSpec('fork-child', { parent: 'alpha-fork', inherit: { mode: 'shared' } });
         const { agent: child } = await framework.createEphemeralAgent({ ...resident('fork-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        adopt(framework, child);
         await child.buildActivationRequest([tool('a')]);
         await child.buildActivationRequest([tool('a'), tool('b')]);
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
@@ -1252,7 +1276,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const internals = framework as unknown as { store: { setStateJson(id: string, value: unknown): unknown }; headDeclarations: { read(name: string): unknown } };
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         alpha.keepToHeadUntilBuiltAgain();
@@ -1278,9 +1302,9 @@ describe('toolDeclarations in the framework', () => {
     it("shows a host's change row in an inspection of a live 'head' resident, whose compile leaves it out", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        say(alpha, 'user', 'hello');
+        say(framework, alpha, 'user', 'hello');
         const hostChange = [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[];
-        alpha.getContextManager().addMessage('system', hostChange);
+        store(framework, alpha, 'system', hostChange);
         const compiledChanges = async (cm: ContextManager) => changesIn((await cm.compile(undefined, undefined, { dryRun: true })).messages);
         assert.deepEqual(await compiledChanges(alpha.getContextManager()), [], "the premise: alpha's compile leaves it out");
         assert.deepEqual(await compiledChanges(await framework.inspectAgentContext('alpha')), [hostChange], 'inspected, it shows as stored');
@@ -1291,7 +1315,7 @@ describe('toolDeclarations in the framework', () => {
   it("keeps the subconscious's own declared change in its view, so it declares it once", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
-      say(alpha, 'user', 'hello');
+      say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       const subconscious = framework.getAgent('Subconscious')!;
       await subconscious.buildActivationRequest([tool('think')]);
