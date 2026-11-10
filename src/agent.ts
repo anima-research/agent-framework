@@ -12,7 +12,7 @@ import { carriedBlock, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
-import { EFFORT_ROW_KEY, EFFORT_ROW_PARTICIPANT, effortChange, effortMarksOf, effortOf, effortRowOf, keepsEffortRow, withTopLevelEffort, type EffortPlan, type EffortPlanner } from './effort.js';
+import { EFFORT_ROW_PARTICIPANT, effortChange, effortMarksOf, effortOf, effortRowMetadata, effortRowOf, keepsEffortRow, withTopLevelEffort, type EffortPlan, type EffortPlanner } from './effort.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
@@ -1830,13 +1830,13 @@ export class Agent {
       console.error(`[effort] ${this.name}: could not read stored row ${id}, so it counts as no effort row of the framework's:`, err);
     });
     return result.messages.map((message, i) =>
-      effortOf(message.content) === undefined || keepsEffortRow(plan, marks(i), (participant) => this.isOwnParticipant(participant)));
+      effortOf(message.content) === undefined || keepsEffortRow(plan, marks(i)));
   }
 
   /** @internal For the framework's tool boundaries; not a host API. */
   sendsAtBoundary(row: { content: ContentBlock[]; metadata?: MessageMetadata }): boolean {
     if (effortOf(row.content) === undefined) return true;
-    return keepsEffortRow(this.effortPlanner?.('preview'), [effortRowOf(row.metadata)], (participant) => this.isOwnParticipant(participant));
+    return keepsEffortRow(this.effortPlanner?.('preview'), [effortRowOf(row.metadata)]);
   }
 
   /** A stored row's injection mark, or undefined for any other row, and for
@@ -2442,7 +2442,7 @@ export class Agent {
   ): Promise<NormalizedRequest> {
     const effort = this.effortPlanner?.('preview');
     const given = options.appendedMessages?.filter((m) =>
-      effortOf(m.content) === undefined || keepsEffortRow(effort, [undefined], (participant) => this.isOwnParticipant(participant)));
+      effortOf(m.content) === undefined || keepsEffortRow(effort, [undefined]));
     const appendedMessages = effort?.change
       ? [...(given ?? []), { participant: EFFORT_ROW_PARTICIPANT, content: [effortChange(effort.change)] }]
       : given;
@@ -2513,7 +2513,7 @@ export class Agent {
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
     const effort = this.effortPlanner?.('turn');
-    if (effort?.change) storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)], { [EFFORT_ROW_KEY]: this.name } as MessageMetadata);
+    if (effort?.change) storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)], effortRowMetadata(this.name));
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,

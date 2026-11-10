@@ -1,6 +1,6 @@
 import * as membrane from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
-import type { CompileResult, ContextManager, MessageId } from '@animalabs/context-manager';
+import type { CompileResult, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { EffortLevel } from './types/framework.js';
 
 // Membrane sends an effort-only `system_change` from the release that exports `SYSTEM_CHANGE_EFFORT` (0.10.0); an
@@ -26,24 +26,31 @@ export const EFFORT_ROW_PARTICIPANT = 'system';
 
 export const EFFORT_ROW_KEY = 'effortRowOf';
 
+export const EFFORT_ROW_KIND = 'effort-change';
+
+export function effortRowMetadata(agentName: string): MessageMetadata {
+  return { [EFFORT_ROW_KEY]: agentName, system: true, kind: EFFORT_ROW_KIND } as MessageMetadata;
+}
+
 export function effortRowOf(metadata: unknown): string | undefined {
   if (!metadata || typeof metadata !== 'object') return undefined;
   const of = (metadata as Record<string, unknown>)[EFFORT_ROW_KEY];
   return typeof of === 'string' ? of : undefined;
 }
 
+export function isAnotherAgentsEffortRow(metadata: unknown, agentName: string): boolean {
+  const of = effortRowOf(metadata);
+  return of !== undefined && of !== agentName;
+}
+
 export function effortMarksOf(
-  cm: Pick<ContextManager, 'getMessage'> & Partial<Pick<ContextManager, 'getPresentedMessages'>>,
+  cm: Pick<ContextManager, 'getMessage'>,
   result: Pick<CompileResult, 'provenance'>,
   unread: (id: MessageId, error: unknown) => void,
 ): (i: number) => Array<string | undefined> {
-  let window: Map<MessageId, { metadata?: unknown }> | undefined;
   const markOf = (id: MessageId): string | undefined => {
     try {
-      // context-manager's getMessage reads only the agent's own slot; a row of a slot merged into its view is in
-      // the window alone.
-      const row = cm.getMessage(id) ?? (window ??= new Map((cm.getPresentedMessages?.() ?? []).map((m) => [m.id, m]))).get(id);
-      return effortRowOf(row?.metadata);
+      return effortRowOf(cm.getMessage(id)?.metadata);
     } catch (error) {
       unread(id, error);
       return undefined;
@@ -55,13 +62,9 @@ export function effortMarksOf(
   };
 }
 
-export function keepsEffortRow(
-  plan: EffortPlan | undefined,
-  marks: ReadonlyArray<string | undefined>,
-  isOwn: (participant: string) => boolean,
-): boolean {
+export function keepsEffortRow(plan: EffortPlan | undefined, marks: ReadonlyArray<string | undefined>): boolean {
   if (plan === undefined) return marks.every((of) => of === undefined);
-  return plan.rows && marks.length > 0 && marks.every((of) => of !== undefined && isOwn(of));
+  return plan.rows && marks.length > 0 && marks.every((of) => of !== undefined);
 }
 
 export function effortChange(level: EffortLevel): ContentBlock {

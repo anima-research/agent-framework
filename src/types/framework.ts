@@ -348,7 +348,12 @@ export interface FrameworkConfig {
    * is live: an agent's end drops it. So an agent resumed after its end, or a
    * new one under its name, starts a new base at the live level, and its first
    * request writes the prompt cache again. A derived agent on its parent's
-   * model starts from the parent's base.
+   * model starts from the parent's base. What of `framework/state`'s
+   * `effortBases` this release can't read is never stored over, nor dropped
+   * at an end's or a boot's sweep: it's said once, and reads as no base. So
+   * an ended agent's record of another shape outlives it, and a later agent
+   * under that name reads no base and gets none stored until the record is
+   * repaired. Each such agent's top-level effort is its live level meanwhile.
    *
    * A different level travels as one effort-only `system_change` row, stored
    * under the participant `'system'` at the start of the turn that answers new
@@ -360,16 +365,21 @@ export interface FrameworkConfig {
    * follows a row, the next start writes another after it, and the newest
    * governs.
    *
-   * An agent's requests carry only the effort rows the framework wrote for it,
-   * or for a voice it inherits, such as a shared derivation's parent. Another
-   * agent's rows, an observed resident's among them, and a host's own effort
-   * rows are left out, at a tool boundary too. They never count as in force. A
-   * copy derivation takes the parent's own rows as its own, beside the parent's
-   * base. A conversation fork's seed, which takes no base, leaves the
+   * Each row is stored as the framework's own, with `system: true` and
+   * `kind: 'effort-change'`. An agent's requests carry the effort rows the
+   * framework wrote for it, or for a voice it inherits, such as a shared
+   * derivation's parent. Another agent's effort rows, an observed resident's
+   * among them, are out of the agent's view: they're never presented to it,
+   * heard at a tool boundary or copied into a derivation of it. A host's own
+   * effort rows are left out of the agent's requests. Neither counts as in
+   * force. A copy derivation takes the parent's rows as its own, beside the
+   * parent's base. A conversation fork's seed, which takes no base, leaves the
    * template's effort rows out.
    *
    * `undefined` sends no top-level effort and leaves effort rows out of the
-   * request. It starts a base of none, and a level after it travels as a row.
+   * request. Where the base was a level, that takes it off the top, which
+   * changes the whole prompt, once. It starts a base of none, and a level
+   * after it travels as a row.
    * When a level comes back, the agent's last row counts again from where it
    * sits, before the requests that went without effort. The requests from then
    * on carry it there, which changes the prompt from that row on, once.
@@ -378,11 +388,15 @@ export interface FrameworkConfig {
    * `systemChangeRefused`, before the stream's first tool round, the request
    * is sent again at once. The retry carries no effort rows, and the live
    * level as its top-level effort. Neither a provider hold nor a stated wait
-   * takes it first. The agent's effort rows that no stored reply of its own
-   * follows are taken back out of the store, since no answered request
-   * carried them. The agent's requests go without effort rows from then on,
-   * until the agent ends or the process does. A refusal after a tool round
-   * goes to the error policy, whose retry starts the turn's next stream.
+   * takes it first. The agent's effort rows that no stored row in its own
+   * voice follows are taken back out of the store. The agent's requests go
+   * without effort rows from then on, until the agent ends or the process
+   * does. A refusal after a tool round goes to the error policy instead.
+   * `DefaultErrorPolicy` doesn't retry it, so the turn ends there. A host
+   * policy that retries starts the turn's next stream. Either way, the
+   * agent's next first request is refused once, and goes again at once
+   * without rows. Such a refusal needs a request after a tool round that
+   * carries a row its stream's first request didn't.
    *
    * A preview shows the row a start would write, unstored. The direct API
    * (`Agent.runInference`) sends what a turn's request would carry and writes

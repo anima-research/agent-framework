@@ -229,7 +229,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { EFFORT_ROW_KEY, effortMarksOf, effortOf, effortRowOf, isEffortLevel, MEMBRANE_SENDS_EFFORT_ROWS, type EffortPlan } from './effort.js';
+import { EFFORT_ROW_KEY, effortMarksOf, effortOf, effortRowMetadata, effortRowOf, isAnotherAgentsEffortRow, isEffortLevel, MEMBRANE_SENDS_EFFORT_ROWS, type EffortPlan } from './effort.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, suppressedRow, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -427,7 +427,9 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
  * `primaryIfUnread` a module's write for an ephemeral run or a
  * conversation fork, which goes to the primary if its target never read it
  * (passesToPrimary), and `dendrite` the stamp of delivered agent mail, whose
- * `mailId` releases that held mail once the row lands (releaseLandedMail). A
+ * `mailId` releases that held mail once the row lands (releaseLandedMail),
+ * and `effortRowOf` a framework effort row's agent, whose rows a refusal
+ * takes back (FrameworkConfig.effort). A
  * server's metadata, a channel message's `metadata` or a
  * push event's `origin`, is stored without them, and the host writes its own
  * after it: MCPL SPEC §16.6 makes metadata the producer's untrusted claims,
@@ -439,6 +441,7 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
 const HOST_METADATA_KEYS = [
   'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'suppressed', 'coalescingSubject', 'firstView',
   'deferredWriteId', 'external', 'openaiResponsesItems', STORED_INJECTION_KEY, PRIMARY_IF_UNREAD_KEY, 'dendrite',
+  EFFORT_ROW_KEY,
 ] as const;
 
 /**
@@ -4309,6 +4312,15 @@ function isLegacyFamily(config: McplServerConfig): boolean {
   }
 }
 
+function effortBaseOf(bases: readonly unknown[], agentName: string): { model?: unknown; effort?: unknown } | undefined {
+  return bases.find((entry) => !!entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName) as
+    { model?: unknown; effort?: unknown } | undefined;
+}
+
+function soundEffortBase(record: { model?: unknown; effort?: unknown }): record is { model: string; effort: EffortLevel | 'none' } {
+  return typeof record.model === 'string' && (record.effort === 'none' || isEffortLevel(record.effort));
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -4936,6 +4948,7 @@ export class AgentFramework {
   private effortSetting: FrameworkConfig['effort'];
   private readonly effortAnswersLogged = new Set<string>();
   private readonly effortRowsRefused = new Set<string>();
+  private readonly effortBasesUnreadableSaid = new Set<string>();
   /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
   private derivationNoticeHook?: (record: AgentRecord, from: string, defaultText: string) => string | null;
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
@@ -9783,18 +9796,22 @@ export class AgentFramework {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const bases = data && typeof data === 'object' ? (data as Record<string, unknown>).effortBases : undefined;
     if (bases === undefined) return undefined;
-    const unsound = (what: string): undefined => {
-      if (report) {
-        console.error(`[effort] ${agentName}: ${FRAMEWORK_STATE_ID}'s effortBases ${what}, so it reads as no base. This turn stores the agent's base afresh.`);
+    const unreadable = (key: string, line: string): undefined => {
+      if (report && !this.effortBasesUnreadableSaid.has(key)) {
+        this.effortBasesUnreadableSaid.add(key);
+        console.error(line);
       }
       return undefined;
     };
-    if (!Array.isArray(bases)) return unsound('isn\'t a list of records');
-    const record = (bases as unknown[]).find((entry) => !!entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName) as
-      { model?: unknown; effort?: unknown } | undefined;
-    if (!record) return undefined;
-    if (typeof record.model !== 'string' || !(record.effort === 'none' || isEffortLevel(record.effort))) {
-      return unsound('holds a record for it that isn\'t a model and a level');
+    if (!Array.isArray(bases)) {
+      return unreadable('', `[effort] ${FRAMEWORK_STATE_ID}'s effortBases isn't a list of records, so it reads as no base for any agent, and ` +
+        'it\'s left as it is to be repaired. Until then, each request\'s top-level effort is its agent\'s live level.');
+    }
+    const record = effortBaseOf(bases, agentName);
+    if (record === undefined) return undefined;
+    if (!soundEffortBase(record)) {
+      return unreadable(agentName, `[effort] ${agentName}: ${FRAMEWORK_STATE_ID}'s effortBases holds a record for it that isn't a model and a ` +
+        'level, so it reads as no base, and it\'s left as it is to be repaired. Until then, its requests\' top-level effort is its live level.');
     }
     return { model: record.model, effort: record.effort };
   }
@@ -9802,10 +9819,11 @@ export class AgentFramework {
   private writeEffortBase(agentName: string, record: { model: string; effort: EffortLevel | 'none' }): void {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-    const others = Array.isArray(state.effortBases)
-      ? (state.effortBases as unknown[]).filter((entry) => !(entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName))
-      : [];
-    state.effortBases = [...others, { agent: agentName, ...record }];
+    if (state.effortBases !== undefined && !Array.isArray(state.effortBases)) return;
+    const others = Array.isArray(state.effortBases) ? state.effortBases as unknown[] : [];
+    const kept = effortBaseOf(others, agentName);
+    if (kept !== undefined && !soundEffortBase(kept)) return;
+    state.effortBases = [...others.filter((entry) => effortBaseOf([entry], agentName) === undefined), { agent: agentName, ...record }];
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
@@ -9816,7 +9834,7 @@ export class AgentFramework {
       if (!Array.isArray(bases)) return;
       const kept = (bases as unknown[]).filter((entry) => {
         const agent = entry && typeof entry === 'object' ? (entry as { agent?: unknown }).agent : undefined;
-        return typeof agent === 'string' && keep(agent);
+        return typeof agent !== 'string' || keep(agent) || !soundEffortBase(entry as { model?: unknown; effort?: unknown });
       });
       if (kept.length === bases.length) return;
       this.store.setStateJson(FRAMEWORK_STATE_ID, { ...(data as Record<string, unknown>), effortBases: kept });
@@ -12394,14 +12412,12 @@ export class AgentFramework {
         });
         for (const [i, message] of messages.entries()) {
           const of = marks(i);
-          const mark = of.length > 0 && of.every((agent) => agent !== undefined)
-            ? (of.every((agent) => parent.isOwnParticipant(agent!)) ? options.name : of[0]!)
-            : undefined;
+          const effortRow = effortOf(message.content) !== undefined && of.length > 0 && of.every((agent) => agent !== undefined);
           storeOwnRow(
             created.agent,
             parent.isOwnParticipant(message.participant) ? options.name : message.participant,
             message.content,
-            mark !== undefined ? { [EFFORT_ROW_KEY]: mark } : undefined,
+            effortRow ? effortRowMetadata(options.name) : undefined,
           );
         }
         created.agent.markContextConsumed();
@@ -12775,7 +12791,8 @@ export class AgentFramework {
    * residents' view when its edge leaves held traffic out, and the
    * subconscious's when it shows it. For an isolated agent that
    * watches no residents' slot on its branch (a worker, a conversation
-   * fork), whose view excludes only legacy reasoning-loss notices.
+   * fork), whose view excludes legacy reasoning-loss notices and another
+   * agent's framework effort rows, which a slot it observes can hold.
    */
   private liveViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
     if (record.ownSlot?.namespace === null) return residentViewFilter(record.name);
@@ -12783,7 +12800,7 @@ export class AgentFramework {
       const slot = this.registry.observedSlotOf(edge);
       return slot !== undefined && slot.branch === undefined && sameSlot(slot, RESIDENTS_SLOT);
     });
-    if (residents.length === 0) return (message) => !isReasoningLoss(message.metadata);
+    if (residents.length === 0) return (message) => !isReasoningLoss(message.metadata) && !isAnotherAgentsEffortRow(message.metadata, record.name);
     return residents.some((edge) => edge.includeHeld === true) ? subconsciousViewFilter(record.name) : residentViewFilter(record.name);
   }
 
@@ -12826,7 +12843,7 @@ export class AgentFramework {
     }
     if (names.length === 0) return ownerSees;
     return (message) => !isReasoningLoss(message.metadata)
-      && (ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name)));
+      && (ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name) || effortRowOf(message.metadata) === name));
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -12877,7 +12894,7 @@ export class AgentFramework {
     // even when the source has no additional view recorded.
     const sourceSees = this.storeSees.get(source);
     const sees = (metadata: unknown): boolean => !isReasoningLoss(metadata)
-      && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name));
+      && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name) || effortRowOf(metadata) === config.name);
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -21053,7 +21070,7 @@ export class AgentFramework {
         });
         const frameworkEffortRow = (i: number) => {
           const of = marks(i);
-          return of.length > 0 && of.every((agent) => agent !== undefined);
+          return effortOf(compiledWhole[i]!.content) !== undefined && of.length > 0 && of.every((agent) => agent !== undefined);
         };
         const withoutInjections = compiledWhole.filter((_, i) => !onlyInjections(i));
         const compiled = compiledWhole.filter((_, i) => !onlyInjections(i) && !frameworkEffortRow(i));
