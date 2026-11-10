@@ -41750,6 +41750,8 @@ export class AgentFramework {
       ...(asked ? { suppressionAsked: true } : {}),
       ...(opts.folds ? { folds: true as const } : {}),
     });
+    const wakesAtOnce = (d: GateDecision): boolean =>
+      d.trigger && !(typeof d.behavior === 'object' && d.behavior !== null && ('debounce' in d.behavior || 'judge' in d.behavior));
     const decision = admit(env, {
       untargetedRecipients: () => this.registry.untargetedRecipients(),
       ...(asked
@@ -41762,12 +41764,12 @@ export class AgentFramework {
       ...(this.eventGate
         ? {
             gate: {
-              evaluate: (e: InboundEnvelope) => (gateDecision = this.eventGate!.evaluate(gateInfo(e), after)).trigger,
+              evaluate: (e: InboundEnvelope) => wakesAtOnce(gateDecision = this.eventGate!.evaluate(gateInfo(e), after)),
               // "Would the gate have woken them": a debounce policy says yes,
               // later — for the hold's reader that is a pass, not a mute.
               probe: (e: InboundEnvelope) => {
                 const d = this.eventGate!.probe(gateInfo(e));
-                return d.trigger || (typeof d.behavior === 'object' && d.behavior !== null && 'debounce' in d.behavior);
+                return wakesAtOnce(d) || (typeof d.behavior === 'object' && d.behavior !== null && 'debounce' in d.behavior);
               },
             },
           }
