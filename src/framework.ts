@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
-import { MembraneError } from '@animalabs/membrane';
+import { MembraneError, isAbortedResponse } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetryClass, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { boundFailureText, compileRefusalType, failureWords, FAILURE_TEXT_MAX_CHARS, houseReason, isMembraneError, PROVIDER_ERROR_CODE_MAX_CHARS } from './failure-text.js';
@@ -3957,9 +3957,9 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   usage limits reached) are auth, and a context overflow, by its code or
  *   text, is context_length. A 401, 402 or 403 is auth, a 408 timeout, a 429
  *   rate_limit, a 404 invalid_request and a 413 context_length; other 4xx
- *   are invalid_request. So a 413 the table types sheds, an Anthropic one
- *   included, while a context_length at 400 or 422, a token overflow, keeps
- *   the history, and so does an account refusal, which is auth. An adapter
+ *   are invalid_request. So shedMayHelp holds for a 413 the table types,
+ *   an Anthropic one included, and not for a context_length at 400 or 422,
+ *   a token overflow, or for an account refusal, which is auth. An adapter
  *   can type a failure before the table does, as Anthropic's does for a
  *   gateway's aggregate error (server). A failure with no HTTP status takes
  *   the status its provider code implies when the table knows the code, as
@@ -3975,6 +3975,41 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
 export function shedMayHelp(errorType: string | undefined, httpStatus: number | undefined): boolean {
   if (httpStatus === 413) return errorType === 'invalid_request' || errorType === 'context_length';
   return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
+}
+
+const PROBE_FIELDS = {
+  messages: 'replaced',
+  onCacheWireReceipt: 'left out',
+  shedOversizeImages: 'kept',
+  system: 'kept',
+  config: 'kept',
+  tools: 'kept',
+  toolMode: 'kept',
+  stopSequences: 'kept',
+  maxParticipantsForStop: 'kept',
+  promptCaching: 'kept',
+  cacheMarkers: 'kept',
+  cacheTtl: 'kept',
+  floatingCacheMarker: 'kept',
+  contextPrefix: 'kept',
+  prefillUserMessage: 'kept',
+  assistantParticipant: 'kept',
+  streaming: 'kept',
+  providerParams: 'kept',
+} as const satisfies Record<keyof NormalizedRequest, 'kept' | 'left out' | 'replaced'>;
+
+function withoutHistory(request: NormalizedRequest): NormalizedRequest {
+  let asking: string | undefined;
+  for (const message of request.messages) if (message.participant !== request.assistantParticipant) asking = message.participant;
+  asking ??= request.assistantParticipant === 'User' ? 'Human' : 'User';
+  const probe: Record<string, unknown> = {
+    messages: [{ participant: asking, content: [{ type: 'text', text: 'Reply with one word.' }] }],
+  };
+  for (const [field, use] of Object.entries(PROBE_FIELDS)) {
+    const value = request[field as keyof NormalizedRequest];
+    if (use === 'kept' && value !== undefined) probe[field] = value;
+  }
+  return probe as unknown as NormalizedRequest;
 }
 
 function responseParts(response: EventResponse | undefined): string {
@@ -4342,6 +4377,8 @@ export class AgentFramework {
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
   private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
+  private readonly failedRequests = new Map<string, NormalizedRequest>();
+  private readonly breakerProbes = new Set<{ agentName: string; abort: AbortController; settled: Promise<void>; stale: boolean }>();
   private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -6137,14 +6174,15 @@ export class AgentFramework {
    * A timed-out wait lets teardown go on while what it waited for may still
    * act on what is being torn down.
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
-   * turn: on the streams it cancels, on maintenance in flight (a pass or an
-   * over-budget drain kick), on the event loop, on an operator's operations
-   * already running, on modules and MCPL (its servers and the inference
-   * requests they made) together, where a module whose start() is still
-   * running counts until that start() has settled and its stop() returned,
-   * then on Discord awareness
+   * turn: on the streams it cancels, on the code_execution scripts it
+   * stops, on maintenance in flight (a pass, an over-budget drain kick or a
+   * poison-history breaker's probe), on the
+   * event loop, on an operator's operations already running, on modules
+   * and MCPL (its servers and the inference requests they made) together,
+   * where a module whose start() is still running counts until that
+   * start() has settled and its stop() returned, then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
-   * close ended. With a budget, a stop() can take up to six of them, besides
+   * close ended. With a budget, a stop() can take up to seven of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
    * wait until each settles, as required by existing module/child contracts.
    * A wait whose budget runs out fails the stop() with a ShutdownTimeoutError
@@ -6359,6 +6397,7 @@ export class AgentFramework {
     for (const run of this.ephemeralRuns.values()) run.endReason ??= 'host-stop';
     this.providerAdmissionClosed = true;
     for (const wake of [...this.retryWaitWakers]) step(wake);
+    for (const probe of this.breakerProbes) step(() => probe.abort.abort());
     this.guardSpillsClosed = false;
     step(() => this.queue.close());
     let inferences: Array<{ label: string; promise: Promise<void> }> = [];
@@ -6490,7 +6529,10 @@ export class AgentFramework {
     // before the store closes. Its bookkeeping outlives a timeout, since no
     // pass starts while one runs and a drain leaves its set only as it
     // settles, so it needs no leftRunning entry.
-    await waitFor(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []);
+    await waitFor([
+      ...(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []),
+      ...[...this.breakerProbes].map((probe) => ({ label: 'poison-history probe', promise: probe.settled })),
+    ]);
 
     await waitFor(withLeftovers('loop', this.loopPromise ? [{ label: 'event loop', promise: this.loopPromise }] : []), 'loop');
 
@@ -13233,6 +13275,7 @@ export class AgentFramework {
   }
 
   private forgetFailureAccounting(name: string): void {
+    this.staleBreakerProbes(name);
     this.consecutiveInferenceFailures.delete(name);
     this.exhaustionRewinds.delete(name);
     this.refusalStreak.delete(name);
@@ -13332,6 +13375,7 @@ export class AgentFramework {
     this.rearmDeadlineCuts.delete(name);
     this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
+    this.failedRequests.delete(name);
     this.endStatedWaitRun(name);
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stopReader();
@@ -28718,12 +28762,7 @@ export class AgentFramework {
           agentName: agent.name,
           error: err.message,
           ...shownReasonOf(err),
-          // Drives the poison-history breaker (shedMayHelp: an
-          // `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
-          // `context_length` at 413, suggests the provider refused the
-          // request's content or size, which a shed of the newest exchange may
-          // fix; auth/abort and other context_length failures are also
-          // non-retryable but must NOT cost history) and the OverBudget drain breaker
+          // Drives the OverBudget drain breaker
           // (`over_budget`: compile refused to fit the hard budget — this is
           // the site that sees it, since compile runs before the stream
           // exists). `retryable` is kept for observability.
@@ -30666,6 +30705,7 @@ export class AgentFramework {
                 cause: err,
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
+              if (compiledRequest) this.failedRequests.set(agent.name, compiledRequest);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -31070,6 +31110,7 @@ export class AgentFramework {
         cause: err,
       }, streamRouting);
       if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
+      if (compiledRequest) this.failedRequests.set(agent.name, compiledRequest);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
@@ -35361,6 +35402,7 @@ export class AgentFramework {
       // threshold, so neither the alert nor the breaker would come.
       const name = event.agentName as string | undefined;
       if (name && this.consecutiveInferenceFailures.get(name)) {
+        this.staleBreakerProbes(name);
         this.consecutiveInferenceFailures.set(name, 0);
       }
       if (name && this.exhaustionRewinds.get(name)) {
@@ -35467,7 +35509,10 @@ export class AgentFramework {
    *      tool_use/tool_result pairing or an oversized attachment), retrying
    *      the same context is likely to fail the same way, and every new push
    *      event would wake the agent onto that same history. At the hard-down
-   *      threshold, automatically quarantine: shed the newest complete
+   *      threshold, it first sends the failed request without its history,
+   *      and only if that is answered does it quarantine (later failures in
+   *      the same run of failures, whose history that answer already
+   *      implicated, quarantine without another probe): shed the newest complete
    *      exchange (the same forced-rewind primitive `/unstick` uses —
    *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
    *      bounded by the same rewind cap so the breaker can never eat the
@@ -35861,6 +35906,8 @@ export class AgentFramework {
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
+    const failedRequest = this.failedRequests?.get(agentName);
+    this.failedRequests?.delete(agentName);
     const rearmed = this.exhaustingRearms?.delete(agentName) === true;
     const madeAgain = this.freshCallsCut?.delete(agentName) === true;
     // The reason is the failure's own message, and a provider can echo the
@@ -35898,6 +35945,7 @@ export class AgentFramework {
     const cutAt = (excerpt: string): Record<string, unknown> =>
       excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
+    this.staleBreakerProbes(agentName);
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
 
@@ -36009,8 +36057,9 @@ export class AgentFramework {
         `inferences — it cannot complete a turn. Last reason: ${reason}`,
       );
 
-      // Ops alert (webhook + ops:alert trace), throttled per (agent, kind) —
-      // a hard-down agent re-posts every ~15 min, not on every failed retry.
+      // Ops alert: its trace goes out on every call, and only its webhook post
+      // is throttled per (agent, kind), so a hard-down agent re-posts there
+      // every ~15 min, not on every failed retry.
       // failures.log already got the per-exhaustion record above.
       // The excerpt leaves room for the prefix, so the alert's own bound
       // never cuts it a second time.
@@ -36036,10 +36085,86 @@ export class AgentFramework {
       // stamp a rewind marker saying the API kept refusing them.
       // `retryable` is kept only for the trace.
       void retryable;
-      if (agent && shedMayHelp(errorType, httpStatus)) {
-        this.quarantinePoisonedHistory(agent, wholeReason);
+      if (agent && shedMayHelp(errorType, httpStatus) && !this.providerAdmissionClosed && this.agents.get(agent.name) === agent) {
+        if (!failedRequest) {
+          console.error(`[inference-rewind] agent=${agent.name} sheds nothing: no request reached the breaker to send without its history.`);
+        } else if ((this.exhaustionRewinds.get(agent.name) ?? 0) > 0) this.quarantinePoisonedHistory(agent, wholeReason);
+        else this.probeBeforeShed(agent, failedRequest, wholeReason, { errorType, httpStatus });
       }
     }
+  }
+
+  private probeBeforeShed(
+    agent: Agent,
+    request: NormalizedRequest,
+    wholeReason: string,
+    failure: { errorType?: string; httpStatus?: number },
+  ): void {
+    const name = agent.name;
+    const cm = agent.getContextManager();
+    let historyMoved = false;
+    const detach = cm.onMessage(() => { historyMoved = true; });
+    const rowsOf = (): string => (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages())
+      .map((m) => m.id).join('\n');
+    const sent = {
+      turn: this.activeTurnTokens.get(name),
+      branch: this.store.currentBranch().name,
+      rows: rowsOf(),
+    };
+    const abort = new AbortController();
+    const settled = this.ownAuxiliaryMembraneFor(agent).complete(withoutHistory(request), { retry: false, signal: abort.signal }).then(
+      (response): Error | null => (isAbortedResponse(response)
+        ? new Error(`the probe was aborted (${String((response as { reason?: unknown }).reason ?? 'no reason given')})`)
+        : null),
+      (error: unknown): Error => (error instanceof Error ? error : new Error(failureDescription(error))),
+    ).then((probeFailure) => {
+      const turn = this.activeTurnTokens.get(name);
+      if (this.agents.get(name) !== agent || this.providerAdmissionClosed || this.surgeryHold || probe.stale
+        || (turn !== undefined && turn !== sent.turn)
+        || this.store.currentBranch().name !== sent.branch
+        || historyMoved || rowsOf() !== sent.rows) {
+        console.error(`[inference-rewind] agent=${name}: its probe's answer is set aside, since the agent, its history or the ` +
+          'framework changed while it was out; the next failure decides.');
+        return;
+      }
+      if (probeFailure === null) {
+        this.quarantinePoisonedHistory(agent, wholeReason);
+        return;
+      }
+      const answered = this.classifyInferenceError(probeFailure);
+      const same = answered.errorType === failure.errorType && answered.httpStatus === failure.httpStatus;
+      const status = answered.httpStatus === undefined ? 'with no status' : `at HTTP ${answered.httpStatus}`;
+      const answer = `The probe's answer: ${boundFailureText(probeFailure.message, FAILURE_SUMMARY_MAX_CHARS)}`;
+      const next = 'No retry was queued, so the agent tries again only when something next wakes it.';
+      const message = same
+        ? `the request fails without its history too, with the same ${String(answered.errorType)} ${status}, so none of the history was shed. ${next} ${answer}`
+        : `a probe without its history couldn't tell whether the history is the cause, so none of it was shed. ${next} ${answer}`;
+      console.error(`[inference-rewind] agent=${name} kept its history: ${message}`);
+      const verdict = same ? 'fails-without-history' : 'could-not-tell';
+      this.opsAlert('history-kept', name, message, { data: { probe: verdict, ...answered }, key: verdict });
+    }).catch((error: unknown) => {
+      console.error(`[inference-rewind] agent=${name}: the breaker failed while acting on its probe's answer, and may already have shed part of the history: ${describeFailureWithFrames(error)}`);
+    }).finally(() => {
+      detach();
+      this.breakerProbes.delete(probe);
+    });
+    const probe = { agentName: name, abort, settled, stale: false };
+    this.breakerProbes.add(probe);
+  }
+
+  private staleBreakerProbes(name: string): void {
+    for (const probe of this.breakerProbes) {
+      if (probe.agentName !== name) continue;
+      probe.stale = true;
+      probe.abort.abort();
+    }
+  }
+  private ownAuxiliaryMembraneFor(agent: Agent): Membrane {
+    const release = this.managerReleases.get(agent);
+    if (!release) return this.auxiliaryMembraneFor(agent.name);
+    return this.ephemeralAgents.has(agent)
+      ? this.ephemeralAuxiliaryMembraneFor(agent.name, release)
+      : this.withdrawnOnceReleased(this.conversationAuxiliaryMembraneFor(agent.name), agent.name, release);
   }
 
   /**
