@@ -202,7 +202,7 @@ class HoldRound implements Module {
 
 type Trace = Record<string, unknown> & { type: string };
 
-async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; ontology?: unknown; extraFeatureSets?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[] } = {}) {
+async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; ontology?: unknown; extraFeatureSets?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; gateDir?: string } = {}) {
   const f = await fixture({
     ...(opts.agents ? { agents: opts.agents } : {}),
     featureSets: {
@@ -212,7 +212,8 @@ async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; onto
     server: { enabledFeatureSets: ['games'] },
     framework: {
       ...opts.framework,
-      gate: { config: { policies: opts.policies ?? [CATCH_ALL], default: 'skip' }, ...(opts.onboarding === false ? { onboarding: false } : {}) },
+      // `gateDir` keeps the gate's files outside the store, where a second start finds them (the fixture's close removes its directory).
+      gate: { ...(opts.gateDir ? { configPath: join(opts.gateDir, 'gate.json') } : {}), config: { policies: opts.policies ?? [CATCH_ALL], default: 'skip' }, ...(opts.onboarding === false ? { onboarding: false } : {}) },
     } as Partial<FrameworkConfig>,
   });
   const traces: Trace[] = [];
@@ -235,12 +236,121 @@ async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; onto
   /** The window's texts, in order. */
   const window = (agent = 'agent') => (f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Row[])
     .map((m) => (m.content as Array<{ type: string; text?: string }>).map((b) => b.text ?? '').join(''));
-  const gateJson = () => JSON.parse(readFileSync(join(f.dir, 'store', 'config', 'gate.json'), 'utf8')) as { policies: GatePolicy[] };
-  const decisionsPath = join(f.dir, 'store', 'config', 'wake-decisions.json');
+  const configDir = opts.gateDir ?? join(f.dir, 'store', 'config');
+  const gateJson = () => JSON.parse(readFileSync(join(configDir, 'gate.json'), 'utf8')) as { policies: GatePolicy[] };
+  const decisionsPath = join(configDir, 'wake-decisions.json');
   const tool = async (name: string, input: Record<string, unknown>) => (await f.framework.puppetToolCall('agent', name, input)).result;
   const decisions = () => (f.framework as unknown as { wakeDecisions: WakeDecisions }).wakeDecisions;
   return { f, traces, push, woke, notices, stored, window, gateJson, decisionsPath, tool, decisions };
 }
+
+describe('wake onboarding: the servers a store already had', () => {
+  it('are kept unasked from the first start that finds no decisions file, which that start writes; a later start reads them, and takes no more', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wake-predating-'));
+    const path = join(dir, 'config', 'wake-decisions.json');
+    const t0 = Date.parse('2026-11-10T00:00:00Z');
+    const d = new WakeDecisions(path, undefined, ['games', 'discord']);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), { servers: {}, predating: ['discord', 'games'] }, 'written at once');
+    assert.equal(d.predates('discord'), true);
+    assert.equal(d.predates('docs'), false, 'a server the store did not have');
+    d.set('discord', { digest: 'a', state: 'unasked' }, t0);
+    assert.equal(d.predates('discord'), false, 'settled');
+    assert.equal(d.mayOffer('discord', 'a', t0 + 10 * OFFER_FLOOR_MS), false, 'not asked about what it declared then');
+    assert.equal(d.mayOffer('discord', 'b', t0 + OFFER_FLOOR_MS), true, 'a changed declaration is asked about, as any server\'s is');
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).predating, ['games']);
+    // A later start: the file is there, so the servers configured now are not taken.
+    const again = new WakeDecisions(path, undefined, ['docs', 'games']);
+    assert.equal(again.predates('games'), true, 'still waiting for its first undecided event');
+    assert.equal(again.predates('docs'), false, 'added since: offered as before');
+    assert.deepEqual(again.get('discord'), { digest: 'a', state: 'unasked', at: new Date(t0).toISOString() });
+    // A new store: nothing predates, and the file still says onboarding has started.
+    const fresh = join(mkdtempSync(join(tmpdir(), 'wake-predating-')), 'config', 'wake-decisions.json');
+    const none = new WakeDecisions(fresh);
+    assert.deepEqual(JSON.parse(readFileSync(fresh, 'utf8')), { servers: {} });
+    assert.equal(none.predates('games'), false);
+    // A file that can't be read: onboarding had started here, so nothing
+    // predates it, at this start or at the next, and the empty file says so.
+    writeFileSync(path, '{ not json');
+    const damaged = new WakeDecisions(path, undefined, ['games', 'discord']);
+    assert.equal(damaged.predates('games'), false, 'a damaged file costs a repeated offer, not a silent one');
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), { servers: {} }, 'written anew at once');
+    assert.equal(new WakeDecisions(path, undefined, ['games', 'discord']).predates('games'), false, 'and the start after finds it');
+  });
+
+  it('a store that had its gate before onboarding started on it: no notice and no wake for its servers, and their suggestions are still there to take', { timeout: 60_000 }, async () => {
+    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-predating-'));
+    // A release without onboarding ran here, and the agent changed a rule
+    // under it: gate.json is written, and no decisions.
+    const earlier = await games({ gateDir, onboarding: false });
+    earlier.f.framework.addGatePolicy({ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' });
+    await earlier.f.close();
+    assert.ok(existsSync(join(gateDir, 'gate.json')) && !existsSync(earlier.decisionsPath), 'premise: the store has a gate, and no decisions file');
+    const h = await games({ gateDir });
+    try {
+      assert.deepEqual(JSON.parse(readFileSync(h.decisionsPath, 'utf8')), { servers: {}, predating: ['editor'] });
+      await h.push('verso joined as White. Your move.', ['surface:turn', 'go:start']);
+      await h.push('White played D4. Your move.', ['surface:turn', 'go:move']);
+      assert.deepEqual(h.stored(), [], 'no notice was written');
+      assert.ok(!h.woke(), 'and the catch-all skipped both, as it did before the update');
+      assert.ok(!h.traces.some((t) => t.type === 'gate:onboarding-offered'));
+      assert.equal(h.traces.filter((t) => t.type === 'gate:onboarding-decided' && t.state === 'unasked').length, 1, 'settled once');
+      const record = JSON.parse(readFileSync(h.decisionsPath, 'utf8')) as { servers: Record<string, { state: string }>; predating?: string[] };
+      assert.equal(record.servers.editor!.state, 'unasked');
+      assert.equal(record.predating, undefined);
+      // The agent can read and take the suggestions whenever it wants them.
+      const taken = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.equal(taken.success, true, taken.error);
+      assert.deepEqual(h.gateJson().policies.map((p) => p.name).filter((name) => name.startsWith('suggested:')), ['suggested:editor:1', 'suggested:editor:2']);
+      assert.equal(h.decisions().get('editor')!.state, 'accepted');
+    } finally { await h.f.close(); }
+  });
+
+  it("a server whose events the agent's own rule decides is settled at its first event too, against what it declares then", { timeout: 60_000 }, async () => {
+    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-decided-'));
+    const policies: GatePolicy[] = [{ name: 'editor-quiet', match: { source: 'editor' }, behavior: 'defer' }, CATCH_ALL];
+    const earlier = await games({ gateDir, onboarding: false, policies });
+    earlier.f.framework.addGatePolicy({ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' });
+    await earlier.f.close();
+    const h = await games({ gateDir, policies });
+    try {
+      assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
+      await h.push('Your move.', ['surface:turn']);
+      assert.equal(h.decisions().get('editor')?.state, 'unasked', 'the rule decided the event, and the server is settled all the same');
+      assert.equal(h.stored().length, 0);
+    } finally { await h.f.close(); }
+  });
+
+  it('an unasked server whose declaration has changed: accepting takes the current suggestions, with no word of having been told', { timeout: 60_000 }, async () => {
+    const h = await games();
+    try {
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'unasked' });
+      const taken = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.equal(taken.success, true, taken.error);
+      assert.equal(h.decisions().get('editor')!.state, 'accepted');
+      // An offered one in the same place is shown the list again first, as before.
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'offered' });
+      const refused = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.match(refused.error ?? '', /changed since you were told about them/);
+    } finally { await h.f.close(); }
+  });
+
+  it('only that first start: where onboarding has already started, a server is offered as before', { timeout: 60_000 }, async () => {
+    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-started-'));
+    // A new store's first start: no gate.json before it, so nothing predates.
+    // The agent changes a rule, so the store has a gate.json from here on.
+    const first = await games({ gateDir });
+    assert.deepEqual(JSON.parse(readFileSync(first.decisionsPath, 'utf8')), { servers: {} });
+    first.f.framework.addGatePolicy({ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' });
+    await first.f.close();
+    assert.ok(existsSync(join(gateDir, 'gate.json')) && existsSync(first.decisionsPath), 'premise: the next start finds both');
+    const h = await games({ gateDir });
+    try {
+      await h.push('verso joined as White. Your move.', ['surface:turn', 'go:start']);
+      await eventually(() => h.notices().length === 1, 'the onboarding notice');
+      assert.equal(h.decisions().get('editor')!.state, 'offered');
+    } finally { await h.f.close(); }
+  });
+});
 
 describe('wake onboarding: the host', () => {
   it('a Go turn skipped by a catch-all wakes the agent once with the server\'s suggestions; accepting writes them ahead of it', { timeout: 60_000 }, async () => {
@@ -317,7 +427,8 @@ describe('wake onboarding: the host', () => {
     try {
       await h.push('Your move.', ['surface:turn']);
       assert.equal(h.stored().length, 0);
-      assert.equal(existsSync(h.decisionsPath), false);
+      // The file is there from the first start, and holds no decision.
+      assert.deepEqual(JSON.parse(readFileSync(h.decisionsPath, 'utf8')), { servers: {} });
     } finally { await h.f.close(); }
   });
 
