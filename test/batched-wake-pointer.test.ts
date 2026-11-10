@@ -127,6 +127,7 @@ const linesOf = (b: Bare, name = 'scout'): string[] => b.framework.getAgent(name
   .map(rowText).filter((t) => t.startsWith('[Gate:'));
 /** Whether the `n`th request `b`'s membrane was sent holds `text`. */
 const inRequest = (b: Bare, text: string, n = 0): boolean => JSON.stringify(b.membrane.calls[n]).includes(text);
+const hostChange = { type: 'system_change', defineTools: [{ name: 'h', description: 'h does a thing', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock;
 const wake = (rows: string[], agentName = 'scout', timestamp = Date.now()) =>
   ({ agentName, reason: 'gate:debounce', source: 'gate', timestamp, [BATCH_ROWS]: rows });
 
@@ -213,6 +214,22 @@ describe("a batched wake's line at its turn's start, where something follows its
       const shown = presentedTexts(b);
       assert.ok(shown.indexOf('are you there?') >= 0 && shown.indexOf('are you there?') < shown.indexOf('[clock row]'), `premise: the window holds the DM, then the clock row: ${JSON.stringify(shown)}`);
       assert.deepEqual(linesOf(b), [], "a clock row isn't a message a reply could be meant for");
+    } finally { await done(b); }
+  });
+
+  it("a host's system change after it: no line", async () => {
+    const b = await bare(['scout']);
+    try {
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      const cm = b.framework.getAgent('scout')!.getContextManager();
+      const change = cm.addMessage('system', [hostChange]);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      const shown = cm.getPresentedMessages().map((m) => m.id);
+      assert.ok(shown.indexOf(dm) >= 0 && shown.indexOf(dm) < shown.indexOf(change), `premise: the window holds the DM, then the change: ${JSON.stringify(shown)}`);
+      assert.deepEqual(linesOf(b), [], "a system change isn't a message a reply could be meant for");
     } finally { await done(b); }
   });
 
@@ -760,6 +777,21 @@ describe("a batched wake's line in a window still in legacy mode", () => {
       assert.equal(b.membrane.calls.length, 2, 'premise: both turns ran');
       assert.deepEqual(linesOf(b, 'mira'), [], "the co-resident's start places nothing in the shared record");
       assert.equal(linesOf(b, 'scout').length, 1, "the delivery agent's start writes the slot's line");
+    } finally { await done(b); }
+  });
+
+  it("a host's system change after it: no line", async () => {
+    const b = await legacy(['scout']);
+    try {
+      assert.equal(b.framework.getAgent('scout')!.getContextManager().windowMode(), 'legacy', 'premise: the window is the record');
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      b.framework.getAgent('scout')!.getContextManager().addMessage('system', [hostChange]);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
+      assert.deepEqual(linesOf(b), [], "a system change isn't a message a reply could be meant for");
     } finally { await done(b); }
   });
 

@@ -98,6 +98,42 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
+  it("leaves a resident's change row out of a co-resident's window, as another agent's own row", async () => {
+    await withFramework([resident('alpha'), resident('beta')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      const beta = framework.getAgent('beta')!;
+      say(framework, alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      const [row] = alpha.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'alpha' } }).messages;
+      assert.ok(row, "the premise: alpha's change row is stored");
+      assert.ok(beta.getContextManager().getPresentedMessages().some((m) => (m.content[0] as { text?: string }).text === 'hello'), "the premise: beta's window holds the slot's conversation");
+      assert.equal(alpha.getContextManager().windowStatusOf(row!.id), 'in', "alpha's window holds its own change");
+      assert.notEqual(beta.getContextManager().windowStatusOf(row!.id), 'in', "and beta's leaves it out");
+    });
+  });
+
+  it("takes a resident's change row out of the window of a resident that observes it, when a move of its head removes it, traced as `head-moved`", async () => {
+    await withFramework([resident('alpha'), { ...resident('beta'), observes: ['alpha'] }], async (framework) => {
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
+      const alpha = framework.getAgent('alpha')!;
+      const beta = framework.getAgent('beta')!;
+      const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
+      say(framework, alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')], system('v1'));
+      await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
+      const [row] = alpha.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'alpha' } }).messages;
+      assert.ok(row, "the premise: alpha's change row is stored");
+      assert.equal(beta.getContextManager().windowStatusOf(row!.id), 'in', 'the premise: beta, which observes alpha, is shown it');
+      await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
+      assert.equal(storedChanges(alpha, 'alpha'), 0, "the premise: the replacement moved alpha's head and took the row out");
+      assert.equal(beta.getContextManager().ordinalOf(row!.id), undefined, "beta's window lets it go");
+      const retracted = traces.filter((t) => t.type === 'presentation:retracted' && (t as { agentName: string }).agentName === 'beta') as unknown as Array<{ reason: string; messageIds: string[] }>;
+      assert.deepEqual(retracted.map((t) => [t.reason, t.messageIds]), [['head-moved', [row!.id]]]);
+    });
+  });
+
   it('keeps a resident\'s recorded head across a restart', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'tool-declarations-restart-'));
     const storePath = join(tempDir, 'store.chronicle');
