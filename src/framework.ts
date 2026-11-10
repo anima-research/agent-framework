@@ -20244,7 +20244,7 @@ export class AgentFramework {
         });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) {
           wakeAfter = placement;
-          if (id && !audience && !heldFromResidents(metadata)) added = placement;
+          if (id && !heldFromResidents(metadata)) added = placement;
         }
         // A write kept in memory (a surgery's hold, or the wait for its
         // agent's recovery) has no id yet: it is traced once, as it is
