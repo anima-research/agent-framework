@@ -198,9 +198,14 @@ export interface AgentConfig {
    * and the current system text, and leaves the agent's own change rows out
    * of its request, since its head already holds what they declare. Under
    * `'entries'` it carries a host's change rows as the agent's requests do;
-   * on its head it carries none. Its compile binds thinking under the current
-   * head, so on an `'entries'` agent whose recorded head differs, the next
-   * request the agent makes sets aside the thinking before it.
+   * on its head it carries none. With `thinkingBinding.binds: true`, its
+   * compile binds thinking under the current head, so on an `'entries'`
+   * agent whose recorded head differs, the next request the agent makes sets
+   * aside the thinking before it. With `binds` left out, where the agent's
+   * recorded head differs, the direct request carries its thinking under a
+   * prefix it wasn't signed under: with `dropBlock` the provider drops it,
+   * and without it an account that enforces the binding refuses the request,
+   * and one that doesn't decides for itself.
    *
    * Turning it on is a choice from those records, not a runtime toggle, so
    * it isn't one of the agent's runtime settings.
@@ -373,11 +378,17 @@ export interface AgentConfig {
      * `toolDeclarations: 'entries'`: a model that may bind consolidates for
      * free only where no thinking sits before the compile's `firstChanged`
      * (the first message that compile renders differently from the last
-     * one; thinking from there on is set aside by the compile's own change).
+     * one; the compile's own change already moved the prefix of everything
+     * from there on, so a move adds no loss of its own there).
      * Past a fifth of the request, or when a compile is refused over budget,
      * or for dropping messages no summary covers, with changes kept, it
-     * consolidates anyway, setting that thinking
-     * aside. The host's model records carry `binds`, beside "takes entries".
+     * consolidates anyway. With `true`, the compile for the new head leaves
+     * that thinking out. Left out, the request still carries it, under a
+     * prefix it wasn't signed under. With `dropBlock`, the provider drops it
+     * from each request that carries it. Without it, an account that enforces
+     * the binding refuses each such request, and one that doesn't decides for
+     * itself. The host's model records carry `binds`, beside "takes
+     * entries".
      */
     binds?: boolean;
   };

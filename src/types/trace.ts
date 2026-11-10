@@ -145,8 +145,11 @@ export type TraceEvent =
       /** A consolidation no compile made free: past a fifth of the request
        *  ('share'), or at a compile refused over budget, or for dropping
        *  messages no summary covers, with changes kept
-       *  ('budget'). A whole write, and on a binding model the request's
-       *  thinking set aside. */
+       *  ('budget'). A whole write. With `thinkingBinding.binds: true`, the
+       *  request's thinking is left out. With `binds` left out, the requests
+       *  after it still carry it: with `dropBlock` the provider drops it, and
+       *  without it an account that enforces the binding refuses them, and
+       *  one that doesn't decides for itself. */
       forced?: 'share' | 'budget';
     })
   | (TraceEventBase & {

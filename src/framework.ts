@@ -18918,7 +18918,7 @@ export class AgentFramework {
 
   private thinkingSetAside(agent: Agent, said: string): string {
     if (!agent.mayBindThinking) return '';
-    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
+    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} only with thinkingBinding.binds: true; left out, the request still carries it, under a prefix it wasn't signed under: with thinkingBinding.dropBlock the provider drops it from each request that carries it, and without it an account that enforces the binding refuses each such request and one that doesn't decides for itself`;
   }
 
   private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean, stream?: YieldingStream): boolean {
@@ -18930,7 +18930,7 @@ export class AgentFramework {
     const setAside = this.setAsideThinkingSignedOverChanges(agent, stream);
     const thinking = setAside.ids.length === 0 ? ''
       : setAside.noted ? `, and sets aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change`
-      : `; the note setting aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change didn't land, so, where its head didn't move with the refusal (a move sets every earlier reply's thinking aside), its requests can carry that thinking, which a model that binds it refuses, until those replies leave its window or it's built again`;
+      : `; the note setting aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change didn't land, so, where its head didn't move with the refusal (a move sets every earlier reply's thinking aside), its requests can carry that thinking until those replies leave its window or it's built again, and without thinkingBinding.dropBlock an account that enforces the binding refuses them`;
     console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again, by a restart of the host or by creating the agent again${thinking}; for a model that refuses system changes, set toolDeclarations: 'head' on it: ${error.message}`);
     if (!recognised || (setAside.ids.length > 0 && !setAside.noted)) {
       this.opsAlert('head-resend', agent.name,

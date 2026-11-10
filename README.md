@@ -120,10 +120,13 @@ or when a compile is refused over budget, or for dropping messages no summary
 covers, with changes kept, it happens anyway, with an operator line.
 `thinkingBinding.binds` says whether the model binds its thinking to
 everything before it. Unless it's `false`, such a compile must keep no
-thinking before the first message it renders anew (its `firstChanged`), and a
-forced move sets that thinking aside; with `true`, each compile is told the
-head the request carries, so the context manager leaves out the thinking a
-move of the head sets aside. The host chooses both settings from what it knows
+thinking before the first message it renders anew (its `firstChanged`). With
+`true`, each compile is told the head the request carries, so the context
+manager leaves out the thinking a move of the head would send under a prefix
+it wasn't signed under. Left out, the requests after a forced move still carry
+that thinking. With `dropBlock`, the provider drops it from each of them.
+Without it, an account that enforces the binding refuses them, and one that
+doesn't decides for itself. The host chooses both settings from what it knows
 of the model; neither is a runtime setting.
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified

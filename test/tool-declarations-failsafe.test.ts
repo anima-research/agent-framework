@@ -486,13 +486,13 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     assert.equal((resend[0] as { thinkingSetAside: number }).thinkingSetAside, 1, "the second round's reply, signed after the change the boundary handed");
   });
 
-  it("says, when its note can't land, that where its head didn't move its requests can carry thinking a binding model refuses, until those replies leave its window or it's built again", async () => {
+  it("says, when its note can't land, that where its head didn't move its requests can carry that thinking until those replies leave its window or it's built again, which an account that enforces the binding refuses without the drop control", async () => {
     const { traces, outcomes } = await refusedAtALaterRound(false);
     assert.deepEqual(outcomes.slice(2), ['refused: thinking signed over the change', 'refused: thinking signed over the change'], 'the resend and the next turn carry that thinking, and are refused');
     assert.equal((traces.find((t) => t.type === 'head:resend') as { thinkingSetAside: number }).thinkingSetAside, 0, 'nothing set aside');
     const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string; data?: { noted?: boolean } }>;
     assert.equal(alerts.length, 1, 'an operator line, though the refusal was recognised');
-    assert.match(alerts[0]!.message, /didn't land, so, where its head didn't move with the refusal \(a move sets every earlier reply's thinking aside\), its requests can carry that thinking, which a model that binds it refuses, until those replies leave its window or it's built again/);
+    assert.match(alerts[0]!.message, /didn't land, so, where its head didn't move with the refusal \(a move sets every earlier reply's thinking aside\), its requests can carry that thinking until those replies leave its window or it's built again, and without thinkingBinding\.dropBlock an account that enforces the binding refuses them/);
     assert.equal(alerts[0]!.data?.noted, false);
   });
 

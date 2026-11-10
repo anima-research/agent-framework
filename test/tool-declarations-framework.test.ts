@@ -285,7 +285,7 @@ describe('toolDeclarations in the framework', () => {
     const wide = { ...tool('b'), description: 'b does a thing. '.repeat(2000) };
     const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
     for (const [binding, clause] of [
-      [undefined, /: one whole write, and the thinking the request held set aside if its model binds it$/],
+      [undefined, /: one whole write, and the thinking the request held set aside only with thinkingBinding\.binds: true; left out, the request still carries it, under a prefix it wasn't signed under: with thinkingBinding\.dropBlock the provider drops it from each request that carries it, and without it an account that enforces the binding refuses each such request and one that doesn't decides for itself$/],
       [{ binds: true, dropBlock: true }, /: one whole write, and the thinking the request held set aside$/],
     ] as const) {
       await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
@@ -317,7 +317,7 @@ describe('toolDeclarations in the framework', () => {
   });
 
   it("raises an operator line for a move forced past a fifth, naming no thinking for a model whose `binds` is false, and one for a move forced by the budget", async () => {
-    for (const [binding, clause] of [[{ binds: false }, /: one whole write$/], [undefined, /set aside if its model binds it$/]] as const) {
+    for (const [binding, clause] of [[{ binds: false }, /: one whole write$/], [undefined, /set aside only with thinkingBinding\.binds: true; left out, the request still carries it, under a prefix it wasn't signed under: with thinkingBinding\.dropBlock the provider drops it from each request that carries it, and without it an account that enforces the binding refuses each such request and one that doesn't decides for itself$/]] as const) {
       await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
