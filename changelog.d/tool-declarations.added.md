@@ -20,12 +20,13 @@
   ignored. So this saves cache writes only while the system blocks already
   declared stay as they are: a block whose text changes on every request moves
   the head on every request. A move stores the new head first, and takes the
-  agent's change rows out of its context only once that's stored. A head that
-  can't be stored moves nothing: the request goes on the recorded head with
-  its changes (with none recorded, on what's current, the agent's change
+  agent's change rows out of its context once that's stored. A head that
+  can't be stored moves nothing while a head is recorded: the request goes on
+  the recorded head with its changes, and a later request moves it again.
+  With none recorded, the request goes on what's current, the agent's change
   rows taken out of its context and its compile made again, so the compile
   the context manager keeps is the request sent; a removal the store refuses
-  then fails the turn), and a later request moves it again. A change row the
+  then fails the turn. A change row the
   store refuses to write is logged, and the first later request that can
   store a change declares what differs then; one whose write throws though
   the store holds it is declared. A request
