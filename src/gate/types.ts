@@ -405,7 +405,9 @@ export interface UpcomingWake {
    *  has read and answered them. True or false of every agent `agents`
    *  names: a batch certain for some and not others is a wake for each. */
   certain: boolean;
-  /** What it is, as the judge is told ("its own skip_reply timer"). */
+  /** What it is, as the judge is told ("its own skip_reply timer"). A
+   *  debounced batch's counts the events delivery gives the agents it names,
+   *  so a batch giving them different counts is a wake for each count. */
   what: string;
   /** What it is, in a word that quotes nothing, for healthSnapshot: `what` can
    *  quote a reminder or a queue reason. The judge isn't told it. */
