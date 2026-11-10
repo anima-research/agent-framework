@@ -268,6 +268,13 @@ describe('wake onboarding: the servers a store already had', () => {
     const none = new WakeDecisions(fresh);
     assert.deepEqual(JSON.parse(readFileSync(fresh, 'utf8')), { servers: {} });
     assert.equal(none.predates('games'), false);
+    // A file that can't be read: onboarding had started here, so nothing
+    // predates it, at this start or at the next, and the empty file says so.
+    writeFileSync(path, '{ not json');
+    const damaged = new WakeDecisions(path, undefined, ['games', 'discord']);
+    assert.equal(damaged.predates('games'), false, 'a damaged file costs a repeated offer, not a silent one');
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), { servers: {} }, 'written anew at once');
+    assert.equal(new WakeDecisions(path, undefined, ['games', 'discord']).predates('games'), false, 'and the start after finds it');
   });
 
   it('a store that had its gate before onboarding started on it: no notice and no wake for its servers, and their suggestions are still there to take', { timeout: 60_000 }, async () => {
@@ -295,6 +302,35 @@ describe('wake onboarding: the servers a store already had', () => {
       assert.equal(taken.success, true, taken.error);
       assert.deepEqual(h.gateJson().policies.map((p) => p.name).filter((name) => name.startsWith('suggested:')), ['suggested:editor:1', 'suggested:editor:2']);
       assert.equal(h.decisions().get('editor')!.state, 'accepted');
+    } finally { await h.f.close(); }
+  });
+
+  it("a server whose events the agent's own rule decides is settled at its first event too, against what it declares then", { timeout: 60_000 }, async () => {
+    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-decided-'));
+    const policies: GatePolicy[] = [{ name: 'editor-quiet', match: { source: 'editor' }, behavior: 'defer' }, CATCH_ALL];
+    const earlier = await games({ gateDir, onboarding: false, policies });
+    earlier.f.framework.addGatePolicy({ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' });
+    await earlier.f.close();
+    const h = await games({ gateDir, policies });
+    try {
+      assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
+      await h.push('Your move.', ['surface:turn']);
+      assert.equal(h.decisions().get('editor')?.state, 'unasked', 'the rule decided the event, and the server is settled all the same');
+      assert.equal(h.stored().length, 0);
+    } finally { await h.f.close(); }
+  });
+
+  it('an unasked server whose declaration has changed: accepting takes the current suggestions, with no word of having been told', { timeout: 60_000 }, async () => {
+    const h = await games();
+    try {
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'unasked' });
+      const taken = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.equal(taken.success, true, taken.error);
+      assert.equal(h.decisions().get('editor')!.state, 'accepted');
+      // An offered one in the same place is shown the list again first, as before.
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'offered' });
+      const refused = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.match(refused.error ?? '', /changed since you were told about them/);
     } finally { await h.f.close(); }
   });
 

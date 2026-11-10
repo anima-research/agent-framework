@@ -41050,7 +41050,9 @@ export class AgentFramework {
 
     if (!connected) return fail(`${quotedValue(server)} isn't connected, so its suggestions can't be read now. wake_decline still records a decline.`);
     const offer = this.wakeOffer(server);
-    if (record && (record.shown ?? record.digest) !== offer.digest) {
+    // An unasked server's agent was shown no numbered list: it reads the
+    // numbers from event_tags, which gives the current ones.
+    if (record && record.state !== 'unasked' && (record.shown ?? record.digest) !== offer.digest) {
       // The numbers the agent was shown may not mean what they mean now: show them again, and ask again.
       // The decision on record (and its time, which the daily floor counts from) stays as it is.
       this.wakeDecisions.markShown(server, offer.digest);
@@ -41824,21 +41826,28 @@ export class AgentFramework {
   }): void {
     try {
       const d = event.gateDecision;
-      if (!this.wakeDecisions || !this.eventGate || !d || d.trigger) return;
+      if (!this.wakeDecisions || !this.eventGate) return;
+      if (this.wakeDecisions.predates(event.serverId)) {
+        // The store's own server from before onboarding started on it: its
+        // rules stand unasked. It is settled at its first event, whatever
+        // the gate decided about that one, against what it declares now, so
+        // that a declaration it changes later is asked about as any
+        // server's is. A server whose events a rule of the agent's always
+        // decides would otherwise wait unsettled, and be settled against
+        // whatever it declared on the day that rule went.
+        if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
+        const digest = this.wakeOffer(event.serverId).digest;
+        this.wakeDecisions.set(event.serverId, { digest, state: 'unasked' });
+        this.emitTrace({ type: 'gate:onboarding-decided', serverId: event.serverId, digest, state: 'unasked', rules: [] });
+        return;
+      }
+      if (!d || d.trigger) return;
       // Cheap refusals first: this runs for every event a catch-all lets by.
       if (!this.wakeDecisions.mayOfferSoon(event.serverId)) return;
       if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
       const policy = d.policyName === null ? undefined : this.eventGate.policyInForce(d.policyName);
       if (!isUndecided(d, policy)) return;
       const offer = this.wakeOffer(event.serverId);
-      if (this.wakeDecisions.predates(event.serverId)) {
-        // The store's own server from before onboarding started on it: its
-        // rules stand unasked, recorded against what it declares now, so a
-        // changed declaration is asked about as any server's is.
-        this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'unasked' });
-        this.emitTrace({ type: 'gate:onboarding-decided', serverId: event.serverId, digest: offer.digest, state: 'unasked', rules: [] });
-        return;
-      }
       if (!this.wakeDecisions.mayOffer(event.serverId, offer.digest)) return;
       const wake = carriesAttention(event.tags);
       const text = this.wakeOnboardingText(offer, { policyName: d.policyName, behavior: String(d.behavior), tags: event.tags ?? [], wake });

@@ -252,9 +252,9 @@ export interface DecisionRecord {
  * and an offer for each, at the first event one of its catch-alls lets by,
  * would ask it about every server it has at once, on the day its host was
  * updated. They are kept in the file until each is settled as `unasked`
- * (`predates`, at its first undecided event, when its digest is known). A
- * server added afterwards is offered as before, and so is one of these once
- * what it declares changes.
+ * (`predates`, at its first event of any kind, when its digest is known).
+ * A server added afterwards is offered as before, and so is one of these
+ * once what it declares changes.
  */
 export class WakeDecisions {
   private records: Record<string, DecisionRecord> = {};
@@ -282,6 +282,12 @@ export class WakeDecisions {
       const aside = `${path}.unreadable-${Date.now()}`;
       try { renameSync(path, aside); } catch { /* leave it */ }
       this.log(`wake decisions: ${path} could not be read (${(error as Error).message}); set aside as ${aside}, starting empty`);
+      // Onboarding had started here, so no server predates it: the empty
+      // file is written now, or the next start would find none and take
+      // every server, the ones already answered among them, as predating.
+      this.records = {};
+      this.predating = new Set();
+      this.write();
     }
   }
 
