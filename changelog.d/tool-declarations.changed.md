@@ -45,8 +45,8 @@
   boundary, and isn't noted as said to it or heard; and for an agent on its
   head, which sends no change row, neither is any change row stored at its
   tool boundary injected.
-- Whether an MCPL event's own entry is the newest in the window a batched
-  wake's `[Gate: …]` line goes to now reads past any number of clock rows,
-  stored context injections, system changes and rows the agent's view leaves
-  out. Past 32 of them it used to answer no, so the line was written rather
-  than handed to the wake.
+- A system change row, a host's or an agent's own, isn't a row a reply
+  could be meant for. So a change row stored after a batched wake's messages
+  doesn't make the turn's start write the wake's `[Gate: …]` line, as a
+  clock row doesn't. This holds in a presented window and in one still in
+  legacy mode.
