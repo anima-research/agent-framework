@@ -335,8 +335,9 @@ export type TraceEvent =
        * whose preview didn't name a newer message as what would make room, with none of these changed since: the
        * budget, the compression holds, the live context settings, the strategy's counts of chunks, pending
        * merges, compressed chunks, compressions and summaries at each level (or, for a strategy that reports
-       * none of them, its pending work's description), the pins and document marks other than the turn's own, or
-       * a stored row edited or removed. It ran no preview, and its figures are that earlier preview's. Rows
+       * none of them, its pending work's description), the pins and document marks other than the turn's own,
+       * whether the budget hold can take the agent, or a stored row edited or removed. It ran no preview, and its
+       * figures are that earlier preview's. Rows
        * added to the store, the stream's own among them, and context-manager's calibration multiplier aren't in
        * that list. When the stream's rows close one of the strategy's chunks, its count of chunks moves, and the
        * next boundary previews again. A fresh preview can name compression a boundary before that count moves.

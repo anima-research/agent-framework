@@ -485,6 +485,7 @@ export class Agent {
   private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
   private rowChanges: () => number;
+  private stopCountingRowChanges: (() => void) | undefined;
   private membrane: Membrane;
 
   constructor(
@@ -531,7 +532,7 @@ export class Agent {
     this.contextManager = contextManager;
     let rowChanges = 0;
     if (typeof contextManager.onMessage === 'function') {
-      contextManager.onMessage((event) => { if (event.type !== 'add') rowChanges++; });
+      this.stopCountingRowChanges = contextManager.onMessage((event) => { if (event.type !== 'add') rowChanges++; });
     }
     this.rowChanges = () => rowChanges;
     this.membrane = membrane;
@@ -2372,6 +2373,8 @@ export class Agent {
 
   /** @internal For the framework's shared slot; not a host API. */
   readRowChangesFrom(read: () => number): void {
+    this.stopCountingRowChanges?.();
+    this.stopCountingRowChanges = undefined;
     this.rowChanges = read;
   }
 

@@ -13954,15 +13954,17 @@ export class AgentFramework {
     try {
       const pin = this.turnRouting.get(agent.name)?.inputsPin;
       const excludePins = pin?.agent === agent ? [pin.id] : undefined;
-      const key = agent.restartPreviewKey(excludePins);
+      const key = () => JSON.stringify([agent.restartPreviewKey(excludePins), this.budgetHoldCanTake(agent)]);
       const remembered = this.restartDeclines.get(agent);
-      if (remembered?.streamId === agent.streamId && remembered.key === key) return { decline: remembered, previewed: false };
+      if (remembered?.streamId === agent.streamId && remembered.key !== undefined && remembered.key === key()) {
+        return { decline: remembered, previewed: false };
+      }
       const preview = agent.previewCompile(excludePins);
       if (preview !== null && !preview.fits && (!preview.clearedBy?.includes('compression') || !this.budgetHoldCanTake(agent))) {
         decline = {
           reason: 'wont_fit', finalTokens: preview.finalTokens, budgetTokens: preview.budgetTokens,
           ...(preview.clearedBy !== undefined ? { clearedBy: preview.clearedBy } : {}),
-          streamId: agent.streamId, ...(preview.clearedBy?.includes('newer-message') ? {} : { key }),
+          streamId: agent.streamId, ...(preview.clearedBy?.includes('newer-message') ? {} : { key: key() }),
         };
       }
     } catch (error) {
@@ -36123,15 +36125,16 @@ export class AgentFramework {
       : !agent ? 'unavailable (no agent handle)'
       : this.kickOverBudgetDrain(agentName, agent);
     if (overBudget) {
+      const opening = afterDecline
+        ? `the provider refused a request as too long on a stream whose maxStreamTokens restart was declined, since ${decline?.reason === 'uncovered_drop' ? 'its compile would drop messages no summary covers' : "its compile wouldn't fit"}`
+        : `compile refused (${errorType ?? 'unclassified'})`;
+      const close = ` — drain breaker ${drainState}; ` + (afterDecline
+        ? `if this persists, set physicalWindowTokens below the provider's window.`
+        : `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`);
       this.opsAlert(
         'context-refusal',
         agentName,
-        `${afterDecline ? `the provider refused a request as too long (context_length) on a stream whose maxStreamTokens restart was declined (${decline?.reason})`
-          : `compile refused (${errorType ?? 'unclassified'})`}: ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
-        `drain breaker ${drainState}; ` +
-        (afterDecline
-          ? `if this persists, raise contextBudgetTokens, or set physicalWindowTokens below the provider's window so the stream restarts before it.`
-          : `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`),
+        `${opening}: ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)}${close}`,
         { skipLog: true },
       );
     }
