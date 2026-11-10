@@ -854,6 +854,55 @@ describe('FrameworkConfig.effort: the thinking binding', () => {
       assert.equal(signed(provider.calls[3]!), false, 'so the reply minted after it goes without its thinking');
     } finally { await cleanup(); }
   });
+
+  it('walks only the rows written since its last answer of whether own effort rows are left out, and the whole store after a removal', async () => {
+    try {
+      const agent = { thinking: { enabled: true, budgetTokens: 1024 }, thinkingBinding: { binds: true, dropBlock: true } };
+      const { framework } = await resident({ agent });
+      const subject = framework.getAgent('agent')!;
+      const cm = subject.getContextManager();
+      const read = cm.getAllMessages.bind(cm);
+      // Each row's content read is counted. The view keeps the manager's identities: one array while the store is
+      // unchanged, and one object per row across writes.
+      let reads = 0;
+      const views = new WeakMap<object, object>();
+      const view = (row: object) => {
+        let seen = views.get(row);
+        if (!seen) {
+          seen = new Proxy(row, { get: (target, key, receiver) => { if (key === 'content') reads++; return Reflect.get(target, key, receiver); } });
+          views.set(row, seen);
+        }
+        return seen;
+      };
+      let source: unknown;
+      let viewed: object[] = [];
+      (cm as unknown as { getAllMessages(): object[] }).getAllMessages = () => {
+        const rows = read();
+        if (rows !== source) { source = rows; viewed = rows.map(view); }
+        return viewed;
+      };
+      const leftOut = () => (subject as unknown as { ownEffortRowsLeftOut(plan: undefined): boolean }).ownEffortRowsLeftOut(undefined);
+      for (let i = 0; i < 40; i++) cm.addMessage(i % 2 === 0 ? 'User' : 'agent', [{ type: 'text', text: `Row ${i}.` }]);
+      const stored = read().length;
+      reads = 0;
+      assert.equal(leftOut(), false, 'premise: no effort row stored');
+      assert.equal(reads, stored, 'premise: the first answer walks the whole store');
+      reads = 0;
+      leftOut();
+      assert.equal(reads, 0, 'no write since: no row read again');
+      cm.addMessage('User', [{ type: 'text', text: 'Row 40.' }]);
+      cm.addMessage('agent', [{ type: 'text', text: 'Row 41.' }]);
+      reads = 0;
+      assert.equal(leftOut(), false);
+      assert.equal(reads, 2, 'two rows written: only those two read');
+      const row = cm.addMessage('system', [effortBlock('low')], { effortRowOf: 'agent' });
+      assert.equal(leftOut(), true, 'an own effort row written is seen');
+      cm.removeMessage(row);
+      reads = 0;
+      assert.equal(leftOut(), false, 'its removal is seen');
+      assert.equal(reads, stored + 2, 'by walking the whole store again');
+    } finally { await cleanup(); }
+  });
 });
 
 describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () => {
