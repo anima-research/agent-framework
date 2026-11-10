@@ -13,7 +13,7 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
+import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetryClass, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { boundFailureText, compileRefusalType, failureWords, FAILURE_TEXT_MAX_CHARS, houseReason, isMembraneError, PROVIDER_ERROR_CODE_MAX_CHARS } from './failure-text.js';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
@@ -111,7 +111,7 @@ import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRe
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
-import { expandCoreTags, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
+import { expandCoreTags, isAmbient, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -720,7 +720,7 @@ const authorName = (metadata: Record<string, unknown> | undefined): string =>
 /** A wake's `ambient` mark: only a message its server tagged `chat:ambient`
  *  (RFC-001) is known to ask nothing of the agent. */
 const ambientMark = (tags?: string[]): { ambient?: true } =>
-  Array.isArray(tags) && tags.includes('chat:ambient') ? { ambient: true } : {};
+  isAmbient(tags) ? { ambient: true } : {};
 
 /** A wake's `systemNotice` mark: a message its server tagged `chat:system`
  *  (RFC-001 rev 3) is a notice about the place (a join, the weather), not
@@ -977,14 +977,14 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
-import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText, type WritePlacement } from './gate/event-gate.js';
+import { BATCH_LINE_ROWS, EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, type MarkedProvenance, type WakeWrite, type WritePlacement } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
 import {
   WakeDecisions, carriesAttention, isSuggestedRuleOf, isUndecided, offerFor, placementFor, rulesToWrite,
   type OfferedRule, type ServerOffer,
 } from './gate/wake-onboarding.js';
 import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatScheduledWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
-import type { GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
+import type { GateDecision, GateEventInfo } from './gate/types.js';
 import {
   MAX_RECENT, renderSuppressedDump, suppressedRecords, suppressionRecordOf, suppressionStats,
   type SuppressedDumpFormat, type SuppressedEventRecord,
@@ -1307,12 +1307,22 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
+/**
+ * The rows a batched wake's line can name (the gate's BATCH_LINE_ROWS), on
+ * the wake of every agent the batch wakes: a fresh start of the turn it
+ * starts writes one `[Gate: …]` line naming those of them in the agent's
+ * window, as its own row, where a row a reply could be meant for follows
+ * them there (placeBatchLine). It is empty for a batch with nothing to name,
+ * so a merge still takes the wake as a batch's (mergedBatchRows). Internal:
+ * a mark the framework's own gate wiring sets, exported for tests.
+ */
+export const BATCH_ROWS: unique symbol = Symbol('batch-rows');
 const UNPROMPTED: unique symbol = Symbol('unprompted');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
 const BUDGET_WAIT: unique symbol = Symbol('budget-wait');
 interface BudgetWait {
   since: number;
-  row?: string;
+  rows?: string[];
   alerted?: true;
 }
 interface TurnCarry {
@@ -1320,7 +1330,11 @@ interface TurnCarry {
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[] };
+
+function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
+  return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
+}
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
@@ -1387,6 +1401,12 @@ function continuesTurn(request: InferenceRequest): boolean {
 
 function budgetWaitOf(request: InferenceRequest | undefined): BudgetWait | undefined {
   return request ? (request as MarkedRequest)[BUDGET_WAIT] : undefined;
+}
+
+/** The rows a wake is for: its one row, or a batched wake's rows. */
+function wakeRows(request: InferenceRequest | undefined): string[] {
+  if (request?.readsRow !== undefined) return [request.readsRow];
+  return (request?.readsRows ?? []).map(({ row }) => row);
 }
 
 function turnCarryOf(request: InferenceRequest | undefined): TurnCarry | undefined {
@@ -1557,7 +1577,8 @@ interface TurnRouting {
   /** The turn asked for a ` !` continuation; taken once. */
   continuation: boolean;
   start?: { branch: string; sequence: number };
-  firstRow?: string;
+  /** The rows the wake that opened the turn reads: its one row, or a batched wake's rows. */
+  triggerRows?: string[];
   roundsRan?: true;
   unflushedRounds?: number;
   unpostedSpeech?: true;
@@ -3003,14 +3024,15 @@ export class DefaultErrorPolicy implements ErrorPolicy {
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
     if (isDeadlineExpiry(error)) {
-      const decision = retryDecision(this.settings.deadline ? 'deadline' : 'retryable', attempt + 1, undefined, this.settings);
-      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+      const cls = this.settings.deadline ? 'deadline' : 'retryable';
+      const decision = retryDecision(cls, attempt + 1, undefined, this.settings);
+      return decision.retry ? this.retryAction(cls, decision.delayMs) : { retry: false };
     }
     if (!isMembraneError(error)) {
       // Not a provider failure membrane classified: retried as any other
       // retryable failure, on the base schedule.
       const decision = retryDecision('retryable', attempt + 1, undefined, this.settings);
-      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+      return decision.retry ? this.retryAction('retryable', decision.delayMs) : { retry: false };
     }
     if (error.retryable === false) return { retry: false };
     // The facts membrane classifies by, read off the error itself (from either
@@ -3020,8 +3042,47 @@ export class DefaultErrorPolicy implements ErrorPolicy {
     const cls = classifyFailure({ retryable: facts.retryable !== false, type: facts.type, httpStatus: facts.httpStatus, message: facts.message });
     // `attempt` counts this turn's earlier failures; membrane counts tries.
     const decision = retryDecision(cls, attempt + 1, error.retryAfterMs, this.settings);
-    return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+    return decision.retry ? this.retryAction(cls, decision.delayMs) : { retry: false };
   }
+
+  /** A retry, with the class it was decided as and the tries that class's
+   *  schedule allows (membrane's choice of schedule: an `overloaded` failure
+   *  with no schedule of its own takes `retryable`'s). */
+  private retryAction(cls: RetryClass, delayMs: number): ErrorAction {
+    const schedule = cls === 'overloaded' ? this.settings.overloaded ?? this.settings.retryable : this.settings[cls];
+    const maxTries = schedule?.maxAttempts;
+    return { retry: true, delayMs, retryClass: cls, ...(typeof maxTries === 'number' ? { maxTries } : {}) };
+  }
+}
+
+/**
+ * A turn waiting out its error policy's delay before its next try, as
+ * healthSnapshot() reports it. While it waits, the agent's state is `idle`:
+ * the failed call reset it, and no call is out. The turn is alive all the
+ * same, and a wake arriving meanwhile is buffered until the turn ends.
+ */
+interface TurnRetryWait {
+  /** When the wait began (epoch ms). */
+  since: number;
+  /** When it is due to end (epoch ms), as `inference:waiting` says it.
+   *  Absent for a wait too long for a date. */
+  until?: number;
+  /** The try the wait leads to, as the error policy counts tries (against
+   *  `maxTries`): each failed start counts, whether or not it reached the
+   *  provider; a provider hold that queues the turn again starts the count
+   *  over; a deadline's retries count that call's expiries. So it is the
+   *  policy's place in its schedule, not a count of sends. Absent only from a
+   *  wait started without it. */
+  nextTry?: number;
+  /** The most tries the policy allows (ErrorAction.maxTries), when it says
+   *  so as a positive whole number. A turn re-armed after it ran out of tries
+   *  ends at its second deadline expiry with no completed round, transient
+   *  failure or message said to it between them, whatever this says. */
+  maxTries?: number;
+  /** What the policy retries the failure as (ErrorAction.retryClass), such as
+   *  `overloaded`, when it says. A longer one than 128 characters is shown
+   *  as its start and end around a note of how much was left out. */
+  retryClass?: string;
 }
 
 /** How many upcoming wakes healthSnapshot lists per agent: an agent can hold any number of reminders. */
@@ -3182,7 +3243,11 @@ interface BudgetHold {
   startedAt: number;
   wait: BudgetWait;
   turn: InferenceRequest;
+  /** The rows its wake read. It's dropped once every one has left, since one
+   *  removed message leaves the others still to answer. */
   standsOn: string[];
+  /** A continued turn's own rows since its start. Any one leaving drops it. */
+  ownRows: string[];
   wakes: InferenceRequest[];
   errorType: 'over_budget' | 'context_refusal';
   reason: string;
@@ -4217,17 +4282,26 @@ function isPrimaryIfUnread(metadata: unknown): boolean {
   return (metadata as Record<string, unknown> | null | undefined)?.[PRIMARY_IF_UNREAD_KEY] === true;
 }
 
-/** The batched-wake lines a merge of wakes carries (InferenceRequest
- *  wakeLines), one per event, in request order; undefined for none. */
-function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | undefined {
-  const byEntry = new Map<string, WakeLine>();
-  for (const request of requests) {
-    for (const line of request.wakeLines ?? []) {
-      const key = wakeLineKey(line);
-      if (!byEntry.has(key)) byEntry.set(key, line);
-    }
-  }
-  return byEntry.size > 0 ? [...byEntry.values()] : undefined;
+function readsRowsKey(request: InferenceRequest | undefined): string {
+  return JSON.stringify(request?.readsRows ?? null);
+}
+
+function batchRowsKey(request: InferenceRequest | undefined): string {
+  return JSON.stringify(batchRowsOf(request) ?? null);
+}
+
+function isGateLine(m: StoredMessage): boolean {
+  return (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce';
+}
+
+/** One channel's entry in a batched wake's line: how many of the wake's
+ *  messages are in it, or name none, and how long ago the oldest arrived,
+ *  as of `now`. */
+function batchReferenceLine(count: number, channel: string | undefined, oldest: number, now: number): string {
+  const age = Math.round((now - oldest) / 1000);
+  return `- ${count} message${count > 1 ? 's' : ''} ${channel === undefined ? 'with no channel' : `in ${channel}`} ` +
+    `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
+    `batched wake, not new content`;
 }
 
 function wakeChannelsOf(requests: readonly ({ wakeChannels?: ChannelRef[] } | undefined)[]): ChannelRef[] | undefined {
@@ -4238,10 +4312,14 @@ function wakeChannelsOf(requests: readonly ({ wakeChannels?: ChannelRef[] } | un
   return channels.length > 0 ? channels : undefined;
 }
 
-/** A batched-wake line's identity: its event's stored entry. */
-function wakeLineKey(line: WakeLine): string {
-  const { eventType, serverId, channelId, messageId, eventId } = line.entry;
-  return JSON.stringify([eventType, serverId ?? null, channelId ?? null, messageId ?? null, eventId ?? null]);
+/** Whether the scheduler could drop `request` once the agent has read it: it
+ *  reads rows (readsRow, readsRows), or it's a start merged from wakes
+ *  (MERGED_BATCH) each of which could be, since the scheduler judges those
+ *  one by one. */
+function droppableAsRead(request: InferenceRequest): boolean {
+  const batch = mergedBatch(request);
+  if (batch?.length) return batch.every(droppableAsRead);
+  return request.readsRow !== undefined || request.readsRows !== undefined;
 }
 
 /** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
@@ -4267,7 +4345,8 @@ const JUDGE_PARAMETER: ToolParameter = {
     'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
     'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
     'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
-    'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
+    'If the judge fails or times out you are woken, unless your host set it to stay quiet then or every ' +
+    'event in the batch was written for you and you\'ve already read and answered it. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {
     debounceMs: { type: 'number', description: 'Quiet period (ms) before the batch is judged (100–300000).' },
@@ -4422,6 +4501,11 @@ export class AgentFramework {
   private providerWaits: ProviderWaits | undefined;
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
   private retryWaitWakers = new Set<() => void>();
+  /** Each agent's error-policy retry wait in progress, for healthSnapshot():
+   *  while it lasts the agent's state reads `idle` though its turn is alive.
+   *  Keyed by the Agent, not its name: an agent registered under a removed
+   *  one's name doesn't inherit its wait. */
+  private turnRetryWaits = new WeakMap<Agent, TurnRetryWait>();
   private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   private providerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
@@ -4795,6 +4879,8 @@ export class AgentFramework {
    *  where the liveness watchdog starts, or would if it isn't enabled, and
    *  leaves in stop() where the watchdog stops. */
   private static readonly diagnosed = new Set<AgentFramework>();
+  /** How many of a window's newest rows batchIsNewest reads. */
+  private static readonly NEWEST_SCAN_ROWS = 32;
   private static diagnosticsListenerInstalled = false;
 
   // MCPL subsystems (null when no mcplServers configured)
@@ -4918,11 +5004,12 @@ export class AgentFramework {
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
-  /** The batched-wake lines already written (placeWakeLines), and the agents
-   *  each was written for, so every later start of a wake writes each at
-   *  most once for its agent: the delivery agent alone, and with the
-   *  presentation index each resident a wake was for. */
-  private readonly placedWakeLines = new WeakMap<WakeLine, Set<string>>();
+  /** The batched wakes' rows (BATCH_ROWS) whose line a start has written,
+   *  with the agents it was written for, by the array every copy of a wake's
+   *  request carries; and a merge's union's parts (batchRowsParts), which
+   *  placing the union places. */
+  private readonly placedBatchRows = new WeakMap<readonly string[], Set<string>>();
+  private readonly batchRowsParts = new WeakMap<readonly string[], ReadonlyArray<readonly string[]>>();
   /** Rounds of tool calls, by their results array, that a save_recent_image
    *  in the round counted by their share of the bound: such a round is
    *  stored by its share whether or not it fits (buildStoredToolResultContent). */
@@ -4941,11 +5028,11 @@ export class AgentFramework {
   private readonly managerReleases = new WeakMap<Agent, ManagerRelease>();
   private readonly releasedByCleanup = new WeakSet<Agent>();
   private readonly resumesPending = new Map<string, Agent | undefined>();
-  // context-manager 0.25.1: a strategy that keeps its context, as
-  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3156),
+  // context-manager 0.27.0: a strategy that keeps its context, as
+  // AutobiographicalStrategy does (hostContext, autobiographical.ts:3150),
   // keeps its manager reachable while its work is pending, since the
   // context's tools and systemPrompt getters close over the manager
-  // (context-manager.ts:4602-4621). So such a released manager is collected
+  // (context-manager.ts:4626-4645). So such a released manager is collected
   // only once nothing of its work can still read the store, and stop()
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
@@ -5254,7 +5341,7 @@ export class AgentFramework {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
           "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
-          'Install @animalabs/context-manager ^0.25.1, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
+          'Install @animalabs/context-manager ^0.27.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
@@ -5702,15 +5789,18 @@ export class AgentFramework {
         requestInference: (agentName, reason, source, provenance, after) => {
           const request: MarkedRequest = {
             agentName, reason, source, timestamp: Date.now(),
-            ...framework.readsRowFor(after, agentName),
+            ...(provenance?.writes ? framework.readsRowsFor(provenance.writes, agentName) : framework.readsRowFor(after, agentName)),
+            // The rows the batch's line can name, on every agent's wake: each
+            // one's start decides its own line by its own window (placeBatchLine).
+            ...((): Partial<MarkedRequest> => {
+              const placed = (provenance as MarkedProvenance | undefined)?.[BATCH_LINE_ROWS];
+              return placed ? { [BATCH_ROWS]: placed.flatMap((p) => (p.messageId ? [p.messageId] : [])) } : {};
+            })(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
             // as TELEMETRY fields — the host's stamp reads them.
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
-            // The batch's line, when the gate left it to the turn's start
-            // (beginAgentTurn decides it: placeWakeLines).
-            ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
@@ -5748,13 +5838,10 @@ export class AgentFramework {
         // them to the registered composite id the same way ingestion does
         // (handleMcplPushEvent registers that channel on arrival, before any
         // debounce can fire).
-        // A batched wake's summary names each channel as the agent names it
-        // back, with its server where another server shares its id.
+        // The judge's summary of a batch names each channel as the agent
+        // names it back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? suppliedValue(channel.channelId),
-        // A batched wake for one message still newest in the window hands its
-        // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
-        // to decide (placeWakeLines).
-        isNewestEntry: (entry, recipients) => framework.isNewestContextEntry(entry, recipients),
+        isAnswered: (after) => framework.answeredWrite(after),
         // What a source can send, for the rule-order notes: an MCPL server's
         // events reach the gate as its pushes and channel messages only (a
         // module's events carry a source of the module's own, such as "cli"
@@ -6850,9 +6937,13 @@ export class AgentFramework {
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
-   * request already queued for it (it runs as soon as the agent is free) and
-   * turns a provider cooldown holds until its end. The reply judge is told of
-   * them beside the gate's own timers, so it can weigh what waiting costs.
+   * request already queued for it, which runs as soon as the agent is free,
+   * and turns a provider cooldown holds until its end. Either only may wake
+   * the agent when each request reads rows (readsRow, readsRows) and nothing
+   * else, or is a start merged from such wakes (droppableAsRead), since the
+   * scheduler drops one whose rows the agent has answered by then. The reply
+   * judge is told of them beside the gate's own timers, so it can weigh what
+   * waiting costs.
    */
   private upcomingWakesFor(agentName: string): import('./gate/types.js').UpcomingWake[] {
     const wakes: import('./gate/types.js').UpcomingWake[] = [];
@@ -6860,14 +6951,14 @@ export class AgentFramework {
     if (queued.length > 0) {
       const reason = queued[0]!.reason;
       wakes.push({
-        certain: true,
+        certain: queued.some((r) => !droppableAsRead(r)),
         kind: 'queued',
         what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})`,
       });
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
-      wakes.push({ at: cooldown.until, certain: true, kind: 'provider-hold', what: cooldown.rearm
+      wakes.push({ at: cooldown.until, certain: cooldown.heldRequests.some((r) => !droppableAsRead(r)), kind: 'provider-hold', what: cooldown.rearm
         ? `a turn whose retries ran out, sent again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
         : 'a turn held by a provider cooldown, when it ends' });
     }
@@ -6878,9 +6969,12 @@ export class AgentFramework {
   /**
    * What will wake `agentName` with no new event, as healthSnapshot reports
    * it: soonest first, the first HEALTH_UPCOMING_WAKES of them, each with its
-   * time, kind and whether the rule table lets it wake the agent (a probe:
-   * gate.js isn't asked). A wake's `what` stays out: it can quote a reminder or
-   * a queue reason, and health goes to observers granted nothing else.
+   * time, kind and whether it will wake the agent (`UpcomingWake.certain`).
+   * It only may where the rule table would hold it back (a probe: gate.js
+   * isn't asked) or hands it to the judge, or where it starts no turn once
+   * the agent has answered the rows it reads. A wake's `what` stays out:
+   * it can quote a reminder or a queue reason, and health goes to observers
+   * granted nothing else.
    *
    * The field is left out when this can't say, so that it isn't taken for an
    * agent with nothing due: when a read throws, and when the heartbeat is
@@ -6988,7 +7082,7 @@ export class AgentFramework {
     const targets = this.heartbeatTargets();
     const silent = wake.kind === 'heartbeat' && wake.silent;
     // Without a gate, a push wakes the agent, and so does a tick.
-    const triggers = (): boolean => !this.eventGate || this.eventGate.evaluate(this.heartbeatGateEvent({ ...wake, silent })).trigger;
+    const triggers = (after?: WritePlacement): boolean => !this.eventGate || this.eventGate.evaluate(this.heartbeatGateEvent({ ...wake, silent }), after).trigger;
     if (silent) {
       if (!triggers()) return;
       console.error(`[heartbeat] silent scheduled wake ${logValue(wake.eventId)}`);
@@ -7010,7 +7104,7 @@ export class AgentFramework {
     // id yet, and is traced once, as its release stores it (surgery-release).
     if (id) this.emitTrace({ type: 'message:added', messageId: id, source: wake.kind === 'reminder' ? 'heartbeat:reminder' : 'heartbeat' });
     // The text is in context whatever the rules decide, as a push's is.
-    if (!triggers()) return;
+    if (!triggers(placement)) return;
     for (const agentName of targets) {
       this.pendingRequests.push({
         agentName, reason: wake.kind, source: 'heartbeat', timestamp: Date.now(),
@@ -7231,7 +7325,7 @@ export class AgentFramework {
    *  same agent, reason, source, time and channel, on the same server (two
    *  servers' channels can share an id), and the same coalescing
    *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
-   *  single subject), and the write a wake reads. A wake with any of them
+   *  single subject), and the rows a wake reads. A wake with any of them
    *  can be withdrawn or dropped on its own, and must not stand for one
    *  without. (coalescingBatch is set only beside one of the first two.) */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
@@ -7239,8 +7333,7 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow &&
-      (a.wakeLines ?? []).map(wakeLineKey).join('\n') === (b.wakeLines ?? []).map(wakeLineKey).join('\n');
+      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b);
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
@@ -7504,12 +7597,12 @@ export class AgentFramework {
     const turn = retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
-    const standsOn = !continuesTurn(turn) && carried
-      ? (carried.row !== undefined ? [carried.row] : [])
+    const { standsOn, ownRows } = !continuesTurn(turn) && carried
+      ? { standsOn: [...(carried.rows ?? [])], ownRows: [] }
       : this.rowsTurnStandsOn(agent, turn, routing);
     const wait: BudgetWait = {
       since: carried?.since ?? startedAt,
-      ...(!continuesTurn(turn) && standsOn[0] !== undefined ? { row: standsOn[0] } : {}),
+      ...(!continuesTurn(turn) && standsOn.length > 0 ? { rows: standsOn } : {}),
       ...(carried?.alerted ? { alerted: true } : {}),
     };
     (turn as MarkedRequest)[BUDGET_WAIT] = wait;
@@ -7519,6 +7612,7 @@ export class AgentFramework {
       wait,
       turn,
       standsOn,
+      ownRows,
       wakes: [],
       errorType,
       reason: boundFailureText(String(error.message)),
@@ -7576,14 +7670,12 @@ export class AgentFramework {
     return true;
   }
 
-  private rowsTurnStandsOn(agent: Agent, turn: InferenceRequest, routing: TurnRouting): string[] {
-    if (!continuesTurn(turn)) {
-      const row = this.activeTurnTriggers.get(agent.name)?.readsRow;
-      return row !== undefined ? [row] : [];
-    }
-    const rows = routing.firstRow !== undefined ? [routing.firstRow] : [];
+  private rowsTurnStandsOn(agent: Agent, turn: InferenceRequest, routing: TurnRouting): { standsOn: string[]; ownRows: string[] } {
+    if (!continuesTurn(turn)) return { standsOn: wakeRows(this.activeTurnTriggers.get(agent.name)), ownRows: [] };
+    const standsOn = [...(routing.triggerRows ?? [])];
+    const rows: string[] = [];
     const from = routing.start?.sequence;
-    if (from === undefined) return rows;
+    if (from === undefined) return { standsOn, ownRows: rows };
     try {
       const ownCalls = new Set<string>();
       for (const row of agent.getContextManager().getPresentedMessages()) {
@@ -7592,9 +7684,9 @@ export class AgentFramework {
         rows.push(String(row.id));
       }
     } catch (error) {
-      console.error(`[budget-hold] agent=${agent.name}: could not read the rows its held turn stands on, so a surgery checks its first row alone:`, error);
+      console.error(`[budget-hold] agent=${agent.name}: could not read the rows its held turn stands on, so a surgery checks its wake's rows alone:`, error);
     }
-    return rows;
+    return { standsOn, ownRows: rows };
   }
 
   private compressionPending(agent: Agent): boolean {
@@ -7819,8 +7911,8 @@ export class AgentFramework {
   }
 
   private budgetWaitEnded(agent: Agent, trigger: InferenceRequest | undefined): boolean {
-    const row = budgetWaitOf(trigger)?.row;
-    if (row === undefined || !this.rowLeftWindow(agent, row)) return false;
+    const rows = budgetWaitOf(trigger)?.rows ?? [];
+    if (rows.length === 0 || !rows.every((row) => this.rowLeftWindow(agent, row))) return false;
     const batch = mergedBatch(trigger!);
     if (batch) appendAll(this.pendingRequests, batch.filter((r) => budgetWaitOf(r) === undefined));
     this.endContinuedTurn(agent.name, { kind: 'dropped', why: 'what its held turn stood on was removed', reason: BUDGET_HELD_TURN_REMOVED }, true);
@@ -7831,12 +7923,16 @@ export class AgentFramework {
     for (const [agentName, hold] of [...(this.budgetHolds?.entries() ?? [])]) {
       const agent = this.agents.get(agentName);
       if (!agent || (only !== undefined && agentName !== only) || this.budgetHolds?.get(agentName) !== hold) continue;
-      const wakes = hold.wakes.filter((wake) => wake.readsRow === undefined || !this.rowGone(agent, wake.readsRow));
+      const wakes = hold.wakes.filter((wake) => {
+        const rows = wakeRows(wake);
+        return rows.length === 0 || !rows.every((row) => this.rowGone(agent, row));
+      });
       if (wakes.length < hold.wakes.length) {
         console.error(`[budget-hold] agent=${agentName}: ${hold.wakes.length - wakes.length} held wake(s) dropped, their rows removed`);
       }
       hold.wakes = wakes;
-      if (hold.standsOn.some((row) => this.rowLeftWindow(agent, row))) {
+      const left = (row: string) => this.rowLeftWindow(agent, row);
+      if (hold.ownRows.some(left) || (hold.standsOn.length > 0 && hold.standsOn.every(left))) {
         this.dropHeldTurn(agentName, hold, 'a surgery or an undo removed what its held turn stood on');
       } else if (release) {
         this.releaseBudgetHold(agentName);
@@ -7995,12 +8091,29 @@ export class AgentFramework {
    * (checkWindow) carries a waker that ends the whole wait: a stop
    * abortInference() records, or an operator's abandon, wakes it.
    */
-  private async waitForRetry(ms: number, checkWindow: CheckWindow, agent: Agent): Promise<void> {
+  private async waitForRetry(
+    ms: number,
+    checkWindow: CheckWindow,
+    agent: Agent,
+    about?: { nextTry: number; action: ErrorAction },
+  ): Promise<void> {
     // An infinite delay waits until stop(), like any wait too long to end; a
     // delay that isn't a number, or is 0 or less, waits none.
     let remaining = ms > 0 ? ms : 0;
     if (!(remaining > 0)) return;
-    const until = Date.now() + remaining;
+    const since = Date.now();
+    const until = since + remaining;
+    // What healthSnapshot() and inference:waiting say of the wait: the try it
+    // leads to, and what the policy said of the retry, when it said.
+    // (Every caller in the framework passes them; the wait still runs without.)
+    const action = about?.action;
+    const shown = {
+      ...(about ? { nextTry: about.nextTry } : {}),
+      ...(action?.retry && Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? { maxTries: action.maxTries } : {}),
+      ...(action?.retry && typeof action.retryClass === 'string' ? { retryClass: boundFailureText(action.retryClass, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
+    };
+    const record: TurnRetryWait = { since, ...(until <= MAX_DATE_MS ? { until } : {}), ...shown };
+    this.turnRetryWaits.set(agent, record);
     // stop() wakes this step through retryWaitWakers and ends the rest by
     // closing admission; the window's waker ends the rest itself.
     let ended = false;
@@ -8018,7 +8131,7 @@ export class AgentFramework {
         if (sinceSaid >= every) {
           sinceSaid = 0;
           if (this.agents.get(agent.name) === agent) {
-            this.emitTrace({ type: 'inference:waiting', agentName: agent.name, ...(until <= MAX_DATE_MS ? { until } : {}) });
+            this.emitTrace({ type: 'inference:waiting', agentName: agent.name, ...(until <= MAX_DATE_MS ? { until } : {}), ...shown });
           }
           if (over()) return;
         }
@@ -8033,6 +8146,7 @@ export class AgentFramework {
       }
     } finally {
       wakers.delete(wake);
+      if (this.turnRetryWaits.get(agent) === record) this.turnRetryWaits.delete(agent);
     }
   }
 
@@ -10084,7 +10198,9 @@ export class AgentFramework {
   }
 
   private hasTurn(agentName: string): boolean {
-    return this.activeTurnTokens.has(agentName) || this.pendingContinuationAgents().has(agentName);
+    // Read defensively, as pendingContinuationAgents reads its fields: healthSnapshot()
+    // calls this, and the operator tests build a framework from the prototype.
+    return (this.activeTurnTokens?.has(agentName) ?? false) || this.pendingContinuationAgents().has(agentName);
   }
 
   /** The provider hold keeping `agentName`'s turn for its retry (TURN_RETRY),
@@ -14465,7 +14581,9 @@ export class AgentFramework {
           },
           debounceMs: {
             type: 'number',
-            description: 'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000).',
+            description:
+              'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000), unless by the ' +
+              'time it would start your turn every event in the batch was written for you and you\'ve read and answered it.',
           },
           rateLimit: {
             type: 'object',
@@ -20143,6 +20261,7 @@ export class AgentFramework {
     const eventServer = (event as { serverId?: unknown }).serverId;
     const stampSource = typeof eventServer === 'string' && eventServer !== '' ? eventServer : source;
     let added: WritePlacement | undefined;
+    let wakeAfter: WritePlacement | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
@@ -20158,7 +20277,10 @@ export class AgentFramework {
           placement, ...(audience ? { audience } : {}),
           ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source: stampSource } } : {}),
         });
-        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
+        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) {
+          wakeAfter = placement;
+          if (id && !audience && !heldFromResidents(metadata)) added = placement;
+        }
         // A write kept in memory (a surgery's hold, or the wait for its
         // agent's recovery) has no id yet: it is traced once, as it is
         // stored ('surgery-release').
@@ -20202,7 +20324,7 @@ export class AgentFramework {
           serverId: source,
           channelId: '',
           ...(suppressionAsked ? { suppressionAsked: true } : {}),
-        });
+        }, added);
         if (!decision.trigger) return;
       }
 
@@ -20222,7 +20344,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            ...this.readsRowFor(added, agentName),
+            ...this.readsRowFor(wakeAfter, agentName),
           });
         }
       }
@@ -20425,6 +20547,7 @@ export class AgentFramework {
     // whether this counts as the latest delivered inbound. Every path below
     // consumes `decision`; none re-asks the policy.
     const addressed = isAddressedMessage(event.tags);
+    const placement: CoalescingPlacement = { agent: '' };
     // Under conversation routing the message may go to a fork's own store,
     // which has no view filter, so nothing on this lane is suppressed there.
     const decision = this.admitInbound({
@@ -20451,7 +20574,7 @@ export class AgentFramework {
         author: event.author,
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    }, { suppressible: !this.conversationRouter, ...(event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}) });
+    }, { suppressible: !this.conversationRouter, ...(event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}) }, placement);
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
@@ -20482,7 +20605,7 @@ export class AgentFramework {
           this.storeDueClock(target, 'event');
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
-        const placement = this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content), event.mayBeStored);
+        Object.assign(placement, this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content), event.mayBeStored));
         // Delivered to the fork, so it is the latest delivered inbound too
         // (the channel context's `incoming`; the fallback locus under the
         // legacy rule), as a resident's delivery is below.
@@ -20515,7 +20638,9 @@ export class AgentFramework {
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       decision.recipients = [target.name];
     } else if (this.conversationRouter) {
-      return this.routeConversationIncoming({ ...event, content }, metadata, decision);
+      const written = await this.routeConversationIncoming({ ...event, content }, metadata, decision);
+      if (written) Object.assign(placement, written);
+      return written;
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
@@ -20555,7 +20680,6 @@ export class AgentFramework {
     // the fallback locus under the legacy rule) — a held one never is.
     // A suppressed one is stored with its record (suppressedRow) and rendered
     // nowhere, and is never the latest delivered inbound either.
-    const placement: CoalescingPlacement = { agent: '' };
     // The row is for the recipients admission delivered it to, and for none
     // of them when a tune-out holds it or a suppress rule took it
     // (inboundAudience).
@@ -22499,6 +22623,7 @@ export class AgentFramework {
     // Admission (Dendrite §D): the same decision as the channel lane. A DM
     // arrives here, so this is where tuning out a DM takes effect (#232 gap
     // 1). An event with no channel provenance cannot be held.
+    const placement: CoalescingPlacement = { agent: '' };
     const decision = this.admitInbound({
       lane: 'push',
       serverId: event.serverId,
@@ -22521,7 +22646,7 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    }, event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {});
+    }, event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}, placement);
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
@@ -22533,7 +22658,6 @@ export class AgentFramework {
       );
     }
 
-    const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
       // The row is for the recipients admission delivered it to, and for none
       // of them when a tune-out holds it or a suppress rule took it
@@ -22910,21 +23034,22 @@ export class AgentFramework {
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
-          // and a wake that reads a row is its row's (readsRow): neither may
-          // absorb an unrelated wake that would vanish with it.
+          // and a wake that reads rows is its rows' (readsRow, readsRows):
+          // neither may absorb an unrelated wake that would vanish with it.
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.privateCaller ? 'p' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${budgetWaitOf(request) ? 'waited' : ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.privateCaller ? 'p' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${readsRowsKey(request)}|${budgetWaitOf(request) ? 'waited' : ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
-          // The wake it absorbs hands on its lines (WakeLine): each event's
-          // line stays to be decided when the host resumes.
-          const lines = prev ? mergeWakeLines([prev, request]) : undefined;
-          if (lines) kept.wakeLines = lines;
           const pair = prev ? [prev, request] : undefined;
           const channels = pair ? wakeChannelsOf(pair) : undefined;
           if (channels) kept.wakeChannels = channels;
+          if (pair) {
+            const rows = this.mergedBatchRows(kept.agentName, pair);
+            if (rows) (kept as MarkedRequest)[BATCH_ROWS] = rows;
+            else delete (kept as MarkedRequest)[BATCH_ROWS];
+          }
           newestByKey.set(key, kept);
         }
         appendAll(this.pendingRequests, [...newestByKey.values()]);
@@ -23024,18 +23149,20 @@ export class AgentFramework {
         continue;
       }
 
-      // A wake whose sole cause was a stored row (readsRow): one not
-      // presented to this agent at its write, stored during its turn, or one
-      // stored for it as it arrived, has nothing left to do once a request
-      // that carried that row was answered and, if the wake carries a
-      // channel and isn't marked ambient, the agent has published there
-      // since, or once the row is gone from the store's current branch: it
-      // starts no turn (rowDone). A wake is marked ambient when its
+      // A wake whose sole cause was a stored row (readsRow), or a batch's
+      // rows (readsRows, every one of them): one not presented to this agent
+      // at its write, stored during its turn, or one stored for it as it
+      // arrived, has nothing left to do once a request that carried that row
+      // was answered and, if the wake carries a channel and isn't marked
+      // ambient (for readsRows, if the row's replyTo names one), the agent
+      // has published there since, or once the row is gone from the store's
+      // current branch: it starts no turn (rowDone). A wake is marked ambient when its
       // message's server tagged it chat:ambient, or for a render, every
       // notice the render stands for: such a message asked nothing of the
       // agent, so reading it was all its wake was for, as for a chat:system
       // notice. One with neither tag is judged as addressed.
       const read = requests.filter((r) => {
+        if (r.readsRows !== undefined) return r.readsRows.every(({ row, replyTo }) => this.rowDone(agent, row, replyTo));
         if (r.readsRow === undefined) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
         // speech is routed by it, so waiting for one in its channel would
@@ -23049,7 +23176,7 @@ export class AgentFramework {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
         appendAll(requests, left);
-        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the wake's channel where it carries one not marked ambient, or that were removed` +
+        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
           this.endPendingPrimary(agentName);
@@ -23191,7 +23318,7 @@ export class AgentFramework {
       // exists only once assembly renders it. Recorded for the whole batch
       // (not inherited from requests[0]), so a requeued trigger stays honest.
       const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
-      const merged: InferenceRequest = {
+      const merged: MarkedRequest = {
         ...trigger,
         coalescingBatch: batchOnly || undefined,
         coalescingBatchSubjects: batchOnly
@@ -23208,9 +23335,11 @@ export class AgentFramework {
         // take no other cause with it.
         readsRow: requests.every((r) => r.readsRow === trigger?.readsRow)
           ? trigger?.readsRow : undefined,
-        // Every merged wake's handed line, each event's once: the turn's start
-        // decides each (beginAgentTurn).
-        wakeLines: mergeWakeLines(requests),
+        readsRows: requests.every((r) => readsRowsKey(r) === readsRowsKey(trigger))
+          ? trigger?.readsRows : undefined,
+        // A batched wake's line names the rows of every batch the turn is
+        // for, and none where a wake that isn't a batch's is merged in.
+        [BATCH_ROWS]: trigger ? this.mergedBatchRows(trigger.agentName, requests) : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         // A heartbeat's turn when any cause is a heartbeat's wake and none
@@ -25702,9 +25831,6 @@ export class AgentFramework {
     };
   }
 
-  /** Rows isNewestIn reads back past clock rows and stored injections. */
-  private static readonly NEWEST_SCAN_ROWS = 32;
-
   /** Rows a window's last-clock scan reads at a time. */
   private static readonly CLOCK_SCAN_ROWS = 256;
 
@@ -28089,20 +28215,13 @@ export class AgentFramework {
     // fails throws, and fails the start, as the turn start's does.
     if (assembled && !this.quiesced && this.presents(agent)) appendAll(presented, this.presentation!.presentAtStart(agent, 'assembly'));
 
-    // The batched-wake lines the gate left to this start (WakeLine), decided
-    // now that the turn's inputs are in and before its checkpoint: on each
-    // start of an agent the wake is for whose window presents, and for an
-    // agent whose window is the record, on the delivery agent's alone
-    // (placeWakeLines), from here to the compile an arrival into its window is
-    // deferred past this request. Not on a start that resumes a logical turn,
-    // as the flushes above: it takes in no new input. Each line is written at
-    // most once (placeWakeLines); one left out is decided again by a later
-    // fresh start of the same wake (a provider hold's release, a requeue),
-    // whose window may have taken arrivals while the turn was held. Fresh
-    // starts only, as the flushes: a retry re-sends the same turn, and what
-    // follows the message by then is mostly the first attempt's own notices or
-    // rounds, so a line would land after them, mid-turn.
-    if (trigger?.wakeLines && attempt === 0 && !resumesTurn) this.placeWakeLines(agent, trigger.wakeLines);
+    // A batched wake's line, decided now that the turn's inputs are in and
+    // before its own notices and checkpoint (placeBatchLine). At a fresh
+    // start of the wake only, a provider hold's release among them: an
+    // attempt after the first re-sends the same request, and a start that
+    // resumes a logical turn continues one already under way.
+    const batchRows = batchRowsOf(trigger);
+    if (batchRows && attempt === 0 && !resumesTurn) this.placeBatchLine(agent, batchRows);
 
     // An autoContinue continuation's `[continue]` row, written here: the
     // turn has passed every gate that could still stop it (a stopping
@@ -28133,8 +28252,8 @@ export class AgentFramework {
     }
 
     // The turn has passed its gate, so from here it goes on with a copy of
-    // its trigger without a batch wake's marks or the mark of a wake for a
-    // row it reads (readsRow). A retry of it then comes back as an ordinary wake by
+    // its trigger without a batch wake's marks or the mark of a wake for the
+    // rows it reads (readsRow, readsRows). A retry of it then comes back as an ordinary wake by
     // whatever door it takes (a provider hold's release, the auxiliary park's
     // requeue, the tool-result guard's restart): this gate doesn't withdraw
     // it for finding its batches consumed, no withdrawal of the subject's
@@ -28144,8 +28263,8 @@ export class AgentFramework {
     // once this attempt's compile has moved the watermark past the row.
     // This frame's activeTurnTriggers entry keeps the trigger as it came; a
     // retry's frame records the copy it carries.
-    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined) {
-      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, ...retry } = trigger;
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined || trigger?.readsRows !== undefined) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, ...retry } = trigger;
       trigger = retry;
     }
     // The wakes merged into this start are the turn's now: it reads them,
@@ -28202,7 +28321,7 @@ export class AgentFramework {
       if (continued?.roundsRan) routing.roundsRan = true;
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
       if (continued?.start) routing.start = continued.start;
-      if (continued?.firstRow !== undefined) routing.firstRow = continued.firstRow;
+      if (continued?.triggerRows !== undefined) routing.triggerRows = continued.triggerRows;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -28217,8 +28336,8 @@ export class AgentFramework {
     if (opensTurn) {
       const head = agent.branchHead();
       if (head && !routing.start) routing.start = head;
-      const firstRow = this.activeTurnTriggers.get(agent.name)?.readsRow;
-      if (firstRow !== undefined) routing.firstRow = firstRow;
+      const triggerRows = wakeRows(this.activeTurnTriggers.get(agent.name));
+      if (triggerRows.length > 0) routing.triggerRows = triggerRows;
       // A silent start, and an agent whose configuration turns the pin off
       // (turnInputsPin: false), pin nothing, and a pin of the name left from
       // before goes.
@@ -28766,14 +28885,16 @@ export class AgentFramework {
       }
 
       const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+      // The earlier failures the policy counts, which the wait's nextTry follows.
+      const policyAttempt = cuts ?? attempt;
       const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(routing) || (isDeadlineExpiry(err) && !asTransient)))
-        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
       if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
       else this.deadlineCuts.delete(agent.name);
       if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
-        await this.waitForRetry(action.delayMs, checkWindow, agent);
+        await this.waitForRetry(action.delayMs, checkWindow, agent, { nextTry: policyAttempt + 2, action });
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
           // it, and a stop kept for the turn goes with it. The turn ends as
@@ -30723,8 +30844,10 @@ export class AgentFramework {
             }
 
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+            // The earlier failures the policy counts, which the wait's nextTry follows.
+            const policyAttempt = cuts ?? attempt;
             const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
-              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
@@ -30736,7 +30859,7 @@ export class AgentFramework {
               const retryWindow: CheckWindow = { abandoned: false };
               this.checkAhead.set(agent, retryWindow);
               // A policy's delay can be a provider's retry-after: wait all of it.
-              await this.waitForRetry(action.delayMs, retryWindow, agent);
+              await this.waitForRetry(action.delayMs, retryWindow, agent, { nextTry: policyAttempt + 2, action });
               if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
@@ -34314,174 +34437,6 @@ export class AgentFramework {
     return named.length > 0 ? named : [agent];
   }
 
-  /**
-   * Whether an MCPL event's own stored entry is the newest entry in the window
-   * a batched wake's line is written to, with no turn alive there (turnAlive:
-   * started, streaming, or waiting on its tools): the window of each agent a
-   * targeted event was delivered to (`recipients`), else the delivery
-   * agent's (deliveryAgent(): the primary's). The gate then hands the line to
-   * the wake (WakeLine) instead of writing it, and the turn's start decides
-   * it (placeWakeLines). A channel message is found by its server, channel
-   * and message id, a push event by its server and event id. A message a
-   * tune-out holds from the residents is never "newest" here.
-   */
-  private isNewestContextEntry(entry: GateEntryRef, recipients?: readonly string[]): boolean {
-    const agents = recipients !== undefined ? recipients.map((name) => this.agents.get(name)) : [this.deliveryAgent()];
-    if (agents.length === 0) return false;
-    // A turn starting, streaming or waiting on its tools writes after the
-    // message, and the line says which message the wake is for.
-    return agents.every((agent) => agent !== undefined && !this.turnAlive(agent) && this.isNewestIn(agent, entry));
-  }
-
-  /**
-   * Write the batched-wake lines the gate left to this turn's start (WakeLine)
-   * into the starting agent's own window, as its own rows (#291). Called by
-   * a fresh start that doesn't resume a logical turn, after the turn's own
-   * inputs (a due clock row, and the rows its start presents) and before its
-   * checkpoint, so a line lands after whatever entered the window since the
-   * gate's decision, before the notices the turn's start writes itself (the
-   * locus notice among them), and before the agent's answer to the wake.
-   *
-   * - A wake's one line whose event is still the newest entry of the
-   *   agent's window is left out: no message follows the wake's, so it is
-   *   the wake's whole cause, and an arrival stored past the start enters
-   *   the window at a later point, after its request. (The start's own
-   *   notices, written after this, aren't messages a reply could be meant
-   *   for.)
-   * - Each resident a batched wake is for (every resident, or a targeted
-   *   batch's recipients) gets it, and each one's start
-   *   decides and writes its own line: a co-resident's line, and her reply,
-   *   are her own rows and enter no other window but an observer's
-   *   (AgentConfig.observes), which takes them as it takes her rounds; in
-   *   no other can either land under the message or after another
-   *   resident's answer. For an agent whose
-   *   window isn't presented (its write-down failed, so its window is the
-   *   record), only the delivery agent's start writes the slot's one line,
-   *   and a co-resident's start places nothing.
-   * - Two or more lines are all written, each naming its message, its age
-   *   counted to now.
-   * - None is written while the host is quiesced, as for a clock row. They
-   *   stay undecided, and are written only if another fresh start of the
-   *   wake comes (a provider hold's release, a requeue): this start's
-   *   request goes without them.
-   *
-   * A line left out is traced. Each line is written once (placedWakeLines),
-   * across the wake's retries and holds, whichever copy of its trigger a
-   * start carries: every request for the wake carries the same line. A line
-   * left out, or whose write fails, stays undecided for a later fresh start.
-   */
-  private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
-    // Each resident the wake was for writes the line into its own window, as
-    // its own row, at its own start (#291): a resident's line enters no
-    // other resident's window but an observer's (AgentConfig.observes), as
-    // the turn it starts does, so in its own window it can't land under the
-    // message or after another resident's answer. For an agent whose window
-    // isn't presented, the delivery agent's start alone writes the slot's
-    // one line.
-    const slot = this.deliveryAgent();
-    if (!slot || (agent !== slot && !this.presents(agent))) return;
-    const open = lines.filter((line) => !this.placedWakeLines.get(line)?.has(agent.name));
-    const held = this.quiesced;
-    const leftOut = held
-      || (lines.length === 1 && open.length === 1 && this.isNewestIn(agent, open[0].entry));
-    if (leftOut) {
-      const reason = held ? 'held' : 'newest';
-      for (const line of open) {
-        this.emitTrace({
-          type: 'gate:wake-line-omitted',
-          reason,
-          policyNames: line.policyNames,
-          eventType: line.entry.eventType,
-          ...(line.channelId !== undefined ? { channelId: line.channelId } : {}),
-        });
-      }
-      return;
-    }
-    for (const line of open) {
-      // The agent's own row, written for its start, and presented to it as
-      // it is written: the delivery agent's, or with the presentation index
-      // the resident whose start this is.
-      const metadata = { source: 'gate:debounce', policies: line.policyNames } as MessageMetadata;
-      // A line is the wake's context, not its cause, so a write that fails
-      // doesn't fail the start: the line stays undecided, for a later fresh
-      // start of the wake. One whose write threw after its row landed counts
-      // as written, read back as the clock row's is.
-      const before = this.storedCountOf(agent);
-      let id: MessageId;
-      try {
-        id = storeOwnRow(agent, 'user', [{ type: 'text', text: wakeLineText(line, Date.now()) }], metadata);
-      } catch (err) {
-        const landed = before === undefined ? undefined
-          : this.storedSince(agent, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', 'a batched wake\'s line');
-        if (!landed || landed.length === 0) {
-          console.error(`[gate] ${agent.name}: a batched wake's line could not be written${landed ? '' : ' (whether it landed is unknown)'}:`, err);
-          continue;
-        }
-        console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
-        id = landed[0]!.id;
-        agent.ownRowsStored([id]);
-      }
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
-      const placed = this.placedWakeLines.get(line) ?? new Set<string>();
-      placed.add(agent.name);
-      this.placedWakeLines.set(line, placed);
-    }
-  }
-
-  /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
-   *  clock rows, stored context injections and rows the agent's own view
-   *  leaves out after it aside: a channel message by its server, channel and
-   *  message id, a push event by its server and event id, and never one the
-   *  agent's view leaves out (agentSees), such as one a tune-out holds. Past
-   *  NEWEST_SCAN_ROWS such rows, it answers no. While the agent's context
-   *  is in legacy mode, its window is the slot's record, read from its
-   *  newest row. Once it presents rows (#291), the window's own order
-   *  decides, as the agent's next request will hold it (windowTail): the
-   *  rows presented to it, then its own rows and its arrivals not presented
-   *  yet (bearingOf), an observed co-resident's rounds among them, which its
-   *  next start presents; a row stored in a shared slot for another agent,
-   *  such as the own round of a co-resident it doesn't observe, isn't in
-   *  it. */
-  private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
-    // A clock row the framework wrote after it (a turn start's, an event's),
-    // or a stored context injection (any agent's, a start's), isn't a
-    // message a reply could be meant for, so it doesn't count.
-    const cm = agent.getContextManager();
-    const tail = cm.windowMode() === 'presented'
-      ? this.windowTail(agent, AgentFramework.NEWEST_SCAN_ROWS)
-      : cm.queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages;
-    const newest = tail
-      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata)
-        && this.agentSees(agent, m.metadata));
-    const md = newest?.metadata as Record<string, unknown> | undefined;
-    if (!md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
-    if (entry.eventType === 'mcpl:channel-incoming') {
-      return entry.messageId !== undefined && md.messageId === entry.messageId && md.channelId === entry.channelId;
-    }
-    if (entry.eventType === 'mcpl:push-event') {
-      return entry.eventId !== undefined && md.eventId === entry.eventId;
-    }
-    return false;
-  }
-
-  /**
-   * The newest `limit` rows of a presented window as the agent's next
-   * request will hold them, newest first: the rows it is owed and not
-   * presented yet (its own rows and its arrivals, one per body, as the
-   * presentation index reads them: owedOf, so an observed co-resident's
-   * round is among them), after the rows its window holds. A row presented
-   * later than a newer one comes after it here, as in the window.
-   */
-  private windowTail(agent: Agent, limit: number): StoredMessage[] {
-    const cm = agent.getContextManager();
-    const pending = this.presentation?.owedOf(agent) ?? [];
-    const tail: StoredMessage[] = [];
-    for (let i = pending.length - 1; i >= 0 && tail.length < limit; i--) tail.push(pending[i]!);
-    const presented = cm.getPresentedMessages();
-    for (let i = presented.length - 1; i >= 0 && tail.length < limit; i--) tail.push(presented[i]!);
-    return tail;
-  }
-
   /** Where addMessage delivers: the named agent, else the primary, else the
    *  first registered agent. Undefined when there is no such agent. */
   private deliveryAgent(forAgent?: string): Agent | undefined {
@@ -35292,6 +35247,168 @@ export class AgentFramework {
     return placement.messageId ? { readsRow: placement.messageId } : {};
   }
 
+  private readsRowsFor(writes: readonly WakeWrite[], agentName: string): Pick<InferenceRequest, 'readsRows'> {
+    const rows: NonNullable<InferenceRequest['readsRows']> = [];
+    for (const { after, replyTo } of writes) {
+      const row = this.readsRowFor(after, agentName).readsRow;
+      if (row === undefined) return {};
+      rows.push({ row, ...(replyTo ? { replyTo } : {}) });
+    }
+    return rows.length > 0 ? { readsRows: rows } : {};
+  }
+
+  /**
+   * The batched wake's rows (BATCH_ROWS) a turn merging `requests` for
+   * `agentName` is for: the union of every request's, leaving out those
+   * whose line a start already wrote for the agent, or none when a request
+   * carries none (a wake that isn't a batch's), since the line would name
+   * only some of the turn's causes. One open array is kept as it is, so its
+   * identity places it; a union records the arrays it was made from.
+   */
+  private mergedBatchRows(agentName: string, requests: readonly InferenceRequest[]): string[] | undefined {
+    const each = requests.map(batchRowsOf);
+    if (each.length === 0 || !each.every((rows) => rows !== undefined)) return undefined;
+    const arrays = [...new Set(each as string[][])];
+    const open = arrays.filter((rows) => !this.batchRowsPlaced(rows, agentName));
+    if (open.length <= 1) return open[0] ?? arrays[0];
+    const union = [...new Set(open.flat())];
+    this.batchRowsParts.set(union, open);
+    return union;
+  }
+
+  private batchRowsPlaced(rows: readonly string[], agentName: string): boolean {
+    return this.placedBatchRows.get(rows)?.has(agentName) === true;
+  }
+
+  private markBatchRowsPlaced(rows: readonly string[], agentName: string): void {
+    for (const placed of [rows, ...(this.batchRowsParts.get(rows) ?? [])]) {
+      const agents = this.placedBatchRows.get(placed) ?? new Set<string>();
+      agents.add(agentName);
+      this.placedBatchRows.set(placed, agents);
+    }
+  }
+
+  /**
+   * Write a batched wake's line into the starting agent's own window, as its
+   * own row, where a row a reply could be meant for follows the wake's rows
+   * there (batchIsNewest): one line naming those of the rows its window
+   * holds, by count and channel. Called by a fresh start that doesn't resume
+   * a logical turn, after the turn's own inputs and before its own notices
+   * (the locus notice among them), so a line lands after whatever entered the
+   * window since the batch was delivered and before the agent's answer.
+   *
+   * - Each agent the batch woke decides its own line by its own window; for
+   *   an agent whose window isn't presented, only the delivery agent's start
+   *   writes the slot's one line.
+   * - None is written while the host is quiesced, as for a clock row, nor
+   *   where the rows are the newest; either way the line stays undecided, for
+   *   a later fresh start of the same wake (a provider hold's release).
+   * - Once written for the agent, by the rows' identity, no later start of
+   *   the wake writes it again. A read or write that fails doesn't fail the
+   *   start: the line stays undecided; one that landed though it threw counts
+   *   as written.
+   */
+  private placeBatchLine(agent: Agent, rows: readonly string[]): void {
+    const slot = this.deliveryAgent();
+    if (!slot || (agent !== slot && !this.presents(agent))) return;
+    if (this.quiesced || this.batchRowsPlaced(rows, agent.name)) return;
+    let text: string;
+    try {
+      const cm = agent.getContextManager();
+      const held = rows
+        .filter((id) => this.windowHolds(agent, id))
+        .map((id) => cm.getMessage(id as MessageId))
+        .filter((m): m is StoredMessage => m != null && !isGateLine(m));
+      if (held.length === 0 || this.batchIsNewest(agent, rows)) return;
+      const now = Date.now();
+      const byChannel = new Map<string, { name: string | undefined; count: number; oldest: number }>();
+      for (const m of held) {
+        const md = (m.metadata ?? {}) as { serverId?: unknown; channelId?: unknown; channelName?: unknown };
+        const serverId = typeof md.serverId === 'string' ? md.serverId : undefined;
+        const channelId = typeof md.channelId === 'string' && md.channelId !== '' ? md.channelId : undefined;
+        const label = typeof md.channelName === 'string' && md.channelName !== '' ? md.channelName : undefined;
+        const name = channelId === undefined ? undefined
+          : serverId === undefined ? suppliedValue(channelId)
+          : label !== undefined ? this.labelledChannel({ serverId, channelId, label: label.startsWith('#') ? label : `#${label}` })
+          : this.channelShown({ serverId, channelId });
+        const at = m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp);
+        const key = JSON.stringify([serverId ?? null, channelId ?? null]);
+        const entry = byChannel.get(key) ?? { name, count: 0, oldest: Number.isFinite(at) ? at : now };
+        entry.count += 1;
+        if (Number.isFinite(at)) entry.oldest = Math.min(entry.oldest, at);
+        byChannel.set(key, entry);
+      }
+      const lines = [...byChannel.values()].map(({ name, count, oldest }) => batchReferenceLine(count, name, oldest, now));
+      text = `[${NOTICE_TAG.gate}: ${held.length} event${held.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    } catch (err) {
+      console.error(`[gate] ${agent.name}: a batched wake's line couldn't be decided, since reading the window failed; the turn goes on without it, and a later fresh start of the wake decides it again:`, err);
+      return;
+    }
+    const metadata = { source: 'gate:debounce' } as MessageMetadata;
+    const before = this.storedCountOf(agent);
+    let id: MessageId;
+    try {
+      id = storeOwnRow(agent, 'user', [{ type: 'text', text }], metadata);
+    } catch (err) {
+      const landed = before === undefined ? undefined
+        : this.storedSince(agent, before, isGateLine, 'gate', "a batched wake's line");
+      if (!landed || landed.length === 0) {
+        console.error(`[gate] ${agent.name}: a batched wake's line ${landed ? 'was not written; the turn goes on without it' : 'may not have been written (whether it landed is unknown); the turn goes on'}, and a later fresh start of the wake decides it again:`, err);
+        return;
+      }
+      console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
+      id = landed[0]!.id;
+      agent.ownRowsStored([id]);
+    }
+    this.markBatchRowsPlaced(rows, agent.name);
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
+  }
+
+  /** Whether the newest row of `agent`'s window a reply could be meant for
+   *  is one of `rows`, as the start's request will hold it: clock rows,
+   *  stored context injections and the batch's own gate line, which the
+   *  start's line can't name, aside. Past NEWEST_SCAN_ROWS rows, it answers
+   *  no. A presented window is the request's own: the start has presented
+   *  what arrived (an observed co-resident's round among it), and what
+   *  arrives from here waits for the next request. A window still in legacy
+   *  mode (its write-down failed) is the slot's record, read from its newest
+   *  row, through the agent's view (agentSees). */
+  private batchIsNewest(agent: Agent, rows: readonly string[]): boolean {
+    const cm = agent.getContextManager();
+    const presented = cm.windowMode() === 'presented';
+    const tail = presented
+      ? cm.getPresentedMessages().slice(-AgentFramework.NEWEST_SCAN_ROWS).reverse()
+      : cm.queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages;
+    const newest = tail.find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND
+      && !storedInjectionMarkOf(m.metadata) && (presented || this.agentSees(agent, m.metadata))
+      && !(isGateLine(m) && rows.includes(m.id)));
+    return newest !== undefined && rows.includes(newest.id);
+  }
+
+  /** Whether the start's request holds row `id`: in a presented window, or
+   *  for a window still in legacy mode, stored and seen by the agent's view. */
+  private windowHolds(agent: Agent, id: string): boolean {
+    const cm = agent.getContextManager();
+    if (cm.windowMode() === 'presented') return cm.windowStatusOf(id as MessageId) === 'in';
+    const row = cm.getMessage(id as MessageId);
+    return row != null && this.agentSees(agent, row.metadata);
+  }
+
+  private answeredWrite(after: WritePlacement): boolean {
+    const agent = after.agent !== undefined ? this.agents.get(after.agent) : undefined;
+    if (!agent || after.messageId === undefined) return true;
+    try {
+      const cm = agent.getContextManager();
+      const row = cm.getMessage(after.messageId as MessageId);
+      if (!row) return true;
+      const mark = agent.getAnsweredWatermark();
+      return mark !== null && covers(mark, cm, row) !== 'not-covered';
+    } catch (err) {
+      console.error(`[gate] ${agent.name}: whether a batched event's message was answered couldn't be read, so it counts as answered and its wake stays:`, err);
+      return true;
+    }
+  }
+
   // A module context's reads, edits and removals, and a process answer's,
   // go to the store addMessage writes by default, by a stored id. For one
   // release they also take the `held:` handle a release before #291 gave a
@@ -35606,7 +35723,19 @@ export class AgentFramework {
       activeStreams: [...this.activeStreams.keys()],
       agents: [...this.agents.entries()].map(([name, agent]) => ({
         name,
+        // The agent's state machine, as before. It reads `idle` between a
+        // failed call and its retry, and while a turn's teardown is pending:
+        // `turnAlive` and `retrying` say what it doesn't.
         status: agent.state.status,
+        /** A turn of the agent's is alive (it holds its token, or its continuation or retry is on its way, as the scheduler reads it), whatever `status` says. */
+        turnAlive: this.hasTurn(name),
+        /** The turn's wait for its error policy's next try, or null: see TurnRetryWait. A retry a provider hold
+         *  keeps (a stated wait, an acceleration limit or a host's hold) reads null here, and
+         *  `providerAdmission` shows the hold: `cooldownUntil`, `cooldownReason` and `hostHold`. */
+        retrying: (() => {
+          const wait = this.turnRetryWaits?.get(agent);
+          return wait ? { ...wait } : null;
+        })(),
         consecutiveInferenceFailures: this.consecutiveInferenceFailures.get(name) ?? 0,
         providerAdmission: (() => {
           const gate = this.providerGates?.get(name);
@@ -41801,6 +41930,7 @@ export class AgentFramework {
      * of asking again, since a rule's script answers once per event.
      */
     opts: { suppressible?: boolean; decided?: string | null; folds?: boolean } = {},
+    after?: WritePlacement,
   ): AdmissionDecision & { gateDecision?: GateDecision } {
     // The gate's whole decision, for wake onboarding (which rule let the event
     // go by); admission itself reads only whether it wakes.
@@ -41832,7 +41962,7 @@ export class AgentFramework {
       ...(this.eventGate
         ? {
             gate: {
-              evaluate: (e: InboundEnvelope) => (gateDecision = this.eventGate!.evaluate(gateInfo(e))).trigger,
+              evaluate: (e: InboundEnvelope) => (gateDecision = this.eventGate!.evaluate(gateInfo(e), after)).trigger,
               // "Would the gate have woken them": a debounce policy says yes,
               // later — for the hold's reader that is a pass, not a mute.
               probe: (e: InboundEnvelope) => {
@@ -42021,7 +42151,7 @@ export class AgentFramework {
     const b = r.behavior;
     const does = b === 'always' ? 'wake you'
       : b === 'defer' || b === 'skip' ? 'don\'t wake you (they still enter your context)'
-      : typeof b === 'object' && 'debounce' in b ? `wake you once, ${spanOf(b.debounce)} after a burst goes quiet`
+      : typeof b === 'object' && 'debounce' in b ? `wake you once, ${spanOf(b.debounce)} after a burst goes quiet, unless by the time it would start your turn every event in the burst was written for you and you've read and answered it`
       : typeof b === 'object' && 'rate_limit' in b ? `wake you at most once every ${spanOf(b.rate_limit.refillIntervalMs)}`
       : typeof b === 'object' && 'passive_sample' in b ? (b.passive_sample.every === 1 ? 'wake you' : `wake you for one in every ${b.passive_sample.every}`)
       : 'wake you as the server says';

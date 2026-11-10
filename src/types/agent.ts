@@ -2,7 +2,6 @@ import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
-import type { WakeLine } from '../gate/types.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -673,6 +672,13 @@ export interface InferenceRequest {
    *  the wake starts no turn. A row stored and not yet presented to the
    *  agent keeps its wake. */
   readsRow?: string;
+  /** Host-owned: this wake's sole cause is these rows, a batched wake's
+   *  writes (WakeProvenance.writes): the message of its own of each event
+   *  that has one, and the batch's line where one was written. The wake starts no turn once each
+   *  row is done as a `readsRow` is, with the channel a reply to it is owed
+   *  in (`replyTo`) as that row's channel. A row stored and not yet
+   *  presented to the agent keeps its wake. */
+  readsRows?: Array<{ row: string; replyTo?: { serverId: string; channelId: string } }>;
   agentName: string;
   reason: string;
   source: string;
@@ -805,12 +811,6 @@ export interface InferenceRequest {
   wakeChannels?: Array<{ serverId: string; channelId: string }>;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
-  /** Batched-wake lines the gate handed to this wake rather than wrote
-   *  (WakeLine), decided by a fresh start of its turn as WakeLine says: each
-   *  written once into the window it names, or left for a later fresh start
-   *  of the same wake. A retry, or a start that resumes a logical turn,
-   *  decides none. */
-  wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;

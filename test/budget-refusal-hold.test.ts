@@ -176,6 +176,8 @@ interface Internal {
   turnCounters: Map<string, number>;
   getTurnCheckpoints(agentName: string): Array<{ turnIndex: number }>;
   checkBudgetHoldsAfterWindowChange(only?: string, release?: boolean): void;
+  removeMessage(id: string): void;
+  addMessage(participant: string, content: unknown[], metadata?: unknown): string;
   readHostMode(): { quiesced: boolean } | null;
   saveTurnCheckpoints(agentName: string, checkpoints: Array<{ turnIndex: number }>): void;
   cancelCoalescedWakes(subject: string): void;
@@ -314,6 +316,12 @@ async function resident(options: {
     sendForPrime: (body: string) => {
       const id = String(inbox.ctx!.addMessage('User', [text(body)], undefined, { forAgent: 'prime' } as never));
       internal.pendingRequests.push({ agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now(), readsRow: id });
+    },
+    /** Rows for prime, and a batched wake for them, as a debounced batch's wake reads its rows (readsRows). */
+    batchForPrime: (bodies: string[]) => {
+      const ids = bodies.map((body) => String(internal.addMessage('User', [text(body)])));
+      internal.pendingRequests.push({ agentName: 'prime', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsRows: ids.map((row) => ({ row })) });
+      return ids;
     },
     stored: () => rows().map(bodyOf).join('\n'),
     rowWith: (body: string) => rows().find((r) => bodyOf(r) === body)!,
@@ -1560,6 +1568,55 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
+  it("a waiting first start a batched wake made stands on its rows: a suppression of one releases it, and a rollback past all of them drops it", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered both'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.batchForPrime(['one', 'two']);
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const refused = c.refusals;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('one').id] });
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released'], 'one of its rows left: the other is still to answer');
+        assert.ok(await pollUntil(() => c.refusals > refused && t.internal.budgetHolds.has('prime')), 'its start was refused again, and waits again');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.rollbackToMessage('prime', { messageId: t.rowWith('hello').id });
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed'], 'the rollback took every row it stood on');
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 1, 'no turn ran for the removed rows');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a wake that joined a wait and reads rows is dropped once every one of its rows is gone, and kept while one is there", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const ids = ['one', 'two'].map((body) => { t.cm().addMessage('User', [text(body)]); return t.rowWith(body).id; });
+        const hold = t.internal.budgetHolds.get('prime')! as unknown as { wakes: Array<Record<string, unknown>> };
+        hold.wakes.push({ agentName: 'prime', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsRows: ids.map((row) => ({ row })) });
+        t.internal.removeMessage(ids[0]!);
+        t.internal.checkBudgetHoldsAfterWindowChange('prime', false);
+        assert.equal(hold.wakes.length, 1, 'one of its rows is still there');
+        t.internal.removeMessage(ids[1]!);
+        t.internal.checkBudgetHoldsAfterWindowChange('prime', false);
+        assert.deepEqual(hold.wakes, [], 'every row it read is gone');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('admits a branch switch, a puppet call and an undo while a first start waits, and a start whose trigger reads no row keeps waiting', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'], modules: [new PingModule()] });
@@ -2469,7 +2526,7 @@ describe("the hold's note is stored at its release, where its turn's request rea
 });
 
 describe('a continuation refused for budget mid-turn waits idle too', () => {
-  async function heldContinuation(c: Compression, options: { gate?: boolean; replies?: Reply[]; policy?: { shouldInfer(agentName: string, requests: Array<Record<string, unknown>>): boolean }; watch?: (t: Resident) => void } = {}) {
+  async function heldContinuation(c: Compression, options: { gate?: boolean; replies?: Reply[]; policy?: { shouldInfer(agentName: string, requests: Array<Record<string, unknown>>): boolean }; watch?: (t: Resident) => void; batch?: string[] } = {}) {
     c.refuseFrom = 2;
     const t = await resident({
       restart: true, maintenanceIntervalMs: 0, replies: options.replies ?? ['Done after the restart'],
@@ -2478,7 +2535,8 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
     t.internal.budgetHoldRecheckMs = 60_000;
     options.watch?.(t);
     t.cm().addMessage('user', [text('hello')]);
-    t.send('fetch it');
+    if (options.batch) t.batchForPrime(options.batch);
+    else t.send('fetch it');
     assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the continuation is held');
     return t;
   }
@@ -2522,6 +2580,41 @@ describe('a continuation refused for budget mid-turn waits idle too', () => {
         assert.ok(t.internal.budgetHolds.has('prime'), 'the turn still waits');
         fit(c, t);
         assert.ok(await pollUntil(() => t.stored().includes('Done after the restart')));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a held continuation of a turn a batched wake started stands on every row of its batch: a suppression of one keeps it, and of both drops it", async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c, { batch: ['fetch it', 'and this'] });
+      try {
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('fetch it').id] });
+        const kept = t.of('inference:hold_ended');
+        assert.ok(kept.length >= 1 && kept.every((e) => e.outcome === 'released'), 'one batch row left, the other still to answer: released, not dropped');
+        assert.ok(await pollUntil(() => t.internal.budgetHolds.has('prime')), 'and refused again, it waits again');
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('and this').id] });
+        assert.equal(t.of('inference:hold_ended').at(-1)?.outcome, 'removed', 'every batch row has left');
+        fit(c, t);
+        await t.framework.runUntilIdle();
+        assert.ok(!t.stored().includes('Done after the restart'), 'nothing runs on the suppressed rows');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a held continuation of a turn a batched wake started is dropped when one of the turn's own rows leaves", async () => {
+    await withCompression({}, async (c) => {
+      const t = await heldContinuation(c, { batch: ['fetch it', 'and this'] });
+      try {
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('Working').id] });
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['removed']);
+        fit(c, t);
+        await t.framework.runUntilIdle();
+        assert.ok(!t.stored().includes('Done after the restart'), "nothing runs once the turn's own round is gone");
       } finally {
         await t.close();
       }
