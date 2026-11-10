@@ -31,6 +31,8 @@ const HOST_KEYS: Record<string, unknown> = {
   // A stored context injection's mark: every other agent's view leaves such a row out.
   contextInjection: { agent: 'scout', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 },
   primaryIfUnread: true,
+  // A framework effort row's mark: a refusal takes back the rows it names.
+  effortRowOf: 'scout',
   dendrite: { mailId: 'mail-1', kind: 'result', from: { agent: 'scout', incarnation: 1 } },
 };
 

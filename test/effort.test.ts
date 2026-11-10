@@ -13,7 +13,8 @@ import * as membrane from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
-import { AgentFramework } from '../src/index.js';
+import { ContextManager as StoreWindow } from '@animalabs/context-manager';
+import { AgentFramework, residentViewFilter, subconsciousViewFilter, workerSpec } from '../src/index.js';
 import type { ErrorAction, EventResponse, Module, ModuleContextInjection, ProcessEvent, ToolCall, TraceEvent } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
@@ -238,6 +239,9 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
       assert.deepEqual(third.messages.slice(0, second!.messages.length), second!.messages, 'what the second request sent is the third\'s prefix');
       assert.ok(textOf(third.messages[second!.messages.length]!).includes('Reply 2.'), 'the reply that ran at low follows its row');
       assert.equal(storedEffortRows(framework).length, 1, 'one row stored');
+      const metadata = storedEffortRows(framework)[0]!.metadata as Record<string, unknown>;
+      assert.deepEqual([metadata.effortRowOf, metadata.system, metadata.kind], ['agent', true, 'effort-change'],
+        'marked for its agent, and as the framework\'s own row');
     } finally { await cleanup(); }
   });
 
@@ -375,7 +379,7 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
     } finally { await cleanup(); }
   });
 
-  it('reads the mark of a row in a merged slot from the window: unset, the subconscious leaves out a resident\'s framework row', async () => {
+  it('keeps a resident\'s framework row out of the subconscious\'s window, and sends a host\'s: unset', async () => {
     try {
       const { framework } = await resident({ config: { subconscious: { enabled: true, systemPrompt: 'You notice.' } } });
       const cm = framework.getAgent('agent')!.getContextManager();
@@ -385,7 +389,8 @@ describe('FrameworkConfig.effort: the base on top, a change as a row', () => {
       // Written past the framework, the rows enter the subconscious's window at its next point.
       (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('Subconscious'));
       const window = framework.getAgent('Subconscious')!.getContextManager().getPresentedMessages();
-      assert.equal(window.filter((m) => m.content.some(isEffortBlock)).length, 2, 'premise: its window holds both rows, from the residents\' slot');
+      assert.deepEqual(window.filter((m) => m.content.some(isEffortBlock)).map((m) => (m.metadata as { effortRowOf?: string } | undefined)?.effortRowOf), [undefined],
+        'its window holds the host\'s row from the residents\' slot, and not the resident\'s');
       const preview = await framework.previewActivation('Subconscious');
       assert.deepEqual(effortRows(preview).map((r) => r.effort), ['max'], 'the resident\'s framework row is left out, and the host\'s goes');
     } finally { await cleanup(); }
@@ -483,6 +488,26 @@ describe('FrameworkConfig.effort: every agent', () => {
     } finally { await cleanup(); }
   });
 
+  it('sends a shared derivation its parent\'s rows and its own', { skip: NEEDS_ROWS }, async () => {
+    try {
+      let live: Level = 'high';
+      const { framework, provider, turn } = await resident({ effort: (agent: { name: string }) => (agent.name === 'kid' ? 'medium' : live) });
+      await turn('One.');
+      live = 'low';
+      await turn('Two.');
+      const kid = await framework.deriveAgent({
+        name: 'kid', from: 'agent',
+        framing: [{ participant: 'user', content: [{ type: 'text', text: 'Kid.' }] }],
+      });
+      await framework.runEphemeralToCompletion(kid.agent, kid.contextManager);
+      const [request] = provider.carrying('Kid.');
+      assert.deepEqual(effortRows(request!), [
+        { at: indexOfText(request!, 'Two.') + 1, effort: 'low', participant: 'system' },
+        { at: indexOfText(request!, 'Kid.') + 1, effort: 'medium', participant: 'system' },
+      ], 'the parent\'s row in its place, and the row the kid wrote for itself');
+    } finally { await cleanup(); }
+  });
+
   it('gives a copy derivation the parent\'s effort rows as its own, in place, under the parent\'s base', { skip: NEEDS_ROWS }, async () => {
     try {
       let live: Level = 'high';
@@ -495,12 +520,78 @@ describe('FrameworkConfig.effort: every agent', () => {
         framing: [{ participant: 'user', content: [{ type: 'text', text: 'Copy.' }] }],
       });
       const rows = copy.contextManager.getAllMessages().filter((m) => m.content.some(isEffortBlock));
-      assert.deepEqual(rows.map((m) => (m.metadata as { effortRowOf?: string } | undefined)?.effortRowOf), ['copy'], 'the parent\'s row, marked for the copy');
+      assert.deepEqual(rows.map((m) => {
+        const metadata = m.metadata as Record<string, unknown>;
+        return [metadata.effortRowOf, metadata.system, metadata.kind];
+      }), [['copy', true, 'effort-change']], 'the parent\'s row, marked for the copy, as the framework\'s own row');
       await framework.runEphemeralToCompletion(copy.agent, copy.contextManager);
       const [request] = provider.carrying('Copy.');
       assert.equal(topLevel(request!), 'high', 'the parent\'s base');
       assert.deepEqual(effortRows(request!), [{ at: indexOfText(request!, 'Two.') + 1, effort: 'low', participant: 'system' }],
         'the row in its place, and no new one');
+    } finally { await cleanup(); }
+  });
+
+  it('sends a shared derivation resumed after its end the row it wrote for itself', { skip: NEEDS_ROWS }, async () => {
+    try {
+      let live: Level = 'high';
+      const { framework, provider, turn } = await resident({ effort: (agent: { name: string }) => (agent.name === 'kid' ? 'medium' : live) });
+      await turn('One.');
+      live = 'low';
+      await turn('Two.');
+      const kid = await framework.deriveAgent({
+        name: 'kid', from: 'agent',
+        framing: [{ participant: 'user', content: [{ type: 'text', text: 'Kid.' }] }],
+      });
+      await framework.runEphemeralToCompletion(kid.agent, kid.contextManager);
+      assert.deepEqual(effortRows(provider.carrying('Kid.')[0]!).map((r) => r.effort), ['low', 'medium'], 'premise: the kid wrote its row');
+      const resumed = await framework.resumeAgent('kid', { model: 'claude-opus-5-5', systemPrompt: 'test', proseRouting: 'disabled' } as never);
+      resumed.contextManager.addMessage('user', [{ type: 'text', text: 'Kid again.' }]);
+      await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+      const [again] = provider.carrying('Kid again.');
+      assert.deepEqual(effortRows(again!).map((r) => r.effort), ['low', 'medium'], 'its reopened view keeps its parent\'s row and its own');
+    } finally { await cleanup(); }
+  });
+
+  it('passes over its effort row when a window that\'s still the record sheds a turn', { skip: NEEDS_ROWS }, async () => {
+    try {
+      let live: Level = 'high';
+      const presentRows = StoreWindow.prototype.presentRows;
+      StoreWindow.prototype.presentRows = function (this: StoreWindow, ids: Parameters<typeof presentRows>[0], ...rest: unknown[]) {
+        if (ids.length === 0) throw new Error('the write-down is refused (test)');
+        return (presentRows as (...a: unknown[]) => ReturnType<typeof presentRows>).call(this, ids, ...rest);
+      } as typeof presentRows;
+      let made: Awaited<ReturnType<typeof resident>>;
+      try {
+        made = await resident({ effort: () => live });
+      } finally { StoreWindow.prototype.presentRows = presentRows; }
+      const { framework, provider, turn } = made;
+      const agent = framework.getAgent('agent')!;
+      assert.equal(agent.getContextManager().windowMode(), 'legacy', 'premise: its window is still the record');
+      await turn('One.');
+      live = 'low';
+      // The turn's start stores its row, and its request fails unmarked, so nothing of the agent's follows the row.
+      provider.fail = (request) => (indexOfText(request, 'Two.') >= 0 ? refusal(false) : undefined);
+      await turn('Two.');
+      assert.equal(storedEffortRows(framework).length, 1, 'premise: the start stored its row');
+      const shed = (framework as unknown as { shedNewestTurn(agent: unknown): { removedIds: string[] } | null }).shedNewestTurn(agent);
+      assert.ok(shed && shed.removedIds.length > 0, 'premise: the shed took a turn');
+      assert.equal(storedEffortRows(framework).length, 1, 'and passed over the row, which stays in place');
+    } finally { await cleanup(); }
+  });
+
+  it('marks a copy\'s row as an effort row only where it holds an effort block', async () => {
+    try {
+      const { framework, turn } = await resident({ effort: 'high' });
+      await turn('One.');
+      framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: 'MARKED.' }], { effortRowOf: 'agent' });
+      // Written past the framework, the row enters the resident's window at its next point.
+      (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('agent'));
+      const copy = await framework.deriveAgent({ name: 'copy', from: 'agent', mode: 'copy' });
+      const marked = copy.contextManager.getAllMessages().find((m) => textOf(m).includes('MARKED.'));
+      assert.ok(marked, 'premise: the copy holds the row');
+      const metadata = (marked!.metadata ?? {}) as Record<string, unknown>;
+      assert.deepEqual([metadata.effortRowOf, metadata.system, metadata.kind], [undefined, undefined, undefined], 'the mark alone makes no effort row');
     } finally { await cleanup(); }
   });
 
@@ -976,7 +1067,7 @@ describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () =>
     ((framework.getStore().getStateJson('framework/state') ?? {}) as { effortBases?: Array<{ agent: string }> }).effortBases ?? [];
   const agents = (framework: AgentFramework) => bases(framework).map((record) => record.agent);
 
-  it('reads a base of another shape as none, says so on one line, and stores a sound one', async () => {
+  it('reads a base of another shape as none, says so on one line, and leaves it as it is', async () => {
     try {
       const { framework, provider, turn } = await resident({ effort: 'high' });
       await turn('One.');
@@ -993,7 +1084,30 @@ describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () =>
       } finally { console.error = error; }
       assert.deepEqual(provider.calls.slice(1).map(topLevel), ['high', 'high'], 'the live level, never the record\'s');
       assert.equal(logged.filter((line) => line.includes('effortBases')).length, 1, 'one line');
-      assert.deepEqual(bases(framework), [{ agent: 'agent', model: 'claude-opus-5-5', effort: 'high' }], 'a sound base in its place');
+      assert.deepEqual(bases(framework), [{ agent: 'agent', model: 'claude-opus-5-5', effort: 'turbo' }], 'stored over by nothing');
+    } finally { await cleanup(); }
+  });
+
+  it('leaves bases it can\'t read as they are, says so on one line, and sends the live level on top', async () => {
+    try {
+      let live: Level = 'high';
+      const { framework, provider, turn } = await resident({ effort: () => live });
+      await turn('One.');
+      const store = framework.getStore();
+      const unreadable = { agent: { model: 'claude-opus-5-5', effort: 'high' }, other: { model: 'claude-opus-5-5', effort: 'max' } };
+      store.setStateJson('framework/state', { ...(store.getStateJson('framework/state') as object), effortBases: unreadable });
+      const logged: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        await turn('Two.');
+        live = 'low';
+        await turn('Three.');
+      } finally { console.error = error; }
+      assert.deepEqual((store.getStateJson('framework/state') as { effortBases?: unknown }).effortBases, unreadable, 'stored over by nothing');
+      assert.deepEqual(provider.calls.slice(1).map(topLevel), ['high', 'low'], 'the live level on top');
+      assert.deepEqual(provider.calls.slice(1).map(effortRows), [[], []], 'and no row, with no base to change from');
+      assert.equal(logged.filter((line) => line.includes('effortBases')).length, 1, 'one line');
     } finally { await cleanup(); }
   });
 
@@ -1087,6 +1201,26 @@ describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () =>
       assert.deepEqual(agents(second.framework), ['agent'], 'the resident\'s base stays, and the interrupted run\'s goes');
       await second.turn('Two.');
       assert.equal(topLevel(second.provider.calls[0]!), 'high', 'the resident\'s base, kept across the restart');
+    } finally { await cleanup(); }
+  });
+
+  it('keeps at a sweep every entry it can\'t read, an ended agent\'s record of another shape among them', async () => {
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'af-effort-sweep-'));
+      dirs.push(dir);
+      const first = await resident({ effort: 'high', dir });
+      await first.turn('One.');
+      const store = first.framework.getStore();
+      const state = store.getStateJson('framework/state') as Record<string, unknown>;
+      const unreadable = [7, { model: 'claude-opus-5-5', effort: 'max' }, { agent: 'job', model: 'claude-opus-5-5', effort: 'turbo' }];
+      store.setStateJson('framework/state', {
+        ...state, effortBases: [...(state.effortBases as object[]), ...unreadable, { agent: 'gone', model: 'claude-opus-5-5', effort: 'max' }],
+      });
+      await first.stop();
+      const second = await resident({ effort: 'low', dir });
+      const after = (second.framework.getStore().getStateJson('framework/state') as { effortBases: unknown[] }).effortBases;
+      assert.deepEqual(after, [{ agent: 'agent', model: 'claude-opus-5-5', effort: 'high' }, ...unreadable],
+        'the resident\'s base and every entry it can\'t read stay, and the ended agent\'s sound base goes');
     } finally { await cleanup(); }
   });
 });
@@ -1199,7 +1333,57 @@ describe('FrameworkConfig.effort: two agents on one store', { skip: NEEDS_ROWS }
     } finally { await cleanup(); }
   });
 
-  it('copies an observed agent\'s effort row into a copy derivation under that agent\'s mark, and the copy\'s requests leave it out', async () => {
+  it('injects no host\'s effort row heard at a tool boundary while the setting is set', async () => {
+    try {
+      let during: (() => Promise<void>) | undefined;
+      const tool: Module = {
+        name: 'pause',
+        async start() {},
+        async stop() {},
+        getTools() { return [{ name: 'wait', description: 'Wait a moment.', inputSchema: { type: 'object', properties: {} } }]; },
+        async handleToolCall() {
+          await during?.();
+          return { success: true, data: 'waited' };
+        },
+        async onProcess() { return {}; },
+      } as unknown as Module;
+      const { framework, provider, turn } = await pair({ tool });
+      await turn('alpha', 'One.');
+      provider.script = (request) => request.assistantParticipant === 'alpha' && indexOfText(request, 'Two.') >= 0 && indexOfText(request, 'waited') < 0
+        ? [createMockResponse([{ type: 'tool_use', id: 'w1', name: 'pause--wait', input: {} } as ContentBlock], 'tool_use'),
+          createMockResponse([{ type: 'text', text: 'Done waiting.' }])]
+        : undefined;
+      // While alpha waits on its tool, the host writes a note and an effort row of its own.
+      during = async () => {
+        during = undefined;
+        const cm = framework.getAgent('alpha')!.getContextManager();
+        cm.addMessage('user', [{ type: 'text', text: 'HOST NOTE.' }]);
+        cm.addMessage('system', [effortBlock('max')]);
+      };
+      await turn('alpha', 'Two.');
+      const stream = [...provider.streams].find(([request]) => request.assistantParticipant === 'alpha' && indexOfText(request, 'Two.') >= 0)?.[1];
+      const injected = (stream?.receivedToolResultOptions ?? []).flatMap((o) => o?.injectedMessages ?? []) as Array<{ content: ContentBlock[] }>;
+      assert.ok(injected.some((m) => textOf(m).includes('HOST NOTE.')), 'premise: alpha heard the host\'s rows at its boundary');
+      assert.deepEqual(injected.filter((m) => m.content.some(isEffortBlock)), [], 'but not its effort row');
+    } finally { await cleanup(); }
+  });
+
+  it('never presents to another resident a row that carries an agent\'s effort mark without the framework\'s own-row stamp', async () => {
+    try {
+      const { framework, turn } = await pair();
+      await turn('alpha', 'One.');
+      await turn('beta', 'Two.');
+      const cm = framework.getAgent('alpha')!.getContextManager();
+      cm.addMessage('system', [effortBlock('max')], { effortRowOf: 'alpha' });
+      cm.addMessage('system', [effortBlock('low')], { effortRowOf: 'alpha', audience: ['alpha', 'beta'] } as never);
+      (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('beta'));
+      const window = framework.getAgent('beta')!.getContextManager().getPresentedMessages();
+      assert.ok(window.some((m) => textOf(m).includes('Reply 2.')), 'premise: beta\'s window holds its turn');
+      assert.deepEqual(window.filter((m) => m.content.some(isEffortBlock)), [], 'and neither row marked for alpha, unstamped or stamped for both');
+    } finally { await cleanup(); }
+  });
+
+  it('copies none of an observed agent\'s effort rows into a copy derivation', async () => {
     try {
       const { framework, provider, live, turn } = await pair({ observes: true });
       await turn('alpha', 'One.');
@@ -1213,38 +1397,83 @@ describe('FrameworkConfig.effort: two agents on one store', { skip: NEEDS_ROWS }
         framing: [{ participant: 'user', content: [{ type: 'text', text: 'Copy.' }] }],
       });
       const rows = copy.contextManager.getAllMessages().filter((m) => m.content.some(isEffortBlock));
-      assert.deepEqual(rows.map((m) => (m.metadata as { effortRowOf?: string } | undefined)?.effortRowOf), ['alpha'], 'alpha\'s row, under alpha\'s mark');
+      assert.deepEqual(rows, [], 'beta\'s view never held alpha\'s row, so its copy holds none');
       await framework.runEphemeralToCompletion(copy.agent, copy.contextManager);
       const [request] = provider.carrying('Copy.');
       assert.ok(indexOfText(request!, 'Reply 3.') >= 0, 'premise: the copy holds alpha\'s reply');
-      assert.deepEqual(effortRows(request!), [], 'and its request leaves alpha\'s row out');
+      assert.deepEqual(effortRows(request!), [], 'and its request carries no row');
     } finally { await cleanup(); }
   });
 
-  it('takes back, at a copy\'s refusal, none of the rows it holds under an observed agent\'s mark', async () => {
+  it('takes back, at a resident\'s refusal, none of another resident\'s rows in their shared slot', async () => {
     try {
-      const { framework, provider, live, turn } = await pair({ observes: true });
+      const { framework, provider, live, turn, last } = await pair();
       await turn('alpha', 'One.');
       await turn('beta', 'Two.');
       live.alpha = 'low';
       await turn('alpha', 'Three.');
-      // Beta's turn takes in alpha's rows, and its request fails, so no reply of beta's follows them.
-      provider.fail = (request) => (indexOfText(request, 'Four.') >= 0 ? refusal(false) : undefined);
+      assert.deepEqual(effortRows(last('alpha')).map((r) => r.effort), ['low'], 'premise: alpha wrote its row after beta\'s last reply');
+      live.beta = 'low';
+      provider.fail = (request) => (request.assistantParticipant === 'beta' && effortRows(request).length > 0 ? refusal(true) : undefined);
       await turn('beta', 'Four.');
-      live.copy = 'low';
-      provider.fail = (request) => (indexOfText(request, 'Copy.') >= 0 && effortRows(request).length > 0 ? refusal(true) : undefined);
-      const copy = await framework.deriveAgent({
-        name: 'copy', from: 'beta', mode: 'copy',
-        framing: [{ participant: 'user', content: [{ type: 'text', text: 'Copy.' }] }],
-      });
-      const marks = () => copy.contextManager.getAllMessages().filter((m) => m.content.some(isEffortBlock))
+      const betas = provider.carrying('Four.').filter((r) => r.assistantParticipant === 'beta');
+      assert.deepEqual(betas.map((r) => effortRows(r).map((row) => row.effort)), [['low'], []],
+        'premise: beta\'s own row was refused, and its retry carried none');
+      const marks = framework.getAgent('beta')!.getContextManager().getAllMessages().filter((m) => m.content.some(isEffortBlock))
         .map((m) => (m.metadata as { effortRowOf?: string } | undefined)?.effortRowOf);
-      assert.deepEqual(marks(), ['alpha'], 'premise: the copy holds alpha\'s row, under alpha\'s mark');
-      await framework.runEphemeralToCompletion(copy.agent, copy.contextManager);
-      assert.deepEqual(provider.carrying('Copy.').map((r) => effortRows(r).map((row) => row.effort)), [['low'], []],
-        'premise: the copy\'s own row was refused, and its retry carried none');
-      assert.deepEqual(marks(), ['alpha'], 'the copy\'s own row is taken back, and alpha\'s stays');
+      assert.deepEqual(marks, ['alpha'], 'beta\'s row is taken back, and alpha\'s stays');
     } finally { await cleanup(); }
+  });
+
+  it('never presents an observed agent\'s effort row to the observer', async () => {
+    try {
+      const { framework, live, turn, last } = await pair({ observes: true });
+      await turn('alpha', 'One.');
+      await turn('beta', 'Two.');
+      live.alpha = 'low';
+      await turn('alpha', 'Three.');
+      assert.deepEqual(effortRows(last('alpha')).map((r) => r.effort), ['low'], 'premise: alpha wrote its row');
+      await turn('beta', 'Four.');
+      const window = framework.getAgent('beta')!.getContextManager().getPresentedMessages();
+      assert.ok(window.some((m) => textOf(m).includes('Reply 3.')), 'premise: beta\'s window holds alpha\'s reply');
+      assert.deepEqual(window.filter((m) => m.content.some(isEffortBlock)), [], 'but not alpha\'s row');
+    } finally { await cleanup(); }
+  });
+
+  it('takes a refused row out of the store alone: no other window held it, and a shared derivation keeps its own copy', async () => {
+    try {
+      const { framework, provider, live, turn } = await pair({ observes: true });
+      const retracted: TraceEvent[] = [];
+      framework.onTrace((event) => { if (event.type === 'presentation:retracted') retracted.push(event); });
+      await turn('alpha', 'One.');
+      await turn('beta', 'Two.');
+      live.alpha = 'low';
+      // Alpha's start stores its row, and the request fails unmarked, so the row stays with no reply after it.
+      provider.fail = (request) => (request.assistantParticipant === 'alpha' && indexOfText(request, 'Three.') >= 0 ? refusal(false) : undefined);
+      await turn('alpha', 'Three.');
+      const row = storedEffortRows(framework, 'alpha').find((m) => (m.metadata as { effortRowOf?: string }).effortRowOf === 'alpha');
+      assert.ok(row, 'premise: alpha\'s row is stored');
+      const kid = await framework.deriveAgent({ name: 'kid', from: 'alpha' });
+      assert.ok(kid.contextManager.getAllMessages().some((m) => m.id === row!.id), 'premise: the shared derivation holds the row on its branch');
+      await turn('beta', 'Four.');
+      provider.fail = (request) => (request.assistantParticipant === 'alpha' && effortRows(request).length > 0 ? refusal(true) : undefined);
+      await turn('alpha', 'Five.');
+      assert.deepEqual(provider.carrying('Five.').filter((r) => r.assistantParticipant === 'alpha').map((r) => effortRows(r).length), [1, 0],
+        'premise: alpha\'s request carried the row and was refused, and its retry carried none');
+      assert.equal(storedEffortRows(framework, 'alpha').some((m) => m.id === row!.id), false, 'premise: the refusal took the row back');
+      assert.deepEqual(retracted, [], 'no window gave the row back');
+      assert.deepEqual(framework.getAgent('beta')!.getContextManager().getPresentedMessages().filter((m) => m.content.some(isEffortBlock)), [],
+        'the observer\'s window never held it');
+      assert.ok(kid.contextManager.getAllMessages().some((m) => m.id === row!.id), 'the shared derivation\'s view still holds its branch\'s copy');
+    } finally { await cleanup(); }
+  });
+
+  it('keeps another agent\'s framework effort rows out of the resident and subconscious views', () => {
+    for (const [name, sees] of [['residentViewFilter', residentViewFilter('beta')], ['subconsciousViewFilter', subconsciousViewFilter('beta')]] as const) {
+      assert.equal(sees({ metadata: { effortRowOf: 'alpha' } }), false, `${name}: alpha's row`);
+      assert.equal(sees({ metadata: { effortRowOf: 'beta' } }), true, `${name}: its own`);
+      assert.equal(sees({ metadata: {} }), true, `${name}: an unmarked row`);
+    }
   });
 
   it('sends an agent only its own effort rows, and reads its own as in force', async () => {
@@ -1281,5 +1510,39 @@ describe('FrameworkConfig.effort: two agents on one store', { skip: NEEDS_ROWS }
       assert.deepEqual(effortRows(last('beta')).map((r) => r.effort), ['low'], 'beta still sends its row');
       assert.equal(topLevel(last('beta')), 'high', 'under its base');
     } finally { await cleanup(); }
+  });
+});
+
+describe('FrameworkConfig.effort: an isolated observer whose window is still the record', () => {
+  it('sends a resumed isolated observer none of the observed agent\'s effort rows, unset or set', async () => {
+    for (const effort of [undefined, 'high'] as const) {
+      try {
+        const { framework, provider } = await resident(effort ? { effort } : {});
+        const config = { model: 'claude-opus-5-5', systemPrompt: 'test', proseRouting: 'disabled' };
+        const bee = await framework.createEphemeralAgent({ name: 'bee', ...config } as never, workerSpec('bee'));
+        bee.contextManager.addMessage('user', [{ type: 'text', text: 'BEE NOTE.' }]);
+        bee.contextManager.addMessage('system', [effortBlock('low')], { effortRowOf: 'bee' });
+        await framework.runEphemeralToCompletion(bee.agent, bee.contextManager);
+        // Ay's window is never written down, at its first run or its resume, so it stays the record: the merged slots, through its view.
+        const presentRows = StoreWindow.prototype.presentRows;
+        StoreWindow.prototype.presentRows = function (this: StoreWindow, ids: Parameters<typeof presentRows>[0], ...rest: unknown[]) {
+          if (ids.length === 0) throw new Error('the write-down is refused (test)');
+          return (presentRows as (...a: unknown[]) => ReturnType<typeof presentRows>).call(this, ids, ...rest);
+        } as typeof presentRows;
+        let resumed: Awaited<ReturnType<AgentFramework['resumeAgent']>>;
+        try {
+          const ay = await framework.createEphemeralAgent({ name: 'ay', ...config } as never, { ...workerSpec('ay'), observes: [{ slot: 'subagent/bee' }] });
+          ay.contextManager.addMessage('user', [{ type: 'text', text: 'Ay one.' }]);
+          await framework.runEphemeralToCompletion(ay.agent, ay.contextManager);
+          resumed = await framework.resumeAgent('ay', config as never);
+        } finally { StoreWindow.prototype.presentRows = presentRows; }
+        assert.equal(resumed.contextManager.windowMode(), 'legacy', `${effort ?? 'unset'}: premise: the resumed window is still the record`);
+        resumed.contextManager.addMessage('user', [{ type: 'text', text: 'Ay again.' }]);
+        await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+        const [again] = provider.carrying('Ay again.');
+        assert.ok(indexOfText(again!, 'BEE NOTE.') >= 0, `${effort ?? 'unset'}: premise: ay reads bee's slot`);
+        assert.deepEqual(effortRows(again!), [], `${effort ?? 'unset'}: and is sent none of bee's effort rows`);
+      } finally { await cleanup(); }
+    }
   });
 });

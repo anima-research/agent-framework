@@ -335,6 +335,17 @@ describe('Conversation routing', () => {
     assert.deepEqual(lines, [seedLine(0, 0, 0, 0, 0, 1)]);
   });
 
+  it("a fork's seed keeps a row that carries the effort mark without an effort block", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!;
+    trunk.getContextManager().addMessage('user', [{ type: 'text', text: 'MARKED: a message whose writer set the mark.' }], { effortRowOf: 'trunk' });
+
+    const { seeded, lines } = await seedOf(framework);
+    assert.ok(seeded.some((m) => JSON.stringify(m.content).includes('MARKED')), 'the mark alone makes no effort row');
+    assert.deepEqual(lines, []);
+  });
+
   it('fork inherits the template context, and a seed that leaves nothing out logs nothing', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
     const framework = await makeFramework();
