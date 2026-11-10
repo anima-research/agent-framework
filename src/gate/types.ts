@@ -402,7 +402,8 @@ export interface UpcomingWake {
    *  each have a message of its own written to its window
    *  (WakeProvenance.writes), or a queued wake that reads rows, or a start
    *  merged from wakes that each read rows, starts no turn once the agent
-   *  has read and answered them. */
+   *  has read and answered them. True or false of every agent `agents`
+   *  names: a batch certain for some and not others is a wake for each. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;

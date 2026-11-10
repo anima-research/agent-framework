@@ -4424,18 +4424,18 @@ export class EventGate {
       if (agents.length === 0) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
-      wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge`, agents }
-        : {
-            at: state.dueAt,
-            certain: agents.some((agent) => {
-              const seen = state.events.filter((e) => (e.recipients === undefined ? recipients.includes(agent) : e.recipients.includes(agent)));
-              return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent);
-            }),
-            kind: 'debounce',
-            what: `rule ${quotedValue(name)}'s debounced batch of ${batch}`,
-            agents,
-          });
+      if (state.judge) {
+        wakes.push({ at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge`, agents });
+        continue;
+      }
+      const certainFor = (agent: string): boolean => {
+        const seen = state.events.filter((e) => (e.recipients === undefined ? recipients.includes(agent) : e.recipients.includes(agent)));
+        return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent);
+      };
+      for (const certain of [true, false]) {
+        const group = agents.filter((agent) => certainFor(agent) === certain);
+        if (group.length > 0) wakes.push({ at: state.dueAt, certain, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${batch}`, agents: group });
+      }
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
