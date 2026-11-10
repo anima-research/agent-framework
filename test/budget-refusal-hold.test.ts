@@ -757,6 +757,103 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
+  async function reheldWithSecond(replies: Reply[]) {
+    const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', ...replies] });
+    t.internal.budgetHoldRecheckMs = 60_000;
+    t.send('hello');
+    assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+    t.sendForPrime('go');
+    assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+    t.send('second');
+    assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+    t.internal.releaseBudgetHold('prime');
+    assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
+      'released while compression still refuses, its start merged with that wake is refused and waits again');
+    return t;
+  }
+
+  it('a released turn refused again keeps the wakes merged into it at its release: a surgery that drops it puts them back in the queue, and they run', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await reheldWithSecond(['Answered second']);
+      try {
+        const gated = t.framework.getHostModeStatus().gatedRequests;
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed']);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+        assert.ok(requestText(t.turnCalls()[1]).includes('second'), 'which read it');
+        assert.equal(t.of('inference:held')[1]?.heldRequests, 2, 'the wait held again counted that wake among the requests it held as it started');
+        assert.equal(gated, 2, 'and the host mode status counted the waiting turn and that wake as gated requests');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('abortInference() of a released turn refused again puts the wakes merged into it at its release back in the queue, and they run', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await reheldWithSecond(['Answered second']);
+      try {
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'stopped']);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a released turn refused again twice keeps the wakes merged into it at both releases, and a drop puts them all back', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await reheldWithSecond(['Answered both']);
+      try {
+        const before = t.hold()?.heldRequests as number;
+        t.send('third');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === before + 1), "third's wake joined the wait");
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 3 && t.internal.budgetHolds.has('prime')), 'refused and waiting a third time');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        assert.equal(t.of('inference:hold_ended').at(-1)?.outcome, 'removed');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered both')), 'the wakes ran');
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+        const read = requestText(t.turnCalls()[1]);
+        assert.ok(read.includes('second') && read.includes('third'), 'which read both');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("abortInference() of a held start merged from wakes, none of them a released turn, ends them with it, since they are the waiting turn's own", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered the merge'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('alpha');
+        t.sendForPrime('beta');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'one start, merged from both, waits');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 1, 'no turn after the hello');
+        assert.ok(!t.stored().includes('Answered the merge'));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('stop() ends a held turn with inference:aborted, and the hold with it', async () => {
     await withCompression({ fitAt: Infinity }, async () => {
       const t = await resident({ maintenanceIntervalMs: 0 });
