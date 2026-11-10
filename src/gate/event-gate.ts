@@ -417,6 +417,13 @@ function isWrite(after: WritePlacement | undefined): after is WritePlacement & {
   return !!after?.agent && !!after.messageId;
 }
 
+function surelyWakes(events: readonly PendingEvent[], agentNames: readonly string[]): boolean {
+  return agentNames.some((agent) => {
+    const seen = events.filter((e) => e.recipients === undefined || e.recipients.includes(agent));
+    return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent);
+  });
+}
+
 function withoutWrite(event: PendingEvent): PendingEvent {
   const { after, replyTo: _replyTo, ...rest } = event;
   return after ? { ...rest, named: after } : rest;
@@ -4432,7 +4439,7 @@ export class EventGate {
    * batches of rules other than `exceptPolicy`, with those rules' events
    * buffered while a turn runs or the host is quiesced. A debounce's batch
    * wakes the agent when it's delivered: when it fires, or, buffered, once no
-   * turn runs and the host isn't quiesced. It only may where each of
+   * turn runs and the host isn't quiesced. Either only may where each of
    * `agentNames` is given none of its events, or each event delivery gives
    * that agent has a message of its own whose write was placed for it. A host
    * whose scheduler drops such a wake by its WakeProvenance.writes, as
@@ -4472,15 +4479,7 @@ export class EventGate {
       if (!recipient || name === leftOut.policy || state.events.length === 0) continue;
       const rule = `rule ${quotedValue(name)}'s`;
       if (!state.judge || !this.judgeFn) {
-        wakes.push({
-          at: state.dueAt,
-          certain: agentNames.some((agent) => {
-            const seen = state.events.filter((e) => e.recipients === undefined || e.recipients.includes(agent));
-            return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent);
-          }),
-          kind: 'debounce',
-          what: `${rule} debounced batch of ${count(state.events.length)}`,
-        });
+        wakes.push({ at: state.dueAt, certain: surelyWakes(state.events, agentNames), kind: 'debounce', what: `${rule} debounced batch of ${count(state.events.length)}` });
       } else {
         const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : '';
         wakes.push({ at: state.dueAt, certain: false, kind: 'judge-batch', what: `${rule} batch of ${count(state.events.length)}${joins} goes to the judge` });
@@ -4501,9 +4500,9 @@ export class EventGate {
           ? { certain: false, kind: 'judge-batch', when: "with its rule's next batch, or once the hold on its calls is released, and no turn or quiesce holds it", what: `${batch}, held for the judge` }
           : { certain: false, kind: 'judge-batch', when: 'once no turn or quiesce holds it', what: `${batch}, held for the judge` });
     }
-    const buffered = this.inferenceBuffer.filter((e) => e.policyName !== leftOut.policy && !this.heldNow(e)).length;
-    if (recipient && buffered > 0) {
-      wakes.push({ certain: true, kind: 'debounce', when: "once no turn runs and the host isn't quiesced", what: `${count(buffered)} buffered for delivery` });
+    const buffered = this.inferenceBuffer.filter((e) => e.policyName !== leftOut.policy && !this.heldNow(e));
+    if (recipient && buffered.length > 0) {
+      wakes.push({ certain: surelyWakes(buffered, agentNames), kind: 'debounce', when: "once no turn runs and the host isn't quiesced", what: `${count(buffered.length)} buffered for delivery` });
     }
     const due = (w: UpcomingWake): number => (w.when !== undefined ? Infinity : w.at ?? now);
     return wakes.sort((a, b) => (due(a) === due(b) ? 0 : due(a) - due(b)));

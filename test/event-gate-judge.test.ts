@@ -2008,6 +2008,24 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
+  for (const [what, writes, certain] of [
+    ['each written to the agent only may wake it, since an answered wake starts no turn', [{ agent: 'agent', messageId: 'row-1' }, { agent: 'agent', messageId: 'row-2' }], false],
+    ['with an event given no write, they wake it: the framework has no write to drop the wake by', [{ agent: 'agent', messageId: 'row-1' }, undefined], true],
+  ] as const) {
+    it(`lists events buffered while the host is quiesced as a debounced batch's: ${what}`, async () => {
+      const { gate } = makeGate(writeConfig('upcoming-quiesced-written.json', {
+        policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 30 } }],
+      }));
+      gate.setQuiesced(true);
+      writes.forEach((after: WritePlacement | undefined, i) => {
+        gate.evaluate({ content: `notes-${i}.md`, eventType: 'workspace:modified', serverId: '', channelId: '' }, after);
+      });
+      await until(() => gate.inferenceDiagnostics().bufferedEvents === 2, 'the fired batch buffered while the host is quiesced');
+      assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [['2 events buffered for delivery', certain]]);
+      gate.dispose();
+    });
+  }
+
   it('leaves out of the buffered count an event whose channel is held now', async () => {
     let tunedOut = false;
     const { gate } = makeGate(writeConfig('upcoming-buffered-held.json', {

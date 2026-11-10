@@ -600,11 +600,12 @@ describe('reply judge: the document', () => {
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
   });
 
-  it("says first that the agent's last turn failed, then what runs it again, by the kinds of wake the list holds: a certain queued wake, else the first certain provider hold in the list's order, with its time when it has one, else nothing", async () => {
+  it("says first that the agent's last turn failed, then what runs it again, by the kinds of wake the list holds: a certain queued wake, else the first certain provider hold in the list's order, with its time when it has one, else a queued wake that may be dropped, else the first such provider hold, else nothing", async () => {
     const now = 1_000_000;
     const failed: FailedLastTurn = { at: now - 30_000 };
     const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
     const nothing = 'Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes Scout.';
+    const maybe = ", but it may be dropped without running a turn; if it is, anything that woke the last turn and hasn't been answered stays unanswered until something else wakes Scout.";
     const queued = { certain: true, kind: 'queued', what: 'a wake already queued (x)' } as const;
     const held = { at: now + 180_000, certain: true, kind: 'provider-hold', what: 'a turn held by a provider cooldown, when it ends' } as const;
     const cases: [UpcomingWake[], string][] = [
@@ -615,8 +616,13 @@ describe('reply judge: the document', () => {
       [[{ ...held, at: now + 7_200_000 }, { ...held, at: now + 60_000 }], 'A wake for Scout is held, due to be let go in 60 s.'],
       [[{ when: 'once the operator approves the retry', certain: true, kind: 'provider-hold', what: 'a wake held by the host' }, held], 'A wake for Scout is held, due to be let go in 3 min.'],
       [[held, queued], 'A wake for Scout is already queued.'],
-      [[{ ...queued, certain: false }], nothing],
-      [[{ ...held, certain: false }], nothing],
+      [[{ ...queued, certain: false }], `A wake for Scout is queued${maybe}`],
+      [[{ ...held, certain: false }], `A wake for Scout is held, due to be let go in 3 min${maybe}`],
+      [[{ when: 'once the operator approves the retry', certain: false, kind: 'provider-hold', what: 'a wake held by the host' }], `A wake for Scout is held${maybe}`],
+      [[{ ...held, certain: false, at: now + 7_200_000 }, { ...held, certain: false, at: now + 60_000 }], `A wake for Scout is held, due to be let go in 60 s${maybe}`],
+      [[{ ...queued, certain: false }, held], 'A wake for Scout is held, due to be let go in 3 min.'],
+      [[{ ...held, certain: false }, queued], 'A wake for Scout is already queued.'],
+      [[{ ...held, certain: false }, { ...queued, certain: false }], `A wake for Scout is queued${maybe}`],
       [[{ at: now + 60_000, certain: true, kind: 'heartbeat', what: 'its heartbeat' }, { at: now + 90_000, certain: false, kind: 'judge-batch', what: 'a batch' }], nothing],
       [[{ certain: true, what: 'a wake already queued (x)' }], nothing],
     ];

@@ -283,9 +283,16 @@ function soonestFirst(wakes: readonly UpcomingWake[], now: number): UpcomingWake
 
 export function failedTurnLine(failed: FailedLastTurn, wakes: readonly UpcomingWake[], agentName: string, now: number): string {
   const opening = `${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`;
-  if (wakes.some((w) => w.kind === 'queued' && w.certain)) return `${opening} A wake for ${agentName} is already queued.`;
-  const held = soonestFirst(wakes, now).find((w) => w.kind === 'provider-hold' && w.certain);
-  if (held) return `${opening} A wake for ${agentName} is held${held.at !== undefined ? `, due to be let go ${inWhile(held.at, now)}` : ''}.`;
+  const queued = (certain: boolean): boolean => wakes.some((w) => w.kind === 'queued' && w.certain === certain);
+  const held = (certain: boolean): UpcomingWake | undefined => soonestFirst(wakes, now).find((w) => w.kind === 'provider-hold' && w.certain === certain);
+  const due = (w: UpcomingWake): string => (w.at !== undefined ? `, due to be let go ${inWhile(w.at, now)}` : '');
+  const maybe = `, but it may be dropped without running a turn; if it is, anything that woke the last turn and hasn't been answered stays unanswered until something else wakes ${agentName}.`;
+  if (queued(true)) return `${opening} A wake for ${agentName} is already queued.`;
+  const sure = held(true);
+  if (sure) return `${opening} A wake for ${agentName} is held${due(sure)}.`;
+  if (queued(false)) return `${opening} A wake for ${agentName} is queued${maybe}`;
+  const maybeHeld = held(false);
+  if (maybeHeld) return `${opening} A wake for ${agentName} is held${due(maybeHeld)}${maybe}`;
   return `${opening} Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes ${agentName}.`;
 }
 
