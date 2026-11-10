@@ -32,7 +32,9 @@
   request was serialised to be sent, and a field JSON leaves out, such as a
   function, is left out of the request as it was of what was sent. The
   direct API (`Agent.runInference`, `runInferenceWithInjections`) passes the
-  tools it's given as they are, as before.
+  tools it's given as they are, as before, except where it goes on an
+  `'entries'` agent's recorded head (see `toolDeclarations`), whose copy it
+  sends.
 - The refusal rewind, automatic or forced by `/unstick`, and the shed after
   inference exhaustion pass over every system change row, as they did on a
   presented window: on a window that is the record, a host's change row

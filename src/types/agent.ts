@@ -194,18 +194,23 @@ export interface AgentConfig {
    * clear keeps them until it can), while its compile, made as an
    * `'entries'` agent's, holds a host's until then. An Agent used without the framework
    * keeps its head in memory, per branch of its context, and has no such resend. The direct API
-   * (runInference) declares nothing: it sends the tools its caller passes
-   * and the current system text, and leaves the agent's own change rows out
-   * of its request, since its head already holds what they declare. Under
-   * `'entries'` it carries a host's change rows as the agent's requests do;
-   * on its head it carries none. With `thinkingBinding.binds: true`, its
-   * compile binds thinking under the current head, so on an `'entries'`
-   * agent whose recorded head differs, the next request the agent makes sets
-   * aside the thinking before it. With `binds` left out, where the agent's
-   * recorded head differs, the direct request carries its thinking under a
-   * prefix it wasn't signed under: with `dropBlock` the provider drops it,
-   * and without it an account that enforces the binding refuses the request,
-   * and one that doesn't decides for itself.
+   * (runInference) declares nothing. On an `'entries'` agent with a recorded
+   * head, where the tools its caller passes and the current system text are
+   * what that head and the agent's own change rows declare, its request goes
+   * on that head with every change row, as the agent's own request would, and
+   * its compile binds thinking under that head. Elsewhere it sends the tools
+   * its caller passes and the current system text, and leaves the agent's
+   * own change rows out of its request: under `'entries'` it carries a
+   * host's change rows as the agent's requests do, and on its head it
+   * carries none. Where what the caller passes differs from what the
+   * agent's head and own rows declare, with `thinkingBinding.binds: true`
+   * its compile binds thinking under an identity none of the agent's own
+   * requests has, so it sets aside the thinking before it, as the next
+   * request the agent makes does. With `binds` left out, the direct request
+   * there carries that thinking under a prefix it wasn't signed under: with
+   * `dropBlock` the provider drops it, and without it an account that
+   * enforces the binding refuses the request, and one that doesn't decides
+   * for itself.
    *
    * Turning it on is a choice from those records, not a runtime toggle, so
    * it isn't one of the agent's runtime settings.

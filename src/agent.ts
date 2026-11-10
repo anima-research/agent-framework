@@ -33,6 +33,7 @@ import {
   copyHead,
   pricedCharacters,
   requestCharacters,
+  type DeclarationDifference,
   type HeadDeclaration,
   type HeadDeclarationStore,
   type HeadEvent,
@@ -2032,19 +2033,28 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const binding = this.bindingCompileOptions(this.currentHead(tools, (injections ?? [])
-      .filter((injection) => injection.position === 'system')
-      .flatMap((injection) => injection.content)));
+    const recorded = this.declaresEntries() ? this.headDeclarations.read(this.name) : null;
+    const compileBound = (binding: BindingCompileOptions) => this.toolResultGuard.afterAnnotations(
+      () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
     const assemble = async (): Promise<NormalizedRequest> => {
-      const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
+      let compiled = await compileBound(this.bindingCompileOptions(recorded ?? this.currentHead(tools, (injections ?? [])
+        .filter((injection) => injection.position === 'system')
+        .flatMap((injection) => injection.content))));
+      let current = this.currentHead(tools, compiled.systemInjections);
+      const ownOf = (result: CompileResult) => (this.declaresEntries() ? ownSystemChanges(result, (name) => this.ownsChange(name)) : undefined);
+      let own = ownOf(compiled);
+      const onRecorded = recorded !== null && own !== undefined && this.ownDifference(compiled, own, recorded, current, []).difference.kind === 'none';
+      if (recorded !== null && !onRecorded && this.thinkingBindingOption()) {
+        compiled = await compileBound(this.bindingCompileOptions(current, true));
+        current = this.currentHead(tools, compiled.systemInjections);
+        own = ownOf(compiled);
+      }
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
-      const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const own = this.declaresEntries() ? ownSystemChanges(compiled, (name) => this.ownsChange(name)) : undefined;
-      const carried = compiled.messages.filter((m, i) => !isSystemChangeMessage(m) || (own !== undefined && !own.has(i)));
+      const carried = onRecorded ? compiled.messages
+        : compiled.messages.filter((m, i) => !isSystemChangeMessage(m) || (own !== undefined && !own.has(i)));
       const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(carried)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
@@ -2052,10 +2062,12 @@ export class Agent {
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
       appendAll(messages, unguardedResults);
+      const recordedHead = onRecorded && recorded ? copyHead(recorded) : undefined;
+      const sentTools = recordedHead ? recordedHead.tools : tools;
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
-        system: this.buildSystemPrompt(systemInjections),
-        tools: tools.length > 0 ? tools : undefined,
+        system: recordedHead ? systemTextOf(recordedHead.system) : this.buildSystemPrompt(compiled.systemInjections),
+        tools: sentTools.length > 0 ? sentTools : undefined,
         ...this.requestSettings(),
         assistantParticipant: this.presentAs,
       };
@@ -2440,7 +2452,7 @@ export class Agent {
    * its messages, so a changed one can stand for a first difference where the context manager keeps a
    * thinking-binding record. Nothing without `binds`: the compile is as it was.
    */
-  private bindingCompileOptions(head: HeadDeclaration): BindingCompileOptions {
+  private bindingCompileOptions(head: HeadDeclaration, ownChangesLeftOut = false): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
     if (!thinkingBinding) return {};
     const { config, providerParams, prefillUserMessage } = this.requestSettings();
@@ -2453,6 +2465,7 @@ export class Agent {
         request: wireDigest({
           thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
           prefillUserMessage: prefillUserMessage ?? null,
+          ...(ownChangesLeftOut ? { ownChangesLeftOut } : {}),
         }),
       },
     };
@@ -2912,10 +2925,7 @@ export class Agent {
       return { compiled, head: current };
     }
     if (!recorded) return this.moveHead(compiled, compiledWith, recorded, current, 'adopted', dryRun, compile);
-    const blocks = compiled.messages.flatMap((message, index) => (own.has(index) ? message.content.filter(isSystemChangeContent) : []));
-    const ownDeclaration = effectiveDeclaration(recorded, blocks);
-    const sent = [...compiled.messages, ...previewRows].flatMap((message) => message.content.filter(isSystemChangeContent));
-    const difference = withoutCarried(declarationDifference(ownDeclaration, current), ownDeclaration, effectiveDeclaration(recorded, sent));
+    const { blocks, difference } = this.ownDifference(compiled, own, recorded, current, previewRows);
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, 'replaced', dryRun, compile);
     const consolidation = this.consolidation(compiled, own, blocks, recorded, previewRows);
     if (consolidation) return this.moveHead(compiled, compiledWith, recorded, current, 'consolidated', dryRun, compile, consolidation);
@@ -2947,6 +2957,19 @@ export class Agent {
       const moved = this.takeChangesOverBudget(error, true, recorded, current);
       return { compiled: await compile(moved), head: moved };
     }
+  }
+
+  private ownDifference(
+    compiled: CompileResult,
+    own: ReadonlySet<number>,
+    recorded: HeadDeclaration,
+    current: HeadDeclaration,
+    previewRows: readonly NormalizedMessage[],
+  ): { blocks: SystemChangeContent[]; difference: DeclarationDifference } {
+    const blocks = compiled.messages.flatMap((message, index) => (own.has(index) ? message.content.filter(isSystemChangeContent) : []));
+    const ownDeclaration = effectiveDeclaration(recorded, blocks);
+    const sent = [...compiled.messages, ...previewRows].flatMap((message) => message.content.filter(isSystemChangeContent));
+    return { blocks, difference: withoutCarried(declarationDifference(ownDeclaration, current), ownDeclaration, effectiveDeclaration(recorded, sent)) };
   }
 
   private takeChangesOverBudget(error: unknown, entries: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {

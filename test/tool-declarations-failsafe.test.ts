@@ -419,6 +419,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     .update(canonical({ system: r.system, tools: (r.tools ?? []).map((t) => t.name), messages: r.messages.slice(0, upTo) })).digest('hex');
   const misboundThinking = (r: NormalizedRequest) => r.messages.some((m, i) => m.content.some((b) =>
     (b as { type?: string }).type === 'thinking' && (b as { signature?: string }).signature !== prefixHash(r, i)));
+  const thinkingIn = (r: NormalizedRequest) => r.messages.flatMap((m) => m.content.filter((b) => (b as { type?: string }).type === 'thinking')).length;
 
   class RefusedTwoBoundariesOn extends RefusedAfterChange {
     boundaries = 0;
@@ -555,7 +556,9 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
       return new MockYieldingStream([createMockResponse([{ type: 'thinking', thinking: 'why', signature: prefixHash(request, request.messages.length) } as ContentBlock, { type: 'text', text: 'done' }])]);
     };
     const direct: string[] = [];
+    let directSent: NormalizedRequest | undefined;
     membrane.stream = async (request: NormalizedRequest): Promise<NormalizedResponse> => {
+      directSent = request;
       if (misboundThinking(request)) {
         direct.push('refused');
         throw Object.assign(new MembraneError({ type: 'invalid_request', retryable: false, message: 'thinking signature not valid for this prefix', rawError: { status: 400 } }), { httpStatus: 400 });
@@ -582,9 +585,97 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
       const agent = framework.getAgent('resident')!;
       await agent.runInference(membrane.calls[0]!.tools ?? []).catch(() => undefined);
       assert.deepEqual(direct, ['answered, carrying the change'], "the direct API carries the host's row, as the agent's requests do");
+      assert.equal(thinkingIn(directSent!), 1, "and the reply's thinking, signed after it");
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("the direct API on an 'entries' agent, by what its caller passes against its head and own change rows", () => {
+    async function directAfter(turns: string[][], passed: (calls: readonly NormalizedRequest[]) => unknown[]) {
+      const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-direct-own-'));
+      const membrane = new MockMembrane();
+      const misbound: boolean[] = [];
+      membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+        membrane.calls.push(request);
+        misbound.push(misboundThinking(request));
+        return new MockYieldingStream([createMockResponse([{ type: 'thinking', thinking: 'why', signature: prefixHash(request, request.messages.length) } as ContentBlock, { type: 'text', text: 'done' }])]);
+      };
+      let sent: NormalizedRequest | undefined;
+      let outcome = 'not sent';
+      membrane.stream = async (request: NormalizedRequest): Promise<NormalizedResponse> => {
+        sent = request;
+        if (misboundThinking(request)) {
+          outcome = 'refused';
+          throw Object.assign(new MembraneError({ type: 'invalid_request', retryable: false, message: 'thinking signature not valid for this prefix', rawError: { status: 400 } }), { httpStatus: 400 });
+        }
+        outcome = 'answered';
+        return createMockResponse([{ type: 'text', text: 'direct' }]);
+      };
+      const tools = new ChangingTools();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+        agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries', thinkingBinding: { binds: true } }],
+        modules: [new Input(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+        errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+      });
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
+      framework.start();
+      const completed = () => traces.filter((t) => t.type === 'inference:completed').length;
+      try {
+        for (const [i, names] of turns.entries()) {
+          tools.names = names;
+          framework.pushEvent({ type: 'external-message', source: 'test', content: `turn ${i + 1}`, metadata: {} } as unknown as ProcessEvent);
+          assert.ok(await pollUntil(() => completed() > i), `turn ${i + 1} ended`);
+        }
+        const calls = [...membrane.calls];
+        assert.deepEqual(misbound, turns.map(() => false), "the premise: each turn's request carried every earlier reply's thinking under its prefix");
+        await framework.getAgent('resident')!.runInference(passed(calls) as never).catch(() => undefined);
+        return { calls, sent: sent!, outcome };
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    const changeRows = (r: NormalizedRequest) => r.messages.filter((m) => m.content.some((b) => (b as { type?: string }).type === 'system_change'));
+    const definedIn = (r: NormalizedRequest) => changeRows(r).flatMap((m) => m.content.flatMap((b) => (b as { defineTools?: unknown[] }).defineTools ?? []));
+    const toolNames = (r: NormalizedRequest) => (r.tools ?? []).map((t) => t.name);
+
+    it("goes on the recorded head with both of the agent's own change rows when they net to nothing, keeping the thinking signed after them", async () => {
+      const run = await directAfter([['a'], ['a', 'b'], ['a']], (calls) => calls[2]!.tools ?? []);
+      assert.equal(changeRows(run.calls[2]!).length, 2, "the premise: the third turn carried b's addition and its removal");
+      assert.equal(run.outcome, 'answered');
+      assert.equal(changeRows(run.sent).length, 2, 'the direct request carries both rows');
+      assert.equal(thinkingIn(run.sent), 3, "and every reply's thinking");
+      assert.deepEqual(toolNames(run.sent), toolNames(run.calls[2]!), "on the third turn's head");
+    });
+
+    it("goes on the recorded head with the agent's own row when its caller passes the tools that head and row declare", async () => {
+      const run = await directAfter([['a'], ['a', 'b']], (calls) => [...(calls[1]!.tools ?? []), ...definedIn(calls[1]!)]);
+      assert.equal(definedIn(run.calls[1]!).length, 1, "the premise: the second turn carried b's addition");
+      assert.equal(run.outcome, 'answered');
+      assert.deepEqual(toolNames(run.sent), toolNames(run.calls[1]!), "on the recorded head, which doesn't hold b");
+      assert.equal(definedIn(run.sent).length, 1, "with the row that adds b");
+      assert.equal(thinkingIn(run.sent), 2, "and every reply's thinking");
+    });
+
+    it("leaves the agent's own row out and sets aside the thinking when its caller passes the recorded head's tools without what the row adds", async () => {
+      const run = await directAfter([['a'], ['a', 'b']], (calls) => calls[1]!.tools ?? []);
+      assert.equal(definedIn(run.calls[1]!).length, 1, "the premise: the second turn carried b's addition");
+      assert.equal(run.outcome, 'answered');
+      assert.equal(changeRows(run.sent).length, 0, 'the direct request carries no change row');
+      assert.equal(thinkingIn(run.sent), 0, 'and no thinking');
+      assert.deepEqual(toolNames(run.sent), toolNames(run.calls[1]!), 'and offers only what its caller passed');
+    });
+
+    it("sets aside the thinking when its caller passes a tool neither the head nor a row holds", async () => {
+      const c = { name: 'zz_c', description: 'c does a thing', inputSchema: { type: 'object' as const, properties: {} } };
+      const run = await directAfter([['a']], (calls) => [...(calls[0]!.tools ?? []), c]);
+      assert.equal(run.outcome, 'answered');
+      assert.ok(toolNames(run.sent).includes('zz_c'), 'the direct request offers what its caller passed');
+      assert.equal(thinkingIn(run.sent), 0, 'and carries no thinking');
+    });
   });
 });
