@@ -64,6 +64,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
     name: 'cairn',
     refusalHandling: { maxRewinds: opts?.maxRewinds ?? 3 },
     getContextManager: () => cm,
+    isOwnParticipant: (participant: string) => participant === 'agent',
   }]]);
 
   const errs: string[] = [];
@@ -147,6 +148,35 @@ for (const [kind, carriers] of CARRIER_ROWS) {
     assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
   });
 }
+
+test('nothing left to shed but a row holding only a provider item with no turn before it: the log names that row, which requests still send', () => {
+  const { fw, removed, errs, restore } = makeHarness({ messages: [
+    { id: 'mk', participant: 'user', content: [{ type: 'text', text: 'sys' }], metadata: { system: true } },
+    { id: 'c1', participant: 'agent', content: [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } }] },
+  ] });
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(removed.length, 0, 'premise: the shed takes nothing');
+  const line = errs.find((e) => e.includes('nothing left to shed'));
+  assert.ok(line, `the breaker logs that it has nothing left to shed: ${errs.join(' | ')}`);
+  assert.match(line!, /a message holding only a provider's stored items, which requests still send/, line);
+  assert.doesNotMatch(line!, /rows a request leaves empty\. Manual/, 'not that every row left is one a request leaves empty');
+});
+
+test("nothing left to shed but another participant's row holding only a provider item: the log is the plain one, since no request sends that row", () => {
+  const { fw, removed, errs, restore } = makeHarness({ messages: [
+    { id: 'mk', participant: 'user', content: [{ type: 'text', text: 'sys' }], metadata: { system: true } },
+    { id: 'c1', participant: 'human', content: [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } }] },
+  ] });
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(removed.length, 0, 'premise: the shed takes nothing');
+  const line = errs.find((e) => e.includes('nothing left to shed'));
+  assert.ok(line, `the breaker logs that it has nothing left to shed: ${errs.join(' | ')}`);
+  assert.match(line!, /history holds only system markers and rows a request leaves empty\. Manual/, line);
+});
 
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();

@@ -39,7 +39,7 @@ export function carriedBlock(block: ContentBlock): boolean {
  * only carriers is carried, but the framework's own bookkeeping (the request's last turn, its count of stored
  * injections, a shed) doesn't count it as a turn: the Responses API gets its items, except an Anthropic server-tool
  * block; Anthropic's API gets an assistant turn's paired server-tool blocks, and a lone call in the request's last
- * message; the other wires get none.
+ * message, but not through membrane's XML formatter in XML tool mode; the other wires get none.
  */
 export function holdsTurn(content: readonly ContentBlock[]): boolean {
   return content.some((block) => carriedBlock(block) && !carriesRawItem(block));
@@ -153,8 +153,9 @@ export function roundRows(
   return rows.map((row): SentRow => {
     if (row.id === undefined) return UNSTORED;
     const body = carried(row.id);
-    const content = body ? asNextRequestCarries(body.content) : null;
-    if (!body || !content) return UNSTORED;
+    if (!body) return UNSTORED;
+    const content = asNextRequestCarries(body.content);
+    if (!content) return row.kind === 'injected' && row.sent.length === 0 ? row.id : UNSTORED;
     // What the stream sent, as membrane's native formatter sends it (sentBlock): an exactly empty text block that
     // carries no provider-native item is in neither request.
     const sent = row.kind === 'results' ? submittedBlocks(row.sent) : row.sent.filter(sentBlock);

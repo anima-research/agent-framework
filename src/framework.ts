@@ -18847,7 +18847,7 @@ export class AgentFramework {
           // presents it: its re-inference compiles from the window. A quiesce
           // freezes the boundary too: it presents nothing of others' until
           // the quiesce lifts.
-          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
+          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId; unsent?: true }> = [];
           // What this boundary presented for the agent to hear, in order. An
           // agent whose window isn't presented (a write-down of it failed)
           // hears nothing here: its window is the record.
@@ -18917,11 +18917,13 @@ export class AgentFramework {
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
             if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
+              const content = agent.injectedAsSent(h.participant, asSent(i + first, h.content));
               midTurnInjections.push({
                 participant: h.participant,
-                content: agent.injectedAsSent(h.participant, asSent(i + first, h.content)),
+                content: content ?? [],
                 ...(h.metadata ? { metadata: h.metadata } : {}),
                 id: h.id,
+                ...(content === null ? { unsent: true as const } : {}),
               });
             });
           }
@@ -19193,9 +19195,11 @@ export class AgentFramework {
             // for membrane. Each goes with its name and text as the store
             // keeps them, whether it's a heard message, rendered or not, or a
             // notice the boundary made: this is where they leave for the
-            // request.
+            // request, but for a row it is sent nothing of (unsent), which
+            // the rounds note names as sent with nothing.
             const submitted = agent.toolResultGuard.submissionResults(membraneResults);
             const injectedMessages = midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) }));
+            const handed = injectedMessages.filter((_, i) => !midTurnInjections[i]!.unsent);
             // With the presentation index, the hand-off (#785): the rows the
             // stream is given next, its reply, its results and what it hears,
             // in that order, must be the newest of its window, or the rounds
@@ -19230,12 +19234,12 @@ export class AgentFramework {
             ], replySent === null || replySent === undefined || !vouched);
             const carried = this.streamCarried.get(currentState.stream);
             if (carried) {
-              const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.map((injection) => injection.id) : [];
+              const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.flatMap((injection) => injection.unsent ? [] : [injection.id]) : [];
               for (const id of [replyId, resultsId, ...injected]) if (id !== undefined) carried.add(id);
             }
             currentState.stream.provideToolResults(
               submitted,
-              midTurnInjections.length > 0 ? { injectedMessages } : undefined,
+              handed.length > 0 ? { injectedMessages: handed } : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
             // is assembly too when the stream carries the injected messages
@@ -19261,7 +19265,7 @@ export class AgentFramework {
             // write sits in the next compile where the stream's notes named
             // other rows, so the replies after it go without their
             // thinking, whatever the mark says.
-            if (midTurnInjections.length > 0) {
+            if (handed.length > 0) {
               // Shown: the stream carries them (CoalescerHost.isUnshown).
               agent.markContextShown();
               if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
@@ -19270,7 +19274,7 @@ export class AgentFramework {
             this.emitTrace({
               type: 'inference:stream_resumed',
               agentName: agent.name,
-              ...(midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections.length } : {}),
+              ...(handed.length > 0 ? { injectedMessages: handed.length } : {}),
             });
           } else {
             // Non-streaming fallback: schedule re-inference, which continues
@@ -34851,8 +34855,8 @@ export class AgentFramework {
       ids.forEach((id, i) => {
         const stored = cm.getMessage(id) ?? (injected.has(id) ? this.windowRowOf(cm, id, agent.name) : null);
         const content = rendered ? rendered[i]! : stored?.content ?? null;
-        // An injected row as the boundary sent it (Agent.injectedAsSent).
-        const sent = content && stored && injected.has(id) ? agent.injectedAsSent(stored.participant, content) : content;
+        // An injected row as the boundary sent it (Agent.injectedAsSent), with nothing for a row it sent nothing of.
+        const sent = content && stored && injected.has(id) ? agent.injectedAsSent(stored.participant, content) ?? [] : content;
         carried.set(id, stored && sent ? { participant: stored.participant, content: sent } : null);
       });
       const rows = roundRows(notes.rounds, (id) => carried.get(id) ?? null);
@@ -35305,9 +35309,14 @@ export class AgentFramework {
 
     const rec = this.shedNewestTurn(agent);
     if (!rec) {
+      const cm = agent.getContextManager();
+      const rows = this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages();
+      const itemsLeft = rows.some((m) => agent.isOwnParticipant(m.participant) && Array.isArray(m.content) && !holdsTurn(m.content) && m.content.some(carriesRawItem));
       console.error(
         `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
-        `history holds only system markers and rows a request leaves empty. Manual repair needed.`,
+        (itemsLeft
+          ? `history holds only system markers, rows a request leaves empty, and a message holding only a provider's stored items, which requests still send and a shed doesn't take. Manual repair needed.`
+          : `history holds only system markers and rows a request leaves empty. Manual repair needed.`),
       );
       return;
     }

@@ -131,8 +131,9 @@ describe('buildActivationRequest empty-text sanitize', () => {
       [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } }, true, true],
     ];
     for (const [block, kept, turn] of blocks) {
+      // The agent's own row: another participant's provider items stay out of its requests before this pass.
       const request = await agentCompiling([
-        { participant: 'human', content: [block] },
+        { participant: 'tester', content: [block] },
         { participant: 'human', content: [{ type: 'text', text: 'last' }] },
       ]).buildActivationRequest([]);
       assert.equal(request.messages.length === 2, kept, `kept: ${JSON.stringify(block)}`);
@@ -140,15 +141,14 @@ describe('buildActivationRequest empty-text sanitize', () => {
     }
   });
 
-  it('puts [Continue] after the agent\'s own last turn when another participant\'s carrier-only message follows it', async () => {
+  it('leaves out another participant\'s carrier-only message, and puts [Continue] after the agent\'s own last turn', async () => {
     const carrier = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } };
     const request = await agentCompiling([
       { participant: 'human', content: [{ type: 'text', text: 'hi' }] },
       { participant: 'tester', content: [{ type: 'text', text: 'ok' }] },
       { participant: 'Bob', content: [carrier] },
     ]).buildActivationRequest([]);
-    // A wire that leaves the item out would otherwise end on the agent's own turn.
-    assert.deepEqual(request.messages.map((m) => m.participant), ['human', 'tester', 'Bob', 'user']);
+    assert.deepEqual(request.messages.map((m) => m.participant), ['human', 'tester', 'user']);
     assert.deepEqual(request.messages.at(-1)!.content, [{ type: 'text', text: '[Continue]' }]);
   });
 

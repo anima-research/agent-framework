@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  AnthropicAdapter,
   AnthropicXmlFormatter,
   CompletionsFormatter,
   Membrane,
@@ -180,7 +181,10 @@ async function windowsWithCarrierOnlyMessages(): Promise<Array<[string, Normaliz
   const lastMessages = last.messages as NormalizedMessage[];
   assert.deepEqual(lastMessages.at(-2)!.content, ONLY_CARRIER.content, 'the agent sends the carrier-only message');
   assert.deepEqual(lastMessages.at(-1)!.content, [{ type: 'text', text: '[Continue]' }], 'and [Continue] after it');
-  const direct = (tail: unknown) => [...mid.messages.slice(0, 2), tail] as NormalizedMessage[];
+  // As stored, as a direct caller could hand membrane them: the agent's own requests leave another participant's
+  // items out, so only these hand the formatter a user turn's server block.
+  const direct = (tail: unknown) => [QUESTION, ANSWER, tail] as NormalizedMessage[];
+  assert.ok(!JSON.stringify(mid.messages).includes('srvtoolu_user'), "premise: the agent's request leaves the human's item out");
   return [
     ['mid-request', mid.messages, mid.assistant],
     ['last in the window', lastMessages, last.assistantParticipant ?? 'tester'],
@@ -203,12 +207,12 @@ describe('membrane decides per provider what a carried item becomes', () => {
       for (const [name, built] of [
         ['native', new NativeFormatter().buildMessages([...messages], options(assistant)).messages],
         ['native with server blocks', new NativeFormatter().buildMessages([...messages], options(assistant, { anthropicServerBlocks: true })).messages],
-        ['anthropic-xml', new AnthropicXmlFormatter().buildMessages([...messages], options(assistant)).messages],
+        ['anthropic-xml in XML tool mode', new AnthropicXmlFormatter().buildMessages([...messages], options(assistant, { toolMode: 'xml' })).messages],
         ['completions', new CompletionsFormatter().buildMessages([...messages], options(assistant)).messages],
       ] as const) {
         const at = `${name}, carrier-only message ${where}`;
         const handed = JSON.stringify(messages);
-        assert.ok(handed.includes('cmp_') && handed.includes('srvtoolu_user'), `${at}: the premise: the formatter is handed the carriers`);
+        assert.ok(handed.includes('cmp_') && (where.startsWith('last,') === handed.includes('srvtoolu_user')), `${at}: the premise: the formatter is handed the carriers`);
         for (const m of built as Array<{ content?: unknown }>) {
           if (typeof m.content === 'string') assert.notEqual(m.content.trim(), '', `${at}: an empty message`);
           if (Array.isArray(m.content)) assert.notEqual(m.content.length, 0, `${at}: a message with no content`);
@@ -226,6 +230,16 @@ describe('membrane decides per provider what a carried item becomes', () => {
     assert.deepEqual(on.filter((b) => b.type === 'server_tool_use' || b.type === 'web_search_tool_result'), [SEARCH_CALL, SEARCH_RESULT]);
     const off = builtBlocks(new NativeFormatter().buildMessages([...messages], options(assistant)).messages);
     assert.deepEqual(off.filter((b) => b.type === 'server_tool_use' || b.type === 'web_search_tool_result'), []);
+  });
+
+  it("sends an assistant turn's server-tool blocks through membrane's default Anthropic formatter, which it builds in native tool mode", async () => {
+    const { messages, assistant } = await requestWithCarriers();
+    const membrane = new Membrane(new AnthropicAdapter({ apiKey: 'test' }));
+    const built = (membrane as unknown as { transformRequest(request: unknown): { providerRequest: { messages: unknown }; toolMode: string } })
+      .transformRequest({ messages: [...messages], config: { model: 'claude-test', maxTokens: 100 }, system: 'sys', assistantParticipant: assistant });
+    assert.equal(built.toolMode, 'native', 'premise: membrane builds its default formatter in native tool mode');
+    const blocks = builtBlocks(built.providerRequest.messages);
+    assert.deepEqual(blocks.filter((b) => b.type === 'server_tool_use' || b.type === 'web_search_tool_result'), [SEARCH_CALL, SEARCH_RESULT]);
   });
 
   it('ends on a paused round stored as a lone server call, with no [Continue], which the native wire sends last', async () => {

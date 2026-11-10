@@ -95,6 +95,10 @@ describe('roundRows', () => {
     ['results-error', { participant: 'user', content: [result('c1', 'ok', true)] }],
     ['note-undefined', { participant: 'user', content: [{ ...text('A note.'), citations: undefined } as never] }],
     ['gone', null],
+    // As the next request carries them: a row of another participant's provider items alone, as nothing, and a
+    // row of whitespace.
+    ['emptied', { participant: 'scout', content: [] }],
+    ['spaces', { participant: 'user', content: [text(' \n')] }],
   ]);
   const carried = (id: MessageId) => store.get(id) ?? null;
 
@@ -114,7 +118,9 @@ describe('roundRows', () => {
       { kind: 'injected', id: 'note-undefined', participant: 'user', sent: [text('A note.')] },
       // membrane sent the carrier as its item or left it out, and does the same with it in the next request.
       { kind: 'reply', id: 'reply-carrier', sent: [signed('s'), { type: 'text', text: '', rawItem: { type: 'web_search_tool_result' } } as ContentBlock, text('Found.')] },
-    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked', 'note', 'note', 'note-undefined', 'reply-carrier'] as SentRow[]);
+      // The stream was given nothing for the row, and the next request carries nothing for it either.
+      { kind: 'injected', id: 'emptied', participant: 'scout', sent: [] },
+    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked', 'note', 'note', 'note-undefined', 'reply-carrier', 'emptied'] as SentRow[]);
   });
 
   it('marks a row the next request carries otherwise, or doesn\'t carry, or the store doesn\'t hold', () => {
@@ -135,7 +141,11 @@ describe('roundRows', () => {
       // Results for another call, and an error flag that differs.
       { kind: 'results', id: 'results', sent: [{ toolUseId: 'c2', content: 'ok', isError: false }] },
       { kind: 'results', id: 'results-error', sent: [{ toolUseId: 'c1', content: 'ok', isError: false }] },
-    ], carried), Array(10).fill(UNSTORED) as SentRow[]);
+      // membrane sent the whitespace, and the next request carries nothing for the row.
+      { kind: 'injected', id: 'spaces', participant: 'user', sent: [text(' \n')] },
+      // The stream was given nothing for a row the next request carries.
+      { kind: 'injected', id: 'note', participant: 'user', sent: [] },
+    ], carried), Array(12).fill(UNSTORED) as SentRow[]);
   });
 });
 

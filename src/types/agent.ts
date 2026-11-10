@@ -490,7 +490,9 @@ export interface AgentConfig {
    * How the rounds of an agent it observes (`observes`) go out in this
    * agent's requests, as `PersistentReaderConfig.foreignRounds` for the
    * persistent subconscious: `'transcript'` (the default), a line per tool
-   * call and per result and none of their thinking, or `'raw'`, as stored.
+   * call and per result and none of their thinking, or `'raw'`, as stored
+   * but for a provider's stored items, such as a compaction item, which are
+   * another conversation's state: a row holding only those is left out.
    * Unread for an agent that observes no one.
    */
   foreignRounds?: 'transcript' | 'raw';

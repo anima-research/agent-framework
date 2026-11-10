@@ -9,7 +9,7 @@ import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { carriedBlock, holdsTurn, type SentRow } from './sent-rows.js';
-import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
+import { foreignRowAsSent, rawForeignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
@@ -582,8 +582,9 @@ export class Agent {
 
   /**
    * How another agent's rounds go out in this agent's requests (#291, answer
-   * 13): `'raw'`, as stored, or `'transcript'` (foreign-rounds.ts), a line
-   * per call and per result and no thinking, the same in every compile and
+   * 13): `'raw'`, as stored but for a provider's stored items, or
+   * `'transcript'` (foreign-rounds.ts), a line per call and per result and
+   * no thinking, the same in every compile and
    * in what a tool boundary injects. The framework sets it, once the
    * agent's window follows the presentation index, for the persistent
    * subconscious, for a resident that observes another
@@ -593,7 +594,8 @@ export class Agent {
    * other agent reads no other agent's
    * rounds, but for a co-resident's rows stored before audience stamps,
    * which a window written down from the record keeps and which go out as
-   * stored ('raw'), as earlier releases sent them.
+   * stored ('raw'), as earlier releases sent them, but for a provider's
+   * stored items (rawForeignRowAsSent).
    */
   private foreignRounds: 'raw' | 'transcript' = 'raw';
 
@@ -605,19 +607,27 @@ export class Agent {
   /**
    * A stored row as this agent's requests carry it, for a row a tool
    * boundary injects: another participant's row as a transcript where this
-   * agent is sent other agents' rounds so (setForeignRounds), its own and
-   * every row otherwise as stored. An injected row holds no tool block (the
-   * boundary cuts at one), so what changes is its thinking.
+   * agent is sent other agents' rounds so (setForeignRounds), and otherwise
+   * as stored without its provider items (rawForeignRowAsSent), as a compile
+   * sends it; its own as stored. Null for a row that leaves nothing, which
+   * the compile drops and the boundary doesn't hand its stream. An injected
+   * row holds no tool block (the boundary cuts at one), so what changes is
+   * its thinking and its items.
    */
-  injectedAsSent(participant: string, content: ContentBlock[]): ContentBlock[] {
-    if (this.foreignRounds !== 'transcript' || this.isOwnParticipant(participant)) return content;
-    return foreignRowAsSent(content);
+  injectedAsSent(participant: string, content: ContentBlock[]): ContentBlock[] | null {
+    if (this.isOwnParticipant(participant)) return content;
+    return this.foreignRounds === 'transcript' ? foreignRowAsSent(content) : rawForeignRowAsSent(content);
   }
 
   /** A compile's messages with other agents' rounds as this agent is sent them (setForeignRounds). */
   private foreignRoundsAsSent(messages: NormalizedMessage[]): NormalizedMessage[] {
-    if (this.foreignRounds !== 'transcript') return messages;
-    return transcribeForeignRounds(messages, (participant) => this.isOwnParticipant(participant));
+    const isOwn = (participant: string) => this.isOwnParticipant(participant);
+    if (this.foreignRounds === 'transcript') return transcribeForeignRounds(messages, isOwn);
+    return messages.flatMap((message) => {
+      if (isOwn(message.participant)) return [message];
+      const content = rawForeignRowAsSent(message.content);
+      return content === null ? [] : content === message.content ? [message] : [{ ...message, content }];
+    });
   }
 
   /**

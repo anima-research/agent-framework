@@ -7,7 +7,8 @@
  * agent derived or forked from such a watcher inherits them, sent in its
  * mode. A co-resident's rows stored before audience stamps, which a window
  * written down from the record keeps, reach an agent that observes no one
- * too: they go out as stored there, as earlier releases sent them. An agent
+ * too: they go out as stored there, as earlier releases sent them, but for a
+ * provider's stored items (rawForeignRowAsSent). An agent
  * sent others' rounds as a transcript is sent those as one, read by their
  * participant.
  * Those rounds are stored as the other agent's: its signed thinking, its
@@ -36,6 +37,7 @@
  */
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 import { NOTICE_TAG } from './notice-tags.js';
+import { carriedBlock, carriesRawItem } from './sent-rows.js';
 import { cutToFit, markedTexts, oneLine } from './supplied-text.js';
 
 /** How long one transcript line's call or outcome runs before it is cut. */
@@ -152,6 +154,12 @@ export function foreignRowAsSent(
   }
   if (!changed) return content as ContentBlock[];
   return out.length > 0 ? out : [{ type: 'text', text: NOTHING_SAID }];
+}
+
+export function rawForeignRowAsSent(content: readonly ContentBlock[]): ContentBlock[] | null {
+  if (!content.some(carriesRawItem)) return content as ContentBlock[];
+  const out = content.filter((block) => !carriesRawItem(block));
+  return out.some(carriedBlock) ? out : null;
 }
 
 /**

@@ -112,7 +112,8 @@ export function isStoredKind(injection: ContextInjection): boolean {
  * item's carrier. A message holding only carriers isn't a turn: the
  * Responses API gets its items, except an Anthropic server-tool block;
  * Anthropic's API gets an assistant turn's paired server-tool blocks, and
- * a lone call in the request's last message; the other wires get none. An
+ * a lone call in the request's last message, but not through membrane's
+ * XML formatter in XML tool mode; the other wires get none. An
  * injection with no turn isn't stored, as before: compile() places it.
  */
 export function hasRenderedContent(content: ContextInjection['content']): boolean {
