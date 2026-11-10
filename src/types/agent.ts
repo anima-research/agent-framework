@@ -88,7 +88,9 @@ export interface AgentConfig {
    *  events report it. Where membrane knows the provider's cache convention
    *  (one other than `'unknown'`), `inputTokens` leaves out cache reads and
    *  writes, so on a mostly cached prompt this setting doesn't bound a
-   *  request's size. `physicalWindowTokens`, when set, does.
+   *  request's size. `physicalWindowTokens`, when set, restarts the stream
+   *  once a projection of its next request, made from the last prompt a call
+   *  of the stream reported, passes it.
    *
    *  The restart is declined where context-manager's preview of its compile
    *  says it won't fit and doesn't name compression as what would make room.

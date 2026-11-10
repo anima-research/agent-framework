@@ -26,24 +26,27 @@
     gate, so compression landing while its stream goes on moves the kept
     decline's counts, and a later boundary takes the restart if its compile
     then fits.
-  - **What it costs:** under a strategy that previews, a restart past
-    `maxStreamTokens` that is taken runs its compile's select twice, once
-    for the preview, and the preview is synchronous, so nothing else on the
-    host's event loop runs meanwhile. A strategy with no preview, such as
+  - **What it costs:** under a strategy that previews, each preview runs the
+    compile's select, synchronously, so nothing else on the host's event
+    loop runs meanwhile. A restart taken after a preview that selected runs
+    that select again in its compile. A preview that throws before it
+    selects costs no select. A strategy with no preview, such as
     `PassthroughStrategy`, pays nothing more.
   - **Migration:** with `physicalWindowTokens` unset, nothing else bounds a
     declined stream. It can go on until the provider refuses a request at
     its own window. The turn then ends with a `context_length` failure row,
     which raises the `context-refusal` ops alert and kicks the compression
     drain, as a refused compile does. Set `physicalWindowTokens` below the
-    provider's window, with a `contextBudgetTokens` the window can hold, to
-    restart the stream before a request the window can't hold. That restart
-    is taken whatever its compile would do, as before this release.
+    provider's window, with a `contextBudgetTokens` the window can hold, and
+    the stream restarts once a projection of its next request passes that
+    setting, projected as before this release. That restart is taken
+    whatever its compile would do, as it was before.
   - **A host whose `contextBudgetTokens` bounds what a request costs,**
     rather than the provider's window: a declined stream's requests can now
     grow past that budget toward the provider's window.
-    `physicalWindowTokens`, set below the provider's window, bounds them
-    instead, once a call of the stream has reported its prompt.
+    `physicalWindowTokens`, set below the provider's window, restarts the
+    stream instead once a projection of its next request passes it, which it
+    makes once a call of the stream has reported its prompt.
   - **A restart the window projection forces** is the window's even where
     the stream is past `maxStreamTokens` too. Its
     `inference:stream_restarted` trace gives the reason `physical_window`,
