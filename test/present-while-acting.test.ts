@@ -1630,7 +1630,7 @@ describe('present while acting', () => {
       const framework = await createFramework({ ...(speech === 'latest-inbound' ? LEGACY : {}), maxStreamTokens: 20 });
       const routed = stubChannelRegistry(framework);
       const cm = framework.getAgent('assistant')!.getContextManager();
-      cm.previewContext = (() => ({ fits: false, clearedBy: ['compression'], finalTokens: 9_000, budgetTokens: 8_000 })) as unknown as typeof cm.previewContext;
+      cm.previewContext = (() => ({ fits: false, clearedBy: [], finalTokens: 9_000, budgetTokens: 8_000 })) as unknown as typeof cm.previewContext;
       module.interjection = 'quick question for you';
       module.interjectionMetadata = addressed('discord:dm:antra');
       const declines: string[] = [];
@@ -1672,7 +1672,7 @@ describe('present while acting', () => {
       const framework = await createFramework({ speech: { locus: speech }, maxStreamTokens: 20, proseRouting: 'locked' });
       stubChannelRegistry(framework);
       const cm = framework.getAgent('assistant')!.getContextManager();
-      cm.previewContext = (() => ({ fits: false, clearedBy: ['compression'], finalTokens: 9_000, budgetTokens: 8_000 })) as unknown as typeof cm.previewContext;
+      cm.previewContext = (() => ({ fits: false, clearedBy: [], finalTokens: 9_000, budgetTokens: 8_000 })) as unknown as typeof cm.previewContext;
       module.interjection = 'quick question for you';
       module.interjectionMetadata = addressed('discord:dm:antra');
       const declines: string[] = [];
