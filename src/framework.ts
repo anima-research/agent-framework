@@ -12133,7 +12133,7 @@ export class AgentFramework {
     // agent's message and context states in the store.
     assertAgentSwitches(config);
     const parent = spec?.inherit && spec.inherit.atSequence === undefined ? this.agents.get(spec.inherit.from) : undefined;
-    let seedHead: HeadDeclaration | null = null;
+    const seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -12174,9 +12174,7 @@ export class AgentFramework {
         namespace = derived.namespace;
         sourceChangeOwners = derived.sourceChangeOwners;
         ownSlot = derived.ownSlot;
-        seedHead = derived.seedHead;
       } else {
-        seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
         // A namespace belongs to the agent that opened it: another agent's
         // turns there would be read as its own by inspection and by its
         // resumption, which reopens "its own namespace". So one another
@@ -12835,7 +12833,6 @@ export class AgentFramework {
     /** The parent's message slot, on the child's own branch. */
     ownSlot: MessageSlotRef;
     sourceChangeOwners: string[];
-    seedHead: HeadDeclaration | null;
   }> {
     const parent = this.agents.get(inherit.from);
     if (!parent) {
@@ -12868,7 +12865,6 @@ export class AgentFramework {
     // The global legacy-notice exclusion applies
     // even when the source has no additional view recorded.
     const view = derivedView(this.storeViews.get(source) ?? EVERY_ROW_VIEW, config.name, ownParticipantsOf(config.name, config.selfParticipants));
-    const seedHead = inherit.atSequence === undefined && parent.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -12896,7 +12892,6 @@ export class AgentFramework {
       },
       namespace: this.registry.get(inherit.from)?.namespace ?? `subagent/${config.name}`,
       sourceChangeOwners: parent.changeOwners(),
-      seedHead,
       ownSlot: {
         namespace: derivation?.slots
           ? derivation.slots.messageNamespace
