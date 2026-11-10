@@ -63,6 +63,12 @@ export function isSystemNotice(tags: unknown): boolean {
   return Array.isArray(tags) && tags.includes('chat:system');
 }
 
+/** True when a (possibly untyped) tag list marks a message its server tagged
+ *  `chat:ambient` (RFC-001): one known to ask nothing of the agent. */
+export function isAmbient(tags: unknown): boolean {
+  return Array.isArray(tags) && tags.includes('chat:ambient');
+}
+
 /**
  * Expand a raw tag list over the normative core closure, then resolve the
  * §16.2 mutual exclusion: `chat:addressed` and `chat:ambient` cannot both

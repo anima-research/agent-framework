@@ -62,12 +62,19 @@ export interface PassiveSampleConfig {
  * good time for the agent to reply. The judge reads the agent's context as one
  * document (its newest part), the agent's own `instructions` and the batch,
  * and answers reply or wait. On reply the
- * batch is delivered as a debounce's is; on wait the agent isn't woken: the
+ * batch is delivered as a debounce's is, except that an event the agent had
+ * already answered when the judge answered keeps the wake, since the judge
+ * answered after it (EventGate's `isAnswered`; a host without it keeps the
+ * wake for every event); on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
  * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
- * times out wakes the agent (fail open),
- * unless the host set its `onError` to `"skip"`.
+ * times out delivers the batch as a debounce's is (fail open), unless the
+ * host set its `onError` to `"skip"`. The wake then carries the batch's
+ * writes where the host gave `evaluate` one for each event in the window
+ * (WakeProvenance.writes), so a host that drops an answered wake, as
+ * AgentFramework does, starts no turn when the agent has answered every
+ * event.
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
@@ -382,14 +389,20 @@ export type UpcomingWakeKind =
   | 'provider-hold';
 
 /**
- * Something that will (or, for a batch going to the judge, may) wake the
- * agent with no new event: what the judge is told would happen if it answers
- * wait and nothing else arrives.
+ * Something that will (or, for a batch going to the judge, or a wake that
+ * starts no turn once the agent has answered what it is for, may) wake the
+ * agent with no new event (`certain`): what the judge is told would happen
+ * if it answers wait and nothing else arrives.
  */
 export interface UpcomingWake {
   /** When (ms), when known; absent for one due as soon as the agent is free. */
   at?: number;
-  /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
+  /** False when it only may wake the agent: a judge rule's batch goes to the
+   *  judge then, and a debounced batch whose events delivery gives the agent
+   *  each have a message of its own written to its window
+   *  (WakeProvenance.writes), or a queued wake that reads rows, or a start
+   *  merged from wakes that each read rows, starts no turn once the agent
+   *  has read and answered them. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
@@ -530,47 +543,6 @@ export interface GateEventInfo {
   folds?: true;
 }
 
-/** An MCPL event whose content the framework stored at arrival, as a
- *  batched wake names it to the framework (EventGate's `isNewestEntry`):
- *  a channel message by its server, channel and message id, a push event by
- *  its server and event id. */
-export interface GateEntryRef {
-  eventType: string;
-  serverId?: string;
-  channelId?: string;
-  messageId?: string;
-  eventId?: string;
-}
-
-/** A batched wake's `[Gate: …]` line that the gate handed to the wake rather
- *  than wrote: its batch was one event whose entry was still the newest in
- *  the window when the batch fired (EventGate's `isNewestEntry`). A fresh
- *  start of the wake's turn decides it (the framework's placeWakeLines): the
- *  delivery agent's start, and on a presented window each resident's own
- *  start, decides its own line, leaving it out while that entry is still
- *  the newest in its window and writing it once something follows; a
- *  co-resident whose window isn't presented places none; two or more such
- *  lines are each written; and none is written while the host is quiesced.
- *  A line left out stays for a later fresh start of the same wake. Its text
- *  is rendered when it's written (wakeLineText), so its age is true then.
- *
- *  Every request for one wake carries the same object: the framework writes
- *  each line once by its identity, across the wake's retries and holds. A
- *  host that hands the gate's requests on itself passes the line on as it
- *  is, not a copy per agent. */
-export interface WakeLine {
-  /** The event's own entry. */
-  entry: GateEntryRef;
-  policyNames: string[];
-  /** The channel as the line names it to the agent. */
-  shown: string;
-  /** When the event arrived (ms): the line's age is counted from it to when
-   *  the line is written (wakeLineText). */
-  at: number;
-  /** The channel the line names, as the omission's trace reports it. */
-  channelId?: string;
-}
-
 /** Per-policy runtime statistics (for gate:status). */
 export interface GatePolicyStats {
   name: string;
@@ -608,7 +580,9 @@ export interface GatePolicyStats {
     judging: boolean;
     /** Events held for the judge until the agent's turn (or the host's quiesce) ends. */
     heldCount: number;
-    /** Verdicts so far: woke the agent, let the batch go by, and judge failures. */
+    /** Verdicts so far: reply (the batch sent on to delivery to wake the
+     *  agent, as JudgeConfig says), wait (the batch let go by), and judge
+     *  failures. */
     verdicts: { reply: number; wait: number; error: number };
     /** The newest verdict. */
     last?: {
