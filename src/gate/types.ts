@@ -405,9 +405,10 @@ export interface UpcomingWake {
    *  has read and answered them. True or false of every agent `agents`
    *  names: a batch certain for some and not others is a wake for each. */
   certain: boolean;
-  /** What it is, as the judge is told ("its own skip_reply timer"). A
-   *  debounced batch's counts the events delivery gives the agents it names,
-   *  so a batch giving them different counts is a wake for each count. */
+  /** What it is, as the judge is told ("its own skip_reply timer"). For a
+   *  debounced batch it counts the events delivery gives the agents it
+   *  names, so a batch giving them different counts is a wake for each
+   *  count. */
   what: string;
   /** What it is, in a word that quotes nothing, for healthSnapshot: `what` can
    *  quote a reminder or a queue reason. The judge isn't told it. */
@@ -530,13 +531,14 @@ export interface GateEventInfo {
   /** Whom the event is for, which decides whom a batch holding it shows it
    *  to and wakes. Admission sets it for a targeted MCPL event (its
    *  targetAgents that are registered). The framework sets it for a module's
-   *  response asking inference for named agents: those its source can
-   *  trigger that read the slot its messages land in and whose view shows a
-   *  message it stores, where it stores any. A resident's view leaves out a
-   *  message held from the residents and a subconscious's keeps it, so a
-   *  response storing held messages alone names, of the agents it asks for,
-   *  a subconscious and not a resident, and the framework wakes no named
-   *  agent its view shuts out.
+   *  response asking inference for named agents, to an event other than an
+   *  MCPL push or channel message, which admission gated as it arrived:
+   *  those its source can trigger that read the slot its messages land in
+   *  and whose view shows a message it stores, where it stores any. A
+   *  resident's view leaves out a message held from the residents and a
+   *  subconscious's keeps it, so a response storing held messages alone
+   *  names, of the agents it asks for, a subconscious and not a resident,
+   *  and the framework wakes no named agent its view shuts out.
    *  - Untargeted (absent): shown to every agent getAgentNames lists, and
    *    wakes them. A batch of untargeted events alone stores its line as a
    *    write that names no agent.
@@ -549,7 +551,8 @@ export interface GateEventInfo {
    *    is the caller's: the framework wakes a named agent that reads no slot
    *    of the residents', such as an isolated job, as it does any named
    *    agent, when its view shows a message the response stores, where it
-   *    stores any.
+   *    stores any, and admission, given a batching rule's pass, wakes no one
+   *    for a targeted MCPL event none of whose targets is registered.
    *  In a batch holding named events, each agent the batch wakes is shown the
    *  untargeted events if getAgentNames lists it, and the named events that
    *  name it. Agents shown the same events share one line, stored for them.
