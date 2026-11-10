@@ -12,7 +12,6 @@ import { AgentFramework, workerSpec } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 const ROUNDS = 12;
-// A recent window wider than any turn here: no round is ever chunked for compression, so a preview that can't fit names no compression that would make room.
 const NOTHING_TO_COMPRESS = 1_000_000;
 const PAGE = 'page text '.repeat(400);
 const SUMMARY = 'Recollection of the pages read so far.';
@@ -58,8 +57,6 @@ class PagesModule implements Module {
 
 const estimatedTokens = (value: unknown) => Math.ceil(JSON.stringify(value ?? null).length / 4);
 
-// A provider with a context window: once a stream's request, grown by the results sent into it, is past the
-// window, the provider refuses it as too long.
 class WindowStream extends MockYieldingStream {
   refusedAt?: number;
   protected size: number;
@@ -222,7 +219,6 @@ function compressHistory(framework: AgentFramework, count: number): string[] {
   const cm = framework.getAgent('prime')!.getContextManager();
   const ids: string[] = [];
   for (let i = 1; i <= count; i++) ids.push(cm.addMessage(i % 2 === 1 ? 'User' : 'prime', [{ type: 'text', text: `[h${i}] ${PAGE}` }]));
-  // A resident's window holds a stored row only once it's presented.
   cm.presentRows(ids);
   return ids;
 }
@@ -237,8 +233,6 @@ const restarted = (traces: TraceEvent[]) => traces.filter((event) => event.type 
 type Declined = Extract<TraceEvent, { type: 'inference:restart_declined' }>;
 const declined = (traces: TraceEvent[]) => traces.filter((event): event is Declined => event.type === 'inference:restart_declined');
 
-// What a strategy built from another copy of context-manager throws: an error whose class isn't this copy's, with
-// that copy's name and message.
 function errorFromAnotherCopy(name: string, message: string): Error {
   const error = new (class extends Error {})(message);
   error.name = name;
@@ -307,6 +301,7 @@ test('a maxStreamTokens restart declined at one boundary is taken at a later one
     };
     ask(framework);
     await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.ok(declined(traces).some((decline) => decline.previewed), 'a boundary before the release declined the restart on a preview');
     assert.equal(restarted(traces).length, 1, 'the turn restarted once');
     assert.deepEqual(wholePagesIn(membrane.streams[1], 6), pages(5), 'the turn restarted at the boundary after the release');
     assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
@@ -698,18 +693,15 @@ test('a framework that stops during a tool call asks for no restart preview past
   });
 });
 
-// On the hierarchical path, once the dry select has succeeded, this copy of context-manager answers null. A strategy
-// built from another copy throws that copy's refusal, which this copy's ContextManager doesn't turn into null: a
-// 0.23.1 copy's NoFoldPlanToPreviewError. Each says the compile fits.
 for (const { answer: preview, strategy: make, answersNull } of [
   { answer: "another 0.23.1 copy's NoFoldPlanToPreviewError", strategy: () => new ThrowingPreviewStrategy(errorFromAnotherCopy('NoFoldPlanToPreviewError', 'zz a copy whose refusal reads otherwise'), false) },
   { answer: "this copy's NoFoldPlanToPreviewError, which its ContextManager answers as null", strategy: () => strategy('hierarchical'), answersNull: true },
 ] as Array<{ answer: string; strategy: () => AutobiographicalStrategy; answersNull?: true }>) {
-  test(`a maxStreamTokens restart is taken when the hierarchical preview answers with ${preview}`, async () => {
+  test(`a maxStreamTokens restart is taken when the hierarchical preview answers with ${preview}, and nothing logs it as a failed preview`, async () => {
     const nullAnswered = answersNull === true;
     const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
     const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy: make() });
-    await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    const logged = await loggedDuring(() => withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
       const previews = recordPreviews(framework);
       ask(framework);
       await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.'));
@@ -717,7 +709,8 @@ for (const { answer: preview, strategy: make, answersNull } of [
       if (nullAnswered) assert.ok(previews.every((asked) => asked.answeredNull), 'its ContextManager answered null');
       assert.equal((restarted(traces)[0] as { reason?: string } | undefined)?.reason, 'context_budget', 'the turn restarted');
       assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
-    });
+    }));
+    assert.ok(!logged.some((line) => line.includes("the restart's preview failed")), 'the refusal was recognised, not logged as a failed preview');
   });
 }
 
@@ -811,13 +804,21 @@ test("the restart's preview is given the thinking binding its compile is given, 
       options.push(args[2]);
       return preview(...args);
     };
+    const compile = cm.compile.bind(cm);
+    const compiled: unknown[] = [];
+    cm.compile = ((...args: Parameters<typeof compile>) => {
+      compiled.push(args[2]);
+      return compile(...args);
+    }) as typeof cm.compile;
     ask(framework);
     await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || failureRows(framework).length > 0);
+    const bindingOf = (option: unknown) => (option as { thinkingBinding?: { binds?: boolean; dropBlock?: boolean; participant?: string } } | undefined)?.thinkingBinding;
+    const startBinding = bindingOf(compiled[0]);
+    assert.equal(startBinding?.binds, true, "the turn's start compile was given the binding");
     assert.ok(options.length > 0, 'the restart decision asked for the preview');
     for (const option of options) {
-      const binding = (option as { thinkingBinding?: { binds?: boolean; participant?: string } } | undefined)?.thinkingBinding;
-      assert.equal(binding?.binds, true, 'the preview was given the binding');
-      assert.equal(binding?.participant, 'prime', "the binding names the agent as the participant whose messages it binds");
+      assert.deepEqual(bindingOf(option), startBinding, "the preview was given the binding the compile is given, dropBlock included");
+      assert.equal(bindingOf(option)?.participant, 'prime', "the binding names the agent as the participant whose messages it binds");
     }
     assert.equal(restarted(traces).length, 0, 'no restart');
     assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
@@ -873,8 +874,6 @@ test(`on a host that sets no window, a maxStreamTokens restart whose preview can
   assert.ok(logged.some((line) => line.includes('drain kicked for prime')), 'the ending kicked the compression drain');
 });
 
-// A long agentic turn, its stream's usage reporting each call's request size, summed over the stream's calls as
-// membrane's usage events are. Each stream takes the turn's remaining rounds, so a restart goes on where the turn was.
 class SizedWindowStream extends WindowStream {
   private inputTokens = 0;
   override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
