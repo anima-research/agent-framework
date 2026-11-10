@@ -1134,6 +1134,28 @@ describe('toolDeclarations', () => {
       assert.deepEqual(events, [{ type: 'head:moved', why: 'consolidated', changesRemoved: 1, changeChars: price, requestChars: price * 5, forced: 'share' }]);
     });
 
+    it("prices a preview's appended rows into the request, so a preview moves the head past a fifth exactly when the request with them would", async () => {
+      const b = tool('b', 'b does a thing. '.repeat(40));
+      const own = priceOf({ type: 'system_change', defineTools: [b] });
+      const hostChange: NormalizedMessage = { participant: 'system', content: [{ type: 'system_change', defineTools: [tool('c')] } as never] };
+      const priced = (rows: Array<{ participant: string; content: readonly unknown[] }>) => requestCharacters(firstHead, rows.map((r) => ({ participant: r.participant, content: r.content as ContentBlock[] })));
+      for (const moves of [false, true]) {
+        const rows = [said('user', 'hello'), changeRow([b])];
+        const hostChars = priced([...rows, hostChange]) - priced(rows);
+        sizeRequest(rows, firstHead, moves ? own * 5 - hostChars : own * 5);
+        const context = fakeContext(rows, { firstChanged: () => null });
+        const heads = memoryHeadDeclarations(onMain);
+        heads.write('agent', firstHead);
+        const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads);
+        const preview = await agent.buildActivationRequest([tool('a'), b, tool('c')], undefined, undefined, undefined, { dryRun: true, appendedMessages: [hostChange] });
+        context.cm.addMessage('system', hostChange.content as ContentBlock[], { system: true, kind: 'system-change' });
+        assert.equal(priced(context.rows), moves ? own * 5 : own * 5 + hostChars, "the premise: the request with the host's change, priced as stored");
+        const request = await agent.buildActivationRequest([tool('a'), b, tool('c')]);
+        assert.deepEqual(request.tools, moves ? [tool('a'), b, tool('c')] : [tool('a')], moves ? "at a fifth with the host's change, the head moves" : "under a fifth with the host's change, it stays");
+        assert.deepEqual(preview.tools, request.tools, 'the preview goes on the head the request does');
+      }
+    });
+
     it("prices the changes and the request in characters of JSON, and moves at a tenth of the request, not below", async () => {
       for (const [input, moves] of [[tenth, true], [tenth + 1, false]] as const) {
         const rows = [said('user', 'hello')];
