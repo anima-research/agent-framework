@@ -136,6 +136,7 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  StoredMessage,
   ThinkingStrip,
 } from '@animalabs/context-manager';
 import type {
@@ -2387,11 +2388,36 @@ export class Agent {
    */
   private ownEffortRowsLeftOut(plan: EffortPlan | undefined): boolean {
     if (plan?.rows === true) return false;
-    return this.contextManager.getAllMessages().some((message) => {
-      if (effortOf(message.content) === undefined) return false;
+    return this.storeHoldsOwnEffortRow();
+  }
+
+  /** The store's row array the last own-row walk read, and whether it held an own effort row (storeHoldsOwnEffortRow). */
+  private ownEffortRowsWalked?: { rows: readonly StoredMessage[]; found: boolean };
+
+  /**
+   * Whether the store holds an effort row the framework wrote for one of this agent's participants. The answer is
+   * kept with the row array it was read from. ContextManager returns the same array until the store changes, and the
+   * same object for each row an append leaves in place. So an array that keeps that array's last row at its index,
+   * the same array included, is walked only past it. Any other, after a removal or a branch switch, is walked whole.
+   * An edit in place that adds or takes off an effort row's mark goes unseen until the next whole walk. The framework
+   * never edits its effort rows.
+   */
+  private storeHoldsOwnEffortRow(): boolean {
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return false;
+    const rows = cm.getAllMessages();
+    const walked = this.ownEffortRowsWalked;
+    const last = walked && walked.rows.length > 0 && rows.length >= walked.rows.length
+      && rows[walked.rows.length - 1] === walked.rows[walked.rows.length - 1] ? walked : undefined;
+    let found = last?.found ?? false;
+    for (let i = last ? last.rows.length : 0; !found && i < rows.length; i++) {
+      const message = rows[i]!;
+      if (effortOf(message.content) === undefined) continue;
       const of = effortRowOf(message.metadata);
-      return of !== undefined && this.isOwnParticipant(of);
-    });
+      found = of !== undefined && this.isOwnParticipant(of);
+    }
+    this.ownEffortRowsWalked = { rows, found };
+    return found;
   }
 
   /**
