@@ -329,7 +329,8 @@ export type TraceEvent =
        * at each such boundary. `reason` is why: the restart's compile won't fit by context-manager's preview,
        * and the preview doesn't name compression as what would make room (`wont_fit`, with the preview's
        * `finalTokens`, `budgetTokens` and `clearedBy`), or the preview threw an `UncoveredDropError` with no
-       * compression pending (`uncovered_drop`).
+       * compression pending (`uncovered_drop`). For an agent the budget hold can't take, such as an ephemeral run,
+       * either is declined even where the preview names compression or compression is pending.
        * `previewed` is false where the boundary took an earlier boundary's `wont_fit` on the same stream, one a
        * newer message couldn't clear, with none of these changed since: the budget, the compression holds, the
        * live context settings, the strategy's compression state and its counts of chunks and pending merges, the

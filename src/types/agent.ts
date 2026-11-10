@@ -93,7 +93,10 @@ export interface AgentConfig {
    *  The restart is declined where context-manager's preview of its compile
    *  says it won't fit and doesn't name compression as what would make room.
    *  It is declined too where the preview meets a drop no summary covers
-   *  while no compression is pending. The stream then goes on, and an
+   *  while no compression is pending. For an agent the budget hold can't
+   *  take, such as an ephemeral run, a preview that won't fit declines the
+   *  restart even where it names compression, and so does an uncovered drop
+   *  while compression is pending. The stream then goes on, and an
    *  `inference:restart_declined` trace says why. A later tool boundary
    *  over this budget considers the restart again. Any other failure of the
    *  preview doesn't decline it.

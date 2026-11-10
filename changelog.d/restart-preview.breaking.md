@@ -2,18 +2,30 @@
   past `maxStreamTokens` without restarting. At a tool boundary past it, the
   restart is declined where context-manager's preview of its compile says
   the compile won't fit and doesn't name compression as what would make
-  room. It is declined too where the preview meets a drop no summary
-  covers while no compression is pending. The stream then goes on, and the
-  boundary emits an `inference:restart_declined` trace saying why. A later
-  boundary past `maxStreamTokens` considers the restart again. Every other
-  restart is taken as before, including one whose preview names
-  compression as what would make room, and one whose preview fails.
+  room. It is declined too where the preview meets a drop no summary covers
+  while no compression is pending. For an agent the budget hold can't take,
+  such as an ephemeral run (a host's subagent), a preview that won't fit
+  declines the restart even where it names compression, and so does an
+  uncovered drop while compression is pending. The stream then goes on, and
+  the boundary emits an `inference:restart_declined` trace saying why. A
+  later boundary past `maxStreamTokens` considers the restart again. Every
+  other restart is taken as before, including one whose preview names
+  compression as what would make room for an agent the hold can take, and
+  one whose preview fails.
   - **What it trades:** before this release, a restart the preview now
-    declines was taken, and its compile then refused. While compression was
-    pending, the turn waited in the budget hold, and its restart ran again
-    later. With nothing pending, the turn ended with an `over_budget` failure
-    row, or a `context_refusal` one for a drop no summary covers. Now the
-    stream goes on with the turn's rounds whole, and the turn isn't held.
+    declines was taken, and its compile then refused. Where the budget hold
+    could take the agent and compression was pending, the turn waited in the
+    hold, and its restart ran again later. Otherwise the turn ended with its
+    compile's failure: for a registered agent, an `over_budget` failure row,
+    or a `context_refusal` one for a drop no summary covers. The hold takes
+    a registered agent's turn while the framework runs, and never an
+    ephemeral run's. Now the stream goes on with the turn's rounds whole,
+    and the turn isn't held.
+  - **What it costs:** under a strategy that previews, a restart past
+    `maxStreamTokens` that is taken runs its compile's select twice, once
+    for the preview, and the preview is synchronous, so nothing else on the
+    host's event loop runs meanwhile. A strategy with no preview, such as
+    `PassthroughStrategy`, pays nothing more.
   - **Migration:** with `physicalWindowTokens` unset, nothing else bounds a
     declined stream. It can go on until the provider refuses a request at
     its own window. The turn then ends with a `context_length` failure row,

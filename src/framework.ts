@@ -7538,8 +7538,7 @@ export class AgentFramework {
   ): boolean {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return false;
-    if (!this.budgetHolds || !this.running || this.providerAdmissionClosed) return false;
-    if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent || this.budgetHolds.has(agent.name)) return false;
+    if (!this.budgetHoldCanTake(agent)) return false;
     if (!this.compressionPending(agent)) return false;
     if (checkpoint !== undefined) {
       try {
@@ -7642,6 +7641,11 @@ export class AgentFramework {
       console.error(`[budget-hold] agent=${agent.name}: could not read the rows its held turn stands on, so a surgery checks its wake's rows alone:`, error);
     }
     return { standsOn, ownRows: rows };
+  }
+
+  private budgetHoldCanTake(agent: Agent): boolean {
+    if (!this.budgetHolds || !this.running || this.providerAdmissionClosed) return false;
+    return !this.ephemeralRuns.has(agent.name) && this.agents.get(agent.name) === agent && !this.budgetHolds.has(agent.name);
   }
 
   private compressionPending(agent: Agent): boolean {
@@ -13954,7 +13958,7 @@ export class AgentFramework {
       const remembered = this.restartDeclines.get(agent);
       if (remembered?.streamId === agent.streamId && remembered.key === key) return { decline: remembered, previewed: false };
       const preview = agent.previewCompile(excludePins);
-      if (preview !== null && !preview.fits && !preview.clearedBy?.includes('compression')) {
+      if (preview !== null && !preview.fits && (!preview.clearedBy?.includes('compression') || !this.budgetHoldCanTake(agent))) {
         decline = {
           reason: 'wont_fit', finalTokens: preview.finalTokens, budgetTokens: preview.budgetTokens,
           ...(preview.clearedBy !== undefined ? { clearedBy: preview.clearedBy } : {}),
@@ -13963,7 +13967,7 @@ export class AgentFramework {
       }
     } catch (error) {
       if (error instanceof UncoveredDropError || (error instanceof Error && error.name === 'UncoveredDropError')) {
-        if (!this.compressionPending(agent)) decline = { reason: 'uncovered_drop', streamId: agent.streamId };
+        if (!this.compressionPending(agent) || !this.budgetHoldCanTake(agent)) decline = { reason: 'uncovered_drop', streamId: agent.streamId };
       } else if (!isNoFoldPlanRefusal(error)) {
         console.error(`[context-budget] ${agent.name}: the restart's preview failed, so the maxStreamTokens restart goes ahead: ${describeFailureWithFrames(error)}`);
       }
