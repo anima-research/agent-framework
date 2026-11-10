@@ -222,7 +222,13 @@ export function rulesToWrite(offer: ServerOffer, accepted: readonly OfferedRule[
 /** The least time between two offers for one server (WakeDecisions.mayOffer). */
 export const OFFER_FLOOR_MS = 24 * 60 * 60 * 1000;
 
-export type DecisionState = 'offered' | 'accepted' | 'declined';
+/**
+ * `unasked`: the server was among the store's own when onboarding first
+ * started on it (WakeDecisions' `predating`), so the rules the agent already
+ * had for it were left to stand and no offer was made. The agent can still
+ * read and accept the server's suggestions, or decline them.
+ */
+export type DecisionState = 'offered' | 'accepted' | 'declined' | 'unasked';
 export interface DecisionRecord {
   digest: string;
   state: DecisionState;
@@ -237,16 +243,40 @@ export interface DecisionRecord {
  * The agent's decisions per server, beside gate.json (`wake-decisions.json`).
  * Written whole, through a temporary file; one that can't be read is set aside
  * and starts empty, so a damaged file costs a repeated offer, never a crash.
+ *
+ * The file is written at the first start that finds none, even with nothing
+ * decided, so that its absence means onboarding has never started on this
+ * store. That first start is given the servers the store already had
+ * (`predating`: the ones configured then, where the store had a gate before;
+ * none on a new store). The agent wrote its rules with those servers there,
+ * and an offer for each, at the first event one of its catch-alls lets by,
+ * would ask it about every server it has at once, on the day its host was
+ * updated. They are kept in the file until each is settled as `unasked`
+ * (`predates`, at its first undecided event, when its digest is known). A
+ * server added afterwards is offered as before, and so is one of these once
+ * what it declares changes.
  */
 export class WakeDecisions {
   private records: Record<string, DecisionRecord> = {};
+  private predating = new Set<string>();
 
-  constructor(private readonly path: string, private readonly log: (message: string) => void = () => undefined) {
-    if (!existsSync(path)) return;
+  constructor(
+    private readonly path: string,
+    private readonly log: (message: string) => void = () => undefined,
+    predating: readonly string[] = [],
+  ) {
+    if (!existsSync(path)) {
+      this.predating = new Set(predating);
+      this.write();
+      return;
+    }
     try {
-      const parsed = JSON.parse(readFileSync(path, 'utf8')) as { servers?: Record<string, DecisionRecord> };
+      const parsed = JSON.parse(readFileSync(path, 'utf8')) as { servers?: Record<string, DecisionRecord>; predating?: unknown };
       for (const [server, r] of Object.entries(parsed.servers ?? {})) {
-        if (r && typeof r.digest === 'string' && (r.state === 'offered' || r.state === 'accepted' || r.state === 'declined')) this.records[server] = r;
+        if (r && typeof r.digest === 'string' && (r.state === 'offered' || r.state === 'accepted' || r.state === 'declined' || r.state === 'unasked')) this.records[server] = r;
+      }
+      if (Array.isArray(parsed.predating)) {
+        for (const server of parsed.predating) if (typeof server === 'string' && !this.records[server]) this.predating.add(server);
       }
     } catch (error) {
       const aside = `${path}.unreadable-${Date.now()}`;
@@ -256,6 +286,9 @@ export class WakeDecisions {
   }
 
   get(server: string): DecisionRecord | undefined { return this.records[server]; }
+
+  /** Whether `server` was the store's own when onboarding first started here, and nothing has been recorded for it since. */
+  predates(server: string): boolean { return this.predating.has(server) && !this.records[server]; }
 
   /**
    * Whether an offer for `server` may go out now: never twice for the same
@@ -282,6 +315,7 @@ export class WakeDecisions {
   set(server: string, record: Omit<DecisionRecord, 'at'>, now = Date.now()): DecisionRecord {
     const r: DecisionRecord = { ...record, at: new Date(now).toISOString() };
     this.records[server] = r;
+    this.predating.delete(server);
     this.write();
     return r;
   }
@@ -300,7 +334,8 @@ export class WakeDecisions {
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       const tmp = `${this.path}.tmp-${process.pid}`;
-      writeFileSync(tmp, JSON.stringify({ servers: this.records }, null, 2) + '\n');
+      const predating = [...this.predating].sort();
+      writeFileSync(tmp, JSON.stringify({ servers: this.records, ...(predating.length > 0 ? { predating } : {}) }, null, 2) + '\n');
       renameSync(tmp, this.path);
     } catch (error) {
       this.log(`wake decisions: could not write ${this.path}: ${(error as Error).message}`);

@@ -5694,6 +5694,9 @@ export class AgentFramework {
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
+      // Read before the gate writes its file: a gate.json already there says
+      // the store had its rules before this start (wake onboarding, below).
+      const gateFileExisted = existsSync(configPath);
       const heartbeatOn = config.heartbeat !== undefined && config.heartbeat !== null && config.heartbeat !== false;
       framework.eventGate = new EventGate({
         configPath,
@@ -5803,9 +5806,13 @@ export class AgentFramework {
       // Wake onboarding: the agent's decisions about servers' suggested
       // treatment, beside gate.json (gate/wake-onboarding.ts).
       if (config.gate.onboarding !== false) {
+        // A store that had a gate before onboarding first starts on it keeps
+        // the servers it is configured with unasked (WakeDecisions): its
+        // agent wrote its rules with them there.
         framework.wakeDecisions = new WakeDecisions(
           join(dirname(configPath), 'wake-decisions.json'),
           (message) => console.error(`[gate] ${message}`),
+          gateFileExisted ? [...configuredServerIds] : [],
         );
       }
       // The periodic review of what suppress rules hid (gate/suppression-review.ts),
@@ -41824,6 +41831,14 @@ export class AgentFramework {
       const policy = d.policyName === null ? undefined : this.eventGate.policyInForce(d.policyName);
       if (!isUndecided(d, policy)) return;
       const offer = this.wakeOffer(event.serverId);
+      if (this.wakeDecisions.predates(event.serverId)) {
+        // The store's own server from before onboarding started on it: its
+        // rules stand unasked, recorded against what it declares now, so a
+        // changed declaration is asked about as any server's is.
+        this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'unasked' });
+        this.emitTrace({ type: 'gate:onboarding-decided', serverId: event.serverId, digest: offer.digest, state: 'unasked', rules: [] });
+        return;
+      }
       if (!this.wakeDecisions.mayOffer(event.serverId, offer.digest)) return;
       const wake = carriesAttention(event.tags);
       const text = this.wakeOnboardingText(offer, { policyName: d.policyName, behavior: String(d.behavior), tags: event.tags ?? [], wake });
