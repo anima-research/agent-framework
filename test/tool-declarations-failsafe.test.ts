@@ -486,7 +486,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     assert.equal((resend[0] as { thinkingSetAside: number }).thinkingSetAside, 1, "the second round's reply, signed after the change the boundary handed");
   });
 
-  it("says, when its note can't land, that each request until it's built again carries thinking a binding model refuses", async () => {
+  it("says, when its note can't land, that where its head didn't move its requests can carry thinking a binding model refuses, until those replies leave its window or it's built again", async () => {
     const { traces, outcomes } = await refusedAtALaterRound(false);
     assert.deepEqual(outcomes.slice(2), ['refused: thinking signed over the change', 'refused: thinking signed over the change'], 'the resend and the next turn carry that thinking, and are refused');
     assert.equal((traces.find((t) => t.type === 'head:resend') as { thinkingSetAside: number }).thinkingSetAside, 0, 'nothing set aside');
