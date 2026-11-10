@@ -60,13 +60,13 @@ describe('notice openings in text the framework did not write', () => {
     }
   });
 
-  it('marks each opening context-manager 0.25.1 writes or reads back, besides the truncation note NOTICE_TAG marks', () => {
+  it('marks each opening context-manager 0.27.0 writes or reads back, besides the truncation note NOTICE_TAG marks', () => {
     for (const text of ['[content omitted: x]', '[image not shown: x]', '[Operator note — x]', '[Recall r1]', '[tool call omitted]', '[tool result moved during context repair]', '[Topic Transition]']) {
       assert.equal(markedText(text), `\\${text}`, text);
     }
   });
 
-  it('marks each opening membrane 0.8.0 and 0.9.0 write into a request, and ordinary text its Image tag reaches too', () => {
+  it('marks each opening membrane 0.8.0, 0.9.0, 0.10.0 and 0.10.1 write into a request, and ordinary text its Image tag reaches too', () => {
     for (const text of [
       '[continuing]', '[Image 2]', '[Image omitted]', '[Tool Result: x]', '[image of a cat]', '[Start]',
       '[orphan tool_result for t1]: x', '[duplicate tool_result for t1, an error]: x',

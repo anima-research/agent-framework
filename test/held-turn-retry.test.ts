@@ -15,6 +15,7 @@ import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { BATCH_ROWS } from '../src/framework.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
 
@@ -162,6 +163,31 @@ async function heldTurn(fw: AgentFramework, internal: Internal, membrane: Script
   assert.equal(membrane.primary, 2);
 }
 
+test("a provider hold that queues a turn again starts its error policy's count over: the wait after the hold leads to try 2 again", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const wait = 300;
+    const gateway = () => new MembraneError({ type: 'server', retryable: true, httpStatus: 502, message: 'zz bad gateway', rawError: { status: 502 } });
+    // Call 1 fails into the policy's delay, its retry (call 2) into a stated
+    // wait's hold, and the hold's retry (call 3) into the policy's delay
+    // again; call 4 answers.
+    const membrane: ScriptedMembrane = new ScriptedMembrane(new Set([1, 2, 3]), (request) => (membrane.primary === 2 ? rateLimited(wait, request) : gateway()));
+    const { fw, internal } = await framework(path, membrane, {
+      errorPolicy: { maxRetries: 3, onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 20, maxTries: 4 } : { retry: false }) },
+    });
+    const tries: unknown[] = [];
+    fw.onTrace((event) => { if (event.type === 'inference:waiting') tries.push((event as { nextTry?: number }).nextTry); });
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
+      await waitFor(fw, () => membrane.primary >= 4, 'the answer after the hold');
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 4);
+      assert.deepEqual(tries, [2, 2], 'the wait before the hold and the one after it each lead to try 2');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a resident whose turn a stated wait holds for its retry is mid-turn: not drained, listed, refused surgery naming the hold; the hold's end runs the retry", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
@@ -179,8 +205,11 @@ test("a resident whose turn a stated wait holds for its retry is mid-turn: not d
       const ctx = fw.getAgent('resident')!.getContextManager();
       const before = ctx.queryMessages({}).messages.map((m) => m.id);
       const first = ctx.queryMessages({}).messages.find((m) => JSON.stringify(m.content).includes('zz-first'))!;
-      const { cooldownUntil } = (fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownUntil: number | null } }> })
-        .agents.find((a) => a.name === 'resident')!.providerAdmission;
+      const entry = (fw.healthSnapshot() as { agents: Array<{ name: string; turnAlive: boolean; retrying: unknown; providerAdmission: { cooldownUntil: number | null } }> })
+        .agents.find((a) => a.name === 'resident')!;
+      assert.equal(entry.turnAlive, true, 'the held turn is alive in healthSnapshot');
+      assert.equal(entry.retrying, null, "a hold's retry isn't an error policy's wait; providerAdmission shows the hold");
+      const { cooldownUntil } = entry.providerAdmission;
       const until = new Date(cooldownUntil!).toISOString();
       await assert.rejects(fw.rollbackToMessage('resident', { messageId: first.id }), (error: Error & { code?: string }) => {
         assert.equal(error.code, 'agent-busy');
@@ -1126,7 +1155,7 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
 });
 
 const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-  'coalescingBatchSubjects', 'readsRow', 'wakeLines'];
+  'coalescingBatchSubjects', 'readsRow', 'readsRows', BATCH_ROWS];
 
 function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<string | symbol, unknown>): symbol {
   const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
@@ -1156,7 +1185,7 @@ test("a held turn's retry the hold folds into an equal held wake gives that wake
       const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
       const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
       assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
-      const wake: Record<string, unknown> = {};
+      const wake: Record<string | symbol, unknown> = {};
       for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
       held.push(wake as unknown as Request);
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
@@ -1251,8 +1280,8 @@ test("a gate wake the hold folds into a held turn's merged retry names its batch
     try {
       const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
-      const start = held[0] as unknown as Record<string, unknown>;
-      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:folded' }] };
+      const start = held[0] as unknown as Record<string | symbol, unknown>;
+      const wake: Record<string | symbol, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:folded' }] };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
       assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
@@ -1273,8 +1302,8 @@ test("a held gate wake that an equal merged start folds into names its batch's c
     try {
       const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
-      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
-      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:held-first' }] };
+      const start = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const wake: Record<string | symbol, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:held-first' }] };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
       held.push(wake as unknown as Request);
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);

@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { ContextManager } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, InferenceRequest, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import type { ModuleContextInjection } from '../src/types/module.js';
@@ -163,6 +164,7 @@ async function turn(options: {
   gather?: (h: Harness, agentName: string, n: number) => void;
   beforeEnd?: (h: Harness) => Promise<void>;
   afterEnd?: (h: Harness) => void;
+  budgetHold?: { during: (h: Harness, framework: AgentFramework) => Promise<void>; fit: () => void };
 }): Promise<Turn> {
   const dir = mkdtempSync(join(tmpdir(), 'af-continuing-start-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -205,6 +207,8 @@ async function turn(options: {
     activeTurnTokens: Map<string, unknown>;
     pendingRequests: InferenceRequest[];
     providerAccelerationCooldowns: Map<string, { until: number }>;
+    budgetHolds: Map<string, unknown>;
+    releaseBudgetHold(agentName: string): void;
     openLogical: Map<string, unknown>;
     releaseProviderAccelerationCooldown(agentName: string): void;
     proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> };
@@ -263,6 +267,12 @@ async function turn(options: {
       gate.release();
     }
     if (options.beforeEnd) await options.beforeEnd(h);
+    if (options.budgetHold) {
+      await until(() => internals.budgetHolds?.has('scout'), 'the budget hold');
+      await options.budgetHold.during(h, framework);
+      options.budgetHold.fit();
+      internals.releaseBudgetHold('scout');
+    }
     if (hold) {
       await until(() => internals.providerAccelerationCooldowns.has('scout'), 'the provider hold');
       if (hold.during) await hold.during(h);
@@ -270,7 +280,7 @@ async function turn(options: {
       internals.releaseProviderAccelerationCooldown('scout');
     }
     await until(() => streams >= 2 && !internals.activeTurnTokens.has('scout') && internals.pendingRequests.length === 0
-      && !internals.providerAccelerationCooldowns.has('scout'), 'the turn to end');
+      && !internals.providerAccelerationCooldowns.has('scout') && !internals.budgetHolds?.has('scout'), 'the turn to end');
     await framework.runUntilIdle();
     options.afterEnd?.(h);
     return {
@@ -332,6 +342,41 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
       assert.equal(run.requests.length, 2, 'the stream restarted');
       assert.deepEqual(run.publishes, []);
       assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
+    });
+
+    it(`${proseRouting}: a context-budget restart that waits for compression through a suppression of a row it doesn't stand on keeps the line its stream writes held`, async () => {
+      const proto = ContextManager.prototype as unknown as Record<'compile' | 'isReady', (...args: unknown[]) => unknown>;
+      const original = { compile: proto.compile, isReady: proto.isReady };
+      let compiles = 0;
+      let fit = false;
+      proto.compile = async function (this: unknown, ...args: unknown[]) {
+        if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun !== true && ++compiles >= 2 && !fit) {
+          throw Object.assign(new Error('Compile plan would exceed hard budget'), { name: 'OverBudgetError', budget: 1_000, actual: 2_000 });
+        }
+        return original.compile.apply(this, args);
+      };
+      proto.isReady = function () { return fit; };
+      try {
+        let suppressed = false;
+        const run = await turn({
+          proseRouting, maxStreamTokens: 20,
+          stream: (n) => (n === 1 ? new MockYieldingStream([SEND, overBudget(), createMockResponse([text(FINAL)])], true) : final()),
+          budgetHold: {
+            during: async (h, framework) => {
+              const id = h.storeFor('scout', CHATTER);
+              await framework.suppressMessages('scout', { messageIds: [String(id)] });
+              suppressed = true;
+            },
+            fit: () => { fit = true; },
+          },
+        });
+        assert.ok(suppressed, 'the surgery was admitted while the continuation waited');
+        assert.equal(run.requests.length, 2, 'the continuation ran');
+        assert.deepEqual(run.publishes, [], 'no second post');
+        assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
+      } finally {
+        Object.assign(proto, original);
+      }
     });
 
     it(`${proseRouting}: the provider hold's retry that reads a message sent during the hold answers it in the room`, async () => {
