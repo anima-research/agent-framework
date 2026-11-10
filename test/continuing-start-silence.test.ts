@@ -23,6 +23,7 @@ const call = (id: string, name: string, input: Record<string, unknown> = {}) => 
 
 class ErrorsAfter extends MockYieldingStream {
   reached = false;
+  handedChange = false;
   private release: () => void = () => {};
   private readonly released: Promise<void>;
   constructor(responses: NormalizedResponse[], private readonly depth: number, gated = false) {
@@ -35,6 +36,7 @@ class ErrorsAfter extends MockYieldingStream {
   }
 
   override provideToolResults(results: unknown[], options?: Parameters<MockYieldingStream['provideToolResults']>[1]): void {
+    this.handedChange ||= (options?.injectedMessages ?? []).some((m) => (m.content as Array<{ type?: string }>).some((block) => block.type === 'system_change'));
     super.provideToolResults(results, options);
     if (this.toolDepth !== this.depth) return;
     this.reached = true;
@@ -500,14 +502,16 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
   });
 
   it("under 'entries', a system change handed to the round after a send leaves the retry's line held, since nothing was said to the agent", async () => {
+    let failing: ErrorsAfter | undefined;
     const run = await turn({
       proseRouting: 'locus', toolDeclarations: 'entries',
       whileGated: async (h) => {
         h.storeChange();
         await h.until(() => h.queued(CHANGE), 'the change to wait for the boundary');
       },
-      stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : final()),
+      stream: (n) => (n === 1 ? (failing = new ErrorsAfter([SEND, HELD], 2)) : final()),
     });
+    assert.equal(failing?.handedChange, true, 'the premise: the boundary handed the change to the round after the send');
     assert.ok(read(run.requests[1], CHANGE), 'the retry carried the change');
     assert.deepEqual(run.publishes, []);
     assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));

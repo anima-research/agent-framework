@@ -2884,7 +2884,8 @@ export class Agent {
     return this.toolDeclarations === 'entries' && !this.headUntilBuiltAgain;
   }
 
-  /** The framework's record of heads, its traces of what moved them, and where the change rows a move takes out go (the removal funnel, #291). */
+  /** The framework's record of heads, its traces of what moved them, and where the change rows a move takes out go (the removal funnel, #291).
+   *  @internal For the framework's head store; not a host API. */
   attachHeadDeclarations(
     store: HeadDeclarationStore,
     onEvent?: (event: HeadEvent) => void,

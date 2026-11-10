@@ -43,7 +43,13 @@
 - A message-count undo (`/undo` with `messages`) counts every message but
   system change rows: the change rows among the last N go with them
   uncounted, and a refusal's count of the messages the history holds leaves
-  them out.
+  them out. A rollback refused because rows one write presented with its
+  target follow it counts and names the messages among them, never a system
+  change row, which it no longer advises suppressing; one that change rows
+  alone follow is refused saying so.
+- A surgery preview's `neverPresented` counts a system change row as
+  presented only where a live agent's request carries it, so a change row in
+  the windows of agents on their head alone counts as never presented.
 - A system change row is never a message said to an agent: it restarts no
   re-send count, clears no earlier deadline cut of a re-armed turn
   (agent-framework#871), counts as nothing heard, moves no turn to a channel,

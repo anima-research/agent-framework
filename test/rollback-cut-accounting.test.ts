@@ -56,14 +56,14 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot() {
+async function boot(scout: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-rollback-cut-'));
   dirs.push(dir);
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'),
     membrane: membrane.asMembrane(),
-    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', ...scout }],
     modules: [new SurfaceModule()],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
@@ -91,6 +91,8 @@ async function boot() {
   };
   return { framework, cm, store, textsOf, internals, windowTexts, turn };
 }
+
+const hostChange = (): ContentBlock => ({ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock);
 
 const logged = (framework: AgentFramework): OperatorLogEntry[] =>
   readFileSync(framework.getOperatorLogPath()!, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as OperatorLogEntry);
@@ -346,6 +348,46 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     assert.equal(h.cm().windowStatusOf(injection), 'in');
     const withInjection = h.framework.previewSurgeryMarks('scout', { rollbackTo: t });
     assert.deepEqual([withInjection.messagesRemoved, withInjection.neverPresented], [4, 2], "another agent's injection is never presented to scout");
+  });
+
+  it('the preview counts a system change row as never presented where only an agent on its head holds it', async () => {
+    const h = await boot();
+    const t = h.store('t');
+    h.cm().presentRows([t]);
+    const change = h.cm().addMessage('Host', [hostChange()], { source: 'api' } as never);
+    h.cm().presentRows([change]);
+    assert.equal(h.cm().windowStatusOf(change), 'in', "the premise: scout's window holds it");
+    const preview = h.framework.previewSurgeryMarks('scout', { rollbackTo: t });
+    assert.deepEqual([preview.messagesRemoved, preview.neverPresented], [1, 1], 'scout, on its head, sends no change row');
+  });
+
+  it('the refusal of a rollback the rows presented with its target make empty counts and names the messages among them, not a system change row', async () => {
+    const h = await boot({ toolDeclarations: 'entries' });
+    const x = h.store('x');
+    const y = h.store('y');
+    const change = h.cm().addMessage('Host', [hostChange()], { source: 'api' } as never);
+    h.cm().presentRows([x, y, change]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.match(e.message, /the 1 message after it/, e.message);
+      assert.ok(e.message.endsWith(
+        `suppress it (suppressMessages for ${y}), or hide it by Discord message id (the host's hide command: on scout for d-y)`,
+      ), e.message);
+      return true;
+    });
+  });
+
+  it('the refusal of a rollback that change rows alone follow in its write says so', async () => {
+    const h = await boot({ toolDeclarations: 'entries' });
+    const x = h.store('x');
+    const change = h.cm().addMessage('Host', [hostChange()], { source: 'api' } as never);
+    h.cm().presentRows([x, change]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.match(e.message, /in one write with only system change rows after it/, e.message);
+      assert.doesNotMatch(e.message, /suppress/, e.message);
+      return true;
+    });
   });
 
   it("a host's message-granular undo counts back in the window, whose order isn't the record's", async () => {

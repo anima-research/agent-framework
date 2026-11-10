@@ -12116,7 +12116,7 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
-    if (!config.selfParticipants?.length && spec?.selfParticipants?.length) config = { ...config, selfParticipants: spec.selfParticipants };
+    if (config.selfParticipants === undefined && spec?.selfParticipants?.length) config = { ...config, selfParticipants: spec.selfParticipants };
     const parent = spec?.inherit && spec.inherit.atSequence === undefined ? this.agents.get(spec.inherit.from) : undefined;
     const seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
     // Names are Chronicle namespaces and generation identities. Reserve before
@@ -12215,14 +12215,14 @@ export class AgentFramework {
               ...(inherit ? { inherit } : {}),
               // As opened above, whatever the spec said.
               ownSlot,
-              ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+              ...(config.selfParticipants !== undefined ? { selfParticipants: config.selfParticipants } : {}),
               ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
             }
           : {
               ...workerSpec(config.name, { namespace }),
               model: config.model,
               ownSlot,
-              ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+              ...(config.selfParticipants !== undefined ? { selfParticipants: config.selfParticipants } : {}),
               ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
             },
       });
@@ -15137,12 +15137,9 @@ export class AgentFramework {
    * of the agent's own window, in its order, leave it as an undone turn's
    * do (retractRows with `undone`), so no presentation point brings them
    * back, and the record keeps them, as the marker says. No other agent's
-   * window, nor its cache prefix or signed thinking, changes. A row the
-   * agent is never sent is passed over: a system_change row, a row a
-   * tune-out holds from residents (for an agent whose window leaves them
-   * out), and another agent's stored context injection. On a window that is
-   * still the record, the rows are removed from it, as before the index,
-   * and leave every other window that held them.
+   * window, nor its cache prefix or signed thinking, changes. On a window
+   * that is still the record, the rows are removed from it, as before the
+   * index, and leave every other window that held them.
    *
    * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
    * the shed after inference exhaustion (quarantinePoisonedHistory).
@@ -15182,8 +15179,6 @@ export class AgentFramework {
       const { from: start } = bodyRangeIn(all, i);
       const body = all.slice(start, i + 1);
       const resultOfCarriedCall = body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start);
-      // A row the agent is never sent is passed over, unless it is the
-      // stored result of a call the request carried: the exchange goes whole.
       if (passedOver(all[i]!) && !resultOfCarriedCall) continue;
       if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
         && (wasCarried(start, i) || resultOfCarriedCall)) {
@@ -18141,7 +18136,13 @@ export class AgentFramework {
     }
     const messagesRemoved = discarded.length;
     if (messagesRemoved <= 0 && !window?.returned.length) {
-      const kept = window?.kept ?? [];
+      const keptRows = window?.kept ?? [];
+      const kept = keptRows.filter((row) => !isSystemChangeMessage(row));
+      if (kept.length === 0 && keptRows.length > 0) {
+        throw new OperatorActionError('invalid',
+          `Message ${messageId} was presented to ${agentName} in one write with only system change rows after it in its window, ` +
+          `and a branch cut can't separate the rows one write presented, so a rollback to it would change nothing`);
+      }
       if (kept.length > 0) {
         const n = kept.length;
         const first = kept[0]!;
@@ -18393,7 +18394,7 @@ export class AgentFramework {
       let unknown = 0;
       const unreadable = new Map<string, string>();
       for (const m of messages) {
-        const holders = this.holderNames(m.id as MessageId, m.metadata);
+        const holders = this.holderNames(m.id as MessageId, m);
         if (holders.names.length > 0) continue;
         if (holders.unreadable.length === 0) { neverPresented++; continue; }
         unknown++;
@@ -18435,15 +18436,13 @@ export class AgentFramework {
   /**
    * The live agents whose window holds a row now (#291): each whose context
    * reads it `'in'` (windowStatusOf), every agent whose window is still the
-   * record and whose record holds it among them (`names`). A row an agent's
-   * view leaves out (agentSees) is held by no such agent, though its window
-   * holds it: one a tune-out holds from residents, or another agent's stored
-   * context injection, which a write-down from the record took in. A row a
+   * record and whose record holds it among them (`names`). A row a
    * suppress rule hid is held by no agent: no view shows it. An agent
    * whose lookup throws is in `unreadable`, with the error: whether its
    * window holds the row isn't known.
    */
-  private holderNames(id: MessageId, metadata?: unknown): { names: string[]; unreadable: Array<{ agent: string; error: string }> } {
+  private holderNames(id: MessageId, row: ViewedRow): { names: string[]; unreadable: Array<{ agent: string; error: string }> } {
+    const { metadata } = row;
     const held = heldFromResidents(metadata as Record<string, unknown> | undefined);
     const names: string[] = [];
     const unreadable: Array<{ agent: string; error: string }> = [];
@@ -18456,7 +18455,7 @@ export class AgentFramework {
         unreadable.push({ agent: agent.name, error: thrownText(error) });
         continue;
       }
-      if ((held && readerFacts(this.registry, agent.name).hidesHeld) || !this.agentSees(agent, metadata)) continue;
+      if ((held && readerFacts(this.registry, agent.name).hidesHeld) || !this.requestCarries(agent, row)) continue;
       names.push(agent.name);
     }
     return { names, unreadable };
@@ -18888,7 +18887,7 @@ export class AgentFramework {
       const head = isHeadDeclaration(stored) ? stored : null;
       if (stored != null && head === null) {
         this.headDeclarationCache!.setAside.add(agentName);
-        console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside, and the agent records its current tools and system text as its head, taking its own change rows out`);
+        console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside: under 'entries' the agent's next request records its current tools and system text as its head and takes its own change rows out, once the store takes the write, and an agent on its head sends no request on it`);
       }
       heads.set(agentName, head);
       this.headDeclarationsUnreadable.delete(agentName);
@@ -18906,9 +18905,11 @@ export class AgentFramework {
     try {
       this.store.setStateJson(this.headStateId(agentName), head);
     } catch (error) {
-      console.error(head !== null && !recorded
-        ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded === undefined ? ' that can be read' : ''}, so its requests go on its current head with its own change rows taken out until a later request stores it:`
-        : `[head-declarations] ${agentName}: the recorded head could not be stored, so what was recorded stays, with the agent's change rows, until a later request stores it:`, error);
+      console.error(head === null
+        ? `[head-declarations] ${agentName}: the recorded head could not be cleared, so it stays, with the agent's own change rows, until a later request on its head clears it:`
+        : !recorded
+          ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded === undefined ? ' that can be read' : ''}, so its requests go on its current head with its own change rows taken out until a later request stores it:`
+          : `[head-declarations] ${agentName}: the recorded head could not be stored, so what was recorded stays, with the agent's change rows, until a later request stores it:`, error);
       return false;
     }
     this.headsOnBranch().set(agentName, head);
@@ -39852,11 +39853,10 @@ export class AgentFramework {
         const repeated: string[] = [];
         // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
         // the conversation and called through toolsets--act, never offered
-        // here: every change to this list rebuilds the prompt cache. Their
-        // server, RFC-008 class and feature set are kept as any tool's are,
-        // so a call act makes is attributed, classed and state-exchanged as
-        // a direct call of the tool would be. The list was read through the
-        // server's tap, so its presence is current.
+        // here. Their server, RFC-008 class and feature set are kept as any
+        // tool's are, so a call act makes is attributed, classed and
+        // state-exchanged as a direct call of the tool would be. The list
+        // was read through the server's tap, so its presence is current.
         // The static↔dynamic moves the lists made since the last rebuild
         // reach the tool list here (§4.2). The agent is told where each tool
         // went once this refresh publishes a list that shows it there: a move

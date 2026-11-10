@@ -1076,14 +1076,19 @@ separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot
 the agent observes, which the refusal names), or, for those with a Discord message id,
 the host's `hide` by it, run on the agent whose own slot holds the row (the
-refusal names it), takes them out. A row holding a result of a call at or
+refusal names it), takes them out. The refusal counts and names the messages
+among them and never a system change row, which it doesn't advise removing;
+a target followed in its write by change rows alone is refused saying so. A row holding a result of a call at or
 before the target (a tool boundary presents a round's reply and its results
 in one write) isn't advised for suppression, which would leave the call
 without its result: the refusal says to roll back before the call. The preview's `neverPresented` counts the messages it
 removes that no live agent is shown: no window holds them, or only windows
-whose view leaves them out (a row a tune-out holds); a message that may be in
+whose view or request leaves them out (a row a tune-out holds, or a system
+change row for an agent on its head); a message that may be in
 a window that couldn't be read isn't counted, and is logged. The host command's
-`/undo n` counts back over the rows of the agent's own slot in its window. A
+`/undo n` counts back over the rows of the agent's own slot in its window,
+every row but system change rows: the change rows among the last n go with
+them uncounted. A
 removal in place
 (a `hide`, a suppression on its fork, a module's or the coalescer's removal)
 takes the rows out of every other live agent's window on that branch that

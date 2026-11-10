@@ -247,6 +247,8 @@ describe('toolDeclarations in the framework', () => {
       assert.equal(result.ok, true, result.error);
       assert.equal(result.messagesRemoved, 1, 'B alone');
       assert.ok(cm.getMessage(change as never), 'the change stays stored, as the cut keeps it');
+      assert.notEqual(cm.windowStatusOf(change as never), 'in', 'and leaves the window, returned to arrivals');
+      assert.equal(window().at(-1), 'A', 'which ends on A');
     });
   });
 
@@ -882,7 +884,9 @@ describe('toolDeclarations in the framework', () => {
       const alpha = framework.getAgent('alpha')!;
       say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
-      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      const second = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      assert.notDeepEqual(changesIn(second.messages), [], "the premise: alpha's second request declares its change");
+      assert.equal(storedChanges(alpha, 'alpha'), 1, 'and alpha stored it in the slot the subconscious reads');
       const subconscious = framework.getAgent('Subconscious')!;
       const request = await subconscious.buildActivationRequest([tool('think')]);
       assert.deepEqual(changesIn(request.messages), [], "alpha's change declares alpha's tools");
@@ -1122,7 +1126,7 @@ describe('toolDeclarations in the framework', () => {
         try { request = await alpha.buildActivationRequest([tool('a'), tool('c')]); } finally { console.error = error; }
         assert.deepEqual(request.tools, [tool('a'), tool('c')], 'what is current');
         assert.deepEqual(traces.filter((t) => t.type === 'head:moved').map((t) => (t as { why: string }).why), ['adopted']);
-        assert.deepEqual(errors, ["[head-declarations] alpha: the recorded head isn't one, so it was set aside, and the agent records its current tools and system text as its head, taking its own change rows out"]);
+        assert.deepEqual(errors, ["[head-declarations] alpha: the recorded head isn't one, so it was set aside: under 'entries' the agent's next request records its current tools and system text as its head and takes its own change rows out, once the store takes the write, and an agent on its head sends no request on it"]);
         assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as { tools: ToolDefinition[] }).tools, [tool('a'), tool('c')], 'and the record is a head again');
         assert.deepEqual((internals.headDeclarations.read('beta') as { tools: ToolDefinition[] }).tools, [tool('b')], "beta's stays");
       });
@@ -1177,6 +1181,8 @@ describe('toolDeclarations in the framework', () => {
         const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
         say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.equal(storedChanges(alpha, 'alpha'), 1, 'the premise: alpha declared a change of its own');
         await beta.buildActivationRequest([tool('b')]);
         const get = internals.store.getStateJson.bind(internals.store);
         internals.store.getStateJson = (id) => {
@@ -1190,7 +1196,8 @@ describe('toolDeclarations in the framework', () => {
         try {
           const request = await alpha.buildActivationRequest([tool('a'), tool('c')]);
           assert.deepEqual(request.tools, [tool('a'), tool('c')], 'what is current');
-          assert.deepEqual(changesIn(request.messages), []);
+          assert.deepEqual(changesIn(request.messages), [], 'with its own change row taken out of the request');
+          assert.equal(storedChanges(alpha, 'alpha'), 0, 'and out of its context');
           internals.headDeclarationCache = null;
           await alpha.buildActivationRequest([tool('a'), tool('c')]);
         } finally {
@@ -1426,13 +1433,14 @@ describe('toolDeclarations in the framework', () => {
     const tight = { contextBudgetTokens: 20000 };
     const lastText = (messages: readonly NormalizedMessage[]) => (messages.at(-1)!.content[0] as { text?: string }).text;
     const internals = (framework: AgentFramework) => framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent> };
+    const holds = (agent: Agent, ids: readonly unknown[]) => ids.every((id) => agent.getContextManager().getMessage(id as never) !== null);
 
     it("sends a resident's request beside a host's change rows that alone exceed its budget", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', ...tight }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        store(framework, alpha, 'system', bulky('h1'));
-        store(framework, alpha, 'system', bulky('h2'));
+        const rows = [store(framework, alpha, 'system', bulky('h1')), store(framework, alpha, 'system', bulky('h2'))];
         say(framework, alpha, 'user', 'hello');
+        assert.ok(holds(alpha, rows), 'the premise: both rows are in its context');
         const request = await alpha.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'hello');
@@ -1442,10 +1450,10 @@ describe('toolDeclarations in the framework', () => {
     it("sends an isolated ephemeral agent's request beside a host's change rows that alone exceed its budget", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const { agent } = await framework.createEphemeralAgent({ name: 'solo', model: 'test-model', systemPrompt: prompt('You work alone.'), ...tight } as never);
-        store(framework, agent, 'system', bulky('h1'));
-        store(framework, agent, 'system', bulky('h2'));
+        const rows = [store(framework, agent, 'system', bulky('h1')), store(framework, agent, 'system', bulky('h2'))];
         say(framework, agent, 'user', 'hello');
         adopt(framework, agent);
+        assert.ok(holds(agent, rows), 'the premise: both rows are in its context');
         const request = await agent.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'hello');
@@ -1455,12 +1463,12 @@ describe('toolDeclarations in the framework', () => {
     it("sends a host's shared child's request beside a host's change rows in its parent's context that alone exceed its budget", async () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
-        store(framework, alpha, 'system', bulky('h1'));
-        store(framework, alpha, 'system', bulky('h2'));
+        const rows = [store(framework, alpha, 'system', bulky('h1')), store(framework, alpha, 'system', bulky('h2'))];
         say(framework, alpha, 'user', 'hello');
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
         const { agent: child } = await framework.createEphemeralAgent({ name: 'host-child', model: 'test-model', systemPrompt: prompt('You are alpha.'), ...tight } as never, spec);
         adopt(framework, child);
+        assert.ok(holds(child, rows), "the premise: both of its parent's rows are in its context");
         const request = await child.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'hello');
@@ -1471,9 +1479,9 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', ...tight }], async (framework) => {
         say(framework, framework.getAgent('alpha')!, 'user', 'hello');
         const fork = await internals(framework).createConversationAgent('alpha-fork', 'chanA');
-        store(framework, fork, 'system', bulky('h1'));
-        store(framework, fork, 'system', bulky('h2'));
+        const rows = [store(framework, fork, 'system', bulky('h1')), store(framework, fork, 'system', bulky('h2'))];
         say(framework, fork, 'user', 'and you');
+        assert.ok(holds(fork, rows), 'the premise: both rows are in its context');
         const request = await fork.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
         assert.equal(lastText(request.messages), 'and you');

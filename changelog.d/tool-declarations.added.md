@@ -59,7 +59,6 @@
   can't clear keeps them, and a later request tries again. New trace events:
   `head:declared`, `head:moved` and `head:resend`. `Agent` gains what a host
   that builds agents without the framework sets and reads:
-  `attachHeadDeclarations` (where heads are kept, and what a move reports),
   `setCompileHoldsChanges` (whether its compile can hold change rows),
   `setSourceChangeOwners`, `ownsChange` and `changeOwners` (whose change rows
   are its own), `declaresEntries` (whether its requests declare changes now)

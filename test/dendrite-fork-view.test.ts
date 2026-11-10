@@ -381,6 +381,20 @@ describe("a shared child of a resident with former names", () => {
     assert.deepEqual(framework.getAgentRecord('job-6')!.selfParticipants, ['zed'], 'its record states the mapping it ran with');
   });
 
+  it("keeps a config's empty mapping as given, live, in its record and when resumed with none of its own", async () => {
+    const { name: _name, ...spec } = taskForkSpec('job-7', { parent: 'mira', inherit: { mode: 'shared' } });
+    const job = await framework.createEphemeralAgent({ name: 'job-7', model: 'test-model', systemPrompt: prompt('Do the task.'), selfParticipants: [] }, { ...spec, selfParticipants: ['zed'] });
+    assert.equal(job.agent.isOwnParticipant('zed'), false, "the config's empty list stands over the spec's");
+    job.contextManager.addMessage('user', [text('Run once.')]);
+    framework.start();
+    membrane.script('job-7', say('job-7 done'));
+    await framework.runEphemeralToCompletion(job.agent, job.contextManager);
+    assert.equal(framework.getAgentRecord('job-7')!.selfParticipants, undefined, "its record states no mapping, as it ran with none, not the spec's");
+    const resumed = await framework.resumeAgent('job-7', { model: 'test-model', systemPrompt: prompt('Do the task.') });
+    assert.equal(resumed.agent.isOwnParticipant('zed'), false, 'resumed with no mapping of its own, it reads the empty list');
+    resumed.cleanup();
+  });
+
   it("gives a child resumed with no mapping of its own the view of its record's", async () => {
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
@@ -442,10 +456,10 @@ describe("a resumed 'head' job", () => {
       await framework.runEphemeralToCompletion(first.agent, first.contextManager);
       const resumed = await framework.resumeAgent('job', job as never);
       adopt(framework, resumed.agent);
-      resumed.contextManager.addMessage('system', bulky('h1'));
-      resumed.contextManager.addMessage('system', bulky('h2'));
+      const rows = [resumed.contextManager.addMessage('system', bulky('h1')), resumed.contextManager.addMessage('system', bulky('h2'))];
       resumed.contextManager.addMessage('user', [text('Once more.')]);
       startOf(framework, resumed.agent);
+      assert.deepEqual(rows.map((id) => resumed.contextManager.windowStatusOf(id)), ['in', 'in'], 'the premise: both changes entered its window at the start');
       const request = await resumed.agent.buildActivationRequest([]);
       assert.equal(textOf(request.messages.at(-1)!), 'Once more.');
       assert.ok(!request.messages.some((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change')), 'and no change row');

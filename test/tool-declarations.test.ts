@@ -756,7 +756,7 @@ describe('toolDeclarations', () => {
     assert.notEqual(context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash, context.compiles.at(-2)?.kvUnifiedImmutablePrefixHash, 'the system text alone changed the hash');
   });
 
-  it('leaves the context\'s changes out of the direct API\'s request', async () => {
+  it("leaves the agent's own changes out of the direct API's request where it has no recorded head", async () => {
     let sent: NormalizedRequest | undefined;
     const membrane = { stream: async (request: NormalizedRequest) => { sent = request; return { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 } }; } };
     const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])]);

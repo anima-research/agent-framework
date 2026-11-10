@@ -192,7 +192,8 @@ export interface AgentConfig {
    * head, it leaves every change row out of its request, and takes its own
    * out of its context once its record is cleared (a record the store can't
    * clear keeps them until it can), while its compile, made as an
-   * `'entries'` agent's, holds a host's until then. An Agent used without the framework
+   * `'entries'` agent's, holds a host's change rows, which take its budget,
+   * until it's built again. An Agent used without the framework
    * keeps its head in memory, per branch of its context, and has no such resend. The direct API
    * (runInference) declares nothing. On an `'entries'` agent with a recorded
    * head, where the tools its caller passes and the current system text are

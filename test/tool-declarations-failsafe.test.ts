@@ -485,6 +485,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     assert.equal(resend.length, 1);
     assert.deepEqual(outcomes, ['answered', 'refused at a later round', 'answered', 'answered'], 'the resend and the next turn go out without that thinking');
     assert.equal((resend[0] as { thinkingSetAside: number }).thinkingSetAside, 1, "the second round's reply, signed after the change the boundary handed");
+    assert.equal(traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend').length, 0, 'a recognised refusal whose note landed needs no operator line');
   });
 
   it("says, when its note can't land, that where its head didn't move its requests can carry that thinking until those replies leave its window or it's built again, which an account that enforces the binding refuses without the drop control", async () => {
