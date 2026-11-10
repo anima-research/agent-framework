@@ -15194,7 +15194,7 @@ export class AgentFramework {
     // In the window, the rows the agent is sent: a held row is in a
     // resident's written-down window and left out by its view, as another
     // agent's injection is (agentSees, the one rule main's #853 asks
-    // everywhere). A system change row is passed over in either mode.
+    // everywhere).
     const passedOver = (m: StoredMessage): boolean => {
       const meta = (m.metadata ?? {}) as Record<string, unknown>;
       if (meta.system || isSystemChangeMessage(m)) return true;
@@ -19125,11 +19125,9 @@ export class AgentFramework {
     // read-only, the tune-out's stamped messages included. The filter, which
     // context-manager applies to the merged view too, leaves out the
     // residents' stored context injections (stored-injections.ts): their
-    // context, which this agent never saw while they were placed unstored;
-    // every system change not its own, a host's included, since those in the
-    // residents' slot declare the residents' tools, not its own; and
-    // suppressed rows (suppressedRow), which render for no one, the reader of
-    // held traffic included.
+    // context, which this agent never saw while they were placed unstored,
+    // and suppressed rows (suppressedRow), which render for no one, the
+    // reader of held traffic included.
     // With the presentation index the merged slot stays the record its
     // window is presented from: a window presents only rows its record
     // holds. The shape is subconsciousContextOptions (context-options.ts),
@@ -19791,11 +19789,8 @@ export class AgentFramework {
           // (agentSees, main's #853) is never its arrival (bearingOf reads the
           // same facts: a resident's hidesHeld, isAnotherAgentsInjection, an
           // observe edge's includeHeld), so injecting it can't put in the live
-          // turn what the next compile hides. A system change for an agent on
-          // its head, whose requests leave every change out, is presented and
-          // not heard, and so is a change row the agent's view leaves out
-          // (agentKeeps). The mail a message carries was released when it was
-          // stored. Only a stream that declares it
+          // turn what the next compile hides. The mail a message carries was
+          // released when it was stored. Only a stream that declares it
           // carries injected messages (supportsInjectedMessages true:
           // membrane's native path) hears what arrived. Membrane's XML prefill
           // path declares false, and a stream that doesn't say is taken as one
@@ -35460,12 +35455,13 @@ export class AgentFramework {
   /** Whether the newest row of `agent`'s window a reply could be meant for
    *  is one of `rows`, as the start's request will hold it: clock rows,
    *  stored context injections, system changes and the batch's own gate
-   *  line, which the start's line can't name, aside. Past NEWEST_SCAN_ROWS rows, it answers
-   *  no. A presented window is the request's own: the start has presented
-   *  what arrived (an observed co-resident's round among it), and what
-   *  arrives from here waits for the next request. A window still in legacy
-   *  mode (its write-down failed) is the slot's record, read from its newest
-   *  row, through the agent's view (agentSees). */
+   *  line, which the start's line can't name, aside. Past NEWEST_SCAN_ROWS
+   *  rows, it answers no. A presented window is the request's own: the
+   *  start has presented what arrived (an observed co-resident's round
+   *  among it), and what arrives from here waits for the next request. A
+   *  window still in legacy mode (its write-down failed) is the slot's
+   *  record, read from its newest row, through the agent's view
+   *  (agentSees). */
   private batchIsNewest(agent: Agent, rows: readonly string[]): boolean {
     const cm = agent.getContextManager();
     const presented = cm.windowMode() === 'presented';
