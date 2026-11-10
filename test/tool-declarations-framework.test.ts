@@ -342,14 +342,6 @@ describe('toolDeclarations in the framework', () => {
         }
       });
     });
-
-    it("of the subconscious are its own alone: it takes none of the primary's identity", async () => {
-      await withFramework([{ ...resident('alpha'), selfParticipants: ['alpha-old'], presentAs: 'alpha-shown' }], async (framework) => {
-        const subconscious = framework.getAgent('Subconscious')!;
-        assert.equal(subconscious.isOwnParticipant('alpha-old'), false, "the primary's former name isn't its own");
-        assert.notEqual(subconscious.presentAs, 'alpha-shown', "nor is the name the primary's turns are presented under");
-      }, undefined, { subconscious: { enabled: true, systemPrompt: 'notice' } });
-    });
   });
 
   describe("an ephemeral agent that continues another's context", () => {

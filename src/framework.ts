@@ -19161,8 +19161,6 @@ export class AgentFramework {
     // subconscious's config sets its own.
     const model = cfg.model ?? primaryConfig.model;
     const inherited: AgentConfig = { ...primaryConfig };
-    delete inherited.selfParticipants;
-    delete inherited.presentAs;
     if (model !== primaryConfig.model) {
       for (const field of SUBCONSCIOUS_MODEL_FIELDS) delete inherited[field];
     }
