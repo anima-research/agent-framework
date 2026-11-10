@@ -98,7 +98,7 @@ async function isolatedJob(f: Fixture, module: ReminderModule) {
 const resident = (name: string, extra: Record<string, unknown> = {}) => ({ name, model: 'test', systemPrompt: 'test', ...extra });
 
 describe("a debounced module event wakes the agents its response asked inference for, and its line is theirs", () => {
-  it('a message for one resident: the batch wakes that resident alone, and its line is stored for that resident alone', async () => {
+  it('a message for one resident: the batch wakes that resident alone, which holds the message once, with no line quoting it', async () => {
     const { f, turns, off } = await setup([resident('agent'), resident('other')]);
     try {
       remind(f, 'water the plants', ['agent']);
@@ -108,8 +108,8 @@ describe("a debounced module event wakes the agents its response asked inference
       assert.deepEqual(turns, ['agent']);
       assert.ok(JSON.stringify(f.membrane.calls[0]).includes('water the plants'), "the resident it's for is woken with it");
       const quoting = rows(f, 'water the plants');
-      assert.ok(quoting.some((m) => JSON.stringify(m.content).includes('[Gate:')), 'premise: the batch wrote its line');
-      assert.deepEqual(quoting.map(audienceOf), quoting.map(() => ['agent']));
+      assert.equal(quoting.length, 1, "the resident's window holds the message once, with no line quoting it again");
+      assert.deepEqual(audienceOf(quoting[0]!), ['agent']);
     } finally { off(); await f.close(); }
   });
 
@@ -135,10 +135,8 @@ describe("a debounced module event wakes the agents its response asked inference
       fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual(turns, ['agent']);
-      const lines = rows(f, '[Gate:');
-      assert.equal(lines.length, 1);
-      assert.ok(JSON.stringify(lines[0]!.content).includes('dim the lamps'));
-      assert.ok(!JSON.stringify(lines[0]!.content).includes('water the plants'));
+      assert.ok(!rows(f, '[Gate:').some((l) => JSON.stringify(l.content).includes('water the plants')), 'no line quotes the event it leaves out');
+      assert.ok(f.membrane.calls.some((c) => JSON.stringify(c).includes('dim the lamps')), "the resident's own reminder reaches it");
     } finally { off(); await f.close(); }
   });
 
@@ -156,10 +154,8 @@ describe("a debounced module event wakes the agents its response asked inference
       fire(f);
       await job.done();
       assert.deepEqual([...new Set(turns)].sort(), ['agent', 'worker-1'], 'no other resident wakes');
-      const lines = rows(f, '[Gate:');
-      assert.equal(lines.length, 1);
-      assert.ok(JSON.stringify(lines[0]!.content).includes('dim the lamps'));
-      assert.ok(!JSON.stringify(lines[0]!.content).includes('water the plants'));
+      assert.ok(!rows(f, '[Gate:').some((l) => JSON.stringify(l.content).includes('water the plants')), 'no line quotes the event it leaves out');
+      assert.ok(f.membrane.calls.some((c) => JSON.stringify(c).includes('dim the lamps')), "the resident's own reminder reaches it");
     } finally {
       module.release('g-worker');
       off();
@@ -196,10 +192,8 @@ describe("a debounced module event wakes the agents its response asked inference
       fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual(turns, ['agent']);
-      const lines = rows(f, '[Gate:');
-      assert.equal(lines.length, 1);
-      assert.ok(JSON.stringify(lines[0]!.content).includes('dim the lamps'));
-      assert.ok(!JSON.stringify(lines[0]!.content).includes('water the plants'));
+      assert.ok(!rows(f, '[Gate:').some((l) => JSON.stringify(l.content).includes('water the plants')), 'no line quotes the event it leaves out');
+      assert.ok(f.membrane.calls.some((c) => JSON.stringify(c).includes('dim the lamps')), "the resident's own reminder reaches it");
     } finally { off(); await f.close(); }
   });
 
