@@ -58,6 +58,7 @@ import {
   storedIdsBetween,
 } from './stored-removal.js';
 import type {
+  EffortLevel,
   FrameworkConfig,
   InferencePolicy,
   ErrorPolicy,
@@ -228,6 +229,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
+import { EFFORT_ROW_KEY, effortMarksOf, effortOf, effortRowMetadata, effortRowOf, isAnotherAgentsEffortRow, isEffortLevel, MEMBRANE_SENDS_EFFORT_ROWS, type EffortPlan } from './effort.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, suppressedRow, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -425,7 +427,9 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
  * `primaryIfUnread` a module's write for an ephemeral run or a
  * conversation fork, which goes to the primary if its target never read it
  * (passesToPrimary), and `dendrite` the stamp of delivered agent mail, whose
- * `mailId` releases that held mail once the row lands (releaseLandedMail). A
+ * `mailId` releases that held mail once the row lands (releaseLandedMail),
+ * and `effortRowOf` a framework effort row's agent, whose rows a refusal
+ * takes back (FrameworkConfig.effort). A
  * server's metadata, a channel message's `metadata` or a
  * push event's `origin`, is stored without them, and the host writes its own
  * after it: MCPL SPEC §16.6 makes metadata the producer's untrusted claims,
@@ -437,6 +441,7 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
 const HOST_METADATA_KEYS = [
   'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'suppressed', 'coalescingSubject', 'firstView',
   'deferredWriteId', 'external', 'openaiResponsesItems', STORED_INJECTION_KEY, PRIMARY_IF_UNREAD_KEY, 'dendrite',
+  EFFORT_ROW_KEY,
 ] as const;
 
 /**
@@ -2419,6 +2424,7 @@ function logSeedOmissions(
   fork: string,
   template: string,
   injections: number,
+  effortRows: number,
   compiled: readonly { content: ContentBlock[] }[],
   withoutReasoning: readonly { content: ContentBlock[] }[],
   withoutNotices: readonly { content: ContentBlock[] }[],
@@ -2430,9 +2436,10 @@ function logSeedOmissions(
   const notices = count(withoutReasoning, (b) => b.type === 'text') - count(withoutNotices, (b) => b.type === 'text');
   const calls = count(withoutNotices, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
   const results = count(withoutNotices, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
-  if (injections + thinking + notices + calls + results === 0) return;
+  if (injections + effortRows + thinking + notices + calls + results === 0) return;
   console.log(
     `[conversation] ${fork}: seeded from ${template} without ${injections} stored context injection(s), ` +
+    `${effortRows} effort row(s), ` +
     `${thinking} thinking block(s), ` +
     `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
   );
@@ -4280,6 +4287,38 @@ function readerModelFields(cfg: SubconsciousConfig): Pick<AgentConfig, (typeof S
   };
 }
 
+function assertEffortSetting(effort: unknown): void {
+  if (effort == null || typeof effort === 'function' || isEffortLevel(effort)) return;
+  throw new Error(
+    `FrameworkConfig.effort is ${JSON.stringify(effort)}, which isn't an effort level. Give low, medium, high, xhigh or max, ` +
+      'or a function that gives one of them, or undefined, for each agent.',
+  );
+}
+
+function assertEffortSource(config: AgentConfig, effort: FrameworkConfig['effort']): void {
+  if (effort == null) return;
+  const outputConfig = (config.providerParams as { output_config?: unknown } | undefined)?.output_config;
+  if (outputConfig !== null && typeof outputConfig === 'object' && (outputConfig as { effort?: unknown }).effort !== undefined) {
+    throw new Error(
+      `Agent "${config.name}" sets providerParams.output_config.effort while FrameworkConfig.effort is set, so the two would say ` +
+        'two things about its effort. Leave its effort to FrameworkConfig.effort, or unset FrameworkConfig.effort to keep its own.',
+    );
+  }
+}
+
+function endsOnNewInput(agent: Agent, rows: readonly StoredMessage[], sees: (metadata: unknown) => boolean): boolean {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (!sees(row.metadata)) continue;
+    const mark = storedInjectionMarkOf(row.metadata);
+    if (mark !== undefined && agent.isOwnParticipant(mark.agent)) continue;
+    if (effortOf(row.content) !== undefined) continue;
+    return !agent.isOwnParticipant(row.participant)
+      && !row.content.some((block) => block.type === 'tool_result' || block.type === 'system_change');
+  }
+  return false;
+}
+
 const JUDGE_PARAMETER: ToolParameter = {
   type: 'object',
   description:
@@ -4312,6 +4351,15 @@ function isLegacyFamily(config: McplServerConfig): boolean {
   } catch {
     return false;
   }
+}
+
+function effortBasesOf(bases: readonly unknown[], agentName: string): Array<{ model?: unknown; effort?: unknown }> {
+  return bases.filter((entry) => !!entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName) as
+    Array<{ model?: unknown; effort?: unknown }>;
+}
+
+function soundEffortBase(record: { model?: unknown; effort?: unknown }): record is { model: string; effort: EffortLevel | 'none' } {
+  return typeof record.model === 'string' && (record.effort === 'none' || isEffortLevel(record.effort));
 }
 
 export class AgentFramework {
@@ -4940,6 +4988,10 @@ export class AgentFramework {
   private collapseDerivationNoticesAfter = 10;
   /** The host's say over each derivation, ephemeral spawn and resume (config.dendrite.beforeDerive). */
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
+  private effortSetting: FrameworkConfig['effort'];
+  private readonly effortAnswersLogged = new Set<string>();
+  private readonly effortRowsRefused = new Set<string>();
+  private readonly effortBasesUnreadableSaid = new Set<string>();
   /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
   private derivationNoticeHook?: (record: AgentRecord, from: string, defaultText: string) => string | null;
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
@@ -5269,7 +5321,11 @@ export class AgentFramework {
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     resolveInferenceBounds(config.inferenceBounds);
     assertFrameworkSwitches(config);
-    for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
+    assertEffortSetting(config.effort);
+    for (const agentConfig of config.agents) {
+      assertAgentSwitches(agentConfig);
+      assertEffortSource(agentConfig, config.effort);
+    }
     assertAgentNamesUnique(config.agents);
     assertObservedAgentsConfigured(config.agents);
     // The presentation index (#291) needs a context-manager that keeps a
@@ -5543,6 +5599,7 @@ export class AgentFramework {
     framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
     framework.collapseDerivationNoticesAfter = Math.max(0, Math.floor(config.dendrite?.collapseDerivationNoticesAfter ?? 10));
     framework.beforeDerive = config.dendrite?.beforeDerive;
+    framework.effortSetting = config.effort ?? undefined;
     framework.derivationNoticeHook = config.dendrite?.derivationNotice;
     framework.speechLocus = config.speech?.locus ?? 'delivery';
     framework.tuneOutOffered = !!config.subconscious?.enabled;
@@ -9732,6 +9789,128 @@ export class AgentFramework {
     });
   }
 
+  private adoptEffort(agent: Agent): void {
+    if (this.effortSetting !== undefined) agent.setEffortPlanner((use) => this.planEffort(agent, use));
+  }
+
+  private liveEffort(agent: Agent, setting: NonNullable<FrameworkConfig['effort']>): EffortLevel | undefined {
+    if (typeof setting !== 'function') return setting;
+    let answer: unknown;
+    try {
+      answer = setting({ name: agent.name, model: agent.model });
+    } catch (error) {
+      if (!this.effortAnswersLogged.has(agent.name)) {
+        this.effortAnswersLogged.add(agent.name);
+        console.error(`[effort] ${agent.name}: FrameworkConfig.effort threw, so its requests go as if it gave undefined:`, error);
+      }
+      return undefined;
+    }
+    if (answer === undefined || isEffortLevel(answer)) return answer;
+    if (!this.effortAnswersLogged.has(agent.name)) {
+      this.effortAnswersLogged.add(agent.name);
+      console.error(
+        `[effort] ${agent.name}: FrameworkConfig.effort gave ${typeof answer === 'string' ? JSON.stringify(answer) : `a value of type ${answer === null ? 'null' : typeof answer}`}, which isn't an effort level, ` +
+          'so its requests go as if it gave undefined.',
+      );
+    }
+    return undefined;
+  }
+
+  private planEffort(agent: Agent, use: 'turn' | 'preview' | 'direct'): EffortPlan | undefined {
+    const setting = this.effortSetting;
+    if (setting === undefined) return undefined;
+    const live = this.liveEffort(agent, setting);
+    if (!MEMBRANE_SENDS_EFFORT_ROWS || this.effortRowsRefused.has(agent.name)) return { rows: false, ...(live !== undefined ? { topLevel: live } : {}) };
+    const record = this.readEffortBase(agent.name, use === 'turn');
+    const kept = record?.model === agent.model ? record.effort : undefined;
+    const base = live === undefined ? 'none' : kept ?? live;
+    if (use === 'turn' && kept !== base) this.writeEffortBase(agent.name, { model: agent.model, effort: base });
+    if (live === undefined) return { rows: false };
+    const plan: EffortPlan = { rows: true, ...(base !== 'none' ? { topLevel: base } : {}) };
+    if (use === 'direct') return plan;
+    const window = agent.getContextManager().getPresentedMessages();
+    const inForce = agent.newestOwnEffortLevel(window) ?? (base === 'none' ? undefined : base);
+    if (live !== inForce && endsOnNewInput(agent, window, (metadata) => this.agentSees(agent, metadata))) plan.change = live;
+    return plan;
+  }
+
+  // effortBases is a list of records, each naming its agent, not a map: chronicle's state store drops an object's own
+  // `__proto__` key, and that's an agent name too.
+  private readEffortBase(agentName: string, report = false): { model: string; effort: EffortLevel | 'none' } | undefined {
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    const bases = data && typeof data === 'object' ? (data as Record<string, unknown>).effortBases : undefined;
+    if (bases === undefined) return undefined;
+    const unreadable = (key: string, line: string): undefined => {
+      if (report && !this.effortBasesUnreadableSaid.has(key)) {
+        this.effortBasesUnreadableSaid.add(key);
+        console.error(line);
+      }
+      return undefined;
+    };
+    if (!Array.isArray(bases)) {
+      return unreadable('', `[effort] ${FRAMEWORK_STATE_ID}'s effortBases isn't a list of records, so it reads as no base for any agent, and ` +
+        'it\'s left as it is to be repaired. Until then, each request\'s top-level effort is its agent\'s live level.');
+    }
+    const records = effortBasesOf(bases, agentName);
+    if (records.length === 0) return undefined;
+    if (!records.every(soundEffortBase)) {
+      return unreadable(agentName, `[effort] ${agentName}: ${FRAMEWORK_STATE_ID}'s effortBases holds a record for it that isn't a model and a ` +
+        'level, so it reads as no base, and it\'s left as it is to be repaired. Until then, its requests\' top-level effort is its live level.');
+    }
+    const [record] = records;
+    return { model: record!.model, effort: record!.effort };
+  }
+
+  private writeEffortBase(agentName: string, record: { model: string; effort: EffortLevel | 'none' }): void {
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+    if (state.effortBases !== undefined && !Array.isArray(state.effortBases)) return;
+    const others = Array.isArray(state.effortBases) ? state.effortBases as unknown[] : [];
+    const kept = effortBasesOf(others, agentName);
+    if (!kept.every(soundEffortBase)) return;
+    state.effortBases = [...others.filter((entry) => !(kept as unknown[]).includes(entry)), { agent: agentName, ...record }];
+    this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+  }
+
+  private keepEffortBases(keep: (agentName: string) => boolean): void {
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const bases = data && typeof data === 'object' ? (data as Record<string, unknown>).effortBases : undefined;
+      if (!Array.isArray(bases)) return;
+      const kept = (bases as unknown[]).filter((entry) => {
+        const agent = entry && typeof entry === 'object' ? (entry as { agent?: unknown }).agent : undefined;
+        return typeof agent !== 'string' || keep(agent) || !soundEffortBase(entry as { model?: unknown; effort?: unknown });
+      });
+      if (kept.length === bases.length) return;
+      this.store.setStateJson(FRAMEWORK_STATE_ID, { ...(data as Record<string, unknown>), effortBases: kept });
+    } catch (err) {
+      console.error('[effort] the effort bases of agents that have ended could not be dropped; they stay until the next end or boot:', err);
+    }
+  }
+
+  private copyEffortBase(from: string, to: string): void {
+    const record = this.readEffortBase(from);
+    if (record) this.writeEffortBase(to, record);
+  }
+
+  private refuseEffortRows(agent: Agent, error: Error, request: NormalizedRequest | undefined): boolean {
+    if (this.effortSetting === undefined || (error as { systemChangeRefused?: unknown }).systemChangeRefused !== true) return false;
+    if (!request?.messages.some((m) => effortOf(m.content) !== undefined)) return false;
+    this.effortRowsRefused.add(agent.name);
+    console.error(
+      `[effort] ${agent.name}: membrane refused a request carrying an effort row (${error.message}). ` +
+        'Its requests carry the live effort on top and no effort rows from now until the agent ends or the process does; this one is sent again at once.',
+    );
+    for (const row of agent.unansweredEffortRows()) {
+      try {
+        agent.getContextManager().removeMessage(row);
+      } catch (removal) {
+        console.error(`[effort] ${agent.name}: the refused effort row ${row} stays stored:`, removal);
+      }
+    }
+    return true;
+  }
+
   /** Each guard that may have queued storage work, once, by agent name: the
    *  live agents' and every other that isn't idle. */
   private guardsWithStorageWork(): Map<ToolResultGuard, string> {
@@ -12044,6 +12223,7 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
+    assertEffortSource(config, this.effortSetting);
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -12117,6 +12297,7 @@ export class AgentFramework {
 
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
+      this.adoptEffort(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, {
         contextManager,
@@ -12269,12 +12450,19 @@ export class AgentFramework {
         // The copies, and the framing below, are the child's own rows: its
         // inheritance and what it is told it is, stored for it, whoever they
         // name as their participant.
-        const { messages } = await parent.getContextManager().compile();
-        for (const message of messages) {
+        const parentCm = parent.getContextManager();
+        const { messages, provenance } = await parentCm.compile();
+        const marks = effortMarksOf(parentCm, { provenance }, (id, err) => {
+          console.error(`[derive] ${options.name}: could not read the parent's row ${id}, so the copy takes it as no effort row:`, err);
+        });
+        for (const [i, message] of messages.entries()) {
+          const of = marks(i);
+          const effortRow = effortOf(message.content) !== undefined && of.length > 0 && of.every((agent) => agent !== undefined);
           storeOwnRow(
             created.agent,
             parent.isOwnParticipant(message.participant) ? options.name : message.participant,
             message.content,
+            effortRow ? effortRowMetadata(options.name) : undefined,
           );
         }
         created.agent.markContextConsumed();
@@ -12283,6 +12471,7 @@ export class AgentFramework {
       for (const message of options.framing ?? []) {
         storeOwnRow(created.agent, message.participant, message.content, message.metadata);
       }
+      if (this.effortSetting !== undefined) this.copyEffortBase(options.from, options.name);
       return created;
     } catch (error) {
       this.discardEphemeralCandidate(created.agent, created.contextManager);
@@ -12434,6 +12623,7 @@ export class AgentFramework {
         : {}),
       ...(config.presentAs === undefined && record.presentAs ? { presentAs: record.presentAs } : {}),
     };
+    assertEffortSource(fullConfig, this.effortSetting);
     const spawnedBy = record.relationships.spawnedBy;
     const resultTo = record.relationships.resultTo;
     const keepSpawner = spawnedBy !== undefined && this.registry.has(spawnedBy);
@@ -12479,6 +12669,7 @@ export class AgentFramework {
       }
       agent = new Agent(fullConfig, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
+      this.adoptEffort(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     } catch (error) {
       this.resumesPending.delete(name);
@@ -12645,7 +12836,8 @@ export class AgentFramework {
    * residents' view when its edge leaves held traffic out, and the
    * subconscious's when it shows it. For an isolated agent that
    * watches no residents' slot on its branch (a worker, a conversation
-   * fork), whose view excludes only legacy reasoning-loss notices.
+   * fork), whose view excludes legacy reasoning-loss notices and another
+   * agent's framework effort rows, which a slot it observes can hold.
    */
   private liveViewFilterOf(record: AgentRecord): ((message: StoredMessage) => boolean) | undefined {
     if (record.ownSlot?.namespace === null) return residentViewFilter(record.name);
@@ -12653,7 +12845,7 @@ export class AgentFramework {
       const slot = this.registry.observedSlotOf(edge);
       return slot !== undefined && slot.branch === undefined && sameSlot(slot, RESIDENTS_SLOT);
     });
-    if (residents.length === 0) return (message) => !isReasoningLoss(message.metadata);
+    if (residents.length === 0) return (message) => !isReasoningLoss(message.metadata) && !isAnotherAgentsEffortRow(message.metadata, record.name);
     return residents.some((edge) => edge.includeHeld === true) ? subconsciousViewFilter(record.name) : residentViewFilter(record.name);
   }
 
@@ -12696,7 +12888,7 @@ export class AgentFramework {
     }
     if (names.length === 0) return ownerSees;
     return (message) => !isReasoningLoss(message.metadata)
-      && (ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name)));
+      && (ownerSees(message) || names.some((name) => isOwnInjection(message.metadata, name) || effortRowOf(message.metadata) === name));
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -12747,7 +12939,7 @@ export class AgentFramework {
     // even when the source has no additional view recorded.
     const sourceSees = this.storeSees.get(source);
     const sees = (metadata: unknown): boolean => !isReasoningLoss(metadata)
-      && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name));
+      && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name) || effortRowOf(metadata) === config.name);
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -13400,6 +13592,12 @@ export class AgentFramework {
    */
   private settleEndedAgent(outcome: EndOutcome | null): void {
     if (!outcome) return;
+    const ended = new Set([...outcome.cascaded, outcome.ended].map((record) => record.name));
+    for (const name of ended) {
+      this.effortRowsRefused.delete(name);
+      this.effortAnswersLogged.delete(name);
+    }
+    this.keepEffortBases((name) => !ended.has(name));
     for (const record of [...outcome.cascaded, outcome.ended]) {
       this.emitTrace({
         type: 'dendrite:agent-ended',
@@ -13718,6 +13916,7 @@ export class AgentFramework {
    */
   private reconcileAgentRegistry(interrupted: AgentRecord[], unpassed: readonly AgentRecord[]): void {
     for (const outcome of this.registry.reconcile().unconfigured) this.settleEndedAgent(outcome);
+    this.keepEffortBases((name) => this.registry.has(name));
 
     const byRecipient = new Map<string, AgentRecord[]>();
     // Those whose recipient's store couldn't be read for their result: left
@@ -18792,6 +18991,7 @@ export class AgentFramework {
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
+    this.adoptEffort(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
     // The first resident declared owns default delivery. Its observe edges
@@ -18937,6 +19137,7 @@ export class AgentFramework {
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
+    this.adoptEffort(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     // Reads the shared slot through its merged view: its bound counts toward
     // a cancel's dump (residentMessageChars).
@@ -19611,6 +19812,7 @@ export class AgentFramework {
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
             if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
+              if (!agent.sendsAtBoundary(h)) return;
               midTurnInjections.push({
                 participant: h.participant,
                 content: agent.injectedAsSent(h.participant, asSent(i + first, h.content)),
@@ -20912,15 +21114,25 @@ export class AgentFramework {
         // stored rows are all marked as injections, by the compile's own
         // account of where each message came from.
         const injectionRows = new Set(templateRows.filter((m) => storedInjectionMarkOf(m.metadata)).map((m) => m.id));
-        const compiled = compiledWhole.filter((_, i) => {
+        const onlyInjections = (i: number) => {
           const source = provenance?.messages[i];
-          return !(source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId)));
+          return source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId));
+        };
+        const marks = effortMarksOf(template.getContextManager(), { provenance }, (id, err) => {
+          console.error(`[conversation] ${name}: could not read the template's row ${id}, so the seed takes it as no effort row:`, err);
         });
+        const frameworkEffortRow = (i: number) => {
+          const of = marks(i);
+          return effortOf(compiledWhole[i]!.content) !== undefined && of.length > 0 && of.every((agent) => agent !== undefined);
+        };
+        const withoutInjections = compiledWhole.filter((_, i) => !onlyInjections(i));
+        const compiled = compiledWhole.filter((_, i) => !onlyInjections(i) && !frameworkEffortRow(i));
         const withoutReasoning = withoutThinking(compiled);
         const withoutNotices = withoutPrimaryNotices(
           withoutReasoning, primaryNoticeTexts(templateRows));
         const seed = stripUnpairedToolBlocks(withoutNotices);
-        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
+        logSeedOmissions(name, template.name, compiledWhole.length - withoutInjections.length, withoutInjections.length - compiled.length,
+          compiled, withoutReasoning, withoutNotices, seed);
         // The fork's own rows: its inheritance, stored for it, and presented
         // to it when it is taken on at its registration below.
         const fork = { name, getContextManager: () => contextManager };
@@ -20933,6 +21145,7 @@ export class AgentFramework {
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
+      this.adoptEffort(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.announceAgentCreated(this.registry.register({
         ...conversationForkSpec(name, {
@@ -30640,14 +30853,15 @@ export class AgentFramework {
             const retry = retryOf(trigger);
             const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
+            const effortRetry = !hadToolCalls && this.refuseEffortRows(agent, err, compiledRequest);
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
-            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
+            if (!effortRetry && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
-            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
+            const statedWait = ownsProviderGate || effortRetry ? undefined : this.nonOwningProviderWait(agent, err, retry);
             if (statedWait === 'held') {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -30657,7 +30871,8 @@ export class AgentFramework {
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
             // The earlier failures the policy counts, which the wait's nextTry follows.
             const policyAttempt = cuts ?? attempt;
-            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
+            const action: ErrorAction = effortRetry ? { retry: true, delayMs: 0 }
+              : statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
               ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
             else this.deadlineCuts.delete(agent.name);
@@ -30694,7 +30909,7 @@ export class AgentFramework {
                   return;
                 }
                 // Marked as its turn's retry, as at the start's failure.
-                await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1);
+                await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), effortRetry ? attempt : attempt + 1);
               } else {
                 // The turn ends here, and its inference:failed doesn't say so,
                 // since a retry usually follows one: an inference:aborted

@@ -69,6 +69,7 @@ import { sameSlot, type AgentRegistry } from './dendrite/registry.js';
 import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
 import type { WindowOrdinal } from './read-marks.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
+import { isAnotherAgentsEffortRow } from './effort.js';
 import { nameAsStored } from './text-as-stored.js';
 import type { PresentationRetractReason, TraceEventInput } from './types/trace.js';
 
@@ -275,15 +276,16 @@ export function bearingOf(
   if (stamp) {
     if (stamp.ownRowOf !== undefined) {
       if (stamp.ownRowOf === reader.name) return 'own';
-      return observesInOwnSlot(reader, stamp.ownRowOf) && !isAnotherAgentsInjection(metadata, reader.name) ? 'arrival' : 'elsewhere';
+      return observesInOwnSlot(reader, stamp.ownRowOf) && !isAnotherAgentsInjection(metadata, reader.name)
+        && !isAnotherAgentsEffortRow(metadata, reader.name) ? 'arrival' : 'elsewhere';
     }
     if (!stamp.audience.includes(reader.name)) return 'elsewhere';
-    if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
+    if (isAnotherAgentsInjection(metadata, reader.name) || isAnotherAgentsEffortRow(metadata, reader.name)) return 'elsewhere';
     return reader.hidesHeld && heldFromResidents(metadata) ? 'elsewhere' : 'arrival';
   }
   if (reader.derivedAt !== undefined && row.sequence <= reader.derivedAt) return 'elsewhere';
   if (reader.hidesHeld && heldFromResidents(metadata)) return 'elsewhere';
-  if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
+  if (isAnotherAgentsInjection(metadata, reader.name) || isAnotherAgentsEffortRow(metadata, reader.name)) return 'elsewhere';
   return 'arrival';
 }
 

@@ -12,6 +12,8 @@ import { carriedBlock, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
+import { EFFORT_ROW_PARTICIPANT, effortChange, effortMarksOf, effortOf, effortRowMetadata, effortRowOf, keepsEffortRow, withTopLevelEffort, type EffortPlan, type EffortPlanner } from './effort.js';
+import type { EffortLevel } from './types/framework.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
@@ -48,7 +50,9 @@ export interface ActivationRequestOptions {
    *  (stored-injections.ts), put where that compile would render them, as
    *  the window's newest rows. A preview stores nothing, so the compile
    *  doesn't weigh them against the budget or shape them as it would the
-   *  stored rows. */
+   *  stored rows. An effort row among them goes as a start would send such
+   *  a stored row (FrameworkConfig.effort): left out while the setting is
+   *  set. */
   appendedMessages?: NormalizedMessage[];
   /** `false`: the caller retries this stream's failures itself, so membrane
    *  sends a failed round once and hands the error up. The framework's turns
@@ -58,6 +62,7 @@ export interface ActivationRequestOptions {
   /** The framework's inferenceBounds, resolved: the stream gets their phase
    *  bounds and flat bound. None when left out. */
   inferenceBounds?: InferenceBounds | null;
+  effort?: EffortPlan;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -132,6 +137,7 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  StoredMessage,
   ThinkingStrip,
 } from '@animalabs/context-manager';
 import type {
@@ -303,6 +309,11 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
     );
   }
   return { maxConsecutive: max };
+}
+
+interface OwnEffortRowWalk {
+  rows: readonly StoredMessage[];
+  newest: StoredMessage | undefined;
 }
 
 /** A stored injection's copy a compile built to send rendered (Agent.renderedInjection). */
@@ -1820,6 +1831,20 @@ export class Agent {
       && source.bodies.every((b) => this.storedMarkOf(b.messageId)?.agent === this.name);
   }
 
+  private effortRowsKept(result: CompileResult, plan: EffortPlan | undefined): boolean[] {
+    const marks = effortMarksOf(this.contextManager, result, (id, err) => {
+      console.error(`[effort] ${this.name}: could not read stored row ${id}, so it counts as no effort row of the framework's:`, err);
+    });
+    return result.messages.map((message, i) =>
+      effortOf(message.content) === undefined || keepsEffortRow(plan, marks(i)));
+  }
+
+  /** @internal For the framework's tool boundaries; not a host API. */
+  sendsAtBoundary(row: { content: ContentBlock[]; metadata?: MessageMetadata }): boolean {
+    if (effortOf(row.content) === undefined) return true;
+    return keepsEffortRow(this.effortPlanner?.('preview'), [effortRowOf(row.metadata)]);
+  }
+
   /** A stored row's injection mark, or undefined for any other row, and for
    *  one the store can't read just now, which is logged: a start doesn't fail
    *  on it (the row then counts as no stored injection). */
@@ -1961,10 +1986,11 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const binding = this.bindingCompileOptions(tools, (injections ?? [])
-      .filter((injection) => injection.position === 'system')
-      .flatMap((injection) => injection.content));
     const assemble = async (): Promise<NormalizedRequest> => {
+      const effort = this.effortPlanner?.('direct');
+      const binding = this.bindingCompileOptions(tools, (injections ?? [])
+        .filter((injection) => injection.position === 'system')
+        .flatMap((injection) => injection.content), effort);
       const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
       // What it holds of the stored injections is what the agent last saw.
@@ -1972,7 +1998,9 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
+      const kept = this.effortRowsKept(compiled, effort);
+      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(
+        compiled.messages.filter((_, i) => kept[i]))));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1983,7 +2011,7 @@ export class Agent {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
         tools: tools.length > 0 ? tools : undefined,
-        ...this.requestSettings(),
+        ...withTopLevelEffort(this.requestSettings(), effort),
         assistantParticipant: this.presentAs,
       };
     };
@@ -2143,7 +2171,7 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
-    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
+    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections, options.effort);
     const compiledResult = await this.compileWithInjections(
       budget,
       injections,
@@ -2171,6 +2199,11 @@ export class Agent {
     // Each message's place in the compile, or a preview's stand-in (null),
     // for the count of stored rows the request ends on, below.
     let origin: Array<number | null> = messages.map((_, i) => i);
+    const kept = this.effortRowsKept(compiledResult, options.effort);
+    if (kept.includes(false)) {
+      messages = messages.filter((_, i) => kept[i]);
+      origin = origin.filter((_, i) => kept[i]);
+    }
     // A request that's sent says which stored injections the agent now has in
     // view, which the next start's same-content skip reads (stored-injections.ts).
     if (!options.dryRun) this.noteRenderedInjections(compiledResult);
@@ -2181,8 +2214,8 @@ export class Agent {
       // places the injections it's given at the end, after the window.
       const sources = compiledResult.provenance?.messages;
       let at = messages.length;
-      if (sources && !messages.some((m, i) => sources[i]?.kind !== 'injection' && m.participant.toLowerCase() === 'user')) {
-        while (at > 0 && sources[at - 1]?.kind === 'injection') at--;
+      if (sources && !messages.some((m, i) => sources[origin[i]!]?.kind !== 'injection' && m.participant.toLowerCase() === 'user')) {
+        while (at > 0 && sources[origin[at - 1]!]?.kind === 'injection') at--;
       }
       origin = [...origin.slice(0, at), ...appended.map(() => null), ...origin.slice(at)];
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
@@ -2274,7 +2307,7 @@ export class Agent {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
       tools: availableTools.length > 0 ? availableTools : undefined,
-      ...this.requestSettings(),
+      ...withTopLevelEffort(this.requestSettings(), options.effort),
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
@@ -2347,6 +2380,43 @@ export class Agent {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
+  private ownEffortRowsLeftOut(plan: EffortPlan | undefined): boolean {
+    if (plan?.rows === true) return false;
+    return this.storeHoldsOwnEffortRow();
+  }
+
+  private ownEffortRowsWalked: { store?: OwnEffortRowWalk; window?: OwnEffortRowWalk } = {};
+
+  private storeHoldsOwnEffortRow(): boolean {
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return false;
+    return this.newestOwnEffortRow(cm.getAllMessages(), 'store') !== undefined;
+  }
+
+  /** @internal For the framework's effort planner; not a host API. */
+  newestOwnEffortLevel(window: readonly StoredMessage[]): EffortLevel | undefined {
+    const row = this.newestOwnEffortRow(window, 'window');
+    return row && effortOf(row.content);
+  }
+
+  private newestOwnEffortRow(rows: readonly StoredMessage[], source: 'store' | 'window'): StoredMessage | undefined {
+    const walked = this.ownEffortRowsWalked[source];
+    const appended = !!walked && walked.rows.length > 0 && rows.length >= walked.rows.length
+      && rows[walked.rows.length - 1] === walked.rows[walked.rows.length - 1];
+    let newest = appended ? walked!.newest : undefined;
+    for (let i = rows.length - 1; i >= (appended ? walked!.rows.length : 0); i--) {
+      const message = rows[i]!;
+      if (effortOf(message.content) === undefined) continue;
+      const of = effortRowOf(message.metadata);
+      if (of !== undefined && this.isOwnParticipant(of)) {
+        newest = message;
+        break;
+      }
+    }
+    this.ownEffortRowsWalked[source] = { rows, newest };
+    return newest;
+  }
+
   /**
    * What a compile the agent sends tells the context manager when the model binds its thinking
    * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
@@ -2358,7 +2428,7 @@ export class Agent {
    * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
    * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
    */
-  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
+  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[], effort: EffortPlan | undefined): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
     if (!thinkingBinding) return {};
     const { config, providerParams, prefillUserMessage } = this.requestSettings();
@@ -2371,6 +2441,7 @@ export class Agent {
         request: wireDigest({
           thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
           prefillUserMessage: prefillUserMessage ?? null,
+          ...(this.ownEffortRowsLeftOut(effort) ? { ownEffortRowsLeftOut: true } : {}),
         }),
       },
     };
@@ -2385,7 +2456,17 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
-    return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
+    const effort = this.effortPlanner?.('preview');
+    const given = options.appendedMessages?.filter((m) =>
+      effortOf(m.content) === undefined || keepsEffortRow(effort, [undefined]));
+    const appendedMessages = effort?.change
+      ? [...(given ?? []), { participant: EFFORT_ROW_PARTICIPANT, content: [effortChange(effort.change)] }]
+      : given;
+    return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, {
+      ...options,
+      ...(appendedMessages ? { appendedMessages } : {}),
+      ...(effort ? { effort } : {}),
+    })).request;
   }
 
   /** Stored rows that follow a request-only turn, memoized on the window's
@@ -2395,6 +2476,20 @@ export class Agent {
    * memo as it was. A context without a window reads the record, the same
    * array as the window's for a single slot that is still the record. */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
+  private effortPlanner?: EffortPlanner;
+  /** @internal For the framework's refusal of effort rows; not a host API. */
+  unansweredEffortRows(): MessageId[] {
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return [];
+    const rows = cm.getAllMessages();
+    const ids: MessageId[] = [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const message = rows[i]!;
+      if (message.participant === this.name) break;
+      if (effortOf(message.content) !== undefined && effortRowOf(message.metadata) === this.name) ids.push(message.id);
+    }
+    return ids;
+  }
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
     const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
@@ -2433,6 +2528,8 @@ export class Agent {
     // Retry accepted history edits before assembling a real request. Pure
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
+    const effort = this.effortPlanner?.('turn');
+    if (effort?.change) storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)], effortRowMetadata(this.name));
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
@@ -2475,7 +2572,7 @@ export class Agent {
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
     const { request, continuePrompt, compiled, binding } = await this.toolResultGuard.afterAnnotations(
-      () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
+      () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, { ...options, ...(effort ? { effort } : {}) }));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -2745,6 +2842,11 @@ export class Agent {
   setOwnRowSink(sink: ((ids: readonly MessageId[]) => void) | undefined): void {
     this.ownRowSink = sink;
     this.toolResultGuard.setOwnRowSink(sink);
+  }
+
+  /** @internal For the framework's FrameworkConfig.effort; not a host API. */
+  setEffortPlanner(planner: EffortPlanner | undefined): void {
+    this.effortPlanner = planner;
   }
 
   /** Tell the sink of own rows just stored (storeOwnRow calls it, once each add has returned). */
