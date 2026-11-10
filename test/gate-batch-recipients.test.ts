@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventGate } from '../src/gate/event-gate.js';
+import { ifYouWait } from '../src/gate/reply-judge.js';
 import type { GateEventInfo, JudgeFn, JudgeRequest } from '../src/gate/types.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-batch-recipients');
@@ -115,6 +116,21 @@ describe('a batch shows each event to the agents it is for', () => {
     const shared = gate.upcomingWakes(['agent', 'other']).filter((w) => w.kind !== 'self-wake');
     assert.deepEqual(shared.map((w) => [w.kind, (w as { agents?: unknown }).agents]), [['debounce', ['agent', 'other']], ['sleep-end', ['agent', 'other']]],
       'an untargeted event and a sleep that names no agent are for every agent asked about');
+    gate.dispose();
+  });
+
+  it("tells each agent a debounced batch's wake as certain or not for that agent alone", () => {
+    const { gate } = makeGate('certain.json', { debounce: 60_000 });
+    gate.evaluate(reminder('water the plants', ['agent']), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(reminder('dim the lamps', ['other']));
+    const wakes = gate.upcomingWakes(['agent', 'other']);
+    const byAgent = (name: string) => wakes.filter((w) => (w as { agents?: string[] }).agents?.includes(name)).map((w) => w.certain);
+    assert.deepEqual(byAgent('agent'), [false], "agent's events each carry its own write, so the batch only may wake it");
+    assert.deepEqual(byAgent('other'), [true], "other's event has no write, so the batch will wake it");
+    const now = Date.now();
+    assert.match(ifYouWait(wakes, 'agent', now), /debounced batch of 2 events/);
+    assert.match(ifYouWait(wakes, 'agent', now), /, maybe: rule/, 'the judge for agent is told maybe');
+    assert.doesNotMatch(ifYouWait(wakes, 'other', now), /maybe/, 'the judge for other is told certain');
     gate.dispose();
   });
 

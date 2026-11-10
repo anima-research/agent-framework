@@ -968,8 +968,9 @@ describe('judge rules: what waiting leaves the agent with', () => {
         gate.evaluate({ content: `notes-${i}.md`, eventType: 'workspace:modified', serverId: '', channelId: '' }, after);
       });
       const n = writes.length;
-      assert.deepStrictEqual(gate.upcomingWakes([...woken]).map((w) => [w.what, w.certain]),
-        [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]]);
+      const last = woken[woken.length - 1]!;
+      assert.deepStrictEqual(gate.upcomingWakes([...woken]).filter((w) => (w as { agents?: string[] }).agents?.includes(last)).map((w) => [w.what, w.certain]),
+        [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]], `the wake for ${last}`);
       gate.dispose();
     });
   }
@@ -1001,7 +1002,8 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
     gate.evaluate({ content: 'b.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['other'] });
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false]);
-    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [true]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => [(w as { agents?: string[] }).agents, w.certain]), [[['other'], true], [['agent'], false]],
+      'a wake per agent where certainty differs');
     gate.dispose();
   });
 
