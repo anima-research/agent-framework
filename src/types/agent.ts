@@ -51,6 +51,22 @@ export interface AgentConfig {
   strategy?: ContextStrategy;
 
   /**
+   * A membrane for this resident's memory-writing calls (compression, merges,
+   * transition summaries), when they should go to another provider or
+   * credential than the framework's membrane. The framework counts its calls
+   * as the agent's maintenance work (withdrawn under a surgery or a stop, and
+   * waited for by a surgery), but they don't wait at the agent's provider
+   * gate, and their failures hold nothing on the agent's own provider: the
+   * context manager's compression lane backs off on its own. Unset: memory
+   * writes go through the framework's membrane, as before. Needs a
+   * @animalabs/context-manager with `compressionMembrane` (createAgent
+   * refuses an older one). Covers the resident's own context only:
+   * conversation forks and ephemeral runs compress on the framework's
+   * membrane.
+   */
+  compressionMembrane?: import('@animalabs/membrane').Membrane;
+
+  /**
    * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
    * - string[]: exact tool names, including module--utility names for utilities.

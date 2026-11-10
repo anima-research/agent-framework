@@ -7105,6 +7105,30 @@ export class AgentFramework {
     look.unref?.();
   }
   /**
+   * A resident's memory-writing calls on a membrane of their own
+   * (AgentConfig.compressionMembrane): another provider or credential. They
+   * are the agent's maintenance work as auxiliary calls are: withdrawn under
+   * a surgery's hold or once stop() closes admission, and counted in flight,
+   * so a surgery waits for them. But the agent's provider gate, holds and
+   * stated waits are its own provider's: a call here neither parks behind
+   * its turns nor is refused by its held model, and a failure here records
+   * no wait and arms no hold for it. The context manager's compression lane
+   * backs off on these failures by itself.
+   */
+  private separateCompressionMembraneFor(agentName: string, base: Membrane): Membrane {
+    return this.membraneAdmitting(async (run) => {
+      this.withdrawMaintenanceUnderSurgery();
+      this.withdrawMaintenanceWhenStopping(agentName);
+      const gate = this.providerGate(agentName);
+      gate.auxiliaryInFlight++;
+      try { return await run(); }
+      finally {
+        gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
+        if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      }
+    }, base);
+  }
+  /**
    * The reply judge's calls. None waits: under the agent's holds a call is
    * refused without being made, and the agent's turn stops the judge. A call
    * that fails records the wait its provider states, if any, and holds
@@ -7222,10 +7246,13 @@ export class AgentFramework {
     const alive = [...this.openManagers].flatMap((ref) => ref.deref() ?? []);
     for (const contextManager of alive) this.closeManager(contextManager);
   }
-  /** The framework's membrane, with each complete() call passed through
-   *  `admit` along with the model it names. */
-  private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
-    const target = this.membrane as unknown as Record<PropertyKey, unknown>;
+  /** The framework's membrane (or `base`), with each complete() call passed
+   *  through `admit` along with the model it names. */
+  private membraneAdmitting(
+    admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>,
+    base: Membrane = this.membrane,
+  ): Membrane {
+    const target = base as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
       const value = Reflect.get(obj, prop, receiver);
       if (prop === 'complete' && typeof value === 'function') {
@@ -7240,11 +7267,11 @@ export class AgentFramework {
               progressTimeoutMs: wholeCallMs(bounds, typeof config?.maxTokens === 'number' ? config.maxTokens : undefined),
             }, ...args.slice(2)]
             : args;
-          return admit(() => Reflect.apply(value, this.membrane, sent) as Promise<unknown>,
+          return admit(() => Reflect.apply(value, base, sent) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
       }
-      return typeof value === 'function' ? value.bind(this.membrane) : value;
+      return typeof value === 'function' ? value.bind(base) : value;
     }}) as unknown as Membrane;
   }
   /** An acceleration hold's length: AF's own pacing (`ownMs`: its default
@@ -18769,6 +18796,10 @@ export class AgentFramework {
       // Context Manager complete() calls are auxiliary work; the primary
       // streaming agent keeps the original Membrane.
       membrane: this.auxiliaryMembraneFor(config.name),
+      // Memory writes on a provider of their own, when the agent names one.
+      ...(config.compressionMembrane
+        ? { compressionMembrane: this.separateCompressionMembraneFor(config.name, config.compressionMembrane) }
+        : {}),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
       // Tune-out (issue #77): messages stamped at ingestion as diverted
       // (metadata.tuneOut = { epochId }) never enter a resident's compiled
@@ -18789,6 +18820,16 @@ export class AgentFramework {
     });
     this.trackManager(contextManager);
     this.recordView(contextManager, options.viewFilter);
+    // A context manager without compressionMembrane would drop it and send
+    // memory writes to the agent's own provider without a word.
+    if (config.compressionMembrane
+      && (contextManager as { getCompressionMembrane?: () => unknown }).getCompressionMembrane?.() === undefined) {
+      this.closeManager(contextManager);
+      throw new Error(
+        `Agent "${config.name}": compressionMembrane needs an @animalabs/context-manager that supports it ` +
+          '(ContextManagerConfig.compressionMembrane); the installed one would send memory writes to the agent\'s own provider',
+      );
+    }
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
