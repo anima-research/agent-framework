@@ -371,6 +371,33 @@ for (const pending of [true, false]) {
   });
 }
 
+for (const { what, reason, make } of [
+  { what: 'whose preview names compression as what would make room', reason: 'wont_fit',
+    make: () => new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] })) },
+  { what: "whose preview throws another context-manager copy's UncoveredDropError while compression is pending", reason: 'uncovered_drop',
+    make: () => {
+      const throwing = new ThrowingPreviewStrategy(errorFromAnotherCopy('UncoveredDropError', 'the select drops messages no summary covers'));
+      throwing.readiness = { ready: false, description: 'Compressing chunk 0' };
+      return throwing;
+    } },
+] as const) {
+  test(`an ephemeral run, which the budget hold can't take, declines a maxStreamTokens restart ${what}, and answers on the stream it has`, async () => {
+    const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+    await withFramework(membrane, new PagesModule(), agentConfig({ triggerSources: [] }), async (framework, traces) => {
+      const { agent, contextManager } = await framework.createEphemeralAgent(
+        agentConfig({ name: 'worker', maxStreamTokens: 10, contextBudgetTokens: 8_000, physicalWindowTokens: undefined, strategy: make() }),
+      );
+      contextManager.addMessage('User', [{ type: 'text', text: 'Read the pages, please.' }]);
+      const run = await framework.runEphemeralToCompletion(agent, contextManager);
+      assert.ok(run.speech.includes('Done on the first stream.'), 'the run answered on its first stream');
+      assert.equal(membrane.streams.length, 1, 'which was its only stream');
+      assert.equal(restarted(traces).length, 0, 'no restart');
+      assert.ok(declined(traces).length > 0, 'each boundary past maxStreamTokens declined the restart');
+      for (const decline of declined(traces)) assert.equal(decline.reason, reason, `the decline says ${reason}`);
+    });
+  });
+}
+
 test("where the window projection restarts the stream, the restart is the window's, with no preview asked and no decline reported", async () => {
   const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
   const strategy = new ThrowingPreviewStrategy(new Error('the preview failed'));
