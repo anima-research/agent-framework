@@ -771,6 +771,8 @@ test("the subconscious's cancel_tuneout gets its turn's own channels from the fr
   fw.tuneOutCoordinator = {
     handleSubconsciousTool: async (_name: string, _input: unknown, own?: readonly ChannelRef[]) => { seen.push(own); return { success: true }; },
     stop: () => {},
+    // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+    stopTimers: () => {},
   };
   fw.turnRouting.set('scout', { turnId: 7, wasIn: [b], triggerChannel: b, engaged: new Set() });
   fw.dispatchToolCall('scout', { id: 'c1', name: 'cancel_tuneout', input: { channelId: 'general' } }, 7);
@@ -1651,7 +1653,7 @@ async function until(condition: () => boolean, what: string, ms = 60_000): Promi
   }
 }
 
-type ToolResult = { success: boolean; data?: unknown; error?: string };
+type ToolResult = { success: boolean; data?: unknown; error?: string; isError?: boolean };
 
 /** The tool results the framework pushes, by call id, kept from its queue. */
 function toolResults(t: TestContext, framework: AgentFramework): Map<string, ToolResult> {
@@ -1776,6 +1778,8 @@ for (const order of orders) {
       cancel: (serverId: string, channelId: string) => { entered.push(`cancel ${serverId} ${channelId}`); return { ok: true }; },
       hasReader: () => true,
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     // The tune-out's transport is another test's (tune-out-transport): here
     // it opens at once, so the answer names only the channel and settings.
@@ -1822,6 +1826,8 @@ for (const order of orders) {
       cancel: () => ({ ok: true }),
       hasReader: () => true,
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     (f.i.channelRegistry as unknown as { openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> })
       .openForTuneOut = async () => undefined;
@@ -1852,6 +1858,8 @@ for (const order of orders) {
       cancel: () => ({ ok: true }),
       hasReader: () => true,
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     reg.openForTuneOut = async () => {
       await reg.handleRegister('b', { channels: [{ id: 'solo', type: 'chat', label: 'solo', direction: 'bidirectional' }] } as never);
@@ -1877,6 +1885,8 @@ for (const order of orders) {
       enter: () => ({ ok: false, error: 'already', alreadyTunedOut: true }),
       cancel: () => ({ ok: true }),
       stop: () => {},
+      // The framework's stop quiets the coordinator's timers first (Weft's hold 2, #844).
+      stopTimers: () => {},
     };
     reg.getTuneOutState = () => ({ params, wakeCount: 0 });
     reg.tuneOutTransportOpen = () => false;
@@ -1970,4 +1980,51 @@ test("a [channels] notice names a channel whose id another server shares by its 
     .flatMap((m) => m.content.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map((c) => c.text));
   assert.equal(notices.length, 2, notices.join('\n'));
   assert.ok(notices.every((n) => n.includes('#general (b:general)')), notices.join('\n'));
+});
+
+test("a fork's channel_publish with a channelId that isn't a string is refused as one, not posted at its home or refused as foreign", async (t) => {
+  const f = await frameworkWith(t, ['a', 'b']);
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
+  const results = toolResults(t, f.framework);
+  const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
+  for (const [id, written] of [['zero', '0'], ['false', 'false'], ['number', '1437820485836259419']] as const) {
+    const input = JSON.parse(`{"channelId":${written},"content":"zz-${id}"}`) as Record<string, unknown>;
+    dispatch('scout', { id, name: 'channel_publish', input });
+    await until(() => results.has(id), `the ${id} publish`);
+    assert.equal(results.get(id)?.success, false, `${id}: ${JSON.stringify(results.get(id))}`);
+    assert.equal(results.get(id)?.isError, true, `${id}: the refusal reaches the model as an error`);
+    assert.match(results.get(id)?.error ?? '', /^Nothing changed: channel_publish's channelId must be a string, and this call gave /);
+  }
+  assert.deepEqual(f.calls.filter((c) => c.includes('publish')), [], 'nothing was published');
+});
+
+test("a fork's channel_close with a channelId or serverId that isn't a string is refused as one, and its home stays open", async (t) => {
+  const f = await frameworkWith(t, ['a', 'b']);
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
+  const results = toolResults(t, f.framework);
+  const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
+  for (const [id, text, field, gave] of [
+    ['close-zero', '{"channelId":0}', 'channelId', 'a number'],
+    ['close-false', '{"channelId":false}', 'channelId', 'a boolean'],
+    ['close-server-zero', '{"channelId":"general","serverId":0}', 'serverId', 'a number'],
+  ] as const) {
+    dispatch('scout', { id, name: 'channel_close', input: JSON.parse(text) as Record<string, unknown> });
+    await until(() => results.has(id), `the ${id} close`);
+    const result = results.get(id);
+    assert.equal(result?.isError, true, `${id}: ${JSON.stringify(result)}`);
+    assert.equal(result?.error?.startsWith(`Nothing changed: channel_close's ${field} must be a string, and this call gave ${gave}.`), true, `${id}: ${result?.error}`);
+  }
+  assert.equal(f.i.channelRegistry.closedByAgent(b), undefined, "the fork's home wasn't closed");
+});
+
+test("a fork's channel_publish naming another server's channel stays refused when its serverId isn't a string", async (t) => {
+  const f = await frameworkWith(t, ['a', 'b']);
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
+  const results = toolResults(t, f.framework);
+  const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
+  dispatch('scout', { id: 'other', name: 'channel_publish', input: { channelId: 'a:general', serverId: 0, content: 'zz-other' } });
+  await until(() => results.has('other'), 'the publish');
+  assert.equal(results.get('other')?.success, false, JSON.stringify(results.get('other')));
+  assert.match(results.get('other')?.error ?? '', /is not allowed\.$/);
+  assert.deepEqual(f.calls.filter((c) => c.includes('publish')), [], 'nothing was published');
 });

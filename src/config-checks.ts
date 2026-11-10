@@ -34,11 +34,18 @@ export function assertBooleanSetting(setting: string, value: unknown, whatItDoes
   throw new Error(`${setting} must be ${wanted} not ${kindOf(value)}: ${whatItDoes}`);
 }
 
-export function assertOneOfSetting(setting: string, value: unknown, allowed: readonly string[], whatItDoes: string): void {
-  if (value === undefined || value === null) return;
-  if (typeof value === 'string' && allowed.includes(value)) return;
-  const shown = typeof value === 'string' ? 'another string' : kindOf(value);
-  throw new Error(`${setting} must be ${allowed.map((v) => `'${v}'`).join(' or ')}, not ${shown}: ${whatItDoes}`);
+/**
+ * Refuse a setting that holds anything but one of `allowed`. null counts as
+ * not set, as leaving it out does. `whatEachDoes` ends the refusal: what each
+ * value does, and what leaving it out does. A string that isn't one of them is
+ * named as another string, never quoted.
+ */
+export function assertOneOfSetting(setting: string, value: unknown, allowed: readonly string[], whatEachDoes: string): void {
+  if (value === undefined || value === null || (typeof value === 'string' && allowed.includes(value))) return;
+  const choices = allowed.map((a) => `'${a}'`);
+  const wanted = choices.length === 1 ? choices[0] : `${choices.slice(0, -1).join(', ')} or ${choices.at(-1)}`;
+  const kind = typeof value === 'string' ? 'another string' : kindOf(value);
+  throw new Error(`${setting} must be ${wanted}, not ${kind}: ${whatEachDoes}`);
 }
 
 /**

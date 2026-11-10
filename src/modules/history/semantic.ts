@@ -15,14 +15,14 @@
  *    its creation time is the only monotonic signal). Both watermarks are
  *    kept in the module's state, which follows the store's branches, so each
  *    branch sends its own messages and summaries. A branch made at an earlier
- *    point, as an undo makes one, mints summary ids its parent already used,
- *    so a summary is keyed `sum:<id>@<created>`.
+ *    point, as a rollback makes one, mints summary ids its parent already
+ *    used, so a summary is keyed `sum:<id>@<created>`.
  *
  * What gets embedded per message: text blocks verbatim, plus the string
  * arguments of the agent's private-prose tools (think / journal / skip_reply
  * / private_note) labelled `[think] …` — that is the resident's own diary and
- * is exactly what "what did I think about X" should find. The message
- * argument of the send tools and edit_message, labelled by tool, such as
+ * is exactly what "what did I think about X" should find. The words of a
+ * speech tool's call (send-tools.ts), labelled by tool, such as
  * `[send_message] …`, since with prose routing disabled the resident speaks
  * through them.
  * tool_result payloads, other tool arguments, thinking blocks and media are
@@ -35,7 +35,7 @@
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { safeSlice } from '../../safe-slice.js';
-import { SEND_TOOLS, bareToolName } from '../../send-tools.js';
+import { speechOf } from '../../send-tools.js';
 import { storedInjectionMarkOf } from '../../stored-injections.js';
 
 export interface SemanticIndexConfig {
@@ -137,12 +137,6 @@ export interface SearchResponse {
 }
 
 const PRIVATE_PROSE_TOOLS = new Set(['think', 'journal', 'skip_reply', 'private_note']);
-/**
- * Tools whose message argument is what the resident said: the send tools,
- * and edit_message, whose argument is the new text of a message it sent.
- * With prose routing disabled the resident speaks through these.
- */
-const SPEECH_TOOLS = new Set([...SEND_TOOLS, 'edit_message']);
 
 /**
  * The semantic index service's failure, said of the service alone: it didn't
@@ -302,8 +296,10 @@ function isHit(hit: unknown): boolean {
   return isObject(hit) && typeof (hit as { id?: unknown }).id === 'string';
 }
 
+export const ERROR_MARK = ', error';
+
 /** Text to embed for one message, or '' when there is nothing worth indexing. */
-export function messageIndexText(msg: StoredMessage, includePrivateTools = true): string {
+export function messageIndexText(msg: StoredMessage, includePrivateTools = true, failed: ReadonlySet<string> = new Set()): string {
   const parts: string[] = [];
   for (const block of msg.content as ContentBlock[]) {
     if (block.type === 'text' && typeof block.text === 'string') {
@@ -313,12 +309,9 @@ export function messageIndexText(msg: StoredMessage, includePrivateTools = true)
       for (const v of Object.values(input)) {
         if (typeof v === 'string' && v.trim().length > 0) parts.push(`[${block.name}] ${v}`);
       }
-    } else if (block.type === 'tool_use' && SPEECH_TOOLS.has(bareToolName(block.name))) {
-      // Only the message: the other arguments are ids, topics and names.
-      // channel_publish still takes `text` from older callers.
-      const input = (block as { input?: { content?: unknown; text?: unknown } }).input ?? {};
-      const v = input.content ?? input.text;
-      if (typeof v === 'string' && v.trim().length > 0) parts.push(`[${bareToolName(block.name)}] ${v}`);
+    } else if (block.type === 'tool_use') {
+      const said = speechOf(block.name, (block as { input?: unknown }).input);
+      if (said) parts.push(`[${said.tool}${failed.has(block.id) ? ERROR_MARK : ''}] ${said.words}`);
     }
   }
   return parts.join('\n').trim();
@@ -705,9 +698,10 @@ export class SemanticIndexer {
           if (budget <= 0) break;
           this.editedIds.delete(id);
           const m = this.cm.getMessage(id as never);
-          // Not on the current branch (e.g. /undo after the edit): drop it,
-          // never delete — /redo brings the message back and the time walk
-          // will not revisit it. Search-time branch checks hide it meanwhile.
+          // Not on the current branch (e.g. a rollback after the edit): drop
+          // it, never delete — a switch back to the branch that holds it
+          // brings the message back and the time walk will not revisit it.
+          // Search-time branch checks hide it meanwhile.
           if (!m) continue;
           edited.push(id); budget--;
           const item = messageToItem(m, this.cfg);
@@ -886,14 +880,14 @@ export class SemanticIndexer {
       // The current branch may then have items this pass didn't send, and
       // old items a failed delete left are still to go.
       if (left || oldItemsOwed) report.more = true;
-      this.consecutiveFailures = 0; this.lastError = named(notStats?.message ?? null, ...phaseErrors); this.lastSyncAt = Date.now();
+      this.consecutiveFailures = 0; this.lastError = named([notStats?.message ?? null, ...phaseErrors]); this.lastSyncAt = Date.now();
       return report;
     } catch (e) {
       this.consecutiveFailures++;
       const delay = Math.min(15 * 60_000, 5_000 * 2 ** Math.min(8, this.consecutiveFailures - 1));
       this.backoffUntil = Date.now() + delay;
       const failure = e instanceof Error ? e.message : String(e);
-      this.lastError = named(failure, notStats?.message ?? null, ...phaseErrors);
+      this.lastError = named([failure, notStats?.message ?? null, ...phaseErrors]);
       this.warn(`sync failed (${this.consecutiveFailures}×, retry in ${Math.round(delay / 1000)}s): ${failure}`);
       report.more = true;
       return report;
@@ -902,6 +896,6 @@ export class SemanticIndexer {
 }
 
 /** Each failure a sync pass met, once, in the order given, for its lastError: null if none. */
-function named(...failures: (string | null)[]): string | null {
+function named(failures: (string | null)[]): string | null {
   return [...new Set(failures.filter((f): f is string => f !== null))].join('; ') || null;
 }

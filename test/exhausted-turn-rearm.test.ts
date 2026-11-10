@@ -390,7 +390,7 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
     const stalled = await stalledByMembrane(t);
     const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled), failsAt);
     assert.deepEqual(openingOf.get(stalled)?.map((e) => (e as { type: string }).type), [],
-      "membrane 0.8.0's stalled stream emits nothing before its cut, and the stall replays that");
+      "membrane 0.8.0's, 0.9.0's, 0.10.0's and 0.10.1's stalled streams emit nothing before their cut, and the stall replays that");
     const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 300, 900] });
     stderr.length = 0;
     r.say('zz-question');
@@ -1477,4 +1477,36 @@ test("a job's turn aborted from outside ends its run without clearing its failur
   await ran(third, "the third run to fail");
   const failed = stderr.filter((line) => line.startsWith('[inference-failed] agent=job consecutive='));
   assert.deepEqual(failed.map((line) => line.match(/consecutive=(\d+)/)![1]), ['1', '2'], 'the abort is neither an end from outside nor a failure');
+});
+
+test("a provider hold that folds a wake into an equal re-arm keeps it re-armed only if both were, as the scheduler's merge does", async (t) => {
+  const membrane = new ScriptedMembrane(() => serverError, 'event');
+  const r = await resident(t, membrane);
+  const internal = r.fw as unknown as {
+    providerAccelerationCooldowns: Map<string, { heldRequests: Array<Record<string | symbol, unknown>> }>;
+    holdRequest(held: unknown[], request: unknown): void;
+  };
+  const rearmedKey = (request: Record<string | symbol, unknown>) =>
+    Object.getOwnPropertySymbols(request).find((key) => key.description === 'rearmed' && request[key] === true);
+  const held = () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests ?? [];
+  r.say('zz-question');
+  await waitFor(() => held().some((request) => rearmedKey(request) !== undefined), 'a re-arm to be held');
+  const rearm = held().find((request) => rearmedKey(request) !== undefined)!;
+  const key = rearmedKey(rearm)!;
+  const wake: Record<string | symbol, unknown> = { ...rearm };
+  delete wake[key];
+  const marked = (): Record<string | symbol, unknown> => ({ ...rearm, [key]: true });
+  const unmarked = (): Record<string | symbol, unknown> => ({ ...wake });
+  const before = held().length;
+  internal.holdRequest(held(), wake);
+  assert.equal(held().length, before, 'premise: the hold folds the equal wake into the re-arm');
+  assert.equal(rearm[key], undefined, "not re-armed, since the wake folded into it wasn't");
+  const both = [marked()];
+  internal.holdRequest(both, marked());
+  assert.equal(both.length, 1, 'premise: the hold folds the equal re-arm into the re-arm');
+  assert.equal(both[0]![key], true, 'still re-armed, since both were');
+  const second = [unmarked()];
+  internal.holdRequest(second, marked());
+  assert.equal(second.length, 1, 'premise: the hold folds the equal re-arm into the wake');
+  assert.equal(second[0]![key], undefined, "not re-armed, since the wake it folded into wasn't");
 });

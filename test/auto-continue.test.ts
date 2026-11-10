@@ -612,7 +612,11 @@ describe('autoContinue', () => {
     }
   });
 
-  it("waits for another resident's turn before writing its row into the shared slot", async () => {
+  // Ported for #291: the continuation's row is its agent's own row, in no
+  // window but its own and an observer's (this host has none), so another
+  // resident's live turn holds nothing. This test once had the continuation
+  // wait for that turn before writing its row.
+  it("doesn't wait for another resident's turn: its row is its own, in no other resident's window", async () => {
     const framework = await createFramework(true, 'locus', undefined, [{ name: 'other', model: 'test-model', systemPrompt: 'Another resident.' }]);
     stubRegistry(framework);
     const internals = framework as unknown as {
@@ -620,19 +624,25 @@ describe('autoContinue', () => {
       processInferenceRequests(): Promise<void>;
       pendingRequests: InferenceRequest[];
       activeTurnTokens: Map<string, number>;
+      presentAtEndOf(agent: unknown): void;
     };
     const triggers = script(framework, [skipReply()]);
     try {
       internals.autoContinueAfterTurn(framework.getAgent('assistant')!, {}, undefined, 'end_turn');
       internals.activeTurnTokens.set('other', 424242);
-      await internals.processInferenceRequests();
-      assert.equal(triggers.length, 0, 'no turn while the other resident\'s turn is alive');
-      assert.deepEqual(notices(framework), [], 'and no row in the middle of it');
-      assert.equal(internals.pendingRequests.filter((r) => r.reason === 'auto-continue').length, 1, 'the continuation waits');
-      internals.activeTurnTokens.delete('other');
       await within(framework.runUntilIdle(), 'the continuation');
-      assert.equal(triggers.length, 1);
+      assert.equal(triggers.length, 1, "the turn runs while the other resident's turn is alive");
       assert.deepEqual(notices(framework), [row(false)]);
+      const rowId = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'auto-continue')!.id;
+      assert.notEqual(framework.getAgent('assistant')!.getContextManager().ordinalOf(rowId), undefined, "in the agent's window");
+      assert.equal(framework.getAgent('other')!.getContextManager().ordinalOf(rowId), undefined, "in no other resident's");
+      // other's live turn would keep an arrival out until its next point, so
+      // end it and run that point: the row isn't other's arrival either.
+      internals.activeTurnTokens.delete('other');
+      internals.presentAtEndOf(framework.getAgent('other')!);
+      assert.equal(framework.getAgent('other')!.getContextManager().ordinalOf(rowId), undefined,
+        "nor once other's turn has ended and its point has run");
     } finally {
       internals.activeTurnTokens.delete('other');
       await framework.stop();
@@ -831,6 +841,65 @@ describe('autoContinue', () => {
     } finally {
       await framework.stop();
     }
+  });
+});
+
+describe("a continuation of a turn its batch gave no channel", () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'batch-continuation-test-'));
+    membrane = new MockMembrane();
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const batchChannels = [{ serverId: 'stub', channelId: 'world:commons' }];
+
+  async function run(proseRouting: AgentConfig['proseRouting'], autoContinue: AgentConfig['autoContinue'], first: NormalizedResponse): Promise<InferenceRequest[]> {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting, autoContinue }],
+      modules: [],
+    });
+    stubRegistry(framework);
+    (framework as unknown as { channelRegistry: { resolveLocus: () => null } }).channelRegistry.resolveLocus = () => null;
+    const triggers: InferenceRequest[] = [];
+    const internals = framework as unknown as { activeTurnTriggers: Map<string, InferenceRequest>; pendingRequests: InferenceRequest[] };
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:started') return;
+      triggers.push(internals.activeTurnTriggers.get('assistant') ?? ({ reason: 'unknown' } as InferenceRequest));
+      membrane.pushResponse(triggers.length === 1 ? first : skipReply(`stray-${triggers.length}`));
+    });
+    try {
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: batchChannels });
+      await within(framework.runUntilIdle(), 'the run');
+    } finally {
+      await framework.stop();
+    }
+    return triggers;
+  }
+
+  it("an autoContinue continuation keeps the batch's channels", async () => {
+    const triggers = await run('locus', true, prose('First thought.'));
+    assert.equal(triggers[1]?.reason, 'auto-continue');
+    assert.deepEqual(triggers[1]?.wakeChannels, batchChannels);
+  });
+
+  it("a ' !' continuation keeps the batch's channels", async () => {
+    const triggers = await run('explicit', false, prose('>>#alpha ! step one'));
+    assert.equal(triggers[1]?.reason, 'prose-continuation');
+    assert.deepEqual(triggers[1]?.wakeChannels, batchChannels);
+  });
+
+  it("a bounce's wake keeps the batch's channels", async () => {
+    const triggers = await run('explicit', false, prose('>>#nowhere words'));
+    assert.equal(triggers[1]?.reason, 'prose-bounce');
+    assert.deepEqual(triggers[1]?.wakeChannels, batchChannels);
   });
 });
 
