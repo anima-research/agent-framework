@@ -1270,13 +1270,12 @@ function isNoFoldPlanRefusal(error: unknown): boolean {
 }
 
 interface RestartDecline {
-  reason: 'wont_fit' | 'uncovered_drop' | 'preview_error';
+  reason: 'wont_fit' | 'uncovered_drop';
   finalTokens?: number;
   budgetTokens?: number;
   clearedBy?: readonly string[];
   streamId: number;
   key?: string;
-  failure?: string;
 }
 
 /**
@@ -13958,7 +13957,7 @@ export class AgentFramework {
       const remembered = this.restartDeclines.get(agent);
       if (remembered?.streamId === agent.streamId && remembered.key === key) return { decline: remembered, previewed: false };
       const preview = agent.previewCompile(excludePins);
-      if (preview !== null && !preview.fits) {
+      if (preview !== null && !preview.fits && !preview.clearedBy?.includes('compression')) {
         decline = {
           reason: 'wont_fit', finalTokens: preview.finalTokens, budgetTokens: preview.budgetTokens,
           ...(preview.clearedBy !== undefined ? { clearedBy: preview.clearedBy } : {}),
@@ -13966,10 +13965,10 @@ export class AgentFramework {
         };
       }
     } catch (error) {
-      if (!isNoFoldPlanRefusal(error)) {
-        const uncovered = error instanceof UncoveredDropError || (error instanceof Error && error.name === 'UncoveredDropError');
-        decline = uncovered ? { reason: 'uncovered_drop', streamId: agent.streamId }
-          : { reason: 'preview_error', streamId: agent.streamId, failure: describeFailureWithFrames(error) };
+      if (error instanceof UncoveredDropError || (error instanceof Error && error.name === 'UncoveredDropError')) {
+        if (!this.compressionPending(agent)) decline = { reason: 'uncovered_drop', streamId: agent.streamId };
+      } else if (!isNoFoldPlanRefusal(error)) {
+        console.error(`[context-budget] ${agent.name}: the restart's preview failed, so the maxStreamTokens restart goes ahead: ${describeFailureWithFrames(error)}`);
       }
     }
     if (decline) this.restartDeclines.set(agent, decline);
@@ -19759,9 +19758,6 @@ export class AgentFramework {
           const budgetRestart = overStreamBudget && (overPhysical || declined === undefined);
           if (declined) {
             const { decline, previewed } = declined;
-            if (decline.failure !== undefined) {
-              console.error(`[context-budget] ${agent.name}: the restart's preview failed, so the maxStreamTokens restart is declined: ${decline.failure}`);
-            }
             this.emitTrace({
               type: 'inference:restart_declined',
               agentName: agent.name,
