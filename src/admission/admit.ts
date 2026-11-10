@@ -54,6 +54,7 @@ export interface InboundEnvelope {
   /** What the gate sees: the text and the metadata shape it has always matched on. */
   gateContent: string;
   gateMetadata: Record<string, unknown>;
+  silentHeartbeat?: { eventId: string; serverId: string };
 }
 
 export interface HoldRecord {

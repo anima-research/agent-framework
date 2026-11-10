@@ -157,6 +157,7 @@ interface PendingEvent {
   routeChannelId?: string;
   /** GateEventInfo.recipients. */
   recipients?: readonly string[];
+  silentHeartbeat?: { eventId: string; serverId: string };
   after?: WritePlacement;
   replyTo?: { serverId: string; channelId: string };
   /** The event's own placement where withoutWrite took its write out of the
@@ -238,6 +239,11 @@ export interface WakeProvenance {
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /** On the wake a batch's silent heartbeat ticks give each agent they
+   *  reach, as the last of them that reached it: the framework makes the
+   *  wake a silent heartbeat, prose suppressed, as the tick's own wake is
+   *  when the gate lets it through at once. */
+  silentHeartbeat?: { eventId: string; serverId: string };
   /** The writes a batched wake is for: the message of its own of each event
    *  that has one, as `evaluate` was given it, and the batch's `[Gate: …]` line where one was
    *  written for events with no message of their own. Present only when
@@ -4113,6 +4119,7 @@ export class EventGate {
       ...(isSystemNotice(info.tags) && !info.folds ? { systemNotice: true as const } : {}),
       routeChannelId,
       ...(info.recipients !== undefined ? { recipients: [...info.recipients] } : {}),
+      ...(info.silentHeartbeat !== undefined ? { silentHeartbeat: { ...info.silentHeartbeat } } : {}),
       ...(after ? { after, ...(replyTo ? { replyTo } : {}) } : {}),
     };
 
@@ -4206,27 +4213,40 @@ export class EventGate {
       });
     }
     if (events.length === 0) return;
+    const ticks = events.filter((e) => e.silentHeartbeat !== undefined);
+    const said = events.filter((e) => e.silentHeartbeat === undefined);
+    const reached = (some: PendingEvent[]): Set<string> => {
+      const names = new Set(some.flatMap((e) => e.recipients ?? []));
+      if (some.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) names.add(name);
+      return names;
+    };
+    const woken = reached(said);
+    const ticked = [...reached(ticks)];
     // Who each delivery woke, so that a throw after a wake is told as a
     // delivery in part (PartialDelivery), the batch dropped only for those
     // it didn't wake.
     const woke: string[] = [];
-    if (events.every((e) => e.recipients === undefined)) {
-      const names = this.getAgentNamesFn();
-      deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
-      return;
+    const groups = new Map<string, { agents: string[]; events: PendingEvent[]; audience?: string[] }>();
+    if (said.length > 0 && said.every((e) => e.recipients === undefined)) {
+      groups.set('', { agents: [...woken], events: said });
+    } else {
+      for (const agentName of woken) {
+        const seen = said.filter((e) => e.recipients === undefined || e.recipients.includes(agentName));
+        const key = seen.map((e) => said.indexOf(e)).join(',');
+        const group = groups.get(key) ?? { agents: [], events: seen, audience: [] };
+        group.agents.push(agentName);
+        group.audience!.push(agentName);
+        groups.set(key, group);
+      }
     }
-    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
-    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
-    const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
-    for (const agentName of woken) {
-      const seen = events.filter((e) => e.recipients === undefined || e.recipients.includes(agentName));
-      const key = seen.map((e) => events.indexOf(e)).join(',');
-      const group = groups.get(key) ?? { agents: [], events: seen };
-      group.agents.push(agentName);
-      groups.set(key, group);
-    }
-    deliveredTracking(woke, [...woken], () => {
-      for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents, woke);
+    deliveredTracking(woke, [...new Set([...woken, ...ticked])], () => {
+      for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.audience, woke);
+      for (const agentName of ticked) {
+        const tick = ticks.filter((e) => reached([e]).has(agentName)).pop()!;
+        const tickWake: MarkedProvenance = { silentHeartbeat: tick.silentHeartbeat, [BATCH_LINE_ROWS]: [] };
+        this.requestInferenceFn(agentName, 'heartbeat', 'heartbeat', tickWake);
+        woke.push(agentName);
+      }
     });
   }
 

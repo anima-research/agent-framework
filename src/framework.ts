@@ -5742,6 +5742,7 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
+            ...(provenance?.silentHeartbeat ? { suppressProse: true, silentHeartbeat: provenance.silentHeartbeat } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
@@ -7005,6 +7006,10 @@ export class AgentFramework {
         ...(wake.silent ? { silent: true } : {}),
       },
       tags: [],
+      ...(wake.silent ? {
+        recipients: this.heartbeatTargets(),
+        silentHeartbeat: { eventId: wake.eventId, serverId: 'heartbeat' },
+      } : {}),
     };
   }
 
@@ -22571,6 +22576,7 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(event.tags ? { tags: event.tags } : {}),
       },
+      ...(silentHeartbeat ? { silentHeartbeat: { eventId: event.eventId, serverId: event.serverId } } : {}),
     }, event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}, placement);
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
@@ -41735,6 +41741,11 @@ export class AgentFramework {
       metadata: e.gateMetadata,
       tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
       ...(e.targetAgents !== undefined ? { recipients: e.targetAgents.filter((name) => this.agents.has(name)) } : {}),
+      ...(e.silentHeartbeat !== undefined ? {
+        silentHeartbeat: e.silentHeartbeat,
+        ...(e.targetAgents === undefined
+          ? { recipients: this.registry.untargetedRecipients().filter((name) => this.agents.has(name)) } : {}),
+      } : {}),
       ...(asked ? { suppressionAsked: true } : {}),
       ...(opts.folds ? { folds: true as const } : {}),
     });
