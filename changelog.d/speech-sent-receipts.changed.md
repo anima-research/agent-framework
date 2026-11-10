@@ -80,3 +80,9 @@
   post what you wrote before your tool calls in one or more of the rounds just
   above. …", where it read "… Nothing you wrote before your tool calls in
   the rounds just above was posted. …".
+- **Residents:** the turn an operator's `/unstick` queues carries the
+  channels and opening messages of the agent's latest turn, as the rewind
+  retries it starts do, where it carried none. So when an ambient batch woke
+  the stuck turn, the notice for the unstick's speech names the channels that
+  batch came from, where it said "this turn came from no channel, and it had
+  no home or recent channel to reply in".
