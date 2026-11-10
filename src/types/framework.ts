@@ -393,10 +393,9 @@ export interface FrameworkConfig {
    * without effort rows from then on, until the agent ends or the process
    * does. A refusal after a tool round goes to the error policy instead.
    * `DefaultErrorPolicy` doesn't retry it, so the turn ends there. A host
-   * policy that retries starts the turn's next stream. Either way, the
-   * agent's next first request is refused once, and goes again at once
-   * without rows. Such a refusal needs a request after a tool round that
-   * carries a row its stream's first request didn't.
+   * policy that retries starts the turn's next stream. Either way, the next
+   * stream's first request carries the agent's stored rows. If that request
+   * is refused too, it goes again at once without them.
    *
    * A preview shows the row a start would write, unstored. The direct API
    * (`Agent.runInference`) sends what a turn's request would carry and writes
