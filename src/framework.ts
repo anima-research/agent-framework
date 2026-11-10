@@ -18930,12 +18930,12 @@ export class AgentFramework {
     const setAside = this.setAsideThinkingSignedOverChanges(agent, stream);
     const thinking = setAside.ids.length === 0 ? ''
       : setAside.noted ? `, and sets aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change`
-      : `; the note setting aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change didn't land, so each of its requests until it's built again carries that thinking, which a model that binds it refuses`;
+      : `; the note setting aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change didn't land, so, where its head didn't move with the refusal (a move sets every earlier reply's thinking aside), its requests can carry that thinking, which a model that binds it refuses, until those replies leave its window or it's built again`;
     console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again, by a restart of the host or by creating the agent again${thinking}; for a model that refuses system changes, set toolDeclarations: 'head' on it: ${error.message}`);
     if (!recognised || (setAside.ids.length > 0 && !setAside.noted)) {
       this.opsAlert('head-resend', agent.name,
-        `${recognised ? 'membrane refused a system change' : "a 400 membrane doesn't recognise as a refused system change ended a request that carried one"}, so it goes again on the agent's head${setAside.ids.length > 0 ? thinking : this.thinkingSetAside(agent, 'which sets aside the thinking the request held')}.${recognised ? '' : ' The 400 may not be about the change.'} The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache. A restart of the host, or creating the agent again, has it declare changes again: ${error.message}`,
-        { data: { ...(recognised ? {} : { httpStatus: 400 }), thinkingSetAside: setAside.ids.length, ...(setAside.ids.length > 0 ? { noted: setAside.noted } : {}) } });
+        `${recognised ? 'membrane refused a system change' : "a 400 membrane doesn't recognise as a refused system change ended a request that carried one"}, so it goes again on the agent's head${setAside.ids.length > 0 ? thinking : this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}.${recognised ? '' : ' The 400 may not be about the change.'} The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache. A restart of the host, or creating the agent again, has it declare changes again: ${error.message}`,
+        { data: { ...(recognised ? {} : { httpStatus: 400 }), ...(setAside.ids.length > 0 ? { repliesSignedOverChanges: setAside.ids.length, noted: setAside.noted } : {}) } });
     }
     this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message, thinkingSetAside: setAside.noted ? setAside.ids.length : 0 });
     return true;

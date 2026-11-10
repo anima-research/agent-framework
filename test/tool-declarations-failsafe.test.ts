@@ -239,7 +239,7 @@ describe("toolDeclarations' fail-safe", () => {
       const alert = alerts[0] as { message: string; data?: { httpStatus?: number } };
       assert.match(alert.message, /role system not accepted here/, 'quoting the 400');
       assert.match(alert.message, /keeps to its head until it's built again/);
-      assert.equal(/sets aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it can be paid`);
+      assert.equal(/can set aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it can be paid`);
       assert.equal(alert.data?.httpStatus, 400);
     }
     const recognised = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(true) : undefined) });
@@ -432,14 +432,24 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
   async function refusedAtALaterRound(noteLands: boolean) {
     const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-rounds-'));
     const membrane = new MockMembrane();
+    const outcomes: string[] = [];
+    const carriesMisbound = (request: NormalizedRequest) => request.messages.some((m) => m.content.some((b) => (b as { signature?: string }).signature === 'signed-over-the-change'));
     membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
       const n = membrane.calls.push(request) - 1;
-      if (n !== 1) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
-      return new RefusedTwoBoundariesOn([
-        createMockResponse([{ type: 'tool_use', id: 'look-1', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
-        createMockResponse([{ type: 'thinking', thinking: 'after the change', signature: 's2' } as ContentBlock, { type: 'tool_use', id: 'look-2', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
-        createMockResponse([{ type: 'text', text: 'done' }]),
-      ], refusal(true));
+      if (n === 1) {
+        outcomes.push('refused at a later round');
+        return new RefusedTwoBoundariesOn([
+          createMockResponse([{ type: 'thinking', thinking: 'before the change', signature: 'signed-before' } as ContentBlock, { type: 'tool_use', id: 'look-1', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
+          createMockResponse([{ type: 'thinking', thinking: 'after the change', signature: 'signed-over-the-change' } as ContentBlock, { type: 'tool_use', id: 'look-2', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
+          createMockResponse([{ type: 'text', text: 'done' }]),
+        ], refusal(true));
+      }
+      if (carriesMisbound(request)) {
+        outcomes.push('refused: thinking signed over the change');
+        return new RefusedStream(Object.assign(new MembraneError({ type: 'invalid_request', retryable: false, message: 'thinking signature not valid for this prefix', rawError: { status: 400 } }), { httpStatus: 400 }));
+      }
+      outcomes.push('answered');
+      return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
     };
     const proto = ContextManager.prototype as { noteThinkingDropped(ids: readonly string[], compileId: string): boolean };
     const note = proto.noteThinkingDropped;
@@ -453,13 +463,14 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     const traces: TraceEvent[] = [];
     framework.onTrace((event) => { traces.push(event); });
     framework.start();
-    const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted').length;
+    const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted' || t.type === 'inference:failed').length;
     try {
-      for (const [text, n] of [['first', 1], ['second', 2]] as const) {
+      for (const [text, n] of [['first', 1], ['second', 2], ['third', 3]] as const) {
+        const before = ended();
         framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
-        assert.ok(await pollUntil(() => ended() === n), `turn ${n} ended`);
+        assert.ok(await pollUntil(() => ended() > before), `turn ${n} ended`);
       }
-      return traces;
+      return { traces, outcomes };
     } finally {
       proto.noteThinkingDropped = note;
       await framework.stop();
@@ -468,18 +479,20 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
   }
 
   it("sets aside the thinking of a later round's reply after a change handed at a boundary, when a round after it is refused", async () => {
-    const traces = await refusedAtALaterRound(true);
+    const { traces, outcomes } = await refusedAtALaterRound(true);
     const resend = traces.filter((t) => t.type === 'head:resend');
     assert.equal(resend.length, 1);
+    assert.deepEqual(outcomes, ['answered', 'refused at a later round', 'answered', 'answered'], 'the resend and the next turn go out without that thinking');
     assert.equal((resend[0] as { thinkingSetAside: number }).thinkingSetAside, 1, "the second round's reply, signed after the change the boundary handed");
   });
 
   it("says, when its note can't land, that each request until it's built again carries thinking a binding model refuses", async () => {
-    const traces = await refusedAtALaterRound(false);
+    const { traces, outcomes } = await refusedAtALaterRound(false);
+    assert.deepEqual(outcomes.slice(2), ['refused: thinking signed over the change', 'refused: thinking signed over the change'], 'the resend and the next turn carry that thinking, and are refused');
     assert.equal((traces.find((t) => t.type === 'head:resend') as { thinkingSetAside: number }).thinkingSetAside, 0, 'nothing set aside');
     const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string; data?: { noted?: boolean } }>;
     assert.equal(alerts.length, 1, 'an operator line, though the refusal was recognised');
-    assert.match(alerts[0]!.message, /didn't land, so each of its requests until it's built again carries that thinking, which a model that binds it refuses/);
+    assert.match(alerts[0]!.message, /didn't land, so, where its head didn't move with the refusal \(a move sets every earlier reply's thinking aside\), its requests can carry that thinking, which a model that binds it refuses, until those replies leave its window or it's built again/);
     assert.equal(alerts[0]!.data?.noted, false);
   });
 
