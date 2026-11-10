@@ -632,6 +632,34 @@ test('a wake while the agent waits starts its turn at once, with the re-armed tr
   assert.equal(r.admission().providerAdmission.heldRequests, 0, 'nothing is left held');
 });
 
+for (const silent of [false, true]) {
+  test(`a ${silent ? 'silent ' : ''}start that throws before its stream, at the turn's checkpoint, is a failed last turn the judge is told of`, async (t) => {
+    const membrane = new ScriptedMembrane(() => undefined);
+    const r = await resident(t, membrane);
+    const internal = r.fw as unknown as {
+      recordTurnCheckpoint(agentName: string): void;
+      failedLastTurnFor(agentName: string): { at: number } | undefined;
+      activeTurnTriggers: Map<string, { suppressProse?: boolean }>;
+    };
+    const record = internal.recordTurnCheckpoint.bind(r.fw);
+    let suppressed: boolean | undefined;
+    internal.recordTurnCheckpoint = () => {
+      internal.recordTurnCheckpoint = record;
+      suppressed = internal.activeTurnTriggers.get('resident')?.suppressProse;
+      throw new Error('zz checkpoint refused');
+    };
+    const before = Date.now();
+    if (silent) queue(r, { reason: 'zz-silent-tick', suppressProse: true });
+    else r.say('zz-question');
+    await waitFor(() => internal.failedLastTurnFor('resident') !== undefined, 'the judge to be told the last turn failed');
+    const failed = internal.failedLastTurnFor('resident')!;
+    assert.ok(failed.at >= before && failed.at <= Date.now(), String(failed.at - before));
+    assert.equal(suppressed === true, silent, "premise: the failing start's trigger kept suppressProse when it had it");
+    assert.equal(membrane.sends.length, 0, 'premise: the start threw before sending anything');
+    assert.equal(r.count('inference:exhausted'), 0, 'premise: no inference failed');
+  });
+}
+
 for (const said of [false, true]) {
   test(`the turn a wake starts while the agent waits is the wake's own, with the error policy's retries; the next re-arm ${said ? 'starts the count again, since a message was said' : 'follows it'}`, async (t) => {
     const membrane = new ScriptedMembrane((n) => (n <= 6 ? serverError : undefined));
@@ -670,9 +698,12 @@ test("a judge rule's wake while the agent waits is judged as usual, and the judg
   const told = [JSON.stringify(request.system ?? ''), ...request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '')].join('\n');
   const when = /- in (\d+) s: a turn whose retries ran out, sent again \(1 of 1\)/.exec(told);
   assert.ok(when, 'the judge is told of the re-arm');
+  const line = /resident's last turn, \d+s ago, failed and may not have answered all of what woke it\. A wake for resident is held, due to be let go in (\d+) s\./.exec(told);
+  assert.ok(line, 'and that the failed turn is held, not that nothing runs it again');
   const leastLeft = Math.floor((heldUntil - membrane.judgedAt[1]!) / 1000);
   const mostLeft = Math.ceil((heldUntil - saidAt) / 1000);
   assert.ok(Number(when[1]) >= leastLeft && Number(when[1]) <= mostLeft, `and when it comes: in ${when[1]} s, between ${leastLeft} and ${mostLeft}`);
+  assert.ok(Number(line[1]) >= leastLeft && Number(line[1]) <= mostLeft, `and the line's time agrees: in ${line[1]} s, between ${leastLeft} and ${mostLeft}`);
 });
 
 test("a message stored in the residents' shared slot starts the count again for each resident that reads it", async (t) => {

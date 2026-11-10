@@ -73,6 +73,36 @@ describe('ProviderWaits', () => {
     } finally { store.close(); }
   }));
 
+  it('reads a wait as of the time it is given, so a caller that states its time left reads the clock once', () => withStoreDir((path) => {
+    const store = JsStore.openOrCreate({ path });
+    try {
+      const time = clock();
+      const waits = new ProviderWaits(store, { now: time.now, ...quiet });
+      const until = time.now() + 60_000;
+      waits.set('ada', 'zz-model', 60_000, 'zz 429');
+      time.advance(60_000);
+      assert.equal(waits.active('ada', 'zz-model'), undefined, 'premise: over by the store\'s clock');
+      assert.equal(waits.active('ada', 'zz-model', until - 1)?.until, until, 'binding a millisecond before its end');
+      assert.equal(waits.active('ada', 'zz-model', until), undefined);
+    } finally { store.close(); }
+  }));
+
+  it('reads its own clock after it retries the recorded waits, so a wait that ends while the retry runs is over', () => withStoreDir((path) => {
+    const store = JsStore.openOrCreate({ path });
+    try {
+      const time = clock();
+      const waits = new ProviderWaits(store, { now: time.now, ...quiet });
+      waits.set('ada', 'zz-model', 100, 'zz 429');
+      const internal = waits as unknown as { retry(): void };
+      const retry = internal.retry.bind(waits);
+      internal.retry = () => {
+        retry();
+        time.advance(200);
+      };
+      assert.equal(waits.active('ada', 'zz-model'), undefined);
+    } finally { store.close(); }
+  }));
+
   it('never lets a later, shorter wait shorten an outstanding one; indefinite stays indefinite', () => withStoreDir((path) => {
     const store = JsStore.openOrCreate({ path });
     try {
@@ -815,6 +845,41 @@ test('auxiliary admission: the same model is refused without a call; another mod
 
       await aux.complete(auxRequest('zz-compression-model'));
       assert.equal(membrane.auxiliary.length, 1, 'a model the provider did not limit keeps working');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('auxiliary admission: the wait a refused call states is the one its single clock reading found binding', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, 60_000);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      const waits = internal.providerWaits;
+      const until = waits.active('resident', 'zz-model')?.until;
+      assert.ok(typeof until === 'number', 'premise: a wait with an end binds the model');
+      const active = waits.active.bind(waits);
+      const readAt: Array<number | undefined> = [];
+      (waits as unknown as { active: (agent: string, model: string, at?: number) => unknown }).active = (agent, model, at) => {
+        readAt.push(at);
+        return active(agent, model, at);
+      };
+      const realNow = Date.now;
+      let clock = realNow();
+      Date.now = () => (clock += 7);
+      let refused: unknown;
+      try {
+        refused = await internal.auxiliaryMembraneFor('resident').complete(auxRequest('zz-model')).then(() => undefined, (e: unknown) => e);
+      } finally {
+        Date.now = realNow;
+      }
+      assert.ok(refused instanceof MembraneError);
+      const stated = refused.retryAfterMs;
+      const timed = readAt.filter((at) => at !== undefined);
+      assert.strictEqual(timed.length, 1, `one timed reading: ${JSON.stringify(readAt)}`);
+      assert.strictEqual(stated, until - timed[0]!, `stated ${stated}, read at ${JSON.stringify(readAt)}, until ${until}`);
     } finally { await fw.stop(); log.restore(); }
   });
 });

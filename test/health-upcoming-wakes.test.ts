@@ -115,6 +115,25 @@ describe('healthSnapshot: upcomingWakes', () => {
     assert.deepEqual(listed.slice(1).map((w) => Math.round((w.at! - before) / 60_000)), [1, 2, 3, 4, 5, 6, 7]);
   });
 
+  it('leaves out a wake whose time is given in words, so it pushes no timed wake past the eight', async (t) => {
+    const { internals, wakes } = await frameworkWith(t, { defaults: { intervalSeconds: 3600 } });
+    const gate = internals.eventGate as unknown as {
+      inferenceBuffer: Array<Record<string, unknown>>;
+      upcomingWakes(agentNames: string[]): Array<{ at?: number; when?: string }>;
+    };
+    const before = Date.now();
+    for (let i = 8; i >= 1; i--) {
+      assert.equal(internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: `r${i}`, inMinutes: i }).success, true);
+    }
+    gate.inferenceBuffer.push({ policyName: 'files', eventType: 'workspace:modified', content: 'notes.md', timestamp: Date.now(), addressed: false });
+    try {
+      assert.ok(gate.upcomingWakes(['scout']).some((w) => w.at === undefined && w.when !== undefined), 'premise: the gate lists one, events buffered behind a turn');
+      assert.deepEqual(wakes()!.map((w) => Math.round((w.at! - before) / 60_000)), [1, 2, 3, 4, 5, 6, 7, 8]);
+    } finally {
+      gate.inferenceBuffer.length = 0;
+    }
+  });
+
   it('leaves the field out when the read throws, says why, and so reads as unknown and not as nothing due', async (t) => {
     const { internals, wakes } = await frameworkWith(t, { defaults: { intervalSeconds: 3600 } });
     internals.upcomingWakesFor = () => { throw new Error('the read failed'); };

@@ -259,6 +259,7 @@ async function resident(options: {
   binds?: boolean;
   restart?: boolean;
   gate?: boolean;
+  judged?: boolean;
   policyRetries?: number;
   policyDelayMs?: number;
   policyErrors?: Error[];
@@ -297,6 +298,10 @@ async function resident(options: {
       },
     },
     ...(options.gate ? { gate: { config: { policies: [], default: 'always' } } } : {}),
+    ...(options.judged ? { gate: {
+      config: { policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 50, instructions: 'Wake me for questions.' } } }] },
+      judge: { onError: 'skip' },
+    } } : {}),
     ...(options.policy ? { inferencePolicy: options.policy } : {}),
   } as Parameters<typeof AgentFramework.create>[0]);
   const internal = framework as unknown as Internal;
@@ -1267,6 +1272,75 @@ describe('a turn refused for budget while compression is pending waits idle, and
         const types = t.traces.map((e) => e.type);
         assert.ok(types.indexOf('inference:held') >= 0 && types.indexOf('inference:held') < types.indexOf('inference:hold_ended'), 'announced before it ended');
         assert.equal(t.alerts('context-refusal-clear').length, 1, 'and its alert cleared');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("refuses the reply judge's calls about an agent whose turn waits, holding a judge rule's batch under onError \"skip\", and asks once the wait ends", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'], judged: true });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const judged: NormalizedRequest[] = [];
+      t.membrane.complete = async (request: NormalizedRequest) => {
+        judged.push(request);
+        return createMockResponse([text('WAIT: chatter')]);
+      };
+      const gate = t.internal.eventGate as unknown as {
+        evaluate(event: Record<string, unknown>): unknown;
+        getStatus(): { policies: Array<{ judgeState?: { heldCount: number; verdicts: Record<string, number> } }> };
+      };
+      const judge = () => gate.getStatus().policies[0]!.judgeState!;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the turn waits for compression');
+        gate.evaluate({ content: 'is prime around?', eventType: 'mcpl:push-event', serverId: 'discord', channelId: 'c1', metadata: { authorId: 'u1', channelName: 'garden' } });
+        assert.ok(await pollUntil(() => Object.values(judge().verdicts).some((n) => n > 0)), 'the judge rule decided its batch');
+        assert.deepEqual(judge().verdicts, { reply: 0, wait: 0, error: 0, refused: 1 }, 'its call was refused while the turn waits');
+        assert.equal(judge().heldCount, 1, 'and its batch is held for the judge');
+        assert.equal(judged.length, 0, 'no judge call was made');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'the waiting turn runs');
+        assert.ok(await pollUntil(() => judge().verdicts.wait === 1), 'the held batch is asked once the wait ends');
+        assert.equal(judged.length, 1);
+        assert.equal(judge().heldCount, 0);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("asks the reply judge about a judge rule's batch held while the agent's turn waited, once a stop ends the wait", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'], judged: true });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const judged: NormalizedRequest[] = [];
+      t.membrane.complete = async (request: NormalizedRequest) => {
+        judged.push(request);
+        return createMockResponse([text('WAIT: chatter')]);
+      };
+      const gate = t.internal.eventGate as unknown as {
+        evaluate(event: Record<string, unknown>): unknown;
+        getStatus(): { policies: Array<{ judgeState?: { heldCount: number; verdicts: Record<string, number> } }> };
+      };
+      const judge = () => gate.getStatus().policies[0]!.judgeState!;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.send('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the turn waits for compression');
+        gate.evaluate({ content: 'is prime around?', eventType: 'mcpl:push-event', serverId: 'discord', channelId: 'c1', metadata: { authorId: 'u1', channelName: 'garden' } });
+        assert.ok(await pollUntil(() => judge().verdicts.refused === 1 && judge().heldCount === 1), 'its call refused and its batch held while the turn waits');
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+        assert.ok(await pollUntil(() => judge().verdicts.wait === 1), 'the held batch is asked once the stop ends the wait');
+        assert.equal(judged.length, 1);
+        assert.equal(judge().heldCount, 0);
       } finally {
         await t.close();
       }
