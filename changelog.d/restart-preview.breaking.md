@@ -13,14 +13,19 @@
   compression as what would make room for an agent the hold can take, and
   one whose preview fails.
   - **What it trades:** before this release, a restart the preview now
-    declines was taken, and its compile then refused. Where the budget hold
-    could take the agent and compression was pending, the turn waited in the
-    hold, and its restart ran again later. Otherwise the turn ended with its
-    compile's failure: for a registered agent, an `over_budget` failure row,
-    or a `context_refusal` one for a drop no summary covers. The hold takes
-    a registered agent's turn while the framework runs, and never an
-    ephemeral run's. Now the stream goes on with the turn's rounds whole,
-    and the turn isn't held.
+    declines was taken. For an agent the budget hold could take, its compile
+    refused, and while compression was pending the turn waited in the hold
+    and its restart ran again later. Otherwise the turn ended with an
+    `over_budget` failure row, or a `context_refusal` one for a drop no
+    summary covers. For an agent the hold can't take, the compile could
+    still fit if compression pending at the boundary landed before it. If
+    not, the run ended with the compile's failure. The hold takes a
+    registered agent's turn while the framework runs, and never an ephemeral
+    run's. Now the stream goes on with the turn's rounds whole, and the turn
+    isn't held. An ephemeral run's compression doesn't wait on a provider
+    gate, so compression landing while its stream goes on moves the kept
+    decline's counts, and a later boundary takes the restart if its compile
+    then fits.
   - **What it costs:** under a strategy that previews, a restart past
     `maxStreamTokens` that is taken runs its compile's select twice, once
     for the preview, and the preview is synchronous, so nothing else on the
