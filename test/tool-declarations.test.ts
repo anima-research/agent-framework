@@ -340,6 +340,24 @@ describe('toolDeclarations', () => {
     assert.equal(next, adopted, "the recorded head's hash is the adopted one's");
   });
 
+  it("compares a tool field left undefined as the wire carries it alike in the difference, the binding's digests and kv-unified's hash", async () => {
+    const withUndefined = { ...tool('a'), extra: undefined } as unknown as ToolDefinition;
+    const adopt = async (tools: ToolDefinition[]) => {
+      const context = fakeContext([said('user', 'hello')], { kvUnified: true });
+      const agent = agentOn(context, { toolDeclarations: 'entries', thinkingBinding: { binds: true } });
+      await agent.buildActivationRequest(tools);
+      return { context, agent, compile: context.compiles.at(-1) as { identity?: Record<string, string>; kvUnifiedImmutablePrefixHash?: string } };
+    };
+    const plain = await adopt([tool('a')]);
+    const left = await adopt([withUndefined]);
+    assert.ok(plain.compile.identity && plain.compile.kvUnifiedImmutablePrefixHash, 'the premise: the compile was told both');
+    assert.deepEqual(left.compile.identity, plain.compile.identity, "the binding's digests");
+    assert.equal(left.compile.kvUnifiedImmutablePrefixHash, plain.compile.kvUnifiedImmutablePrefixHash, "kv-unified's hash");
+    await plain.agent.buildActivationRequest([withUndefined]);
+    await left.agent.buildActivationRequest([tool('a')]);
+    assert.equal(changeRows(plain.context.rows).length + changeRows(left.context.rows).length, 0, 'the difference: no change to declare, either way');
+  });
+
   it('hashes the head that goes out for kv-unified: the recorded one, and the new one after a move', async () => {
     const context = fakeContext([said('user', 'hello')], { kvUnified: true });
     const agent = agentOn(context, { toolDeclarations: 'entries' });

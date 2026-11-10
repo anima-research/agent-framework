@@ -1,5 +1,6 @@
 import { continuesBody, type CompileResult } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
+import { canonicalJson } from './stable-hash.js';
 
 export interface HeadDeclaration {
   tools: ToolDefinition[];
@@ -196,18 +197,8 @@ export function systemTextOf(blocks: readonly string[]): string {
   return blocks.join('\n');
 }
 
-function canonicalJson(value: unknown): string {
-  return canonicalOf(JSON.parse(JSON.stringify(value) ?? 'null'));
-}
-
-function canonicalOf(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalOf).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalOf(v)}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
+function wireJson(value: unknown): string {
+  return canonicalJson(JSON.parse(JSON.stringify(value) ?? 'null'));
 }
 
 export function effectiveDeclaration(
@@ -242,7 +233,7 @@ export function declarationDifference(
   const removeTools = [...effective.tools.keys()].filter((name) => !currentNames.has(name));
   const defineTools = current.tools.filter((tool) => {
     const before = effective.tools.get(tool.name);
-    return !before || canonicalJson(before) !== canonicalJson(tool);
+    return !before || wireJson(before) !== wireJson(tool);
   });
 
   if (removeTools.length === 0 && defineTools.length === 0 && addSystem.length === 0) return { kind: 'none' };
@@ -266,7 +257,7 @@ export function withoutCarried(
   const { block } = difference;
   const defineTools = (block.defineTools ?? []).filter((tool) => {
     const held = carried.tools.get(tool.name);
-    return !held || canonicalJson(held) !== canonicalJson(tool);
+    return !held || wireJson(held) !== wireJson(tool);
   });
   const removeTools = (block.removeTools ?? []).filter((name) => carried.tools.has(name));
   const othersAdded = new Map<string, number>();
