@@ -4,11 +4,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, PassthroughStrategy } from '@animalabs/context-manager';
-import type { ContextInjection } from '@animalabs/context-manager';
+import type { ContextInjection, ContextManager } from '@animalabs/context-manager';
 import { MembraneError } from '@animalabs/membrane';
-import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { AgentConfig, EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework, workerSpec } from '../src/index.js';
+import { Agent } from '../src/agent.js';
+import { opsWebhookText } from '../src/framework.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 const ROUNDS = 12;
@@ -60,7 +62,7 @@ const estimatedTokens = (value: unknown) => Math.ceil(JSON.stringify(value ?? nu
 class WindowStream extends MockYieldingStream {
   refusedAt?: number;
   protected size: number;
-  constructor(responses: NormalizedResponse[], request: NormalizedRequest, private readonly window: number) {
+  constructor(responses: NormalizedResponse[], request: NormalizedRequest, private readonly window: number, private readonly reasonTail = '') {
     super(responses);
     this.size = estimatedTokens(request.messages);
   }
@@ -77,7 +79,7 @@ class WindowStream extends MockYieldingStream {
           type: 'error',
           error: new MembraneError({
             type: 'context_length', retryable: false, httpStatus: 400, providerErrorCode: 'context_length_exceeded',
-            message: `This model's maximum context length is ${this.window} tokens; the request has ${this.size}.`,
+            message: `This model's maximum context length is ${this.window} tokens; the request has ${this.size}.${this.reasonTail}`,
             rawError: { status: 400 },
           }),
         } as StreamEvent;
@@ -91,14 +93,14 @@ class WindowStream extends MockYieldingStream {
 class TurnMembrane extends MockMembrane {
   readonly streams: NormalizedRequest[] = [];
   readonly windowStreams: WindowStream[] = [];
-  constructor(private readonly queues: NormalizedResponse[][], private readonly window?: number) {
+  constructor(private readonly queues: NormalizedResponse[][], private readonly window?: number, private readonly reasonTail = '') {
     super();
   }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.streams.push(request);
     const responses = this.queues.shift() ?? [];
     if (this.window !== undefined) {
-      const stream = new WindowStream(responses, request, this.window);
+      const stream = new WindowStream(responses, request, this.window, this.reasonTail);
       this.windowStreams.push(stream);
       return stream;
     }
@@ -255,6 +257,23 @@ async function loggedDuring(run: (logged: readonly string[]) => Promise<void>): 
 }
 
 type Preview = { args: unknown[]; fits: boolean | undefined; answeredNull?: boolean; finalTokens?: number; budgetTokens?: number; clearedBy?: readonly string[] };
+function recordPreviewOutcomes(framework: AgentFramework): string[] {
+  const agent = framework.getAgent('prime')!;
+  const preview = agent.previewCompile.bind(agent);
+  const outcomes: string[] = [];
+  agent.previewCompile = (...args: Parameters<typeof preview>) => {
+    try {
+      const answer = preview(...args);
+      outcomes.push(answer === null ? 'null' : 'answered');
+      return answer;
+    } catch (error) {
+      outcomes.push(`threw ${(error as Error).name}`);
+      throw error;
+    }
+  };
+  return outcomes;
+}
+
 function recordPreviews(framework: AgentFramework): Preview[] {
   const cm = framework.getAgent('prime')!.getContextManager();
   const preview = cm.previewContext.bind(cm);
@@ -348,8 +367,10 @@ for (const pending of [true, false]) {
     strategy.readiness = pending ? { ready: false, description: 'Compressing chunk 0' } : { ready: true };
     const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
     const logged = await loggedDuring(() => withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+      const outcomes = recordPreviewOutcomes(framework);
       ask(framework);
       await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+      assert.ok(outcomes.length > 0 && outcomes.every((outcome) => outcome === 'threw UncoveredDropError'), `each preview reached the decision as the other copy's UncoveredDropError (${outcomes.join(', ')})`);
       assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
       if (pending) {
         assert.equal(declined(traces).length, 0, 'no boundary declined the restart');
@@ -703,10 +724,13 @@ for (const { answer: preview, strategy: make, answersNull } of [
     const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy: make() });
     const logged = await loggedDuring(() => withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
       const previews = recordPreviews(framework);
+      const outcomes = recordPreviewOutcomes(framework);
       ask(framework);
       await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.'));
       assert.ok(previews.length > 0, 'the restart decision asked for the preview');
       if (nullAnswered) assert.ok(previews.every((asked) => asked.answeredNull), 'its ContextManager answered null');
+      const reached = nullAnswered ? 'null' : 'threw NoFoldPlanToPreviewError';
+      assert.ok(outcomes.length > 0 && outcomes.every((outcome) => outcome === reached), `each preview reached the decision as ${reached} (${outcomes.join(', ')})`);
       assert.equal((restarted(traces)[0] as { reason?: string } | undefined)?.reason, 'context_budget', 'the turn restarted');
       assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
     }));
@@ -718,9 +742,17 @@ test('a maxStreamTokens restart is taken as before under a strategy with no prev
   const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
   const agent = agentConfig({ maxStreamTokens: 10, physicalWindowTokens: undefined, strategy: new PassthroughStrategy() });
   await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    const prime = framework.getAgent('prime')!;
+    const key = prime.restartPreviewKey.bind(prime);
+    let keys = 0;
+    prime.restartPreviewKey = (...args: Parameters<typeof key>) => {
+      keys++;
+      return key(...args);
+    };
     ask(framework);
     await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.'));
     assert.equal((restarted(traces)[0] as { reason?: string } | undefined)?.reason, 'context_budget', 'the turn restarted');
+    assert.equal(keys, 0, "the restart decision never built its key");
     assert.equal(membrane.streams.length, 2, 'the restart sent its request');
     assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
     assert.deepEqual(failureRows(framework), [], "the restart's compile didn't refuse");
@@ -872,6 +904,73 @@ test(`on a host that sets no window, a maxStreamTokens restart whose preview can
     await waitUntil('the drain to end', () => lines.some((line) => line.includes('drain kicked for prime')));
   }));
   assert.ok(logged.some((line) => line.includes('drain kicked for prime')), 'the ending kicked the compression drain');
+});
+
+test("after a declined restart, the context-refusal alert says why in words, advises physicalWindowTokens alone, and keeps that advice whole within the ops webhook's bound where the provider's reason is long", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(ROUNDS, 4_000), answer(FINAL)]], 9_000, ` ${'The provider says more about it. '.repeat(15)}`);
+  const module = new PagesModule();
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 8_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified', NOTHING_TO_COMPRESS) });
+  await loggedDuring((lines) => withFramework(membrane, module, agent, async (framework, traces) => {
+    ask(framework);
+    await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL), 60_000);
+    assert.equal(failureRows(framework)[0]?.errorType, 'context_length', "the turn ended with the provider's refusal as its failure row");
+    const alert = (traces.filter((event) => event.type === 'ops:alert') as Array<{ kind?: string; message?: string }>)
+      .find((event) => event.kind === 'context-refusal')?.message ?? '';
+    assert.ok(alert.includes('The provider says more about it.'), "the alert carries the provider's reason");
+    const sent = opsWebhookText(alert);
+    assert.ok(sent.includes("if this persists, set physicalWindowTokens below the provider's window."), `the webhook's text keeps the whole advice (${sent.length} characters): ${sent}`);
+    assert.ok(sent.includes("its compile wouldn't fit"), 'it says why the restart was declined');
+    assert.ok(!/wont_fit|uncovered_drop|raise contextBudgetTokens/.test(alert), 'with no reason code and no advice to raise the compile budget');
+    await waitUntil('the drain to end', () => lines.some((line) => line.includes('drain kicked for prime')));
+  }));
+});
+
+test("a compression-named restart declined while the budget hold can't take the agent is previewed again once the hold can, and taken", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  const preview = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));
+  const module = new PagesModule();
+  const dir = mkdtempSync(join(tmpdir(), 'restart-preview-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy: preview })],
+    modules: [module],
+    syncIntervalMs: 0,
+  });
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => traces.push(event));
+  module.onCall = (call) => {
+    if (call === 5) framework.start();
+  };
+  try {
+    ask(framework);
+    await framework.runUntilIdle();
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.ok(declined(traces).some((decline) => decline.previewed && decline.clearedBy?.includes('compression')), 'a boundary before start() declined the restart its preview named compression for');
+    assert.equal(restarted(traces).length, 1, 'a boundary after start() took the restart');
+    assert.equal(preview.previews, 2, 'having asked for the preview again');
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an agent that reads the shared slot's count of row changes stops counting its manager's changes itself", () => {
+  let listening = 0;
+  const contextManager = {
+    getStrategy: () => ({}),
+    onMessage: () => {
+      listening++;
+      return () => {
+        listening--;
+      };
+    },
+  } as unknown as ContextManager;
+  const agent = new Agent({ name: 'reader', model: 'test-model', systemPrompt: 'You read.' }, contextManager, {} as Membrane);
+  assert.equal(listening, 1, 'the agent counts its own row changes');
+  agent.readRowChangesFrom(() => 7);
+  assert.equal(listening, 0, "once it reads the shared slot's count, its own listener is gone");
 });
 
 class SizedWindowStream extends WindowStream {
