@@ -102,6 +102,18 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
 });
 
+for (const isPrivate of [true, false]) {
+  test(`the rewind's retry of a ${isPrivate ? 'private' : 'public'} turn ${isPrivate ? 'carries' : "doesn't carry"} the private mark`, () => {
+    const { fw, restore } = makeHarness();
+    fw.turnRouting = new Map([['cairn', isPrivate ? { private: true } : {}]]);
+    try {
+      for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    } finally { restore(); }
+    assert.equal(fw.pendingRequests.length, 1, 'premise: the breaker queued its retry');
+    assert.equal(fw.pendingRequests[0].privateCaller, isPrivate ? true : undefined);
+  });
+}
+
 test("the breaker's retry of a turn its batch gave no channel keeps the batch's channels", () => {
   const { fw, restore } = makeHarness();
   const channels = [{ serverId: 'discord', channelId: 'discord:g:room' }];

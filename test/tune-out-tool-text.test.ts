@@ -45,7 +45,9 @@ describe('the tune_out tool text', () => {
       'Calling tune_out again for a channel already tuned out keeps its settings, and, where this host can open the ' +
       'channel, tries the open again if it isn\'t open. ' +
       'scope "all-except" holds EVERY channel (DMs and new channels included) except channelId, for durationSeconds ' +
-      '(required); your plain speech lands in that channel meanwhile; Muse pauses rather than cancels when its wake ' +
+      '(required); your plain speech lands in that channel meanwhile, except while a message from a surface with no ' +
+      'channel (such as a console, the TUI or an API call) in your context is unanswered, or no channel\'s message there is newer, or on a ' +
+      'turn that continues one where that held: then it goes to no channel; Muse pauses rather than cancels when its wake ' +
       'budget is spent. mode "check" reports what is held without releasing it (`peek` shows one channel\'s newest ' +
       'held lines).');
     assert.equal(backlogCapOf(tool), 'Max raw messages delivered at cancel (default 200). 0 = deliver no raw backlog at all: Muse\'s report is the whole delivery.');

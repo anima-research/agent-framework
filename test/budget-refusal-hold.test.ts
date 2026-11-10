@@ -8,6 +8,7 @@ import { MembraneError, type ContentBlock, type NormalizedRequest, type Normaliz
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { SpeechProbe } from './helpers/surface.js';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
 const NOTE = /\[budget-hold\] Your context didn't fit its budget \(100,201 tokens against 48,568\) when a turn came to start\. That turn waited \d+ (s|min)\./;
@@ -2771,5 +2772,35 @@ describe("the wait on context-manager's own autobiographical compression", () =>
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('a private turn the budget hold keeps', () => {
+  it("reopens private, though compression folded the operator's message out of its window while it waited", async () => {
+    await withCompression({ fitAt: Infinity, readyAt: Infinity, refuseFrom: 1 }, async (c) => {
+      const speaker = new SpeechProbe();
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['zz-after the wait'], modules: [speaker] });
+      try {
+        c.onRefusal = () => {
+          c.onRefusal = undefined;
+          // Compression folds the operator's message while the turn waits, so it's no longer in the agent's window.
+          const asked = t.rowWith('zz-the operator asks').id;
+          const cm = t.cm() as unknown as { getPresentedMessages(): Array<{ id: string }> };
+          const presented = cm.getPresentedMessages.bind(cm);
+          cm.getPresentedMessages = () => presented().filter((row) => row.id !== asked);
+          c.fitAt = c.ticks + 1;
+          c.readyAt = c.ticks + 1;
+        };
+        // The message has no channel: an operator's, so the turn is private.
+        t.send('zz-the operator asks');
+        const ran = await pollUntil(() => t.stored().includes('zz-after the wait'));
+        assert.ok(ran, 'premise: the held turn ran');
+        assert.equal(t.of('inference:held').length, 1, 'premise: the turn waited for budget once');
+        assert.ok(!t.windowText().includes('zz-the operator asks'), "premise: the operator's message left the window");
+        assert.equal(speaker.heard.find((h) => h.text.includes('zz-after the wait'))?.private, true, 'the turn reopened private');
+      } finally {
+        await t.close();
+      }
+    });
   });
 });

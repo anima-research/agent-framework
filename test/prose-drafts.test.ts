@@ -1,6 +1,11 @@
 /**
  * Held prose drafts (shelf-351): plain speech that is not sent is kept as a
- * private, explicitly resendable draft instead of vanishing.
+ * private, explicitly resendable draft instead of vanishing, but for speech
+ * kept as none. That includes disabled mode's, what the agent keeps with
+ * skip_reply or a same-round private think, and a private turn's in locus,
+ * hybrid or locked mode, unless a send in the turn has left its reach unknown
+ * or, in hybrid mode, a `>>>` envelope has bounced (docs/dendrite.md,
+ * "Private turns").
  *
  * Unit tests drive ProseDraftStore over a real Chronicle store; end-to-end
  * tests run real turns (MockMembrane) against a real MCPL child (the
@@ -20,6 +25,7 @@ import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import { jsonLines } from './helpers/json-lines.js';
+import { SurfaceModule, surfaceMessage } from './helpers/surface.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
@@ -3640,6 +3646,29 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           assert.equal(markers(h).length, 1);
           assert.match(markers(h)[0]!, AFTER_ROUNDS);
           assert.ok(!markers(h)[0]!.includes(CUT_OFF), markers(h)[0]);
+        } finally {
+          await h.close();
+        }
+      });
+    }
+
+    for (const [mode, named] of [['locus', false], ['explicit', true]] as const) {
+      it(`a private turn in ${mode} mode ${named ? 'still names unposted speech after a failure past its round, as main does' : 'names no unposted speech after a failure past its round, since its words had nowhere to post'}`, async () => {
+        const h = await harness({ xml: true, roundPreamble: true, retries: 0, agents: [{ name: 'scout', proseRouting: mode }], modules: [new SurfaceModule()] });
+        try {
+          breakAfterToolRound(h.membrane, 'error');
+          h.membrane.pushResponse(round());
+          const routings: Array<{ private?: true } | undefined> = [];
+          h.framework.onTrace((t) => {
+            if (t.type === 'inference:started') routings.push((h.framework as unknown as { turnRouting: Map<string, { private?: true }> }).turnRouting.get('scout'));
+          });
+          h.framework.pushEvent(surfaceMessage('for your eyes only'));
+          await h.until(() => markers(h).length > 0, 'the failure marker');
+          await turnEnded(h);
+          assert.ok(h.messages().some((m) => m.content.some((b) => b.type === 'tool_result')), "premise: the round's results were stored before the failure");
+          assert.equal(routings[0]?.private, true, 'premise: the turn was private');
+          assert.equal(published(h, SPEECH).length, 0, 'premise: nothing it wrote was posted');
+          assert.equal(notices(h).length, named ? 1 : 0, JSON.stringify(notices(h)));
         } finally {
           await h.close();
         }

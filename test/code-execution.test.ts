@@ -1302,7 +1302,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     }, { get: (target, key: string) => (key in target ? (target as Record<string, unknown>)[key] : () => undefined) });
     const run = async () => {
-      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } } as unknown as ProcessEvent);
       await framework.runUntilIdle();
     };
     const done = async () => {
@@ -2499,7 +2499,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     let stream: { cancel(): void } | undefined;
     let agent: { state: { stream?: { cancel(): void } }; reset(): void } | undefined;
     try {
-      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } } as unknown as ProcessEvent);
       void h.framework.runUntilIdle().catch(() => {});
       await soon(() => h.log.includes('tool:slow'));
       assert.ok(h.log.includes('tool:slow'), 'the script reached its slow call');
@@ -2547,7 +2547,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     const error = console.error;
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); error(...args); };
     try {
-      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } } as unknown as ProcessEvent);
       void h.framework.runUntilIdle().catch(() => {});
       // The script is running, held in its slow call.
       await soon(() => h.log.includes('tool:slow'));

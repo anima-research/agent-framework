@@ -77,6 +77,9 @@ posted where they were going.` The last continuation of a run adds `This is the 
 continuation in a row: after this turn you wait for the next event either
 way.` An agent that can't call `skip_reply` is told to end with a
 `>>skip_reply` (explicit) or `>>>skip_reply` (hybrid) envelope instead.
+A continuation whose turn is private (docs/dendrite.md, "Private turns") says
+instead that `plain words you write without it and with no destination go to
+no channel this turn, and an explicit send reaches a channel.`
 
 The wording is neutral on purpose: a row that reads as a lapse ("you ended
 without…") or as a budget ("2 of 3, one more left") invites an apology or a

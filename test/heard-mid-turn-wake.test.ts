@@ -211,7 +211,7 @@ const heardIn = (stream: MockYieldingStream | undefined) => JSON.stringify(strea
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const call = (id: string, name: string, input: Record<string, unknown> = {}) =>
   ({ type: 'tool_use', id, name, input }) as ContentBlock;
-const go = () => ({ type: 'external-message', source: 'test', content: 'go' }) as unknown as ProcessEvent;
+const go = () => ({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: GENERAL }, echoMetadata: false }) as unknown as ProcessEvent;
 const channelMessage = (channelId: string, messageId: string, body: string, addressed = true) => ({
   type: 'mcpl:channel-incoming',
   serverId: 'chat',
@@ -1050,20 +1050,20 @@ describe('a wake for a write heard mid-turn', () => {
   });
 
   const event = (e: Record<string, unknown>) => (framework: AgentFramework) => framework.pushEvent(e as unknown as ProcessEvent);
-  const kept: Array<[string, (framework: AgentFramework) => unknown]> = [
-    ['console input, which nothing records an answer to', event({ type: 'external-message', source: 'console', content: 'are you there?' })],
-    ['API input, which nothing records an answer to', event({ type: 'api:message', source: 'api', content: 'are you there?' })],
-    ['a module event with several messages', event({ type: 'clock:reminder', source: 'clock', content: ['one', 'two'] })],
-    ["a module's message that names its channel, though its event doesn't, which the module answers through its own speech", event({ type: 'clock:reminder', source: 'chat', content: 'a word in room', messageMetadata: { channelId: ROOM } })],
-    ["an external message whose event names its channel, though the module's message doesn't", event({ type: 'external-message', source: 'chat', content: 'a word in room', metadata: { channelId: ROOM }, echoMetadata: false })],
+  const kept: Array<[string, (framework: AgentFramework) => unknown, string]> = [
+    ['console input, which nothing records an answer to', event({ type: 'external-message', source: 'console', content: 'are you there?' }), 'are you there?'],
+    ['API input, which nothing records an answer to', event({ type: 'api:message', source: 'api', content: 'are you there?' }), 'are you there?'],
+    ['a module event with several messages', event({ type: 'clock:reminder', source: 'clock', content: ['one', 'two'] }), 'two'],
+    ["a module's message that names its channel, though its event doesn't, which the module answers through its own speech", event({ type: 'clock:reminder', source: 'chat', content: 'a word in room', messageMetadata: { channelId: ROOM } }), 'a word in room'],
+    ["an external message whose event names its channel, though the module's message doesn't", event({ type: 'external-message', source: 'chat', content: 'a word in room', metadata: { channelId: ROOM }, echoMetadata: false }), 'a word in room'],
     // Its answer is a resend of the held draft, which hearing it doesn't show.
     ['a prose bounce notice', (framework) => {
       const fw = internals(framework);
       fw.bounceProse(fw.agents.get('assistant'), 'hello there', 'no channel named #nowhere', undefined, '>>',
         { routing: fw.turnRouting.get('assistant'), notice: 'now' });
-    }],
+    }, 'no channel named #nowhere'],
   ];
-  for (const [what, write] of kept) {
+  for (const [what, write, heard] of kept) {
     it(`${what}: heard at the boundary, its wake still starts the turn`, async () => {
       const streams = scheduleTurns(membrane, [heardThen(createMockResponse([text('all done')])), [createMockResponse([text('again')])]]);
       const framework = await createFramework();
@@ -1073,8 +1073,8 @@ describe('a wake for a write heard mid-turn', () => {
       framework.pushEvent(go());
       await framework.runUntilIdle();
 
-      assert.ok(streams[0]!.receivedToolResultOptions.some((o) => (o?.injectedMessages?.length ?? 0) > 0),
-        'the turn heard it at its tool boundary');
+      assert.ok(streams[0]!.receivedToolResultOptions.some((o) => (o?.injectedMessages ?? []).some((m) => JSON.stringify(m).includes(heard))),
+        `the turn heard "${heard}" at its tool boundary`);
       assert.equal(membrane.calls.length, 2, 'its wake started the turn');
       assert.deepEqual(drops, []);
       await framework.stop();

@@ -184,7 +184,7 @@ describe('explicit prose routing', () => {
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: { channelId: 'world:commons' },
     } as unknown as ProcessEvent);
   }
 
@@ -790,12 +790,12 @@ describe('explicit prose routing', () => {
 
   type RoutingState = {
     pin?: ChannelRef; hybridHold?: 'private' | 'failed';
-    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number;
+    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number; keptForPrivacy: number;
     triggerChannel?: ChannelRef; locus?: ChannelRef; engaged: Set<string>; wasIn: ChannelRef[]; arrivals: Array<{ messageId: string; channel: ChannelRef }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
-    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0,
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, keptForPrivacy: 0,
     engaged: new Set(), wasIn: [], arrivals: [], ...fields,
   });
 
@@ -1479,6 +1479,38 @@ describe('explicit prose routing', () => {
       } as ProcessEvent);
       assert.ok(internals.pendingRequests.some((r) => r.reason === 'tool_results_ready'), 'the fallback scheduled the re-inference');
       assert.equal(internals.openLogical.get('assistant'), origin, 'without settling the turn it continues');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a direct-API round's re-inference takes no private mark from the framework's last turn", async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      routingOf(name: string): RoutingState & { private?: true };
+      openLogical: Map<string, unknown>;
+      pendingRequests: InferenceRequest[];
+      handleProcessEvent(event: ProcessEvent): Promise<void>;
+    };
+    internals.routingOf('assistant').private = true;
+    assert.equal(internals.openLogical.has('assistant'), false, 'premise: no framework turn is open');
+    const response = createMockResponse([
+      { type: 'tool_use', id: 'unstreamed-private', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    try {
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'Take the direct inference path.' }]);
+      await agent.runInference(framework.getAllTools());
+      agent.addAssistantResponse(response.content);
+      await internals.handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'unstreamed-private',
+        result: { success: true, data: { ok: true } },
+      } as ProcessEvent);
+      const ready = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
+      assert.ok(ready, 'premise: the direct round scheduled the re-inference');
+      assert.equal(ready.privateCaller, undefined, "the re-inference carries no private mark from the framework's last turn");
     } finally {
       await framework.stop();
     }
@@ -2317,6 +2349,7 @@ describe('explicit prose routing', () => {
     const help = decoded.join(' ').replace(/\s+/g, ' ');
     for (const clause of [
       'A destination applies to the rest of that turn, until another is named.',
+      "In a private turn it applies only to its own envelope's words.",
       'A name that matches no channel, or several, bounces and leaves it as it was.',
       'A channel its server declared inbound-only is refused, and clears it.',
       'Where two servers register one channel id, the server goes first: >>server:service:guild:id … (a bounce lists each such name).',

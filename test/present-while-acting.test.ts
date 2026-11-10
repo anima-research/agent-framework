@@ -227,7 +227,7 @@ describe('present while acting', () => {
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: { channelId: 'chan-live-1' },
     } as unknown as ProcessEvent);
   }
 
@@ -1240,7 +1240,7 @@ describe('present while acting', () => {
     };
     const open: Routing = {
       locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set([destinationKey(stub('discord:guild:portables'))]), wasIn: [],
-      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, keptForPrivacy: 0, arrivals: [],
       addressedElsewhere: new Set(), turnId: 1,
     };
     internals.turnRouting.set('assistant', open);
@@ -2954,6 +2954,7 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     module.interjection = 'look left!';
+    module.interjectionChannelId = 'chan-live-1';
 
     trigger(framework);
     await framework.runUntilIdle();

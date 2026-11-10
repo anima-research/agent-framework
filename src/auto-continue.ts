@@ -22,7 +22,8 @@ export const AUTO_CONTINUE_STOP_REASONS: ReadonlySet<string> = new Set(['end_tur
  * The row a continuation's turn reads. It names the agent (residents read
  * one shared message slot), says another turn starts, says how to stop
  * (`stop`, an imperative such as "call skip_reply") and that anything written
- * without it is sent as usual, and, on the last continuation of a run, that
+ * without it is sent as usual, or, in a private turn, goes to no channel
+ * unless it names one, and, on the last continuation of a run, that
  * the agent waits for the next event after it. When some or all of the last
  * turn's closing words were held because a send that turn may already have
  * posted where they were going, it says so. Short,
@@ -35,15 +36,19 @@ export function autoContinueNotice(opts: {
   stop: string;
   last: boolean;
   heldAfterSend?: boolean;
-  /** The run began with a heartbeat's turn, whose plain speech is held as drafts. */
+  /** The run began with a heartbeat's turn, whose plain speech is held as drafts unless the turn is private. */
   heartbeat?: boolean;
+  /** The continuation's turn is private (docs/dendrite.md, "Private turns"), so its plain speech goes to no channel unless the agent names one. */
+  private?: boolean;
 }): string {
   return `[${NOTICE_TAG.continue}] ${opts.agentName}, another turn starts now.` +
     (opts.heldAfterSend
       ? ' Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going.'
       : '') +
-    (opts.heartbeat
-      ? ` If you're done, ${opts.stop}; plain words you write without it and with no destination are held as drafts, as on the heartbeat's turn, and an explicit send reaches a channel.`
-      : ` If you're done, ${opts.stop}; anything you write without it is sent as usual.`) +
+    (opts.private
+      ? ` If you're done, ${opts.stop}; plain words you write without it and with no destination go to no channel this turn, and an explicit send reaches a channel.`
+      : opts.heartbeat
+        ? ` If you're done, ${opts.stop}; plain words you write without it and with no destination are held as drafts, as on the heartbeat's turn, and an explicit send reaches a channel.`
+        : ` If you're done, ${opts.stop}; anything you write without it is sent as usual.`) +
     (opts.last ? ' This is the last continuation in a row: after this turn you wait for the next event either way.' : '');
 }
