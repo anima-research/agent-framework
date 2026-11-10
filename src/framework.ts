@@ -19947,8 +19947,6 @@ export class AgentFramework {
             if (restarted) this.emitTrace({
               type: 'inference:stream_restarted',
               agentName: agent.name,
-              // 'physical_window' whenever the window projection forced the
-              // restart, even where the stream is past maxStreamTokens too.
               reason: overBudget ? 'context_budget' : 'physical_window',
               inputTokens: overBudget ? agent.lastStreamInputTokens : projectedRealTokens,
               budget: overBudget ? agent.maxStreamTokens : (agent.physicalWindowTokens ?? 0),
@@ -30919,8 +30917,6 @@ export class AgentFramework {
             this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
-            // The stream's accumulated inputTokens, which is what the
-            // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;
 
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL

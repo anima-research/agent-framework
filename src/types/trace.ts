@@ -335,7 +335,10 @@ export type TraceEvent =
        * live context settings, the strategy's compression state, the pins and document marks other than the
        * turn's own, or a stored row edited or removed. It ran no preview, and its figures are that earlier
        * preview's. Rows added to the store, the stream's own among them, and context-manager's calibration
-       * multiplier aren't in that list, so such a decline isn't previewed again when only those change.
+       * multiplier aren't in that list, so such a decline isn't previewed again when only those change. For a
+       * resident, a stored row includes a row of the residents' shared slot, edited or removed through another
+       * agent. A `toolResultGuard` edits a round's stored row once it settles it, and a withheld batch's stub once
+       * its annotation is written, so an agent with it on previews again at the first boundary after that edit.
        */
       type: 'inference:restart_declined';
       agentName: string;

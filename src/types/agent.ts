@@ -82,59 +82,31 @@ export interface AgentConfig {
   /** Temperature for inference */
   temperature?: number;
 
-  /** The `inputTokens` total above which framework breaks a yielding
-   *  stream and restarts with recompiled (compressed) context. Default:
+  /** The `inputTokens` total above which the framework breaks a yielding
+   *  stream and restarts it with recompiled (compressed) context. Default:
    *  150000. The total runs over the stream's calls, as membrane's usage
-   *  events report it, and doesn't add the cache reads and writes they
-   *  report beside it. Where membrane knows the provider's cache convention
-   *  (one other than `'unknown'`), `inputTokens` leaves those out, so there,
-   *  where a prompt is mostly cached, this setting doesn't bound the
-   *  request's size: `physicalWindowTokens`, when set, does. The restart is
-   *  declined when context-manager's preview of its compile says it won't
-   *  fit, or the preview fails (a strategy with no preview, or with no fold
-   *  plan to preview as on the hierarchical path, restarts as before), and
-   *  each boundary that declines it emits an
-   *  `inference:restart_declined` trace; a preview that fails other than
-   *  with an `UncoveredDropError` is also logged. The stream goes on, and
-   *  the next tool boundary over this budget considers the restart again.
-   *  It previews anew only once one of these has changed: the budget, the
-   *  compression holds, the live context settings, the strategy's
-   *  compression state, the pins and document marks other than the turn's
-   *  own, or a stored row edited or removed. Rows added to the store, the
-   *  stream's own among them, and context-manager's calibration multiplier
-   *  aren't in that list, so a remembered decline isn't previewed again when
-   *  only those change. That holds unless the preview said a newer message
-   *  could make room, failed, or met a drop no summary covers: each of those
-   *  every boundary previews.
-   *  With `toolResultGuard` on, no remembered decline is taken: the guard
-   *  holds each round's stored results from compression and edits them as
-   *  it settles them, so what a preview rests on changes at every round,
-   *  and each boundary past this budget that would restart previews anew.
-   *  For a resident, a stored row edited or removed includes a row of the
-   *  residents' shared slot edited through another agent, such as that
-   *  agent's `toolResultGuard` replacing a held result's stored placeholder
-   *  with the result: the resident previews anew at its next boundary over
-   *  this budget, and not at the boundaries after it unless something it
-   *  rests on changes again. A
-   *  decline whose preview names only compression as what would make room
-   *  isn't cleared by a compression whose model call hasn't started: the
-   *  stream keeps the agent's provider gate, and that call waits behind it
-   *  until the stream ends. A summary adopted with no call, or a call
-   *  already under way, can still land. With
-   *  `physicalWindowTokens` unset, nothing else then bounds the stream: it
-   *  can go on until the provider refuses a request at its own window, and
-   *  the turn then ends with its `context_length` failure row, which raises
-   *  the `context-refusal` ops alert and kicks the compression drain, as a
-   *  refused compile does.
-   *  The preview can't count the rows
-   *  the restart's start then stores (such as new or changed afterUser
-   *  injections, or a routing notice for an arrival the turn heard), so a
-   *  restart whose preview leaves less room than those rows take can still
-   *  be refused, and the turn then ends with its failure row. Not checked
-   *  mid-turn for an agent whose model binds its thinking
+   *  events report it. Where membrane knows the provider's cache convention
+   *  (one other than `'unknown'`), `inputTokens` leaves out cache reads and
+   *  writes, so on a mostly cached prompt this setting doesn't bound a
+   *  request's size. `physicalWindowTokens`, when set, does.
+   *
+   *  The restart is declined where context-manager's preview of its compile
+   *  says it won't fit and doesn't name compression as what would make room.
+   *  It is declined too where the preview meets a drop no summary covers
+   *  while no compression is pending. The stream then goes on, and an
+   *  `inference:restart_declined` trace says why. A later tool boundary
+   *  over this budget considers the restart again. Any other failure of the
+   *  preview doesn't decline it.
+   *
+   *  With `physicalWindowTokens` unset, a declined stream can grow until the
+   *  provider refuses a request at its own window. The turn then ends with
+   *  a `context_length` failure row. That row raises the `context-refusal`
+   *  ops alert and kicks the compression drain.
+   *
+   *  Not checked mid-turn for an agent whose model binds its thinking
    *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
-   *  there would take the turn's own earlier reasoning out of the request,
-   *  and the window projection still guards the provider's hard cap. */
+   *  there would take the turn's own earlier reasoning out of the request, and
+   *  the window projection still guards the provider's hard cap. */
   maxStreamTokens?: number;
 
   /**
@@ -372,10 +344,7 @@ export interface AgentConfig {
   /** Opt-in tool-output admission and one guarded retry after a provider
    * refusal. Agents can persistently override this via agent_settings
    * tool_result_guard. Full originals remain in Chronicle's audit history.
-   * Default false. Disabling does not restore previously withheld output.
-   * Past `maxStreamTokens`, an agent with it on takes no remembered
-   * decline: each boundary that would restart previews the compile anew
-   * (see `maxStreamTokens`). */
+   * Default false. Disabling does not restore previously withheld output. */
   toolResultGuard?: boolean;
 
   /**
