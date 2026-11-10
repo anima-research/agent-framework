@@ -22,6 +22,7 @@ import type {
   ExternalIdRef,
   SpeechContext,
   SpeechHandlerOptions,
+  SpeechRoutedContext,
   ProcessEvent,
   ToolResultEvent,
   TraceEventListener,
@@ -34,6 +35,7 @@ import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
 import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { markedTexts, oneLine } from './supplied-text.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -112,6 +114,12 @@ interface SpeechHandler {
   priority: number;
 }
 
+
+function speechPlace(named: unknown): string | undefined {
+  const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
+  if (!flat) return undefined;
+  return markedTexts([flat])[0]!;
+}
 
 /**
  * Registry for managing modules.
@@ -744,6 +752,43 @@ export class ModuleRegistry {
         }
       }
     }
+  }
+
+  /** @internal For the framework's speech routing; not a host API. */
+  askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext, onPlace?: () => void): string[] {
+    const places: string[] = [];
+    for (const module of [...this.modules.values()]) {
+      let hook: Module['onSpeechRouted'];
+      try {
+        hook = module.onSpeechRouted;
+      } catch (error) {
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) error reading its onSpeechRouted:`, error);
+        continue;
+      }
+      if (typeof hook !== 'function') continue;
+      let place: string | undefined;
+      try {
+        const answer = hook.call(module, agentName, text, context);
+        if (typeof (answer as { then?: unknown } | null | undefined)?.then === 'function') {
+          (answer as PromiseLike<unknown>).then(undefined, (error: unknown) => {
+            console.error(`Speech-routed module ${module.name} (agent ${agentName}) error:`, error);
+          });
+          continue;
+        }
+        place = speechPlace((answer as { sentTo?: unknown } | null | undefined)?.sentTo);
+      } catch (error) {
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) error:`, error);
+        continue;
+      }
+      if (place === undefined) continue;
+      try {
+        onPlace?.();
+      } catch (error) {
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) place's callback error:`, error);
+      }
+      places.push(place);
+    }
+    return places;
   }
 
   private getStateId(moduleName: string): string {

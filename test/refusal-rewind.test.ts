@@ -69,6 +69,38 @@ test('shed: tool_result removes its paired tool_use turn too (complete exchange)
   assert.equal(added.length, 0, 'shedNewestTurn must not add a marker');
 });
 
+const quotingNotice = (id: string, opening: string) => ({
+  id, participant: 'user', content: [{ type: 'text', text: `[send-undeliverable] Your plain speech "${opening}" (9 chars) had no channel to go to` }],
+  metadata: { system: true, kind: 'discord-send-failed', channelId: '', opening },
+});
+
+test('shed: a no-channel notice that quotes the shed reply goes with it', () => {
+  const msgs = [
+    { id: 'u1', participant: 'simulect', content: [{ type: 'text', text: 'hello there' }], metadata: { messageId: '1' } },
+    quotingNotice('n1', 'Hi there.'),
+    { id: 'a1', participant: 'labclaude', content: [{ type: 'text', text: 'Hi there.' }] },
+  ];
+  const { fw, agent, removed } = makeAgentHarness(msgs);
+  const rec = fw.shedNewestTurn(agent);
+  assert.deepEqual([...removed].sort(), ['a1', 'n1']);
+  assert.deepEqual(rec.removedIds, ['a1', 'n1'], 'newest first');
+  assert.deepEqual(msgs.map((m) => m.id), ['u1']);
+});
+
+test("shed: a notice next to the shed reply that quotes an earlier reply stays", () => {
+  const msgs = [
+    { id: 'u1', participant: 'simulect', content: [{ type: 'text', text: 'hello there' }], metadata: { messageId: '1' } },
+    { id: 'a1', participant: 'labclaude', content: [{ type: 'text', text: 'Hi there.' }] },
+    { id: 'u2', participant: 'simulect', content: [{ type: 'text', text: 'and now?' }], metadata: { messageId: '2' } },
+    { id: 'a2', participant: 'labclaude', content: [{ type: 'text', text: 'Second.' }] },
+    quotingNotice('n1', 'Hi there.'),
+  ];
+  const { fw, agent, removed } = makeAgentHarness(msgs);
+  fw.shedNewestTurn(agent);
+  assert.deepEqual(removed, ['a2']);
+  assert.deepEqual(msgs.map((m) => m.id), ['u1', 'a1', 'u2', 'n1']);
+});
+
 test('shed: human message → described as an incoming message, single removal', () => {
   const msgs = [
     { id: 'a0', participant: 'labclaude', content: [{ type: 'text', text: 'hi' }] },

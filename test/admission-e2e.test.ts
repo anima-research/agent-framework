@@ -65,7 +65,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
       // `speech.locus: 'delivery'` (default): a turn nothing delivered into
       // (a heartbeat here) has no locus — not the last channel that spoke.
       assert.equal(await channellessTurnLocus(f), null, 'no global latest-inbound locus');
-      assert.ok(has(f, 'no channel'), 'the resident is told their prose stays private');
+      assert.ok(has(f, 'Your plain speech currently has no channel, so routing posts it to no channel.'), 'the resident is told routing posts their prose to no channel');
 
       enter(f, 'noisy');
       await incoming(f, 'noisy', 'n1', 'noise');

@@ -11,9 +11,9 @@
  * Now a batch containing an addressed message routes to that message's
  * registered channel. An ambient-only batch gives its turn no channel to
  * route to: under the default `speech.locus: 'delivery'` the turn has no
- * locus, its prose stays private, and the resident is told which channels
- * the batch came from; under `'latest-inbound'` it keeps the legacy
- * fallback.
+ * locus, routing posts its prose to no channel, and the resident is told
+ * which channels the batch came from; under `'latest-inbound'` it keeps the
+ * legacy fallback.
  *
  * The tests hold the gate's batch until both events are in it (holdBatches),
  * so they don't depend on the second reaching the gate inside the window.
@@ -152,12 +152,13 @@ function batchedWakeRig(opts: {
 function assertNamesBatchChannels(notice: string, channels: string[], chars: number): void {
   const shown = channels.map((c) => `#${c} (discord:g1:${c})`);
   const where = shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
-  assert.equal(notice,
-    `[send-undeliverable] Your previous reply (${chars} chars) had no channel to go to — this turn came from ${where}, ` +
+  const rest = ` (${chars} chars) had no channel to go to — this turn came from ${where}, ` +
     `and no channel was chosen for its reply; to reply ${channels.length === 1 ? 'there' : 'in one of them'}, ` +
     'send your reply to that channel explicitly. This is a routing situation, not a channel failure. ' +
     'This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. ' +
-    'It is saved in your archive.');
+    'It is saved in your archive.';
+  assert.ok(notice.endsWith(rest), notice);
+  assert.match(notice.slice(0, -rest.length), /^\[send-undeliverable\] Your plain speech ".+"$/);
 }
 
 async function ambientBatchHasNoLocus(rig: ReturnType<typeof batchedWakeRig>, channels: string[], named: string[]): Promise<void> {
@@ -268,6 +269,26 @@ describe('batched wake routing', () => {
     await ambientBatchHasNoLocus(rig, [ROOM, GENERAL, ROOM], ['room', 'general']);
   });
 
+  it("an operator's unstick of a turn an ambient batch woke is told the batch's channel", async () => {
+    const fw = rig.framework();
+    rig.membrane().pushResponse({ ...createMockResponse([{ type: 'text', text: 'I would rather not.' }], 'refusal'), toolCalls: [] } as ReturnType<typeof createMockResponse>);
+    incoming(ROOM, 'ambient', 'message 1');
+    await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
+    await fw.runUntilIdle();
+    rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'unstuck words' }]));
+    const accepted = await (fw as unknown as { handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> })
+      .handleHostCommand('discord', { command: 'unstick', agentName: 'scout' });
+    assert.equal(accepted.ok, true, `premise: the unstick was accepted: ${accepted.error}`);
+    await waitFor(() => rig.membrane().calls.length >= 2, "the unstick's run started");
+    await fw.runUntilIdle();
+    assert.deepEqual(publishes(), []);
+    const texts = fw.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+    const notices = texts.filter((t) => t.startsWith('[send-undeliverable] Your plain speech "unstuck words"'));
+    assert.equal(notices.length, 1, JSON.stringify(texts));
+    assertNamesBatchChannels(notices[0]!, ['room'], 'unstuck words'.length);
+  });
+
   it("a sleep's announcement in a turn from two channels is told those channels", async () => {
     const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'sleep-1', name: 'sleep', input: { seconds: 60 } }], 'tool_use'));
@@ -332,7 +353,7 @@ describe("batched wake routing with proseRouting 'hybrid'", () => {
     const texts = fw.getAgent('scout')!.getContextManager().getAllMessages()
       .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
     assert.deepEqual(texts.filter((t) => t.startsWith('[routing]')),
-      ['[routing] Your plain speech currently has no channel — it stays in your archive. Use an explicit send tool to reach a channel.'],
+      ['[routing] Your plain speech currently has no channel, so routing posts it to no channel. Use an explicit send tool to reach a channel.'],
       'premise: the continuation opened with no locus, after the channel_open had moved the turn to #general');
     const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
     assert.equal(notices.length, 1, JSON.stringify(texts));

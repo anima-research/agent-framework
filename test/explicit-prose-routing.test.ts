@@ -2167,7 +2167,7 @@ describe('explicit prose routing', () => {
       gateway.appendProseDeliveryReceipt(agent, routing);
       const receipt = context(framework).texts.find((t) => t.startsWith('[delivered]'))!;
       assert.ok(receipt.includes('2 plain-speech segment(s) suppressed and NOT held as drafts (the journal refused the write) — ' +
-        'the words remain only in your history'), receipt);
+        'the words remain in your history'), receipt);
     } finally {
       await framework.stop();
     }

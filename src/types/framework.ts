@@ -196,8 +196,9 @@ export interface FrameworkConfig {
    *   opened during the turn, and past those only from an open all-except
    *   hold's channel or `unpromptedChannel` (below), each for the turns that
    *   take it. Incoming traffic never moves it — not between turns, not
-   *   mid-turn. A turn with no such locus keeps its prose private, and says
-   *   so in a `[routing]` notice.
+   *   mid-turn. A turn with no such locus has routing post its
+   *   prose to no channel, and a `[routing]` notice says so when the locus
+   *   the agent was last told of was a channel.
    * - `'latest-inbound'`: the previous rule. The most recent delivered
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.

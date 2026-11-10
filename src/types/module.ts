@@ -206,6 +206,46 @@ export interface Module {
   ): Promise<void>;
 
   /**
+   * Called with each piece of the agent's plain speech, `text`, that the
+   * framework routes: as it goes to the turn's channel, or, when the turn has
+   * no channel, before the turn is told it had nowhere to go. For a piece no
+   * channel takes, a surface may show it then and answer where. There are
+   * two answers:
+   * - a `SpeechSent` naming a place, `{ sentTo }`, when this module showed
+   *   that text to someone, such as the person whose message opened the
+   *   turn: the turn's `[delivered]` receipt names the place, and a turn
+   *   with no channel writes no `[send-undeliverable]` notice for it;
+   * - `{}` otherwise: it can't say the text reached someone, as for a turn
+   *   none of its surfaces opened. A turn with no channel's notice then
+   *   still says another surface may have shown it. A piece held as a draft
+   *   gets no such notice, since it's named as a draft.
+   *
+   * Called as the turn routes each piece of its plain speech, in the order
+   * it routes them, or holds one as a draft, which can be after later pieces
+   * have routed, under prose routing by locus, hybrid or locked on a host
+   * with a channel registry. Never called with private envelopes or words
+   * kept private, explicit sends (prefixed envelopes included) or their own
+   * words held as drafts, a turn under explicit routing, which writes no
+   * receipt, an ephemeral run's unheld speech with no channel, which is its
+   * caller's result, or speech an agent routes or holds once another agent
+   * has taken its name.
+   *
+   * The call is synchronous, and routing goes on when it returns, so showing
+   * a piece has to be a write that doesn't wait, such as a socket write that
+   * isn't awaited. A module that throws names no place, as `{}` does, and
+   * so does one that returns a promise, whose rejection is logged as a
+   * throw is.
+   *
+   * A piece with `final: true` comes after the turn's `inference:completed`
+   * trace and before the agent's next `inference:started`.
+   */
+  onSpeechRouted?(
+    agentName: string,
+    text: string,
+    context: SpeechRoutedContext
+  ): SpeechSent;
+
+  /**
    * Gather context injections before agent inference.
    * Called before each inference to collect data (e.g., HUD overlays, game state)
    * that should be injected into the compiled context.
@@ -855,6 +895,70 @@ export interface SpeechContext {
    * of the process.
    */
   turnId?: number;
+}
+
+/**
+ * What a module is told with plain speech a turn is routing
+ * (`Module.onSpeechRouted`).
+ */
+export interface SpeechRoutedContext {
+  /**
+   * Whether the text is the turn's final speech: the speech after its last
+   * tool call, which a relay that starts a new speech at each
+   * `inference:tool_calls_yielded` writes as the turn's reply. A refused XML
+   * tool attempt traces no `inference:tool_calls_yielded`, and neither does a
+   * call a round cut off at the output limit left unrun, so neither ends a
+   * speech: the speech on both sides of one is final when no later tool call
+   * follows it.
+   */
+  final: boolean;
+
+  /** The turn, as `SpeechContext.turnId` names it. */
+  turnId?: number;
+
+  /**
+   * The request that opened the turn, kept across its streams: after a
+   * context-budget restart the turn's current request is the framework's
+   * continuation, and this is still the one that started it. `messages`
+   * are the messages added by the module answers whose wakes the turn took,
+   * and, for a turn the framework queued to carry another on (a `!`
+   * continuation, an autoContinue run, a bounce's wake, or a retry on a
+   * history rewound after a refusal, an unstick or an inference failure),
+   * the messages that opened that turn, each as its stored id, which a
+   * module context's `getMessage` takes. A message kept in memory when its
+   * wake was asked for (while a surgery's hold, or its agent's recovery,
+   * keeps the write) has no id yet, and isn't named.
+   * A turn that took a cause of its own that brought messages beside such a
+   * continuation, such as a module answer's wake, before any of its rounds
+   * reached its tool calls names that cause's messages, not those the
+   * continuation carried;
+   * a cause that joins a turn already under way is named beside the turn's
+   * own. A message a rewind
+   * removed is still named, and `getMessage` returns `null` for it. A wake
+   * an event gate debounced carries none, so the messages of the module
+   * answers it stands for aren't named.
+   */
+  openedBy?: {
+    reason: string;
+    source: string;
+    timestamp: number;
+    messages: readonly string[];
+  };
+}
+
+/**
+ * What a module did with plain speech it was asked about
+ * (`Module.onSpeechRouted`).
+ */
+export interface SpeechSent {
+  /**
+   * Where it showed the text, as the agent reads it in its `[delivered]`
+   * receipt: "sent to <sentTo>", such as "the terminal that sent this turn".
+   * Whitespace runs read as one space, with none at either end, and a long
+   * place reads whole. Left out
+   * (`{}`) when the module can't say the text reached someone.
+   */
+  sentTo?: string;
 }
 
 /**

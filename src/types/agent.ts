@@ -669,6 +669,8 @@ export interface InferenceRequest {
    *  the wake starts no turn. A row stored and not yet presented to the
    *  agent keeps its wake. */
   readsRow?: string;
+  /** @internal For the framework's speech receipts; not a host API. */
+  openingMessages?: string[];
   /** Host-owned: this wake's sole cause is these rows, a batched wake's
    *  writes (WakeProvenance.writes): the message of its own of each event
    *  that has one, and the batch's line where one was written. The wake starts no turn once each
