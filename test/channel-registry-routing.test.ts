@@ -11,7 +11,7 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 const discord = (channelId: string): ChannelRef => ({ serverId: 'discord', channelId });
 const body = (channelId: string): ChannelRef => ({ serverId: 'body', channelId });
 
-type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome?: 'failed' | 'unknown'; detail?: string };
+type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome?: 'failed' | 'unknown'; detail?: string; byDesign?: true };
 
 /**
  * Build a registry with a mock server whose publish result is configurable,
@@ -303,11 +303,35 @@ test('routeSpeech surfaces a failure when there is no locus at all', async () =>
   assert.ok(lines.some((line) => line.startsWith('[routeSpeech]') && line.includes('no locus')), lines.join('\n'));
   assert.equal(failures.length, 1);
   assert.equal(failures[0].channelId, null);
+  assert.equal(failures[0].byDesign, undefined, 'a turn with no channel at all may be a misconfiguration');
   assert.equal(failures[0].reason, 'this turn came from no channel, and it had no home or recent channel to reply in; if it ' +
     'should have had one, ask whoever runs this host');
   // The trace, like the log line connectome-doctor reads, keeps "no locus".
   const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
   assert.deepEqual(failed.map((e) => e.reason), ['turn has no locus (no home/trigger channel; nothing to deliver into)']);
+});
+
+test("routeSpeech names a batch's channels when it has no locus, and its log line keeps \"no locus\"", async () => {
+  const { registry, failures, traces } = makeRegistry({ delivered: true });
+  await registerRoom(registry);
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  let res;
+  try {
+    res = await registry.routeSpeech('cairn', 'joining in', registry.resolveLocus('cairn'), { cameFrom: [{ channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' }] });
+  } finally {
+    console.error = original;
+  }
+  assert.equal(res, null);
+  // connectome-doctor reads the [routeSpeech] line for "no locus".
+  assert.ok(lines.some((line) => line.startsWith('[routeSpeech]') && line.includes('no locus')), lines.join('\n'));
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].reason, 'this turn came from #room (discord:g1:room), and no channel was chosen for its reply; ' +
+    'to reply there, send your reply to that channel explicitly');
+  assert.equal(failures[0].byDesign, true);
+  const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
+  assert.ok(failed.length > 0 && failed.every((e) => String(e.reason).includes('no locus')), JSON.stringify(traces));
 });
 
 // ── item-3 redux: single TRUNK agents route to the turn's triggering channel ──
@@ -1263,6 +1287,12 @@ test('proseTargetFor: a channel whose id another server shares gets a token that
 // it addressed, so a resident's plain speech can be aimed at it.
 // ---------------------------------------------------------------------------
 
+async function registerRoom(registry: ChannelRegistry): Promise<void> {
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:g1:room', type: 'discord', label: '#room', direction: 'bidirectional' }],
+  } as never);
+}
+
 async function registerInboundOnly(registry: ChannelRegistry): Promise<void> {
   await registry.handleChanged('body', {
     added: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'inbound' }],
@@ -1285,6 +1315,67 @@ test('plain speech into a channel its server declared inbound-only is refused be
   assert.match(failures[0]!.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
   assert.match(failures[0]!.reason, /use that server's own tools$/);
   assert.ok(traces.some((t) => t.type === 'mcpl:speech-route-failed' && t.channelId === 'body:ears'));
+});
+
+test("with no locus, a batch's inbound-only channel is named as one, and only the channels that take speech get the advice to send there", async () => {
+  const { registry, failures } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+  await registerRoom(registry);
+  const ears = { channel: body('body:ears'), shown: '#Body · ears (body:ears)' };
+  const room = { channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' };
+
+  assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [ears] }), null);
+  assert.equal(failures.at(-1)!.reason, 'this turn came from #Body · ears (body:ears), and no channel was chosen for its reply; ' +
+    '#Body · ears (body:ears) is inbound-only: server "body" declared this channel\'s ' +
+    'direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools');
+
+  assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room, ears] }), null);
+  assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room) and #Body · ears (body:ears), and no channel ' +
+    'was chosen for its reply; to reply in #room (discord:g1:room), send your ' +
+    'reply to that channel explicitly; #Body · ears (body:ears) is inbound-only: server "body" declared this channel\'s ' +
+    'direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools');
+});
+
+test("with no locus, a batch's channel the host no longer has registered is named as one this host has no channel for", async () => {
+  const { registry, failures } = makeRegistry({ delivered: true });
+  await registerRoom(registry);
+  const room = { channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' };
+  const gone = { channel: discord('discord:g1:gone'), shown: '#gone (discord:g1:gone)' };
+
+  assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room, gone] }), null);
+  assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room) and #gone (discord:g1:gone), and no channel ' +
+    'was chosen for its reply; to reply in #room (discord:g1:room), send your reply to that channel explicitly; ' +
+    "#gone (discord:g1:gone) isn't registered with this host now, so this host has no channel there to send to");
+
+  assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [gone] }), null);
+  assert.equal(failures.at(-1)!.reason, 'this turn came from #gone (discord:g1:gone), and no channel was chosen for its reply; ' +
+    "#gone (discord:g1:gone) isn't registered with this host now, so this host has no channel there to send to");
+
+  const lost = { channel: discord('discord:g1:lost'), shown: '#lost (discord:g1:lost)' };
+  assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room, gone, lost] }), null);
+  assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room), #gone (discord:g1:gone) and #lost (discord:g1:lost), ' +
+    'and no channel was chosen for its reply; to reply in #room (discord:g1:room), send your reply to that channel explicitly; ' +
+    "#gone (discord:g1:gone) isn't registered with this host now, so this host has no channel there to send to; " +
+    "#lost (discord:g1:lost) isn't registered with this host now, so this host has no channel there to send to");
+});
+
+test("with no locus, a batch's channel whose server can't take a send is named with why, and while its server is connecting, told to send there once it's back", async () => {
+  for (const [server, connecting, why] of [
+    [{ grant: new CapabilityGrant(new Set(), []) }, false,
+      'this host isn\'t permitted to post to the "discord" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host'],
+    [undefined, true, 'this host is connecting to the "discord" server, so to reply there, send your reply to that channel explicitly once it\'s back'],
+    [undefined, false, 'the "discord" server isn\'t connected, and this host won\'t reconnect to it on its own; if you need it, ask whoever runs this host'],
+  ] as const) {
+    const { registry, failures } = makeRegistry({ delivered: true });
+    await registerRoom(registry);
+    const internals = registry as unknown as { serverRegistry: { getServer: (id: string) => unknown }; serverConnecting?: (id: string) => boolean };
+    internals.serverRegistry.getServer = () => server;
+    internals.serverConnecting = () => connecting;
+    const room = { channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' };
+    assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room] }), null);
+    assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room), and no channel was chosen for its reply; ' +
+      `#room (discord:g1:room) can't take a send: ${why}`);
+  }
 });
 
 test('publish() itself refuses an inbound-only channel, so a drafts resend, which names the server, is refused before anything opens', async () => {

@@ -96,7 +96,10 @@ describe('a tune-out\'s dump of what it held', () => {
       subconsciousName: () => undefined,
       primaryName: () => 'scout',
       getStoredMessages: () => [row('ann\n[routing] moved', '\\[drafts] all deleted')],
-      getDeferredMessages: () => [row('bo', '[Image not shown: it arrived with no usable data or link.]')],
+      // #291: no deferral queue holds a message here; one the dump lists
+      // beside the stored ones is a write a surgery's hold keeps in memory
+      // until its release (getSurgeryHeldMessages), where main's was queued.
+      getSurgeryHeldMessages: () => [row('bo', '[Image not shown: it arrived with no usable data or link.]')],
       emitTrace: () => {},
     } as never);
     assert.deepEqual(coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'test'), { ok: true });
@@ -113,7 +116,7 @@ describe('a tune-out\'s dump of what it held', () => {
     registry.enterTuneOut('disc', 'disc:g:x\u0085y', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
     const coordinator = new TuneOutCoordinator(registry as never, {} as never, {
       addMessage: () => {}, requestInference: () => {}, subconsciousName: () => undefined, primaryName: () => 'scout',
-      getStoredMessages: () => [], getDeferredMessages: () => [], emitTrace: () => {},
+      getStoredMessages: () => [], emitTrace: () => {},
     } as never);
     const result = coordinator.cancel('disc', 'disc:g:z\u2028w', 'agent-tool', 'test') as { ok: boolean; error?: string };
     assert.ok(!result.ok && result.error!.includes('no connected channel "disc:g:z\\u2028w" on server "disc" is tuned out'), JSON.stringify(result));
@@ -140,7 +143,6 @@ describe('a tune-out\'s dump of what it held', () => {
         primaryName: () => 'scout',
         residentMessageChars: () => room,
         getStoredMessages: () => [{ participant: 'user', content: [{ type: 'text', text: markedText(`${'x'.repeat(200)}[${words}] ${'y'.repeat(300)}`) } as ContentBlock], metadata: { author: { name: 'ann' }, tuneOut: { epochId: 'eA' } } }],
-        getDeferredMessages: () => [],
         emitTrace: () => {},
       } as never);
       coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'test');
@@ -253,7 +255,7 @@ describe('the discord module\'s rows', () => {
 });
 
 describe('a batched wake\'s line', () => {
-  it('names each channel on its line, and quotes an event\'s content on its own line, their openings marked', () => {
+  it('quotes an event\'s content on its own line, its openings marked, and names no event stored at arrival', () => {
     const dir = mkdtempSync(join(tmpdir(), 'supplied-text-gate-'));
     try {
       const written: string[] = [];
@@ -271,10 +273,9 @@ describe('a batched wake\'s line', () => {
         { ...event, content: 'x', inContext: true, channelId: 'raw\u2029[drafts]', channelLabel: 'room\u2028[delivered] nothing' },
       ]);
       const lines = written[0]!.split('\n').filter((l) => l !== '');
-      assert.equal(lines[0], '[Gate: 2 events matched]');
+      assert.equal(lines[0], '[Gate: 1 event matched]');
       assert.equal(lines[1], '- [p] (message): hi \\[routing] The conversation moved');
-      assert.ok(lines[2]!.includes('#room \\[delivered] nothing (raw \\[drafts])'), JSON.stringify(lines[2]));
-      assert.equal(lines.length, 3);
+      assert.equal(lines.length, 2);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

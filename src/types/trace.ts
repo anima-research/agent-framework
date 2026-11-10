@@ -3,6 +3,8 @@ import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { UsageUpdatedEvent } from '../usage/types.js';
 import type { DraftReason } from '../prose-drafts.js';
+import type { MessageSlotRef } from '../dendrite/types.js';
+import type { PresentationOccasion } from '../presentation.js';
 import type { RecipeChanges } from '../gate/recipe-reconcile.js';
 import type { DesiredChannelState } from '../mcpl/channel-registry.js';
 import type { PushEventResult } from '../mcpl/types.js';
@@ -134,12 +136,37 @@ export type TraceEvent =
        *  timers, so a stalled event loop can end it later. Absent for a wait
        *  too long for a date. */
       until?: number;
+      /** The try the wait leads to, as the error policy counts tries
+       *  against `maxTries`: each failed start counts, sent or not, the count
+       *  starts over when a provider hold queues the turn again, and a
+       *  deadline's retries count that call's expiries. The policy's place in
+       *  its schedule, not a count of sends. Absent from a framework before
+       *  this field. */
+      nextTry?: number;
+      /** The most tries the error policy allows (ErrorAction.maxTries), when it
+       *  says so as a positive whole number. A turn re-armed after it ran out of
+       *  tries ends at its second deadline expiry with no completed round,
+       *  transient failure or message said to it between them, whatever this
+       *  says. */
+      maxTries?: number;
+      /** What the error policy retries the failure as (ErrorAction.retryClass),
+       *  such as `overloaded`, when it says. A longer one than 128 characters
+       *  is shown as its start and end around a note of how much was left out. */
+      retryClass?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
+      /**
+       * The reason the agent's `[inference-failed]` note may give, before the
+       * note's own 600-character cut, and bounded as `error` is. Present only
+       * when the failure's message holds no provider's text: a progress
+       * bound's cut, a stream's abort, or context-manager's refusal of a
+       * compile. Absent otherwise, and a note then gives no reason.
+       */
+      shownReason?: string;
       /** Whether membrane classified the failure as retryable (observability). */
       retryable?: boolean;
       /**
@@ -153,6 +180,55 @@ export type TraceEvent =
       httpStatus?: number;
       /** The provider's own error code, when it sent one (at most 128 characters). */
       providerErrorCode?: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A start whose compile was refused for budget while compression was
+       * pending waits in the agent's budget hold, idle, instead of failing
+       * (#304). It follows the refused attempt's `inference:failed`. Once
+       * something the refused compile depends on has changed (compression's
+       * progress, nothing left pending, a surgery or an undo, the agent's
+       * budget or live context settings, or a quiesce's end), the hold ends,
+       * the held requests are queued, and its note is stored as the agent's
+       * own row, entering its window at once or, while a turn of the agent's
+       * is alive, at its next presentation point; a failed write stores
+       * none. Their start's own compile is the check: refused again while
+       * compression is pending, it waits in a new hold, with a new
+       * `inference:held`. `inference:hold_ended` follows each, once. An
+       * ephemeral run's start, and one before the framework's `start()`,
+       * never waits.
+       */
+      type: 'inference:held';
+      agentName: string;
+      /** 'over_budget', or 'context_refusal' when no summary covers a span the compile would drop. */
+      errorType: 'over_budget' | 'context_refusal';
+      /** The refusal's message, bounded as a trace event's `error` is (2,000 characters). */
+      error: string;
+      /** The refused compile's budget and size in tokens, when context-manager gave them. */
+      budget?: number;
+      actual?: number;
+      /** When this hold started (epoch ms). A wait held again after its
+       *  release starts a new hold; its `context-refusal` alert and the note
+       *  count from the wait's first hold. */
+      since: number;
+      /** Requests the hold holds as it starts: the refused start's own. */
+      heldRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'inference:hold_ended';
+      agentName: string;
+      /**
+       * 'released': something the refused compile depends on changed, so the
+       * held requests were queued and their start's compile is the check.
+       * 'stopped': the held turn was ended by `abortInference()`, `stop()` or
+       * its agent's end, reported after its `inference:aborted`. 'removed': a
+       * surgery or an undo removed what the held turn stood on, reported after
+       * its `inference:aborted`, and the wakes that joined it go back to the
+       * queue.
+       */
+      outcome: 'released' | 'stopped' | 'removed';
+      /** Since the hold started (`inference:held`'s `since`). */
+      waitedMs: number;
     })
 
   // Streaming inference lifecycle
@@ -389,6 +465,10 @@ export type TraceEvent =
     })
 
   // Message lifecycle
+  /** A message stored, with its stored id. A write kept in memory first (a
+   *  live surgery's hold, or the wait for its agent's context manager to be
+   *  re-initialized) is traced once, as a release stores it, with source
+   *  `surgery-release`; its arrival isn't traced. */
   | (TraceEventBase & {
       type: 'message:added';
       messageId: string;
@@ -399,6 +479,22 @@ export type TraceEvent =
       type: 'message:removed';
       messageId: string;
       source: string;
+    })
+  /** A write kept in memory until a live surgery's release (source
+   *  `surgery-release`) whose store threw there: none of it was stored, or,
+   *  with `mayBeStored`, context-manager couldn't tell what of it landed (the
+   *  first row it names as stored is traced as `message:added`, as a stored
+   *  write is). `external` is the address the write's metadata gave it, for
+   *  the module that wrote it
+   *  (the Discord module ends its record of a create with no row). The
+   *  agent's writes lost at a release are told of once besides, by an ops
+   *  alert of kind `store-held-lost`. */
+  | (TraceEventBase & {
+      type: 'message:lost';
+      source: string;
+      agentName: string;
+      external?: { source: string; id: string };
+      mayBeStored?: true;
     })
   /** A push/event refused at the MCPL boundary: visibly-empty content
    *  (`empty-content`, answered -32602, with no `field` or `detail`), or a
@@ -583,8 +679,9 @@ export type TraceEvent =
   | (TraceEventBase & {
       /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
        *  `reply` or `wait` as the judge answered, `error` when it failed,
-       *  timed out or answered nothing usable; `woke` is whether the batch
-       *  then woke the agent (an error does by the host's onError).
+       *  timed out or answered nothing usable; `woke` is whether the gate
+       *  goes on to deliver the batch to wake the agent (an error's is by the
+       *  host's onError). JudgeConfig says when such a delivery starts no turn.
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';
@@ -597,20 +694,6 @@ export type TraceEvent =
       inputTokens?: number;
       cacheReadTokens?: number;
       outputTokens?: number;
-    })
-  | (TraceEventBase & {
-      /** A batched wake's turn started without its `[Gate: …]` line (the
-       *  gate hands the line to the wake when its message is the newest at
-       *  the fire, EventGate isNewestEntry, and the turn's start decides).
-       *  `reason`: `newest`, on the delivery agent's start the message was
-       *  still the newest entry in the window; `held`, the host was quiesced
-       *  or another reader of the residents' shared slot had a turn alive,
-       *  so no line could be written then. */
-      type: 'gate:wake-line-omitted';
-      reason: 'newest' | 'held';
-      policyNames: string[];
-      eventType: string;
-      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'gate:config-reloaded';
@@ -690,21 +773,6 @@ export type TraceEvent =
 
   // Usage lifecycle
   | (TraceEventBase & Fields<UsageUpdatedEvent>)
-
-  // Undo/redo lifecycle
-  | (TraceEventBase & {
-      type: 'undo:completed';
-      agentName: string;
-      turnIndex: number;
-      fromBranch: string;
-      toBranch: string;
-    })
-  | (TraceEventBase & {
-      type: 'redo:completed';
-      agentName: string;
-      fromBranch: string;
-      toBranch: string;
-    })
 
   // Operator-initiated mutation (rollback/suppress/undo/hide/settings/quiesce…).
   // Mirrors the durable operator-actions.jsonl record so live UIs see the
@@ -830,10 +898,6 @@ export type TraceEvent =
       toolUseId: string;
       isError: boolean;
       durationMs: number;
-      /** The pair was queued behind a turn that replaced the puppet's
-       *  reservation (provider-admission re-entry) instead of stored
-       *  directly; it lands at that turn's end flush. */
-      deferred?: boolean;
     })
 
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
@@ -1041,14 +1105,19 @@ export type TraceEvent =
   // this stream, not a separate system. See connectome docs/observability.md.
   | (TraceEventBase & {
       type: 'ops:alert';
-      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | … */
+      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | …
+       *  A kind ending in `-clear` ends the alert of the kind before it:
+       *  'context-refusal-clear' is raised when a budget hold whose wait
+       *  raised 'context-refusal' ends with its turn stopped or removed, so
+       *  the waiting start doesn't run. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
       /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record),
-       *  bounded field by field as that record is. */
+      /** Kind-specific structured payload (mirrors the failures.log record,
+       *  where the alert writes one: a budget hold's 'context-refusal' and its
+       *  clear write none), bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 
@@ -1135,6 +1204,95 @@ export type TraceEvent =
       wakeCount: number;
       maxWakes: number;
     })
+  /**
+   * A tune-out's cancel asked for while writes were held in memory, queued
+   * for the release and its retry, taken off the queue with what it was for
+   * left undone. `hold-ended`: the hold of the epoch it was asked for
+   * (`epochId`) ended without it, so it ends nothing, and no later hold
+   * there (`currentEpochId`, the one in force when it was dropped, if one
+   * was). `note-undelivered`: its hold ended, by another cancel or by its
+   * own run, and delivering the note it carried failed (`error`).
+   * `stopped`: the host stopped while it waited, its hold still in force,
+   * which the next boot resumes without running it. `superseded`: it was
+   * asked for while an earlier cancel of the same hold ran, and joined that
+   * one when it was queued again, whose note stands.
+   * `noteLost`: it carried a reader's note, which is not delivered, or,
+   * with `noteMayBeStored`, may be stored after all: the store couldn't tell
+   * whether its write landed (`error` says what it couldn't read), as the
+   * author's notice then says it may be lost. Its
+   * author is told so in its own context where the author still exists,
+   * and a reader fork that has ended is not, the loss reaching no one
+   * (`tune-out:note-loss-untold`, `author-gone`). The persistent
+   * subconscious is told by the next boot where the host stopped, and,
+   * where another cancel ended the hold, in that cancel's release, which
+   * its window holds, rather than in a notice of its own. `noteAuthor`, whose note
+   * it was, the name it would have been delivered under (the persistent
+   * subconscious's, or the reader fork's that left it), where one is known.
+   * For the all-except hold (`scope`), the channel is its excepted one.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:deferred-cancel-dropped';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      reason: 'hold-ended' | 'note-undelivered' | 'stopped' | 'superseded';
+      currentEpochId?: string;
+      noteLost: boolean;
+      noteMayBeStored?: true;
+      noteAuthor?: string;
+      error?: string;
+    })
+  /**
+   * At boot, a hold on record (`epochId`; the all-except hold with `scope`,
+   * its channel the excepted one) that the last stop's stamp
+   * (`tune-out/<primary>/stop-stamp`) doesn't cover: the host crashed, or
+   * the store refused the stop's writes. `found`, from that run's rows:
+   * `ran`, a release of that epoch was stored after the cancel was asked,
+   * its end not recorded; `delivered`, a waiting cancel's note was written
+   * to the resident, with no release since; `asked`, the subconscious's
+   * own call of that cancel, answered as waiting, is in its window;
+   * `unknown`, nothing says whether a cancel waited. The persistent
+   * subconscious (`noteAuthor`) is told which, by a loss notice kept and
+   * tried again as the others are (`tune-out:note-loss-untold` where its
+   * write fails). Not traced: a hold no stamp covers because none was ever
+   * written (a first start on a version that stamps its stops), one whose
+   * release already told a waiting note's loss, one whose loss the stop
+   * kept, and one already told as much.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:stop-unrecorded';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      noteAuthor: string;
+      found: 'delivered' | 'ran' | 'asked' | 'unknown';
+    })
+  /**
+   * The notice telling a lost note's author (`noteAuthor`) of the loss (a
+   * `tune-out:deferred-cancel-dropped` with `noteLost`) was not written.
+   * `write-failed`: writing it threw (`error`). It is kept, and tried again
+   * whenever held writes are stored and every 60 s while none are, until it
+   * is written. One for the persistent subconscious is kept in the store
+   * too, so a stop leaves it there and the next boot tries it again; a
+   * reader fork's is dropped at a stop. This traces its first failure only,
+   * a later boot's included, and each later one is logged. `author-gone`:
+   * the framework wrote nothing, as no agent of that name is registered (a
+   * reader fork whose run has ended): the loss reaches no one, and the
+   * notice is not kept. For the all-except hold (`scope`), the channel is
+   * its excepted one.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:note-loss-untold';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      noteAuthor: string;
+      reason: 'write-failed' | 'author-gone';
+      error?: string;
+    })
 
   /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
   | (TraceEventBase & {
@@ -1163,10 +1321,8 @@ export type TraceEvent =
       channelId: string;
       epochId: string;
       trigger: 'cadence' | 'wake' | 'cancel';
-      /** Held messages the fork was handed, stored and queued. */
+      /** Held messages the fork was handed. */
       held: number;
-      /** Of those, the ones still queued behind the resident's turn. */
-      queued: number;
     })
 
   /**
@@ -1188,9 +1344,30 @@ export type TraceEvent =
       returned: number;
     })
 
+  /**
+   * The persistent subconscious's window start was set by index ordinal
+   * (#291): `fixed`, a tune-out's start fixed once no row the subconscious
+   * is owed stored before the start was out of its window, and kept for its
+   * epochs; `clamped`, a kept start (`kept`) past its window's index length
+   * on the store's branch now (one a rollback made shorter), set at the
+   * length instead.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:subconscious-window';
+      agentName: string;
+      /** The tune-outs that start there. */
+      epochIds: string[];
+      how: 'fixed' | 'clamped';
+      /** The ordinal the window starts at now. */
+      ordinal: number;
+      /** For `clamped`, the ordinal kept for them. */
+      kept?: number;
+    })
+
   // Dendrite: agent registry and lifecycle.
-  // `agent-created` is the consent event: it names the kind of agent, what
-  // ends it, and what happens to it when its spawner ends.
+  // `agent-created` is the creation event: it names the kind of agent, what
+  // ends it, and what happens to it when its spawner ends, for whatever a
+  // host records or decides on them.
   | (TraceEventBase & {
       type: 'dendrite:agent-created';
       agentName: string;
@@ -1240,7 +1417,7 @@ export type TraceEvent =
       by?: string;
       reason?: string;
     })
-  /** The message entered the recipient's store (not merely queued for it). */
+  /** The message entered the recipient's store (not merely held for it). */
   | (TraceEventBase & {
       type: 'dendrite:mail-delivered';
       mailId: string;
@@ -1248,7 +1425,10 @@ export type TraceEvent =
       from: string;
       to: string;
     })
-  /** Queued for the recipient's next boundary; `mail-delivered` follows when it lands. */
+  /** Held in memory behind a live surgery (the operator's switch awaited),
+   *  or kept for a recipient whose context manager refuses its work after a
+   *  failed re-initialization; `mail-delivered` follows when a release
+   *  stores it. */
   | (TraceEventBase & {
       type: 'dendrite:mail-deferred';
       mailId: string;
@@ -1298,6 +1478,130 @@ export type TraceEvent =
       error: string;
     })
 
+  // The presentation index (#291, src/presentation.ts): which stored rows
+  // each agent's window holds, in the order its requests carried them.
+  | (TraceEventBase & {
+      /**
+       * Rows entered an agent's window (context-manager's presentRows), at
+       * one of its presentation points (`occasion`): `count` bodies, a
+       * sharded one counted once. At `rebase`, the store's branch moved to a
+       * branch with no window for the agent, and its window there was
+       * written down: `count` is the bodies it holds.
+       */
+      type: 'presentation:presented';
+      agentName: string;
+      occasion: PresentationOccasion;
+      count: number;
+      /** At a tool boundary: the first row that couldn't join the live
+       *  stream (a tool block, or a row named as the agent), where the rows
+       *  presented there stop. It and the rows after it wait for the turn's
+       *  end. */
+      cutAt?: string;
+      /** How many of them carry no audience stamp (stored by a host's
+       *  writer that doesn't stamp), presented to the slot's owners and
+       *  its observers. */
+      unstamped?: number;
+    })
+  | (TraceEventBase & {
+      /** An agent's own rows that were stored and not in its window, found
+       *  when the agent was taken on or at boot, were presented to it. */
+      type: 'presentation:repaired';
+      agentName: string;
+      count: number;
+    })
+  | (TraceEventBase & {
+      /**
+       * A row was stamped for agents of which none reads the slot it is
+       * stored in (`deliveredTo`'s), so no window presents it by its
+       * audience. It is stored as named, never widened: observers of the
+       * slot see it only as their edge shows it.
+       */
+      type: 'presentation:unreadable-audience';
+      messageId?: string;
+      audience: string[];
+      slot: MessageSlotRef;
+      deliveredTo: string;
+    })
+  | (TraceEventBase & {
+      /** A presentation failed; the rows it didn't present stay out of the
+       *  agent's window for its next presentation point. At a fresh turn's
+       *  start (`turn-start`, `assembly`), the start fails too. With
+       *  `legacy`, the agent was left unpresented (legacy mode) until a
+       *  later move of the store's branch: its window the whole record as
+       *  before the index, or, where its strategy couldn't follow a move to
+       *  a branch that holds a window, that window, writes for it waiting in
+       *  memory: at `adopt`, its window couldn't be
+       *  written down (another version's index format, or a failed write);
+       *  at `rebase`, after the store's branch moved, its window couldn't be
+       *  written down on the new branch, or its context's strategy couldn't
+       *  follow the move (`error` says which). The framework logs that and
+       *  raises an ops alert (`presentation-legacy`). Without it, at
+       *  `adopt` or `rebase`, presenting the agent's own rows failed, or
+       *  taking out the rows the write-down took in that aren't the
+       *  agent's did, which is tried again at its next turn start or point
+       *  at rest. */
+      type: 'presentation:failed';
+      agentName: string;
+      occasion: PresentationOccasion;
+      error: string;
+      /** The rows the presentation named that didn't enter the window,
+       *  each body by the id that names it, where they are known (a write
+       *  of the window that failed). Absent where a read failed before the
+       *  rows could be named. */
+      messageIds?: string[];
+      /** Set where the failure left the agent in legacy mode. */
+      legacy?: true;
+    })
+  | (TraceEventBase & {
+      /** At a tool boundary's hand-off, the newest rows of the agent's
+       *  window weren't the rows the stream was about to be given, in that
+       *  order. The stream's later rounds are noted as unvouched, so their
+       *  thinking is left out at the next compile rather than refused. */
+      type: 'presentation:hand-off-mismatch';
+      agentName: string;
+      expected: string[];
+      tail: string[];
+    })
+  | (TraceEventBase & {
+      /**
+       * Rows were taken out of an agent's window. Every reason but `shed`
+       * and `elsewhere` is a removal from the record made through another
+       * agent's context, which context-manager tombstones in that context's
+       * window only: the rows it removed leave this agent's window too, each
+       * at its own place, so no other row's place moves (`hide`, `suppress` on its
+       * fork, a coalescer's `coalescer`, a module's `module`, a suppression
+       * a start finished, `resume`, and a refusal rewind's shed from a
+       * window that is still the record, `rewind`), or that no live context
+       * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
+       * inference failure's shed on a presented window: the rows leave the
+       * agent's own window as an undone turn's do, and stay in the record.
+       * `elsewhere` is a window written down from the shared record when the
+       * agent was taken on, or after a branch move: the rows it took in that
+       * carry an audience stamp and aren't the agent's (another agent's own
+       * rows, mail stamped for others, a held row) leave it, and stay in the
+       * record (decision 1).
+       */
+      type: 'presentation:retracted';
+      agentName: string;
+      messageIds: string[];
+      reason: PresentationRetractReason;
+    })
+  | (TraceEventBase & {
+      /** An undo or a redo on the presentation index, counted in bodies.
+       *  An undo's `retracted` is the bodies from the turn's checkpoint on
+       *  that left the agent's window, the turn's own and what arrived
+       *  after it, and it carries no `represented`. A redo's
+       *  `retracted` is the rows that entered the window after the undo, and
+       *  any of the undo's own still in it after an undo cut short, which
+       *  left so the redone rows come back after their prefix; its
+       *  `represented` is the undone rows presented again. No branch
+       *  moved. */
+      type: 'window:undone';
+      agentName: string;
+      retracted: number;
+      represented?: number;
+    })
+
   // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
   // instead of sent; a resident's explicit resend; a deliberate dismissal.
   | (TraceEventBase & {
@@ -1321,6 +1625,9 @@ export type TraceEvent =
       agentName: string;
       draftIds: string[];
     });
+
+/** Why rows left an agent's window (`presentation:retracted`). */
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
 
 /**
  * Listener for trace events.

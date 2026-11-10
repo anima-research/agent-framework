@@ -389,7 +389,7 @@ test('a silent stream whose failure trace disposes its agent keeps the failure i
     removed = !internal.agents.has('second');
   });
   const logged = () => framework.queryInferenceLogs({ agentName: 'second' }).entries
-    .map((e) => ({ success: e.entry.success, error: e.entry.error }));
+    .map((e) => ({ success: e.entry.success, error: e.entry.error, errorWords: e.entry.errorWords }));
   const cause = 'Stream ended without a final response';
   try {
     framework.start();
@@ -402,7 +402,7 @@ test('a silent stream whose failure trace disposes its agent keeps the failure i
     assert.equal(removed, true, 'the stop removed the agent before the stream logged its end');
     assert.deepEqual(settled.filter((s) => s.stopReason === 'exhausted'), [{ stopReason: 'exhausted', error: cause }], 'its settlement names the failure');
     assert.deepEqual(failures, [{ type: 'inference:exhausted', error: cause }], 'its one failure trace names it');
-    assert.deepEqual(logged(), [{ success: false, error: cause }], 'and so does its inference-log row');
+    assert.deepEqual(logged(), [{ success: false, error: cause, errorWords: cause }], 'both raw and operator-facing log reasons retain the established failure');
     assert.deepEqual(phases(), [['started', 'failed']], 'its lifecycle ends failed, not completed');
     assert.equal(membrane.calls.length, 1, 'nothing retries it or starts its turn again');
   } finally {

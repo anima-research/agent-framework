@@ -1,1 +1,1 @@
-- Fail uncancelled streams that end without a terminal event, release streaming state, and allow the next nudge to start an inference. (#907)
+- Fail uncancelled streams that end without a terminal event, release streaming state, and allow the next nudge to start an inference. (#907) This applies when the stream iterator closes; a contentless stream kept open by JSON ping events remains outside this fix (#980).
