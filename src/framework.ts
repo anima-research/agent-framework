@@ -18986,7 +18986,7 @@ export class AgentFramework {
           `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
           { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });
       }
-    }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head'));
+    }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head-moved'));
   }
 
   /**

@@ -1608,7 +1608,8 @@ export type TraceEvent =
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
        * a start finished, `resume`, a refusal rewind's shed from a window
        * that is still the record, `rewind`, and an agent's own system changes
-       * a move of its recorded head took out, `head`), or that no live context
+       * a move of its recorded head took out, `head-moved`, the
+       * `head:moved` trace after it saying why), or that no live context
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
        * inference failure's shed on a presented window: the rows leave the
        * agent's own window as an undone turn's do, and stay in the record.
@@ -1664,7 +1665,7 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection' | 'head';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection' | 'head-moved';
 
 /**
  * Listener for trace events.
