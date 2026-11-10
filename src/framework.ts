@@ -3348,14 +3348,6 @@ interface HostCommandParams {
   command?: string;
   agentName?: string;
   turns?: number;
-  /** Message-granular undo: branch the chronicle so the last N messages
-   *  (regardless of participant; system change rows among them go too,
-   *  uncounted) are no longer on the active branch (on a presented window,
-   *  but for the rows stored before the write that presented the new tail:
-   *  those the window took after that write, `returnedToArrivals`, and those
-   *  it presented with the tail, `keptInWindowAfterTarget`).
-   *  Counted in the agent's window once it is presented (#291), over the
-   *  rows of the agent's own slot. Mutually exclusive with `turns`. */
   messages?: number;
   /** Message-granular undo: awareness marks on the removed Discord
    *  messages, `none` (the default), `addressed` or `all`. Any other value
@@ -3482,7 +3474,8 @@ const residentView = (name: string, isOwn: (agentName: string) => boolean): Stor
 const observerView = (name: string, includeHeld: boolean, isOwn: (agentName: string) => boolean): StoreView =>
   viewOver(includeHeld ? subconsciousViewFilter(name) : residentViewFilter(name), (row) => !isSystemChangeNotOwn(row, isOwn));
 
-const isolatedView: StoreView = viewOver((message) => !isReasoningLoss(message.metadata), () => true);
+const isolatedView = (isOwn: (agentName: string) => boolean): StoreView =>
+  viewOver((message) => !isReasoningLoss(message.metadata), (row) => !isOthersSystemChange(row, isOwn));
 
 const derivedView = (source: StoreView, name: string, isOwn: (agentName: string) => boolean): StoreView => ({
   sees: (metadata) => !isReasoningLoss(metadata) && (source.sees(metadata) || isOwnInjection(metadata, name)),
@@ -12140,7 +12133,7 @@ export class AgentFramework {
     // agent's message and context states in the store.
     assertAgentSwitches(config);
     const parent = spec?.inherit && spec.inherit.atSequence === undefined ? this.agents.get(spec.inherit.from) : undefined;
-    const seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
+    let seedHead: HeadDeclaration | null = null;
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -12181,7 +12174,9 @@ export class AgentFramework {
         namespace = derived.namespace;
         sourceChangeOwners = derived.sourceChangeOwners;
         ownSlot = derived.ownSlot;
+        seedHead = derived.seedHead;
       } else {
+        seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
         // A namespace belongs to the agent that opened it: another agent's
         // turns there would be read as its own by inspection and by its
         // resumption, which reopens "its own namespace". So one another
@@ -12198,16 +12193,17 @@ export class AgentFramework {
         }
         this.namespaceOwners.set(namespace, config.name);
         opened = namespace;
+        const view = isolatedView(ownParticipantsOf(config.name, config.selfParticipants));
         contextManager = await ContextManager.open({
           store: this.store,
           namespace,
           isolate: true,
-          viewFilter: compiledView(isolatedView.keeps, config.toolDeclarations),
+          viewFilter: compiledView(view.keeps, config.toolDeclarations),
           strategy: config.strategy ?? new PassthroughStrategy(),
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
         });
-        this.storeViews.set(contextManager, isolatedView);
+        this.storeViews.set(contextManager, view);
         ownSlot = { namespace };
       }
       // Either manager is the run's to release (main's manager release), the derived one included.
@@ -12217,7 +12213,7 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       agent.setSourceChangeOwners(sourceChangeOwners);
       agent.setCompileHoldsChanges(config.toolDeclarations === 'entries');
-      const heads = memoryHeadDeclarations();
+      const heads = memoryHeadDeclarations(() => contextManager.currentBranch().id);
       if (seedHead) heads.write(config.name, seedHead);
       this.attachHeads(agent, heads);
       this.adoptToolResultGuard(agent);
@@ -12381,7 +12377,11 @@ export class AgentFramework {
         // The copies, and the framing below, are the child's own rows: its
         // inheritance and what it is told it is, stored for it, whoever they
         // name as their participant.
+        const parentHead = parent.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
         const compiled = await parent.getContextManager().compile();
+        const childHeads = this.headStores.get(created.agent);
+        if (parentHead) childHeads?.write(options.name, parentHead);
+        else childHeads?.delete(options.name);
         const parentsOwnChanges = ownSystemChanges(compiled, (name) => parent.ownsChange(name));
         compiled.messages.forEach((message, index) => {
           storeOwnRow(
@@ -12599,7 +12599,7 @@ export class AgentFramework {
       agent = new Agent(fullConfig, contextManager, this.membrane);
       agent.setSourceChangeOwners(this.sourceChangeOwnersOf(record));
       agent.setCompileHoldsChanges(fullConfig.toolDeclarations === 'entries');
-      this.attachHeads(agent, memoryHeadDeclarations());
+      this.attachHeads(agent, memoryHeadDeclarations(() => contextManager.currentBranch().id));
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     } catch (error) {
@@ -12674,7 +12674,6 @@ export class AgentFramework {
     return this.reopenAgentContext(record, new PassthroughStrategy());
   }
 
-  /** Open the context an ended agent left, wherever it lives: as it's stored, or with `compiling`, as that agent compiles it. */
   private async reopenAgentContext(
     record: AgentRecord,
     strategy?: ContextStrategy,
@@ -12694,10 +12693,6 @@ export class AgentFramework {
             '@animalabs/context-manager cannot reopen (ContextManager.reopenDerived)',
         );
       }
-      // A derived context sees what the chain of shared derivations it came
-      // from saw, back to the agent it started from, and its own stored
-      // injections at each step (derivedViewOf) — as deriveSharedContext
-      // opened it (#291; Weft's eleventh note).
       const view = this.derivedViewOf(record);
       const reopened = await reopen.call(ContextManager, {
         store: this.store,
@@ -12724,9 +12719,6 @@ export class AgentFramework {
     //   branch of its own (a shared fork's), merges nothing: an auxiliary
     //   view reads a namespace on this context's branch, which would show
     //   another branch's rows as that slot's.
-    // Either way, through the view it was opened with (liveViewOf), so
-    // an ended agent's context compiles as its live one did: the residents'
-    // view leaves out the other residents' stored context injections too.
     const own = record.ownSlot;
     if (own?.namespace === null) {
       if (!record.namespace) {
@@ -12784,9 +12776,7 @@ export class AgentFramework {
    * and what it observes (context-options.ts): a resident's, on the
    * residents' slot, or for an isolated agent that watches that slot, the
    * residents' view when its edge leaves held traffic out, and the
-   * subconscious's when it shows it. For an isolated agent that
-   * watches no residents' slot on its branch (a worker, a conversation
-   * fork), whose view excludes only legacy reasoning-loss notices.
+   * subconscious's when it shows it.
    */
   private liveViewOf(record: AgentRecord): StoreView {
     const isOwn = ownParticipantsOf(record.name, record.selfParticipants);
@@ -12795,7 +12785,7 @@ export class AgentFramework {
       const slot = this.registry.observedSlotOf(edge);
       return slot !== undefined && slot.branch === undefined && sameSlot(slot, RESIDENTS_SLOT);
     });
-    if (residents.length === 0) return isolatedView;
+    if (residents.length === 0) return isolatedView(isOwn);
     return observerView(record.name, residents.some((edge) => edge.includeHeld === true), isOwn);
   }
 
@@ -12817,13 +12807,6 @@ export class AgentFramework {
     return current;
   }
 
-  /**
-   * The view a context derived by shared inheritance was opened with
-   * (deriveSharedContext): what the agent its chain of derivations started
-   * from sees (liveViewOf), and the stored injections of each agent in
-   * the chain, which carry that agent's name and would otherwise read as
-   * another's. Legacy notices remain excluded even for an own injection.
-   */
   private derivedViewOf(record: AgentRecord): StoreView {
     const owner = this.viewOwnerOf(record);
     const chain: AgentRecord[] = [];
@@ -12852,6 +12835,7 @@ export class AgentFramework {
     /** The parent's message slot, on the child's own branch. */
     ownSlot: MessageSlotRef;
     sourceChangeOwners: string[];
+    seedHead: HeadDeclaration | null;
   }> {
     const parent = this.agents.get(inherit.from);
     if (!parent) {
@@ -12881,13 +12865,10 @@ export class AgentFramework {
     // alone, which is tied to the source's name (isAnotherAgentsInjection), so
     // the fork's own injections were hidden from its compile while its
     // parent's showed (#291; Weft's eleventh note, on the real compile path).
-    // The composed predicate goes to derive, so the first compile already
-    // reads through it, and is recorded beside the manager (storeViews), so
-    // main's checks of whether an agent sees a row (agentSees: a tool
-    // boundary's injection, an arrival, a reader of an unread message) ask
-    // what its compile shows. The global legacy-notice exclusion applies
+    // The global legacy-notice exclusion applies
     // even when the source has no additional view recorded.
     const view = derivedView(this.storeViews.get(source) ?? EVERY_ROW_VIEW, config.name, ownParticipantsOf(config.name, config.selfParticipants));
+    const seedHead = inherit.atSequence === undefined && parent.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -12915,6 +12896,7 @@ export class AgentFramework {
       },
       namespace: this.registry.get(inherit.from)?.namespace ?? `subagent/${config.name}`,
       sourceChangeOwners: parent.changeOwners(),
+      seedHead,
       ownSlot: {
         namespace: derivation?.slots
           ? derivation.slots.messageNamespace
@@ -15191,10 +15173,6 @@ export class AgentFramework {
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
-    // In the window, the rows the agent is sent: a held row is in a
-    // resident's written-down window and left out by its view, as another
-    // agent's injection is (agentSees, the one rule main's #853 asks
-    // everywhere).
     const passedOver = (m: StoredMessage): boolean => {
       const meta = (m.metadata ?? {}) as Record<string, unknown>;
       if (meta.system || isSystemChangeMessage(m)) return true;
@@ -18927,7 +18905,7 @@ export class AgentFramework {
     try {
       const stored = this.store.getStateJson(headDeclarationId(agentName));
       const head = isHeadDeclaration(stored) ? stored : null;
-      if (stored != null && head === null) console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside`);
+      if (stored != null && head === null) console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside, and the agent records its current tools and system text as its head, taking its own change rows out`);
       heads.set(agentName, head);
       this.headDeclarationsUnreadable.delete(agentName);
       return head;
@@ -18962,10 +18940,10 @@ export class AgentFramework {
     const refused = isMembraneError(error) && error.httpStatus === 400 && error.type !== 'context_length' && error.type !== 'auth';
     if (!recognised && !refused) return false;
     agent.keepToHeadUntilBuiltAgain();
-    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again: ${error.message}`);
+    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again, by a restart of the host or by creating the agent again; for a model that refuses system changes, set toolDeclarations: 'head' on it: ${error.message}`);
     if (!recognised) {
       this.opsAlert('head-resend', agent.name,
-        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
+        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache. A restart of the host, or creating the agent again, has it declare changes again: ${error.message}`,
         { data: { httpStatus: 400 } });
     }
     this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
@@ -18999,9 +18977,7 @@ export class AgentFramework {
     // The residents' shared slot, through a resident's view
     // (residentViewFilter: held rows out, read by heldFromResidents,
     // suppressed rows out, read by suppressedRow, and another agent's stored
-    // context injections out). Main's boundary and arrival checks read the
-    // same predicate (storeViews, agentSees, #853), recorded below, so they
-    // and the compiled view agree.
+    // context injections out).
     const options = residentContextOptions(config.name);
     const view = residentView(config.name, ownParticipantsOf(config.name, config.selfParticipants));
     // Create context manager for this agent
@@ -19122,12 +19098,7 @@ export class AgentFramework {
     }
 
     // Its own slot, with the residents' shared un-namespaced slot merged
-    // read-only, the tune-out's stamped messages included. The filter, which
-    // context-manager applies to the merged view too, leaves out the
-    // residents' stored context injections (stored-injections.ts): their
-    // context, which this agent never saw while they were placed unstored,
-    // and suppressed rows (suppressedRow), which render for no one, the
-    // reader of held traffic included.
+    // read-only, the tune-out's stamped messages included.
     // With the presentation index the merged slot stays the record its
     // window is presented from: a window presents only rows its record
     // holds. The shape is subconsciousContextOptions (context-options.ts),
@@ -19812,7 +19783,7 @@ export class AgentFramework {
           const clock = injects ? this.storeDueClock(agent, 'tool-boundary') : undefined;
           if (presentsWindow) {
             appendAll(heard, this.presentation!.presentAtBoundary(agent, [replyId, resultsId, clock?.id], { injects }).heard
-              .filter((row) => this.agentKeeps(agent, row) && (agent.declaresEntries() || !isSystemChangeMessage(row))));
+              .filter((row) => this.requestCarries(agent, row)));
           }
           // The clock's store and the boundary's presentations run their
           // listeners synchronously too, and one may have stopped the turn,
@@ -19891,13 +19862,6 @@ export class AgentFramework {
             this.midTurnInputSignals.add(agent.name);
           }
 
-          // A live stream handed these messages, system changes aside, after
-          // the results follows them in its next round, not the tool loop of
-          // a reply to [Continue]: that round's rows carry no prompt. A
-          // boundary that ends the turn, restarts the stream or falls back to
-          // a new start below hands them to no live stream, and a new start
-          // reads its own prompt from what it sends. (The routing notice below
-          // rides only an injection already here.)
           if (midTurnInjections.some((inj) => !isSystemChangeMessage(inj))) {
             const turnTrigger = this.activeTurnTriggers.get(agent.name);
             if (turnTrigger) this.turnPrompts.delete(turnTrigger);
@@ -20154,7 +20118,7 @@ export class AgentFramework {
             // left out at the next compile rather than sent under a prefix its
             // window doesn't hold.
             const vouched = presentsWindow
-              ? this.presentation!.handOff(agent, [replyId, resultsId, ...midTurnInjections.map((injection) => injection.id)]).vouched
+              ? this.presentation!.handOff(agent, [replyId, resultsId, ...midTurnInjections.map((injection) => injection.id)], (row) => this.requestCarries(agent, row)).vouched
               : true;
             // The routing notices stored above and the hand-off's
             // presentation run their listeners synchronously too, after the
@@ -21081,17 +21045,17 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
-    const templateHead = this.headDeclarations.read(template.name);
     this.usedEphemeralAgentNames.set(name, 'conversation');
     this.conversationSpawnsInFlight.add(name);
     const release: ManagerRelease = { released: false, calls: new Set() };
     try {
 
+      const view = isolatedView(ownParticipantsOf(name, templateConfig.selfParticipants));
       const contextManager = await ContextManager.open({
         store: this.store,
         namespace: `conversations/${name}`,
         isolate: true,
-        viewFilter: compiledView(isolatedView.keeps, templateConfig.toolDeclarations),
+        viewFilter: compiledView(view.keeps, templateConfig.toolDeclarations),
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
         // Provider cooldown ownership belongs to the persistent resident only;
@@ -21102,7 +21066,7 @@ export class AgentFramework {
       });
       release.manager = contextManager;
       this.trackManager(contextManager);
-      this.storeViews.set(contextManager, isolatedView);
+      this.storeViews.set(contextManager, view);
 
       // Seed with the template's compiled context, renaming the template
       // participant so the fork reads its inheritance as its own history.
@@ -21161,8 +21125,10 @@ export class AgentFramework {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
-        const templateCompile = await template.toolResultGuard.afterAnnotations(
-          () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const { head: templateHead, compiled: templateCompile } = await template.toolResultGuard.afterAnnotations(async () => ({
+          head: this.headDeclarations.read(template.name),
+          compiled: await template.getContextManager().compile(undefined, undefined, { dryRun: true }),
+        }));
         const { messages: compiledWhole, provenance } = templateCompile;
         const templatesOwnChanges = new Set([...ownSystemChanges(templateCompile, (name) => template.ownsChange(name))].flatMap((i) => compiledWhole[i]!.content));
         const templateRows = template.getContextManager().getAllMessages();
@@ -25266,20 +25232,6 @@ export class AgentFramework {
     }
   }
 
-  /**
-   * The channel a message moves its turn's locus to, by the addressed
-   * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (by
-   * isConversationalRow: not a system change or a system marker, nor a reaction, reaction
-   * removal, edit or deletion marker, apart from an edit the coalescer marks
-   * as the agent's first view) that addressed the agent, or that follows up
-   * in a channel the turn sent into (TurnRouting.engaged). Undefined for any
-   * other message. A tool boundary weighs the messages it injects by it,
-   * and noteArrival the ones no boundary of the turn weighs. The rule is
-   * pure; what is done with its answer is `speech.locus`'s: under
-   * `'latest-inbound'` the locus moves, under `'delivery'` (the default) the
-   * agent is told it was addressed from elsewhere and the locus stays
-   * (addressedElsewhereNotice).
-   */
   private repinChannel(row: ViewedRow, routing: TurnRouting): ChannelRef | undefined {
     if (!isConversationalRow(row)) return undefined;
     const m = row.metadata as Record<string, unknown> | undefined;
@@ -26040,18 +25992,14 @@ export class AgentFramework {
     return !isReasoningLoss(row.metadata) && (!view || view.keeps(row));
   }
 
+  private requestCarries(agent: Agent, row: ViewedRow): boolean {
+    return this.agentKeeps(agent, row) && (agent.declaresEntries() || !isSystemChangeMessage(row));
+  }
+
   /**
-   * Record `view`, the view `contextManager` was opened with (residentView,
-   * observerView or isolatedView over context-options.ts's
-   * residentViewFilter and subconsciousViewFilter: liveViewOf's or
-   * derivedViewOf's choice for an agent's record), as what its agent sees
-   * and keeps (storeViews), so main's checks of whether an agent sees a row
-   * (agentSees, #853: a tool boundary's injection, an arrival, an unread
-   * message's readers, the newest-row check, the recent-image scan) ask the
-   * predicate its compiles read. `sees` reads a row's metadata alone;
-   * `keeps` adds the change-row rule its compiles read (agentKeeps). A
-   * manager opened with no view keeps no record, and agentSees reads it as
-   * seeing every row, as its compiles do. Returns the manager.
+   * A manager
+   * opened with no view keeps no record, and agentSees reads it as seeing
+   * every row, as its compiles do. Returns the manager.
    */
   private recordView<T extends ContextManager>(contextManager: T, view: StoreView | undefined): T {
     if (view) this.storeViews.set(contextManager, view);
@@ -35449,16 +35397,6 @@ export class AgentFramework {
     this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
   }
 
-  /** Whether the newest row of `agent`'s window a reply could be meant for
-   *  is one of `rows`, as the start's request will hold it: clock rows,
-   *  stored context injections, system changes and the batch's own gate
-   *  line, which the start's line can't name, aside. Past NEWEST_SCAN_ROWS
-   *  rows, it answers no. A presented window is the request's own: the
-   *  start has presented what arrived (an observed co-resident's round
-   *  among it), and what arrives from here waits for the next request. A
-   *  window still in legacy mode (its write-down failed) is the slot's
-   *  record, read from its newest row, through the agent's view
-   *  (agentSees). */
   private batchIsNewest(agent: Agent, rows: readonly string[]): boolean {
     const cm = agent.getContextManager();
     const presented = cm.windowMode() === 'presented';
@@ -35610,12 +35548,7 @@ export class AgentFramework {
    * delivery agent's view, or the named agent's, which must be registered,
    * as for windowStatusFor, keeps a row, so its requests carry it, as its
    * strategy renders it (a row it has folded, as that summary), while its
-   * window holds it. The view is the one its context was opened with, as
-   * recorded for it (agentSees, main's #853: liveViewOf's choice,
-   * through the agent a shared derivation's view came from): a resident's
-   * leaves out held traffic, the other agents' stored context injections
-   * and what a suppress rule hid, the subconscious's those injections and
-   * suppressed rows, and an agent opened with no view keeps every row. An agent the registry has no
+   * window holds it. An agent the registry has no
    * record of is read through a resident's view, the one that keeps least.
    */
   private viewKeepsFor(row: StoredMessage, opts?: { forAgent?: string }): boolean {
@@ -35625,8 +35558,8 @@ export class AgentFramework {
       if (named !== undefined) throw this.unknownAgentError(named, 'A query');
       throw new Error('No agents configured');
     }
-    if (this.registry.get(agent.name)) return this.agentSees(agent, row.metadata);
-    return residentViewFilter(agent.name)(row);
+    if (this.registry.get(agent.name)) return this.requestCarries(agent, row);
+    return residentView(agent.name, ownParticipantsOf(agent.name)).keeps(row) && (agent.declaresEntries() || !isSystemChangeMessage(row));
   }
 
   /** The live agent whose context a context manager is (ModuleContext.agentNameOf, #291), or undefined. */
@@ -41941,9 +41874,7 @@ export class AgentFramework {
   }
 
   /**
-   * Whether `agent`'s view leaves suppressed rows out, asked of the view
-   * itself (storeViews): every resident's, the subconscious's and a view
-   * derived from one does. An isolated agent's own view excludes legacy
+   * An isolated agent's own view excludes legacy
    * reasoning-loss notices, not suppressed rows, so a suppressed row stamped
    * there would render.
    */

@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import type { ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
 
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
-import { AgentFramework, isSystemChangeMessage, systemChangeMetadata, taskForkSpec, type Agent, type AgentSpec, type ToolCall } from '../src/index.js';
+import { JsStore } from '@animalabs/chronicle';
+import { AgentFramework, audienceOf, isSystemChangeMessage, systemChangeMetadata, taskForkSpec, workerSpec, type Agent, type AgentRegistry, type AgentSpec, type ToolCall } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
+import { storeOwnRow } from '../src/dendrite/audience.js';
 import type { TraceEvent } from '../src/types/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -114,6 +116,38 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
+  it("reopens an isolated agent that observes a slot other than the residents' with a view that leaves another agent's change row out", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const registry = (framework as unknown as { registry: AgentRegistry }).registry;
+      registry.register(workerSpec('clerk'));
+      registry.register({ ...workerSpec('auditor'), observes: [{ agent: 'clerk' }] });
+      const view = (framework as unknown as { liveViewOf(record: unknown): { keeps(row: { content: unknown[]; metadata?: unknown }): boolean } })
+        .liveViewOf(registry.inspect('auditor'));
+      const change = [{ type: 'system_change', defineTools: [tool('c')] }];
+      assert.equal(view.keeps({ content: change, metadata: systemChangeMetadata('clerk') }), false, "clerk's change isn't the auditor's");
+      assert.equal(view.keeps({ content: change, metadata: systemChangeMetadata('auditor') }), true, 'its own is kept');
+      assert.equal(view.keeps({ content: change }), true, "a host's unstamped change is kept, as a resident's view keeps one");
+    });
+  });
+
+  it("answers a module's view lookup with what each agent's request carries: another resident's change isn't kept, nor any change for an agent on its head", async () => {
+    await withFramework([resident('alpha'), resident('beta'), { ...resident('gamma'), toolDeclarations: 'head' }], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(framework, alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      const [row] = alpha.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'alpha' } }).messages;
+      assert.ok(row, "the premise: alpha's change row is stored");
+      const host = { ...row!, metadata: undefined };
+      const keeps = (forAgent: string, of: StoredMessage) =>
+        (framework as unknown as { viewKeepsFor(row: StoredMessage, opts: { forAgent: string }): boolean }).viewKeepsFor(of, { forAgent });
+      assert.equal(keeps('alpha', row!), true, "alpha's request carries its own change");
+      assert.equal(keeps('beta', row!), false, "beta's leaves alpha's out");
+      assert.equal(keeps('beta', host), true, "and carries a host's");
+      assert.equal(keeps('gamma', host), false, 'an agent on its head carries no change');
+    });
+  });
+
   it("takes a resident's change row out of the window of a resident that observes it, when a move of its head removes it, traced as `head-moved`", async () => {
     await withFramework([resident('alpha'), { ...resident('beta'), observes: ['alpha'] }], async (framework) => {
       const traces: TraceEvent[] = [];
@@ -176,6 +210,53 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
+  it("counts host /undo N without a change the cut keeps: one stored before the target and shown after it returns to arrivals, and isn't subtracted", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      const cm = alpha.getContextManager();
+      const internals = framework as unknown as {
+        activeTurnTokens: Map<string, number>;
+        presentAtEndOf(agent: Agent): void;
+        addMessage(participant: string, content: ContentBlock[]): string;
+      };
+      say(framework, alpha, 'user', 'zero');
+      internals.activeTurnTokens.set('alpha', -1);
+      const change = internals.addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] } as unknown as ContentBlock]);
+      storeOwnRow(alpha, 'alpha', [{ type: 'text', text: 'A' } as ContentBlock]);
+      internals.activeTurnTokens.delete('alpha');
+      internals.presentAtEndOf(alpha);
+      say(framework, alpha, 'user', 'B');
+      const window = () => cm.getPresentedMessages().map((m) => (isChange(m) ? 'change' : (m.content[0] as { text: string }).text));
+      assert.deepEqual(window().slice(-3), ['A', 'change', 'B'], 'the premise: the change is shown after A, though stored before it');
+      const host = framework as unknown as { handleHostCommand(server: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string; messagesRemoved?: number }> };
+      const result = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 1 });
+      assert.equal(result.ok, true, result.error);
+      assert.equal(result.messagesRemoved, 1, 'B alone');
+      assert.ok(cm.getMessage(change as never), 'the change stays stored, as the cut keeps it');
+    });
+  });
+
+  it("counts host /undo N in the record's messages on a window that is the record, taking a change among them with them", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      (framework as unknown as { presents(agent: Agent): boolean }).presents = () => false;
+      say(framework, alpha, 'user', 'one');
+      await alpha.buildActivationRequest([tool('a')]);
+      say(framework, alpha, 'alpha', 'two');
+      say(framework, alpha, 'user', 'three');
+      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      say(framework, alpha, 'alpha', 'four');
+      assert.equal(storedChanges(alpha, 'alpha'), 1, 'the premise: the change is stored between three and four');
+      const host = framework as unknown as { handleHostCommand(server: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string; messagesRemoved?: number }> };
+      const tooMany = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 4 });
+      assert.match(tooMany.error ?? '', /history has 4;/, "the record's four messages, the change uncounted");
+      const result = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 2 });
+      assert.equal(result.ok, true, result.error);
+      assert.equal(result.messagesRemoved, 2, 'two messages, as asked');
+      assert.equal(storedChanges(alpha, 'alpha'), 0, 'and the change between them went with them');
+    });
+  });
+
   it('raises an operator line when the changes force the head to move, naming the thinking it sets aside as `binds` says', async () => {
     const wide = { ...tool('b'), description: 'b does a thing. '.repeat(2000) };
     const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
@@ -211,7 +292,7 @@ describe('toolDeclarations in the framework', () => {
     }
   });
 
-  it("raises an operator line for a move forced by the budget, and names no thinking for a model whose `binds` is false", async () => {
+  it("raises an operator line for a move forced past a fifth, naming no thinking for a model whose `binds` is false, and one for a move forced by the budget", async () => {
     for (const [binding, clause] of [[{ binds: false }, /: one whole write$/], [undefined, /set aside if its model binds it$/]] as const) {
       await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
         const traces: TraceEvent[] = [];
@@ -642,6 +723,26 @@ describe('toolDeclarations in the framework', () => {
       });
     }
 
+    it("seeds a copied child with its parent's head as the copy is taken, so a move the parent makes while the child's context opens leaves nothing to declare", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(framework, alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        const [row] = alpha.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'alpha' } }).messages;
+        assert.ok(row, "the premise: alpha's change row is stored");
+        const pending = framework.deriveAgent({ name: 'alpha-child', from: 'alpha', mode: 'copy' });
+        const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
+        heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: [prompt('You are alpha.')] });
+        alpha.getContextManager().removeMessage(row!.id);
+        const { agent: child } = await pending;
+        adopt(framework, child);
+        const request = await child.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools, [tool('a'), tool('b')], "the parent's head as the copy was taken");
+        assert.deepEqual(changesIn(request.messages), [], 'and nothing declared');
+      });
+    });
+
     it("takes a copied change of its parent's out of the child's context when the child's head moves", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
@@ -702,7 +803,7 @@ describe('toolDeclarations in the framework', () => {
     }, undefined, { conversations: { templateAgent: 'alpha' } });
   });
 
-  it("reads the template's head as a fork's creation begins, so a head the template moves meanwhile costs the fork one declaration, never a change carried twice", async () => {
+  it("reads the template's head as the fork's copy is taken, so a head the template moves while the fork's context opens is the fork's head", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
       say(framework, alpha, 'user', 'hello');
@@ -712,8 +813,8 @@ describe('toolDeclarations in the framework', () => {
       internals.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: [prompt('You are alpha.')] });
       const fork = await pending;
       const request = await fork.buildActivationRequest([tool('a'), tool('b')]);
-      assert.deepEqual(request.tools, [tool('a')], "the template's head as creation began");
-      assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'and the difference declared once');
+      assert.deepEqual(request.tools, [tool('a'), tool('b')], "the template's head as the copy was taken");
+      assert.deepEqual(changesIn(request.messages), [], 'and nothing declared');
     }, undefined, { conversations: { templateAgent: 'alpha' } });
   });
 
@@ -884,19 +985,26 @@ describe('toolDeclarations in the framework', () => {
 
     it("registers an agent's state at its first write, and none for an agent on its head", async () => {
       const registered: string[] = [];
-      await withFramework([resident('alpha'), { ...resident('beta'), toolDeclarations: 'head' }], async (framework) => {
-        const internals = framework as unknown as Internals & { store: { registerState(r: { id: string }): void } };
-        const register = internals.store.registerState.bind(internals.store);
-        internals.store.registerState = (r) => { registered.push(r.id); return register(r); };
-        const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
-        say(framework, alpha, 'user', 'hello');
-        await beta.buildActivationRequest([tool('b')]);
-        await beta.buildActivationRequest([tool('b'), tool('c')]);
-        assert.deepEqual(registered.filter((id) => id.startsWith('framework/head-declarations')), [], 'beta, on its head, registers nothing');
-        assert.equal(internals.headDeclarations.read('beta'), null, 'and reads no record');
-        await alpha.buildActivationRequest([tool('a')]);
-        assert.deepEqual(registered.filter((id) => id.startsWith('framework/head-declarations')), ['framework/head-declarations/alpha'], "alpha's state, at its adoption");
-      });
+      const tempDir = mkdtempSync(join(tmpdir(), 'tool-declarations-register-'));
+      const store = JsStore.openOrCreate({ path: join(tempDir, 'store.chronicle') });
+      const register = store.registerState.bind(store);
+      store.registerState = (r) => { registered.push(r.id); return register(r); };
+      try {
+        await withFramework([resident('alpha'), { ...resident('beta'), toolDeclarations: 'head' }], async (framework) => {
+          const internals = framework as unknown as Internals;
+          const [alpha, beta] = [framework.getAgent('alpha')!, framework.getAgent('beta')!];
+          say(framework, alpha, 'user', 'hello');
+          await beta.buildActivationRequest([tool('b')]);
+          await beta.buildActivationRequest([tool('b'), tool('c')]);
+          assert.deepEqual(registered.filter((id) => id.startsWith('framework/head-declarations')), [], 'beta, on its head, registers nothing');
+          assert.equal(internals.headDeclarations.read('beta'), null, 'and reads no record');
+          await alpha.buildActivationRequest([tool('a')]);
+          assert.deepEqual(registered.filter((id) => id.startsWith('framework/head-declarations')), ['framework/head-declarations/alpha'], "alpha's state, at its adoption");
+        }, undefined, { store });
+      } finally {
+        store.close();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     });
 
     it('makes no write that would change nothing', async () => {
@@ -973,7 +1081,7 @@ describe('toolDeclarations in the framework', () => {
         try { request = await alpha.buildActivationRequest([tool('a'), tool('c')]); } finally { console.error = error; }
         assert.deepEqual(request.tools, [tool('a'), tool('c')], 'what is current');
         assert.deepEqual(traces.filter((t) => t.type === 'head:moved').map((t) => (t as { why: string }).why), ['adopted']);
-        assert.deepEqual(errors, ["[head-declarations] alpha: the recorded head isn't one, so it was set aside"]);
+        assert.deepEqual(errors, ["[head-declarations] alpha: the recorded head isn't one, so it was set aside, and the agent records its current tools and system text as its head, taking its own change rows out"]);
         assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as { tools: ToolDefinition[] }).tools, [tool('a'), tool('c')], 'and the record is a head again');
         assert.deepEqual((internals.headDeclarations.read('beta') as { tools: ToolDefinition[] }).tools, [tool('b')], "beta's stays");
       });
@@ -1156,7 +1264,8 @@ describe('toolDeclarations in the framework', () => {
       await alpha.buildActivationRequest([tool('a')], system('v1'));
       await beta.buildActivationRequest([tool('x')]);
       const hostChange = [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[];
-      store(framework, alpha, 'system', hostChange);
+      const hostRow = (framework as unknown as { addMessage(participant: string, content: ContentBlock[]): string }).addMessage('system', hostChange);
+      assert.ok(audienceOf(alpha.getContextManager().getMessage(hostRow as never)!.metadata), "the premise: the host's untargeted write is stamped for the residents");
       assert.deepEqual(changesIn((await alpha.buildActivationRequest([tool('a')], system('v1'))).messages), [hostChange], "alpha's request carries the host's row");
       assert.deepEqual(changesIn((await beta.buildActivationRequest([tool('x')])).messages), [hostChange], "and so does beta's");
       const subconscious = await framework.getAgent('Subconscious')!.buildActivationRequest([tool('think')]);

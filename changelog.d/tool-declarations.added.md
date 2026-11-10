@@ -6,12 +6,15 @@
   A replacement of system text, which is any edit or removal of a block
   already declared, and a consolidation once the changes reach a tenth of the
   request, move the head to what's current. The share is in characters of
-  JSON on both sides, leaving out what a provider doesn't price by its
+  JSON on both sides, of the request as it's sent (another agent's rounds as
+  this agent is sent them), leaving out what a provider doesn't price by its
   characters (a base64 source's data, a generated image's, a redacted
   thinking block's, a thinking block's signature and a block's
   provider-native `rawItem`) and what a request on the native formatter
   doesn't send (a parsed block's `rawXml` and `rawXmlImagesAt`, a call's
-  `unparseableInput` and a block's `tokenEstimate`); JSON runs denser than
+  `unparseableInput` and a block's `tokenEstimate`), from any object with a
+  string `type`, so a tool call's input or a tool's schema holding one beside
+  such a `type` counts without it, though it's sent; JSON runs denser than
   prose, so tool changes read as a smaller share than they would in tokens,
   and a move comes somewhat later. The blocks' order is
   ignored. So this saves cache writes only while the system blocks already
@@ -19,10 +22,13 @@
   the head on every request. A move stores the new head first, and takes the
   agent's change rows out of its context only once that's stored. A head that
   can't be stored moves nothing: the request goes on the recorded head with
-  its changes (with none recorded, on what's current, without the agent's
-  change rows, which stay stored), and a later request moves it again. A
-  change row the store refuses to write is logged, and the first later
-  request that can store a change declares what differs then. A request
+  its changes (with none recorded, on what's current, the agent's change
+  rows taken out of its context and its compile made again, so the compile
+  the context manager keeps is the request sent; a removal the store refuses
+  then fails the turn), and a later request moves it again. A change row the
+  store refuses to write is logged, and the first later request that can
+  store a change declares what differs then; one whose write throws though
+  the store holds it is declared. A request
   carrying a change that ends with a 400 membrane doesn't file as
   `context_length` or `auth`, or with a refusal membrane recognises, goes
   again on the agent's current head, which it keeps to until it's built
@@ -42,7 +48,8 @@
   a change row shown between them, so while the agent's own change rows stay
   in place the input grows beyond the rows' own size, until a consolidation
   takes them out and for a while after, as the merges catch up. A host's own
-  change rows are the host's to remove: the agent neither folds nor removes them. An
+  change rows, stored without the agent's change metadata, are the host's to
+  remove: the agent neither folds nor removes them. An
   agent built again on `'head'` clears its recorded head at its first request
   and then takes its own change rows out of its context; a record the store
   can't clear keeps them, and a later request tries again. New trace events:
@@ -50,7 +57,14 @@
 - An agent that continues another's context starts on that agent's head:
   `deriveAgent`, and `createEphemeralAgent` with a spec whose `inherit` sets
   no `atSequence` and names a running agent that declares entries, start the
-  new agent with that agent's recorded head, read as its creation begins. A
+  new agent with that agent's recorded head, read as its context is taken
+  from that agent's (at the shared derive, or at `deriveAgent`'s copy), and
+  for a host that copies the messages itself, as its creation begins. A
+  conversation fork starts on its template's head, read as its copy of the
+  template is taken. An ephemeral agent's head, and a resumed one's, is kept
+  in memory per branch: on a branch it has no head for, it adopts its
+  current head, where a recorded head is carried into a branch made from
+  another. A
   change the request already carries, whoever's row holds it, isn't declared
   again, so the new agent reads the parent's cache and declares only its own
   difference. `deriveAgent`'s copy stamps the parent's own system changes as

@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
-import { storeOwnRow } from './dendrite/audience.js';
+import { storeOwnRow, storedOfThrownWrite } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { carriedBlock, type SentRow } from './sent-rows.js';
@@ -31,6 +31,7 @@ import {
   systemChangeMetadata,
   systemTextOf,
   copyHead,
+  pricedCharacters,
   requestCharacters,
   type HeadDeclaration,
   type HeadDeclarationStore,
@@ -176,11 +177,6 @@ import type {
 } from './types/index.js';
 
 
-/**
- * Whether a request's messages, as sanitized, end on `agentName`'s own
- * message, apart from `contextTail` stored context injections and system
- * changes after it (counted over the messages the sanitizer keeps).
- */
 function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, contextTail: number): boolean {
   const own = messages[messages.length - 1 - contextTail];
   return own !== undefined && own.participant === agentName
@@ -230,22 +226,6 @@ export function declaresBinding(config: Pick<AgentConfig, 'thinkingBinding'>): b
   return (config.thinkingBinding || undefined)?.binds === true;
 }
 
-/**
- * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
- * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
- * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
- * `refusalHandling` is anything but an object, null or false (holdsSettings),
- * or whose `toolDeclarations` is anything but 'head' or 'entries'
- * (assertOneOfSetting), or whose `autoContinue` resolveAutoContinue refuses,
- * or whose `observes` is anything but a list of names, or whose
- * `foreignRounds` is neither of its modes (assertOneOfSetting). The
- * constructor runs it first, so the rule holds wherever an Agent is built.
- * `create()` also runs it for each of its agents before anything opens, and
- * `createEphemeralAgent` before it reserves the name, so a refusal there
- * leaves nothing behind. Membrane reads `thinking.enabled`, and the refusal
- * is here because the setting is AgentConfig's.
- */
 export function assertAgentSwitches(config: AgentConfig): void {
   const agent = `Agent "${config.name}"`;
   assertBooleanSetting(
@@ -418,7 +398,7 @@ export class Agent {
    *  thinking aside reads it (mayBindThinking). */
   readonly mayBindThinking: boolean;
   private headUntilBuiltAgain = false;
-  private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations();
+  private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations(() => this.contextManager.currentBranch().id);
   private onHeadEvent: ((event: HeadEvent) => void) | undefined;
   private onChangesRemoved: ((ids: readonly MessageId[]) => void) | undefined;
   /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
@@ -711,6 +691,11 @@ export class Agent {
   private foreignRoundsAsSent(messages: NormalizedMessage[]): NormalizedMessage[] {
     if (this.foreignRounds !== 'transcript') return messages;
     return transcribeForeignRounds(messages, (participant) => this.isOwnParticipant(participant));
+  }
+
+  private rowsAsSent(messages: readonly NormalizedMessage[]): NormalizedMessage[] {
+    const carried = this.foreignRoundsAsSent([...messages]).map((m) => ({ ...m, content: m.content.filter(carriedBlock) }));
+    return this.presentOwnTurns(withoutTokenEstimates(carried));
   }
 
   /**
@@ -2258,6 +2243,7 @@ export class Agent {
       entries,
       options.dryRun === true,
       compile,
+      options.appendedMessages ?? [],
     );
     const compiledResult = settled.compiled;
     let { messages } = compiledResult;
@@ -2291,14 +2277,6 @@ export class Agent {
       origin = [...origin.slice(0, at), ...appended.map(() => null), ...origin.slice(at)];
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
     }
-    // The stored context injections and system changes the request ends on,
-    // in either order, counted over the messages the sanitizer below keeps
-    // (hasRenderedContent), since it drops a message it leaves empty, a placed
-    // blank injection among them. A change counts only under 'entries', since
-    // on the head they're left out below. [Continue] goes after them, and a
-    // tool loop's prompt is read from before them: they're context, not what
-    // woke the agent. An injection compile() places ends the tail, as on main,
-    // where every one was placed.
     let contextTail = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (!hasRenderedContent(messages[i]!.content)) continue;
@@ -2324,20 +2302,12 @@ export class Agent {
     // compression path.)
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
-    // Another agent's rounds go out as this agent is sent them (setForeignRounds).
-    messages = this.foreignRoundsAsSent(messages);
-    messages = messages
-      .map((m) => ({ ...m, content: m.content.filter(carriedBlock) }))
-      .filter((m) => m.content.length > 0);
-    // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
-    messages = withoutTokenEstimates(messages);
+    messages = this.rowsAsSent(messages).filter((m) => m.content.length > 0);
     if (!entries) messages = messages.filter((m) => !isSystemChangeMessage(m));
     if (settled.declared) {
       messages = [...messages, settled.declared];
       contextTail++;
     }
-
-    messages = this.presentOwnTurns(messages);
 
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first
@@ -2365,9 +2335,6 @@ export class Agent {
     // loop this reply continues; else none. A request that ends
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
-    // A system change isn't a turn: the request ends on what came before it,
-    // and membrane places the change after the next user turn, which is the
-    // [Continue] row when the agent's own turn is last.
     let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
@@ -2383,8 +2350,6 @@ export class Agent {
       messages = [...messages, continueTurn()];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
     } else {
-      // What the request ends on apart from the stored injections and system
-      // changes after it, which aren't something the reply answers.
       continuePrompt = toolLoopPrompt(messages.at(-1 - contextTail), index);
     }
 
@@ -2471,13 +2436,7 @@ export class Agent {
    * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
    * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of
    * its messages, so a changed one can stand for a first difference where the context manager keeps a
-   * thinking-binding record. The system text and the tools are `head`'s, the head the request will carry (under
-   * `toolDeclarations: 'entries'` its recorded head, whatever the agent advertises now, so a declared change leaves
-   * them as they were and a move of the head changes them wherever it changes what the request carries ahead of its
-   * messages), as the kv-unified prefix hash takes it: the system text
-   * as sent, its system-position injections included, and the tools in their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
-   * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
-   * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
+   * thinking-binding record. Nothing without `binds`: the compile is as it was.
    */
   private bindingCompileOptions(head: HeadDeclaration): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
@@ -2934,6 +2893,7 @@ export class Agent {
     entries: boolean,
     dryRun: boolean,
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
+    previewRows: readonly NormalizedMessage[],
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage }> {
     const current = this.currentHead(availableTools, compiled.systemInjections);
     const own = ownSystemChanges(compiled, (name) => this.ownsChange(name));
@@ -2952,10 +2912,10 @@ export class Agent {
     if (!recorded) return this.moveHead(compiled, compiledWith, recorded, current, 'adopted', dryRun, compile);
     const blocks = compiled.messages.flatMap((message, index) => (own.has(index) ? message.content.filter(isSystemChangeContent) : []));
     const ownDeclaration = effectiveDeclaration(recorded, blocks);
-    const sent = compiled.messages.flatMap((message) => message.content.filter(isSystemChangeContent));
+    const sent = [...compiled.messages, ...previewRows].flatMap((message) => message.content.filter(isSystemChangeContent));
     const difference = withoutCarried(declarationDifference(ownDeclaration, current), ownDeclaration, effectiveDeclaration(recorded, sent));
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, 'replaced', dryRun, compile);
-    const consolidation = this.consolidation(compiled, own, blocks, recorded);
+    const consolidation = this.consolidation(compiled, own, blocks, recorded, previewRows);
     if (consolidation) return this.moveHead(compiled, compiledWith, recorded, current, 'consolidated', dryRun, compile, consolidation);
     if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.changeWouldSplitCall()) {
       return { compiled, head: recorded };
@@ -2965,8 +2925,11 @@ export class Agent {
     try {
       storeOwnRow(this, declared.participant, declared.content, systemChangeMetadata(this.name) as never);
     } catch (error) {
-      console.error(`[head-declarations] ${this.name}: a system change could not be stored, so the request goes on the recorded head, and the first later request that can store a change declares what differs then:`, error);
-      return { compiled, head: recorded };
+      if (storedOfThrownWrite(error, (id) => this.contextManager.getMessage(id) !== null).length === 0) {
+        console.error(`[head-declarations] ${this.name}: a system change could not be stored, so the request goes on the recorded head, and the first later request that can store a change declares what differs then:`, error);
+        return { compiled, head: recorded };
+      }
+      console.error(`[head-declarations] ${this.name}: storing a system change threw, but the store holds it, so the request declares it:`, error);
     }
     this.onHeadEvent?.({
       type: 'head:declared',
@@ -3017,11 +2980,10 @@ export class Agent {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
       return { compiled: this.withoutOwnChanges(shown), head: current };
     }
-    if (!this.headDeclarations.write(this.name, copyHead(current))) {
-      return recorded ? { compiled, head: recorded } : { compiled: this.withoutOwnChanges(compiled), head: current };
-    }
+    const stored = this.headDeclarations.write(this.name, copyHead(current));
+    if (!stored && recorded) return { compiled, head: recorded };
     const removed = this.removeOwnChanges();
-    this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
+    if (stored) this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
     const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
   }
@@ -3038,15 +3000,16 @@ export class Agent {
   // first committing compile; and a passthrough strategy over budget, which
   // keeps changes ahead of its window, re-renders from the first change only at
   // the compile where its window first passes it.
-  private consolidation(compiled: CompileResult, own: ReadonlySet<number>, blocks: SystemChangeContent[], head: HeadDeclaration): { changeChars: number; requestChars: number; forced?: 'share' } | undefined {
+  private consolidation(compiled: CompileResult, own: ReadonlySet<number>, blocks: SystemChangeContent[], head: HeadDeclaration, previewRows: readonly NormalizedMessage[]): { changeChars: number; requestChars: number; forced?: 'share' } | undefined {
     const firstChange = own.values().next().value;
     if (firstChange === undefined) return undefined;
-    const changeChars = blocks.reduce((sum, block) => sum + JSON.stringify(block).length, 0);
-    const requestChars = requestCharacters(head, compiled.messages);
+    const sent = this.rowsAsSent(compiled.messages);
+    const changeChars = blocks.reduce((sum, block) => sum + pricedCharacters(block), 0);
+    const requestChars = requestCharacters(head, [...sent, ...this.rowsAsSent(previewRows)].filter((m) => m.content.length > 0));
     if (changeChars * 10 < requestChars) return undefined;
     // context-manager compares `firstChanged` when it's read.
     const { firstChanged } = compiled;
-    const free = firstChanged != null && firstChanged <= firstChange && !(this.mayBindThinking && compiled.messages.slice(0, firstChanged)
+    const free = firstChanged != null && firstChanged <= firstChange && !(this.mayBindThinking && sent.slice(0, firstChanged)
       .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
     if (free) return { changeChars, requestChars };
     return changeChars * 5 >= requestChars ? { changeChars, requestChars, forced: 'share' } : undefined;

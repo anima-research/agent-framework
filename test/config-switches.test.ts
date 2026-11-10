@@ -43,6 +43,7 @@ const agentWith = (settings: Record<string, unknown>) => ({
  *  activation request needs only compile(), and membrane is never touched. */
 const stubContextManager = {
   compile: async () => ({ messages: [], systemInjections: [] }),
+  currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
 } as unknown as ContextManager;
 const newAgent = (settings: Record<string, unknown>) =>
   new Agent(agentWith(settings) as never, stubContextManager, {} as Membrane);

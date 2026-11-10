@@ -141,7 +141,6 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     providerWaits: { active(agentName: string, model: string): unknown };
   };
   if (opts.asFork) {
-    // The registry's answers for a conversation fork: a home channel, and no provider scheduling of its own.
     const { registry } = internals;
     const home = registry.homeChannel.bind(registry);
     const owns = registry.ownsProviderScheduling.bind(registry);

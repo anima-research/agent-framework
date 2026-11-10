@@ -16,8 +16,9 @@
   carries one. A release before 0.26.0 depends on a membrane with no system
   changes at all.
 - A resident's registry record now states its `selfParticipants` and
-  `presentAs`, as a derived agent's does, so `inspect` shows them and a
-  context reopened from records reads the mapping that ran.
+  `presentAs`, as a derived agent's does, and so does an ephemeral agent's,
+  from its configuration where its spec leaves them out, so `inspect` shows
+  them and a context reopened from records reads the mapping that ran.
 - kv-unified's immutable-prefix hash takes an agent's tools as the wire
   carries them, as JSON writes them: a field whose value is undefined is left
   out, as membrane's request does, where it was hashed as null, and a value
@@ -25,11 +26,13 @@
   hashed as an empty object. A host whose tool definitions carry either,
   built as objects rather than parsed from JSON, gets one fresh layout at the
   upgrade, on `'head'` too.
-- A request's tools are a copy of the agent's tools as JSON writes them, on
-  `'head'` too: a value JSON can't write, such as a BigInt, fails as the
-  request is built, where it failed once the request was serialised to be
-  sent, and a field JSON leaves out, such as a function, is left out of the
-  request as it was of what was sent.
+- A request the framework builds for a turn takes a copy of the agent's
+  tools as JSON writes them, on `'head'` too: a value JSON can't write, such
+  as a BigInt, fails as the request is built, where it failed once the
+  request was serialised to be sent, and a field JSON leaves out, such as a
+  function, is left out of the request as it was of what was sent. The
+  direct API (`Agent.runInference`, `runInferenceWithInjections`) passes the
+  tools it's given as they are, as before.
 - A message-count undo (`/undo` with `messages`) counts every message but
   system change rows: the change rows among the last N go with them
   uncounted, and a refusal's count of the messages the history holds leaves
@@ -48,5 +51,6 @@
 - A system change row, a host's or an agent's own, isn't a row a reply
   could be meant for. So a change row stored after a batched wake's messages
   doesn't make the turn's start write the wake's `[Gate: …]` line, as a
-  clock row doesn't. This holds in a presented window and in one still in
-  legacy mode.
+  clock row doesn't, while the rows after the messages are among the 32
+  newest the check reads. This holds in a presented window and in one still
+  in legacy mode.

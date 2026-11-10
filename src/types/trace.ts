@@ -137,7 +137,8 @@ export type TraceEvent =
        *  'entries', a replacement of system text, a consolidation, or a
        *  request on the head that found changes left from an earlier period. */
       why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
-      /** The change rows removed, since the head now holds them. */
+      /** The change rows removed, since the head now holds what they
+       *  declared, or what they declared is no longer current. */
       changesRemoved: number;
       /** For a consolidation: the changes' characters as JSON, and those of the request they reached a share of. */
       changeChars?: number;

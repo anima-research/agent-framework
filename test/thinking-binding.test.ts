@@ -36,6 +36,7 @@ const agentWith = (settings: Record<string, unknown>) => ({
  *  compile(), so membrane is touched only when a test sends the request. */
 const oneMessage = {
   compile: async () => ({ messages: [{ participant: 'user', content: [{ type: 'text', text: 'Hello.' }] }], systemInjections: [] }),
+  currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
 } as unknown as ContextManager;
 const newAgent = (settings: Record<string, unknown>) =>
   new Agent(agentWith(settings) as never, oneMessage, {} as MembraneType);

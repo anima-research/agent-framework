@@ -240,8 +240,11 @@ describe('a message injected at a tool boundary', () => {
         modules: [module],
       });
       module.framework = framework;
+      const mismatches: unknown[] = [];
+      framework.onTrace((t) => { if (t.type === 'presentation:hand-off-mismatch') mismatches.push(t); });
       const change: ContentBlock = { type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZCHANGE', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock;
       const injected = await turnWith([[change], [text('HEARD')]]);
+      assert.deepEqual(mismatches, [], 'the boundary hands its stream over as vouched for, the change it presented but left out of the stream included');
       assert.ok(framework.getAgent('assistant')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('ZZCHANGE')),
         'the premise: the boundary stored the change');
       assert.notEqual(holding(injected, 'HEARD'), '', 'the message beside it goes in');

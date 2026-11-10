@@ -16,6 +16,7 @@ import type { Membrane } from '@animalabs/membrane';
 function agentCompiling(messages: unknown[]): Agent {
   const cm = {
     compile: async () => ({ messages, systemInjections: [] }),
+    currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
   } as unknown as ContextManager;
   return new Agent(
     { name: 'tester', model: 'test-model', systemPrompt: 'sys' },

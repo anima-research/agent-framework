@@ -12,12 +12,13 @@ export interface HeadDeclarationStore {
   delete(agentName: string): boolean;
 }
 
-export function memoryHeadDeclarations(): HeadDeclarationStore {
+export function memoryHeadDeclarations(branch: () => string): HeadDeclarationStore {
   const heads = new Map<string, HeadDeclaration>();
+  const key = (agentName: string) => JSON.stringify([branch(), agentName]);
   return {
-    read: (agentName) => heads.get(agentName) ?? null,
-    write: (agentName, head) => { heads.set(agentName, head); return true; },
-    delete: (agentName) => { heads.delete(agentName); return true; },
+    read: (agentName) => heads.get(key(agentName)) ?? null,
+    write: (agentName, head) => { heads.set(key(agentName), head); return true; },
+    delete: (agentName) => { heads.delete(key(agentName)); return true; },
   };
 }
 
@@ -174,7 +175,11 @@ export function copyHead(head: HeadDeclaration): HeadDeclaration {
 }
 
 export function requestCharacters(head: HeadDeclaration, messages: readonly unknown[]): number {
-  return JSON.stringify({ system: head.system, tools: head.tools, messages }, unpricedLeftOut).length;
+  return pricedCharacters({ system: head.system, tools: head.tools, messages });
+}
+
+export function pricedCharacters(value: unknown): number {
+  return JSON.stringify(value, unpricedLeftOut).length;
 }
 
 const UNPRICED_BLOCK_FIELDS = new Set(['rawItem', 'rawXml', 'rawXmlImagesAt', 'unparseableInput', 'tokenEstimate']);

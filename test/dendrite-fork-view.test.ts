@@ -440,7 +440,6 @@ describe("a derived agent's change rows, its source's among them", () => {
   let framework: AgentFramework;
   const tool = (name: string) => ({ name, description: name, inputSchema: { type: 'object' as const, properties: {} } });
   const change = (name: string) => [{ type: 'system_change', defineTools: [tool(name)] }] as never;
-  /** The tools a request's change rows define. */
   const defined = (messages: ReadonlyArray<{ content: unknown }>): string[] =>
     messages.flatMap((m) => (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
       .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
@@ -477,7 +476,6 @@ describe("a derived agent's change rows, its source's among them", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  /** A host's shared child `c` of mira, and `g` of `c` made while `c` runs: `g` shared too, or a copy `deriveAgent` makes. */
   async function childAndGrandchild(copy = false) {
     const { name: _c, ...cSpec } = taskForkSpec('c', { parent: 'mira', inherit: { mode: 'shared' } });
     const c = await framework.createEphemeralAgent({ name: 'c', model: 'test-model', systemPrompt: prompt('You are mira.'), toolDeclarations: 'entries' }, cSpec);

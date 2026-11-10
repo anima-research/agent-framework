@@ -141,13 +141,16 @@ export interface AgentConfig {
    *   at a compile that already rewrites them, or a fifth at any compile,
    *   move the head to what's current, with one write. The share is in
    *   characters of JSON on both sides: the changes', and the request's, its
-   *   head's tools and system text and its messages, leaving out what a
+   *   head's tools and system text and its messages as it sends them
+   *   (another agent's rounds as this agent is sent them), leaving out what a
    *   provider doesn't price by its characters (a base64 source's data, a
    *   generated image's, a redacted thinking block's, a thinking block's
    *   signature and a block's provider-native `rawItem`) and what a request
    *   on the native formatter doesn't send (a parsed block's `rawXml` and
    *   `rawXmlImagesAt`, a call's `unparseableInput` and a block's
-   *   `tokenEstimate`). JSON runs denser than prose, so tool changes read as
+   *   `tokenEstimate`), from any object with a string `type`, so a tool
+   *   call's input or a tool's schema holding one beside such a `type` counts
+   *   without it, though it's sent. JSON runs denser than prose, so tool changes read as
    *   a smaller share than they would in tokens, and a move comes somewhat
    *   later. Only for models that
    *   take mid-conversation system messages on the native formatter: the
@@ -175,8 +178,8 @@ export interface AgentConfig {
    * takes them out); it keeps
    * a resident's and a conversation fork's recorded head in its store, so a
    * restart keeps it (an ephemeral agent's, a resumed one's included, is kept
-   * in memory, so a resumed agent adopts its current head at its first
-   * request);
+   * in memory, per branch, so a resumed agent adopts its current head at its
+   * first request, and a run on a branch it has no head for adopts there);
    * and when a request carrying a change
    * ends with a refusal membrane recognises, or with a 400 it doesn't file
    * as context overflow or an account refusal (`type` `context_length` or
@@ -186,7 +189,7 @@ export interface AgentConfig {
    * out of its context once its record is cleared (a record the store can't
    * clear keeps them until it can), while its compile, made as an
    * `'entries'` agent's, holds a host's until then. An Agent used without the framework
-   * keeps its head in memory and has no such resend. The direct API
+   * keeps its head in memory, per branch of its context, and has no such resend. The direct API
    * (runInference) declares nothing: it sends the tools its caller passes
    * and the current system text, and leaves the context's changes out of its
    * request, though under `'entries'` its compile holds them, as a compile
