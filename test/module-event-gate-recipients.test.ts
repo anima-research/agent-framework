@@ -278,7 +278,7 @@ describe("a debounced module event wakes the agents its response asked inference
     }
   });
 
-  it('a request for every agent (true) is batched as before: the batch wakes every resident, and its line is stored as a write that names no agent', async () => {
+  it('a request for every agent (true) is batched as before: the batch wakes every resident, and its message, in their windows, gets no line', async () => {
     const { f, turns, off } = await setup([resident('agent'), resident('other')]);
     try {
       remind(f, 'water the plants', true);
@@ -286,9 +286,8 @@ describe("a debounced module event wakes the agents its response asked inference
       fire(f);
       await f.framework.runUntilIdle();
       assert.deepEqual([...turns].sort(), ['agent', 'other']);
-      const lines = rows(f, '[Gate:');
-      assert.equal(lines.length, 1);
-      assert.deepEqual(audienceOf(lines[0]!), ['agent', 'other']);
+      assert.deepEqual(rows(f, '[Gate:'), [], 'no line: the message is in their windows');
+      assert.equal(rows(f, 'water the plants').length, 1, 'the message, stored once');
     } finally { off(); await f.close(); }
   });
 

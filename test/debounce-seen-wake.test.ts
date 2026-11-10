@@ -270,7 +270,7 @@ describe('debounced writes already read and answered', () => {
     } finally { off(); await f.close(); }
   });
 
-  it("a module message stored for the agent it asks inference for alone: the gate quotes the event, so a resident outside that audience is woken with it", async () => {
+  it("a module message stored for the agent it asks inference for alone: the batch wakes that agent, not a resident outside the message's audience", async () => {
     const module = new TargetedReminderModule();
     const { f } = await setup(60_000, false, undefined,
       ['agent', 'other'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })), module);
@@ -286,9 +286,8 @@ describe('debounced writes already read and answered', () => {
       await eventually(() => module.entered.has('first'), 'the first turn reached its tool');
       module.release('first');
       await idle;
-      assert.ok(turns.includes('other'), `premise: the batch woke the resident outside the message's audience (${turns.join(', ')})`);
-      const request = JSON.stringify(f.membrane.calls[turns.indexOf('other')]);
-      assert.ok(request.includes('water the plants'), "the resident outside the message's audience is woken with the event");
+      assert.ok(turns.includes('agent'), `premise: the batch woke the agent the message is for (${turns.join(', ')})`);
+      assert.ok(!turns.includes('other'), `the resident outside the message's audience isn't woken (${turns.join(', ')})`);
     } finally { off(); await f.close(); }
   });
 
