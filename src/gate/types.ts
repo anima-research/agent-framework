@@ -527,8 +527,8 @@ export interface GateEventInfo {
    *  every agent getAgentNames lists. */
   recipients?: readonly string[];
   /** Set by the framework on a silent heartbeat tick's event, which stores
-   *  nothing: a batch's line leaves it out, and an agent whose share of a
-   *  batch is ticks alone wakes as the tick (WakeProvenance.silentHeartbeat). */
+   *  nothing: a batch's line leaves it out, and each agent it reaches is
+   *  woken as the tick too (WakeProvenance.silentHeartbeat). */
   silentHeartbeat?: { eventId: string; serverId: string };
   /**
    * Set when the framework asked whether the event is suppressed before it

@@ -5742,8 +5742,6 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
-            // An agent whose share of a batch is silent ticks alone wakes as
-            // the tick (deliverHeartbeat).
             ...(provenance?.silentHeartbeat ? { suppressProse: true, silentHeartbeat: provenance.silentHeartbeat } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
@@ -7008,9 +7006,6 @@ export class AgentFramework {
         ...(wake.silent ? { silent: true } : {}),
       },
       tags: [],
-      // In a batch, the tick itself wakes the agents its direct wake does,
-      // not every agent the gate wakes, such as a conversation fork, and
-      // wakes them as the tick (EventGate.deliverEvents).
       ...(wake.silent ? {
         recipients: this.heartbeatTargets(),
         silentHeartbeat: { eventId: wake.eventId, serverId: 'heartbeat' },
@@ -41746,9 +41741,6 @@ export class AgentFramework {
       metadata: e.gateMetadata,
       tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
       ...(e.targetAgents !== undefined ? { recipients: e.targetAgents.filter((name) => this.agents.has(name)) } : {}),
-      // A silent tick's batch wakes as the tick, and only the agents its
-      // direct wake reaches, as the framework's own heartbeat's tick does
-      // (heartbeatGateEvent).
       ...(e.silentHeartbeat !== undefined ? {
         silentHeartbeat: e.silentHeartbeat,
         ...(e.targetAgents === undefined

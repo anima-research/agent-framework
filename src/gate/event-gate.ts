@@ -157,7 +157,6 @@ interface PendingEvent {
   routeChannelId?: string;
   /** GateEventInfo.recipients. */
   recipients?: readonly string[];
-  /** GateEventInfo.silentHeartbeat. */
   silentHeartbeat?: { eventId: string; serverId: string };
   after?: WritePlacement;
   replyTo?: { serverId: string; channelId: string };
@@ -240,8 +239,8 @@ export interface WakeProvenance {
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
-  /** An agent whose share of a batch is silent heartbeat ticks alone wakes
-   *  as the batch's last tick: the framework makes the wake a silent
+  /** On the wake a batch's silent heartbeat ticks give each agent they
+   *  reach, as the batch's last tick: the framework makes the wake a silent
    *  heartbeat, prose suppressed, as the tick's own wake is when the gate
    *  lets it through at once. */
   silentHeartbeat?: { eventId: string; serverId: string };
@@ -4214,11 +4213,6 @@ export class EventGate {
       });
     }
     if (events.length === 0) return;
-    // A silent tick stored nothing, so no line names it: the other events
-    // are delivered as if it weren't there, and every agent the ticks name
-    // is also woken as the batch's last tick, as the tick's own wake would
-    // be. Where the other events' wake is dropped once answered, the tick's
-    // silent turn runs; where both start a turn, the merge is ordinary.
     const ticks = events.filter((e) => e.silentHeartbeat !== undefined);
     const said = events.filter((e) => e.silentHeartbeat === undefined);
     const reached = (some: PendingEvent[]): Set<string> => {
