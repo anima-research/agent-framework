@@ -24,7 +24,7 @@ import { join } from 'node:path';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, UNBOUND_REASON, classifyBlock, referenceRegistry } from '../src/mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, PAYLOAD_NEVER, UNBOUND_REASON, classifyBlock, referenceRegistry } from '../src/mcpl/references.js';
 import type { ReferenceRecord, ReferenceTestimony } from '../src/mcpl/references.js';
 import { nonErrorResultText } from '../src/tool-result-history.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -72,6 +72,9 @@ const blocks = (test: string) => [
   { type: 'image', uri: uris(test).old, mimeType: 'image/png', expiresAt: '2099-12-31T00:00:00Z\u202E' },
 ];
 
+/** What a reference shows that only its result's own claims call `never`, such as a module's: no id to fetch it by. */
+const RESULT_NEVER = (name: string) => ({ type: 'text', text: `[Reference not shown "${name}": its content is marked never to reach you or your tools.]` });
+
 /** A `never` reference, which RFC-005 withholds, with its uri, from every lane the model reads. */
 const never = (test: string) => ({ type: 'resource', uri: `https://files.example.invalid/${test}/sealed.pdf?sig=never-token`, name: 'sealed.pdf', disposition: 'never' });
 
@@ -92,14 +95,14 @@ class Forward implements Module {
   async stop(): Promise<void> {}
   async onProcess(): Promise<EventResponse> { return {}; }
   getTools(): ToolDefinition[] {
-    return ['whole', 'unstructured', 'nested', 'deep--nested', 'failing'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
+    return ['whole', 'unstructured', 'nested', 'deep--nested', 'failing', 'plain'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
     this.during();
     if (name === 'nested') return { success: true, data: this.nested, structured: this.nestedStructured };
     if (name === 'failing') return { success: false, isError: true, error: 'the module failed', data: this.nested, structured: { partial: true } };
-    const result = await this.ctx!.callTool({ id: `fwd-${randomUUID()}`, name: 'mcpl--files--attach', input: {} });
+    const result = await this.ctx!.callTool({ id: `fwd-${randomUUID()}`, name: name === 'plain' ? 'mcpl--plain--attach' : 'mcpl--files--attach', input: {} });
     if (name === 'unstructured') {
       const { structured: _structured, ...rest } = result;
       return rest;
@@ -439,16 +442,79 @@ test("a module's structured result, an MCPL peer's it got through ctx.callTool, 
     // peer's: its object, its uri left out where the model's line for it
     // leaves it out, as here, where it carries a signature.
     const expected: unknown[] = [...treated(report!.refId!, big!.refId!, old!.refId!, link!.refId!)];
-    expected.push({ type: 'resource', refId: sealed!.refId!, name: 'sealed.pdf', savedTo: null });
+    expected.push({ type: 'resource', refId: sealed!.refId!, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error });
     assert.deepEqual(object, { content: expected, structuredContent: { attachments: 2 }, isError: false });
     // The one that counts as expired isn't fetched, as the model's lanes'
     // fetch passes over it (autoFetchReferences).
-    assert.deepEqual(fetched, [uris('module').report, uris('module').big, never('module').uri],
-      'the module\'s references were fetched for the script, but the expired one');
+    assert.deepEqual(fetched, [uris('module').report, uris('module').big],
+      'the module\'s references were fetched for the script, but the expired one and the never one');
     // Each came through ctx.callTool, whose arrival bound it to the server
     // that sent it, and the exit adds no other server.
     for (const uri of [uris('module').report, never('module').uri]) {
       assert.deepEqual(referenceRegistry.findByUri(uri)?.serverIds, ['files'], uri);
+    }
+  });
+});
+
+test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `never` in its blocks, the record its uri already has, and registers its `never` references marked, though its other references aren't registered", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const uri = `https://files.example.invalid/failure-never/${randomUUID()}.pdf`;
+    const c = classifyBlock({ type: 'resource', uri }) as { testimony: ReferenceTestimony };
+    const record = referenceRegistry.register(c.testimony, 'files');
+    const referenced = `https://files.example.invalid/failure-never/${randomUUID()}-referenced.pdf`;
+    const byReference = referenceRegistry.register((classifyBlock({ type: 'resource', uri: referenced }) as { testimony: ReferenceTestimony }).testimony, 'files');
+    const unregistered = `https://files.example.invalid/failure-never/${randomUUID()}-other.pdf`;
+    const unregisteredPlain = `https://files.example.invalid/failure-never/${randomUUID()}-other-plain.pdf`;
+    answer({
+      content: [
+        { type: 'text', text: 'the attach failed' },
+        { type: 'image', uri, data: 'aGk=', mimeType: 'image/png', disposition: 'never' },
+        { type: 'resource', uri: referenced, disposition: 'never' },
+        { type: 'resource', uri: unregistered, disposition: 'never' },
+        { type: 'resource', uri: unregisteredPlain },
+      ],
+      isError: true,
+    });
+    await script('fwd--whole');
+    assert.deepEqual([record.payloadNever, byReference.payloadNever], [true, true]);
+    const fresh = referenceRegistry.findByUri(unregistered);
+    assert.deepEqual([fresh?.payloadNever, fresh?.serverIds, referenceRegistry.findByUri(unregisteredPlain)], [true, ['files'], undefined]);
+    const plainUri = `https://files.example.invalid/failure-never/${randomUUID()}-plain.pdf`;
+    const plain = referenceRegistry.register((classifyBlock({ type: 'resource', uri: plainUri }) as { testimony: ReferenceTestimony }).testimony, 'plain');
+    answer({ content: [{ type: 'text', text: 'the plain attach failed' }, { type: 'resource', uri: plainUri, disposition: 'never' }], isError: true });
+    const failed = JSON.parse(await script('fwd--plain')) as { isError: boolean; content: Array<{ text?: string }> };
+    assert.equal(failed.isError, true);
+    assert.ok(JSON.stringify(failed).includes('the plain attach failed'), JSON.stringify(failed));
+    assert.equal(plain.payloadNever, undefined);
+    const nestedUri = `https://files.example.invalid/failure-never/${randomUUID()}-nested.pdf`;
+    const nested = referenceRegistry.register((classifyBlock({ type: 'resource', uri: nestedUri }) as { testimony: ReferenceTestimony }).testimony, 'files');
+    const nestedFresh = `https://files.example.invalid/failure-never/${randomUUID()}-nested-fresh.pdf`;
+    answer({ content: [{ type: 'text', text: 'the attach failed', attachment: { type: 'resource', uri: nestedUri, disposition: 'never' }, also: { type: 'resource', uri: nestedFresh, disposition: 'never' } }], isError: true });
+    await script('fwd--whole');
+    assert.equal(nested.payloadNever, true, 'a `never` nested in a failure\'s block marks as a success\'s would');
+    assert.deepEqual([referenceRegistry.findByUri(nestedFresh)?.payloadNever, referenceRegistry.findByUri(nestedFresh)?.serverIds], [true, ['files']], 'and registers its uri marked where it has no record');
+    const unreadable = `https://files.example.invalid/failure-never/${randomUUID()}-unreadable.pdf`;
+    const unreadablePlain = `https://files.example.invalid/failure-never/${randomUUID()}-unreadable-plain.pdf`;
+    answer({ content: [{ type: 'resource', uri: unreadable, disposition: 'never' }, { type: 'resource', uri: unreadablePlain }, { type: 'text', text: 'the attach failed', count: BigInt(1) }], isError: true });
+    await script('fwd--whole');
+    assert.deepEqual([referenceRegistry.findByUri(unreadable)?.payloadNever, referenceRegistry.findByUri(unreadable)?.serverIds], [true, ['files']], "a top-level `never` registers where the nested walk can't read the result");
+    assert.equal(referenceRegistry.findByUri(unreadablePlain), undefined, 'and nothing else does');
+  });
+});
+
+test("an MCPL peer's embedded resource beside a `never` for its uri reaches a script as the `never` notice, in either order, called directly and through a module", async () => {
+  await withPeers(async ({ answer, script }) => {
+    for (const order of ['embedded-first', 'never-first'] as const) {
+      for (const tool of ['mcpl--files--attach', 'fwd--whole'] as const) {
+        const uri = `https://files.example.invalid/embedded-never/${randomUUID()}.txt`;
+        const embedded = { type: 'resource', resource: { uri, mimeType: 'text/plain', text: 'embedded-secret' } };
+        const sealed = { type: 'resource', uri, name: 'sealed.txt', disposition: 'never' };
+        answer({ content: order === 'embedded-first' ? [embedded, sealed] : [sealed, embedded], structuredContent: {} });
+        const out = await script(tool);
+        assert.ok(!out.includes('embedded-secret'), `${order}, ${tool}: ${out}`);
+        const shown = (JSON.parse(out) as { content: unknown[] }).content[order === 'embedded-first' ? 0 : 1];
+        assert.deepEqual(shown, { type: 'text', text: '[Resource not shown: its content is marked never to reach you or your tools.]' }, `${order}, ${tool}: ${out}`);
+      }
     }
   });
 });
@@ -474,11 +540,9 @@ test("a module's reference deeper in its blocks reaches a script as the model's 
     ];
     const out = await script('fwd--nested');
     assert.ok(!out.includes('never-token') && !out.includes('object-token'), out);
-    const object = JSON.parse(out) as { content: [unknown, { value: { attachment: { refId: string } } }] };
-    const refId = object.content[1].value.attachment.refId;
-    // A reference the module made itself, bound to no server, says why its
-    // fetch would be refused.
-    const stub = { type: 'resource', refId, name: 'sealed.pdf', savedTo: null, unfetchable: `it's ${UNBOUND_REASON}` };
+    const object = JSON.parse(out) as { content: [unknown, unknown] };
+    // A reference only the module's result calls never gives out no id.
+    const stub = RESULT_NEVER('sealed.pdf');
     assert.deepEqual(object, {
       content: [
         { type: 'text', text: 'one sealed report' },
@@ -525,7 +589,8 @@ test("a server's result reaches a script as its dispatch gave it when its server
 
 test("a module tool's result is treated when a server with a prefix that fits its name connects while its call is in flight", async () => {
   await withPeers(async ({ script, forward, prefixes, fetched }) => {
-    forward.nested = [never('connect')];
+    const { disposition: _never, ...plain } = never('connect');
+    forward.nested = [plain];
     // The prefix arrives as a runtime connect gives it, after the dispatch
     // sent the call to the module.
     forward.during = () => { prefixes.set('fwd--deep', 'files'); };
@@ -538,14 +603,27 @@ test("a module tool's result is treated when a server with a prefix that fits it
   });
 });
 
+test("a module tool's `never` result is passed over and shown with the reason when a server with a prefix that fits its name connects while its call is in flight", async () => {
+  await withPeers(async ({ script, forward, prefixes, fetched }) => {
+    forward.nested = [never('connect-never')];
+    forward.during = () => { prefixes.set('fwd--deep', 'files'); };
+    const out = await script('fwd--deep--nested');
+    assert.equal(prefixes.get('fwd--deep'), 'files', 'the prefix arrived while the call ran');
+    assert.ok(!out.includes('never-token'), out);
+    const object = JSON.parse(out) as { content: unknown[] };
+    assert.deepEqual(object.content, [RESULT_NEVER('sealed.pdf')]);
+    assert.deepEqual(fetched, [], 'the exit fetches nothing for it');
+  });
+});
+
 test("a module's failed result with structured content reaches a script with its blocks treated and its error", async () => {
   await withPeers(async ({ script, forward }) => {
     forward.nested = [{ type: 'text', text: 'partly attached' }, never('module-failing')];
     const out = await script('fwd--failing');
     assert.ok(!out.includes('never-token'), out);
-    const object = JSON.parse(out) as { content: [unknown, { refId: string }]; structuredContent: unknown; isError: boolean };
+    const object = JSON.parse(out) as { content: unknown[]; structuredContent: unknown; isError: boolean };
     assert.deepEqual(object, {
-      content: [{ type: 'text', text: 'partly attached' }, { type: 'resource', refId: object.content[1].refId, name: 'sealed.pdf', savedTo: null, unfetchable: `it's ${UNBOUND_REASON}` }],
+      content: [{ type: 'text', text: 'partly attached' }, RESULT_NEVER('sealed.pdf')],
       structuredContent: { partial: true },
       isError: true,
     });
@@ -664,11 +742,17 @@ test("a nested never decides over a plain reference to its uri at the top, for a
       const fromModule = await exit({ success: true, data: content('module', where), structured: {} }, 'fwd--whole', false);
       for (const out of [fromPeer, fromModule]) {
         assert.ok(!out.includes('elsewhere.example.invalid'), `${where}: ${out}`);
-        // The view was written, each block in it, the link as its object.
+        // The view was written, each block in it, the link as its object, or,
+        // where only the module's result says never, as that notice.
         const object = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
         assert.equal(object.isError, false, out);
         assert.equal(object.content.length, 3, out);
         const link = (where === 'top' ? object.content[0] : object.content[0]!.link) as Record<string, unknown>;
+        if (out === fromModule) {
+          // Only the module's result says never, so the link gives out no id.
+          assert.deepEqual(link, RESULT_NEVER('plain.csv'), out);
+          continue;
+        }
         assert.equal(link.type, 'resource_link', out);
         assert.match(String(link.refId), /^ref_/, out);
         assert.equal(link.uri, undefined, out);
@@ -783,8 +867,7 @@ test("a nested link's uri doesn't turn on the order of the blocks: a reference n
 test("a link's uri reads its record as it stood before the script lane registered anything, through an eviction the treatment's own registrations make", { timeout: 60_000 }, async () => {
   await withPeers(async ({ answer, script, exit }) => {
     for (const route of ['peer', 'module'] as const) {
-      // An earlier result marks the uri never; off the server's origin, so a
-      // link to it with no such claim shows its uri.
+      // An earlier result marks the uri never.
       const uri = `https://elsewhere.example.invalid/evicted-${route}/report.csv`;
       answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
       await script('mcpl--files--attach');
@@ -1073,7 +1156,7 @@ test("a never nested where only the script's view reads it withholds a link whos
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('view-cut'), out);
     const link = (JSON.parse(out) as { content: Array<Record<string, unknown>> }).content[1]!;
-    assert.deepEqual(['uri' in link, typeof link.refId], [false, 'string'], out);
+    assert.deepEqual(link, { type: 'text', text: '[Reference not shown "report.csv": its content is marked never to reach you or your tools.]' }, out);
   });
 });
 

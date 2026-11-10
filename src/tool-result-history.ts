@@ -26,11 +26,13 @@ import {
   AUDIO_NO_DATA_TEXT,
   AUDIO_NO_MEDIA_TYPE_TEXT,
   IMAGE_NO_DATA_TEXT,
+  EMBEDDED_RESOURCE_NEVER_TEXT,
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
   buildReferenceStub,
   classifyBlock,
   contentClaims,
+  embeddedWithheld,
   inlineNeverUri,
   referenceBlockForScript,
   referenceStubOrNull,
@@ -170,7 +172,8 @@ function toolResultBlock(raw: unknown, claims: ResultClaims): ToolResultBlock {
       return { kind: 'marker', text: c.shown };
     case 'embedded':
       // MCP's embedded resource shows as the block its contents make would
-      // show here. Its uri never shows.
+      // show here, unless a `never` names its uri. Its uri never shows.
+      if (embeddedWithheld(raw, claims)) return { kind: 'withheld', text: EMBEDDED_RESOURCE_NEVER_TEXT };
       if (c.contents.kind === 'block') return toolResultBlock(c.contents.block, claims);
       return c.contents.kind === 'withheld'
         ? { kind: 'withheld', text: INLINE_WITHHELD_TEXT }
@@ -558,7 +561,7 @@ function claimsInHistoryOrThrow(data: unknown): ResultClaims {
  * RFC-005 governs is shown as the script lane shows it, a reference as its
  * stub's facts, a link's uri among them only where the model's line for it
  * would show it, an invalid one as the notice, and MCP's embedded resource as
- * the block its contents make (referenceBlockForScript), and inline data
+ * the block its contents make or its `never` notice (referenceBlockForScript), and inline data
  * that also claims a uri of any type or a disposition as the withheld
  * notice, each notice as a text block. A null, absent or empty uri claims
  * none (hasUri), so inline data beside one is itself. Any other value is
