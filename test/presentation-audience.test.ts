@@ -109,6 +109,19 @@ describe("the presentation index's audience rule", () => {
     assert.equal(bearingOf(heldRow, watcher, RESIDENTS_SLOT), 'elsewhere', "through an edge that doesn't show held traffic");
   });
 
+  it('legacy reasoning-loss notices are nowhere presented or injected, including through observe edges', () => {
+    const notice = { system: true, kind: 'reasoning-loss' } as MessageMetadata;
+    for (const metadata of [notice, withAudience(notice, ['mira', 'oren']), asOwnRow(notice, 'mira')]) {
+      for (const reader of [mira, oren, kid]) assert.equal(bearingOf(row(metadata), reader, 'own'), 'elsewhere');
+      assert.equal(bearingOf(row(metadata), sub, RESIDENTS_SLOT), 'elsewhere');
+      assert.equal(bearingOf(row(metadata), watcher, RESIDENTS_SLOT), 'elsewhere');
+      assert.equal(bearingOf(row(metadata), readerFacts(reg, 'worker-1'), 'own'), 'elsewhere');
+    }
+    for (const metadata of [{ system: true }, { kind: 'reasoning-loss' }, { system: 'true', kind: 'reasoning-loss' }]) {
+      assert.equal(bearingOf(row(metadata as MessageMetadata), mira, 'own'), 'arrival', 'both exact flags are required');
+    }
+  });
+
   it("a row a suppress rule hid is every reader's elsewhere, the subconscious's included, and out of both views", () => {
     const suppressed = { suppressed: { rule: 'hide-noisy', eventType: 'mcpl:channel-incoming' } } as unknown as MessageMetadata;
     // As addMessage stamps it (for nobody), and as a release without the stamp stored it.

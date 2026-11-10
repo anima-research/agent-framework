@@ -8,6 +8,7 @@ import type { Module, ModuleContext, ProcessEvent, SpeechContext, SpeechRoutedCo
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
+import { NOTICE_TAG } from '../src/notice-tags.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 const SENT_TO = 'the console that sent this turn';
@@ -1679,7 +1680,7 @@ describe('plain speech a module says it showed', () => {
     await f.runUntilIdle();
     assert.equal(starts, 2, 'premise: the unstick was refused once and retried');
     const sent = JSON.stringify(membrane.calls.at(-1)!.messages);
-    assert.match(sent, /\[refusal-rewind\]/, 'premise: the last request is the retry after the rewind');
+    assert.ok(sent.includes(`[${NOTICE_TAG.refusalRewind}]`), 'premise: the last request is the retry after the rewind');
     assert.doesNotMatch(sent, /Hi there/, "the retry carries neither the set-aside reply nor its notice's quote");
     assert.match(sent, /hello there/, 'what came before stays');
   });

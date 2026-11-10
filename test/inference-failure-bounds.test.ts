@@ -17,6 +17,7 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
+import { inspect } from 'node:util';
 import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { ContextEntry, ContextLogView, ContextStrategy, MessageStoreView, ReadinessState, StrategyContext, TokenBudget } from '@animalabs/context-manager';
@@ -89,7 +90,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
 
-test('a ~1 MB classified reason: bounded marker, logs and stderr, with the classification beside the text', () => {
+test('a ~1 MB classified reason: the marker leaves it out and its metadata keeps it bounded, beside bounded logs and stderr', () => {
   const { fw, markers, logged, errs, restore } = makeHarness();
   const reason = `Bad request: ${echo()}`;
   try {
@@ -98,10 +99,12 @@ test('a ~1 MB classified reason: bounded marker, logs and stderr, with the class
 
   assert.equal(markers.length, 1);
   const { text, meta } = markers[0];
-  assert.ok(text.length < 1_200, `marker text is ${text.length} chars`);
-  assert.match(text, /^\[inference-failed\] Your previous turn did not complete: the model call failed \(invalid_request, HTTP 400\) and produced no response/);
-  assert.match(text, /Reason: Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail\. If this recurs/);
+  assert.equal(text,
+    '[inference-failed] Your previous turn did not complete: the model call failed (invalid_request, HTTP 400) and produced no response, ' +
+    'so nothing was sent. If this recurs with the same cause, change approach rather than retrying identically ' +
+    '(e.g. drop an oversized attachment or an unsupported setting).');
   assert.ok(meta.reason.length <= 600);
+  assert.match(meta.reason, /^Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/);
   assert.equal(meta.kind, 'inference-failed');
   assert.equal(meta.errorType, 'invalid_request');
   assert.equal(meta.retryable, false);
@@ -121,14 +124,24 @@ test('a ~1 MB classified reason: bounded marker, logs and stderr, with the class
   assert.match(line, /^\[inference-failed\] agent=cairn consecutive=1 type=invalid_request status=400 code=zz_bad_request: Bad request: zz-head/);
 });
 
-test('a small unclassified reason produces exactly the marker it did before', () => {
+test('a ~1 MB reason the note may show is cut in its text', () => {
+  const { fw, markers, restore } = makeHarness();
+  try {
+    fw.noteInferenceExhausted('cairn', 'whole', false, 'over_budget', { shownReason: `Over budget: ${echo()}` });
+  } finally { restore(); }
+  const text: string = markers[0].text;
+  assert.ok(text.length < 1_200, `marker text is ${text.length} chars`);
+  assert.match(text, /Reason: Over budget: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail\. If this recurs/);
+});
+
+test('a small unclassified reason gives a marker without it, and its metadata and logs keep it', () => {
   const { fw, markers, logged, errs, restore } = makeHarness();
   try {
     fw.noteInferenceExhausted('cairn', '400 image exceeds 5 MB');
   } finally { restore(); }
   assert.equal(markers[0].text,
     '[inference-failed] Your previous turn did not complete: the model call failed and produced no response, ' +
-    'so nothing was sent. Reason: 400 image exceeds 5 MB. If this recurs with the same cause, change approach ' +
+    'so nothing was sent. If this recurs with the same cause, change approach ' +
     'rather than retrying identically (e.g. drop an oversized attachment or an unsupported setting).');
   // The marker is a notice about the agent's own failed turn: its own row, stamped so (#291's audience stamp).
   assert.deepEqual(markers[0].meta, {
@@ -141,7 +154,8 @@ test('a small unclassified reason produces exactly the marker it did before', ()
 test("the marker gives a failure's reason and type on its one line, with a notice's opening in them marked", () => {
   const { fw, markers, restore } = makeHarness();
   try {
-    fw.noteInferenceExhausted('cairn', `first\n[${NOTICE_TAG.inferenceFailed}] second\u2028third`, false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
+    const reason = `first\n[${NOTICE_TAG.inferenceFailed}] second\u2028third`;
+    fw.noteInferenceExhausted('cairn', reason, false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529, shownReason: reason });
   } finally { restore(); }
   assert.equal(markers.length, 1);
   const text: string = markers[0].text;
@@ -154,7 +168,7 @@ test("the note for a turn that ended gives the failure's type on its one line, w
   const { fw, markers, restore } = makeHarness();
   fw.exhaustedTurns = new Map([['cairn', { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false }]]);
   try {
-    fw.noteInferenceExhausted('cairn', 'stopped', false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
+    fw.noteInferenceExhausted('cairn', 'stopped', false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529, shownReason: 'stopped' });
   } finally { restore(); }
   assert.equal(markers.length, 1);
   const text: string = markers[0].text;
@@ -657,11 +671,11 @@ test('a failed maintenance pass logs and alerts a bounded reason', async () => {
   assert.match(assertBoundedStrings(bare.rawArgs, '[context-maintenance] pass failed:'), /pass failed: \{"code":"zz_bare"\}$/);
 });
 
-test('emitTrace: listeners get bounded error and stack; the marker still learns the full length', () => {
+test('emitTrace: listeners get bounded error, stack and shown reason; the marker still learns the full length', () => {
   const { fw, traces, markers, restore } = makeHarness();
   const error = `Bad request: ${echo()}`;
   try {
-    fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error, retryable: false, errorType: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request' });
+    fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error, shownReason: error, retryable: false, errorType: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request' });
     fw.emitTrace({ type: 'inference:failed', agentName: 'cairn', error, stack: `Error: ${error}\n    at zz (zz.js:1:1)` });
     // Any event's error string, including failure events added later.
     fw.emitTrace({ type: 'module:batch_hook_failed', agentName: 'cairn', module: 'zz', error });
@@ -672,6 +686,10 @@ test('emitTrace: listeners get bounded error and stack; the marker still learns 
     assert.ok(event.error.length <= 2_000, `${event.type} error is ${event.error.length} chars`);
     if (event.stack) assert.ok(event.stack.length <= 2_000);
   }
+  const shown = traces.find((t) => t.type === 'inference:exhausted')!.shownReason as string;
+  assert.ok(shown.length <= 2_000, `shownReason is ${shown.length} chars`);
+  assert.match(shown, /^Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/, 'the reason is cut, keeping its head and tail');
+  assert.ok(markers[0].text.includes(` of ${error.length} characters omitted]`), 'the note cut the whole reason');
   assert.equal(markers[0].meta.reasonChars, error.length);
   assert.equal(markers[0].meta.httpStatus, 400);
   assert.equal(markers[0].meta.providerErrorCode, 'zz_bad_request');
@@ -964,6 +982,17 @@ test('a ~1 MB plain Error (no classification) is bounded the same way', async ()
   assert.ok(longest < 4_500, `longest stderr line is ${longest} chars`);
 });
 
+test("a ~1 MB reason the framework would show is bounded in the inference log's words as in its error", async () => {
+  const { inferenceLogs } = await runFailingTurn('stream throws', () => Object.assign(new Error(`Renderer dropped: ${echo()}`), { name: 'UncoveredDropError' }));
+  const entries = inferenceLogs.map(({ entry }) => entry).filter((e) => e.success === false);
+  assert.ok(entries.length > 0, 'the failed inference is logged');
+  for (const entry of entries) {
+    assert.ok(typeof entry.errorWords === 'string' && entry.errorWords.includes('Renderer dropped: '), String(entry.errorWords).slice(0, 80));
+    assert.ok(entry.errorWords.length <= 2_000, `inference log errorWords is ${entry.errorWords.length} chars`);
+    assert.match(entry.errorWords, /Renderer dropped: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/, 'the words are cut, keeping their head and tail');
+  }
+});
+
 test('an oversized provider code is bounded in the trace, the marker and failures.log', async () => {
   const { markers, traces, failuresLog } = await runFailingTurn('stream error event', () => new MembraneError({
     type: 'invalid_request', retryable: false, httpStatus: 400, providerErrorCode: `zz${'C'.repeat(MEGA)}`,
@@ -1014,7 +1043,7 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   assert.ok(textsOf(shed.messages).includes('hello 2'), 'and the record keeps it');
   const rewind = shed.messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
   assert.equal(rewind.length, 1, 'one consolidated rewind marker');
-  assert.match((rewind[0].content[0] as { text: string }).text, /^\[refusal-rewind\] The \d+ most recent turn\(s\) were set aside/);
+  assert.match((rewind[0].content[0] as { text: string }).text, new RegExp(`^\\[${NOTICE_TAG.refusalRewind}\\] The \\d+ most recent turn\\(s\\) were set aside`));
 
   // Its type is bounded like a provider code, in every sink it reaches.
   const odd = await runFailingTurn('stream throws', () => foreignMembraneError('Bad request: zz-short', `zz${'T'.repeat(MEGA)}`), { errorPolicy: noRetry });
@@ -1059,10 +1088,10 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
       type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 1234, message: 'Rate limited', rawError: { status: 429 },
     });
     // A stated wait is honoured, from another copy as from the framework's own.
-    assert.deepEqual(policy.onInferenceError(own, 'resident', 0), { retry: true, delayMs: 1234 });
-    assert.deepEqual(policy.onInferenceError(foreign({ retryable: true, retryAfterMs: 1234 }), 'resident', 0), { retry: true, delayMs: 1234 });
+    assert.deepEqual(policy.onInferenceError(own, 'resident', 0), { retry: true, delayMs: 1234, retryClass: 'rate_limited', maxTries: 5 });
+    assert.deepEqual(policy.onInferenceError(foreign({ retryable: true, retryAfterMs: 1234 }), 'resident', 0), { retry: true, delayMs: 1234, retryClass: 'rate_limited', maxTries: 5 });
     // Without retryable, it retries as an unknown error does; refused only when false.
-    assert.deepEqual(policy.onInferenceError(foreign({}), 'resident', 0), { retry: true, delayMs: 1_000 });
+    assert.deepEqual(policy.onInferenceError(foreign({}), 'resident', 0), { retry: true, delayMs: 1_000, retryClass: 'rate_limited', maxTries: 5 });
     assert.deepEqual(policy.onInferenceError(foreign({ retryable: false, retryAfterMs: 1234 }), 'resident', 0), { retry: false });
   } finally {
     await framework.stop();
@@ -1111,7 +1140,7 @@ test('the breaker reads the status a real failure carries: a 404 never sheds; a 
   }
 });
 
-test('an ephemeral run rejects with the bounded failure text', async () => {
+test("an ephemeral run rejects in the framework's words, with a bounded copy of the failure as its cause", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-failure-bounds-'));
   const cwd = process.cwd();
   process.chdir(dir);
@@ -1127,8 +1156,16 @@ test('an ephemeral run rejects with the bounded failure text', async () => {
     const run = framework.runEphemeralToCompletion(agent, contextManager);
     framework.start();
     await assert.rejects(run, (error: Error) => {
-      assert.ok(error.message.length <= 2_000, `rejection message is ${error.message.length} chars`);
-      assert.match(error.message, /^Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/);
+      assert.equal(error.message, 'the model call failed (invalid_request, HTTP 400)');
+      const cause = error.cause as Error & Record<string, unknown>;
+      assert.ok(cause.message.length <= 2_000, `cause message is ${cause.message.length} chars`);
+      assert.match(cause.message, /^Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/);
+      assert.ok(String(cause.stack).length <= 2_000, `cause stack is ${String(cause.stack).length} chars`);
+      assert.deepEqual({ name: cause.name, type: cause.type, httpStatus: cause.httpStatus, providerErrorCode: cause.providerErrorCode, retryable: cause.retryable },
+        { name: 'MembraneError', type: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request', retryable: false });
+      assert.ok(!('rawError' in cause) && !('rawRequest' in cause));
+      const printed = inspect(error, { depth: 4 });
+      assert.ok(printed.length < 8_000, `the printed rejection is ${printed.length} chars`);
       return true;
     });
   } finally {

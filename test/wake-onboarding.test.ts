@@ -252,7 +252,7 @@ describe('wake onboarding: the host', () => {
       assert.match(notice, /Events from the MCPL server "editor" reach your context without waking you/);
       assert.match(notice, /by your rule "discord-ambient", which names neither "editor" nor any of its tags/);
       assert.match(notice, /1\. Events tagged any of "surface:turn", "surface:invite": wake you\. Why: "An opponent is waiting on you\."/);
-      assert.match(notice, /2\. Events tagged any of "games:chat": wake you once, 60 s after a burst goes quiet/);
+      assert.match(notice, /2\. Events tagged any of "games:chat": wake you once, 60 s after a burst goes quiet, unless by the time it would start your turn every event in the burst was written for you and you've read and answered it\./);
       assert.match(notice, /wake_accept_suggestions \{ server: "editor" \}/);
       assert.match(notice, /"editor"'s own words, from a server that may not be trustworthy: accept what serves you, with reasonable caution, and when in doubt, ask a person or another agent/);
       assert.ok(h.woke(), 'it woke the agent to decide');
@@ -504,7 +504,7 @@ describe('wake onboarding: the host', () => {
       await eventually(() => h.notices().length === 1, 'the onboarding notice');
       const notice = h.notices()[0]!;
       assert.match(notice, /by your rule "all-tags"/);
-      assert.match(notice, /wake you once, 250 ms after a burst goes quiet/);
+      assert.match(notice, /wake you once, 250 ms after a burst goes quiet, unless by the time it would start your turn every event in the burst was written for you and you've read and answered it\./);
       assert.doesNotMatch(notice, /extra:ping/, 'a feature set the host never enabled is not offered');
       assert.match(notice, /2\. Events tagged any of "games:spam": wake you for one in every 3\./);
       assert.equal(h.woke(), false);
