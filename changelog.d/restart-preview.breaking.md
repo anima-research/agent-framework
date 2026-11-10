@@ -4,14 +4,14 @@
   the compile won't fit and doesn't name compression as what would make
   room. It is declined too where the preview meets a drop no summary covers
   while no compression is pending. For an agent the budget hold can't take,
-  such as an ephemeral run (a host's subagent), a preview that won't fit
-  declines the restart even where it names compression, and so does an
-  uncovered drop while compression is pending. The stream then goes on, and
-  the boundary emits an `inference:restart_declined` trace saying why. A
-  later boundary past `maxStreamTokens` considers the restart again. Every
-  other restart is taken as before, including one whose preview names
-  compression as what would make room for an agent the hold can take, and
-  one whose preview fails.
+  such as an ephemeral run, a preview that won't fit declines the restart
+  even where it names compression, and so does an uncovered drop while
+  compression is pending. The stream then goes on, and the boundary emits an
+  `inference:restart_declined` trace saying why. A later boundary past
+  `maxStreamTokens` considers the restart again. Every other restart is
+  taken as before, including one whose preview names compression as what
+  would make room for an agent the hold can take, and one whose preview
+  fails.
   - **What it trades:** before this release, a restart the preview now
     declines was taken. For an agent the budget hold could take, its compile
     refused, and while compression was pending the turn waited in the hold
