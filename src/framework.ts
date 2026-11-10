@@ -8520,6 +8520,7 @@ export class AgentFramework {
             }
             if (!ticked) {
               left = true;
+              record.leftPassAt = Date.now();
               const apart = (async () => {
                 let tickWithdrawn = false;
                 try {
@@ -8541,7 +8542,10 @@ export class AgentFramework {
                 .catch((error: unknown) => {
                   console.error('[context-maintenance] reporting an agent\'s failure failed:', describeFailureWithFrames(error));
                 })
-                .finally(() => { this.maintenanceApart.delete(agent); });
+                .finally(() => {
+                  this.maintenanceApart.delete(agent);
+                  this.releaseBudgetHoldOnEvidence(agent.name);
+                });
               this.maintenanceApart.set(agent, apart);
               break;
             }
@@ -11152,10 +11156,10 @@ export class AgentFramework {
    * It returns when that pass ends. A tick whose provider call parks at its
    * agent's provider gate leaves the pass and goes on by itself, so that
    * agent's entry in the returned snapshot can be unfinished, with no
-   * `finishedAt`. The run's own entry is completed when the tick settles, and
-   * a snapshot taken after that shows it while the run is still in the
-   * history. A pass begun while that tick goes on skips the agent, and
-   * `resume()` waits for the tick.
+   * `finishedAt` and with `leftPassAt`, when it left. The run's own entry is
+   * completed when the tick settles, and a snapshot taken after that shows
+   * it while the run is still in the history. A pass begun while that tick
+   * goes on skips the agent, and `resume()` waits for the tick.
    */
   async maintenanceTick(): Promise<ContextMaintenanceSnapshot & { ran: boolean }> {
     // A pass already running is stop()'s to wait for; a new one isn't started.
