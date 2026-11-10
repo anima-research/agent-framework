@@ -210,7 +210,7 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
-  it("a silent heartbeat tick's batched wake carries the batch's rows, none, so a merge with another batch's wake keeps that batch's line", async () => {
+  it("a silent heartbeat tick's batched wake, the tick's own, carries the batch's rows, none, so a merge with another batch's wake keeps that batch's line", async () => {
     const { f, module, start } = await setup(60_000);
     try {
       const { loop } = await start();
@@ -222,8 +222,8 @@ describe('debounced writes already read and answered', () => {
       const pending = (f.framework as unknown as { pendingRequests: Array<Record<string | symbol, unknown>> }).pendingRequests;
       const before = pending.length;
       fire(f);
-      const queued = pending.slice(before).filter((r) => r.reason === 'gate:debounce');
-      assert.equal(queued.length, 1, 'premise: the batch queued its wake');
+      const queued = pending.slice(before).filter((r) => r.reason === 'heartbeat' && r.suppressProse === true);
+      assert.equal(queued.length, 1, "premise: the batch queued the tick's own wake");
       assert.deepEqual(queued[0]![BATCH_ROWS], []);
     } finally { await f.close(); }
   });

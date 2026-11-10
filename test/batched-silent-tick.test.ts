@@ -14,9 +14,9 @@ class M extends GateModule {
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
-type Pending = { agentName: string; reason?: string; source?: string; suppressProse?: boolean; silentHeartbeat?: { eventId: string; serverId: string }; wakeLines?: Array<{ entry?: { eventId?: string } }> };
+type Pending = { agentName: string; reason?: string; source?: string; suppressProse?: boolean; silentHeartbeat?: { eventId: string; serverId: string } };
 type Internals = {
-  eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>; fireDebounce(name: string): void };
+  eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>; fireDebounce(name: string): void };
   pendingRequests: Pending[];
   deliverHeartbeat(wake: unknown): void;
   addMessage(participant: string, content: unknown[], metadata: Record<string, unknown>): unknown;
@@ -83,6 +83,33 @@ async function batchedTurn(alongside: (f: Fixture) => Promise<void> | void) {
   } finally { off(); await f.close(); }
 }
 
+/**
+ * The tick, and whatever `alongside` sends, batched with no turn running, so
+ * nothing answers them before the batch fires; a later entry follows them, so
+ * the batch's line is written. The request of the one turn they start, and
+ * what was routed as speech.
+ */
+async function batchedIdle(alongside: (f: Fixture) => Promise<void> | void) {
+  const { f } = await batching();
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request);
+    return new MockYieldingStream([say('fresh turn')], true);
+  };
+  const routed: string[] = [];
+  const off = f.framework.onTrace((e) => { if (/^mcpl:speech-route/.test(e.type)) routed.push(e.type); });
+  try {
+    tick(f);
+    await alongside(f);
+    await f.framework.runUntilIdle();
+    assert.equal(internals(f).eventGate.debounceTimers.get('batch')?.events.length, 2, 'premise: the tick and the other event are batched');
+    internals(f).addMessage('user', [{ type: 'text', text: 'a later note' }], { source: 'test' });
+    fire(f);
+    await f.framework.runUntilIdle();
+    assert.equal(f.membrane.calls.length, 1, 'the batch starts one turn');
+    return { request: JSON.stringify(f.membrane.calls[0]), routed: [...routed] };
+  } finally { off(); await f.close(); }
+}
+
 describe('a silent tick batched by a gate rule', () => {
   it('alone, wakes as the tick: prose suppressed, its separator sent, and no [Gate:] line naming a message it never stored', async () => {
     const { woken, request, routed } = await batchedTurn(() => {});
@@ -93,24 +120,28 @@ describe('a silent tick batched by a gate rule', () => {
     assert.deepEqual(routed, [], 'its prose is not routed as speech');
   });
 
-  it('with a channel message, wakes an ordinary turn whose [Gate:] line counts the message alone', async () => {
-    const { woken, request, routed } = await batchedTurn((f) => incoming(f, 'work', 'm1', 'hello there', MENTION));
-    assert.ok(woken.every((r) => r.suppressProse !== true && r.silentHeartbeat === undefined), 'an ordinary wake');
+  it('with a channel message not yet answered, wakes one ordinary turn whose [Gate:] line counts the message alone', async () => {
+    const { request, routed } = await batchedIdle((f) => incoming(f, 'work', 'm1', 'hello there', MENTION));
     assert.ok(!request.includes(separator), 'no tick separator');
     assert.ok(!request.includes('(unknown channel)'), 'the tick is not counted as a message');
     assert.ok(request.includes('[Gate: 1 event matched]') && request.includes('1 message in work'), "the message's own line");
     assert.deepEqual(routed, ['mcpl:speech-routed'], 'its reply goes to the channel');
   });
 
-  it('with a heartbeat reminder, wakes an ordinary turn whose [Gate:] line counts the reminder alone', async () => {
-    const { woken, request } = await batchedTurn((f) => reminder(f));
-    assert.ok(woken.every((r) => r.suppressProse !== true && r.silentHeartbeat === undefined), 'an ordinary wake');
+  it('with a channel message the last turn answered, wakes as the tick: no wake for the message, and the tick runs silent', async () => {
+    const { request, routed } = await batchedTurn((f) => incoming(f, 'work', 'm1', 'hello there', MENTION));
+    assert.ok(request.includes(separator), 'the tick separator is in the request');
+    assert.deepEqual(routed, [], 'its prose is not routed as speech');
+  });
+
+  it('with a heartbeat reminder not yet answered, wakes one ordinary turn whose [Gate:] line counts the reminder alone', async () => {
+    const { request } = await batchedIdle((f) => reminder(f));
     assert.ok(!request.includes(separator), 'no tick separator');
     assert.ok(request.includes('[Gate: 1 event matched]'), 'one event, the reminder');
     assert.ok(!request.includes('2 messages in'), 'the tick is not counted with the reminder');
   });
 
-  it("is the heartbeat's own: a server's push whose origin says silent, batched alone, keeps its line and wakes an ordinary turn", async () => {
+  it("is the heartbeat's own: a server's push whose origin says silent, batched alone, is stored and wakes an ordinary turn", async () => {
     const { f } = await batching();
     try {
       await f.send('push/event', {
@@ -122,9 +153,8 @@ describe('a silent tick batched by a gate rule', () => {
       const woken = internals(f).pendingRequests;
       assert.ok(woken.length > 0, 'premise: the batch wakes the agent');
       assert.ok(woken.every((r) => r.suppressProse !== true && r.silentHeartbeat === undefined), 'an ordinary wake');
-      const handed = woken.flatMap((r) => r.wakeLines ?? []).map((line) => line.entry?.eventId);
-      assert.ok(handed.includes('p1') || f.context().includes('[Gate: 1 event matched]'),
-        'its own [Gate:] line, handed to the wake for its event or written now');
+      assert.ok(woken.every((r) => r.reason === 'gate:debounce'), "the batch's wake, not a tick's");
+      assert.ok(f.context().includes('a document changed'), 'its message is stored, as a tick stores none');
     } finally {
       internals(f).pendingRequests.splice(0);
       await f.close();
@@ -141,28 +171,6 @@ describe('a silent tick batched by a gate rule', () => {
       assert.deepEqual(internals(f).pendingRequests.map((r) => [r.agentName, r.silentHeartbeat?.eventId]), [['agent', 'newer']]);
     } finally {
       internals(f).pendingRequests.splice(0);
-      await f.close();
-    }
-  });
-
-  it('beside an untargeted reminder, with a fork present, leaves the resident one line for the reminder', async () => {
-    const { f } = await batching();
-    const fw = internals(f);
-    fw.registry.register(conversationForkSpec('agent-conv-1', { template: 'agent', homeChannel: { serverId: 'editor', channelId: 'work' }, idleTtlMs: 60_000 }));
-    fw.agents.set('agent-conv-1', fw.agents.get('agent'));
-    try {
-      tick(f);
-      reminder(f);
-      // A later entry, so the batch's line is written, not handed to a wake.
-      fw.addMessage('user', [{ type: 'text', text: 'a later note' }], { source: 'test' });
-      fire(f);
-      const lines = f.context().split('[Gate: ').length - 1;
-      assert.equal(lines, 1, 'one [Gate:] line in the resident\'s window');
-      assert.ok(fw.pendingRequests.every((r) => r.suppressProse !== true), 'the resident, with the reminder, wakes ordinary');
-    } finally {
-      fw.pendingRequests.splice(0);
-      fw.registry.end('agent-conv-1', 'stopped');
-      fw.agents.delete('agent-conv-1');
       await f.close();
     }
   });

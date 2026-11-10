@@ -4215,9 +4215,10 @@ export class EventGate {
     }
     if (events.length === 0) return;
     // A silent tick stored nothing, so no line names it: the other events
-    // are delivered as if it weren't there, and an agent the ticks name that
-    // none of those wakes wakes as the batch's last tick, as the tick's own
-    // wake would, and as a tick's wake merged with another wake doesn't.
+    // are delivered as if it weren't there, and every agent the ticks name
+    // is also woken as the batch's last tick, as the tick's own wake would
+    // be. Where the other events' wake is dropped once answered, the tick's
+    // silent turn runs; where both start a turn, the merge is ordinary.
     const ticks = events.filter((e) => e.silentHeartbeat !== undefined);
     const said = events.filter((e) => e.silentHeartbeat === undefined);
     const reached = (some: PendingEvent[]): Set<string> => {
@@ -4226,7 +4227,7 @@ export class EventGate {
       return names;
     };
     const woken = reached(said);
-    const tickOnly = [...reached(ticks)].filter((name) => !woken.has(name));
+    const ticked = [...reached(ticks)];
     // Who each delivery woke, so that a throw after a wake is told as a
     // delivery in part (PartialDelivery), the batch dropped only for those
     // it didn't wake.
@@ -4244,10 +4245,13 @@ export class EventGate {
         groups.set(key, group);
       }
     }
-    deliveredTracking(woke, [...woken, ...tickOnly], () => {
+    deliveredTracking(woke, [...new Set([...woken, ...ticked])], () => {
       for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.audience, woke);
-      for (const agentName of tickOnly) {
-        this.requestInferenceFn(agentName, 'heartbeat', 'heartbeat', { silentHeartbeat: ticks[ticks.length - 1]!.silentHeartbeat });
+      const tick = ticks[ticks.length - 1];
+      if (!tick) return;
+      const tickWake: MarkedProvenance = { silentHeartbeat: tick.silentHeartbeat, [BATCH_LINE_ROWS]: [] };
+      for (const agentName of ticked) {
+        this.requestInferenceFn(agentName, 'heartbeat', 'heartbeat', tickWake);
         woke.push(agentName);
       }
     });
