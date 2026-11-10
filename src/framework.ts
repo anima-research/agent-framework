@@ -36104,8 +36104,6 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     let historyMoved = false;
     const detach = cm.onMessage(() => { historyMoved = true; });
-    // The rows a shed would act on (shedNewestTurn's selector): a window move,
-    // such as an undo's retractRows, writes no message the listener hears.
     const rowsOf = (): string => (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages())
       .map((m) => m.id).join('\n');
     const sent = {
@@ -36142,7 +36140,6 @@ export class AgentFramework {
         ? `the request fails without its history too, with the same ${String(answered.errorType)} ${status}, so none of the history was shed. ${next} ${answer}`
         : `a probe without its history couldn't tell whether the history is the cause, so none of it was shed. ${next} ${answer}`;
       console.error(`[inference-rewind] agent=${name} kept its history: ${message}`);
-      // Each verdict has its own webhook cooldown, so a conclusive one isn't held back by an inconclusive one.
       const verdict = same ? 'fails-without-history' : 'could-not-tell';
       this.opsAlert('history-kept', name, message, { data: { probe: verdict, ...answered }, key: verdict });
     }).catch((error: unknown) => {
@@ -36155,12 +36152,6 @@ export class AgentFramework {
     this.breakerProbes.add(probe);
   }
 
-  /**
-   * The agent's failure count moved: a failure counted, its streak reset by a
-   * completed turn, or its accounting forgotten. A probe still out for it was
-   * sent for a count that no longer holds, even one the count comes back to,
-   * so it's withdrawn and its answer is set aside.
-   */
   private staleBreakerProbes(name: string): void {
     for (const probe of this.breakerProbes) {
       if (probe.agentName !== name) continue;
