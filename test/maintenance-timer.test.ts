@@ -714,6 +714,25 @@ class CallingStrategy implements ContextStrategy {
   }
 }
 
+class LateRecordingStrategy extends CallingStrategy {
+  recorded = 0;
+  constructor(agent: string, log: string[], private readonly lagMs: number) { super(agent, log); }
+  override checkReadiness(): ReadinessState {
+    return { ready: !this.queued || this.recorded >= this.needs, description: `${this.agent} queued` };
+  }
+  getProgressSnapshot(): Record<string, unknown> {
+    return { chunksCompressed: this.recorded, summaryCounts: { l1: this.recorded, l2: 0, l3: 0 } };
+  }
+  override async tick(ctx: StrategyContext): Promise<void> {
+    const before = this.ticks;
+    await super.tick(ctx);
+    if (this.ticks > before) {
+      await new Promise((resolve) => setTimeout(resolve, this.lagMs));
+      this.recorded = this.ticks;
+    }
+  }
+}
+
 function plainResponse(): NormalizedResponse {
   return {
     content: [{ type: 'text', text: 'done' }],
@@ -2709,6 +2728,96 @@ describe('queued context maintenance timer', () => {
       }
     });
   }
+
+  it('a tick that left its pass marks its entry with when it left, and an entry finished in its pass has no such mark', { timeout: 10_000 }, async () => {
+    const parked = await parkedBehind('cooldown');
+    try {
+      const history = () => parked.framework.getContextMaintenanceSnapshot().history;
+      const runOfA = history().find((run) => run.agents.some((agent) => agent.agentName === 'A'));
+      assert.ok(runOfA?.finishedAt !== undefined, 'the pass that ticked A has ended');
+      const entryOfA = () => history().flatMap((run) => run.agents).find((agent) => agent.agentName === 'A');
+      const left = entryOfA()?.leftPassAt;
+      assert.equal(typeof left, 'number', "A's entry says when its tick left the pass");
+      assert.ok(left! >= runOfA!.startedAt && left! <= runOfA!.finishedAt!, 'it left within its pass');
+      assert.equal(entryOfA()?.finishedAt, undefined, "A's work isn't finished yet");
+      parked.b.queued = true;
+      await waitFor(() => history().flatMap((run) => run.agents).some((agent) => agent.agentName === 'B' && agent.finishedAt !== undefined), 2000);
+      const entryOfB = history().flatMap((run) => run.agents).find((agent) => agent.agentName === 'B');
+      assert.equal(entryOfB?.leftPassAt, undefined, "B's tick finished in its pass");
+      parked.openGate();
+      await waitFor(() => entryOfA()?.finishedAt !== undefined, 2000);
+      assert.equal(entryOfA()?.leftPassAt, left, 'the mark stays once the tick has settled');
+      assert.ok(left! <= entryOfA()!.finishedAt!);
+    } finally {
+      await parked.cleanup();
+    }
+  });
+
+  it("a budget hold on an agent whose tick left its pass is released by that tick's evidence when the tick settles, though its strategy records a macrotask after the answer and no later pass comes", { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-hold-apart-'));
+    const log: string[] = [];
+    const turnMembrane = new TurnMembrane();
+    const a = new LateRecordingStrategy('A', log, 20);
+    const b = new CallingStrategy('B', log);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: turnMembrane.asMembrane(),
+      agents: [
+        { name: 'A', model: 'test-model', systemPrompt: 'test', strategy: a },
+        { name: 'B', model: 'test-model', systemPrompt: 'test', strategy: b },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 60_000,
+    });
+    const internals = framework as unknown as {
+      providerGate(agentName: string): { deferredAuxiliary: number };
+      providerAccelerationCooldowns: Map<string, Record<string, unknown>>;
+      flushAuxiliaryAdmission(agentName: string): void;
+      budgetHolds: Map<string, Record<string, unknown>>;
+      releaseBudgetHold(agentName: string): void;
+      compressionProgressOf(agent: unknown): string | undefined;
+    };
+    let cooldownTimer: ReturnType<typeof setTimeout> | undefined;
+    const first = heldUntilReleased();
+    try {
+      framework.getAgent('A')!.getContextManager().addMessage('user', [{ type: 'text', text: 'm1' }]);
+      turnMembrane.plans.set('A', [{ until: first.until }, {}]);
+      framework.start();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      a.needs = 2;
+      a.queued = true;
+      const pass = framework.maintenanceTick();
+      await waitFor(() => turnMembrane.calls.includes('A'), 2000);
+      const now = Date.now();
+      cooldownTimer = setTimeout(() => {}, 60_000);
+      internals.providerAccelerationCooldowns.set('A', { startedAt: now, until: now + 60_000, timer: cooldownTimer, heldRequests: [], reason: 'test hold', failures: 1 });
+      first.release();
+      await waitFor(() => internals.providerGate('A').deferredAuxiliary === 1, 2000);
+      await pass;
+      const passes = framework.getContextMaintenanceSnapshot().history.length;
+      const agent = framework.getAgent('A')!;
+      const released: number[] = [];
+      internals.releaseBudgetHold = (name: string) => { released.push(a.recorded); internals.budgetHolds.delete(name); };
+      internals.budgetHolds.set('A', {
+        startedAt: Date.now(), wait: { since: Date.now() }, turn: { agentName: 'A', reason: 'test', source: 'test', timestamp: Date.now() },
+        standsOn: [], wakes: [], errorType: 'over_budget', reason: 'test', budget: undefined, actual: undefined,
+        managerCalls: 0, progressAtHold: internals.compressionProgressOf(agent), settingsAtHold: agent.contextSettingsChanges(),
+      });
+      clearTimeout(cooldownTimer);
+      internals.providerAccelerationCooldowns.delete('A');
+      internals.flushAuxiliaryAdmission('A');
+      await waitFor(() => a.recorded === 2, 2000);
+      await waitFor(() => released.length > 0, 500);
+      assert.deepEqual(released, [2], 'released once, on the progress the tick recorded');
+      assert.equal(framework.getContextMaintenanceSnapshot().history.length, passes, 'no later pass ran');
+    } finally {
+      first.release();
+      clearTimeout(cooldownTimer);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('stop() withdraws the parked call of a tick that left its pass, and that is no failure', { timeout: 10_000 }, async () => {
     const parked = await parkedBehind('turn');
