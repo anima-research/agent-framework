@@ -102,12 +102,16 @@ left out of any object with a string `type`, so a tool call's input or a
 tool's schema that holds one beside such a `type` counts without it, though
 it's sent. JSON runs denser than prose, so tool changes read as a smaller
 share than they would in tokens, and a move comes somewhat later. Carried
-changes are read on every request. Where a cache read costs a tenth of the
-input price, changes at a tenth of a request's input tokens cost in reads,
+changes are read on every request. What that adds over `'head'` is what a move
+would take out: the old definition of a tool since replaced or removed, which
+the head keeps, and the rows' wrapping. An added tool's definition, or added
+system text, is read either way. Where a cache read costs a tenth of the input
+price, a tenth of a request's input tokens carried that way costs in reads,
 about every 115 to 190 requests, what rewriting the whole input costs beyond
 reading it. On Opus 5.5 and Sonnet 5.5 that's every 240 to 390 requests, and
 on Fable 5.1 every 615 to 990. Each range runs from the 5-minute write to the
-1-hour. A
+1-hour. The share a consolidation waits for counts the rows, so a removed
+tool's definition doesn't count toward it. A
 replacement is a block of system text already declared that's dropped or
 edited (an added block is a change, and order doesn't count), so `'entries'`
 saves writes only while those blocks stay as they are: one whose text changes
