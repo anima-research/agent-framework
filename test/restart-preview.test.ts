@@ -414,7 +414,7 @@ class ScriptedPreviewStrategy extends AutobiographicalStrategy {
   compressionCount = 0;
   reportsStats: boolean | 'none of the counts' = true;
   constructor(private readonly answer: (budget: { maxTokens: number; reserveForResponse: number }, ask: number) => { fits: boolean; clearedBy?: string[] }) {
-    super({ compressionModel: 'test-compression-model', targetChunkTokens: 1_000, recentWindowTokens: 2_000, adaptiveResolution: true });
+    super({ compressionModel: 'test-compression-model', targetChunkTokens: 1_000, recentWindowTokens: NOTHING_TO_COMPRESS, adaptiveResolution: true });
   }
   override previewContext(...args: unknown[]): ReturnType<AutobiographicalStrategy['previewContext']> {
     const { fits, clearedBy } = this.answer(args[2] as { maxTokens: number; reserveForResponse: number }, ++this.previews);
@@ -924,6 +924,35 @@ test("under kv-unified, a restart declined since nothing would make room isn't p
       "with the figures of the preview it took");
     assert.equal(previews.filter((preview) => preview.fits === false).length, 1, 'one preview declined');
     assert.equal(previews.length, restarted(traces).length + 1, 'every other preview was a restart that fit');
+  });
+});
+
+test("under kv-unified, a remembered decline isn't taken again once the stream's own rows have closed a chunk, and the restart, which compression would make room for, is taken and held", async () => {
+  const module = new PagesModule();
+  const membrane = new LongTurnMembrane(longTurn(30), module, 40_000);
+  const agent = agentConfig({ maxStreamTokens: 8_000, contextBudgetTokens: 10_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified', 6_000) });
+  await withFramework(membrane, module, agent, async (framework, traces) => {
+    const cm = framework.getAgent('prime')!.getContextManager();
+    const chunks = () => (cm.getStrategy() as unknown as { getStats(): { chunksTotal: number } }).getStats().chunksTotal;
+    const atDecline: Array<{ previewed: boolean; chunks: number; pending: boolean }> = [];
+    framework.onTrace((event) => {
+      if (event.type === 'inference:restart_declined') atDecline.push({ previewed: event.previewed, chunks: chunks(), pending: cm.getPendingWork() !== null });
+    });
+    ask(framework);
+    await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL), 120_000);
+    assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered');
+    const first = declined(traces)[0];
+    assert.ok(first?.previewed && first.reason === 'wont_fit' && !first.clearedBy?.includes('compression'),
+      'a boundary declined the restart on a preview naming no compression that would make room');
+    assert.equal(atDecline[0]?.pending, false, 'with nothing pending');
+    let chunksAtPreview = -1;
+    for (const decline of atDecline) {
+      if (decline.previewed) chunksAtPreview = decline.chunks;
+      else assert.equal(decline.chunks, chunksAtPreview, "no boundary took a remembered decline once the stream's rows had closed a chunk");
+    }
+    assert.ok(restarted(traces).length > 0, 'a later boundary took the restart');
+    assert.ok(traces.some((event) => event.type === 'inference:held'), "and its refused compile was held until compression made room");
   });
 });
 
