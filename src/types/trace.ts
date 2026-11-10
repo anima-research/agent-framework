@@ -702,8 +702,9 @@ export type TraceEvent =
   | (TraceEventBase & {
       /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
        *  `reply` or `wait` as the judge answered, `error` when it failed,
-       *  timed out or answered nothing usable; `woke` is whether the batch
-       *  then woke the agent (an error does by the host's onError).
+       *  timed out or answered nothing usable; `woke` is whether the gate
+       *  goes on to deliver the batch to wake the agent (an error's is by the
+       *  host's onError). JudgeConfig says when such a delivery starts no turn.
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';
@@ -716,19 +717,6 @@ export type TraceEvent =
       inputTokens?: number;
       cacheReadTokens?: number;
       outputTokens?: number;
-    })
-  | (TraceEventBase & {
-      /** A batched wake's turn started without its `[Gate: …]` line (the
-       *  gate hands the line to the wake when its message is the newest at
-       *  the fire, EventGate isNewestEntry, and the turn's start decides).
-       *  `reason`: `newest`, on the delivery agent's start the message was
-       *  still the newest entry in the window; `held`, the host was
-       *  quiesced, so no line could be written then. */
-      type: 'gate:wake-line-omitted';
-      reason: 'newest' | 'held';
-      policyNames: string[];
-      eventType: string;
-      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'gate:config-reloaded';

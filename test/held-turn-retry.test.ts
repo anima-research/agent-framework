@@ -15,6 +15,7 @@ import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { BATCH_ROWS } from '../src/framework.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
 
@@ -1154,7 +1155,7 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
 });
 
 const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-  'coalescingBatchSubjects', 'readsRow', 'wakeLines'];
+  'coalescingBatchSubjects', 'readsRow', 'readsRows', BATCH_ROWS];
 
 function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<string | symbol, unknown>): symbol {
   const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
@@ -1184,7 +1185,7 @@ test("a held turn's retry the hold folds into an equal held wake gives that wake
       const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
       const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
       assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
-      const wake: Record<string, unknown> = {};
+      const wake: Record<string | symbol, unknown> = {};
       for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
       held.push(wake as unknown as Request);
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
@@ -1279,8 +1280,8 @@ test("a gate wake the hold folds into a held turn's merged retry names its batch
     try {
       const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
-      const start = held[0] as unknown as Record<string, unknown>;
-      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:folded' }] };
+      const start = held[0] as unknown as Record<string | symbol, unknown>;
+      const wake: Record<string | symbol, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:folded' }] };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
       assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
@@ -1301,8 +1302,8 @@ test("a held gate wake that an equal merged start folds into names its batch's c
     try {
       const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
-      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
-      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:held-first' }] };
+      const start = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const wake: Record<string | symbol, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:held-first' }] };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
       held.push(wake as unknown as Request);
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);

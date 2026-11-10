@@ -442,7 +442,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.noticeUnnoticedDrafts': { count: 1, when: 'turn', what: "a start's drafts notice" },
   'framework.ts AgentFramework.noticeHeadMoves': { count: 1, when: 'turn', what: "a start's workspace head-move notice" },
   'framework.ts AgentFramework.writeAutoContinueNotice': { count: 1, when: 'turn', what: "a continuation's [continue] row, at its start" },
-  'framework.ts AgentFramework.placeWakeLines': { count: 1, when: 'turn', what: "a batched wake's line, at its start" },
+  'framework.ts AgentFramework.placeBatchLine': { count: 1, when: 'turn', what: "a batched wake's line, at its start" },
   'framework.ts AgentFramework.runPuppetToolCall': { count: 2, when: 'held-back', what: "the puppet's pair: under its own reservation, or held back once a turn replaced it" },
   'framework.ts AgentFramework.appendProseDeliveryReceipt': { count: 1, when: 'end', what: "a stream's delivery receipt, after its last request" },
   'framework.ts AgentFramework.driveStream': { count: 2, when: 'end', what: "the contained tool-wrapper prose marker, and main's cut-off tool-block notice" },
