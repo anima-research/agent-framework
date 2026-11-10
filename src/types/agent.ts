@@ -197,8 +197,9 @@ export interface AgentConfig {
    * (runInference) declares nothing. On an `'entries'` agent with a recorded
    * head, where the tools its caller passes and the current system text are
    * what that head and the agent's own change rows declare, its request goes
-   * on that head with every change row, as the agent's own request would, and
-   * its compile binds thinking under that head. Elsewhere it sends the tools
+   * on that head with every change row, as the agent's own requests on that
+   * head do, and, with `thinkingBinding.binds: true`, its compile binds
+   * thinking under that head. Elsewhere it sends the tools
    * its caller passes and the current system text, and leaves the agent's
    * own change rows out of its request: under `'entries'` it carries a
    * host's change rows as the agent's requests do, and on its head it
@@ -207,7 +208,9 @@ export interface AgentConfig {
    * its compile binds thinking under an identity none of the agent's own
    * requests has, so it sets aside the thinking before it, as the next
    * request the agent makes does. With `binds` left out, the direct request
-   * there carries that thinking under a prefix it wasn't signed under: with
+   * there carries the thinking signed after the first change row it leaves
+   * out, and all of it where the heads differ, under a prefix it wasn't
+   * signed under: with
    * `dropBlock` the provider drops it, and without it an account that
    * enforces the binding refuses the request, and one that doesn't decides
    * for itself.

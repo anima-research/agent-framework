@@ -593,7 +593,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
   });
 
   describe("the direct API on an 'entries' agent, by what its caller passes against its head and own change rows", () => {
-    async function directAfter(turns: string[][], passed: (calls: readonly NormalizedRequest[]) => unknown[]) {
+    async function directAfter(turns: string[][], passed: (calls: readonly NormalizedRequest[]) => unknown[], binds = true) {
       const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-direct-own-'));
       const membrane = new MockMembrane();
       const misbound: boolean[] = [];
@@ -616,7 +616,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
       const tools = new ChangingTools();
       const framework = await AgentFramework.create({
         storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-        agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries', thinkingBinding: { binds: true } }],
+        agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries', ...(binds ? { thinkingBinding: { binds: true } } : {}) }],
         modules: [new Input(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
         errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
       });
@@ -650,6 +650,14 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
       assert.equal(changeRows(run.sent).length, 2, 'the direct request carries both rows');
       assert.equal(thinkingIn(run.sent), 3, "and every reply's thinking");
       assert.deepEqual(toolNames(run.sent), toolNames(run.calls[2]!), "on the third turn's head");
+    });
+
+    it("goes on the recorded head with both of the agent's own change rows when they net to nothing, for a model whose binding isn't declared too", async () => {
+      const run = await directAfter([['a'], ['a', 'b'], ['a']], (calls) => calls[2]!.tools ?? [], false);
+      assert.equal(changeRows(run.calls[2]!).length, 2, "the premise: the third turn carried b's addition and its removal");
+      assert.equal(run.outcome, 'answered');
+      assert.equal(changeRows(run.sent).length, 2, 'the direct request carries both rows');
+      assert.equal(thinkingIn(run.sent), 3, "and every reply's thinking, under the prefix it was signed under");
     });
 
     it("goes on the recorded head with the agent's own row when its caller passes the tools that head and row declare", async () => {
