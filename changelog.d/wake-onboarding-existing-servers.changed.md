@@ -6,8 +6,9 @@
   had written its rules with those servers there. Now the first start that
   finds a `gate.json` and no `wake-decisions.json` records the servers it is
   configured with as predating onboarding, and each is settled as `unasked`
-  at its first undecided event, with no notice and no wake (trace
-  `gate:onboarding-decided` with `state: "unasked"`). Nothing else changes
+  at its first event, whatever the gate decided about that one, with no
+  notice and no wake (trace `gate:onboarding-decided` with
+  `state: "unasked"`). Nothing else changes
   for them: `event_tags` shows their suggestions, `wake_accept_suggestions`
   and `wake_decline` answer them, and a changed declaration is asked about as
   any server's is. A server added after that start is offered as before, and
@@ -17,4 +18,8 @@
   while any of those servers is unsettled, and `unasked` among its states. A
   host that already started 0.33.0 and has a `wake-decisions.json` is not
   affected; one that started it and has none yet (no server's event was
-  undecided) treats its next start as that first one.
+  undecided) treats its next start as that first one. A decisions file that
+  can't be read is set aside and written anew, empty, at once: onboarding
+  had started there, so no server predates it. Going back to 0.33.0 without
+  restoring the store's files drops the `unasked` records and the list, and
+  those servers are offered.

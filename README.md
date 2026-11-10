@@ -540,8 +540,8 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   a day per server). A store that already had a `gate.json` when onboarding
   first starts on it (an update from a release without it) isn't asked about
   the servers it is configured with then: its agent wrote its rules with them
-  there, so each is recorded `unasked` at its first undecided event, with no
-  notice and no wake. Their suggestions stay readable (`event_tags`) and can be
+  there, so each is recorded `unasked` at its first event, with no notice and
+  no wake. Their suggestions stay readable (`event_tags`) and can be
   accepted or declined as any other's; a server added later is offered as
   above, and so is one of these once what it declares changes. `gate_status.catchAll` names the catch-all; `event_tags`
   shows each server's offer. `gate.onboarding: false` turns it off.
