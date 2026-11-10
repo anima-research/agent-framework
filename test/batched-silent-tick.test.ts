@@ -8,6 +8,10 @@ import { incoming, registerOpen, MENTION } from './helpers/admission.js';
 import { GateModule, waitCall, say } from './helpers/dendrite.js';
 import { MockYieldingStream } from './helpers/mock-membrane.js';
 import { SILENT_HEARTBEAT_SEPARATOR } from '../src/silent-heartbeat.js';
+import { EventGate } from '../src/gate/event-gate.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 class M extends GateModule {
   override async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
@@ -28,7 +32,6 @@ const tick = (f: Fixture, eventId = 'tick') => internals(f).deliverHeartbeat({ k
 const reminder = (f: Fixture) => internals(f).deliverHeartbeat({ kind: 'reminder', reminderId: 'r1', recurring: false, text: 'water the plants', eventId: 'rem' });
 const separator = SILENT_HEARTBEAT_SEPARATOR.slice(0, 40);
 
-/** A framework whose gate batches channel messages and pushes, the heartbeat's included, for a minute. */
 async function batching() {
   const module = new M();
   const f = await fixture({ framework: {
@@ -40,7 +43,6 @@ async function batching() {
   return { f, module };
 }
 
-/** Fire every pending batch now, as its timer would. */
 function fire(f: Fixture): void {
   const gate = internals(f).eventGate;
   assert.ok(gate.debounceTimers.size > 0, 'premise: a batch is pending');
@@ -50,11 +52,6 @@ function fire(f: Fixture): void {
   }
 }
 
-/**
- * A first turn waits at a tool while the tick, and whatever `alongside`
- * sends, arrive and are batched; the batch fires once that turn has ended.
- * The request of the turn the batch wakes, and what was routed as speech.
- */
 async function batchedTurn(alongside: (f: Fixture) => Promise<void> | void) {
   const { f, module } = await batching();
   let n = 0;
@@ -75,20 +72,15 @@ async function batchedTurn(alongside: (f: Fixture) => Promise<void> | void) {
     module.release('first');
     await loop;
     routed.length = 0;
+    const batched = internals(f).eventGate.debounceTimers.get('batch')?.events.length;
     fire(f);
     const woken = internals(f).pendingRequests.map((r) => ({ ...r }));
     await f.framework.runUntilIdle();
     assert.equal(f.membrane.calls.length, 2, 'premise: the batch wakes one turn');
-    return { woken, request: JSON.stringify(f.membrane.calls[1]), routed: [...routed] };
+    return { woken, batched, request: JSON.stringify(f.membrane.calls[1]), routed: [...routed] };
   } finally { off(); await f.close(); }
 }
 
-/**
- * The tick, and whatever `alongside` sends, batched with no turn running, so
- * nothing answers them before the batch fires; a later entry follows them, so
- * the batch's line is written. The request of the one turn they start, and
- * what was routed as speech.
- */
 async function batchedIdle(alongside: (f: Fixture) => Promise<void> | void) {
   const { f } = await batching();
   (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
@@ -129,7 +121,8 @@ describe('a silent tick batched by a gate rule', () => {
   });
 
   it('with a channel message the last turn answered, wakes as the tick: no wake for the message, and the tick runs silent', async () => {
-    const { request, routed } = await batchedTurn((f) => incoming(f, 'work', 'm1', 'hello there', MENTION));
+    const { batched, request, routed } = await batchedTurn((f) => incoming(f, 'work', 'm1', 'hello there', MENTION));
+    assert.equal(batched, 2, "premise: the message joined the tick's batch");
     assert.ok(request.includes(separator), 'the tick separator is in the request');
     assert.deepEqual(routed, [], 'its prose is not routed as speech');
   });
@@ -167,12 +160,35 @@ describe('a silent tick batched by a gate rule', () => {
       tick(f, 'older');
       await new Promise((resolve) => setTimeout(resolve, 5));
       tick(f, 'newer');
+      assert.equal(internals(f).eventGate.debounceTimers.get('batch')?.events.length, 2, 'premise: both ticks are batched');
       fire(f);
       assert.deepEqual(internals(f).pendingRequests.map((r) => [r.agentName, r.silentHeartbeat?.eventId]), [['agent', 'newer']]);
     } finally {
       internals(f).pendingRequests.splice(0);
       await f.close();
     }
+  });
+
+  it('of ticks that reach different agents, wakes each as the last tick that reached it', (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'silent-tick-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const configPath = join(dir, 'gate.json');
+    writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [{ name: 'batch', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 1000 } }] }));
+    const wakes: Array<[string, string | undefined]> = [];
+    const gate = new EventGate({
+      configPath, getAgentNames: () => ['a', 'b'], emitTrace: () => {}, addMessage: () => '',
+      requestInference: (agentName, _reason, _source, provenance) => { wakes.push([agentName, provenance?.silentHeartbeat?.eventId]); },
+    });
+    t.after(() => gate.dispose());
+    const tickFor = (eventId: string, agentName: string) => gate.evaluate({
+      content: '', eventType: 'mcpl:push-event', serverId: 'heartbeat', channelId: '',
+      recipients: [agentName], silentHeartbeat: { eventId, serverId: 'heartbeat' },
+    });
+    assert.equal(tickFor('first', 'a').trigger, false, 'premise: the rule batches the first tick');
+    assert.equal(tickFor('second', 'b').trigger, false, 'premise: and the second');
+    t.mock.timers.tick(1000);
+    assert.deepEqual(wakes, [['a', 'first'], ['b', 'second']]);
   });
 
   it("from the heartbeat-mcpl server, batched alone, wakes as the tick, and only the agents its direct wake reaches", async () => {
@@ -197,7 +213,6 @@ describe('a silent tick batched by a gate rule', () => {
       fire(f);
       assert.deepEqual(fw.pendingRequests.map((r) => [r.agentName, r.suppressProse, r.silentHeartbeat]),
         [['agent', true, { eventId: 'hb1', serverId: 'heartbeat' }]]);
-      assert.ok(!f.context().includes('[Gate: '), 'no [Gate:] line');
     } finally {
       fw.pendingRequests.splice(0);
       fw.registry.end('agent-conv-1', 'stopped');

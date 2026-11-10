@@ -240,9 +240,9 @@ export interface WakeProvenance {
    *  requests can order by event recency, not by flush order. */
   at?: number;
   /** On the wake a batch's silent heartbeat ticks give each agent they
-   *  reach, as the batch's last tick: the framework makes the wake a silent
-   *  heartbeat, prose suppressed, as the tick's own wake is when the gate
-   *  lets it through at once. */
+   *  reach, as the last of them that reached it: the framework makes the
+   *  wake a silent heartbeat, prose suppressed, as the tick's own wake is
+   *  when the gate lets it through at once. */
   silentHeartbeat?: { eventId: string; serverId: string };
   /** The writes a batched wake is for: the message of its own of each event
    *  that has one, as `evaluate` was given it, and the batch's `[Gate: …]` line where one was
@@ -4241,10 +4241,9 @@ export class EventGate {
     }
     deliveredTracking(woke, [...new Set([...woken, ...ticked])], () => {
       for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.audience, woke);
-      const tick = ticks[ticks.length - 1];
-      if (!tick) return;
-      const tickWake: MarkedProvenance = { silentHeartbeat: tick.silentHeartbeat, [BATCH_LINE_ROWS]: [] };
       for (const agentName of ticked) {
+        const tick = ticks.filter((e) => reached([e]).has(agentName)).pop()!;
+        const tickWake: MarkedProvenance = { silentHeartbeat: tick.silentHeartbeat, [BATCH_LINE_ROWS]: [] };
         this.requestInferenceFn(agentName, 'heartbeat', 'heartbeat', tickWake);
         woke.push(agentName);
       }

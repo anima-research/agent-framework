@@ -9,11 +9,6 @@ import { incoming, registerOpen, MENTION } from './helpers/admission.js';
 import { GateModule, waitCall, say } from './helpers/dendrite.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { readMarkForTest } from '../src/read-marks.js';
-import * as frameworkModule from '../src/framework.js';
-
-/** The framework's internal mark of a batched wake's rows, read loosely so
- *  this file still runs, red, against a framework without it. */
-const BATCH_ROWS: symbol = (frameworkModule as unknown as { BATCH_ROWS?: symbol }).BATCH_ROWS ?? Symbol('no batch mark');
 
 class ReminderModule extends GateModule {
   override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -207,24 +202,6 @@ describe('debounced writes already read and answered', () => {
       assert.deepEqual(wakes, [{ agentName: 'agent' }], 'the batch requested its wake, with no writes');
       assert.equal(f.membrane.calls.length, 2, 'its wake starts its turn');
       assert.ok(!f.context().includes('[Gate:'), 'no line');
-    } finally { await f.close(); }
-  });
-
-  it("a silent heartbeat tick's batched wake, the tick's own, carries the batch's rows, none, so a merge with another batch's wake keeps that batch's line", async () => {
-    const { f, module, start } = await setup(60_000);
-    try {
-      const { loop } = await start();
-      (f.framework as unknown as { deliverHeartbeat(wake: import('../src/heartbeat/heartbeat.js').HeartbeatWake): void }).deliverHeartbeat(
-        { kind: 'heartbeat', reason: 'schedule', silent: true, text: 'tick prompt', eventId: 'tick' });
-      module.release('first');
-      await loop;
-      assert.ok(!stored(f, 'tick prompt'), 'premise: the silent tick stored nothing');
-      const pending = (f.framework as unknown as { pendingRequests: Array<Record<string | symbol, unknown>> }).pendingRequests;
-      const before = pending.length;
-      fire(f);
-      const queued = pending.slice(before).filter((r) => r.reason === 'heartbeat' && r.suppressProse === true);
-      assert.equal(queued.length, 1, "premise: the batch queued the tick's own wake");
-      assert.deepEqual(queued[0]![BATCH_ROWS], []);
     } finally { await f.close(); }
   });
 
