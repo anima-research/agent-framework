@@ -2380,7 +2380,7 @@ export class Agent {
     const cm = this.contextManager;
     const hot = this.getHotContextSettings();
     const stats = (cm.getStrategy() as { getStats?: () => Record<string, unknown> }).getStats?.();
-    const counts = stats && [stats.chunksCompressed, stats.compressionCount, stats.l1, stats.l2, stats.l3];
+    const counts = stats && [stats.chunksTotal, stats.pendingMerges, stats.chunksCompressed, stats.compressionCount, stats.l1, stats.l2, stats.l3];
     const pins = cm.listPins().filter((pin) => !excludePins?.includes(pin.id))
       .map((pin) => [pin.id, pin.firstMessageId, pin.lastMessageId]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     return JSON.stringify([
