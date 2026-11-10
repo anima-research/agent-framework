@@ -629,6 +629,7 @@ export class Agent {
    * source's own. Under `'entries'` its requests carry them, so it reads
    * them as its own change rows: what it declares, consolidates and takes
    * out.
+   * @internal For the framework's derived and shared agents; not a host API.
    */
   setSourceChangeOwners(owners: Iterable<string>): void {
     this.sourceChangeOwners = new Set([...owners].filter((owner) => !this.ownParticipants.has(owner)));
@@ -639,17 +640,20 @@ export class Agent {
    * opens its context manager with a view that leaves every change row out,
    * as the framework does for an agent on `'head'`. A compile refused over
    * budget then takes none out, since taking them can't help it fit.
+   * @internal For the framework's views; not a host API.
    */
   setCompileHoldsChanges(holds: boolean): void {
     this.compileHoldsChanges = holds;
   }
 
-  /** Whether a change row stamped with this participant is one of this agent's own. */
+  /** Whether a change row stamped with this participant is one of this agent's own.
+   *  @internal For the framework's views and moves; not a host API. */
   ownsChange(participant: string): boolean {
     return this.ownParticipants.has(participant) || this.sourceChangeOwners.has(participant);
   }
 
-  /** The participants whose change rows are this agent's own. */
+  /** The participants whose change rows are this agent's own.
+   *  @internal For the framework's views and moves; not a host API. */
   changeOwners(): string[] {
     return [...this.ownParticipants, ...this.sourceChangeOwners];
   }
@@ -2879,7 +2883,8 @@ export class Agent {
     return { tools, system: this.systemBlocks(systemInjections) };
   }
 
-  /** Whether this agent's requests declare later changes in its context. */
+  /** Whether this agent's requests declare later changes in its context.
+   *  @internal For the framework's turns and fail-safe; not a host API. */
   declaresEntries(): boolean {
     return this.toolDeclarations === 'entries' && !this.headUntilBuiltAgain;
   }
@@ -2896,7 +2901,8 @@ export class Agent {
     this.onChangesRemoved = onChangesRemoved;
   }
 
-  /** The fail-safe: declare on the head until this agent is built again. */
+  /** The fail-safe: declare on the head until this agent is built again.
+   *  @internal For the framework's fail-safe; not a host API. */
   keepToHeadUntilBuiltAgain(): void {
     this.headUntilBuiltAgain = true;
   }

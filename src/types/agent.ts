@@ -188,7 +188,8 @@ export interface AgentConfig {
    * ends with a refusal membrane recognises, or with a 400 it doesn't file
    * as context overflow or an account refusal (`type` `context_length` or
    * `auth`), whether or not the change caused it, the request goes again on
-   * the agent's head, which it keeps to until it's built again. Kept to its
+   * the agent's head, which it keeps to until it's built again, and an
+   * operator line (`head-resend`) says so. Kept to its
    * head, it leaves every change row out of its request, and takes its own
    * out of its context once its record is cleared (a record the store can't
    * clear keeps them until it can), while its compile, made as an

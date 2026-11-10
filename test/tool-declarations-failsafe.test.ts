@@ -115,13 +115,13 @@ async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boole
 
 const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCreationTokens: 200 + n, cacheReadTokens: 3000 + n });
 
-async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
+async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; refuseLater?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
   const membrane = new MockMembrane();
   let turn = 0;
   membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
     const n = membrane.calls.push(request) - 1;
-    const error = turn === 2 ? opts.refuse(request) : undefined;
+    const error = turn === 2 || (opts.refuseLater && turn > 2) ? opts.refuse(request) : undefined;
     return error
       ? new RefusedStream(error)
       : new MockYieldingStream([{ ...createMockResponse([{ type: 'text', text: 'done' }]), usage: usageOf(n) } as NormalizedResponse]);
@@ -169,6 +169,7 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
       waitRecorded: internals.providerWaits.active('resident', 'test-model') !== undefined,
     };
     if (opts.third) {
+      if (opts.refuseLater) tools.names = ['a', 'b', 'c'];
       await send('third', 3);
     }
     return { calls: membrane.calls, traces, policyCalls, ...afterSecond };
@@ -242,8 +243,18 @@ describe("toolDeclarations' fail-safe", () => {
       assert.equal(/can set aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it can be paid`);
       assert.equal(alert.data?.httpStatus, 400);
     }
-    const recognised = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(true) : undefined) });
-    assert.equal(recognised.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend').length, 0, 'a refusal membrane recognises needs none');
+  });
+
+  it("tells the operator of a refusal membrane recognises, with the remedy, once in the agent's build", async () => {
+    const run = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(true) : undefined), third: true, refuseLater: true });
+    assert.equal(run.onHead, true, 'the premise: the refusal kept the agent to its head');
+    assert.equal(carriesChange(run.calls.at(-1)!), false, 'the premise: the third turn, after its tools changed again, carried no change to refuse');
+    const alerts = run.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string; data?: { httpStatus?: number } }>;
+    assert.equal(alerts.length, 1, 'one operator line for the build');
+    assert.match(alerts[0]!.message, /membrane refused a system change, so it goes again on the agent's head/);
+    assert.match(alerts[0]!.message, /keeps to its head until it's built again/);
+    assert.match(alerts[0]!.message, /set toolDeclarations: 'head' on it; where membrane refused the change before sending it, send through a formatter and an adapter that send system changes/);
+    assert.equal(alerts[0]!.data?.httpStatus, undefined, 'naming no 400 of its own');
   });
 
   it('leaves a failure that isn\'t a 400 to the error policy', async () => {
@@ -485,7 +496,9 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     assert.equal(resend.length, 1);
     assert.deepEqual(outcomes, ['answered', 'refused at a later round', 'answered', 'answered'], 'the resend and the next turn go out without that thinking');
     assert.equal((resend[0] as { thinkingSetAside: number }).thinkingSetAside, 1, "the second round's reply, signed after the change the boundary handed");
-    assert.equal(traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend').length, 0, 'a recognised refusal whose note landed needs no operator line');
+    const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string }>;
+    assert.equal(alerts.length, 1, 'an operator line for the recognised refusal');
+    assert.doesNotMatch(alerts[0]!.message, /didn't land/, 'whose note landed');
   });
 
   it("says, when its note can't land, that where its head didn't move its requests can carry that thinking until those replies leave its window or it's built again, which an account that enforces the binding refuses without the drop control", async () => {

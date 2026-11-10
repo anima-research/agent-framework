@@ -114,7 +114,8 @@ it doesn't file as context overflow or an account refusal, whatever caused it,
 goes again on the agent's current head, and the agent keeps to its head until
 it's built again, its record and then its own change rows taken out (a record
 the store can't clear keeps them until it can), so an unrelated 400, such as
-one for an oversized image, ends its `'entries'` too. A consolidation waits
+one for an oversized image, ends its `'entries'` too. Either raises an operator
+line (`head-resend`), naming the remedy for a refused change. A consolidation waits
 for a compile that already rewrites the changes; past a fifth of the request,
 or when a compile is refused over budget, or for dropping messages no summary
 covers, with changes kept, it happens anyway, with an operator line.

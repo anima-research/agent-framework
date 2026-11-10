@@ -36,7 +36,7 @@
   carrying a change that ends with a 400 membrane doesn't file as
   `context_length` or `auth`, or with a refusal membrane recognises, goes
   again on the agent's current head, which it keeps to until it's built
-  again. Until then it compiles as it's configured, so a host's
+  again, and raises an operator line (`head-resend`). Until then it compiles as it's configured, so a host's
   change rows stay in its compile, unsent. A consolidation waits for a compile
   that already rewrites the changes, which `thinkingBinding.binds` narrows for
   a model that binds its thinking: left out, it counts as one here, and only
@@ -57,12 +57,7 @@
   agent built again on `'head'` clears its recorded head at its first request
   and then takes its own change rows out of its context; a record the store
   can't clear keeps them, and a later request tries again. New trace events:
-  `head:declared`, `head:moved` and `head:resend`. `Agent` gains what a host
-  that builds agents without the framework sets and reads:
-  `setCompileHoldsChanges` (whether its compile can hold change rows),
-  `setSourceChangeOwners`, `ownsChange` and `changeOwners` (whose change rows
-  are its own), `declaresEntries` (whether its requests declare changes now)
-  and `keepToHeadUntilBuiltAgain` (the fail-safe).
+  `head:declared`, `head:moved` and `head:resend`.
 - An agent that continues another's context starts on that agent's head:
   `deriveAgent`, and `createEphemeralAgent` with a spec whose `inherit` sets
   no `atSequence` and names a running agent that declares entries, start the
