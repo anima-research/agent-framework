@@ -766,38 +766,7 @@ describe('plain speech a module says it showed', () => {
     }
   });
 
-  it("a hybrid reply's later envelopes aren't posted once a module has replaced its agent from inside its hook", async (t) => {
-    const errors: string[] = [];
-    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
-    const surface = new Surface();
-    surface.answer = 'none';
-    const f = await host([surface], new MockMembrane(), { proseRouting: 'hybrid' });
-    const { server, published } = channelServer(true);
-    const registry = internals(f).channelRegistry;
-    registry.serverRegistry = { getServer: () => server };
-    registry.ensureChannelRegistered('srv', 'room', 'room');
-    await f.start();
-    const internal = f as unknown as {
-      agents: Map<string, unknown>;
-      routingOf(name: string): unknown;
-      deliverHybridProse(agent: unknown, rawText: string, locus: null, allowLocus: boolean, round: unknown): Promise<void>;
-    };
-    const original = internal.agents.get('resident');
-    surface.onAsked = () => { internal.agents.set('resident', { name: 'resident' }); };
-    try {
-      await internal.deliverHybridProse(original, 'Said before the swap.\n>>>room Posted after it.', null, true, { routing: internal.routingOf('resident') });
-      assert.equal(surface.asked.length, 1, "premise: the plain piece's module was asked");
-      assert.ok(errors.includes(`[routeSpeech] resident: replaced while its modules were asked; ${'Said before the swap.'.length} chars not routed for the replacement`), `premise: the plain piece met the replacement: ${errors.join('\n')}`);
-      assert.deepEqual(published, [], "the >>> envelope isn't posted for the replacement");
-      assert.ok(errors.includes(`[prose] resident: replaced while its reply was routed; ${'>>>room Posted after it.'.length} chars not routed for the replacement`), errors.join('\n'));
-    } finally {
-      internal.agents.set('resident', original);
-    }
-  });
-
-  for (const where of ['a channel', 'no channel'] as const) it(`a piece with ${where} that a replaced agent routes after another agent took its name is neither asked about nor routed`, async (t) => {
-    const errors: string[] = [];
-    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+  for (const where of ['a channel', 'no channel'] as const) it(`a piece with ${where} that a replaced agent routes after another agent took its name asks no module and routes under that name`, async (t) => {
     const surface = new Surface();
     const f = await host([surface], new MockMembrane());
     const { server, published } = channelServer(true);
@@ -810,48 +779,20 @@ describe('plain speech a module says it showed', () => {
       routingOf(name: string): unknown;
       routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: { serverId: string; channelId: string } | null): Promise<unknown>;
     };
-    const original = internal.agents.get('resident');
-    const text = 'Said after the swap.';
-    internal.agents.set('resident', { name: 'resident' });
-    try {
-      const result = await internal.routeLocusSpeech(original, { routing: internal.routingOf('resident') }, text, where === 'a channel' ? { serverId: 'srv', channelId: 'room' } : null);
-      assert.equal(result, null);
-      assert.deepEqual(surface.asked, [], 'no module is asked about it');
-      assert.deepEqual(published, [], "it isn't posted");
-      assert.ok(errors.includes(`[routeSpeech] resident: replaced before this piece was routed; ${text.length} chars not routed for the replacement`), errors.join('\n'));
-    } finally {
-      internal.agents.set('resident', original);
-    }
-  });
-
-  it("a piece with no channel that a replaced agent with no fallback routes after another agent took its name isn't routed", async (t) => {
-    const errors: string[] = [];
-    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
-    const surface = new Surface();
-    const f = await host([surface], new MockMembrane());
-    await f.start();
-    const internal = f as unknown as {
-      agents: Map<string, unknown>;
-      usedEphemeralAgentNames: Map<string, string>;
-      routingOf(name: string): unknown;
-      routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: null): Promise<unknown>;
-    };
     const routed: string[] = [];
-    const registry = internals(f).channelRegistry as unknown as { routeSpeech(name: string, text: string): unknown };
-    t.mock.method(registry, 'routeSpeech', (name: string, text: string) => { routed.push(`${name}: ${text}`); return null; });
+    const routes = registry as unknown as { routeSpeech(name: string, text: string, ...rest: unknown[]): unknown };
+    const routeSpeech = routes.routeSpeech.bind(routes);
+    t.mock.method(routes, 'routeSpeech', (name: string, text: string, ...rest: unknown[]) => { routed.push(`${name}: ${text}`); return routeSpeech(name, text, ...rest); });
     const original = internal.agents.get('resident');
-    internal.usedEphemeralAgentNames.set('resident', 'run');
     const text = 'Said after the swap.';
     internal.agents.set('resident', { name: 'resident' });
     try {
-      const result = await internal.routeLocusSpeech(original, { routing: internal.routingOf('resident') }, text, null);
-      assert.equal(result, null);
-      assert.deepEqual(routed, [], "it isn't routed under the name");
+      await internal.routeLocusSpeech(original, { routing: internal.routingOf('resident') }, text, where === 'a channel' ? { serverId: 'srv', channelId: 'room' } : null);
       assert.deepEqual(surface.asked, [], 'no module is asked about it');
-      assert.ok(errors.includes(`[routeSpeech] resident: replaced before this piece was routed; ${text.length} chars not routed for the replacement`), errors.join('\n'));
+      assert.deepEqual(routed, [`resident: ${text}`], 'it routes under the name');
+      if (where === 'a channel') assert.deepEqual(published.map((p) => p.text), [text], "it's posted");
     } finally {
       internal.agents.set('resident', original);
-      internal.usedEphemeralAgentNames.delete('resident');
     }
   });
 
@@ -877,34 +818,6 @@ describe('plain speech a module says it showed', () => {
     } finally {
       internal.agents.set('resident', original);
     }
-  });
-
-  it("explicit routing's envelopes that a replaced agent routes after another agent took its name aren't posted", async (t) => {
-    const errors: string[] = [];
-    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
-    const surface = new Surface();
-    const f = await host([surface], new MockMembrane(), { proseRouting: 'explicit' });
-    const { server, published } = channelServer(true);
-    const registry = internals(f).channelRegistry;
-    registry.serverRegistry = { getServer: () => server };
-    registry.ensureChannelRegistered('srv', 'room', 'room');
-    await f.start();
-    const internal = f as unknown as {
-      agents: Map<string, unknown>;
-      deliverProse(agent: unknown, rawText: string): Promise<void>;
-    };
-    const original = internal.agents.get('resident');
-    const posted = (): Array<string | undefined> => published.map((p) => p.text);
-    internal.agents.set('resident', { name: 'resident' });
-    try {
-      await internal.deliverProse(original, '>>room First for the room.\n>>room Second for it.');
-      assert.deepEqual(posted(), [], 'neither is posted for the replacement');
-      assert.equal(errors.filter((e) => e.startsWith('[prose] resident: replaced while its reply was routed;')).length, 2, errors.join('\n'));
-    } finally {
-      internal.agents.set('resident', original);
-    }
-    await internal.deliverProse(original, '>>room Third, from the agent itself.');
-    assert.deepEqual(posted(), ['Third, from the agent itself.'], 'premise: the agent that holds its name posts there');
   });
 
   it("a module whose onSpeechRouted can't be read isn't asked, and the others are", async (t) => {

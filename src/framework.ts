@@ -24462,19 +24462,16 @@ export class AgentFramework {
       this.holdHeartbeatProse(agent, [text], round);
       return null;
     }
-    const now = this.agents.get(agent.name);
-    if (now && now !== agent) {
-      console.error(`[routeSpeech] ${agent.name}: replaced before this piece was routed; ${text.length} chars not routed for the replacement`);
-      return null;
-    }
     if (locus === null && !this.takesGlobalFallback(agent.name)) {
       return this.channelRegistry!.routeSpeech(agent.name, text, locus, this.cameFrom(round.routing, locus));
     }
-    const places = this.askSpeechRouted(agent, round, text);
+    const holder = this.agents.get(agent.name);
+    const replaced = holder !== undefined && holder !== agent;
+    const places = replaced ? [] : this.askSpeechRouted(agent, round, text);
     this.noteSpeechPlaces(round.routing, places);
     if (locus === null) {
       const current = this.agents.get(agent.name);
-      if (current && current !== agent) {
+      if (!replaced && current && current !== agent) {
         console.error(`[routeSpeech] ${agent.name}: replaced while its modules were asked; ${text.length} chars not routed for the replacement`);
         return null;
       }
@@ -27061,13 +27058,6 @@ export class AgentFramework {
     return draft ? draftState(draft) : 'let go';
   }
 
-  private refusedForReplacement(agent: Agent, chars: number): boolean {
-    const now = this.agents.get(agent.name);
-    if (!now || now === agent) return false;
-    console.error(`[prose] ${agent.name}: replaced while its reply was routed; ${chars} chars not routed for the replacement`);
-    return true;
-  }
-
   /** Locus-preserving explicit publication. Source remains byte-identical in Chronicle. */
   private async deliverHybridProse(
     agent: Agent,
@@ -27125,7 +27115,6 @@ export class AgentFramework {
         console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
         return;
       }
-      if (this.refusedForReplacement(agent, envelope.length)) return;
       try {
         routing.postTried = true;
         const outcome = await this.deliverWithUnsent(agent, body, pinned, unsent.draft);
@@ -27315,7 +27304,6 @@ export class AgentFramework {
       return;
     }
 
-    if (this.refusedForReplacement(agent, rawText.length)) return;
     let delivered = false;
     try {
       const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft);

@@ -31,15 +31,12 @@
   called logs `Speech-routed module <name> (agent <agent>) …` when its hook
   can't be read or throws, and when the framework's callback for a place it
   names throws.
-- **Hosts:** once another agent holds an agent's name, plain speech the
-  replaced agent routes after that, under locus, locked, hybrid or explicit
-  prose routing, a piece with a channel and an envelope's named target
-  included, is neither asked about nor routed under that name, where it was
-  routed; each stop is logged with the agent's name and how many characters
-  weren't routed for the replacement. Its tool calls go as before. A module
-  can replace the agent from inside its own hook. Later modules are still
-  asked about the piece in hand, and about a draft hold's later pieces. A
-  piece with a channel is still posted. A piece with no channel isn't.
+- **Hosts:** once another agent holds an agent's name, no module is asked
+  about plain speech the replaced agent routes after that, which routes as
+  before. A module can replace the agent from inside its own hook. Later
+  modules are still asked about the piece in hand, and about a draft hold's
+  later pieces. The piece in hand still posts if it has a channel; with
+  none, it isn't routed for the replacement.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, except an ephemeral run's, which gets
   none, as before; the notice now names the piece by its opening words,
