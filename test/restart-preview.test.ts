@@ -237,8 +237,6 @@ const restarted = (traces: TraceEvent[]) => traces.filter((event) => event.type 
 type Declined = Extract<TraceEvent, { type: 'inference:restart_declined' }>;
 const declined = (traces: TraceEvent[]) => traces.filter((event): event is Declined => event.type === 'inference:restart_declined');
 
-const HIERARCHICAL_REFUSAL = 'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview';
-
 // What a strategy built from another copy of context-manager throws: an error whose class isn't this copy's, with
 // that copy's name and message.
 function errorFromAnotherCopy(name: string, message: string): Error {
@@ -675,9 +673,8 @@ test('a framework that stops during a tool call asks for no restart preview past
 
 // On the hierarchical path, once the dry select has succeeded, this copy of context-manager answers null. A strategy
 // built from another copy throws that copy's refusal, which this copy's ContextManager doesn't turn into null: a
-// 0.23.1 copy's NoFoldPlanToPreviewError, or 0.23.0's plain Error. Each says the compile fits.
+// 0.23.1 copy's NoFoldPlanToPreviewError. Each says the compile fits.
 for (const { answer: preview, strategy: make, answersNull } of [
-  { answer: "a 0.23.0 copy's plain Error", strategy: () => new ThrowingPreviewStrategy(new Error(HIERARCHICAL_REFUSAL), false) },
   { answer: "another 0.23.1 copy's NoFoldPlanToPreviewError", strategy: () => new ThrowingPreviewStrategy(errorFromAnotherCopy('NoFoldPlanToPreviewError', 'zz a copy whose refusal reads otherwise'), false) },
   { answer: "this copy's NoFoldPlanToPreviewError, which its ContextManager answers as null", strategy: () => strategy('hierarchical'), answersNull: true },
 ] as Array<{ answer: string; strategy: () => AutobiographicalStrategy; answersNull?: true }>) {

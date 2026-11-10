@@ -1261,12 +1261,9 @@ function announcedDomainsOf(announce: unknown): string[] {
   return Array.isArray(domains) ? domains.filter((domain): domain is string => typeof domain === 'string') : [];
 }
 
-// A strategy from another context-manager copy can't be matched by class: its refusal is matched by name
-// (NoFoldPlanToPreviewError, from 0.23.1 on) or by 0.23.0's plain Error message, verbatim.
-const HIERARCHICAL_PREVIEW_REFUSAL = 'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview';
-
+// A strategy from another context-manager copy can't be matched by class, so its refusal is matched by name.
 function isNoFoldPlanRefusal(error: unknown): boolean {
-  return error instanceof Error && (error.name === 'NoFoldPlanToPreviewError' || error.message === HIERARCHICAL_PREVIEW_REFUSAL);
+  return error instanceof Error && error.name === 'NoFoldPlanToPreviewError';
 }
 
 interface RestartDecline {
@@ -18797,6 +18794,7 @@ export class AgentFramework {
   }
 
   private feedSharedSlot(contextManager: ContextManager): void {
+    if (this.sharedSlotManagers.has(contextManager)) return;
     if (typeof contextManager.onMessage === 'function') {
       contextManager.onMessage((event) => { if (event.type !== 'add') this.sharedSlotRowChanges++; });
     }
