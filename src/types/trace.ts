@@ -329,20 +329,21 @@ export type TraceEvent =
        * at each such boundary. `reason` is why: the restart's compile won't fit by context-manager's preview,
        * and the preview doesn't name compression as what would make room (`wont_fit`, with the preview's
        * `finalTokens`, `budgetTokens` and `clearedBy`), or the preview threw an `UncoveredDropError` with no
-       * compression pending (`uncovered_drop`). For an agent the budget hold can't take, such as an ephemeral run,
-       * either is declined even where the preview names compression or compression is pending.
-       * `previewed` is false where the boundary took an earlier boundary's `wont_fit` on the same stream, one a
-       * newer message couldn't clear, with none of these changed since: the budget, the compression holds, the
-       * live context settings, the strategy's compression state and its counts of chunks and pending merges, the
-       * pins and document marks other than the turn's own, or a stored row edited or removed. It ran no preview,
-       * and its figures are that earlier preview's. Rows added to the store, the stream's own among them, and
-       * context-manager's calibration multiplier aren't in that list. When the stream's rows close one of the
-       * strategy's chunks, its count of chunks moves, and the next boundary previews again. A fresh preview can
-       * name compression a boundary before that count moves. Otherwise such a decline isn't previewed again when
-       * only those change. For a resident, a stored row includes a row of the residents' shared slot, edited or
-       * removed through another agent. A `toolResultGuard` edits a round's stored row once it settles it, and a
-       * withheld batch's stub once its annotation is written, so an agent with it on previews again at the first
-       * boundary after that edit.
+       * compression pending (`uncovered_drop`). For an agent the budget hold can't take, such as an ephemeral
+       * run, either is declined even where the preview names compression or compression is pending.
+       * `previewed` is false where the boundary took an earlier boundary's `wont_fit` on the same stream, one
+       * whose preview didn't name a newer message as what would make room, with none of these changed since: the
+       * budget, the compression holds, the live context settings, the strategy's counts of chunks, pending
+       * merges, compressed chunks, compressions and summaries at each level (or, for a strategy that reports
+       * none of them, its pending work's description), the pins and document marks other than the turn's own, or
+       * a stored row edited or removed. It ran no preview, and its figures are that earlier preview's. Rows
+       * added to the store, the stream's own among them, and context-manager's calibration multiplier aren't in
+       * that list. When the stream's rows close one of the strategy's chunks, its count of chunks moves, and the
+       * next boundary previews again. A fresh preview can name compression a boundary before that count moves.
+       * Otherwise such a decline isn't previewed again when only those change. For a resident, a stored row
+       * includes a row of the residents' shared slot, edited or removed through another agent. A
+       * `toolResultGuard` edits a round's stored row once it settles it, and a withheld batch's stub once its
+       * annotation is written, so an agent with it on previews again at the first boundary after that edit.
        */
       type: 'inference:restart_declined';
       agentName: string;
