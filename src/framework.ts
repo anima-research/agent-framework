@@ -5548,6 +5548,9 @@ export class AgentFramework {
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
+      // Read before the gate writes its file: a gate.json already there says
+      // the store had its rules before this start (wake onboarding, below).
+      const gateFileExisted = existsSync(configPath);
       const heartbeatOn = config.heartbeat !== undefined && config.heartbeat !== null && config.heartbeat !== false;
       framework.eventGate = new EventGate({
         configPath,
@@ -5650,9 +5653,13 @@ export class AgentFramework {
       // Wake onboarding: the agent's decisions about servers' suggested
       // treatment, beside gate.json (gate/wake-onboarding.ts).
       if (config.gate.onboarding !== false) {
+        // A store that had a gate before onboarding first starts on it keeps
+        // the servers it is configured with unasked (WakeDecisions): its
+        // agent wrote its rules with them there.
         framework.wakeDecisions = new WakeDecisions(
           join(dirname(configPath), 'wake-decisions.json'),
           (message) => console.error(`[gate] ${message}`),
+          gateFileExisted ? [...configuredServerIds] : [],
         );
       }
       // The periodic review of what suppress rules hid (gate/suppression-review.ts),
@@ -40191,7 +40198,9 @@ export class AgentFramework {
 
     if (!connected) return fail(`${quotedValue(server)} isn't connected, so its suggestions can't be read now. wake_decline still records a decline.`);
     const offer = this.wakeOffer(server);
-    if (record && (record.shown ?? record.digest) !== offer.digest) {
+    // An unasked server's agent was shown no numbered list: it reads the
+    // numbers from event_tags, which gives the current ones.
+    if (record && record.state !== 'unasked' && (record.shown ?? record.digest) !== offer.digest) {
       // The numbers the agent was shown may not mean what they mean now: show them again, and ask again.
       // The decision on record (and its time, which the daily floor counts from) stays as it is.
       this.wakeDecisions.markShown(server, offer.digest);
@@ -40962,7 +40971,22 @@ export class AgentFramework {
   }): void {
     try {
       const d = event.gateDecision;
-      if (!this.wakeDecisions || !this.eventGate || !d || d.trigger) return;
+      if (!this.wakeDecisions || !this.eventGate) return;
+      if (this.wakeDecisions.predates(event.serverId)) {
+        // The store's own server from before onboarding started on it: its
+        // rules stand unasked. It is settled at its first event, whatever
+        // the gate decided about that one, against what it declares now, so
+        // that a declaration it changes later is asked about as any
+        // server's is. A server whose events a rule of the agent's always
+        // decides would otherwise wait unsettled, and be settled against
+        // whatever it declared on the day that rule went.
+        if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
+        const digest = this.wakeOffer(event.serverId).digest;
+        this.wakeDecisions.set(event.serverId, { digest, state: 'unasked' });
+        this.emitTrace({ type: 'gate:onboarding-decided', serverId: event.serverId, digest, state: 'unasked', rules: [] });
+        return;
+      }
+      if (!d || d.trigger) return;
       // Cheap refusals first: this runs for every event a catch-all lets by.
       if (!this.wakeDecisions.mayOfferSoon(event.serverId)) return;
       if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
