@@ -4393,9 +4393,9 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy`. A debounce's batch wakes the
-   * agent when it fires. It only may where each of `agentNames` is given none
-   * of its events, or each event delivery gives that agent has a message of its
-   * own whose write was placed for it. A host whose scheduler drops such a wake
+   * agent when it fires. It only may for an agent given none of its events, or
+   * one whose every event delivery gives it a message of its own whose write
+   * was placed for it. A host whose scheduler drops such a wake
    * by its WakeProvenance.writes, as AgentFramework's does, starts no turn for
    * an agent that has read and answered every one. A judge
    * rule's batch goes to the judge, so it only may. A batch counts for the
