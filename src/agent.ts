@@ -2486,18 +2486,24 @@ export class Agent {
    * array as the window's for a single slot that is still the record. */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
   private effortPlanner?: EffortPlanner;
-  /** The effort row this agent's latest turn start stored, if it stored one (takeEffortRowAtStart). */
-  private effortRowAtStart: MessageId | undefined;
-
   /**
-   * The effort row this agent's latest turn start stored, once. The framework takes the row back when membrane
-   * refuses the start's request, which carried it (refuseEffortRows), so no request ever sends it.
+   * The effort rows the framework wrote for this agent (marked with its own name) that no stored reply of the agent's
+   * follows. No answered turn request carried them: every turn request while rows are on carries the agent's own
+   * rows, and an answered turn stores the agent's reply after them. The framework takes them back when membrane
+   * refuses rows (refuseEffortRows).
    * @internal For the framework's refusal of effort rows; not a host API.
    */
-  takeEffortRowAtStart(): MessageId | undefined {
-    const id = this.effortRowAtStart;
-    this.effortRowAtStart = undefined;
-    return id;
+  unansweredEffortRows(): MessageId[] {
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return [];
+    const rows = cm.getAllMessages();
+    const ids: MessageId[] = [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const message = rows[i]!;
+      if (message.participant === this.name) break;
+      if (effortOf(message.content) !== undefined && effortRowOf(message.metadata) === this.name) ids.push(message.id);
+    }
+    return ids;
   }
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
@@ -2538,9 +2544,7 @@ export class Agent {
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
     const effort = this.effortPlanner?.('turn');
-    this.effortRowAtStart = effort?.change
-      ? storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)], { [EFFORT_ROW_KEY]: this.name } as MessageMetadata)
-      : undefined;
+    if (effort?.change) storeOwnRow(this, EFFORT_ROW_PARTICIPANT, [effortChange(effort.change)], { [EFFORT_ROW_KEY]: this.name } as MessageMetadata);
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
