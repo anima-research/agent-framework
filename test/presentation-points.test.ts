@@ -55,7 +55,6 @@ type Internals = {
   createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<Agent>;
   surgeryHeldWrites: unknown[];
   storeDueClock(agent: Agent, occasion: 'event' | 'turn-start' | 'tool-boundary'): { id: MessageId } | undefined;
-  placeWakeLines(agent: Agent, lines: unknown[]): void;
   sweepExpiredConversations(): void;
   nonOwningProviderWait(agent: Agent, error: Error): 'held' | 'fail' | undefined;
   budgetHolds: Map<string, unknown>;
@@ -619,16 +618,6 @@ describe('presentation points (#291)', () => {
     assert.equal(h.cm('oren').ordinalOf(clock.id), undefined, "nor once oren's turn has ended and its point has run");
   });
 
-  it("each resident a batched wake was for writes its own line into its own window, once", async () => {
-    const line = { entry: { eventType: 'mcpl:push-event', serverId: 'notes', eventId: 'not-stored' }, policyNames: ['batch'], shown: '#room', at: Date.now() };
-    const h = await boot({ residents: ['mira', 'oren'] });
-    for (const name of ['mira', 'oren', 'mira', 'oren']) h.internals.placeWakeLines(h.agent(name), [line]);
-    const lines = h.cm('mira').getAllMessages().filter((m) => (m.metadata as { source?: string } | undefined)?.source === 'gate:debounce');
-    assert.deepEqual(lines.map((m) => audienceOf(m.metadata)?.ownRowOf), ['mira', 'oren'], "one line each, each the resident's own row");
-    assert.deepEqual(lines.map((m) => [h.cm('mira').ordinalOf(m.id) !== undefined, h.cm('oren').ordinalOf(m.id) !== undefined]),
-      [[true, false], [false, true]], 'each in its own window');
-  });
-
   it("a closing fork whose closure wake waits isn't disposed when the turn that was alive at its expiry ends, and its closure turn runs", async () => {
     const h = await boot({ forks: true });
     const fork = await h.fork('fork-room');
@@ -702,7 +691,7 @@ describe('presentation points (#291)', () => {
     const real = h.internals.conversationRouter;
     h.internals.conversationRouter = { expired: () => [], unbind: () => {}, getBinding: () => undefined, closurePrompt: 'the conversation is closing' };
     h.internals.closingConversationAgents.add('fork-room');
-    h.internals.budgetHolds.set('fork-room', { startedAt: Date.now(), wait: { since: Date.now() }, turn: { agentName: 'fork-room', reason: 'conversation:closure', source: 'test', timestamp: Date.now() }, standsOn: [], wakes: [] });
+    h.internals.budgetHolds.set('fork-room', { startedAt: Date.now(), wait: { since: Date.now() }, turn: { agentName: 'fork-room', reason: 'conversation:closure', source: 'test', timestamp: Date.now() }, standsOn: [], ownRows: [], wakes: [] });
     try {
       h.internals.lastConversationSweep = 0;
       h.internals.sweepExpiredConversations();

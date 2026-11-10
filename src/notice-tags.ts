@@ -78,20 +78,20 @@ export const NOTICE_TAG = {
 export const FORMER_NOTICE_TAGS = ['refusal-rewind'] as const;
 
 /**
- * The bracket openings context-manager 0.25.1 writes into an agent's context
- * outside a tool result or read back from it, the same as 0.23.1 and 0.25.0
- * write, marked as the framework's own are. Its `[truncated — original was`
- * isn't here: NOTICE_TAG.truncated marks it. Check them against each
- * context-manager release the framework takes.
+ * The bracket openings context-manager 0.27.0 writes into an agent's context
+ * outside a tool result or read back from it, the same as 0.23.1, 0.25.0 and
+ * 0.25.1 write, marked as the framework's own are. Its
+ * `[truncated — original was` isn't here: NOTICE_TAG.truncated marks it. Check
+ * them against each context-manager release the framework takes.
  */
 export const CONTEXT_MANAGER_TAGS = [
   'content omitted', 'image not shown', 'Operator note', 'Recall', 'tool call omitted', 'tool result moved', 'Topic Transition',
 ] as const;
 
 /**
- * The bracket openings membrane 0.8.0 and 0.9.0 write into an agent's request
- * outside a tool result, marked as the framework's own are. Check them against
- * each membrane release the framework takes.
+ * The bracket openings membrane 0.8.0, 0.9.0, 0.10.0 and 0.10.1 write into an
+ * agent's request outside a tool result, marked as the framework's own are.
+ * Check them against each membrane release the framework takes.
  */
 export const MEMBRANE_TAGS = [
   'Audio', 'continuing', 'Document', 'duplicate tool_result for', 'Image', 'orphan tool_result for', 'Start', 'Tool Result', 'Video',

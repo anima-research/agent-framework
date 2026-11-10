@@ -1088,10 +1088,10 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
       type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 1234, message: 'Rate limited', rawError: { status: 429 },
     });
     // A stated wait is honoured, from another copy as from the framework's own.
-    assert.deepEqual(policy.onInferenceError(own, 'resident', 0), { retry: true, delayMs: 1234 });
-    assert.deepEqual(policy.onInferenceError(foreign({ retryable: true, retryAfterMs: 1234 }), 'resident', 0), { retry: true, delayMs: 1234 });
+    assert.deepEqual(policy.onInferenceError(own, 'resident', 0), { retry: true, delayMs: 1234, retryClass: 'rate_limited', maxTries: 5 });
+    assert.deepEqual(policy.onInferenceError(foreign({ retryable: true, retryAfterMs: 1234 }), 'resident', 0), { retry: true, delayMs: 1234, retryClass: 'rate_limited', maxTries: 5 });
     // Without retryable, it retries as an unknown error does; refused only when false.
-    assert.deepEqual(policy.onInferenceError(foreign({}), 'resident', 0), { retry: true, delayMs: 1_000 });
+    assert.deepEqual(policy.onInferenceError(foreign({}), 'resident', 0), { retry: true, delayMs: 1_000, retryClass: 'rate_limited', maxTries: 5 });
     assert.deepEqual(policy.onInferenceError(foreign({ retryable: false, retryAfterMs: 1234 }), 'resident', 0), { retry: false });
   } finally {
     await framework.stop();
