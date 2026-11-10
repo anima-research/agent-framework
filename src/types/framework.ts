@@ -341,9 +341,11 @@ export interface FrameworkConfig {
    *
    * A request's top-level effort is the agent's base. A turn sets it as it
    * assembles the agent's first request on its model, at the live level. The
-   * direct API sets none. The base is kept per agent in `framework/state`, so
-   * it survives a restart and moves with a branch switch. It's kept only for
-   * the model of the agent's latest turn, so going back to an earlier model
+   * direct API sets none. A turn sets or changes a base only where the
+   * agent's rows can go: not with an earlier membrane, and not after a
+   * refusal (both below). The base is kept per agent in `framework/state`,
+   * so it survives a restart and moves with a branch switch. It's kept only
+   * for the model of the agent's latest turn, so going back to an earlier model
    * starts a new base there at the live level. It's kept only while the agent
    * is live: an agent's end drops it. So an agent resumed after its end, or a
    * new one under its name, starts a new base at the live level, and its first
@@ -389,10 +391,11 @@ export interface FrameworkConfig {
    * is sent again at once. The retry carries no effort rows, and the live
    * level as its top-level effort. Neither a provider hold nor a stated wait
    * takes it first. The agent's effort rows that no stored row in its own
-   * voice follows are taken back out of the store. The agent's requests go
-   * without effort rows from then on, until the agent ends or the process
-   * does. A refusal after a tool round goes to the error policy instead.
-   * `DefaultErrorPolicy` doesn't retry it, so the turn ends there. A host
+   * voice follows are taken back out of the store. A removal that fails is
+   * logged, and its row stays. The agent's requests go without effort rows
+   * from then on, until the agent ends or the process does. A refusal after a
+   * tool round goes to the error policy instead. `DefaultErrorPolicy` doesn't
+   * retry it, so the turn ends there. A host
    * policy that retries starts the turn's next stream. Either way, the next
    * stream's first request carries the agent's stored rows. If that request
    * is refused too, it goes again at once without them.
@@ -422,8 +425,11 @@ export interface FrameworkConfig {
    * wrote for the agent. A request that starts or stops leaving them out has
    * a changed head, as a change of model does. Its compile then leaves the
    * stored replies' thinking out. That happens when a function's answer
-   * moves between a level and `undefined`, when membrane refuses the agent's
-   * rows, and when a restart unsets this or sets it again.
+   * moves between a level and `undefined` while the agent's rows go, when
+   * membrane refuses the agent's rows, or when a restart unsets this or sets
+   * it again. The identity also covers `providerParams`, as before, so moving
+   * an agent's effort from there to this setting leaves that thinking out
+   * once.
    */
   effort?: EffortLevel | ((agent: { name: string; model: string }) => EffortLevel | undefined);
 

@@ -13,6 +13,7 @@ import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
 import { EFFORT_ROW_PARTICIPANT, effortChange, effortMarksOf, effortOf, effortRowMetadata, effortRowOf, keepsEffortRow, withTopLevelEffort, type EffortPlan, type EffortPlanner } from './effort.js';
+import type { EffortLevel } from './types/framework.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
@@ -308,6 +309,11 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
     );
   }
   return { maxConsecutive: max };
+}
+
+interface OwnEffortRowWalk {
+  rows: readonly StoredMessage[];
+  newest: StoredMessage | undefined;
 }
 
 /** A stored injection's copy a compile built to send rendered (Agent.renderedInjection). */
@@ -2379,26 +2385,36 @@ export class Agent {
     return this.storeHoldsOwnEffortRow();
   }
 
-  private ownEffortRowsWalked?: { rows: readonly StoredMessage[]; found: boolean };
+  private ownEffortRowsWalked: { store?: OwnEffortRowWalk; window?: OwnEffortRowWalk } = {};
 
   private storeHoldsOwnEffortRow(): boolean {
     const cm = this.contextManager as Partial<ContextManager>;
     if (typeof cm.getAllMessages !== 'function') return false;
-    const rows = cm.getAllMessages();
-    const walked = this.ownEffortRowsWalked;
-    // context-manager returns the same row array until the store changes, and the same object for each row an
-    // append leaves in place, so a walk can start past the last row it read.
-    const last = walked && walked.rows.length > 0 && rows.length >= walked.rows.length
-      && rows[walked.rows.length - 1] === walked.rows[walked.rows.length - 1] ? walked : undefined;
-    let found = last?.found ?? false;
-    for (let i = last ? last.rows.length : 0; !found && i < rows.length; i++) {
+    return this.newestOwnEffortRow(cm.getAllMessages(), 'store') !== undefined;
+  }
+
+  /** @internal For the framework's effort planner; not a host API. */
+  newestOwnEffortLevel(window: readonly StoredMessage[]): EffortLevel | undefined {
+    const row = this.newestOwnEffortRow(window, 'window');
+    return row && effortOf(row.content);
+  }
+
+  private newestOwnEffortRow(rows: readonly StoredMessage[], source: 'store' | 'window'): StoredMessage | undefined {
+    const walked = this.ownEffortRowsWalked[source];
+    const appended = !!walked && walked.rows.length > 0 && rows.length >= walked.rows.length
+      && rows[walked.rows.length - 1] === walked.rows[walked.rows.length - 1];
+    let newest = appended ? walked!.newest : undefined;
+    for (let i = rows.length - 1; i >= (appended ? walked!.rows.length : 0); i--) {
       const message = rows[i]!;
       if (effortOf(message.content) === undefined) continue;
       const of = effortRowOf(message.metadata);
-      found = of !== undefined && this.isOwnParticipant(of);
+      if (of !== undefined && this.isOwnParticipant(of)) {
+        newest = message;
+        break;
+      }
     }
-    this.ownEffortRowsWalked = { rows, found };
-    return found;
+    this.ownEffortRowsWalked[source] = { rows, newest };
+    return newest;
   }
 
   /**

@@ -4268,10 +4268,12 @@ function assertEffortSource(config: AgentConfig, effort: FrameworkConfig['effort
   }
 }
 
-function endsOnNewInput(agent: Agent, rows: readonly StoredMessage[]): boolean {
+function endsOnNewInput(agent: Agent, rows: readonly StoredMessage[], sees: (metadata: unknown) => boolean): boolean {
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i]!;
-    if (storedInjectionMarkOf(row.metadata)?.agent === agent.name) continue;
+    if (!sees(row.metadata)) continue;
+    const mark = storedInjectionMarkOf(row.metadata);
+    if (mark !== undefined && agent.isOwnParticipant(mark.agent)) continue;
     if (effortOf(row.content) !== undefined) continue;
     return !agent.isOwnParticipant(row.participant)
       && !row.content.some((block) => block.type === 'tool_result' || block.type === 'system_change');
@@ -4312,9 +4314,9 @@ function isLegacyFamily(config: McplServerConfig): boolean {
   }
 }
 
-function effortBaseOf(bases: readonly unknown[], agentName: string): { model?: unknown; effort?: unknown } | undefined {
-  return bases.find((entry) => !!entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName) as
-    { model?: unknown; effort?: unknown } | undefined;
+function effortBasesOf(bases: readonly unknown[], agentName: string): Array<{ model?: unknown; effort?: unknown }> {
+  return bases.filter((entry) => !!entry && typeof entry === 'object' && (entry as { agent?: unknown }).agent === agentName) as
+    Array<{ model?: unknown; effort?: unknown }>;
 }
 
 function soundEffortBase(record: { model?: unknown; effort?: unknown }): record is { model: string; effort: EffortLevel | 'none' } {
@@ -9756,7 +9758,7 @@ export class AgentFramework {
     if (!this.effortAnswersLogged.has(agent.name)) {
       this.effortAnswersLogged.add(agent.name);
       console.error(
-        `[effort] ${agent.name}: FrameworkConfig.effort gave ${JSON.stringify(answer)}, which isn't an effort level, ` +
+        `[effort] ${agent.name}: FrameworkConfig.effort gave ${typeof answer === 'string' ? JSON.stringify(answer) : `a value of type ${answer === null ? 'null' : typeof answer}`}, which isn't an effort level, ` +
           'so its requests go as if it gave undefined.',
       );
     }
@@ -9775,18 +9777,9 @@ export class AgentFramework {
     if (live === undefined) return { rows: false };
     const plan: EffortPlan = { rows: true, ...(base !== 'none' ? { topLevel: base } : {}) };
     if (use === 'direct') return plan;
-    const cm = agent.getContextManager();
-    const rows = this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages();
-    let inForce: string | undefined = base === 'none' ? undefined : base;
-    for (let i = rows.length - 1; i >= 0; i--) {
-      const level = effortOf(rows[i]!.content);
-      const of = effortRowOf(rows[i]!.metadata);
-      if (level !== undefined && of !== undefined && agent.isOwnParticipant(of)) {
-        inForce = level;
-        break;
-      }
-    }
-    if (live !== inForce && endsOnNewInput(agent, rows)) plan.change = live;
+    const window = agent.getContextManager().getPresentedMessages();
+    const inForce = agent.newestOwnEffortLevel(window) ?? (base === 'none' ? undefined : base);
+    if (live !== inForce && endsOnNewInput(agent, window, (metadata) => this.agentSees(agent, metadata))) plan.change = live;
     return plan;
   }
 
@@ -9807,13 +9800,14 @@ export class AgentFramework {
       return unreadable('', `[effort] ${FRAMEWORK_STATE_ID}'s effortBases isn't a list of records, so it reads as no base for any agent, and ` +
         'it\'s left as it is to be repaired. Until then, each request\'s top-level effort is its agent\'s live level.');
     }
-    const record = effortBaseOf(bases, agentName);
-    if (record === undefined) return undefined;
-    if (!soundEffortBase(record)) {
+    const records = effortBasesOf(bases, agentName);
+    if (records.length === 0) return undefined;
+    if (!records.every(soundEffortBase)) {
       return unreadable(agentName, `[effort] ${agentName}: ${FRAMEWORK_STATE_ID}'s effortBases holds a record for it that isn't a model and a ` +
         'level, so it reads as no base, and it\'s left as it is to be repaired. Until then, its requests\' top-level effort is its live level.');
     }
-    return { model: record.model, effort: record.effort };
+    const [record] = records;
+    return { model: record!.model, effort: record!.effort };
   }
 
   private writeEffortBase(agentName: string, record: { model: string; effort: EffortLevel | 'none' }): void {
@@ -9821,9 +9815,9 @@ export class AgentFramework {
     const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
     if (state.effortBases !== undefined && !Array.isArray(state.effortBases)) return;
     const others = Array.isArray(state.effortBases) ? state.effortBases as unknown[] : [];
-    const kept = effortBaseOf(others, agentName);
-    if (kept !== undefined && !soundEffortBase(kept)) return;
-    state.effortBases = [...others.filter((entry) => effortBaseOf([entry], agentName) === undefined), { agent: agentName, ...record }];
+    const kept = effortBasesOf(others, agentName);
+    if (!kept.every(soundEffortBase)) return;
+    state.effortBases = [...others.filter((entry) => !(kept as unknown[]).includes(entry)), { agent: agentName, ...record }];
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
