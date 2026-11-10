@@ -1825,12 +1825,6 @@ export class Agent {
       && source.bodies.every((b) => this.storedMarkOf(b.messageId)?.agent === this.name);
   }
 
-  /**
-   * Which of `result`'s compiled messages this agent's request carries, as far
-   * as effort rows go (effort.ts keepsEffortRow, under `plan`, with each effort
-   * row's marks read by effortMarksOf). A row the store can't read just now is
-   * logged, and counts as no row of the framework's.
-   */
   private effortRowsKept(result: CompileResult, plan: EffortPlan | undefined): boolean[] {
     const marks = effortMarksOf(this.contextManager, result, (id, err) => {
       console.error(`[effort] ${this.name}: could not read stored row ${id}, so it counts as no effort row of the framework's:`, err);
@@ -1839,7 +1833,7 @@ export class Agent {
       effortOf(message.content) === undefined || keepsEffortRow(plan, marks(i), (participant) => this.isOwnParticipant(participant)));
   }
 
-  /** @internal Whether a stored row this agent's tool boundary would inject goes in its requests, as far as effort rows go. */
+  /** @internal For the framework's tool boundaries; not a host API. */
   sendsAtBoundary(row: { content: ContentBlock[]; metadata?: MessageMetadata }): boolean {
     if (effortOf(row.content) === undefined) return true;
     return keepsEffortRow(this.effortPlanner?.('preview'), [effortRowOf(row.metadata)], (participant) => this.isOwnParticipant(participant));
@@ -1987,7 +1981,6 @@ export class Agent {
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
     const assemble = async (): Promise<NormalizedRequest> => {
-      // Each assembly plans effort afresh, and its binding reads that plan.
       const effort = this.effortPlanner?.('direct');
       const binding = this.bindingCompileOptions(tools, (injections ?? [])
         .filter((injection) => injection.position === 'system')
@@ -2381,32 +2374,20 @@ export class Agent {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
-  /**
-   * Whether this agent's requests leave out an effort row the framework wrote for one of its own participants, among
-   * the rows its store holds. Unset (no plan), every such row is left out. Set without rows, every effort row is. Set
-   * with rows, the agent's own are sent.
-   */
   private ownEffortRowsLeftOut(plan: EffortPlan | undefined): boolean {
     if (plan?.rows === true) return false;
     return this.storeHoldsOwnEffortRow();
   }
 
-  /** The store's row array the last own-row walk read, and whether it held an own effort row (storeHoldsOwnEffortRow). */
   private ownEffortRowsWalked?: { rows: readonly StoredMessage[]; found: boolean };
 
-  /**
-   * Whether the store holds an effort row the framework wrote for one of this agent's participants. The answer is
-   * kept with the row array it was read from. ContextManager returns the same array until the store changes, and the
-   * same object for each row an append leaves in place. So an array that keeps that array's last row at its index,
-   * the same array included, is walked only past it. Any other, after a removal or a branch switch, is walked whole.
-   * An edit in place that adds or takes off an effort row's mark goes unseen until the next whole walk. The framework
-   * never edits its effort rows.
-   */
   private storeHoldsOwnEffortRow(): boolean {
     const cm = this.contextManager as Partial<ContextManager>;
     if (typeof cm.getAllMessages !== 'function') return false;
     const rows = cm.getAllMessages();
     const walked = this.ownEffortRowsWalked;
+    // context-manager returns the same row array until the store changes, and the same object for each row an
+    // append leaves in place, so a walk can start past the last row it read.
     const last = walked && walked.rows.length > 0 && rows.length >= walked.rows.length
       && rows[walked.rows.length - 1] === walked.rows[walked.rows.length - 1] ? walked : undefined;
     let found = last?.found ?? false;
@@ -2429,10 +2410,7 @@ export class Agent {
    * injections given to the compile as the kv-unified prefix hash builds it; the tools are the ones it will carry, in
    * their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
    * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
-   * of a conversation that would begin with the assistant. `request` also covers whether the request leaves out
-   * effort rows the framework wrote for the agent (`ownEffortRowsLeftOut`). The request leaves them out after the
-   * compile, where the context manager can't see it, so a change in that has to change the head. Nothing without
-   * `binds`: the compile is as it was.
+   * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
    */
   private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[], effort: EffortPlan | undefined): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
@@ -2463,9 +2441,6 @@ export class Agent {
     options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
     const effort = this.effortPlanner?.('preview');
-    // A caller's message stands for a row a start would store, which is no row
-    // the framework marks: it goes as a start would send such a row
-    // (keepsEffortRow). The plan's own row is the agent's.
     const given = options.appendedMessages?.filter((m) =>
       effortOf(m.content) === undefined || keepsEffortRow(effort, [undefined], (participant) => this.isOwnParticipant(participant)));
     const appendedMessages = effort?.change
@@ -2486,13 +2461,7 @@ export class Agent {
    * array as the window's for a single slot that is still the record. */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
   private effortPlanner?: EffortPlanner;
-  /**
-   * The effort rows the framework wrote for this agent (marked with its own name) that no stored reply of the agent's
-   * follows. No answered turn request carried them: every turn request while rows are on carries the agent's own
-   * rows, and an answered turn stores the agent's reply after them. The framework takes them back when membrane
-   * refuses rows (refuseEffortRows).
-   * @internal For the framework's refusal of effort rows; not a host API.
-   */
+  /** @internal For the framework's refusal of effort rows; not a host API. */
   unansweredEffortRows(): MessageId[] {
     const cm = this.contextManager as Partial<ContextManager>;
     if (typeof cm.getAllMessages !== 'function') return [];
@@ -2859,7 +2828,7 @@ export class Agent {
     this.toolResultGuard.setOwnRowSink(sink);
   }
 
-  /** @internal The framework's `FrameworkConfig.effort` for this agent's requests (planEffort). */
+  /** @internal For the framework's FrameworkConfig.effort; not a host API. */
   setEffortPlanner(planner: EffortPlanner | undefined): void {
     this.effortPlanner = planner;
   }

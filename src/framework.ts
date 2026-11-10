@@ -4246,7 +4246,6 @@ function readerModelFields(cfg: SubconsciousConfig): Pick<AgentConfig, (typeof S
   };
 }
 
-/** FrameworkConfig.effort: a level, a function, or left out (null counts as left out). */
 function assertEffortSetting(effort: unknown): void {
   if (effort == null || typeof effort === 'function' || isEffortLevel(effort)) return;
   throw new Error(
@@ -4270,7 +4269,6 @@ function endsOnNewInput(agent: Agent, rows: readonly StoredMessage[]): boolean {
   for (let i = rows.length - 1; i >= 0; i--) {
     const row = rows[i]!;
     if (storedInjectionMarkOf(row.metadata)?.agent === agent.name) continue;
-    // An effort row is the agent's own, which doesn't end its input, or one its requests leave out.
     if (effortOf(row.content) !== undefined) continue;
     return !agent.isOwnParticipant(row.participant)
       && !row.content.some((block) => block.type === 'tool_result' || block.type === 'system_change');
@@ -4936,7 +4934,6 @@ export class AgentFramework {
   /** The host's say over each derivation, ephemeral spawn and resume (config.dendrite.beforeDerive). */
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
   private effortSetting: FrameworkConfig['effort'];
-  /** Agents whose FrameworkConfig.effort answer was logged as unusable (liveEffort), until each ends. */
   private readonly effortAnswersLogged = new Set<string>();
   private readonly effortRowsRefused = new Set<string>();
   /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
@@ -9730,11 +9727,6 @@ export class AgentFramework {
     if (this.effortSetting !== undefined) agent.setEffortPlanner((use) => this.planEffort(agent, use));
   }
 
-  /**
-   * The live level FrameworkConfig.effort gives `agent`. A function's answer
-   * that isn't a level or undefined, or a throw, reads as undefined, and is
-   * logged once per agent while the process runs.
-   */
   private liveEffort(agent: Agent, setting: NonNullable<FrameworkConfig['effort']>): EffortLevel | undefined {
     if (typeof setting !== 'function') return setting;
     let answer: unknown;
@@ -9785,12 +9777,8 @@ export class AgentFramework {
     return plan;
   }
 
-  /**
-   * The base stored for `agentName` (framework/state's effortBases), or undefined where none is. The bases are a
-   * list of records, each naming its agent, since a name the store drops as an object's key (`__proto__`) is an agent
-   * name too. A list or record of another shape reads as none. Where `report` is set, as a turn's planning sets it,
-   * that's said on one log line: the turn then stores a sound record in its place, so the line comes once.
-   */
+  // effortBases is a list of records, each naming its agent, not a map: chronicle's state store drops an object's own
+  // `__proto__` key, and that's an agent name too.
   private readEffortBase(agentName: string, report = false): { model: string; effort: EffortLevel | 'none' } | undefined {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const bases = data && typeof data === 'object' ? (data as Record<string, unknown>).effortBases : undefined;
@@ -9811,7 +9799,6 @@ export class AgentFramework {
     return { model: record.model, effort: record.effort };
   }
 
-  /** Store `agentName`'s base, in place of any record it has. */
   private writeEffortBase(agentName: string, record: { model: string; effort: EffortLevel | 'none' }): void {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
@@ -9822,12 +9809,6 @@ export class AgentFramework {
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
-  /**
-   * Keep only the bases of the agents `keep` names. A base keeps the top level steady while a cached prefix may still
-   * be warm, so it's kept for a live agent alone: an agent's end drops it (settleEndedAgent), and so does the boot
-   * once its configured agents are live again (reconcileAgentRegistry). A store that can't take the write just now
-   * is logged, and the bases stay until the next end or boot.
-   */
   private keepEffortBases(keep: (agentName: string) => boolean): void {
     try {
       const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
@@ -9857,10 +9838,6 @@ export class AgentFramework {
       `[effort] ${agent.name}: membrane refused a request carrying an effort row (${error.message}). ` +
         'Its requests carry the live effort on top and no effort rows from now until the agent ends or the process does; this one is sent again at once.',
     );
-    // The agent's rows no stored reply follows were carried by no answered
-    // request, and no reply's thinking is bound to them. Taking them back
-    // leaves no row a release without FrameworkConfig.effort would send
-    // down a path that refuses it.
     for (const row of agent.unansweredEffortRows()) {
       try {
         agent.getContextManager().removeMessage(row);
@@ -12410,10 +12387,6 @@ export class AgentFramework {
         // The copies, and the framing below, are the child's own rows: its
         // inheritance and what it is told it is, stored for it, whoever they
         // name as their participant.
-        // An effort row the framework wrote for the parent's own voice is the
-        // child's too, re-marked as its turns are renamed, so the copy keeps
-        // the parent's level in force beside the parent's base, and the
-        // parent's cached prefix. One written for another agent keeps its mark.
         const parentCm = parent.getContextManager();
         const { messages, provenance } = await parentCm.compile();
         const marks = effortMarksOf(parentCm, { provenance }, (id, err) => {
@@ -13881,7 +13854,6 @@ export class AgentFramework {
    */
   private reconcileAgentRegistry(interrupted: AgentRecord[], unpassed: readonly AgentRecord[]): void {
     for (const outcome of this.registry.reconcile().unconfigured) this.settleEndedAgent(outcome);
-    // Every configured agent is live again by now, so a base of any other name goes (keepEffortBases).
     this.keepEffortBases((name) => this.registry.has(name));
 
     const byRecipient = new Map<string, AgentRecord[]>();
@@ -19776,7 +19748,6 @@ export class AgentFramework {
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
             if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
-              // An effort row its requests leave out is presented, never sent (effort.ts keepsEffortRow).
               if (!agent.sendsAtBoundary(h)) return;
               midTurnInjections.push({
                 participant: h.participant,
@@ -21077,8 +21048,6 @@ export class AgentFramework {
           const source = provenance?.messages[i];
           return source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId));
         };
-        // The framework's effort rows (effort.ts) are the template's, or the agents' it observes: the fork, which
-        // takes no base of the template's, starts without them.
         const marks = effortMarksOf(template.getContextManager(), { provenance }, (id, err) => {
           console.error(`[conversation] ${name}: could not read the template's row ${id}, so the seed takes it as no effort row:`, err);
         });
@@ -30819,12 +30788,6 @@ export class AgentFramework {
             const retry = retryOf(trigger);
             const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
-            // A marked refusal of a request carrying an effort row, before the
-            // stream's first tool round, is sent again at once without rows,
-            // so neither a hold nor a stated wait takes it. One after a tool
-            // round goes to the error policy, whose retry starts the turn's
-            // next stream: no tool has run when that start's first request is
-            // refused.
             const effortRetry = !hadToolCalls && this.refuseEffortRows(agent, err, compiledRequest);
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
