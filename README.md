@@ -90,28 +90,35 @@ mid-conversation system messages on the native formatter, a request carries
 a recorded head instead, and each later change to the tools, or addition to
 the system text, is stored in the agent's context as a system change where
 it took effect. A replacement of system text, and a consolidation once the
-changes reach a tenth of the input, move the head to what's current, with
-one write. A replacement is a block of system text already declared that's
-dropped or edited (an added block is a change, and order doesn't count), so
-`'entries'` saves writes only while those blocks stay as they are: one whose
-text changes every request moves the head every request. A
-change row a host stores is the host's to remove. A request carrying a
-change that ends with a refusal membrane recognises, or with a 400 it
-doesn't file as context overflow or an account refusal, whatever caused it,
-goes again on the agent's current head, and the agent keeps to its head
-until it's built again, its record and then its own change rows taken out
-(a record the store can't clear keeps them until it can), so an
-unrelated 400, such as one for an
-oversized image, ends its `'entries'` too. A consolidation waits for a compile that
-already rewrites the changes; past a fifth of the input, or when a compile
-is refused over budget, or for dropping messages no summary covers, with
-changes kept, it happens anyway, with an operator line. `thinkingBinding.binds` says whether the model binds its
-thinking to everything before it. Unless it's `false`, such a compile must
-keep no thinking before the first message it renders anew (its
-`firstChanged`), and a forced move sets that thinking aside; with `true`,
-each compile is told the head the request carries, so the context manager
-leaves out the thinking a move of the head sets aside. The host chooses both
-settings from what it knows of the model; neither is a runtime setting.
+changes reach a tenth of the request, move the head to what's current, with
+one write. The share is in characters of JSON on both sides, leaving out what
+a provider doesn't price by its characters (a base64 source's data, a
+generated image's, a redacted thinking block's, a thinking block's signature
+and a block's provider-native `rawItem`) and what a request on the native
+formatter doesn't send (a parsed block's `rawXml` and `rawXmlImagesAt`, a
+call's `unparseableInput` and a block's `tokenEstimate`); JSON runs denser
+than prose, so tool changes read as a smaller share than they would in tokens,
+and a move comes somewhat later. A replacement is a block of system text
+already declared that's dropped or edited (an added block is a change, and
+order doesn't count), so `'entries'` saves writes only while those blocks stay
+as they are: one whose text changes every request moves the head every
+request. A change row a host stores is the host's to remove. A request
+carrying a change that ends with a refusal membrane recognises, or with a 400
+it doesn't file as context overflow or an account refusal, whatever caused it,
+goes again on the agent's current head, and the agent keeps to its head until
+it's built again, its record and then its own change rows taken out (a record
+the store can't clear keeps them until it can), so an unrelated 400, such as
+one for an oversized image, ends its `'entries'` too. A consolidation waits
+for a compile that already rewrites the changes; past a fifth of the request,
+or when a compile is refused over budget, or for dropping messages no summary
+covers, with changes kept, it happens anyway, with an operator line.
+`thinkingBinding.binds` says whether the model binds its thinking to
+everything before it. Unless it's `false`, such a compile must keep no
+thinking before the first message it renders anew (its `firstChanged`), and a
+forced move sets that thinking aside; with `true`, each compile is told the
+head the request carries, so the context manager leaves out the thinking a
+move of the head sets aside. The host chooses both settings from what it knows
+of the model; neither is a runtime setting.
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.

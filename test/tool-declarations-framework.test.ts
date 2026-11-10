@@ -17,10 +17,11 @@ const tool = (name: string): ToolDefinition => ({
   inputSchema: { type: 'object', properties: {} },
 });
 
+const prompt = (text: string) => `${text}\n${'Follow the task, and say what you did. '.repeat(2000)}`;
 const resident = (name: string) => ({
   name,
   model: 'test-model',
-  systemPrompt: `You are ${name}.`,
+  systemPrompt: prompt(`You are ${name}.`),
   toolDeclarations: 'entries' as const,
 });
 
@@ -176,6 +177,7 @@ describe('toolDeclarations in the framework', () => {
   });
 
   it('raises an operator line when the changes force the head to move, naming the thinking it sets aside as `binds` says', async () => {
+    const wide = { ...tool('b'), description: 'b does a thing. '.repeat(2000) };
     const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
     for (const [binding, clause] of [
       [undefined, /: one whole write, and the thinking the request held set aside if its model binds it$/],
@@ -188,22 +190,23 @@ describe('toolDeclarations in the framework', () => {
         say(framework, alpha, 'user', 'hello');
         store(framework, alpha, 'alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
         await alpha.buildActivationRequest([tool('a')]);
-        const declared = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        const declared = await alpha.buildActivationRequest([tool('a'), wide]);
         assert.ok(hasThinking(declared.messages), `${JSON.stringify(binding)}: a declared change keeps the thinking before it`);
-        alpha.noteResponseInput(10);
-        const request = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        const request = await alpha.buildActivationRequest([tool('a'), wide]);
         assert.deepEqual(request.tools?.map((t) => t.name), ['a', 'b'], 'past a fifth, the head moved');
         assert.equal(hasThinking(request.messages), !binding, `${JSON.stringify(binding)}: with binds, the compile for the new head leaves the thinking out`);
         const moved = traces.filter((t) => t.type === 'head:moved' && (t as { why: string }).why === 'consolidated');
         assert.equal(moved.length, 1);
         assert.equal((moved[0] as { forced?: string }).forced, 'share');
-        const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: { inputTokens?: number; forced?: string } }[];
+        const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: { changeChars?: number; requestChars?: number; forced?: string } }[];
         assert.equal(alerts.length, 1);
-        assert.match(alerts[0]!.message, /a fifth of the last response's 10/);
+        const { changeChars, requestChars } = moved[0] as { changeChars?: number; requestChars?: number };
+        assert.equal(changeChars, JSON.stringify({ type: 'system_change', defineTools: [wide] }).length, 'the change, in characters of JSON');
+        assert.ok(changeChars! * 5 >= requestChars!, 'the premise: at least a fifth of the request');
+        assert.match(alerts[0]!.message, new RegExp(`reached ${changeChars} characters of JSON, at least a fifth of the request's ${requestChars},`));
         assert.match(alerts[0]!.message, clause);
-        assert.equal(alerts[0]!.data?.inputTokens, 10);
-        assert.equal(alerts[0]!.data?.forced, 'share');
-        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(alerts[0]!.data, { forced: 'share', changesRemoved: 1, changeChars, requestChars });
+        await alpha.buildActivationRequest([tool('a'), wide]);
       });
     }
   });
@@ -215,10 +218,10 @@ describe('toolDeclarations in the framework', () => {
         framework.onTrace((event) => { traces.push(event); });
         const alpha = framework.getAgent('alpha')!;
         say(framework, alpha, 'user', 'hello');
+        const wide = { ...tool('b'), description: 'b does a thing. '.repeat(2000) };
         await alpha.buildActivationRequest([tool('a')]);
-        await alpha.buildActivationRequest([tool('a'), tool('b')]);
-        alpha.noteResponseInput(10);
-        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        await alpha.buildActivationRequest([tool('a'), wide]);
+        await alpha.buildActivationRequest([tool('a'), wide]);
         const share = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string }[];
         assert.equal(share.length, 1, `${JSON.stringify(binding)}: forced by its share`);
         assert.match(share[0]!.message, clause, JSON.stringify(binding));
@@ -309,7 +312,7 @@ describe('toolDeclarations in the framework', () => {
       assert.ok(hasThinking((await alpha.buildActivationRequest([tool('a')], system('v1'))).messages), 'adopted');
       assert.ok(hasThinking((await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'))).messages), 'a declared change');
       const replaced = await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
-      assert.equal(replaced.system, 'You are alpha.\nv2', 'the head moved');
+      assert.equal(replaced.system, `${prompt('You are alpha.')}\nv2`, 'the head moved');
       assert.equal(hasThinking(replaced.messages), false, 'and the compile for it left the thinking out');
       await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
     });
@@ -355,7 +358,7 @@ describe('toolDeclarations in the framework', () => {
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
-      const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: 'You are alpha.', ...parentConfig } as never, spec);
+      const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: prompt('You are alpha.'), ...parentConfig } as never, spec);
       for (const m of messages) {
         if (isSystemChangeMessage(m)) store(framework, child, m.participant, m.content, systemChangeMetadata(name) as never);
         else store(framework, child, m.participant, m.content);
@@ -383,7 +386,7 @@ describe('toolDeclarations in the framework', () => {
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
-        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are the child.' } as never, spec);
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: prompt('You are the child.') } as never, spec);
         assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
         adopt(framework, child);
         const request = await child.buildActivationRequest([tool('c')]);
@@ -412,7 +415,7 @@ describe('toolDeclarations in the framework', () => {
           await alpha.buildActivationRequest([...parentTools]);
           assert.equal(storedChanges(alpha, 'alpha'), 1, "the premise: the parent's change is stored");
           const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
-          const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are alpha.' } as never, spec);
+          const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: prompt('You are alpha.') } as never, spec);
           adopt(framework, child);
           const request = await child.buildActivationRequest([...childTools]);
           assert.deepEqual(readTools(request), childTools.map((t) => t.name).sort(), `with ${parentTools.length} tools on its parent's branch, the model reads the child's own`);
@@ -428,7 +431,7 @@ describe('toolDeclarations in the framework', () => {
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         store(framework, alpha, 'system', [{ type: 'system_change', defineTools: [tool('o')] }] as never, systemChangeMetadata('alpha-old') as never);
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
-        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are the child.' } as never, spec);
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: prompt('You are the child.') } as never, spec);
         assert.equal(storedChanges(child, 'alpha') + storedChanges(child, 'alpha-old'), 2, "the premise: the child's branch holds both of its parent's rows");
         adopt(framework, child);
         const request = await child.buildActivationRequest([tool('c')], undefined, undefined, undefined, { dryRun: true });
@@ -448,7 +451,7 @@ describe('toolDeclarations in the framework', () => {
         assert.ok(row, "the premise: alpha's added block is a change row");
         const atSequence = alpha.getContextManager().getMessage(row!.id)!.sequence;
         const { name: _name, ...spec } = taskForkSpec('checkpoint-child', { parent: 'alpha', inherit: { mode: 'shared', atSequence } });
-        const { agent: child } = await framework.createEphemeralAgent({ ...resident('checkpoint-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('checkpoint-child'), systemPrompt: prompt('You are alpha.') } as never, spec);
         assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
         adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a')], [block]);
@@ -466,7 +469,7 @@ describe('toolDeclarations in the framework', () => {
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
-        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: prompt('You are alpha.') } as never, spec);
         adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(request.tools, [tool('a')], "the parent's recorded head");
@@ -484,7 +487,7 @@ describe('toolDeclarations in the framework', () => {
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
-        const { agent: child } = await framework.createEphemeralAgent({ ...resident('copy-child'), systemPrompt: 'You are alpha.' } as never, inheriting('copy-child', 'alpha'));
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('copy-child'), systemPrompt: prompt('You are alpha.') } as never, inheriting('copy-child', 'alpha'));
         for (const m of messages) store(framework, child, m.participant, m.content);
         adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
@@ -519,9 +522,9 @@ describe('toolDeclarations in the framework', () => {
         say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
-        heads.headDeclarations.write('alpha', { tools: [tool('old')], system: ['You are alpha.'] });
-        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, inheriting('seeded', 'alpha'))).agent;
-        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
+        heads.headDeclarations.write('alpha', { tools: [tool('old')], system: [prompt('You are alpha.')] });
+        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: prompt('You are alpha.') } as never, inheriting('seeded', 'alpha'))).agent;
+        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: prompt('You are alpha.') } as never)).agent;
         for (const child of [seeded, unseeded]) store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         for (const child of [seeded, unseeded]) adopt(framework, child);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
@@ -544,9 +547,9 @@ describe('toolDeclarations in the framework', () => {
         const alpha = framework.getAgent('alpha')!;
         say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
-        const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, inheriting('child', 'alpha'));
+        const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: prompt('You are alpha.') } as never, inheriting('child', 'alpha'));
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
-        heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
+        heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: [prompt('You are alpha.')] });
         const { agent: child } = await pending;
         store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         adopt(framework, child);
@@ -562,8 +565,8 @@ describe('toolDeclarations in the framework', () => {
         say(framework, alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         const spec = { ...inheriting('seeded', 'alpha'), inherit: { from: 'alpha', mode: 'copy' as const, atSequence: 1 } };
-        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, spec)).agent;
-        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
+        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: prompt('You are alpha.') } as never, spec)).agent;
+        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: prompt('You are alpha.') } as never)).agent;
         for (const child of [seeded, unseeded]) store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         for (const child of [seeded, unseeded]) adopt(framework, child);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
@@ -573,8 +576,8 @@ describe('toolDeclarations in the framework', () => {
 
     it("gives a child nothing from an inherit naming no running agent, so it starts as an unseeded child does", async () => {
       await withFramework([resident('alpha')], async (framework) => {
-        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, inheriting('seeded', 'nobody'))).agent;
-        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
+        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: prompt('You are alpha.') } as never, inheriting('seeded', 'nobody'))).agent;
+        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: prompt('You are alpha.') } as never)).agent;
         for (const child of [seeded, unseeded]) store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         for (const child of [seeded, unseeded]) adopt(framework, child);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
@@ -597,7 +600,7 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
-    for (const [how, config] of [['on the head', { toolDeclarations: 'head' }], ['at a move of its head', { systemPrompt: 'You are the child.' }]] as const) {
+    for (const [how, config] of [['on the head', { toolDeclarations: 'head' }], ['at a move of its head', { systemPrompt: prompt('You are the child.') }]] as const) {
       it(`a shared child that removes its own change rows ${how} takes its parent's from its own branch, and leaves its parent's context as it was`, async () => {
         await withFramework([resident('alpha')], async (framework) => {
           const alpha = framework.getAgent('alpha')!;
@@ -706,7 +709,7 @@ describe('toolDeclarations in the framework', () => {
       await alpha.buildActivationRequest([tool('a')]);
       const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent>; headDeclarations: { write(name: string, head: unknown): void } };
       const pending = internals.createConversationAgent('alpha-fork', 'chanA');
-      internals.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
+      internals.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: [prompt('You are alpha.')] });
       const fork = await pending;
       const request = await fork.buildActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(request.tools, [tool('a')], "the template's head as creation began");
@@ -742,7 +745,7 @@ describe('toolDeclarations in the framework', () => {
       const request = await subconscious.buildActivationRequest([tool('think')]);
       assert.deepEqual(changesIn(request.messages), [], "alpha's change declares alpha's tools");
       assert.ok(request.messages.some((m) => (m.content[0] as { text?: string }).text === 'hello'), 'while the conversation reads through');
-    }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.' } });
+    }, undefined, { subconscious: { enabled: true, systemPrompt: prompt('You attend.') } });
   });
 
   it('leaves a change row out of the poisoned-history shed, which takes turns', async () => {
@@ -847,7 +850,7 @@ describe('toolDeclarations in the framework', () => {
         const betaHead = internals.store.getStateJson('framework/head-declarations/beta');
         const written = await statesWritten(internals.store, () => alpha.buildActivationRequest([tool('a')], system('v2')));
         assert.deepEqual(written, ['framework/head-declarations/alpha'], "alpha's replacement writes alpha's state alone");
-        assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as { system: string[] }).system, ['You are alpha.', 'v2']);
+        assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as { system: string[] }).system, [prompt('You are alpha.'), 'v2']);
         assert.deepEqual(internals.store.getStateJson('framework/head-declarations/beta'), betaHead);
       });
     });
@@ -942,7 +945,7 @@ describe('toolDeclarations in the framework', () => {
         const main = internals.store.currentBranch().name;
         internals.store.createBranch('trial', main);
         internals.store.switchBranch('trial');
-        internals.headDeclarations.write('alpha', { tools: [tool('b')], system: ['You are alpha.'] });
+        internals.headDeclarations.write('alpha', { tools: [tool('b')], system: [prompt('You are alpha.')] });
         internals.store.switchBranch(main);
         internals.store.deleteBranch('trial');
         internals.store.createBranch('trial', main);
@@ -1020,11 +1023,11 @@ describe('toolDeclarations in the framework', () => {
       say(framework, alpha, 'user', 'three');
       await alpha.buildActivationRequest([tool('a')], system('v2'));
       const internals = framework as unknown as { headDeclarations: { read(name: string): { system: string[] } | null } };
-      assert.deepEqual(internals.headDeclarations.read('alpha')!.system, ['You are alpha.', 'v2']);
+      assert.deepEqual(internals.headDeclarations.read('alpha')!.system, [prompt('You are alpha.'), 'v2']);
       const host = framework as unknown as { handleHostCommand(server: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> };
       const undone = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 2 });
       assert.equal(undone.ok, true, undone.error);
-      assert.deepEqual(internals.headDeclarations.read('alpha')!.system, ['You are alpha.', 'v1'], "the undo's branch has the head from before the move");
+      assert.deepEqual(internals.headDeclarations.read('alpha')!.system, [prompt('You are alpha.'), 'v1'], "the undo's branch has the head from before the move");
     });
   });
 
@@ -1056,7 +1059,7 @@ describe('toolDeclarations in the framework', () => {
     for (const [model, want] of [['test-model', 'entries'], ['another-model', 'head']] as const) {
       await withFramework([resident('alpha')], async (framework) => {
         assert.equal(framework.getAgent('Subconscious')!.toolDeclarations, want, model);
-      }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.', model } });
+      }, undefined, { subconscious: { enabled: true, systemPrompt: prompt('You attend.'), model } });
     }
   });
 
@@ -1165,7 +1168,7 @@ describe('toolDeclarations in the framework', () => {
       await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
       assert.deepEqual(owners(), ['host'], "alpha's move took its own change and left the host's");
       assert.deepEqual(changesIn((await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'))).messages), [hostChange], 'which still goes out as stored');
-    }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.' } });
+    }, undefined, { subconscious: { enabled: true, systemPrompt: prompt('You attend.') } });
   });
 
   it("lets a host's row that adds system text a resident doesn't hold cause no move and no declaration, request after request", async () => {
@@ -1245,7 +1248,7 @@ describe('toolDeclarations in the framework', () => {
 
     it("sends an isolated ephemeral agent's request beside a host's change rows that alone exceed its budget", async () => {
       await withFramework([resident('alpha')], async (framework) => {
-        const { agent } = await framework.createEphemeralAgent({ name: 'solo', model: 'test-model', systemPrompt: 'You work alone.', ...tight } as never);
+        const { agent } = await framework.createEphemeralAgent({ name: 'solo', model: 'test-model', systemPrompt: prompt('You work alone.'), ...tight } as never);
         store(framework, agent, 'system', bulky('h1'));
         store(framework, agent, 'system', bulky('h2'));
         say(framework, agent, 'user', 'hello');
@@ -1263,7 +1266,7 @@ describe('toolDeclarations in the framework', () => {
         store(framework, alpha, 'system', bulky('h2'));
         say(framework, alpha, 'user', 'hello');
         const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
-        const { agent: child } = await framework.createEphemeralAgent({ name: 'host-child', model: 'test-model', systemPrompt: 'You are alpha.', ...tight } as never, spec);
+        const { agent: child } = await framework.createEphemeralAgent({ name: 'host-child', model: 'test-model', systemPrompt: prompt('You are alpha.'), ...tight } as never, spec);
         adopt(framework, child);
         const request = await child.buildActivationRequest([tool('a')]);
         assert.deepEqual(changesIn(request.messages), []);
@@ -1289,7 +1292,7 @@ describe('toolDeclarations in the framework', () => {
         say(framework, framework.getAgent('alpha')!, 'user', 'hello');
         await internals(framework).createConversationAgent('alpha-fork', 'chanA');
         const { name: _name, ...spec } = taskForkSpec('fork-child', { parent: 'alpha-fork', inherit: { mode: 'shared' } });
-        const { agent: child } = await framework.createEphemeralAgent({ ...resident('fork-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('fork-child'), systemPrompt: prompt('You are alpha.') } as never, spec);
         adopt(framework, child);
         await child.buildActivationRequest([tool('a')]);
         await child.buildActivationRequest([tool('a'), tool('b')]);
@@ -1352,6 +1355,6 @@ describe('toolDeclarations in the framework', () => {
       assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('ponder')] }]], 'its own change, once');
       const own = subconscious.getContextManager().getAllMessages().filter(isChange).filter((m) => (m.metadata as { agent?: string } | undefined)?.agent === 'Subconscious');
       assert.equal(own.length, 1, 'stored once');
-    }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.' } });
+    }, undefined, { subconscious: { enabled: true, systemPrompt: prompt('You attend.') } });
   });
 });

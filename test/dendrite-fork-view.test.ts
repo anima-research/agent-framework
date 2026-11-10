@@ -38,6 +38,7 @@ const adopt = (framework: AgentFramework, agent: Agent) => (framework as unknown
 const startOf = (framework: AgentFramework, agent: Agent) =>
   (framework as unknown as { presentation: { presentAtStart(agent: Agent, occasion: 'turn-start'): unknown } }).presentation.presentAtStart(agent, 'turn-start');
 
+const prompt = (text: string) => `${text}\n${'Follow the task, and say what you did. '.repeat(2000)}`;
 const FRAMING = '[FORK-FRAMING] Count the open issues.';
 const GRANDCHILD = '[GRANDCHILD-FRAMING] Count the closed ones.';
 /** The rows a view can leave out: each agent's stored injection, and a row a tune-out holds from the residents. */
@@ -65,8 +66,8 @@ describe("a shared fork's view", () => {
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', toolDeclarations: 'entries' },
-        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.', toolDeclarations: 'entries' },
+        { name: 'mira', model: 'test-model', systemPrompt: prompt('You are mira.'), toolDeclarations: 'entries' },
+        { name: 'oren', model: 'test-model', systemPrompt: prompt('You are oren.'), toolDeclarations: 'entries' },
       ],
       modules: [gates],
       syncIntervalMs: 0,
@@ -201,8 +202,8 @@ describe("a shared fork of an isolated-slot reader's view", () => {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
-      subconscious: { enabled: true, systemPrompt: 'notice' },
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: prompt('You are mira.') }],
+      subconscious: { enabled: true, systemPrompt: prompt('notice') },
       modules: [],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
@@ -281,8 +282,8 @@ describe("a shared child of a resident with former names", () => {
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'], presentAs: 'mira-shown' },
-        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
+        { name: 'mira', model: 'test-model', systemPrompt: prompt('You are mira.'), selfParticipants: ['mira-old'], presentAs: 'mira-shown' },
+        { name: 'oren', model: 'test-model', systemPrompt: prompt('You are oren.') },
       ],
       modules: [],
       syncIntervalMs: 0,
@@ -306,7 +307,7 @@ describe("a shared child of a resident with former names", () => {
       [{ type: 'system_change', defineTools: [{ name: 'old-tool', description: 'old', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('mira-old') as never);
     const { name: _name, ...spec } = taskForkSpec('job-1', { parent: 'mira', inherit: { mode: 'shared' } });
-    const job = await framework.createEphemeralAgent({ name: 'job-1', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, spec);
+    const job = await framework.createEphemeralAgent({ name: 'job-1', model: 'test-model', systemPrompt: prompt('Do the task.'), toolDeclarations: 'entries' }, spec);
     job.contextManager.addMessage('user', [text('Run once.')]);
     assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], "live, the child keeps the change its source keeps");
     framework.start();
@@ -331,13 +332,13 @@ describe("a shared child of a resident with former names", () => {
       [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('zed') as never);
     const { name: _name, ...spec } = taskForkSpec('job-2', { parent: 'mira', inherit: { mode: 'shared' } });
-    const job = await framework.createEphemeralAgent({ name: 'job-2', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, spec);
+    const job = await framework.createEphemeralAgent({ name: 'job-2', model: 'test-model', systemPrompt: prompt('Do the task.'), toolDeclarations: 'entries' }, spec);
     job.contextManager.addMessage('user', [text('Run once.')]);
     assert.deepEqual(await changeTools(job.contextManager), [], "the premise: live, a change stamped by another is out of its view");
     framework.start();
     membrane.script('job-2', say('job-2 done'));
     await framework.runEphemeralToCompletion(job.agent, job.contextManager);
-    const resumed = await framework.resumeAgent('job-2', { model: 'test-model', systemPrompt: 'Do the task.', selfParticipants: ['zed'], toolDeclarations: 'entries' } as never);
+    const resumed = await framework.resumeAgent('job-2', { model: 'test-model', systemPrompt: prompt('Do the task.'), selfParticipants: ['zed'], toolDeclarations: 'entries' } as never);
     assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], 'resumed as zed too, its view keeps the change it now counts as its own');
     resumed.cleanup();
   });
@@ -345,7 +346,7 @@ describe("a shared child of a resident with former names", () => {
   it("records the mapping a job's requests use when its config names it and its spec doesn't", async () => {
     framework.getAgent('mira')!.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
     const { name: _name, ...spec } = taskForkSpec('job-4', { parent: 'mira', inherit: { mode: 'shared' } });
-    const config = (name: string) => ({ name, model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries', selfParticipants: ['zed'], presentAs: `${name}-shown` });
+    const config = (name: string) => ({ name, model: 'test-model', systemPrompt: prompt('Do the task.'), toolDeclarations: 'entries', selfParticipants: ['zed'], presentAs: `${name}-shown` });
     const withSpec = await framework.createEphemeralAgent(config('job-4') as never, spec);
     const bare = await framework.createEphemeralAgent(config('job-5') as never);
     for (const job of [withSpec, bare]) job.contextManager.addMessage('user', [text('Run once.')]);
@@ -370,13 +371,13 @@ describe("a shared child of a resident with former names", () => {
       [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('zed') as never);
     const { name: _name, ...spec } = taskForkSpec('job-3', { parent: 'mira', inherit: { mode: 'shared' } });
-    const job = await framework.createEphemeralAgent({ name: 'job-3', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, { ...spec, selfParticipants: ['zed'] });
+    const job = await framework.createEphemeralAgent({ name: 'job-3', model: 'test-model', systemPrompt: prompt('Do the task.'), toolDeclarations: 'entries' }, { ...spec, selfParticipants: ['zed'] });
     job.contextManager.addMessage('user', [text('Run once.')]);
     framework.start();
     membrane.script('job-3', say('job-3 done'));
     await framework.runEphemeralToCompletion(job.agent, job.contextManager);
     assert.deepEqual(framework.getAgentRecord('job-3')!.selfParticipants, ['zed'], 'the premise: its record states zed as its own');
-    const resumed = await framework.resumeAgent('job-3', { model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' } as never);
+    const resumed = await framework.resumeAgent('job-3', { model: 'test-model', systemPrompt: prompt('Do the task.'), toolDeclarations: 'entries' } as never);
     assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], "resumed with no mapping of its own, its view counts its record's");
     resumed.cleanup();
   });
@@ -393,7 +394,7 @@ describe("a resumed 'head' job", () => {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: prompt('You are mira.') }],
       modules: [],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
@@ -407,7 +408,7 @@ describe("a resumed 'head' job", () => {
 
   const bulky = (name: string) =>
     [{ type: 'system_change', defineTools: [{ name, description: `${name} `.repeat(20000), inputSchema: { type: 'object', properties: {} } }] }] as never;
-  const job = { model: 'test-model', systemPrompt: 'Do the task.', contextBudgetTokens: 20000 };
+  const job = { model: 'test-model', systemPrompt: prompt('Do the task.'), contextBudgetTokens: 20000 };
 
   for (const [how, shared] of [['in a namespace of its own', false], ["continuing a resident's context", true]] as const) {
     it(`sends its request beside a host's change rows that alone exceed its budget, ${how}`, async () => {
@@ -457,7 +458,7 @@ describe("a derived agent's change rows, its source's among them", () => {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'], toolDeclarations: 'entries' }],
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: prompt('You are mira.'), selfParticipants: ['mira-old'], toolDeclarations: 'entries' }],
       modules: [gates],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
@@ -479,7 +480,7 @@ describe("a derived agent's change rows, its source's among them", () => {
   /** A host's shared child `c` of mira, and `g` of `c` made while `c` runs: `g` shared too, or a copy `deriveAgent` makes. */
   async function childAndGrandchild(copy = false) {
     const { name: _c, ...cSpec } = taskForkSpec('c', { parent: 'mira', inherit: { mode: 'shared' } });
-    const c = await framework.createEphemeralAgent({ name: 'c', model: 'test-model', systemPrompt: 'You are mira.', toolDeclarations: 'entries' }, cSpec);
+    const c = await framework.createEphemeralAgent({ name: 'c', model: 'test-model', systemPrompt: prompt('You are mira.'), toolDeclarations: 'entries' }, cSpec);
     c.contextManager.addMessage('user', [text(FRAMING)]);
     framework.start();
     membrane.script('c', waitCall('g-c'), say('c done'));
@@ -487,10 +488,10 @@ describe("a derived agent's change rows, its source's among them", () => {
     await until(() => gates.entered.has('g-c'), 'c to block mid-turn');
     let g: { agent: Agent; contextManager: ContextManager };
     if (copy) {
-      g = await framework.deriveAgent({ name: 'g', from: 'c', mode: 'copy', config: { systemPrompt: 'You are g.' }, framing: [{ participant: 'user', content: [text(GRANDCHILD)] }] });
+      g = await framework.deriveAgent({ name: 'g', from: 'c', mode: 'copy', config: { systemPrompt: prompt('You are g.') }, framing: [{ participant: 'user', content: [text(GRANDCHILD)] }] });
     } else {
       const { name: _g, ...gSpec } = taskForkSpec('g', { parent: 'c', inherit: { mode: 'shared' } });
-      g = await framework.createEphemeralAgent({ name: 'g', model: 'test-model', systemPrompt: 'You are mira.', toolDeclarations: 'entries' }, gSpec);
+      g = await framework.createEphemeralAgent({ name: 'g', model: 'test-model', systemPrompt: prompt('You are mira.'), toolDeclarations: 'entries' }, gSpec);
       g.contextManager.addMessage('user', [text(GRANDCHILD)]);
     }
     return { c, g, run };
@@ -503,7 +504,7 @@ describe("a derived agent's change rows, its source's among them", () => {
     gates.release('g-c');
     assert.equal((await run).speech, 'c done');
     for (const name of ['c', 'g']) {
-      const resumed = await framework.resumeAgent(name, { model: 'test-model', systemPrompt: `You are ${name}, resumed.`, toolDeclarations: 'entries' } as never);
+      const resumed = await framework.resumeAgent(name, { model: 'test-model', systemPrompt: prompt(`You are ${name}, resumed.`), toolDeclarations: 'entries' } as never);
       const before = defined((await resumed.contextManager.compile(undefined, undefined, { dryRun: true })).messages);
       assert.ok(holdsBoth(before), `the premise: resumed ${name}'s view keeps mira's rows under both its names: ${before}`);
       const request = await resumed.agent.buildActivationRequest([]);
@@ -541,8 +542,8 @@ describe("a 'head' agent whose compile is refused over budget", () => {
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'], toolDeclarations: 'entries' },
-        { name: 'nell', model: 'test-model', systemPrompt: 'You are nell.' },
+        { name: 'mira', model: 'test-model', systemPrompt: prompt('You are mira.'), selfParticipants: ['mira-old'], toolDeclarations: 'entries' },
+        { name: 'nell', model: 'test-model', systemPrompt: prompt('You are nell.') },
       ],
       modules: [],
       syncIntervalMs: 0,
@@ -564,7 +565,7 @@ describe("a 'head' agent whose compile is refused over budget", () => {
     const traces: Array<{ type: string; agentName?: string }> = [];
     framework.onTrace((event) => { traces.push(event as never); });
     const { name: _name, ...spec } = taskForkSpec('hc', { parent: 'mira', inherit: { mode: 'shared' } });
-    const hc = await framework.createEphemeralAgent({ name: 'hc', model: 'test-model', systemPrompt: 'You are hc.' }, spec);
+    const hc = await framework.createEphemeralAgent({ name: 'hc', model: 'test-model', systemPrompt: prompt('You are hc.') }, spec);
     hc.contextManager.addMessage('system', change('h'), systemChangeMetadata('hc') as never);
     hc.contextManager.addMessage('user', [text('Run once.')]);
     const stored = () => ['mira', 'mira-old', 'hc'].map((owner) => hc.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: owner } }).messages.length);
@@ -586,7 +587,7 @@ describe("a 'head' agent whose compile is refused over budget", () => {
     const [last] = mira.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'mira-old' } }).messages;
     const atSequence = mira.getContextManager().getMessage(last!.id)!.sequence;
     const { name: _name, ...spec } = taskForkSpec('hc', { parent: 'mira', inherit: { mode: 'shared', atSequence } });
-    const config = { model: 'test-model', systemPrompt: 'You are hc.' };
+    const config = { model: 'test-model', systemPrompt: prompt('You are hc.') };
     const hc = await framework.createEphemeralAgent({ name: 'hc', ...config }, spec);
     hc.contextManager.addMessage('system', change('h'), systemChangeMetadata('hc') as never);
     hc.contextManager.addMessage('user', [text('Run once.')]);

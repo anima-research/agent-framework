@@ -131,8 +131,8 @@ export type HeadEvent =
       type: 'head:moved';
       why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
       changesRemoved: number;
-      changeTokens?: number;
-      inputTokens?: number;
+      changeChars?: number;
+      requestChars?: number;
       forced?: 'share' | 'budget';
     };
 
@@ -171,6 +171,20 @@ export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'pro
 
 export function copyHead(head: HeadDeclaration): HeadDeclaration {
   return { tools: JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[], system: [...head.system] };
+}
+
+export function requestCharacters(head: HeadDeclaration, messages: readonly unknown[]): number {
+  return JSON.stringify({ system: head.system, tools: head.tools, messages }, unpricedLeftOut).length;
+}
+
+const UNPRICED_BLOCK_FIELDS = new Set(['rawItem', 'rawXml', 'rawXmlImagesAt', 'unparseableInput', 'tokenEstimate']);
+
+function unpricedLeftOut(this: unknown, key: string, value: unknown): unknown {
+  const type = (this as { type?: unknown } | null)?.type;
+  if (typeof type === 'string' && UNPRICED_BLOCK_FIELDS.has(key)) return undefined;
+  if (key === 'data' && (type === 'base64' || type === 'generated_image' || type === 'redacted_thinking')) return undefined;
+  if (key === 'signature' && type === 'thinking') return undefined;
+  return value;
 }
 
 export function systemTextOf(blocks: readonly string[]): string {

@@ -3,7 +3,6 @@ import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, SystemChangeContent, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse, isSystemChangeContent } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
-import { jsonTokenEstimator } from '@animalabs/context-manager';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
@@ -32,6 +31,7 @@ import {
   systemChangeMetadata,
   systemTextOf,
   copyHead,
+  requestCharacters,
   type HeadDeclaration,
   type HeadDeclarationStore,
   type HeadEvent,
@@ -421,7 +421,6 @@ export class Agent {
   private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations();
   private onHeadEvent: ((event: HeadEvent) => void) | undefined;
   private onChangesRemoved: ((ids: readonly MessageId[]) => void) | undefined;
-  private lastResponseInputTokens: number | undefined;
   /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
   readonly prefillUserMessage?: string;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
@@ -2922,11 +2921,6 @@ export class Agent {
     this.onChangesRemoved = onChangesRemoved;
   }
 
-  /** A response's reported input, from the framework's usage handler. */
-  noteResponseInput(tokens: number): void {
-    if (tokens > 0) this.lastResponseInputTokens = tokens;
-  }
-
   /** The fail-safe: declare on the head until this agent is built again. */
   keepToHeadUntilBuiltAgain(): void {
     this.headUntilBuiltAgain = true;
@@ -2961,7 +2955,7 @@ export class Agent {
     const sent = compiled.messages.flatMap((message) => message.content.filter(isSystemChangeContent));
     const difference = withoutCarried(declarationDifference(ownDeclaration, current), ownDeclaration, effectiveDeclaration(recorded, sent));
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, 'replaced', dryRun, compile);
-    const consolidation = this.consolidation(compiled, own, blocks);
+    const consolidation = this.consolidation(compiled, own, blocks, recorded);
     if (consolidation) return this.moveHead(compiled, compiledWith, recorded, current, 'consolidated', dryRun, compile, consolidation);
     if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.changeWouldSplitCall()) {
       return { compiled, head: recorded };
@@ -3017,7 +3011,7 @@ export class Agent {
     why: 'adopted' | 'replaced' | 'consolidated',
     dryRun: boolean,
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
-    sizes?: { changeTokens: number; inputTokens: number; forced?: 'share' },
+    sizes?: { changeChars: number; requestChars: number; forced?: 'share' },
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
@@ -3041,22 +3035,21 @@ export class Agent {
 
   // context-manager: `firstChanged` is the first compiled message whose bytes
   // differ from the previous committing compile's, and null before a manager's
-  // first committing compile; a change is priced as `jsonTokenEstimator` prices
-  // it; and a passthrough strategy over budget, which keeps changes ahead of its
-  // window, re-renders from the first change only at the compile where its
-  // window first passes it.
-  private consolidation(compiled: CompileResult, own: ReadonlySet<number>, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number; forced?: 'share' } | undefined {
+  // first committing compile; and a passthrough strategy over budget, which
+  // keeps changes ahead of its window, re-renders from the first change only at
+  // the compile where its window first passes it.
+  private consolidation(compiled: CompileResult, own: ReadonlySet<number>, blocks: SystemChangeContent[], head: HeadDeclaration): { changeChars: number; requestChars: number; forced?: 'share' } | undefined {
     const firstChange = own.values().next().value;
-    const inputTokens = this.lastResponseInputTokens;
-    if (firstChange === undefined || inputTokens === undefined) return undefined;
-    const changeTokens = blocks.reduce((sum, block) => sum + jsonTokenEstimator(JSON.stringify(block)), 0);
-    if (changeTokens * 10 < inputTokens) return undefined;
+    if (firstChange === undefined) return undefined;
+    const changeChars = blocks.reduce((sum, block) => sum + JSON.stringify(block).length, 0);
+    const requestChars = requestCharacters(head, compiled.messages);
+    if (changeChars * 10 < requestChars) return undefined;
     // context-manager compares `firstChanged` when it's read.
     const { firstChanged } = compiled;
     const free = firstChanged != null && firstChanged <= firstChange && !(this.mayBindThinking && compiled.messages.slice(0, firstChanged)
       .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
-    if (free) return { changeTokens, inputTokens };
-    return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
+    if (free) return { changeChars, requestChars };
+    return changeChars * 5 >= requestChars ? { changeChars, requestChars, forced: 'share' } : undefined;
   }
 
   private ownChangeRows() {

@@ -112,7 +112,6 @@ async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boole
 }
 
 const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCreationTokens: 200 + n, cacheReadTokens: 3000 + n });
-const inputOf = (n: number) => { const u = usageOf(n); return u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens; };
 
 async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
@@ -161,11 +160,8 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
   try {
     await send('first', 1);
     const agent = framework.getAgent('resident')!;
-    const input = () => (agent as unknown as { lastResponseInputTokens?: number }).lastResponseInputTokens;
-    const inputs = [input()];
     tools.names = opts.second ?? ['a', 'b'];
     await send('second', 2);
-    inputs.push(input());
     const afterSecond = {
       onHead: !agent.declaresEntries(),
       undoDepth: framework.getUndoRedoState('resident').undoDepth,
@@ -173,9 +169,8 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     };
     if (opts.third) {
       await send('third', 3);
-      inputs.push(input());
     }
-    return { calls: membrane.calls, traces, policyCalls, inputs, ...afterSecond };
+    return { calls: membrane.calls, traces, policyCalls, ...afterSecond };
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -282,12 +277,6 @@ describe("toolDeclarations' fail-safe", () => {
     assert.equal(run.onHead, false);
     assert.equal(resends(run.traces), 0);
     assert.deepEqual(run.policyCalls, [0], 'the error policy had it');
-  });
-
-  it('hands each answer\'s whole input to the agent: fresh, cache written and cache read', async () => {
-    const run = await turns({ binds: true, refuse: () => undefined, third: true });
-    assert.equal(run.calls.length, 3);
-    assert.deepEqual(run.inputs, [inputOf(0), inputOf(1), inputOf(2)], 'the latest answer\'s, after each turn');
   });
 });
 

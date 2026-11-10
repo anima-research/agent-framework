@@ -18981,10 +18981,10 @@ export class AgentFramework {
       if (event.type === 'head:moved' && event.forced) {
         const why = event.forced === 'budget'
           ? `a compile was refused over budget, or for dropping messages no summary covers, with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
-          : `the system changes reached ${event.changeTokens} tokens, at least a fifth of the last response's ${event.inputTokens}, and no compile had taken them into the head at no further cost, so the head took them`;
+          : `the system changes reached ${event.changeChars} characters of JSON, at least a fifth of the request's ${event.requestChars}, and no compile had taken them into the head at no further cost, so the head took them`;
         this.opsAlert('head-consolidated', agent.name,
           `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
-          { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });
+          { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeChars: event.changeChars, requestChars: event.requestChars } : {}) } });
       }
     }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head-moved'));
   }
@@ -31167,7 +31167,6 @@ export class AgentFramework {
               : agent.maxTokens;
             if (realTotal > 0) {
               agent.lastStreamRealInputTokens = realTotal;
-              agent.noteResponseInput(realTotal);
               agent.lastStreamOutputTokens = callOutputTokens;
               agent.lastStreamUnreportedTokens = 0;
             } else {

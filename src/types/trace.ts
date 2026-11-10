@@ -139,10 +139,10 @@ export type TraceEvent =
       why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
       /** The change rows removed, since the head now holds them. */
       changesRemoved: number;
-      /** For a consolidation: the changes' tokens, priced from their JSON, and the input they reached a share of. */
-      changeTokens?: number;
-      inputTokens?: number;
-      /** A consolidation no compile made free: past a fifth of the input
+      /** For a consolidation: the changes' characters as JSON, and those of the request they reached a share of. */
+      changeChars?: number;
+      requestChars?: number;
+      /** A consolidation no compile made free: past a fifth of the request
        *  ('share'), or at a compile refused over budget, or for dropping
        *  messages no summary covers, with changes kept
        *  ('budget'). A whole write, and on a binding model the request's

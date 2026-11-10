@@ -137,9 +137,19 @@ export interface AgentConfig {
    *   later change to the tools, or addition to the system text, goes into
    *   the context as a system change at the point it took effect, which the
    *   provider reads without rewriting what came before. A replacement of
-   *   system text, and consolidation once changes reach a tenth of the input
+   *   system text, and consolidation once changes reach a tenth of the request
    *   at a compile that already rewrites them, or a fifth at any compile,
-   *   move the head to what's current, with one write. Only for models that
+   *   move the head to what's current, with one write. The share is in
+   *   characters of JSON on both sides: the changes', and the request's, its
+   *   head's tools and system text and its messages, leaving out what a
+   *   provider doesn't price by its characters (a base64 source's data, a
+   *   generated image's, a redacted thinking block's, a thinking block's
+   *   signature and a block's provider-native `rawItem`) and what a request
+   *   on the native formatter doesn't send (a parsed block's `rawXml` and
+   *   `rawXmlImagesAt`, a call's `unparseableInput` and a block's
+   *   `tokenEstimate`). JSON runs denser than prose, so tool changes read as
+   *   a smaller share than they would in tokens, and a move comes somewhat
+   *   later. Only for models that
    *   take mid-conversation system messages on the native formatter: the
    *   host's model records say which. Membrane refuses a system change any
    *   other way. The agent's own change rows are those stored with its
@@ -176,9 +186,7 @@ export interface AgentConfig {
    * out of its context once its record is cleared (a record the store can't
    * clear keeps them until it can), while its compile, made as an
    * `'entries'` agent's, holds a host's until then. An Agent used without the framework
-   * keeps its head in memory and has no such resend, and consolidates past a
-   * share of the input only if its host reports each response's input
-   * (`noteResponseInput`). The direct API
+   * keeps its head in memory and has no such resend. The direct API
    * (runInference) declares nothing: it sends the tools its caller passes
    * and the current system text, and leaves the context's changes out of its
    * request, though under `'entries'` its compile holds them, as a compile
@@ -356,7 +364,7 @@ export interface AgentConfig {
      * free only where no thinking sits before the compile's `firstChanged`
      * (the first message that compile renders differently from the last
      * one; thinking from there on is set aside by the compile's own change).
-     * Past a fifth of the input, or when a compile is refused over budget,
+     * Past a fifth of the request, or when a compile is refused over budget,
      * or for dropping messages no summary covers, with changes kept, it
      * consolidates anyway, setting that thinking
      * aside. The host's model records carry `binds`, beside "takes entries".

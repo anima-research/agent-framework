@@ -5,7 +5,15 @@
   it took effect, so it no longer rewrites the provider's cache from the head.
   A replacement of system text, which is any edit or removal of a block
   already declared, and a consolidation once the changes reach a tenth of the
-  last response's input, move the head to what's current. The blocks' order is
+  request, move the head to what's current. The share is in characters of
+  JSON on both sides, leaving out what a provider doesn't price by its
+  characters (a base64 source's data, a generated image's, a redacted
+  thinking block's, a thinking block's signature and a block's
+  provider-native `rawItem`) and what a request on the native formatter
+  doesn't send (a parsed block's `rawXml` and `rawXmlImagesAt`, a call's
+  `unparseableInput` and a block's `tokenEstimate`); JSON runs denser than
+  prose, so tool changes read as a smaller share than they would in tokens,
+  and a move comes somewhat later. The blocks' order is
   ignored. So this saves cache writes only while the system blocks already
   declared stay as they are: a block whose text changes on every request moves
   the head on every request. A move stores the new head first, and takes the
@@ -26,7 +34,7 @@
   manager's record, takes `true` alone). Under `'entries'`, the digests a
   compile with `binds: true` is told are the recorded head's, so a declared
   change keeps them, and a move of the head changes them wherever it changes
-  what the request carries ahead of its messages. Past a fifth of the input,
+  what the request carries ahead of its messages. Past a fifth of the request,
   or when a compile is refused over budget, or for dropping messages no
   summary covers, with changes kept, it happens anyway, raising an operator
   line (`head-consolidated`). A strategy that merges adjacent summaries, as
