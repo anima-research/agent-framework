@@ -52,16 +52,22 @@ const remind = (f: Fixture, content: string, agents: Asked, held: boolean | 'bes
 type GateHandle = {
   debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>;
   fireDebounce(name: string): void;
-  evaluate(info: { content?: unknown }): unknown;
+  evaluate(info: { content?: unknown }, after?: unknown): { trigger: boolean };
 };
 const gateOf = (f: Fixture) => (f.framework as unknown as { eventGate: GateHandle }).eventGate;
 
-function gateAsked(f: Fixture): string[] {
+function gateAsked(f: Fixture): { asked: string[]; verdicts: boolean[] } {
   const gate = gateOf(f);
   const evaluate = gate.evaluate.bind(gate);
   const asked: string[] = [];
-  gate.evaluate = (info) => { asked.push(String(info.content)); return evaluate(info); };
-  return asked;
+  const verdicts: boolean[] = [];
+  gate.evaluate = (info, after) => {
+    asked.push(String(info.content));
+    const decision = evaluate(info, after);
+    verdicts.push(decision.trigger);
+    return decision;
+  };
+  return { asked, verdicts };
 }
 
 function fire(f: Fixture): void {
@@ -126,7 +132,7 @@ describe("a debounced module event wakes the agents its response asked inference
 
   it('a request for an empty list of agents is shown to no one in its batch, beside one for a resident', async () => {
     const { f, turns, off } = await setup([resident('agent'), resident('other')]);
-    const asked = gateAsked(f);
+    const { asked } = gateAsked(f);
     try {
       remind(f, 'water the plants', []);
       remind(f, 'dim the lamps', ['agent']);
@@ -136,13 +142,14 @@ describe("a debounced module event wakes the agents its response asked inference
       await f.framework.runUntilIdle();
       assert.deepEqual(turns, ['agent']);
       assert.ok(!rows(f, '[Gate:').some((l) => JSON.stringify(l.content).includes('water the plants')), 'no line quotes the event it leaves out');
+      assert.equal(rows(f, 'dim the lamps').length, 1, "the resident's window holds its own reminder once, with no line quoting it");
       assert.ok(f.membrane.calls.some((c) => JSON.stringify(c).includes('dim the lamps')), "the resident's own reminder reaches it");
     } finally { off(); await f.close(); }
   });
 
   it("a request naming only an isolated job, which doesn't read the message's slot, is shown to no one in its batch and asks inference for the job, beside one for a resident", async () => {
     const { f, module, turns, off } = await setup([resident('agent'), resident('other')]);
-    const asked = gateAsked(f);
+    const { asked } = gateAsked(f);
     try {
       const job = await isolatedJob(f, module);
       remind(f, 'water the plants', ['worker-1']);
@@ -155,6 +162,7 @@ describe("a debounced module event wakes the agents its response asked inference
       await job.done();
       assert.deepEqual([...new Set(turns)].sort(), ['agent', 'worker-1'], 'no other resident wakes');
       assert.ok(!rows(f, '[Gate:').some((l) => JSON.stringify(l.content).includes('water the plants')), 'no line quotes the event it leaves out');
+      assert.equal(rows(f, 'dim the lamps').length, 1, "the resident's window holds its own reminder once, with no line quoting it");
       assert.ok(f.membrane.calls.some((c) => JSON.stringify(c).includes('dim the lamps')), "the resident's own reminder reaches it");
     } finally {
       module.release('g-worker');
@@ -183,7 +191,7 @@ describe("a debounced module event wakes the agents its response asked inference
 
   it('a request whose message is held from the residents is shown to no one in its batch, beside one for a resident', async () => {
     const { f, turns, off } = await setup([resident('agent'), resident('other')]);
-    const asked = gateAsked(f);
+    const { asked } = gateAsked(f);
     try {
       remind(f, 'water the plants', ['agent'], true);
       remind(f, 'dim the lamps', ['agent']);
@@ -193,12 +201,14 @@ describe("a debounced module event wakes the agents its response asked inference
       await f.framework.runUntilIdle();
       assert.deepEqual(turns, ['agent']);
       assert.ok(!rows(f, '[Gate:').some((l) => JSON.stringify(l.content).includes('water the plants')), 'no line quotes the event it leaves out');
+      assert.equal(rows(f, 'dim the lamps').length, 1, "the resident's window holds its own reminder once, with no line quoting it");
       assert.ok(f.membrane.calls.some((c) => JSON.stringify(c).includes('dim the lamps')), "the resident's own reminder reaches it");
     } finally { off(); await f.close(); }
   });
 
   it('with no rule batching it, a request whose message is held from the residents wakes no one either', async () => {
     const { f, turns, off } = await setup([resident('agent'), resident('other')], []);
+    const { verdicts } = gateAsked(f);
     const added: string[] = [];
     const offAdded = f.framework.onTrace((event) => {
       if (event.type === 'message:added') added.push(event.source);
@@ -207,6 +217,7 @@ describe("a debounced module event wakes the agents its response asked inference
       remind(f, 'water the plants', ['agent'], true);
       await f.framework.runUntilIdle();
       assert.deepEqual(added, ['clock:reminder'], 'premise: the held message is stored');
+      assert.deepEqual(verdicts, [true], 'the gate lets it through, so the direct path decides');
       assert.deepEqual(turns, []);
     } finally { offAdded(); off(); await f.close(); }
   });
@@ -259,13 +270,14 @@ describe("a debounced module event wakes the agents its response asked inference
   it("a response storing only another agent's stored context injection doesn't wake the resident it names, batched or not", async () => {
     for (const policies of [[], BATCH]) {
       const { f, turns, off } = await setup([resident('agent'), resident('other')], policies);
-      const asked = gateAsked(f);
+      const { asked, verdicts } = gateAsked(f);
       try {
         remind(f, 'water the plants', ['agent'], false, { contextInjection: { agent: 'other', namespace: 'agents/other', contentHash: 'h1', part: 0, parts: 1 } });
         await f.framework.runUntilIdle();
         const how = policies.length > 0 ? 'batched' : 'no rule';
         assert.equal(rows(f, 'water the plants').length, 1, `${how}: premise: the message is stored`);
         assert.deepEqual(asked, ['water the plants'], `${how}: premise: the gate is asked about it`);
+        assert.deepEqual(verdicts, [true], `${how}: the gate lets it through, so the direct path decides`);
         if (policies.length > 0) assert.equal(gateOf(f).debounceTimers.size, 0, 'batched: it joins no batch');
         assert.deepEqual(turns, [], `${how}: no one wakes`);
       } finally { off(); await f.close(); }

@@ -952,25 +952,27 @@ describe('judge rules: what waiting leaves the agent with', () => {
   });
 
   const toAgent = { agent: 'agent', messageId: 'row-1' };
-  for (const [what, writes, woken, certain] of [
-    ['its one event written to the agent it wakes only may wake it, since an answered batch starts no turn', [toAgent], ['agent'], false],
-    ['each of its events written to the agent it wakes only may wake it', [toAgent, { agent: 'agent', messageId: 'row-2' }], ['agent'], false],
-    ['with an event given no write, it wakes the agent: the framework has no write to drop the wake by', [toAgent, undefined], ['agent'], true],
-    ["with an event written to another agent's window, it wakes the agent", [{ agent: 'other', messageId: 'row-1' }], ['agent'], true],
-    ['with a write that names no agent, it wakes the agent', [{ messageId: 'row-1' }], ['agent'], true],
-    ["it wakes a co-resident, whom the delivery agent's answer doesn't take it from", [toAgent], ['agent', 'other'], true],
+  for (const [what, writes, certainFor] of [
+    ['its one event written to the agent it wakes only may wake it, since an answered batch starts no turn', [toAgent], { agent: false }],
+    ['each of its events written to the agent it wakes only may wake it', [toAgent, { agent: 'agent', messageId: 'row-2' }], { agent: false }],
+    ['with an event given no write, it wakes the agent: the framework has no write to drop the wake by', [toAgent, undefined], { agent: true }],
+    ["with an event written to another agent's window, it wakes the agent", [{ agent: 'other', messageId: 'row-1' }], { agent: true }],
+    ['with a write that names no agent, it wakes the agent', [{ messageId: 'row-1' }], { agent: true }],
+    ["it wakes a co-resident, whom the delivery agent's answer doesn't take it from, and only may wake the delivery agent", [toAgent], { agent: false, other: true }],
   ] as const) {
     it(`tells the judge of a pending debounced batch: ${what}`, () => {
       const { gate } = makeGate(writeConfig('upcoming-written.json', {
         policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
-      }), { recipients: [...woken] });
+      }), { recipients: Object.keys(certainFor) });
       writes.forEach((after: WritePlacement | undefined, i) => {
         gate.evaluate({ content: `notes-${i}.md`, eventType: 'workspace:modified', serverId: '', channelId: '' }, after);
       });
       const n = writes.length;
-      const last = woken[woken.length - 1]!;
-      assert.deepStrictEqual(gate.upcomingWakes([...woken]).filter((w) => (w as { agents?: string[] }).agents?.includes(last)).map((w) => [w.what, w.certain]),
-        [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]], `the wake for ${last}`);
+      const wakes = gate.upcomingWakes(Object.keys(certainFor));
+      for (const [agent, certain] of Object.entries(certainFor)) {
+        assert.deepStrictEqual(wakes.filter((w) => (w as { agents?: string[] }).agents?.includes(agent)).map((w) => [w.what, w.certain]),
+          [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]], `the wake for ${agent}`);
+      }
       gate.dispose();
     });
   }

@@ -114,8 +114,11 @@ describe('a batch shows each event to the agents it is for', () => {
     gate.evaluate(reminder('dim the lamps'));
     gate.setSleep(300);
     const shared = gate.upcomingWakes(['agent', 'other']).filter((w) => w.kind !== 'self-wake');
-    assert.deepEqual(shared.map((w) => [w.kind, (w as { agents?: unknown }).agents]), [['debounce', ['agent', 'other']], ['sleep-end', ['agent', 'other']]],
-      'an untargeted event and a sleep that names no agent are for every agent asked about');
+    assert.deepEqual(shared.map((w) => [w.kind, (w as { agents?: unknown }).agents, w.what]), [
+      ['debounce', ['agent'], 'rule "batch"\'s debounced batch of 1 event'],
+      ['debounce', ['other'], 'rule "batch"\'s debounced batch of 2 events'],
+      ['sleep-end', ['agent', 'other'], 'the end of its sleep'],
+    ], 'an untargeted event is for every agent asked about, each told the events delivery gives it, and a sleep that names no agent is for both');
     gate.dispose();
   });
 
@@ -128,7 +131,8 @@ describe('a batch shows each event to the agents it is for', () => {
     assert.deepEqual(byAgent('agent'), [false], "agent's events each carry its own write, so the batch only may wake it");
     assert.deepEqual(byAgent('other'), [true], "other's event has no write, so the batch will wake it");
     const now = Date.now();
-    assert.match(ifYouWait(wakes, 'agent', now), /debounced batch of 2 events/);
+    assert.match(ifYouWait(wakes, 'agent', now), /debounced batch of 1 event\b/, "agent is told the events delivery gives it");
+    assert.match(ifYouWait(wakes, 'other', now), /debounced batch of 1 event\b/, 'and so is other');
     assert.match(ifYouWait(wakes, 'agent', now), /, maybe: rule/, 'the judge for agent is told maybe');
     assert.doesNotMatch(ifYouWait(wakes, 'other', now), /maybe/, 'the judge for other is told certain');
     gate.dispose();
