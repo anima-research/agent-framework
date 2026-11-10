@@ -120,7 +120,6 @@ export type TraceEvent =
       /** Bounded like `error`. */
       stack?: string;
     })
-  // An agent's head under toolDeclarations 'entries' (system-changes.ts)
   | (TraceEventBase & {
       type: 'head:declared';
       agentName: string;
@@ -156,6 +155,9 @@ export type TraceEvent =
       agentName: string;
       /** The refusal's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
+      /** How many of the agent's replies it noted to go without their thinking, which was signed under a prefix that
+       *  held a system change its requests on the head leave out. */
+      thinkingSetAside: number;
     })
   | (TraceEventBase & {
       /**
@@ -1609,8 +1611,9 @@ export type TraceEvent =
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
        * a start finished, `resume`, a refusal rewind's shed from a window
        * that is still the record, `rewind`, and an agent's own system changes
-       * a move of its recorded head took out, `head-moved`, the
-       * `head:moved` trace after it saying why), or that no live context
+       * a move of its head took out, `head-moved`, the `head:moved` trace
+       * after it saying why, or none where the head couldn't be stored and
+       * none was recorded), or that no live context
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
        * inference failure's shed on a presented window: the rows leave the
        * agent's own window as an undone turn's do, and stay in the record.

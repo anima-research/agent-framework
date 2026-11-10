@@ -154,8 +154,12 @@ export interface AgentConfig {
    *   a smaller share than they would in tokens, and a move comes somewhat
    *   later. Only for models that
    *   take mid-conversation system messages on the native formatter: the
-   *   host's model records say which. Membrane refuses a system change any
-   *   other way. The agent's own change rows are those stored with its
+   *   host's model records say which. Membrane refuses a system change before
+   *   sending it unless the formatter's `rendersSystemChanges` and the
+   *   adapter's `sendsSystemChanges` both hold, as the native formatter's and
+   *   the Anthropic adapter's do; an adapter wrapped in another needs the
+   *   wrapper to declare `sendsSystemChanges` too. A refused change keeps the
+   *   agent to its head until it's built again. The agent's own change rows are those stored with its
    *   `systemChangeMetadata(name)`, or with one of its `selfParticipants`'
    *   (see `selfParticipants`), and for an agent that shares another's
    *   context on a branch of its own, those its source counts as its own.
@@ -191,9 +195,12 @@ export interface AgentConfig {
    * `'entries'` agent's, holds a host's until then. An Agent used without the framework
    * keeps its head in memory, per branch of its context, and has no such resend. The direct API
    * (runInference) declares nothing: it sends the tools its caller passes
-   * and the current system text, and leaves the context's changes out of its
-   * request, though under `'entries'` its compile holds them, as a compile
-   * kept to its head does.
+   * and the current system text, and leaves the agent's own change rows out
+   * of its request, since its head already holds what they declare. Under
+   * `'entries'` it carries a host's change rows as the agent's requests do;
+   * on its head it carries none. Its compile binds thinking under the current
+   * head, so on an `'entries'` agent whose recorded head differs, the next
+   * request the agent makes sets aside the thinking before it.
    *
    * Turning it on is a choice from those records, not a runtime toggle, so
    * it isn't one of the agent's runtime settings.
@@ -466,7 +473,9 @@ export interface AgentConfig {
    * parent's turns read as its own history. Stored authorship is never
    * rewritten. A system change stored with one of these names' change
    * metadata is this agent's own too: its view keeps it, and a move of its
-   * head, or a request on the head, takes it out of the agent's own context.
+   * head takes it out of the agent's own context, as does a request on the
+   * head that clears a recorded head or whose compile holds one of the
+   * agent's own change rows.
    */
   selfParticipants?: string[];
 

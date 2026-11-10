@@ -247,6 +247,8 @@ describe('a message injected at a tool boundary', () => {
       assert.deepEqual(mismatches, [], 'the boundary hands its stream over as vouched for, the change it presented but left out of the stream included');
       assert.ok(framework.getAgent('assistant')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('ZZCHANGE')),
         'the premise: the boundary stored the change');
+      assert.ok(framework.getAgent('assistant')!.getContextManager().getPresentedMessages().some((m) => JSON.stringify(m.content).includes('ZZCHANGE')),
+        'and presented it in the window, so the hand-off had a row to pass over');
       assert.notEqual(holding(injected, 'HEARD'), '', 'the message beside it goes in');
       const next = await nextRequest();
       assert.notEqual(next('HEARD'), '', 'the premise: the next request is the resident\'s');

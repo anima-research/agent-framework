@@ -1,5 +1,8 @@
 - An agent can keep its requests' head fixed and declare later changes in its
-  context: with `toolDeclarations: 'entries'`, each request carries the
+  context, where membrane's formatter renders system changes and its adapter
+  sends them (`rendersSystemChanges` and `sendsSystemChanges`, as the native
+  formatter and the Anthropic adapter declare, and a wrapping adapter must
+  declare too): with `toolDeclarations: 'entries'`, each request carries the
   agent's recorded tools and system text, and each later change to its tools,
   or addition to its system text, is stored as a `system_change` message where
   it took effect, so it no longer rewrites the provider's cache from the head.
@@ -54,7 +57,13 @@
   agent built again on `'head'` clears its recorded head at its first request
   and then takes its own change rows out of its context; a record the store
   can't clear keeps them, and a later request tries again. New trace events:
-  `head:declared`, `head:moved` and `head:resend`.
+  `head:declared`, `head:moved` and `head:resend`. `Agent` gains what a host
+  that builds agents without the framework sets and reads:
+  `attachHeadDeclarations` (where heads are kept, and what a move reports),
+  `setCompileHoldsChanges` (whether its compile can hold change rows),
+  `setSourceChangeOwners`, `ownsChange` and `changeOwners` (whose change rows
+  are its own), `declaresEntries` (whether its requests declare changes now)
+  and `keepToHeadUntilBuiltAgain` (the fail-safe).
 - An agent that continues another's context starts on that agent's head:
   `deriveAgent`, and `createEphemeralAgent` with a spec whose `inherit` sets
   no `atSequence` and names a running agent that declares entries, start the

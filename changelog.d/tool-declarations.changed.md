@@ -33,6 +33,11 @@
   function, is left out of the request as it was of what was sent. The
   direct API (`Agent.runInference`, `runInferenceWithInjections`) passes the
   tools it's given as they are, as before.
+- The refusal rewind, automatic or forced by `/unstick`, and the shed after
+  inference exhaustion pass over every system change row, as they did on a
+  presented window: on a window that is the record, a host's change row
+  stored without the framework's system metadata, which they could take
+  before, now stays.
 - A message-count undo (`/undo` with `messages`) counts every message but
   system change rows: the change rows among the last N go with them
   uncounted, and a refusal's count of the messages the history holds leaves

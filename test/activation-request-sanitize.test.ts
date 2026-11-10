@@ -12,7 +12,6 @@ import { Agent } from '../src/agent.js';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Membrane } from '@animalabs/membrane';
 
-/** buildActivationRequest only needs compile(); membrane is never touched. */
 function agentCompiling(messages: unknown[]): Agent {
   const cm = {
     compile: async () => ({ messages, systemInjections: [] }),

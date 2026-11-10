@@ -2043,7 +2043,9 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages).filter((m) => !isSystemChangeMessage(m))));
+      const own = this.declaresEntries() ? ownSystemChanges(compiled, (name) => this.ownsChange(name)) : undefined;
+      const carried = compiled.messages.filter((m, i) => !isSystemChangeMessage(m) || (own !== undefined && !own.has(i)));
+      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(carried)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.

@@ -1698,24 +1698,6 @@ function freshTurnRouting(): TurnRouting {
   };
 }
 
-/**
- * The rows that opened an agent's turn (#867), as a range of its window: its
- * window read back from its newest row (getPresentedMessages: the rows
- * presented to it, in their order, once its context presents rows, #291; in
- * legacy mode the record), through the rows its consumed mark doesn't cover
- * (coverTest: in presented mode, a row at or past the index length the mark
- * took, or, for a mark taken before the window was written down, a row the
- * window didn't hold where it stands by the mark's head, such as an older row
- * presented again since; in legacy mode, a row stored after the head) and
- * that it sees, up to the newest row the mark covers or the newest it sees
- * under its own name; from the oldest of them that holds more than tool
- * results to the newest. A row it doesn't see is passed over. Undefined when
- * there is none, and when the mark can't say (none, one on another branch,
- * or one taken in presented mode read against a manager that no longer
- * presents). The ids name a range of the window: a strategy reads a pin by
- * its rows' positions in its message view, which is the window, in its order
- * (pinRange).
- */
 function turnInputs(
   cm: ContextManager, mark: ReadMark | null, agentName: string, sees: (metadata: unknown) => boolean,
 ): { first: MessageId; last: MessageId } | undefined {
@@ -4337,6 +4319,8 @@ interface StreamRequestNotes {
   note: (rows: readonly SentRow[]) => boolean;
   rounds: RoundRow[];
   stopped: boolean;
+  noteDropped?: (messageIds: readonly MessageId[]) => boolean;
+  carried?: ReadonlySet<MessageId>;
 }
 
 const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding', 'toolDeclarations'] as const satisfies ReadonlyArray<keyof AgentConfig>;
@@ -12132,6 +12116,7 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
+    if (!config.selfParticipants?.length && spec?.selfParticipants?.length) config = { ...config, selfParticipants: spec.selfParticipants };
     const parent = spec?.inherit && spec.inherit.atSequence === undefined ? this.agents.get(spec.inherit.from) : undefined;
     const seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
     // Names are Chronicle namespaces and generation identities. Reserve before
@@ -13465,6 +13450,7 @@ export class AgentFramework {
     this.toolImageLedgers.delete(name);
     this.evictTurnCheckpoints(name);
     this.headDeclarationCache?.heads.delete(name);
+    this.headDeclarationCache?.setAside.delete(name);
     this.activeTurnTokens.delete(name);
     this.activeTurnTriggers.delete(name);
     this.logicalTurnToolCalls.delete(agent);
@@ -18866,7 +18852,7 @@ export class AgentFramework {
 
   // chronicle's state is the branch's: after a switch (undo, redo, a rollback,
   // a fork) a read gives the other branch's.
-  private headDeclarationCache: { branch: string; heads: Map<string, HeadDeclaration | null> } | null = null;
+  private headDeclarationCache: { branch: string; heads: Map<string, HeadDeclaration | null>; setAside: Set<string> } | null = null;
   // chronicle: a branch made from another carries only registered states, and
   // each registration costs a lookup at every branch made.
   private readonly registeredHeadStates = new Set<string>();
@@ -18875,7 +18861,7 @@ export class AgentFramework {
   private readonly headDeclarations: HeadDeclarationStore = {
     read: (agentName) => this.readHeadDeclaration(agentName) ?? null,
     write: (agentName, head) => this.storeHeadDeclaration(agentName, head),
-    delete: (agentName) => this.readHeadDeclaration(agentName) === null || this.storeHeadDeclaration(agentName, null),
+    delete: (agentName) => (this.readHeadDeclaration(agentName) === null && !this.headDeclarationCache!.setAside.has(agentName)) || this.storeHeadDeclaration(agentName, null),
   };
 
   private headStateId(agentName: string): string {
@@ -18889,7 +18875,7 @@ export class AgentFramework {
 
   private headsOnBranch(): Map<string, HeadDeclaration | null> {
     const branch = this.store.currentBranch().id;
-    if (this.headDeclarationCache?.branch !== branch) this.headDeclarationCache = { branch, heads: new Map() };
+    if (this.headDeclarationCache?.branch !== branch) this.headDeclarationCache = { branch, heads: new Map(), setAside: new Set() };
     return this.headDeclarationCache.heads;
   }
 
@@ -18900,12 +18886,15 @@ export class AgentFramework {
     try {
       const stored = this.store.getStateJson(headDeclarationId(agentName));
       const head = isHeadDeclaration(stored) ? stored : null;
-      if (stored != null && head === null) console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside, and the agent records its current tools and system text as its head, taking its own change rows out`);
+      if (stored != null && head === null) {
+        this.headDeclarationCache!.setAside.add(agentName);
+        console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside, and the agent records its current tools and system text as its head, taking its own change rows out`);
+      }
       heads.set(agentName, head);
       this.headDeclarationsUnreadable.delete(agentName);
       return head;
     } catch (error) {
-      if (this.headDeclarationsUnreadable.get(agentName) !== branch) console.error(`[head-declarations] ${agentName}: the recorded head could not be read, so its requests go on its current head, which it records in its place once it can:`, error);
+      if (this.headDeclarationsUnreadable.get(agentName) !== branch) console.error(`[head-declarations] ${agentName}: the recorded head could not be read, so its requests go on its current head, its own change rows taken out, and it records that head once it can; a record that reads again before then is the head its next request declares from:`, error);
       this.headDeclarationsUnreadable.set(agentName, branch);
       return undefined;
     }
@@ -18913,14 +18902,17 @@ export class AgentFramework {
 
   private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): boolean {
     const recorded = this.readHeadDeclaration(agentName);
-    if (recorded !== undefined && JSON.stringify(recorded) === JSON.stringify(head)) return true;
+    if (recorded !== undefined && !this.headDeclarationCache!.setAside.has(agentName) && JSON.stringify(recorded) === JSON.stringify(head)) return true;
     try {
       this.store.setStateJson(this.headStateId(agentName), head);
     } catch (error) {
-      console.error(`[head-declarations] ${agentName}: the recorded head could not be stored, so what was recorded stays, with the agent's change rows, until a later request stores it:`, error);
+      console.error(head !== null && !recorded
+        ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded === undefined ? ' that can be read' : ''}, so its requests go on its current head with its own change rows taken out until a later request stores it:`
+        : `[head-declarations] ${agentName}: the recorded head could not be stored, so what was recorded stays, with the agent's change rows, until a later request stores it:`, error);
       return false;
     }
     this.headsOnBranch().set(agentName, head);
+    this.headDeclarationCache!.setAside.delete(agentName);
     return true;
   }
 
@@ -18929,20 +18921,42 @@ export class AgentFramework {
     return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
   }
 
-  private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean): boolean {
+  private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean, stream?: YieldingStream): boolean {
     if (!agent.declaresEntries() || !carriedChange) return false;
     const recognised = isMembraneError(error) && error.systemChangeRefused === true;
     const refused = isMembraneError(error) && error.httpStatus === 400 && error.type !== 'context_length' && error.type !== 'auth';
     if (!recognised && !refused) return false;
     agent.keepToHeadUntilBuiltAgain();
-    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again, by a restart of the host or by creating the agent again; for a model that refuses system changes, set toolDeclarations: 'head' on it: ${error.message}`);
-    if (!recognised) {
+    const setAside = this.setAsideThinkingSignedOverChanges(agent, stream);
+    const thinking = setAside.ids.length === 0 ? ''
+      : setAside.noted ? `, and sets aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change`
+      : `; the note setting aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change didn't land, so each of its requests until it's built again carries that thinking, which a model that binds it refuses`;
+    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again, by a restart of the host or by creating the agent again${thinking}; for a model that refuses system changes, set toolDeclarations: 'head' on it: ${error.message}`);
+    if (!recognised || (setAside.ids.length > 0 && !setAside.noted)) {
       this.opsAlert('head-resend', agent.name,
-        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache. A restart of the host, or creating the agent again, has it declare changes again: ${error.message}`,
-        { data: { httpStatus: 400 } });
+        `${recognised ? 'membrane refused a system change' : "a 400 membrane doesn't recognise as a refused system change ended a request that carried one"}, so it goes again on the agent's head${setAside.ids.length > 0 ? thinking : this.thinkingSetAside(agent, 'which sets aside the thinking the request held')}.${recognised ? '' : ' The 400 may not be about the change.'} The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache. A restart of the host, or creating the agent again, has it declare changes again: ${error.message}`,
+        { data: { ...(recognised ? {} : { httpStatus: 400 }), thinkingSetAside: setAside.ids.length, ...(setAside.ids.length > 0 ? { noted: setAside.noted } : {}) } });
     }
-    this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
+    this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message, thinkingSetAside: setAside.noted ? setAside.ids.length : 0 });
     return true;
+  }
+
+  private setAsideThinkingSignedOverChanges(agent: Agent, stream: YieldingStream | undefined): { ids: MessageId[]; noted: boolean } {
+    const notes = stream ? this.streamRequestNotes.get(stream) : undefined;
+    if (!notes?.noteDropped) return { ids: [], noted: false };
+    const sent = new Set<MessageId>([...(notes.carried ?? []), ...notes.rounds.flatMap((row) => (row.id === undefined ? [] : [row.id]))]);
+    const cm = agent.getContextManager();
+    const ids: MessageId[] = [];
+    let afterChange = false;
+    for (const row of cm.windowMode() === 'presented' ? cm.getPresentedMessages() : cm.getAllMessages()) {
+      if (!sent.has(row.id)) continue;
+      if (isSystemChangeMessage(row)) afterChange = true;
+      else if (afterChange && agent.isOwnParticipant(row.participant) && row.content.some((b) => ['thinking', 'redacted_thinking'].includes((b as { type?: string }).type ?? ''))) ids.push(row.id);
+    }
+    if (ids.length === 0) return { ids, noted: false };
+    let noted = false;
+    try { noted = notes.noteDropped(ids); } catch (error) { console.error(`[head-declarations] ${agent.name}: the note setting aside thinking signed under a system change threw:`, error); }
+    return { ids, noted };
   }
 
   private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
@@ -21166,6 +21180,8 @@ export class AgentFramework {
           idleTtlMs: router.idleTtlMs,
         }),
         model: config.model,
+        ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+        ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
       }));
       this.managerReleases.set(agent, release);
       this.agents.set(name, agent);
@@ -28725,7 +28741,13 @@ export class AgentFramework {
       });
       if (trigger) delete (trigger as MarkedRequest)[BUDGET_WAIT];
       // Each later round this stream sends is noted as it goes (noteRoundSent).
-      if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
+      if (noteRequestSent) {
+        this.streamRequestNotes.set(stream, {
+          note: noteRequestSent, rounds: [], stopped: false,
+          ...(noteThinkingDropped ? { noteDropped: noteThinkingDropped } : {}),
+          ...(carriedBodies ? { carried: carriedBodies } : {}),
+        });
+      }
       if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership and admission again.
@@ -30855,7 +30877,7 @@ export class AgentFramework {
             const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
             const onHead = this.keepToHeadAfterRefusal(agent, err,
-              compiledRequest?.messages.some(isSystemChangeMessage) === true || this.streamsHandedChange.has(stream));
+              compiledRequest?.messages.some(isSystemChangeMessage) === true || this.streamsHandedChange.has(stream), stream);
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
             if (!onHead && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
