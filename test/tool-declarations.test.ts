@@ -52,6 +52,7 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
       messages: rows.filter((r) => Object.entries(filter.metadata ?? {}).every(([k, v]) => r.metadata?.[k] === v)),
       totalCount: 0,
     }),
+    getMessage: (id: string) => rows.find((r) => r.id === id) ?? null,
     removeMessage: (id: string) => {
       const at = rows.findIndex((r) => r.id === id);
       if (at >= 0) rows.splice(at, 1);
