@@ -595,6 +595,72 @@ describe('FrameworkConfig.effort: a model that refuses effort rows', { skip: NEE
     } finally { await cleanup(); }
   });
 
+  it('takes back, at a refusal after a restart, the row a stopped start stored and no request sent', async () => {
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'af-effort-unsent-refused-'));
+      dirs.push(dir);
+      let live: Level = 'high';
+      const first = await resident({ effort: () => live, dir });
+      await first.turn('One.');
+      live = 'low';
+      // The framework stops as Two.'s stream is made, before it's read: the start stored its row and sent nothing.
+      let stopped: Promise<void> | undefined;
+      first.provider.onStream = (request) => {
+        if (indexOfText(request, 'Two.') < 0) return;
+        first.provider.onStream = undefined;
+        stopped = first.stop();
+      };
+      first.framework.pushEvent({ type: 'external-message', source: 'test', content: 'Two.', metadata: {} } as never);
+      for (const until = Date.now() + 5_000; !stopped && Date.now() < until;) await new Promise((r) => setTimeout(r, 10));
+      await stopped;
+      const provider = new Provider();
+      provider.fail = (request) => (effortRows(request).length > 0 ? refusal(true) : undefined);
+      const second = await resident({ effort: () => live, dir, provider });
+      assert.equal(storedEffortRows(second.framework).length, 1, 'premise: the unsent row is stored');
+      await second.turn('Three.');
+      assert.deepEqual(provider.calls.map((r) => effortRows(r).map((row) => row.effort)), [['low'], []],
+        'premise: the restart\'s first request carried the row, unwritten by its start, and was refused; its retry carried none');
+      assert.equal(storedEffortRows(second.framework).length, 0, 'the row no request sent is taken back');
+    } finally { await cleanup(); }
+  });
+
+  it('takes back every row of the agent\'s that no reply follows, at a refusal: two levels set before any reply', async () => {
+    try {
+      let live: Level = 'high';
+      const errorPolicy = new RecordingPolicy(() => ({ retry: false }));
+      const provider = new Provider();
+      const { framework, turn } = await resident({ effort: () => live, provider, errorPolicy });
+      await turn('One.');
+      live = 'low';
+      provider.fail = () => new MembraneError({ type: 'server', retryable: true, httpStatus: 529, message: 'overloaded_error', rawError: undefined } as never);
+      await turn('Two.');
+      assert.deepEqual(effortRows(provider.calls[1]!).map((r) => r.effort), ['low'], 'premise: Two.\'s request carried its row and got no answer');
+      live = 'medium';
+      provider.fail = (request) => (effortRows(request).length > 0 ? refusal(true) : undefined);
+      await turn('Three.');
+      assert.deepEqual(effortRows(provider.calls[2]!).map((r) => r.effort), ['low', 'medium'], 'premise: Three.\'s refused request carried both rows');
+      assert.equal(storedEffortRows(framework).length, 0, 'both rows are taken back');
+    } finally { await cleanup(); }
+  });
+
+  it('keeps a row a reply follows, and takes back the one after it, at a refusal', async () => {
+    try {
+      let live: Level = 'high';
+      const provider = new Provider();
+      const { framework, turn } = await resident({ effort: () => live, provider });
+      await turn('One.');
+      live = 'low';
+      await turn('Two.');
+      assert.deepEqual(effortRows(provider.calls[1]!).map((r) => r.effort), ['low'], 'premise: the row was sent, and answered');
+      live = 'medium';
+      provider.fail = (request) => (effortRows(request).length > 0 ? refusal(true) : undefined);
+      await turn('Three.');
+      assert.deepEqual(effortRows(provider.calls[2]!).map((r) => r.effort), ['low', 'medium'], 'premise: the refused request carried both');
+      assert.deepEqual(storedEffortRows(framework).map((m) => (m.content[0] as unknown as { effort: string }).effort), ['low'],
+        'the answered row stays; the one no reply follows is taken back');
+    } finally { await cleanup(); }
+  });
+
   it('doesn\'t count the retry after a marked refusal as one of the error policy\'s attempts', async () => {
     try {
       let live: Level = 'high';
@@ -980,6 +1046,8 @@ describe('FrameworkConfig.effort: the stored bases', { skip: NEEDS_ROWS }, () =>
       assert.deepEqual(provider.carrying('Kid.').map((r) => effortRows(r).length), [1, 0], 'premise: the kid\'s row was refused, and its retry carried none');
       const refused = (framework as unknown as { effortRowsRefused: Set<string> }).effortRowsRefused;
       assert.equal(refused.has('kid'), false, 'its end dropped its name from the refused');
+      assert.deepEqual(storedEffortRows(framework).map((m) => (m.content[0] as unknown as { effort: string }).effort), ['low'],
+        'the kid\'s refusal takes back none of its parent\'s rows');
     } finally { await cleanup(); }
   });
 
