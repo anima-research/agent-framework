@@ -28,10 +28,6 @@
     API, the first request after a host takes this release differs from the
     one before it from the first such item on, and the provider's prompt cache
     matches it only up to there.
-  - An agent whose `foreignRounds` is `'raw'`, and a co-resident's rows stored
-    before audience stamps, send another participant's rows without their
-    stored items, which are another conversation's provider state, and leave
-    out a row holding only such items, as earlier releases did.
   - The agent's own stored message holding only such items is sent, but the
     framework doesn't count it as a turn: the request's last turn and its
     count of stored injections pass over it, as before. The Responses API gets
