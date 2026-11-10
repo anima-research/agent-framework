@@ -65,7 +65,7 @@ const permissionsHold = process.platform !== 'win32' && process.getuid?.() !== 0
 const BEHAVIORS = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit", "passive_sample" and "judge"';
 /** A character outside the Basic Multilingual Plane: one code point, two UTF-16 units. */
 const GRIN = '\u{1F600}';
-const POLICY_FIELDS = '"name", "match", "behavior", "resets" and "passthrough"';
+const POLICY_FIELDS = '"name", "match", "behavior", "resets", "passthrough" and "suppress"';
 const MATCH_FIELDS = '"scope", "source", "channel", "mount", "pathGlob", "tagsAny", "tagsAll", "tagsNone", "metadataTrue" and "filter"';
 const MENTIONS = { name: 'mentions', match: { tagsAny: ['chat:mention'] }, behavior: 'always' };
 const event = (tags: string[], eventType = 'mcpl:channel-incoming'): GateEventInfo =>
@@ -1998,7 +1998,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   // Its own parameters are checked as a rule's fields are: a slip is refused.
   const before = readFileSync(configPath, 'utf-8');
   const parameters = '"name", "match", "behavior", "debounceMs", "rateLimit", "passiveSample", "judge", "position", "insertBefore", '
-    + '"insertAfter", "passthrough" and "resets"';
+    + '"insertAfter", "passthrough", "resets" and "suppress"';
   const slip = await call({ name: 'watch', passiveSample: { every: 10 }, pasthrough: true });
   assert.equal(slip.isError, true);
   assert.ok(
@@ -2150,15 +2150,17 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   // Each of the description's examples, made as the call it shows, is saved as it reads.
   const examples = [...description.matchAll(/`(\{ name: "[^`]+\})`/g)]
     .map((m) => new Function(`return (${m[1]});`)() as Record<string, unknown>);
-  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'ambient-judged']);
+  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'hide-tool-flaps', 'ambient-judged']);
   for (const example of examples) {
     const result = await call(example);
     assert.equal(result.isError, false, result.content);
     assert.equal(JSON.parse(result.content).ignoredFields, undefined, 'every field it gives is read');
   }
-  assert.deepEqual(onDisk(configPath).policies.slice(-3), [
+  assert.deepEqual(onDisk(configPath).policies.slice(-4), [
     { name: 'watch-notes', match: { scope: ['workspace:modified'], mount: 'project', pathGlob: 'notes/*.md' }, behavior: 'always' },
     { name: 'watch-cairn', match: { source: 'discord', channel: 'discord:*:12345', tagsAny: ['chat:ambient'] }, behavior: { debounce: 60000 } },
+    // A suppress rule given no behavior is saved with "defer" written out.
+    { name: 'hide-tool-flaps', match: { source: 'body', scope: ['mcpl:tool-changes'] }, behavior: 'defer', suppress: { description: "the body's tools coming and going" } },
     {
       name: 'ambient-judged',
       match: { tagsAny: ['chat:ambient'] },
@@ -2288,6 +2290,26 @@ test('rules that share a name keep their state through a write that leaves them 
   assert.deepEqual(wakes, ['agent', 'agent'], 'the batch is sent once the rules swap behaviors');
 });
 
+test("a batch whose line quoting an event can't be written is named in the log and dropped, and wakes no one", (t) => {
+  const dir = tempDir(t);
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const configPath = join(dir, 'gate.json');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [{ name: 'quiet', match: {}, behavior: { debounce: 1000 } }] }));
+  const wakes: string[] = [];
+  const gate = new EventGate({
+    configPath, getAgentNames: () => ['agent'], emitTrace: () => {},
+    addMessage: () => { throw new Error('store unavailable'); },
+    requestInference: (agent) => { wakes.push(agent); },
+  });
+  t.after(() => gate.dispose());
+  assert.equal(gate.evaluate(event([], 'clock:reminder')).trigger, false, 'premise: the event waits in the debounce batch');
+  t.mock.timers.tick(1000);
+  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (store unavailable), so the batch is dropped']);
+  assert.deepEqual(wakes, []);
+});
+
 test("a batch whose delivery throws is named in the log and dropped, whether its timer sends it or it was held for an agent's turn", async (t) => {
   const dir = tempDir(t);
   const logged: string[] = [];
@@ -2303,8 +2325,8 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
   const gate = new EventGate({
     configPath, getAgentNames: () => ['agent'],
     emitTrace: (e) => { if (e.type === 'gate:debounce-delivered') delivered.push(String(e.policyName)); },
-    addMessage: () => { attempts++; if (fails) throw new Error('no agent to deliver to'); return ''; },
-    requestInference: (agent) => { wakes.push(agent); },
+    addMessage: () => '',
+    requestInference: (agent) => { attempts++; if (fails) throw new Error('no agent to deliver to'); wakes.push(agent); },
   });
   t.after(() => gate.dispose());
 
@@ -2460,11 +2482,11 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   // Whether limited's bucket is still there as each batch is sent.
   const bucketAtDelivery: boolean[] = [];
   const gate: EventGate = new EventGate({
-    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: (agent) => { wakes.push(agent); },
-    addMessage: () => {
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], addMessage: () => '',
+    requestInference: (agent) => {
       bucketAtDelivery.push((gate as unknown as { rateLimitBuckets: Map<string, unknown> }).rateLimitBuckets.has('limited'));
       if (++deliveries === 1) throw new Error('no agent to deliver to');
-      return '';
+      wakes.push(agent);
     },
   });
   t.after(() => gate.dispose());
@@ -2498,8 +2520,8 @@ test("a reload whose pending batch can't be delivered still puts the new rules i
   const quiet = { name: 'quiet', match: { tagsAny: ['chat:mention'] }, behavior: { debounce: 60000 } };
   writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [quiet] }));
   const gate = new EventGate({
-    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: () => {},
-    addMessage: () => { throw new Error('no agent to deliver to'); },
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], addMessage: () => '',
+    requestInference: () => { throw new Error('no agent to deliver to'); },
   });
   t.after(() => gate.dispose());
   assert.equal(gate.evaluate(MENTION).trigger, false, "the mention waits in quiet's batch");

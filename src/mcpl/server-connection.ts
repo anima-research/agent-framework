@@ -16,6 +16,7 @@ import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
 import { logDetail, logValue, logValueRedacted, loggedCode } from './log-value.js';
+import { jsonKind, readEnvelope } from '../jsonrpc-envelope.js';
 import {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
@@ -156,20 +157,27 @@ const UNSUPPORTED_PROTOCOL_VERSION_CODE = -32022;
 const MAX_TOOL_LIST_PAGES = 100;
 
 /**
- * The server and this engine have no protocol revision in common, so the
- * connection was never established. This is a protocol-negotiation fact, not
- * a request outcome. Retrying cannot change it: each engine offers one
- * revision, and only configuration can fix the mismatch. A connection that
- * gets this error does not schedule reconnects. The legacy engine and the
- * modern one (ModernMcpConnection, whose pinned revision the server refused)
- * both throw it, so its readers treat them alike.
+ * This engine and the server could not negotiate a protocol revision, so the
+ * connect that throws it established no connection. Usually they share none. Over HTTP it
+ * can also be the SDK's own refusal: after a -32022 whose list names a
+ * revision from 2026-07-28 on that this client doesn't speak, the SDK
+ * negotiates no further, even when the list also names a 2025 revision both
+ * speak. This is a protocol-negotiation fact, not a request outcome.
+ * Retrying cannot change it: each engine offers the same revisions every
+ * time (`offeredRevisions`), and only configuration, or the server's
+ * operator, can fix the mismatch. A connection that gets this error does not
+ * schedule reconnects. The legacy engine and the modern one
+ * (ModernMcpConnection) both throw it, so its readers treat them alike.
  *
- * - `rejected`: the server refused the offered revision: the legacy engine's
- *   `initialize` answered with error -32022, or a modern server's discovery
- *   or error naming no common revision. `supported` is the server's own list,
- *   when it gave one.
- * - `mismatch`: the server answered the legacy engine's `initialize` with a
- *   revision other than 2024-11-05, or with none.
+ * - `rejected`: the server refused the revision offered. The legacy
+ *   engine's `initialize` was answered with error -32022. A modern server's
+ *   discovery or -32022 error named no revision in common (over HTTP, a
+ *   discovery's list counts once the server has refused the `initialize`
+ *   tried after it too), or, over HTTP, named one this client doesn't speak,
+ *   as above. `supported` is the server's own list, when it gave one.
+ * - `mismatch`: the server answered `initialize` with a revision that
+ *   handshake doesn't accept, or with none: the legacy engine's, or a modern
+ *   connection's 2025 handshake over HTTP.
  */
 export class McplProtocolVersionError extends Error {
   constructor(
@@ -184,9 +192,15 @@ export class McplProtocolVersionError extends Error {
      *  redacted (`rejected`). */
     readonly code?: number,
     readonly data?: unknown,
-    /** The revision this client offered: the legacy engine's, unless a
-     *  modern connection's. */
+    /** The revision this client offered first, in its order of preference:
+     *  the legacy engine's (2024-11-05), a modern connection's over stdio
+     *  (2026-07-28), or over HTTP 2026-07-28, the first of
+     *  `offeredRevisions`. */
     readonly offered: string = MCP_PROTOCOL_VERSION,
+    /** Every revision this client offered, in its order of preference: the
+     *  legacy engine's one, a modern connection's one over stdio, or its
+     *  list over HTTP. */
+    readonly offeredRevisions: readonly string[] = [offered],
   ) {
     super(message);
     this.name = 'McplProtocolVersionError';
@@ -367,11 +381,32 @@ interface HeldItem {
   kept?: true;
 }
 
-/** A request's method for a log line, whatever the server sent there. */
-function describeMethod(method: unknown): string {
-  return typeof method === 'string'
-    ? `method ${logValue(method)}`
-    : `a method of type ${method === null ? 'null' : typeof method}`;
+/** Whether a response that can't be matched to a request of ours, its id
+ *  being neither a string nor a number or missing, is logged: only a
+ *  JSON-RPC 2.0 error is, since that's how a server says it couldn't read a
+ *  message of ours (JSON-RPC 2.0 §5). Anything else id-less, such as a
+ *  server's own JSON log line with `"id": null`, is ignored silently, as it
+ *  was before #475, so a server's log output can't fill the host's. */
+function isJsonRpcError(response: object): boolean {
+  return (response as { jsonrpc?: unknown }).jsonrpc === '2.0' && Object.hasOwn(response, 'error');
+}
+
+/** The log line for such an error. The host's own request ids are numbers,
+ *  so it can't be matched to one. Once connected it may be the answer to a
+ *  request of ours, which gets nothing from it and ends as any unanswered
+ *  request does, by its timeout where it has one. (During the handshake an
+ *  error with id null or no id answers initialize.) Its error member is the
+ *  server's text, whatever JSON value it is, so it's printed redacted with
+ *  `redact`, the server's redaction (logValueRedacted), as handleResponse
+ *  prints a matched error's code and message. */
+function unmatchedResponse(
+  serverId: string,
+  response: { id?: unknown; error?: unknown },
+  redact: (text: string) => string,
+): string {
+  const which = Object.hasOwn(response, 'id') ? `whose id is ${jsonKind(response.id)}` : 'with no id';
+  return `[mcpl] ${serverId}: ignored a response ${which}, which can't be matched to a request of ours; ` +
+    `its error: ${logValueRedacted(response.error, redact)}`;
 }
 
 /**
@@ -700,13 +735,14 @@ export class McplServerConnection extends EventEmitter {
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
   /** The redactor of the server's text for `config`, made at its first error
-   *  answer, by when `config` is set, and kept: a framework-launched child's
-   *  `env` is a getter that reads the awareness ledger, so a redactor built
-   *  per answer would read it per answer (#540's review, R1-2). An answer
-   *  takes one build of it for its words, data and log line (`now()`), so
-   *  it reads the ledger at most once. It builds again only after a build
-   *  that failed, which withholds that answer's text, or once a dial notes
-   *  something new (serverTextRedactor). */
+   *  answer or response it can't match (handleResponse), by when `config`
+   *  is set, and kept: a framework-launched child's `env` is a getter that
+   *  reads the awareness ledger, so a redactor built per answer would read
+   *  it per answer (#540's review, R1-2). An answer takes one build of it
+   *  for its words, data and log line (`now()`), so it reads the ledger at
+   *  most once. It builds again only after a build that failed, which
+   *  withholds that answer's text, or once a dial notes something new
+   *  (serverTextRedactor). */
   private redactor: ServerTextRedactor | null = null;
   private hostCapabilities: McplHostCapabilities | null = null;
   private reconnectEnabled = false;
@@ -1358,15 +1394,35 @@ export class McplServerConnection extends EventEmitter {
           // initialize response, whatever its id: a server's own ids can start
           // at 0, this handshake's. MCP lets a server ping before
           // initialization completes, and the ping gets its empty result, as
-          // on a connected transport. Anything else it sends now is ignored.
-          if ('method' in msg) {
-            const request = msg as unknown as JsonRpcRequest;
-            if (request.method === 'ping' && request.id != null) {
-              transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }));
+          // on a connected transport, `"id": null` included
+          // (src/jsonrpc-envelope.ts). Anything else it sends now is ignored,
+          // an invalid request included. Of its responses, the one with
+          // initialize's id answers it, and so does a JSON-RPC 2.0 error with
+          // id null or with no id: a peer answers a request it couldn't read
+          // that way (JSON-RPC 2.0 §5; MCP 2025-11-25, Basic), initialize is
+          // the only request this host has out, and a peer never answers a
+          // response. Such an error means the server can't read this host's
+          // messages, so the handshake fails at once, with the error's message.
+          // `"jsonrpc": "2.0"` keeps a server's own JSON log line with an
+          // error key and id null, or no id, from failing it; one with
+          // initialize's id is taken for the answer, whatever its jsonrpc. Of
+          // the other responses, a JSON-RPC 2.0 error whose id is neither a
+          // string nor a number is logged, as on a connected transport, and
+          // any other is ignored.
+          const envelope = readEnvelope(msg as unknown as Record<string, unknown>);
+          if (envelope.kind === 'request' && envelope.method === 'ping') {
+            transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, result: {} }));
+            return;
+          }
+          if (envelope.kind !== 'response') return;
+          const namesNoRequest = msg.id === null || !Object.hasOwn(msg, 'id');
+          const answersInitialize = msg.id === initId || (namesNoRequest && msg.jsonrpc === '2.0' && Boolean(msg.error));
+          if (!answersInitialize) {
+            if (typeof msg.id !== 'string' && typeof msg.id !== 'number' && isJsonRpcError(msg)) {
+              console.error(unmatchedResponse(config.id, msg, (text) => redactServerText(text, config)));
             }
             return;
           }
-          if (msg.id !== initId) return;
           cleanup();
           if (msg.error) {
             // describeCause rather than the template's own conversion: the
@@ -1739,8 +1795,9 @@ export class McplServerConnection extends EventEmitter {
    * following `nextCursor` across pages (2024-11-05 pagination). Cursors are
    * opaque strings, `''` included: only an absent or null `nextCursor` ends
    * the inventory (a null one is how some servers say "no more", and main
-   * read it as a complete page). A page that isn't well formed (no `tools` array, a cursor
-   * that isn't a string), or cursors that don't terminate (a repeat, or more
+   * read it as a complete page). A page that isn't well formed (no `tools` array, an entry
+   * that isn't an object with a string `name`, a cursor that isn't a string), or cursors
+   * that don't terminate (a repeat, or more
    * than {@link MAX_TOOL_LIST_PAGES} pages), are errors, never a partial or
    * empty inventory published as complete. The read tap (RFC-014) is handed
    * the complete inventory once, with the last page's `_meta`, as the last
@@ -1755,9 +1812,12 @@ export class McplServerConnection extends EventEmitter {
     let first: Record<string, unknown> | undefined;
     const read: McpToolDefinition[] = [];
     const revs = new Set<unknown>();
+    const isTool = (entry: unknown): boolean =>
+      !!entry && typeof entry === 'object' && typeof (entry as { name?: unknown }).name === 'string';
     const onRead = (result: unknown) => {
       if (!result || typeof result !== 'object' || !Array.isArray((result as { tools?: unknown }).tools)) return;
       const r = result as { tools: McpToolDefinition[]; nextCursor?: unknown; _meta?: unknown };
+      if (!r.tools.every(isTool)) return;
       for (const t of r.tools) read.push(t);
       const rev = (r._meta as Record<string, unknown> | undefined)?.['mcpl/rev'];
       if (typeof rev === 'number') revs.add(rev);
@@ -1774,6 +1834,8 @@ export class McplServerConnection extends EventEmitter {
       if (!result || typeof result !== 'object' || !Array.isArray(result.tools)) {
         throw malformed('no tools array');
       }
+      const unreadable = (result.tools as unknown[]).findIndex((entry) => !isTool(entry));
+      if (unreadable !== -1) throw malformed(`entry ${unreadable + 1} isn't an object with a string name`);
       first ??= result;
       for (const t of result.tools as McpToolDefinition[]) tools.push(t);
       if (result.nextCursor === undefined || result.nextCursor === null) {
@@ -2389,10 +2451,10 @@ export class McplServerConnection extends EventEmitter {
     // passed is the dead process's (afterBoundary).
     const epoch = this.transportEpoch;
     transport.on('line', (line: string) => {
-      const msg = messageFromLine(this.id, line, transport) as JsonRpcRequest | JsonRpcResponse | undefined;
+      const msg = messageFromLine(this.id, line, transport);
       if (!msg) return;
       try {
-        this.dispatchMessage(msg, epoch);
+        this.dispatchMessage(msg as Record<string, unknown>, epoch);
       } catch (error) {
         const request = msg as { method?: unknown; id?: unknown };
         this.reportInboundFailure(error, {
@@ -2404,25 +2466,47 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /** Contain synchronous dispatch failures; async RPC handlers own their promises. */
-  private dispatchMessage(msg: JsonRpcRequest | JsonRpcResponse, epoch: number): void {
-    // Is this a response to one of our outbound requests?
-    if ('id' in msg && msg.id != null && !('method' in msg)) {
-      const late = epoch !== this.transportEpoch;
-      // RFC-014: its hints apply as it's read, whether or not anyone still
-      // waits for it. A dead transport's revs are its own, so a response
-      // read after its boundary is never tapped.
-      if (!late) this.tapResponse(msg as JsonRpcResponse);
-      this.handleResponse(msg as JsonRpcResponse, late);
-      return;
+  private dispatchMessage(msg: Record<string, unknown>, epoch: number): void {
+    // The envelope is read once, here (src/jsonrpc-envelope.ts says how).
+    const envelope = readEnvelope(msg);
+    switch (envelope.kind) {
+      case 'response': {
+        // Never answered, so a server that answers what it can't read, with
+        // id null, can't start an exchange of errors with us. One read after
+        // its transport's boundary is late (handleResponse).
+        const late = epoch !== this.transportEpoch;
+        // RFC-014: its hints apply as it's read, whether or not anyone still
+        // waits for it. A dead transport's revs are its own, so a response
+        // read after its boundary is never tapped.
+        if (!late) this.tapResponse(msg as unknown as JsonRpcResponse);
+        this.handleResponse(msg as unknown as JsonRpcResponse, late);
+        return;
+      }
+      case 'neither':
+        // Not JSON-RPC: ignored like the server's other unrelated output.
+        return;
+      case 'invalid': {
+        // Answered on the transport it came on, as every request is. One
+        // read after that transport's boundary is the dead process's and
+        // isn't answered: sendErrorResponse logs the answer it didn't send.
+        this.sendErrorResponse(envelope.id, envelope.error.code, envelope.error.message, undefined, epoch);
+        if (epoch !== this.transportEpoch) return;
+        const forMethod = envelope.method !== undefined ? ` for method ${logValue(envelope.method)}` : '';
+        console.error(`[mcpl] ${this.id}: answered -32600 to an invalid request${forMethod}: ${envelope.problems}`);
+        return;
+      }
     }
 
-    // It is an inbound request or notification from the server
-    const request = msg as JsonRpcRequest;
+    // It is an inbound request or notification from the server, its method
+    // a string. A request's id is a string, a number or null, and `"id": null`
+    // is answered with id null; a notification has none.
+    const request = msg as unknown as JsonRpcRequest;
+    const requestId = envelope.kind === 'request' ? envelope.id : undefined;
 
     // Read after its transport's boundary, it is the dead process's: the
     // boundary's rule applies (afterBoundary).
     if (epoch !== this.transportEpoch) {
-      this.afterBoundary(request, epoch);
+      this.afterBoundary(request, requestId, epoch);
       return;
     }
 
@@ -2432,7 +2516,7 @@ export class McplServerConnection extends EventEmitter {
     // paused plane mustn't hold that answer. A ping sent as a notification
     // has nothing to answer. The handshake answers one too.
     if (request.method === 'ping') {
-      if (request.id != null) this.sendResponse(request.id, {});
+      if (requestId !== undefined) this.sendResponse(requestId, {});
       return;
     }
 
@@ -2443,11 +2527,11 @@ export class McplServerConnection extends EventEmitter {
     if (request.method === 'push/event') this.tap({ kind: 'push', params: request.params });
     else if (request.method === 'tools/hints' && this.readTap) {
       this.tap({ kind: 'hints', params: request.params });
-      if (request.id != null) this.sendResponse(request.id, {});
+      if (requestId !== undefined) this.sendResponse(requestId, {});
       return;
     }
 
-    const eventName = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+    const eventName = Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
       ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
 
     // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
@@ -2459,8 +2543,8 @@ export class McplServerConnection extends EventEmitter {
     // routed, control-plane classified, and mutating declarations — a
     // live ungated self-attestation path (PR #79 review blocker 4).
     if (request.method === McplMethod.FeatureSetsChanged) {
-      if (request.id != null) {
-        this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
+      if (requestId !== undefined) {
+        this.sendErrorResponse(requestId, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
       } else {
         console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
       }
@@ -2468,8 +2552,8 @@ export class McplServerConnection extends EventEmitter {
     }
 
     if (request.method === McplMethod.ScopeElevate) {
-      if (request.id != null) {
-        this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
+      if (requestId !== undefined) {
+        this.sendErrorResponse(requestId, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
       }
       return;
     }
@@ -2481,20 +2565,19 @@ export class McplServerConnection extends EventEmitter {
 
     if (!eventName) {
       // §6.6: a request that will never be answered MUST get an error, so a
-      // request (it has an id) whose method isn't a string, or isn't one this
-      // host handles, is answered -32601. A notification nobody handles is
-      // ignored, as JSON-RPC asks.
-      if (request.id != null) {
-        this.sendErrorResponse(request.id, -32601, 'Method not found');
-        console.error(`[mcpl] ${this.id}: answered -32601 to a request for ${describeMethod(request.method)}, which this host doesn't handle`);
+      // request whose method isn't one this host handles is answered -32601.
+      // A notification nobody handles is ignored, as JSON-RPC asks.
+      if (requestId !== undefined) {
+        this.sendErrorResponse(requestId, -32601, 'Method not found');
+        console.error(`[mcpl] ${this.id}: answered -32601 to a request for method ${logValue(request.method)}, which this host doesn't handle`);
       }
       return;
     }
 
     // Emit the typed event with params and (for requests) a respond callback
-    if (request.id != null) {
+    if (requestId !== undefined) {
       // Server expects a response — provide a respond helper
-      this.dispatchInboundEvent(eventName, request.params, this.responderFor(request.id, epoch));
+      this.dispatchInboundEvent(eventName, request.params, this.responderFor(requestId, epoch));
     } else {
       // Notification — no response expected
       this.dispatchInboundEvent(eventName, request.params);
@@ -2504,9 +2587,10 @@ export class McplServerConnection extends EventEmitter {
   /**
    * A request's responder, bound to the transport it came on (`epoch`): an
    * answer, or a streamed inference's chunk, sent after that transport has
-   * closed reaches nothing, never a server that didn't ask it.
+   * closed reaches nothing, never a server that didn't ask it. A request
+   * sent with id null is answered with id null.
    */
-  private responderFor(id: string | number, epoch: number) {
+  private responderFor(id: string | number | null, epoch: number) {
     return {
       id,
       signal: epoch === this.transportEpoch ? this.transportEnded.signal : AbortSignal.abort(),
@@ -2531,17 +2615,17 @@ export class McplServerConnection extends EventEmitter {
    * it while its writer lives, with no grant to come, so it drops and logs
    * all of it; hold's bounds cap what any other keeps.
    */
-  private afterBoundary(request: JsonRpcRequest, epoch: number): void {
-    const event = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+  private afterBoundary(request: JsonRpcRequest, requestId: string | number | null | undefined, epoch: number): void {
+    const event = Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
       ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
     if (this.closedForGood || event === undefined || !McplServerConnection.WORLD_EVENTS.has(event)) {
       console.error(
         `[mcpl] ${this.id}: dropped a message read after its transport closed` +
-        `${this.closedForGood ? ', with no transport to come' : ''}: ${describeMethod(request.method)}`,
+        `${this.closedForGood ? ', with no transport to come' : ''}: method ${logValue(request.method)}`,
       );
       return;
     }
-    this.hold(event, request.id != null ? [request.params, this.responderFor(request.id, epoch)] : [request.params], true);
+    this.hold(event, requestId !== undefined ? [request.params, this.responderFor(requestId, epoch)] : [request.params], true);
   }
 
   /** Live delivery and delayed plane flushes share the same containment boundary. */
@@ -2596,7 +2680,7 @@ export class McplServerConnection extends EventEmitter {
   /** Tap a response to a hinted request (RFC-014): its result's hints, or a
    *  list's statement, apply now, awaited or not. */
   private tapResponse(response: JsonRpcResponse): void {
-    if (!this.readTap) return;
+    if (!this.readTap || response.id === null) return;
     const sent = this.hintedRequests.get(response.id);
     if (!sent) return;
     this.hintedRequests.delete(response.id);
@@ -2609,6 +2693,16 @@ export class McplServerConnection extends EventEmitter {
    * Handle a JSON-RPC response by resolving/rejecting the corresponding pending request.
    */
   private handleResponse(response: JsonRpcResponse, late = false): void {
+    // A response whose id is neither a string nor a number, or that has
+    // none, can't be matched to a request of ours, on this transport or an
+    // earlier one. It isn't an orphan, which is a late answer to one, so
+    // it's ignored, and logged when it's a JSON-RPC 2.0 error.
+    if (typeof response.id !== 'string' && typeof response.id !== 'number') {
+      if (isJsonRpcError(response)) {
+        console.error(unmatchedResponse(this.id, response, (this.redactor ??= serverTextRedactor(this.config ?? {})).now()));
+      }
+      return;
+    }
     // One read after its transport's boundary answers a request the close
     // ended. It's matched against none of this connection's request records,
     // since the next transport numbers its requests afresh, and goes the way
@@ -2706,7 +2800,7 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Send a successful JSON-RPC response back to the server.
    */
-  private sendResponse(id: string | number, result: unknown, epoch = this.transportEpoch): void {
+  private sendResponse(id: string | number | null, result: unknown, epoch = this.transportEpoch): void {
     // A closed connection's epoch is past every request's, so a refusal
     // while it is closed is logged too.
     if (!this.sameTransport(id, epoch) || this.closed) return;
@@ -2717,7 +2811,7 @@ export class McplServerConnection extends EventEmitter {
   /** Whether a response to a request received on `epoch` may go out now.
    *  The id is the server's, so it's logged as a field; `answer`, which the
    *  caller has formatted for the log, ends the line. */
-  private sameTransport(id: string | number, epoch: number, answer?: string): boolean {
+  private sameTransport(id: string | number | null, epoch: number, answer?: string): boolean {
     if (epoch === this.transportEpoch) return true;
     console.error(
       `[mcpl] ${this.id}: not answering request ${logValue(id)}: the transport it came on has closed${answer ? `, with ${answer}` : ''}`,
@@ -2729,7 +2823,7 @@ export class McplServerConnection extends EventEmitter {
    * Send a JSON-RPC error response back to the server.
    */
   private sendErrorResponse(
-    id: string | number,
+    id: string | number | null,
     code: number,
     message: string,
     data?: unknown,

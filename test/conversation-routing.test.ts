@@ -13,7 +13,7 @@ import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent, ConversationRouterConfig, TraceEvent, Module, ModuleContext, ToolCall, ToolResult } from '../src/index.js';
 import { Membrane, OpenAIResponsesAPIAdapter, OpenAIResponsesFormatter } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
 import type { EventGate } from '../src/gate/event-gate.js';
 import { gateToolCalls } from './helpers/gate-tool-calls.js';
@@ -155,6 +155,64 @@ describe('Conversation routing', () => {
     }
   });
 
+  for (const via of ['routing', 'deliverTo'] as const) {
+    it(`a fork that read and answered an ambient message delivered by ${via} before its debounced batch fired isn't woken by the batch, and nobody gets a line`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+        modules: [],
+        conversations: { templateAgent: 'trunk' },
+        gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'], tagsAny: ['chat:ambient'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
+      });
+      try {
+        framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+        await framework.runUntilIdle();
+        const fork = forkName('slack:D1', 1);
+        assert.ok(framework.getAgent(fork), 'premise: the DM spawned its fork');
+        const ambient = { ...incomingEvent({ channelId: 'slack:D1', text: 'just chatting', channelType: 'im' }), tags: ['chat:ambient'] };
+        if (via === 'routing') framework.pushEvent(ambient as unknown as ProcessEvent);
+        else await (framework as unknown as { handleMcplChannelIncoming(event: unknown): Promise<unknown> }).handleMcplChannelIncoming({ ...ambient, deliverTo: fork });
+        await framework.runUntilIdle();
+        const turns: string[] = [];
+        framework.onTrace((event) => { if (event.type === 'inference:started') turns.push(event.agentName); });
+        (membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+          membrane.calls.push(request as never);
+          return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'noted' }])]);
+        };
+        (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: fork, reason: 'test', source: 'test', timestamp: Date.now() });
+        await framework.runUntilIdle();
+        assert.deepEqual(turns, [fork], "premise: the fork's own turn read the message and was answered");
+        assert.ok(JSON.stringify(membrane.calls.at(-1)).includes('just chatting'), "premise: the fork's request carried the ambient message");
+        const gate = (framework as unknown as {
+          eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>; fireDebounce(name: string): void };
+        }).eventGate;
+        assert.equal(gate.debounceTimers.size, 1, 'premise: the ambient message is batched');
+        for (const [name, state] of gate.debounceTimers) {
+          clearTimeout(state.timer);
+          gate.fireDebounce(name);
+        }
+        const queued = (framework as unknown as { pendingRequests: Array<{ agentName: string; readsRows?: Array<{ row: string }> }> }).pendingRequests;
+        const stored = framework.getAgent(fork)!.getContextManager().getAllMessages()
+          .find((m) => m.content.some((b) => b.type === 'text' && ((b as { text?: string }).text ?? '').includes('just chatting')));
+        assert.deepEqual(queued.filter((r) => r.agentName === fork).map((r) => r.readsRows?.map((x) => x.row)), [[stored?.id]],
+          "premise: the batch queued the fork's wake, reading the fork's own stored message");
+        assert.deepEqual(queued.filter((r) => r.agentName === 'trunk').map((r) => r.readsRows), via === 'routing' ? [undefined] : [],
+          "the trunk's wake, where there is one, reads no row of its own, so it stays");
+        await framework.runUntilIdle();
+        assert.ok(!turns.slice(1).includes(fork), "the fork's batched wake was dropped");
+        assert.equal(turns.slice(1).includes('trunk'), via === 'routing', "the trunk's wake ran where the batch woke it");
+        const lines = (name: string) => framework.getAgent(name)!.getContextManager().getAllMessages()
+          .filter((m) => (m.metadata as { source?: string } | undefined)?.source === 'gate:debounce');
+        assert.equal(lines('trunk').length, 0, "no line in the trunk's window");
+        assert.equal(lines(fork).length, 0, "nor in the fork's");
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
   it('DM message spawns a fork, routes the message there, and triggers inference', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
     const framework = await makeFramework();
@@ -274,6 +332,9 @@ describe('Conversation routing', () => {
   /** Spawn the fork for `slack:D3`, and return what its namespace was seeded
    *  with and the `[conversation]` lines the spawn logged. */
   async function seedOf(framework: AgentFramework) {
+    // What a test wrote into the trunk past the framework enters its window
+    // at its next point (#291), here before the spawn seeds from it.
+    (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('trunk'));
     const log = mock.method(console, 'log', () => {});
     let lines: string[];
     try {
@@ -631,6 +692,8 @@ describe('Conversation routing', () => {
     fw1.getAgent('trunk')!.getContextManager().addMessage('user', [
       { type: 'text', text: 'HANDBOOK-V1: always check the logs first.' },
     ]);
+    // Written past the framework, it enters the trunk's window at its next point (#291).
+    (fw1 as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(fw1.getAgent('trunk'));
     fw1.pushEvent(incomingEvent({ channelId: 'slack:D8', text: 'case one', channelType: 'im' }));
     await fw1.runUntilIdle();
     assert.ok(fw1.getAgent(forkName('slack:D8', 1)), 'first engagement spawns g1');
@@ -952,7 +1015,7 @@ describe('Conversation routing', () => {
     }
   });
 
-  it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {
+  it("a write for a fork during its closure turn is stored at once, and enters the fork's window at that turn's end, before the fork is disposed", async () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
@@ -964,28 +1027,35 @@ describe('Conversation routing', () => {
     forceExpiry(framework, { serverId: 'srv', channelId: 'slack:D4' }, IDLE_TTL_MS);
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
     // While the closure turn is alive, a write addressed to the fork is
-    // deferred to that turn's end.
+    // stored at once, out of the turn's window until its end (#291).
     const internals = framework as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
     };
     const streamYielding = membrane.streamYielding.bind(membrane);
+    let during: { id: string; stored: boolean; status: string } | undefined;
     membrane.streamYielding = (request, options) => {
-      internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
+      const id = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
         { forAgent: forkName('slack:D4', 1) });
+      const cm = g1.getContextManager();
+      during = { id, stored: cm.getAllMessages().some((m) => m.id === id), status: id ? cm.windowStatusOf(id as never) : 'none' };
       return streamYielding(request, options);
     };
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
 
+    assert.ok(during, 'the closure turn streamed');
+    assert.notEqual(during!.id, '', 'the write has an id: stored at once');
+    assert.deepEqual([during!.stored, during!.status], [true, 'out'], "in the fork's store, and out of the closure turn's window");
+
     assert.equal(framework.getAgent(forkName('slack:D4', 1)), null, 'disposed once its closure turn finished');
-    const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
-    assert.ok(stored[stored.length - 2]!.includes('Final report posted.'), stored.join('\n'));
-    assert.ok(stored[stored.length - 1]!.includes('one more thing'), 'stored after the closure reply, before the fork was disposed');
+    const window = g1.getContextManager().getPresentedMessages().map((m) => JSON.stringify(m.content));
+    assert.ok(window[window.length - 2]!.includes('Final report posted.'), window.join('\n'));
+    assert.ok(window[window.length - 1]!.includes('one more thing'), "in the fork's window after the closure reply, before the fork was disposed");
 
     await framework.stop();
   });
 
-  it('a fork whose closure turn ends while the host is quiesced is disposed at the turn\'s end, and what was held for it lands in its window at resume', async () => {
+  it("a fork whose closure turn ends while the host is quiesced is disposed at the turn's end, and what was stored for it meanwhile enters no window", async () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
@@ -999,11 +1069,10 @@ describe('Conversation routing', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
     const internals = framework as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
-      deferredMessages: Array<{ forAgent?: string }>;
     };
-    // While the closure turn is alive, a write for the fork is deferred to
-    // the turn's end, and an operator quiesces the host, which waits for the
-    // turn to end.
+    // While the closure turn is alive, a write for the fork is stored at
+    // once, out of the turn's window (#291), and an operator quiesces the
+    // host, which waits for the turn to end, and freezes the window.
     const streamYielding = membrane.streamYielding.bind(membrane);
     let deferred: string | undefined;
     let quiescing: Promise<unknown> | undefined;
@@ -1014,76 +1083,27 @@ describe('Conversation routing', () => {
       }
       return streamYielding(request, options);
     };
-    const lastStored = () => JSON.stringify(g1.getContextManager().getAllMessages().at(-1)?.content);
-    const queued = () => internals.deferredMessages.filter((m) => m.forAgent === fork).length;
+    const inStore = () => g1.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('one more thing'));
+    const inWindow = () => g1.getContextManager().getPresentedMessages().some((m) => JSON.stringify(m.content).includes('one more thing'));
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
     await quiescing;
     assert.equal(framework.getAgent(fork), null, 'disposed at its closure turn\'s end, though the host is quiesced');
-    assert.equal(queued(), 1, 'what was held for it waits for its window\'s release at resume');
-    assert.ok(!lastStored().includes('one more thing'), `not stored while quiesced:\n${lastStored()}`);
+    assert.equal(inStore(), true, "in the fork's store");
+    assert.equal(inWindow(), false, 'and in no window: the quiesce froze it, and the fork is gone');
 
     await framework.resume();
-    assert.ok(lastStored().includes('one more thing'), `stored in the fork at resume:\n${lastStored()}`);
-    assert.equal(queued(), 0, 'nothing is left queued for the fork');
-
-    await framework.stop();
-  });
-
-  it("a write deferred for a fork that its store refuses at the closure turn's end is tried again at the fork's release, and leaves the queue there, logged", async () => {
-    const IDLE_TTL_MS = 60_000;
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
-    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
-    framework.pushEvent(incomingEvent({ channelId: 'slack:D5', text: 'hi', channelType: 'im' }));
-    await framework.runUntilIdle();
-    const fork = forkName('slack:D5', 1);
-    const g1 = framework.getAgent(fork)!;
-    assert.ok(g1, 'g1 fork should exist after spawn');
-    // The fork's store refuses 'one more thing' each time it's written.
-    const cm = g1.getContextManager();
-    const add = cm.addMessage.bind(cm);
-    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
-      if ((args[1] as Array<{ text?: string }>).some((b) => b.text === 'one more thing')) throw new Error('disk full');
-      return add(...args);
-    };
-
-    forceExpiry(framework, { serverId: 'srv', channelId: 'slack:D5' }, IDLE_TTL_MS);
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
-    const internals = framework as unknown as {
-      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
-      deferredMessages: Array<{ forAgent?: string }>;
-    };
-    const streamYielding = membrane.streamYielding.bind(membrane);
-    let deferred: string | undefined;
-    membrane.streamYielding = (request, options) => {
-      deferred = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined, { forAgent: fork });
-      return streamYielding(request, options);
-    };
-    const errors: string[] = [];
-    const error = console.error;
-    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-    try {
-      framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
-      await framework.runUntilIdle();
-    } finally { console.error = error; }
-
-    assert.equal(deferred, '', 'deferred: the closure turn was alive');
-    assert.equal(framework.getAgent(fork), null, 'disposed once its closure turn finished');
-    assert.deepEqual(internals.deferredMessages.filter((m) => m.forAgent === fork), [], 'nothing is left queued for the fork');
-    assert.ok(errors.some((e) => e.includes('turn-end flush: deferred write ')
-      && e.includes(`(alice: text) for ${fork} could not be stored; it stays queued`)),
-      `the closure turn's flush met the refusal:\n${errors.join('\n')}`);
-    assert.ok(errors.some((e) => e.includes(`[deferred-flush] ${fork}: failed to store a queued write before release (participant=alice)`)
-      && e.includes('disk full')), `the fork's release met it again:\n${errors.join('\n')}`);
+    assert.equal(inWindow(), false, "a released fork's window takes nothing more");
 
     await framework.stop();
   });
 
   /** A fork spawned on `channelId` and closed by the sweep, whose closure
    *  request is then dropped before it runs, as a stale one is, with a write
-   *  for it deferred meanwhile. Nothing holds it when this returns: no
-   *  stream, no request, no turn token, and the host isn't quiesced. */
-  async function closingForkWithAQueuedWrite(channelId: string) {
+   *  for it stored meanwhile, while a turn of its held its token, out of its
+   *  window. Nothing holds it when this returns: no stream, no request, no
+   *  turn token, and the host isn't quiesced. */
+  async function closingForkWithAWrite(channelId: string) {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
@@ -1094,7 +1114,6 @@ describe('Conversation routing', () => {
     assert.ok(g1, 'the fork should exist after spawn');
     const internals = framework as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
-      deferredMessages: Array<{ forAgent?: string }>;
       pendingRequests: Array<{ agentName: string }>;
       activeTurnTokens: Map<string, number>;
       lastConversationSweep: number;
@@ -1106,33 +1125,32 @@ describe('Conversation routing', () => {
     internals.pendingRequests.splice(0, internals.pendingRequests.length,
       ...internals.pendingRequests.filter((r) => r.agentName !== fork));
     internals.activeTurnTokens.set(fork, 1);
-    assert.equal(internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined, { forAgent: fork }), '', 'deferred');
+    assert.notEqual(internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined, { forAgent: fork }), '', 'stored at once');
     internals.activeTurnTokens.delete(fork);
     const sweep = () => {
       internals.lastConversationSweep = 0;
       internals.sweepExpiredConversations();
     };
     const lastStored = () => JSON.stringify(g1.getContextManager().getAllMessages().at(-1)?.content);
-    const queued = () => internals.deferredMessages.filter((m) => m.forAgent === fork).length;
-    return { framework, fork, sweep, lastStored, queued };
+    const inWindow = () => g1.getContextManager().getPresentedMessages().some((m) => JSON.stringify(m.content).includes('one more thing'));
+    return { framework, fork, sweep, lastStored, inWindow };
   }
 
-  it('the reaper disposes a closing fork on a quiesced host too, and its queued write lands in its window at resume', async () => {
-    const { framework, fork, sweep, lastStored, queued } = await closingForkWithAQueuedWrite('slack:D9');
+  it('the reaper disposes a closing fork on a quiesced host too, and its write stays in its store', async () => {
+    const { framework, fork, sweep, lastStored, inWindow } = await closingForkWithAWrite('slack:D9');
     await framework.quiesce({ reason: 'test window' });
     sweep();
     assert.equal(framework.getAgent(fork), null, 'disposed, though the host is quiesced');
-    assert.equal(queued(), 1, 'its write waits for its window\'s release at resume');
-    assert.ok(!lastStored().includes('one more thing'), `not stored while quiesced:\n${lastStored()}`);
+    assert.ok(lastStored().includes('one more thing'), `stored when it was written:\n${lastStored()}`);
 
     await framework.resume();
-    assert.ok(lastStored().includes('one more thing'), `stored in the fork at resume:\n${lastStored()}`);
-    assert.equal(queued(), 0, 'nothing is left queued for the fork');
+    assert.ok(lastStored().includes('one more thing'), `still in the fork's store at resume:\n${lastStored()}`);
+    assert.equal(inWindow(), false, "a released fork's window takes nothing more");
 
     await framework.stop();
   });
 
-  it('a closure turn that restarts is disposed by the frame that ends it, after storing what was held for it', async () => {
+  it("a closure turn that restarts is disposed by the frame that ends it, after its window takes what arrived for it", async () => {
     const IDLE_TTL_MS = 60_000;
     // One tool, for the closure turn's tool round.
     const tools: Module = {
@@ -1173,7 +1191,7 @@ describe('Conversation routing', () => {
       const first = streams++ === 0;
       if (first) {
         // While the closure turn is alive, a write addressed to the fork is
-        // deferred to that turn's end.
+        // stored at once, out of the turn's window until its end (#291).
         internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
           { forAgent: forkName('slack:D6', 1) });
       }
@@ -1188,11 +1206,12 @@ describe('Conversation routing', () => {
 
     assert.equal(streams, 2, 'the closure turn restarted once');
     assert.equal(framework.getAgent(forkName('slack:D6', 1)), null, 'disposed once its closure turn finished');
-    const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
-    // The restart's turn start stores what was held for the turn, before its
-    // compile, so the restarted stream carries it and its reply follows.
-    assert.ok(stored[stored.length - 2]!.includes('one more thing'), stored.join('\n'));
-    assert.ok(stored[stored.length - 1]!.includes('Final report posted.'), 'the restarted closure turn finished in the fork');
+    const window = g1.getContextManager().getPresentedMessages().map((m) => JSON.stringify(m.content));
+    // The closure turn's tool boundary hears what arrived (#291), so the
+    // restarted stream carries it and its reply follows.
+    assert.ok(window[window.length - 2]!.includes('one more thing'), window.join('\n'));
+    assert.ok(JSON.stringify(membrane.calls.at(-1)!.messages).includes('one more thing'), "the restart's request carries it");
+    assert.ok(window[window.length - 1]!.includes('Final report posted.'), 'the restarted closure turn finished in the fork');
 
     await framework.stop();
   });
@@ -1437,6 +1456,7 @@ describe('Conversation routing', () => {
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       getDescriptor: () => ({}),
+      nonStringRefusal: () => undefined,
     } as typeof fw.channelRegistry;
 
     // (a) omitted channelId → rewritten to the home channel, passes the fence

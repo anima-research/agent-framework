@@ -62,12 +62,19 @@ export interface PassiveSampleConfig {
  * good time for the agent to reply. The judge reads the agent's context as one
  * document (its newest part), the agent's own `instructions` and the batch,
  * and answers reply or wait. On reply the
- * batch is delivered as a debounce's is; on wait the agent isn't woken: the
+ * batch is delivered as a debounce's is, except that an event the agent had
+ * already answered when the judge answered keeps the wake, since the judge
+ * answered after it (EventGate's `isAnswered`; a host without it keeps the
+ * wake for every event); on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
  * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
- * times out wakes the agent (fail open),
- * unless the host set its `onError` to `"skip"`.
+ * times out delivers the batch as a debounce's is (fail open), unless the
+ * host set its `onError` to `"skip"`. The wake then carries the batch's
+ * writes where the host gave `evaluate` one for each event in the window
+ * (WakeProvenance.writes), so a host that drops an answered wake, as
+ * AgentFramework does, starts no turn when the agent has answered every
+ * event.
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
@@ -179,6 +186,81 @@ export interface GatePolicy {
    * fire" has no meaning distinct from the behavior itself.
    */
   passthrough?: boolean;
+  /**
+   * Suppression: an event this rule takes is stored in the chronicle and
+   * never rendered into the residents' context. It isn't compiled, injected
+   * at a tool boundary, folded into memory, woken for, or counted as the
+   * latest inbound. The framework decides this once, as the event arrives
+   * (`EventGate.decideSuppression`), and stamps the row
+   * (`metadata.suppressed = { rule, eventType }`). The view filters read only
+   * that stamp, so changing the rule later never changes what was already
+   * rendered or hidden: a removed rule stops suppressing from then on, and
+   * the rows it hid stay hidden.
+   *
+   * The rule needs `behavior: "defer"` (or the legacy `"skip"`), so a release
+   * that doesn't know `suppress` defers its events instead of waking the
+   * agent on them, and a match that narrows something. Rules stay
+   * first-match, with three exceptions: an event addressed to the agent
+   * (`chat:addressed`), a heartbeat, and console or API input are never
+   * suppressed. The rule lets them by, and the rules after it decide them.
+   * A suppress rule decides no wake for an event suppression was asked about
+   * (`evaluate` and `probe` pass over it there, `GateEventInfo.suppressionAsked`);
+   * where suppression wasn't asked, it defers, as its behavior says.
+   */
+  suppress?: SuppressConfig;
+}
+
+/** A suppress rule's own settings (GatePolicy.suppress). */
+export interface SuppressConfig {
+  /**
+   * What the rule is for, in the agent's words ("the eye going on and off").
+   * Required: the periodic review (SuppressionReviewOptions), where the host
+   * runs it, checks a sample of the events the rule hid against it.
+   */
+  description: string;
+  /**
+   * The agent's own logic for the rule, when matching isn't enough: the
+   * source of a function `(event, state) => boolean`, called for each event
+   * the rule's match takes that reaches it (one an earlier rule decides, an
+   * addressed one, or the heartbeat's never does), only `true` hiding it. `event` is the event's type,
+   * source, channel, author, tags, text, arrival time (`at`, ms) and
+   * metadata. `state` is the rule's own JSON object, which the script reads
+   * and changes as it likes, kept between events and across restarts
+   * (suppress-scripts.ts), and started afresh when the script changes or the
+   * rule is removed. So a rule can hide repeats, count, or keep a window of
+   * its own. A script that throws or runs past its time counts as saying
+   * show: the event goes on to the rules after it. Left out, every event the
+   * rule matches is hidden.
+   */
+  script?: string;
+}
+
+/**
+ * The periodic review of what suppress rules hid (src/gate/suppression-review.ts):
+ * every `intervalMs`, for each rule that hid events since the last review, a
+ * small model reads the rule's description and the events it hid (a sample,
+ * past `maxEventsPerRule`) and flags any that don't fit the description or
+ * that the agent would plausibly need to see. The agent is told what each
+ * rule hid and what was flagged, in a `[suppression review]` notice; a
+ * flagged event wakes it.
+ */
+export interface SuppressionReviewOptions {
+  /** False turns the review off. Default true. */
+  enabled?: boolean;
+  /** How often, in ms. Default 2 hours; at least 10 minutes. */
+  intervalMs?: number;
+  /** The reviewer's model, as the host's membrane names it. Default `claude-haiku-5-5`. */
+  model?: string;
+  /** When the agent is told: after every review in which a rule hid something (`"always"`, the default), or only when an event was flagged (`"flagged"`). */
+  notify?: 'always' | 'flagged';
+  /** Whether a flagged event wakes the agent, which is a full turn of its own model, so a false flag costs that turn. Default true. */
+  wakeOnFlag?: boolean;
+  /** The most events of one rule the reviewer reads in one review, spread across the period. Default 60. */
+  maxEventsPerRule?: number;
+  /** How long one rule's review may take, in ms. Default 60,000. */
+  timeoutMs?: number;
+  /** The reviewer's effort (`output_config.effort`); `"none"` sends none. Default `"low"`. */
+  effort?: 'low' | 'medium' | 'high' | 'none';
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +305,21 @@ export interface GateOptions {
    *  null), the judge is wired with its defaults; it runs only for `judge`
    *  rules, so a gate with none makes no judge calls. */
   judge?: ReplyJudgeOptions | null;
+  /**
+   * The periodic review of what suppress rules hid (SuppressionReviewOptions).
+   * On by default wherever a gate is; false turns it off.
+   */
+  suppressionReview?: SuppressionReviewOptions | false;
+  /** How long a suppress rule's script may take for one event before the event is shown (ms). Default 50. */
+  suppressScriptTimeoutMs?: number;
+  /**
+   * Wake onboarding (gate/wake-onboarding.ts): the first event from an MCPL
+   * server that the agent's rules let go by without deciding about it brings
+   * the agent that server's suggested treatment (MCPL RFC-001 §5), once per
+   * declared ontology, with `wake_accept_suggestions` / `wake_decline` to
+   * answer. On unless set to false.
+   */
+  onboarding?: boolean;
 }
 
 /**
@@ -280,18 +377,38 @@ export interface JudgeEventSummary {
   at: number;
 }
 
+/** The kinds of UpcomingWake. */
+export type UpcomingWakeKind =
+  | 'heartbeat'
+  | 'reminder'
+  | 'self-wake'
+  | 'sleep-end'
+  | 'debounce'
+  | 'judge-batch'
+  | 'queued'
+  | 'provider-hold';
+
 /**
- * Something that will (or, for a batch going to the judge, may) wake the
- * agent with no new event: what the judge is told would happen if it answers
- * wait and nothing else arrives.
+ * Something that will (or, for a batch going to the judge, or a wake that
+ * starts no turn once the agent has answered what it is for, may) wake the
+ * agent with no new event (`certain`): what the judge is told would happen
+ * if it answers wait and nothing else arrives.
  */
 export interface UpcomingWake {
   /** When (ms), when known; absent for one due as soon as the agent is free. */
   at?: number;
-  /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
+  /** False when it only may wake the agent: a judge rule's batch goes to the
+   *  judge then, and a debounced batch whose events delivery gives the agent
+   *  each have a message of its own written to its window
+   *  (WakeProvenance.writes), or a queued wake that reads rows, or a start
+   *  merged from wakes that each read rows, starts no turn once the agent
+   *  has read and answered them. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
+  /** What it is, in a word that quotes nothing, for healthSnapshot: `what` can
+   *  quote a reminder or a queue reason. The judge isn't told it. */
+  kind?: UpcomingWakeKind;
 }
 
 /** What the gate asks the reply judge for one batch. */
@@ -403,47 +520,27 @@ export interface GateEventInfo {
   paths?: string[];
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
-}
-
-/** An MCPL event whose content the framework stored at arrival, as a
- *  batched wake names it to the framework (EventGate's `isNewestEntry`):
- *  a channel message by its server, channel and message id, a push event by
- *  its server and event id. */
-export interface GateEntryRef {
-  eventType: string;
-  serverId?: string;
-  channelId?: string;
-  messageId?: string;
-  eventId?: string;
-}
-
-/** A batched wake's `[Gate: …]` line that the gate handed to the wake rather
- *  than wrote: its batch was one event whose entry was still the newest in
- *  the window when the batch fired (EventGate's `isNewestEntry`). A fresh
- *  start of the wake's turn decides it (the framework's placeWakeLines): the
- *  delivery agent's own start leaves it out while that entry is still the
- *  newest, and writes it once something follows; a co-resident's start
- *  places none; two or more such lines are each written;
- *  and none is written while the host is quiesced or another reader of the
- *  residents' shared slot has a turn alive. A line left out stays for a
- *  later fresh start of the same wake. Its text is rendered when it's
- *  written (wakeLineText), so its age is true then.
- *
- *  Every request for one wake carries the same object: the framework writes
- *  each line once by its identity, across the wake's retries and holds. A
- *  host that hands the gate's requests on itself passes the line on as it
- *  is, not a copy per agent. */
-export interface WakeLine {
-  /** The event's own entry. */
-  entry: GateEntryRef;
-  policyNames: string[];
-  /** The channel as the line names it to the agent. */
-  shown: string;
-  /** When the event arrived (ms): the line's age is counted from it to when
-   *  the line is written (wakeLineText). */
-  at: number;
-  /** The channel the line names, as the omission's trace reports it. */
-  channelId?: string;
+  /** The agents admission delivered a targeted event to (its targetAgents).
+   *  A debounced batch wakes each agent with the events it may see, those
+   *  naming it and those naming no agent, and agents that may see the same
+   *  events share one line. Absent for an untargeted event, whose batch wakes
+   *  every agent getAgentNames lists. */
+  recipients?: readonly string[];
+  /**
+   * Set when the framework asked whether the event is suppressed before it
+   * asked about its wake (decideSuppression), so a suppress rule that
+   * matches it let it by. Left out, a suppress rule defers the events it
+   * matches, as its behavior says: suppression wasn't asked, as for an event
+   * that lands where no view hides suppressed rows.
+   */
+  suppressionAsked?: boolean;
+  /**
+   * A coalesced render, which folds its batch's every occurrence while its
+   * `tags` are the latest's (MCPL RFC-006): never taken as a `chat:system`
+   * notice, as the render's own wake isn't, so a message it folds keeps
+   * its channel when a notice came last.
+   */
+  folds?: true;
 }
 
 /** Per-policy runtime statistics (for gate:status). */
@@ -452,6 +549,15 @@ export interface GatePolicyStats {
   behavior: GateBehavior;
   matchCount: number;
   lastMatchTimestamp: number | null;
+  /**
+   * Present on a suppress rule: its settings, and with a script, how the
+   * script has run since this process started. Its `matchCount` and
+   * `lastMatchTimestamp` count the events it took since then: those it
+   * suppressed, and those it only deferred where suppression wasn't asked
+   * (a channel under conversation routing). `suppression_stats` reads the
+   * stamped rows themselves, so its counts cover every start.
+   */
+  suppress?: SuppressConfig & { scriptStatus?: import('./suppress-scripts.js').SuppressScriptStatus };
   debounceState?: {
     pendingCount: number;
     nextDeliveryMs: number | null;
@@ -474,7 +580,9 @@ export interface GatePolicyStats {
     judging: boolean;
     /** Events held for the judge until the agent's turn (or the host's quiesce) ends. */
     heldCount: number;
-    /** Verdicts so far: woke the agent, let the batch go by, and judge failures. */
+    /** Verdicts so far: reply (the batch sent on to delivery to wake the
+     *  agent, as JudgeConfig says), wait (the batch let go by), and judge
+     *  failures. */
     verdicts: { reply: number; wait: number; error: number };
     /** The newest verdict. */
     last?: {
@@ -504,6 +612,13 @@ export interface GateStatus {
    * same hazards wake_add_rule warns about at install time.
    */
   shadowWarnings: string[];
+  /**
+   * The first rule that takes MCPL servers' events without naming a server, a
+   * channel or a tag (gate/wake-onboarding.ts placementFor): every server
+   * connected later is handled by it until a rule for that server goes ahead of
+   * it. Absent when there is none.
+   */
+  catchAll?: { rule: string; note: string };
   /** Total events the gate has evaluated since startup. */
   totalEvaluations: number;
   /**

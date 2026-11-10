@@ -35,6 +35,7 @@ import {
   type ChangeSet, type MetaToolNames, type Presence,
 } from './tool-presence.js';
 import type { HintedTool } from './tool-signature.js';
+import { appendAll } from '../append-all.js';
 
 /** The meta-tools' module, whose tools are `toolsets--open` and so on. */
 export const TOOLSETS_MODULE = 'toolsets';
@@ -246,7 +247,7 @@ export class ToolsetController {
         const toolset = typeof res.toolset === 'string' ? res.toolset : String(params.toolset ?? '');
         const instance = typeof res.instance === 'string' && res.instance ? res.instance : typeof params.instance === 'string' ? params.instance : undefined;
         this.presence.noteOpened(toolset, instance, typeof res.title === 'string' && res.title ? res.title : undefined);
-        cs.changes.push(...this.presence.diff(before, this.presence.view()).changes);
+        appendAll(cs.changes, this.presence.diff(before, this.presence.view()).changes);
         break;
       }
       case 'toolsets/close': {
@@ -255,7 +256,7 @@ export class ToolsetController {
         cs = this.applyHints(metaHints(res), 'toolsets/close');
         const before = this.presence.view();
         this.presence.noteClosed(String(params.toolset ?? ''), typeof params.instance === 'string' ? params.instance : undefined);
-        cs.changes.push(...this.presence.diff(before, this.presence.view()).changes);
+        appendAll(cs.changes, this.presence.diff(before, this.presence.view()).changes);
         break;
       }
       default:
@@ -298,7 +299,7 @@ export class ToolsetController {
       this.scheduleRecovery();
     }
     const cs = this.presence.diff(before, this.presence.view());
-    cs.suggest.push(...r.suggest);
+    appendAll(cs.suggest, r.suggest);
     return cs;
   }
 
@@ -332,11 +333,11 @@ export class ToolsetController {
       this.scheduleRecovery();
     }
     const cs = this.presence.diff(before, this.presence.view());
-    cs.suggest.push(...suggest);
+    appendAll(cs.suggest, suggest);
     // A lost toolset gets its note, not also a "closed" line.
     cs.changes = cs.changes.filter((c) => !lost.some((o) => keyOf(o.toolset, o.instance) === c.key));
     const told = this.presence.adoptionNotes(lost, ended);
-    cs.notes.push(...told.notes);
+    appendAll(cs.notes, told.notes);
     if (told.ended.length) cs.ended = [...(cs.ended ?? []), ...told.ended];
     return cs;
   }
@@ -625,7 +626,7 @@ export class ToolsetController {
     const moved = this.presence.applyMoves(moves);
     if (!moved.length) return;
     const cs = emptyChange();
-    cs.notes.push(...moved.map(({ name, to }) => to === 'dynamic'
+    appendAll(cs.notes, moved.map(({ name, to }) => to === 'dynamic'
       ? `${nameToTypeBack(name)} left your tool list: it's announced when available, and called with ${META_TOOL_NAMES.act} {server:"${this.serverId}", tool:${quotedValue(name)}, args}.`
       : `${nameToTypeBack(name)} is in your tool list now, as ${nameToTypeBack(this.deps.listedName(this.serverId, name))}.`));
     this.deliver(cs);
