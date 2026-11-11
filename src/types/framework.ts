@@ -427,6 +427,53 @@ export interface FrameworkConfig {
    * `abortInference()` doesn't end it.
    */
   exhaustedTurnRearmMs?: number[] | false;
+  /**
+   * A message quiet period: an idle agent's turn waits while message wakes
+   * for it keep arriving, so a burst (a caption and its images, a reply split
+   * into several messages) starts one turn, not one per part. A gate rule's
+   * `debounce` settles a burst too, by delivering it as one wake of the
+   * gate's own; this instead delays the start of each message's own wake,
+   * so each keeps its channel and the gate's decision for it. A burst is one
+   * channel's message wakes (server and channel id), or a channel-less
+   * source's; each is held on its own clock, until `quietMs` have passed
+   * since its newest wake or `maxWaitMs` (default 30000) since its oldest,
+   * and then starts a turn with its wakes alone, the other bursts waiting
+   * their own turns. So chatter in one channel neither delays another
+   * channel's turn nor takes its reply, and, for locus-routed prose
+   * (`proseRouting` `locus` or `hybrid`) under the default `speech.locus:
+   * 'delivery'`, each channel's turn speaks in its own channel. A `quietMs`
+   * of 0 holds nothing and is the same as leaving the option out; one above
+   * 0 is refused with `speech.locus: 'latest-inbound'`, where a held
+   * message would become a turn's fallback locus; a locked agent speaks at its lock,
+   * and explicit and disabled routing deliver no unprefixed prose, as
+   * always. A
+   * message wake is a channel message's or a server event's
+   * (`mcpl:channel-incoming`, `mcpl:push-event`) other than the heartbeat's.
+   * Each message's own decision stays what the gate gives it: who wakes a
+   * sleeping agent, where a reply goes, what tune-out and conversation
+   * routing see. Held messages are already in context, so another burst's
+   * turn can read them: an ambient burst that turn has read is dropped as
+   * read, as without the option, and what the agent says about it goes in
+   * that turn's channel; an addressed channel burst keeps its own turn, and
+   * so does a deferred coalesced batch, which a turn started for another
+   * burst leaves unassembled, a notice that arrives meanwhile included; a
+   * channel-less burst another turn has read is dropped,
+   * addressed or not, as its wake asks for no reply in a channel. The turn's
+   * `incoming` anchor (what servers are told the agent replies to, and what a
+   * refusal reacts to) stays the latest delivered inbound message, which can
+   * be a held channel's. Any other wake (a timer, an operator's, a tool
+   * result) isn't held: it starts now, with the wakes that name no channel
+   * and at most one channel's burst (the channel it names, else the ready
+   * burst that waited longest), the other channels' bursts still waiting. A
+   * backlog that waited out a busy turn longer than its deadlines starts one
+   * turn per channel, oldest first, where it starts one merged turn without the option. The
+   * hold is observable as `quiet-period:held` and `quiet-period:released`
+   * traces. Held wakes live only in the queue: as with any queued wake,
+   * `stop()` within the hold drops them, and the message, stored at ingress,
+   * waits in context for the next wake (a coalesced batch, stored as
+   * pending, is restored and wakes again). Off when omitted.
+   */
+  messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
 
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;

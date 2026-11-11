@@ -771,6 +771,41 @@ export type TraceEvent =
       rules: string[];
     })
 
+  // Message quiet period (FrameworkConfig.messageQuietPeriod)
+  /** An idle agent's turn is held for a burst of message wakes: one event
+   *  when the hold begins, naming the burst (a channel's, `channel`, server
+   *  and id, or a channel-less source's, `source`, name; the parts as a JSON
+   *  array, such as `["channel","discord","g1:room"]`) and how long until it
+   *  is ready as of this pass (0 for a burst ready now that waits only for
+   *  another burst's turn to start first). */
+  | (TraceEventBase & {
+      type: 'quiet-period:held';
+      agentName: string;
+      burst: string;
+      wakes: number;
+      readyInMs: number;
+    })
+  /** The quiet period stops holding a burst, paired with its
+   *  `quiet-period:held`: how many of its wakes go to the start, how long
+   *  the hold lasted, and why it ended: `quiet` (quietMs since its newest
+   *  wake), `cap` (maxWaitMs since its oldest), `other-wake` (a wake that is
+   *  no message started it), or `gone` (its wakes left the queue without a
+   *  start: withdrawn, dropped as read, skipped by policy, or dropped as its
+   *  agent ended or the framework stopped; `wakes` is 0). A start can still
+   *  wait on something else after this (an auxiliary call, a quiesce, a
+   *  provider's hold), and one that goes back to the queue can be held and
+   *  traced again, as a pair of its own. A burst that starts the first time
+   *  it is seen (already past its deadline, as the first of a backlog after
+   *  a busy turn) emits neither trace. */
+  | (TraceEventBase & {
+      type: 'quiet-period:released';
+      agentName: string;
+      burst: string;
+      wakes: number;
+      heldMs: number;
+      cause: 'quiet' | 'cap' | 'other-wake' | 'gone';
+    })
+
   // Usage lifecycle
   | (TraceEventBase & Fields<UsageUpdatedEvent>)
 

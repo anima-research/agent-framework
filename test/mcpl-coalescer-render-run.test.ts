@@ -283,3 +283,24 @@ test("a render left unread after a later one was read stays a render: a notice l
   assert.deepEqual(h.removed, ['row-1'], "n1's render is still tracked, so the retraction removes it");
   assert.equal(withdrawn.coalesce?.outcome, 'noted', "n2's render was read");
 });
+
+test("an assembly told to leave a subject still joins that subject's running render, and leaves the batch opened during it", async () => {
+  const h = makeHost();
+  const coalescer = new PushCoalescer<null>(h.host);
+  h.hold.n1 = true;
+  await coalescer.accept(notice('n1', true));
+  const started = h.started();
+  const first = coalescer.assemble('agent');
+  await started;
+  await coalescer.accept(notice('n2'));
+  const leaving = coalescer.assemble('other', [], () => true);
+  const before = await Promise.race([leaving.then(() => 'assembled'), new Promise((resolve) => setImmediate(() => resolve('waiting')))]);
+  assert.equal(before, 'waiting', "'other' is in n1's render's audience, so its assembly waits for that render");
+  h.release('n1');
+  await first;
+  const result = await leaving;
+  assert.equal(result.settled.size, 1, "the joined render settles for 'other'");
+  assert.equal(result.materialized.size, 0, "the render 'agent' froze is that request's to read, not 'other''s");
+  assert.equal(coalescer.pendingBatches(), 1, "n2's batch is left for its own turn");
+  assert.deepEqual(h.texts(), ['changes in n1'], 'only the running render landed');
+});
