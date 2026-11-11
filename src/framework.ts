@@ -7441,6 +7441,7 @@ export class AgentFramework {
       delete request.counterparty;
     }
     if (speaking) {
+      if (!sameChannel(speaking, routing?.triggerChannel)) delete request.answersMessageId;
       request.channelId = speaking.channelId;
       request.channelServerId = speaking.serverId;
       request.addressed = true;
@@ -20626,7 +20627,7 @@ export class AgentFramework {
     }
     if (decision.locus) this.noteDeliveredOrPark(event);
     if (!decision.held && !decision.suppressed) {
-      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId });
+      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId, ...this.answersOn(event) });
     }
 
     if (decision.wake) {
@@ -22634,7 +22635,10 @@ export class AgentFramework {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
     if (!silentHeartbeat && !decision.held && !decision.suppressed) {
-      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId });
+      this.considerWakeOnboarding({
+        serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId,
+        ...this.answersOn({ messageId: typeof event.origin?.messageId === 'string' ? event.origin.messageId : undefined, tags: event.tags, firstView: event.firstView }),
+      });
     }
 
     if (decision.wake) {
@@ -41855,6 +41859,8 @@ export class AgentFramework {
     recipients: readonly string[];
     /** Where the event came from, so a turn it wakes speaks there (as the lane's own wake would). */
     channelId?: string;
+    /** The message the event delivered, which a turn it wakes answers (as the lane's own wake would). */
+    answersMessageId?: string;
   }): void {
     try {
       const d = event.gateDecision;
@@ -41910,7 +41916,7 @@ export class AgentFramework {
           reason: 'wake-onboarding',
           source: event.serverId,
           timestamp: Date.now(),
-          ...(event.channelId ? { channelId: event.channelId, channelServerId: event.serverId } : {}),
+          ...(event.channelId ? { channelId: event.channelId, channelServerId: event.serverId, ...(event.answersMessageId ? { answersMessageId: event.answersMessageId } : {}) } : {}),
           addressed: isAddressedMessage(event.tags as string[] | undefined),
           ...this.readsRowFor(placements.get(agentName) ?? placement, agentName),
         });
