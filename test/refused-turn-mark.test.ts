@@ -1,6 +1,6 @@
 import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { createMockResponse, HeldStream, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, ok, TS } from './helpers/coalescing-fixture.js';
@@ -500,6 +500,70 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the rewind')), 'the retry\'s answer published');
     assert.ok(queuedBehind, 'premise: an ambient wake from general was queued behind the retry');
     assert.equal(r.f.membrane.calls.length, 3, 'premise: the retry and the ambient wake started one turn');
+    const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind'));
+    assert.equal(post?.channelId, ROOM);
+  });
+
+  const lookup = { fixture: { tools: [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object' } }] } };
+  const heldRefusal = async (r: Awaited<ReturnType<typeof rig>>, responses: ReturnType<typeof createMockResponse>[]) => {
+    r.f.membrane.supportsInjectedMessages = false;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    r.streams.push(() => new HeldStream(released, responses), () => new MockYieldingStream([answer('the answer after the rewind')]));
+    await r.incoming(ROOM, 'm-a');
+    await eventually(() => r.f.membrane.calls.length === 1, 'the turn for m-a, held');
+    await r.incoming(GENERAL, 'm-b');
+    const pending = () => (r.f.framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+    await eventually(() => r.stored('m-b') && pending().some((q) => q.channelId === GENERAL && q.addressed === true), 'premise: m-b stored and its addressed wake queued');
+    release();
+    await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the rewind')), 'the retry\'s answer published');
+    assert.equal(r.f.membrane.calls.length, 2, 'premise: the retry and m-b\'s wake started one turn');
+    const sent = JSON.stringify(r.f.membrane.calls[1]!.messages);
+    return { hasA: sent.includes('message m-a'), hasB: sent.includes('message m-b'), post: r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind')) };
+  };
+
+  it('a refused first round\'s retry merged with an addressed wake from another channel queued while it ran: the rewind set the retry\'s message aside, so the turn speaks in the other message\'s channel', async (t) => {
+    const r = await rig(t, rewinding);
+    const seen = await heldRefusal(r, [refusal()]);
+    assert.ok(!seen.hasA && seen.hasB, 'premise: the retry\'s request shows m-b and not m-a');
+    assert.equal(seen.post?.channelId, GENERAL);
+  });
+
+  it('a retry after a refused tool round merged with an addressed wake from another channel queued while it ran: the retry\'s message stays, so the turn speaks in its channel', async (t) => {
+    const r = await rig(t, { ...rewinding, ...lookup });
+    const call = { type: 'tool_use', id: 'look-1', name: 'mcpl--editor--lookup', input: {} } as ContentBlock;
+    const seen = await heldRefusal(r, [
+      createMockResponse([{ type: 'text', text: 'let me look' }, call], 'tool_use'),
+      { ...createMockResponse([{ type: 'text', text: 'let me look' }, call, { type: 'tool_result', toolUseId: 'look-1', content: 'what the tool saw' } as ContentBlock], 'refusal'), toolCalls: [] },
+    ]);
+    assert.ok(seen.hasA && !seen.hasB, 'premise: the retry\'s request shows m-a and not m-b');
+    assert.equal(seen.post?.channelId, ROOM);
+  });
+
+  it('a retry whose message the rewind set aside, held apart from an ambient wake by a stated wait and merged with a later one on release, still outranks both', async (t) => {
+    const r = await rig(t, rewinding);
+    const fw = r.f.framework as unknown as { pendingRequests: Array<Record<string, unknown>>; rewindRetry(...args: unknown[]): Record<string, unknown> };
+    const waits = (r.fw as unknown as { providerWaits: { set(agent: string, model: string, ms: number, why: string): unknown } }).providerWaits;
+    const held = () => (r.fw as unknown as { providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }> }).providerAccelerationCooldowns.get('agent')?.heldRequests.length;
+    const ambient = (at: number) => ({ agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'editor', timestamp: at, channelId: GENERAL, channelServerId: 'editor', ambient: true });
+    const rewindRetry = fw.rewindRetry.bind(fw);
+    let at = 0;
+    t.mock.method(fw, 'rewindRetry', (...args: unknown[]) => {
+      const retry = rewindRetry(...args);
+      if (!at) {
+        at = retry.timestamp as number;
+        waits.set('agent', 'test', 600_000, 'a stated wait');
+        fw.pendingRequests.push(ambient(at + 1));
+      }
+      return retry;
+    });
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the rewind')]));
+    await r.incoming(ROOM, 'm-a');
+    await eventually(() => held() === 2, 'premise: the stated wait holds the retry and the ambient wake apart');
+    fw.pendingRequests.push(ambient(at + 2));
+    r.f.framework.releaseProviderWait('agent', 'test', 'test');
+    await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the rewind')), 'the retry\'s answer published');
+    assert.equal(r.f.membrane.calls.length, 2, 'premise: the three requests started one turn');
     const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind'));
     assert.equal(post?.channelId, ROOM);
   });
