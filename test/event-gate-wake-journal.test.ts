@@ -12,18 +12,23 @@
  *   - stopWakeTimers() (the host's stop) silences the timers and keeps the
  *     intents;
  *   - a journal that can't be written leaves the live timer in force and
- *     reports `durable: false`; one that can't be read is set aside.
+ *     reports `durable: false`; one whose content can't be read is set
+ *     aside; one the process can't read at all is left alone and not
+ *     written over;
+ *   - a restored sleep or self-wake naming an agent this host doesn't have
+ *     is ended at admission.
+ * The framework's wiring of these is pinned in framework-wake-journal.test.ts.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventGate } from '../src/gate/event-gate.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-wake-journal');
 
-function makeGate(opts: { configPath?: string; now?: () => number; agents?: string[] } = {}) {
+function makeGate(opts: { configPath?: string; now?: () => number; agents?: string[]; hasAgent?: (name: string) => boolean } = {}) {
   const inferenceRequests: Array<{ agentName: string; reason: string; source: string }> = [];
   const messages: Array<{ participant: string; text: string; metadata?: Record<string, unknown>; forAgent?: string }> = [];
   const gate = new EventGate({
@@ -35,6 +40,7 @@ function makeGate(opts: { configPath?: string; now?: () => number; agents?: stri
     },
     requestInference: (a, r, s) => inferenceRequests.push({ agentName: a, reason: r, source: s }),
     getAgentNames: () => opts.agents ?? ['agent'],
+    ...(opts.hasAgent ? { hasAgent: opts.hasAgent } : {}),
     ...(opts.now ? { now: opts.now } : {}),
   });
   return { gate, inferenceRequests, messages };
@@ -336,6 +342,197 @@ describe('EventGate wake journal', () => {
       gate.admitOverdueWakeIntents();
       assert.strictEqual(gate.getSleepState(), null, 'the invalid sleep is not taken');
       assert.deepStrictEqual(gate.upcomingWakes(['agent', 'agent2']).map((w) => w.kind), ['self-wake']);
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+  it('admission on a gate whose wake timers are stopped, or that is disposed, emits nothing and keeps the journal', () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    const now = 1_700_000_000_000;
+    writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
+      version: 1,
+      sleep: { agentName: 'agent', armedAt: now - 10_000, wakeAt: now - 1, source: 'sleep' },
+      selfWakes: [{ agentName: 'agent', armedAt: now - 10_000, wakeAt: now - 1, source: 'skip_reply' }],
+    }));
+    const original = console.error;
+    console.error = () => {};
+    try {
+      for (const how of ['stopped', 'disposed'] as const) {
+        const { gate, inferenceRequests, messages } = makeGate({ configPath, now: () => now });
+        gate.restoreWakeIntents();
+        if (how === 'stopped') gate.stopWakeTimers(); else gate.dispose();
+        gate.admitOverdueWakeIntents();
+        assert.strictEqual(inferenceRequests.length, 0, `${how}: no wake requested`);
+        assert.strictEqual(messages.length, 0, `${how}: no notice`);
+        const kept = journal(gate);
+        assert.ok(kept.sleep, `${how}: the sleep stays journaled`);
+        assert.strictEqual(kept.selfWakes.length, 1, `${how}: the self-wake stays journaled`);
+        if (how === 'stopped') gate.dispose();
+      }
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it('a journal write after dispose() keeps the self-wakes', () => {
+    const { gate } = makeGate();
+    gate.armSelfWake('agent', 60, 'skip_reply');
+    gate.dispose();
+    // A late turn's sleep, between the host's stop and its exit.
+    gate.setSleep(120, undefined, 'agent');
+    const written = journal(gate);
+    assert.strictEqual(written.selfWakes.length, 1, 'the self-wake armed before the dispose is still there');
+    assert.ok(written.sleep);
+  });
+
+  it('an entry whose wakeAt precedes its armedAt is skipped', () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    const now = 1_700_000_000_000;
+    writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
+      version: 1,
+      sleep: { agentName: 'agent', armedAt: now + 5_000, wakeAt: now + 1_000, source: 'sleep' },
+      selfWakes: [
+        { agentName: 'agent', armedAt: now + 5_000, wakeAt: now + 1_000, source: 'skip_reply' },
+        { agentName: 'agent2', armedAt: now, wakeAt: now + 60_000, source: 'skip_reply' },
+      ],
+    }));
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const { gate } = makeGate({ configPath, now: () => now, agents: ['agent', 'agent2'] });
+      gate.restoreWakeIntents();
+      gate.admitOverdueWakeIntents();
+      assert.strictEqual(gate.getSleepState(), null);
+      assert.deepStrictEqual(gate.upcomingWakes(['agent', 'agent2']).map((w) => w.what), ["agent2's own skip_reply timer"]);
+      assert.strictEqual(logged.filter((l) => /skipping/.test(l)).length, 2);
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("a restored sleep or self-wake naming an agent this host doesn't have is ended at admission, and the journal says so", () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    const now = 1_700_000_000_000;
+    writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
+      version: 1,
+      sleep: { agentName: 'old-name', armedAt: now - 1_000, wakeAt: now + 6 * 3_600_000, source: 'sleep' },
+      selfWakes: [
+        { agentName: 'old-name', armedAt: now - 1_000, wakeAt: now + 60_000, source: 'skip_reply' },
+        { agentName: 'new-name', armedAt: now - 1_000, wakeAt: now + 60_000, source: 'skip_reply' },
+      ],
+    }));
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      // The agent renamed in the recipe between restarts; a non-recipient
+      // agent counts as present too (hasAgent, not getAgentNames).
+      const { gate, inferenceRequests } = makeGate({ configPath, now: () => now, agents: [], hasAgent: (name) => name === 'new-name' });
+      gate.restoreWakeIntents();
+      assert.ok(gate.getSleepState(), 'restored, the sleep suppresses until admission');
+      gate.admitOverdueWakeIntents();
+      assert.strictEqual(gate.getSleepState(), null, 'the absent agent\'s sleep is ended');
+      assert.strictEqual(inferenceRequests.length, 0, 'ended, not woken: there is no one to wake');
+      assert.deepStrictEqual(gate.upcomingWakes(['new-name']).map((w) => w.kind), ['self-wake'], 'the present agent\'s self-wake is armed');
+      const written = journal(gate);
+      assert.strictEqual(written.sleep, undefined);
+      assert.deepStrictEqual(written.selfWakes.map((w) => w.agentName), ['new-name']);
+      assert.ok(logged.some((l) => /ending the restored sleep of "old-name"/.test(l)));
+      assert.ok(logged.some((l) => /dropping the restored self-wake of "old-name"/.test(l)));
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it('a journal the process cannot read is left in place and not written over, and every write answers durable: false', () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    // A directory where the journal should be: the read fails with EISDIR,
+    // which says nothing about the content (as EACCES or EIO wouldn't).
+    const journalPath = join(TMP_DIR, 'gate.wake-intents.json');
+    mkdirSync(journalPath);
+    writeFileSync(join(journalPath, 'keep'), 'a file the quarantine would have moved');
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const { gate } = makeGate({ configPath });
+      gate.restoreWakeIntents();
+      gate.admitOverdueWakeIntents();
+      assert.ok(existsSync(join(journalPath, 'keep')), 'left in place');
+      assert.ok(!existsSync(`${journalPath}.corrupt`), 'not set aside');
+      assert.ok(logged.some((l) => /wake journal: read failed/.test(l)));
+      assert.strictEqual(gate.setSleep(60, undefined, 'agent').durable, false);
+      assert.strictEqual(gate.armSelfWake('agent', 60, 'skip_reply').durable, false);
+      assert.strictEqual(gate.endSleep().durable, false);
+      assert.ok(existsSync(join(journalPath, 'keep')), 'still in place after the writes');
+      assert.deepStrictEqual(readdirSync(TMP_DIR).filter((f) => f.includes('.tmp-')), [], 'no temp file left behind');
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it('a failed journal write takes its temp file with it', () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    // The journal's path is a directory, so the temp file is written and
+    // fsynced, and the rename over the directory fails.
+    mkdirSync(join(TMP_DIR, 'gate.wake-intents.json'));
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const { gate } = makeGate({ configPath });
+      assert.strictEqual(gate.setSleep(60, undefined, 'agent').durable, false);
+      assert.strictEqual(gate.armSelfWake('agent', 60, 'skip_reply').durable, false);
+      assert.deepStrictEqual(readdirSync(TMP_DIR).filter((f) => f.includes('.tmp-')), []);
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it('a sleep its own reader would skip is not journaled, and says so', () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    const now = 1_700_000_000_000;
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const { gate } = makeGate({ configPath, now: () => now });
+      gate.armSelfWake('agent', 60, 'skip_reply');
+      // Past the reader's bound (8.64e15 ms, the largest Date): the sleep
+      // holds in this process, and the journal keeps what it had.
+      const set = gate.setSleep(9e12, undefined, 'agent');
+      assert.strictEqual(set.durable, false);
+      assert.ok(gate.getSleepState(), 'the sleep is set in memory');
+      const written = journal(gate);
+      assert.strictEqual(written.sleep, undefined, 'not written');
+      assert.strictEqual(written.selfWakes.length, 1, 'the earlier journal stands');
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it('endSleep() says whether the end reached the journal', () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const { gate } = makeGate({ configPath });
+      gate.setSleep(60, undefined, 'agent');
+      assert.deepStrictEqual(gate.endSleep(), { woke: true, durable: true });
+      assert.deepStrictEqual(gate.endSleep(), { woke: false, durable: true });
+      assert.strictEqual(journal(gate).sleep, undefined);
+      // The journal's path blocked after the sleep was journaled: the end
+      // holds in this process, and the journal still says asleep.
+      gate.setSleep(60, undefined, 'agent');
+      rmSync(gate.wakeJournalPath);
+      mkdirSync(gate.wakeJournalPath);
+      assert.deepStrictEqual(gate.endSleep(), { woke: true, durable: false });
+      assert.strictEqual(gate.getSleepState(), null);
       gate.dispose();
     } finally {
       console.error = original;

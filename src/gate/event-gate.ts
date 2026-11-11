@@ -13,7 +13,7 @@
 
 import { NOTICE_TAG } from '../notice-tags.js';
 import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-text.js';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
@@ -2412,6 +2412,11 @@ export class EventGate {
    *  (restoreWakeIntents, admitOverdueWakeIntents). */
   private readonly wakeStatePath: string;
   private wakeIntentsRestored = false;
+  /** Set when the journal exists but couldn't be read for a reason other
+   *  than its content (EACCES, EIO): the file is left as it is and this
+   *  process writes no journal, answering `durable: false`, rather than
+   *  overwrite wakes it couldn't read. */
+  private wakeJournalReadFailed = false;
   // From stopWakeTimers() on (the host's stop(), before it closes its queue),
   // no wake timer fires or is armed: a wake due in the stop's own gap would
   // be requested of a queue about to close, and lost. The intents stay.
@@ -2443,6 +2448,7 @@ export class EventGate {
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
+  private hasAgentFn: (agentName: string) => boolean;
   /** Delivery-time re-check: is this channel held from the recipients now? */
   private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
@@ -2470,6 +2476,12 @@ export class EventGate {
      *  message is answered. */
     requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
     getAgentNames: () => string[];
+    /** Whether the framework has an agent of this name, recipient or not:
+     *  admission ends a restored sleep or self-wake naming an agent this
+     *  boot doesn't have (a rename between restarts), which would otherwise
+     *  quiet the whole gate for the sleep's length and wake no one. Left
+     *  out, every restored name is taken as present. */
+    hasAgent?: (agentName: string) => boolean;
     /**
      * Whether a channel is held from the recipients (a tune-out epoch in
      * force). A held event never enters a batch — admission runs before the
@@ -2535,6 +2547,7 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.hasAgentFn = opts.hasAgent ?? (() => true);
     this.isHeldFn = opts.isHeld ?? (() => false);
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
@@ -4821,7 +4834,8 @@ export class EventGate {
    * Arm the sleep's wake for its end by the gate's own clock. One timer holds
    * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
    * and wakeFromSleep reads the clock as each one fires. Nothing is armed
-   * once the gate is disposed.
+   * once the gate is disposed or its wake timers are stopped (stopWakeTimers):
+   * the sleep then stays, in memory and in the journal, for the next start.
    */
   private armSleepWake(): void {
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
@@ -4856,8 +4870,9 @@ export class EventGate {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
     // A stopped framework's late turn arms no timer and journals no intent
     // (disposed): nothing asked for after a stop() reaches the next start().
-    // Intents armed before the stop stay in the journal, and the next start
-    // arms them again (restoreWakeIntents).
+    // Intents armed before the stop stay in the journal; the next start
+    // restores them (restoreWakeIntents) and its admission arms them again
+    // (admitOverdueWakeIntents).
     if (this.disposed) return { inMs: ms, armed: false, durable: false };
     const armedAt = this.now();
     this.selfWakeDue.set(agentName, { at: armedAt + ms, source, armedAt });
@@ -4899,9 +4914,13 @@ export class EventGate {
    * stays, timer and all: its wake would be parked in memory, which a
    * restart mid-quiesce loses, so resume delivers it instead
    * (admitOverdueWakeIntents). Otherwise the notice and the wake go first,
-   * and the intent leaves the journal once they have: a crash between the
-   * two replays the wake once at the next start, as a recovery, rather than
-   * losing it.
+   * and the intent leaves the journal once they have: a delete whose write
+   * fails leaves the entry, which replays once at the next start, as a
+   * recovery. The notice, the request and the delete run in one synchronous
+   * step, so the gap that promise doesn't cover is the one after it: a
+   * request still waiting in pendingRequests when the host stops is lost,
+   * which is why the framework admits restored intents only once its loop
+   * runs (start()), not at create().
    */
   private fireSelfWake(agentName: string, due: { at: number; source: string; armedAt: number }, recovered = false): void {
     if (this.quiesced) return;
@@ -4947,18 +4966,25 @@ export class EventGate {
     }
   }
 
-  /** End sleep immediately. Returns true if the agent was asleep. The
-   *  journal is written whether or not a sleep was set, so a `wake` called
-   *  again after one whose write failed takes the stale sleep out. */
+  /** End sleep immediately. Returns true if the agent was asleep. */
   clearSleep(): boolean {
+    return this.endSleep().woke;
+  }
+
+  /** End sleep immediately: `woke` says whether the agent was asleep, and
+   *  `durable` whether the end reached the journal. One that didn't leaves
+   *  the sleep in the journal, so a restart would sleep again until the old
+   *  deadline; the journal is written whether or not a sleep was set, so a
+   *  `wake` called again after one whose write failed takes it out. */
+  endSleep(): { woke: boolean; durable: boolean } {
     const wasAsleep = this.sleepUntil > this.now();
     this.sleepUntil = 0;
     this.sleepArmedAt = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
-    this.tryPersistWakeState('clearing a sleep');
-    return wasAsleep;
+    const durable = this.tryPersistWakeState('clearing a sleep');
+    return { woke: wasAsleep, durable };
   }
 
   /**
@@ -4980,8 +5006,9 @@ export class EventGate {
     }
     // A sleep ending while the host is quiesced stays, in memory and in the
     // journal: its wake would be parked in memory, which a restart loses, so
-    // resume ends it instead (admitOverdueWakeIntents). Suppression goes on
-    // meanwhile, as the quiesce holds everything anyway.
+    // resume ends it instead (admitOverdueWakeIntents). Its deadline has
+    // passed, so it suppresses nothing from here on; the quiesce is what
+    // holds events meanwhile.
     if (this.quiesced) return;
     const note = this.sleepNote;
     const agent = this.sleepAgent;
@@ -5013,8 +5040,9 @@ export class EventGate {
    * anything or writing the journal, so an agent's sleep suppresses from the
    * start, before input flows. admitOverdueWakeIntents() then arms the ones
    * still ahead and delivers the ones whose time passed. Reads the journal
-   * once; one unreadable is set aside (`.corrupt-<time>`) and logged, and
-   * the gate starts with no wake set.
+   * once; one whose content can't be read is set aside (`.corrupt`) and
+   * logged, and the gate starts with no wake set; one the process can't
+   * read at all (EACCES, EIO) is left where it is and not written over.
    */
   restoreWakeIntents(): void {
     if (this.wakeIntentsRestored) return;
@@ -5050,6 +5078,7 @@ export class EventGate {
    */
   admitOverdueWakeIntents(): void {
     if (this.disposed || this.wakeTimersStopped || this.quiesced) return;
+    this.dropWakeIntentsOfAbsentAgents();
     const now = this.now();
     if (this.sleepUntil > 0) {
       if (this.sleepUntil > now) {
@@ -5070,11 +5099,42 @@ export class EventGate {
   }
 
   /**
+   * End a restored sleep, and drop restored self-wakes, that name an agent
+   * this boot doesn't have (renamed or removed in the recipe between
+   * restarts). A sleep's suppression is the whole gate's, whoever slept, and
+   * agentGone ends a sleep for the same reason at runtime; a restored one
+   * would otherwise quiet every agent for the rest of its window and then
+   * wake a name that no longer exists. The check is against the framework's
+   * agents, not the gate's recipients: a non-recipient agent may sleep too.
+   */
+  private dropWakeIntentsOfAbsentAgents(): void {
+    let changed = false;
+    if (this.sleepUntil > 0 && this.sleepAgent !== undefined && !this.hasAgentFn(this.sleepAgent)) {
+      console.error(`[gate] wake journal: ending the restored sleep of "${this.sleepAgent}", an agent this host doesn't have`);
+      this.sleepUntil = 0;
+      this.sleepArmedAt = 0;
+      this.sleepNote = undefined;
+      this.sleepAgent = undefined;
+      if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+      changed = true;
+    }
+    for (const agentName of [...this.selfWakeDue.keys()]) {
+      if (this.hasAgentFn(agentName)) continue;
+      console.error(`[gate] wake journal: dropping the restored self-wake of "${agentName}", an agent this host doesn't have`);
+      const timer = this.selfWakeTimers.get(agentName);
+      if (timer) { clearTimeout(timer); this.selfWakeTimers.delete(agentName); }
+      this.selfWakeDue.delete(agentName);
+      changed = true;
+    }
+    if (changed) this.tryPersistWakeState('dropping wakes of absent agents');
+  }
+
+  /**
    * The host is stopping: no wake timer fires or is armed from here on, and
    * the intents stay, in memory and in the journal, for the next start.
-   * Called before the host closes its queue: a wake due in the gap between
-   * the close and dispose() would be requested of a closed queue and its
-   * intent taken from the journal, lost to the restart.
+   * Called in stop()'s first steps: a wake firing during the stop would have
+   * its request queued in pendingRequests, which the stop never serves, and
+   * its intent taken from the journal, lost to the restart.
    */
   stopWakeTimers(): void {
     this.wakeTimersStopped = true;
@@ -5089,9 +5149,21 @@ export class EventGate {
   }
 
   private readWakeState(): PersistedWakeState | null {
-    if (!existsSync(this.wakeStatePath)) return null;
+    // Only ENOENT means "no journal". Any other read error (EACCES from a
+    // journal written by another user, EIO, EMFILE) says nothing about the
+    // content, so the file stays as it is and this process writes no
+    // journal: a fresh one would lose the wakes it couldn't read.
+    let text: string;
     try {
-      const raw = JSON.parse(readFileSync(this.wakeStatePath, 'utf8')) as Record<string, unknown>;
+      text = readFileSync(this.wakeStatePath, 'utf8');
+    } catch (error) {
+      if (isMissing(error)) return null;
+      this.wakeJournalReadFailed = true;
+      console.error(`[gate] wake journal: read failed (${errorText(error)}); the file is left in place, and this process won't write the journal, so wakes set now may not survive a restart`);
+      return null;
+    }
+    try {
+      const raw = JSON.parse(text) as Record<string, unknown>;
       if (raw === null || typeof raw !== 'object' || raw.version !== 1 || !Array.isArray(raw.selfWakes)) {
         throw new Error('not a version 1 wake journal');
       }
@@ -5143,19 +5215,39 @@ export class EventGate {
         agentName, armedAt: due.armedAt, wakeAt: due.at, source: due.source,
       })),
     };
+    if (this.wakeJournalReadFailed) {
+      throw new Error('the journal could not be read at start, so it is not written');
+    }
+    // What the reader would skip is not written: a sleep past the reader's
+    // bound (setSleep of ~285,000 years) would answer `durable: true` and be
+    // gone at the next boot.
+    if (state.sleep && !validWakeIntent(state.sleep, true)) {
+      throw new Error(`the sleep (wakeAt ${(state.sleep as PersistedWakeIntent).wakeAt}) is one the journal's reader would skip`);
+    }
+    for (const entry of state.selfWakes) {
+      if (!validWakeIntent(entry, false)) {
+        throw new Error(`the self-wake of "${(entry as PersistedWakeIntent).agentName}" (wakeAt ${(entry as PersistedWakeIntent).wakeAt}) is one the journal's reader would skip`);
+      }
+    }
     mkdirSync(dirname(this.wakeStatePath), { recursive: true });
     // A name of this writer's own, and the bytes on disk before the rename:
     // a `durable: true` answered to the agent means the journal survives a
-    // power loss, not only a crash.
+    // power loss, not only a crash. A write that fails takes its temp file
+    // with it, so ENOSPC doesn't leave one per attempt beside the config.
     const tmp = `${this.wakeStatePath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
     const fd = openSync(tmp, 'w', 0o600);
     try {
-      writeSync(fd, JSON.stringify(state, null, 2) + '\n');
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+      try {
+        writeSync(fd, JSON.stringify(state, null, 2) + '\n');
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, this.wakeStatePath);
+    } catch (error) {
+      try { unlinkSync(tmp); } catch { /* already gone, or the same disk fault */ }
+      throw error;
     }
-    renameSync(tmp, this.wakeStatePath);
   }
 
   /** persistWakeState, with a failure logged (once per action) rather than
