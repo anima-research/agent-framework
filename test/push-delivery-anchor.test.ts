@@ -92,6 +92,27 @@ describe('a push that delivers a new message becomes the latest delivered inboun
     assert.notEqual(fw.channelRegistry.getDesiredState('editor', ADMIN), 'open', 'and admin stays closed');
   });
 
+  it('under \'latest-inbound\', an ambient push from a closed channel sent channel-scoped coalesced, as discord-mcpl sends one, moves neither the fallback locus nor the reply anchor, and parks nothing', async (t) => {
+    const { f, fw, origin } = await rig(t, { ...NO_WAKES, speech: { locus: 'latest-inbound' } });
+    await f.send('channels/incoming', {
+      messages: [{ channelId: ROOM, messageId: 'm-room', timestamp: TS, author: { id: 'U1', name: 'Antra' }, tags: ADDRESSED, content: [{ type: 'text', text: 'in room' }] }],
+    });
+    await f.framework.runUntilIdle();
+    assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-room', 'premise: the room message is the latest inbound');
+
+    const reply = await f.send('push/event', {
+      featureSet: 'doc', eventId: 'e-ambient', timestamp: TS, origin: origin(ADMIN, 'm-ambient'), tags: ['chat:ambient', 'chat:from-human'],
+      coalesce: { key: 'message:m-ambient', initial: true, channelId: ADMIN },
+      payload: { content: [{ type: 'text', text: 'coalesced chatter in admin' }] },
+    });
+    assert.match(JSON.stringify(reply), /"accepted":true/, 'premise: the push is accepted');
+    await f.framework.runUntilIdle();
+    assert.ok(f.context().includes('coalesced chatter in admin'), 'premise: the ambient push was delivered');
+    assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-room');
+    assert.equal(fw.channelRegistry.resolveLocus('agent')?.channelId, ROOM);
+    assert.equal(fw.parkedAnchors.size, 0);
+  });
+
   it('under \'latest-inbound\', a push its server tagged with nothing counts, as a message no tag calls ambient', async (t) => {
     const { f, fw, origin } = await rig(t, { ...NO_WAKES, speech: { locus: 'latest-inbound' } });
     await f.send('channels/incoming', {
@@ -232,6 +253,7 @@ describe('a push that delivers a new message becomes the latest delivered inboun
     });
     assert.match(JSON.stringify(reply), /"accepted":true/, 'premise: the push is accepted');
     await f.framework.runUntilIdle();
+    assert.ok(f.context().includes('a push that names no message'), 'premise: the push was delivered');
     assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-room');
   });
 

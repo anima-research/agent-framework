@@ -255,7 +255,6 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
       assert.deepEqual(records.map((r) => [r.agent, r.locus]), [['sub-run-refused', null]], 'the subagent\'s refusal is logged, with no locus');
       assert.deepEqual(reacted, ['sub-run-refused'], 'premise: the subagent\'s refusal reached the reaction');
 
-      // A mark the subagent's refusal sent would reach the server before the resident's.
       await fw.reactToRefusal('agent', 'other');
       await eventually(() => calls.length >= 1, 'control: the resident\'s refusal is marked');
       await f.framework.runUntilIdle();
