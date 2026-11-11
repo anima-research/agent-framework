@@ -28834,11 +28834,6 @@ export class AgentFramework {
             const roundAdmitted = turnProseRouting === 'explicit'
               ? roundSegments.map((seg) => this.admitProse(seg, streamRouting))
               : [];
-            // Now, not when the round is routed: a round waiting on a script
-            // may never be, and the turn-end delivery still drops its prose.
-            if (roundToolNames.includes('think') && requestSnapshot.sameRoundThinkTextPolicy === 'private') {
-              privateThinkRounds.add(toolRound);
-            }
             const routeRound = (calls: readonly RoundCall[]): void => {
               if (!this.channelRegistry) return;
               const toolNames = calls.map((c) => c.name);
