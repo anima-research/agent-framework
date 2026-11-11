@@ -430,7 +430,10 @@ export interface FrameworkConfig {
   /**
    * A message quiet period: an idle agent's turn waits while message wakes
    * for it keep arriving, so a burst (a caption and its images, a reply split
-   * into several messages) starts one turn, not one per part. A burst is one
+   * into several messages) starts one turn, not one per part. A gate rule's
+   * `debounce` settles a burst too, by delivering it as one wake of the
+   * gate's own; this instead delays the start of each message's own wake,
+   * so each keeps its channel and the gate's decision for it. A burst is one
    * channel's message wakes (server and channel id), or a channel-less
    * source's; each is held on its own clock, until `quietMs` have passed
    * since its newest wake or `maxWaitMs` (default 30000) since its oldest,
