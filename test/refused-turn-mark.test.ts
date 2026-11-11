@@ -25,7 +25,7 @@ class FailedCall implements YieldingStream {
   pendingToolCallIds: string[] = [];
   toolDepth = 0;
   isCancelled = false;
-  constructor(private readonly kind: 'invalid-request' | 'rate-limit' = 'invalid-request') {}
+  constructor(private readonly kind: 'invalid-request' | 'rate-limit' | 'server' = 'invalid-request') {}
   provideToolResults(): void {}
   cancel(): void { this.isCancelled = true; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -33,14 +33,17 @@ class FailedCall implements YieldingStream {
       type: 'error',
       error: this.kind === 'rate-limit'
         ? new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 50, message: 'rate limit reached for requests', rawError: { status: 429 } })
+        : this.kind === 'server'
+        ? new MembraneError({ type: 'server', retryable: true, httpStatus: 502, message: 'bad gateway', rawError: undefined } as never)
         : new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, message: 'the provider could not process the request', rawError: { status: 400 } }),
     } as StreamEvent;
   }
 }
 
-async function rig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>; agents?: unknown[] } = {}) {
+async function rig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>; agents?: unknown[]; fixture?: Record<string, unknown> } = {}) {
   const marks: Array<{ name?: unknown; arguments?: Record<string, unknown> }> = [];
   const f = await fixture({
+    ...opts.fixture,
     framework: opts.framework,
     agents: opts.agents,
     toolsCall: (params) => { marks.push(params as { name?: unknown; arguments?: Record<string, unknown> }); return { content: [] }; },
@@ -165,6 +168,63 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await r.markSent();
     assert.deepEqual(r.marked(), []);
     assert.equal(r.records[0]!.locus, ADMIN);
+  });
+
+  it('a mention whose server\'s wakes are undecided wakes its turn through wake onboarding: the turn answers the mention, and its refusal marks it', async (t) => {
+    const ontology = {
+      coreTags: ['chat:addressed', 'chat:from-human'],
+      tags: { 'surface:turn': { desc: 'A Go game is waiting on you.', facet: 'addressing' } },
+      suggestedTreatment: [{ tagsAny: ['surface:turn'], behavior: 'immediate', rationale: 'An opponent is waiting on you.' }],
+      open: true,
+    };
+    const r = await rig(t, {
+      framework: { gate: { config: { policies: [{ name: 'discord-ambient', match: { scope: ['mcpl:push-event', 'mcpl:channel-incoming'] }, behavior: 'skip' }], default: 'skip' } } } as never,
+      fixture: { featureSets: { games: { description: 'games', uses: ['pushEvents'], tagOntology: ontology } }, server: { enabledFeatureSets: ['games'] } },
+    });
+    const offers: Array<{ wake?: boolean }> = [];
+    r.f.framework.onTrace((e) => { if ((e as { type?: string }).type === 'gate:onboarding-offered') offers.push(e as { wake?: boolean }); });
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-on');
+    await eventually(() => r.records.length === 1, 'the onboarding turn, refused');
+    assert.deepEqual(offers.map((o) => o.wake), [true], 'premise: the onboarding offer woke the turn');
+    await eventually(() => r.marks.length === 1, 'and marked');
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-on']]);
+    assert.equal(r.records[0]!.locus, ROOM);
+  });
+
+  it('a locked agent\'s turn re-armed after its retries ran out speaks at its lock, so it answers no one message: its refusal marks nothing, and the record names the lock', async (t) => {
+    const r = await rig(t, {
+      framework: {
+        errorPolicy: { maxRetries: 2, onInferenceError: (e: unknown, _a: unknown, attempt: number) => ((e as { retryable?: boolean }).retryable !== false && attempt < 2 ? { retry: true, delayMs: 5 } : { retry: false }) },
+        exhaustedTurnRearmMs: [50],
+      } as never,
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting: 'locked', proseLock: GENERAL, refusalHandling: { retries: 0, autoRewind: false } }],
+    });
+    r.streams.push(() => new FailedCall('server'), () => new FailedCall('server'), () => new FailedCall('server'), () => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-1');
+    await eventually(() => r.records.length === 1, 'the re-armed turn, refused');
+    assert.equal(r.f.membrane.calls.length, 4, 'premise: three failed sends, then the re-armed one');
+    await r.markSent();
+    assert.deepEqual(r.marked(), []);
+    assert.equal(r.records[0]!.locus, GENERAL);
+  });
+
+  it('a correction delivered to the conversation fork that holds its message, as the agent\'s first view of it: its refused turn marks that message', async (t) => {
+    const r = await rig(t, { framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never });
+    await r.answered(ROOM, 'm-1');
+    const fork = (r.f.framework as unknown as { conversationRouter: { getBinding(c: { serverId: string; channelId: string }): { agentName: string } | undefined } })
+      .conversationRouter.getBinding({ serverId: 'editor', channelId: ROOM })?.agentName;
+    assert.ok(fork, 'premise: the room has its fork');
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    r.f.framework.pushEvent({
+      type: 'mcpl:channel-incoming', serverId: 'editor', channelId: ROOM, messageId: 'm-2', timestamp: TS,
+      author: { id: 'U1', name: 'Antra' }, tags: ['chat:edited', ...ADDRESSED], firstView: true, deliverTo: fork, triggerInference: true,
+      content: [{ type: 'text', text: 'message m-2, edited' }],
+    } as never);
+    await eventually(() => r.records.length === 1 && r.marks.length === 1, 'the fork\'s turn for the correction, refused and marked');
+    assert.equal(r.records[0]!.agent, fork, 'premise: the fork took the correction');
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-2']]);
+    assert.equal(r.records[0]!.locus, ROOM);
   });
 
   it('a message that arrived while the turn before it was alive: its own refused turn marks it, though an ambient message came after it', async (t) => {
@@ -323,8 +383,11 @@ describe('a refused turn is marked on the message it answers, and its failure na
     for (let i = 0; i < 4; i++) r.streams.push(() => new MockYieldingStream([refusal()]));
     const waits = (r.fw as unknown as { providerWaits: { set(agent: string, model: string, ms: number, why: string): unknown } }).providerWaits;
     const message = (messageId: string) => ({ channelId: ROOM, messageId, timestamp: TS, author: { id: 'U1', name: 'Antra' }, tags: ADDRESSED, content: [{ type: 'text', text: `message ${messageId}` }] });
+    const held = (agentName: string) => (r.fw as unknown as { providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }> })
+      .providerAccelerationCooldowns.get(agentName)?.heldRequests.length;
     waits.set('second', 'test', 300, 'a stated wait');
     await r.incoming(ROOM, 'm-1');
+    await eventually(() => held('second') === 1, 'premise: the stated wait holds the second resident\'s wake for m-1');
     await eventually(() => r.records.length === 2 && r.marks.length === 2, 'control: both residents\' turns for m-1, refused and marked, the second\'s after its wait');
     assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']]);
     await r.f.framework.runUntilIdle();
@@ -338,8 +401,6 @@ describe('a refused turn is marked on the message it answers, and its failure na
     // the second message's wakes after it has answered the delivery.
     const clock = t.mock.method(Date, 'now', () => now);
     await r.f.send('channels/incoming', { messages: [message('m-2'), message('m-3')] });
-    const held = (agentName: string) => (r.fw as unknown as { providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }> })
-      .providerAccelerationCooldowns.get(agentName)?.heldRequests.length;
     await eventually(() => held('second') === 1 && held('agent') === 2,
       'premise: the second resident\'s hold keeps its two wakes as one, the first resident\'s apart');
     clock.mock.restore();

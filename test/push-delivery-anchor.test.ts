@@ -57,11 +57,13 @@ describe('a push that delivers a new message becomes the latest delivered inboun
     const incoming = fw.channelRegistry.incomingFor('agent');
     assert.deepEqual(incoming && { messageId: incoming.messageId, threadId: incoming.threadId }, { messageId: 'm-admin', threadId: 't-admin' });
 
-    await f.send('push/event', {
+    const edit = await f.send('push/event', {
       featureSet: 'doc', eventId: 'e-edit', timestamp: TS, origin: origin(ROOM, 'm-room'), tags: ['chat:edited'],
       payload: { content: [{ type: 'text', text: '[message edited] Antra: in room, edited' }] },
     });
+    assert.match(JSON.stringify(edit), /"accepted":true/, 'premise: the edit is accepted');
     await f.framework.runUntilIdle();
+    assert.ok(f.context().includes('in room, edited'), 'premise: the edit was delivered');
     assert.equal(fw.channelRegistry.resolveLocus('agent')?.channelId, ADMIN);
   });
 
@@ -208,6 +210,7 @@ describe('a push that delivers a new message becomes the latest delivered inboun
       assert.equal(fw.parkedAnchors.size, 1, 'premise: the older message\'s anchor is parked');
       await newer(f);
       await f.framework.runUntilIdle();
+      assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-newer', 'premise: the newer message is the latest inbound while the older commit is held');
       release();
       assert.match(JSON.stringify(await sent), /"accepted":true/, 'premise: the create is accepted');
       assert.equal(fw.parkedAnchors.size, 0, 'premise: its acceptance took the parked anchor');
@@ -246,6 +249,7 @@ describe('a push that delivers a new message becomes the latest delivered inboun
     assert.match(JSON.stringify(await f.send('push/event', deferred)), /"accepted":true/, 'premise: the deferred create is accepted');
     await eventually(() => f.renders.length === 1, 'the deferred create rendered at assembly');
     await f.framework.runUntilIdle();
+    assert.ok(f.context().includes('document_diff'), 'premise: the rendered create was delivered');
     assert.match(JSON.stringify(await f.send('push/event', deferred)), /"accepted":true/, 'premise: the resend is accepted');
     const incoming = fw.channelRegistry.incomingFor('agent');
     assert.deepEqual(incoming && { channelId: incoming.channel.channelId, messageId: incoming.messageId }, { channelId: ROOM, messageId: 'm-room' });

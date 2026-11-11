@@ -248,8 +248,12 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
       const records: Array<Record<string, unknown>> = [];
       t.mock.method(fw, 'logFailure', (record: Record<string, unknown>) => { if (record.kind === 'refusal') records.push(record); });
 
+      const reacted: string[] = [];
+      const react = fw.reactToRefusal.bind(fw);
+      t.mock.method(fw, 'reactToRefusal', (name: string, category: string) => { reacted.push(name); return react(name, category); });
       await runSubagent(f, 'sub-run-refused', 'locus', false, createMockResponse([], 'refusal')).catch(() => undefined);
       assert.deepEqual(records.map((r) => [r.agent, r.locus]), [['sub-run-refused', null]], 'the subagent\'s refusal is logged, with no locus');
+      assert.deepEqual(reacted, ['sub-run-refused'], 'premise: the subagent\'s refusal reached the reaction');
 
       // A mark the subagent's refusal sent would reach the server before the resident's.
       await fw.reactToRefusal('agent', 'other');
