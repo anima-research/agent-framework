@@ -273,10 +273,13 @@ export interface PersistentReaderConfig extends SubconsciousConfigBase {
    *   stored, and none of the resident's thinking (foreign-rounds.ts).
    * - `'raw'`: as stored, as 0.30.0 sent them: the resident's thinking
    *   blocks, its tool calls and their results, in the subconscious's
-   *   requests under the resident's name. A provider pairs tool blocks only
-   *   in the turns of the agent that made the call, so it may refuse them, or
-   *   the formatter may move them into the subconscious's own turns, where
-   *   they read as calls it made.
+   *   requests under the resident's name. A provider item membrane stores
+   *   on an empty text block, such as a compaction item or a server-tool
+   *   block, is another conversation's state and stays out, and a row
+   *   holding only such items is left out. A provider pairs tool blocks
+   *   only in the turns of the agent that made the call, so it may refuse
+   *   them, or the formatter may move them into the subconscious's own turns,
+   *   where they read as calls it made.
    *
    * A thinking block's signature binds the block to the prefix the resident
    * was sent, so the block can't be sent as part of another agent's prefix;

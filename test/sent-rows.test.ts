@@ -66,6 +66,13 @@ describe('asNextRequestCarries', () => {
     assert.deepEqual(asNextRequestCarries([signed('s', 900), text(''), text('  '), text('Hi.')]), [signed('s'), text('Hi.')]);
     assert.equal(asNextRequestCarries([text(''), text('\n')]), null);
   });
+
+  it('keeps a provider-native item\'s carrier, an exactly empty text block whose rawItem is an object, as membrane marks one', () => {
+    const carrier = { type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } } as ContentBlock;
+    assert.deepEqual(asNextRequestCarries([carrier, text('Hi.')]), [carrier, text('Hi.')]);
+    // A row holding only a carrier is carried: the request sends it where its provider takes the item.
+    assert.deepEqual(asNextRequestCarries([carrier]), [carrier]);
+  });
 });
 
 describe('roundRows', () => {
@@ -81,13 +88,17 @@ describe('roundRows', () => {
     ['results-image-limited', { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'c1', content: [text('A chart.')] } as ContentBlock] }],
     // An injected message whose first text block is whitespace, which the next request's sanitize pass leaves out.
     ['note-spaced', { participant: 'Bob', content: [text(' \n'), text('A note.')] }],
-    // A reply holding a provider-native item on an empty text carrier, which the sanitize pass leaves out.
+    // A reply holding a provider-native item on an empty text carrier, which the next request carries as the stream did.
     ['reply-carrier', { participant: 'agent', content: [signed('s'), { type: 'text', text: '', rawItem: { type: 'web_search_tool_result' } } as ContentBlock, text('Found.')] }],
     // A stored block with a stale cache marker, which the binding doesn't count.
     ['note-marked', { participant: 'user', content: [{ ...text('A note.'), cache_control: { type: 'ephemeral' } } as ContentBlock] }],
     ['results-error', { participant: 'user', content: [result('c1', 'ok', true)] }],
     ['note-undefined', { participant: 'user', content: [{ ...text('A note.'), citations: undefined } as never] }],
     ['gone', null],
+    // As the next request carries them: a row of another participant's provider items alone, as nothing, and a
+    // row of whitespace.
+    ['emptied', { participant: 'scout', content: [] }],
+    ['spaces', { participant: 'user', content: [text(' \n')] }],
   ]);
   const carried = (id: MessageId) => store.get(id) ?? null;
 
@@ -105,7 +116,11 @@ describe('roundRows', () => {
       // A field whose value is undefined, on either side, is absent, as JSON leaves it out.
       { kind: 'injected', id: 'note', participant: 'user', sent: [{ ...text('A note.'), citations: undefined } as never] },
       { kind: 'injected', id: 'note-undefined', participant: 'user', sent: [text('A note.')] },
-    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked', 'note', 'note', 'note-undefined'] as SentRow[]);
+      // membrane sent the carrier as its item or left it out, and does the same with it in the next request.
+      { kind: 'reply', id: 'reply-carrier', sent: [signed('s'), { type: 'text', text: '', rawItem: { type: 'web_search_tool_result' } } as ContentBlock, text('Found.')] },
+      // The stream was given nothing for the row, and the next request carries nothing for it either.
+      { kind: 'injected', id: 'emptied', participant: 'scout', sent: [] },
+    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked', 'note', 'note', 'note-undefined', 'reply-carrier', 'emptied'] as SentRow[]);
   });
 
   it('marks a row the next request carries otherwise, or doesn\'t carry, or the store doesn\'t hold', () => {
@@ -121,14 +136,16 @@ describe('roundRows', () => {
       { kind: 'results', id: 'results-image-limited', sent: [{ toolUseId: 'c1', content: [text('A chart.'), image] as never, isError: false }] },
       // membrane sent the whitespace block, behind Bob's name; the next request leaves it out.
       { kind: 'injected', id: 'note-spaced', participant: 'Bob', sent: [text(' \n'), text('A note.')] },
-      // membrane sent the carrier's item; the next request leaves the carrier out.
-      { kind: 'reply', id: 'reply-carrier', sent: [signed('s'), { type: 'text', text: '', rawItem: { type: 'web_search_tool_result' } } as ContentBlock, text('Found.')] },
       // A difference inside a nested field: the image's data.
       { kind: 'results', id: 'results-image', sent: [{ toolUseId: 'c1', content: [text('A chart.'), { ...image, source: { ...(image as { source: object }).source, data: 'other' } }] as never, isError: false }] },
       // Results for another call, and an error flag that differs.
       { kind: 'results', id: 'results', sent: [{ toolUseId: 'c2', content: 'ok', isError: false }] },
       { kind: 'results', id: 'results-error', sent: [{ toolUseId: 'c1', content: 'ok', isError: false }] },
-    ], carried), Array(11).fill(UNSTORED) as SentRow[]);
+      // membrane sent the whitespace, and the next request carries nothing for the row.
+      { kind: 'injected', id: 'spaces', participant: 'user', sent: [text(' \n')] },
+      // The stream was given nothing for a row the next request carries.
+      { kind: 'injected', id: 'note', participant: 'user', sent: [] },
+    ], carried), Array(12).fill(UNSTORED) as SentRow[]);
   });
 });
 
