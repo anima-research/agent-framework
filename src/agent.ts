@@ -173,6 +173,7 @@ function wireDigest(value: unknown): string {
 }
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: 100_000, reserveForResponse: 4_000 };
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
@@ -389,9 +390,10 @@ export class Agent {
    * closure) so the next activation can close whatever its predecessor left
    * open — see failOpenKvSubmissions. */
   private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
-  /** The current stream's fresh input so far, as membrane's usage event
+  /** The current stream's `inputTokens` so far, as membrane's usage event
    *  reports it (cumulative across the tool loop): what the maxStreamTokens
-   *  budget checks. */
+   *  budget checks. Where membrane knows the provider's cache convention it
+   *  leaves out cache reads and writes; where it doesn't, it can hold them. */
   lastStreamInputTokens = 0;
   /** Real prompt size of the stream's latest provider call that reported a
    *  prompt, which is what the provider billed it: fresh + cache creation +
@@ -399,8 +401,9 @@ export class Agent {
    *  lastStreamUnreportedTokens). Membrane's usage events are cumulative, so
    *  this is the call's share of its event (cumulativeDelta): the whole event
    *  for a stream's first call, and the event's own value where a counter
-   *  went back. THE window-shaped number — `lastStreamInputTokens` alone
-   *  omits cached tokens, which are most of a warm stream's window. 0 until a
+   *  went back. THE window-shaped number — `lastStreamInputTokens` leaves out
+   *  cached tokens wherever membrane knows the provider's cache convention,
+   *  and they are most of a warm stream's window. 0 until a
    *  call on this stream reports a prompt, and the physical-window
    *  projection runs only once one has. */
   lastStreamRealInputTokens = 0;
@@ -481,6 +484,8 @@ export class Agent {
   /** Told when that changes (the framework records it beside the persisted budget). */
   private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
+  private rowChanges: () => number;
+  private stopCountingRowChanges: (() => void) | undefined;
   private membrane: Membrane;
 
   constructor(
@@ -525,6 +530,11 @@ export class Agent {
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
+    let rowChanges = 0;
+    if (typeof contextManager.onMessage === 'function') {
+      this.stopCountingRowChanges = contextManager.onMessage((event) => { if (event.type !== 'add') rowChanges++; });
+    }
+    this.rowChanges = () => rowChanges;
     this.membrane = membrane;
     const hot = this.getHotContextSettings();
     this.configuredTailTokens = hot?.tailTokens;
@@ -681,7 +691,7 @@ export class Agent {
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
     // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    const base = resolved ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
   }
 
@@ -2345,6 +2355,49 @@ export class Agent {
    */
   thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
+  }
+
+  /** @internal For the framework's restart decision; not a host API. */
+  previewCompile(excludePins?: readonly string[]): ReturnType<ContextManager['previewContext']> {
+    const thinkingBinding = this.thinkingBindingOption();
+    const opts = {
+      ...(thinkingBinding ? { thinkingBinding } : {}),
+      ...(excludePins && excludePins.length > 0 ? { excludePins } : {}),
+    };
+    return this.contextManager.previewContext(
+      this.previewBudget(),
+      undefined,
+      Object.keys(opts).length > 0 ? opts : undefined,
+    );
+  }
+
+  /** @internal For the framework's shared slot; not a host API. */
+  readRowChangesFrom(read: () => number): void {
+    this.stopCountingRowChanges?.();
+    this.stopCountingRowChanges = undefined;
+    this.rowChanges = read;
+  }
+
+  /** @internal For the framework's restart decision; not a host API. */
+  restartPreviewKey(excludePins?: readonly string[]): string {
+    const cm = this.contextManager;
+    const hot = this.getHotContextSettings();
+    const stats = (cm.getStrategy() as { getStats?: () => Record<string, unknown> }).getStats?.();
+    const counts = stats && [stats.chunksTotal, stats.pendingMerges, stats.chunksCompressed, stats.compressionCount, stats.l1, stats.l2, stats.l3];
+    const pins = cm.listPins().filter((pin) => !excludePins?.includes(pin.id))
+      .map((pin) => [pin.id, pin.firstMessageId, pin.lastMessageId]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return JSON.stringify([
+      this.previewBudget(),
+      [...cm.getCompressionHolds()].sort(),
+      hot && [hot.tailTokens, hot.transitionPaceTokens ?? null, hot.preparedWindowTokens ?? null],
+      counts?.some((count) => typeof count === 'number') ? counts : cm.getPendingWork()?.description ?? null,
+      pins,
+      this.rowChanges(),
+    ]);
+  }
+
+  private previewBudget(): TokenBudget {
+    return this.compileBudget() ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
   }
 
   /**

@@ -82,9 +82,33 @@ export interface AgentConfig {
   /** Temperature for inference */
   temperature?: number;
 
-  /** Max input tokens before framework breaks a yielding stream and
-   *  restarts with recompiled (compressed) context. Default: 150000. Not
-   *  checked mid-turn for an agent whose model binds its thinking
+  /** The `inputTokens` total above which the framework breaks a yielding
+   *  stream and restarts it with recompiled (compressed) context. Default:
+   *  150000. The total runs over the stream's calls, as membrane's usage
+   *  events report it. Where membrane knows the provider's cache convention
+   *  (one other than `'unknown'`), `inputTokens` leaves out cache reads and
+   *  writes, so on a mostly cached prompt this setting doesn't bound a
+   *  request's size. `physicalWindowTokens`, when set, restarts the stream
+   *  once a projection of its next request, made from the last prompt a call
+   *  of the stream reported, passes it.
+   *
+   *  The restart is declined where context-manager's preview of its compile
+   *  says it won't fit and doesn't name compression as what would make room.
+   *  It is declined too where the preview meets a drop no summary covers
+   *  while no compression is pending. For an agent the budget hold can't
+   *  take, such as an ephemeral run, a preview that won't fit declines the
+   *  restart even where it names compression, and so does an uncovered drop
+   *  while compression is pending. The stream then goes on, and an
+   *  `inference:restart_declined` trace says why. A later tool boundary
+   *  over this budget considers the restart again. Any other failure of the
+   *  preview doesn't decline it.
+   *
+   *  With `physicalWindowTokens` unset, a declined stream can grow until the
+   *  provider refuses a request at its own window. The turn then ends with
+   *  a `context_length` failure row. That row raises the `context-refusal`
+   *  ops alert and kicks the compression drain.
+   *
+   *  Not checked mid-turn for an agent whose model binds its thinking
    *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
    *  there would take the turn's own earlier reasoning out of the request, and
    *  the window projection still guards the provider's hard cap. */
@@ -100,7 +124,10 @@ export interface AgentConfig {
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
    * stream has reported its prompt. Unset → no projection; only the
-   * maxStreamTokens restart applies. A value is converted to a number as a
+   * maxStreamTokens restart applies. Where membrane knows the provider's
+   * cache convention, the count that restart compares leaves out cache reads
+   * and writes, so a turn's requests can then grow past the window while
+   * most of their prompt is cached. A value is converted to a number as a
    * comparison converts it, so a string such as "200000" reads as its number;
    * one whose number isn't finite, such as null, reads as unset.
    */

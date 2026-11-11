@@ -903,7 +903,7 @@ static tools are listed like any server's.
 2. **Drive**: Framework iterates stream events (tokens, tool-calls, complete, error)
 3. **Tool yield**: Stream yields tool calls → framework dispatches concurrently → collects results
 4. **Resume**: All results in → stream resumes with tool results
-5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed (the turn's opening messages kept whole, as Context Management says), and a fresh stream starts. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
+5. **Budget restart**: If the stream's running total of `inputTokens` exceeds `maxStreamTokens`, the stream is cancelled, context is recompressed (the turn's opening messages kept whole, as Context Management says), and a fresh stream starts. Where context-manager's preview says that compile won't fit and doesn't name compression as what would make room, the restart is declined and the stream goes on, as `maxStreamTokens`' doc says. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
 6. **Complete**: Final response saved to context, agent returns to idle
 
 ### Inference bounds

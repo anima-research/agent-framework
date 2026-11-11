@@ -16,7 +16,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetryClass, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { boundFailureText, compileRefusalType, failureWords, FAILURE_TEXT_MAX_CHARS, houseReason, isMembraneError, PROVIDER_ERROR_CODE_MAX_CHARS } from './failure-text.js';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 // Not named imports from context-manager: 0.24.0 has neither, and a named
 // import of either would fail this package's load there before create()
 // could name the release it needs.
@@ -1259,6 +1259,20 @@ function announcedDomainsOf(announce: unknown): string[] {
     ? (announce as { domains?: unknown }).domains
     : undefined;
   return Array.isArray(domains) ? domains.filter((domain): domain is string => typeof domain === 'string') : [];
+}
+
+// A strategy from another context-manager copy can't be matched by class, so its refusal is matched by name.
+function isNoFoldPlanRefusal(error: unknown): boolean {
+  return error instanceof Error && error.name === 'NoFoldPlanToPreviewError';
+}
+
+interface RestartDecline {
+  reason: 'wont_fit' | 'uncovered_drop';
+  finalTokens?: number;
+  budgetTokens?: number;
+  clearedBy?: readonly string[];
+  streamId: number;
+  key?: string;
 }
 
 /**
@@ -4745,6 +4759,7 @@ export class AgentFramework {
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
    *  its admission back; the park, woken, then finds it gone. */
   private parkedContinuations: Set<InferenceRequest> = new Set();
+  private restartDeclines = new WeakMap<Agent, RestartDecline>();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
    *  token, and a turn that has ended isn't live (liveTurns). A later start
@@ -4945,6 +4960,8 @@ export class AgentFramework {
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
+  private readonly sharedSlotManagers = new WeakSet<ContextManager>();
+  private sharedSlotRowChanges = 0;
   /** The batched wakes' rows (BATCH_ROWS) whose line a start has written,
    *  with the agents it was written for, by the array every copy of a wake's
    *  request carries; and a merge's union's parts (batchRowsParts), which
@@ -7521,8 +7538,7 @@ export class AgentFramework {
   ): boolean {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return false;
-    if (!this.budgetHolds || !this.running || this.providerAdmissionClosed) return false;
-    if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent || this.budgetHolds.has(agent.name)) return false;
+    if (!this.budgetHoldCanTake(agent)) return false;
     if (!this.compressionPending(agent)) return false;
     if (checkpoint !== undefined) {
       try {
@@ -7625,6 +7641,11 @@ export class AgentFramework {
       console.error(`[budget-hold] agent=${agent.name}: could not read the rows its held turn stands on, so a surgery checks its wake's rows alone:`, error);
     }
     return { standsOn, ownRows: rows };
+  }
+
+  private budgetHoldCanTake(agent: Agent): boolean {
+    if (!this.budgetHolds || !this.running || this.providerAdmissionClosed) return false;
+    return !this.ephemeralRuns.has(agent.name) && this.agents.get(agent.name) === agent && !this.budgetHolds.has(agent.name);
   }
 
   private compressionPending(agent: Agent): boolean {
@@ -12478,6 +12499,7 @@ export class AgentFramework {
         throw new Error(`resumeAgent: "${name}" was registered while it was being resumed`);
       }
       agent = new Agent(fullConfig, contextManager, this.membrane);
+      if (this.sharedSlotManagers.has(contextManager)) agent.readRowChangesFrom(() => this.sharedSlotRowChanges);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     } catch (error) {
@@ -12612,6 +12634,7 @@ export class AgentFramework {
         membrane,
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
+      this.feedSharedSlot(opened);
       return this.recordView(opened, residentView);
     }
     const namespace = own?.namespace ?? record.namespace;
@@ -13924,6 +13947,36 @@ export class AgentFramework {
     if (!run) return;
     run.toolCallsCount += count;
     run.lastActivity = Date.now();
+  }
+
+  private declineBudgetRestart(agent: Agent): { decline: RestartDecline; previewed: boolean } | undefined {
+    let decline: RestartDecline | undefined;
+    try {
+      const pin = this.turnRouting.get(agent.name)?.inputsPin;
+      const excludePins = pin?.agent === agent ? [pin.id] : undefined;
+      const key = () => JSON.stringify([agent.restartPreviewKey(excludePins), this.budgetHoldCanTake(agent)]);
+      const remembered = this.restartDeclines.get(agent);
+      if (remembered?.streamId === agent.streamId && remembered.key !== undefined && remembered.key === key()) {
+        return { decline: remembered, previewed: false };
+      }
+      const preview = agent.previewCompile(excludePins);
+      if (preview !== null && !preview.fits && (!preview.clearedBy?.includes('compression') || !this.budgetHoldCanTake(agent))) {
+        decline = {
+          reason: 'wont_fit', finalTokens: preview.finalTokens, budgetTokens: preview.budgetTokens,
+          ...(preview.clearedBy !== undefined ? { clearedBy: preview.clearedBy } : {}),
+          streamId: agent.streamId, ...(preview.clearedBy?.includes('newer-message') ? {} : { key: key() }),
+        };
+      }
+    } catch (error) {
+      if (error instanceof UncoveredDropError || (error instanceof Error && error.name === 'UncoveredDropError')) {
+        if (!this.compressionPending(agent) || !this.budgetHoldCanTake(agent)) decline = { reason: 'uncovered_drop', streamId: agent.streamId };
+      } else if (!isNoFoldPlanRefusal(error)) {
+        console.error(`[context-budget] ${agent.name}: the restart's preview failed, so the maxStreamTokens restart goes ahead: ${describeFailureWithFrames(error)}`);
+      }
+    }
+    if (decline) this.restartDeclines.set(agent, decline);
+    else this.restartDeclines.delete(agent);
+    return decline && { decline, previewed: true };
   }
 
   /**
@@ -18746,6 +18799,20 @@ export class AgentFramework {
     }
   }
 
+  private feedSharedSlot(contextManager: ContextManager): void {
+    if (this.sharedSlotManagers.has(contextManager)) return;
+    if (typeof contextManager.onMessage === 'function') {
+      contextManager.onMessage((event) => { if (event.type !== 'add') this.sharedSlotRowChanges++; });
+    }
+    this.sharedSlotManagers.add(contextManager);
+  }
+
+  private joinSharedSlot(agent: Agent, contextManager: ContextManager): void {
+    this.feedSharedSlot(contextManager);
+    agent.readRowChangesFrom(() => this.sharedSlotRowChanges);
+    this.sharedSlotAgents.add(agent);
+  }
+
   /**
    * A configured agent (a resident). `configured` is every configured
    * agent's name: an agent its `observes` names may be registered after it,
@@ -18793,7 +18860,7 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.sharedSlotAgents.add(agent);
+    this.joinSharedSlot(agent, contextManager);
     // The first resident declared owns default delivery. Its observe edges
     // are its configuration's `observes`, each on another configured agent.
     this.announceAgentCreated(
@@ -19655,7 +19722,7 @@ export class AgentFramework {
           // compiles afresh, and what that compile changes ahead of the turn's own earlier rounds takes their
           // reasoning out of the request mid-step. The window projection below still breaks the stream before a
           // request the window can't hold (issue #92).
-          const overBudget = currentState.stream
+          const overStreamBudget = currentState.stream
             && !(agent.thinkingBindingOption() !== undefined && agent.physicalWindowTokens !== undefined)
             && agent.lastStreamInputTokens > 0
             && agent.lastStreamInputTokens > agent.maxStreamTokens;
@@ -19689,6 +19756,25 @@ export class AgentFramework {
             : 0;
           const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
 
+          const declined = overStreamBudget && !shouldEndTurn && !this.providerAdmissionClosed && !overPhysical
+            ? this.declineBudgetRestart(agent) : undefined;
+          const overBudget = overStreamBudget && !overPhysical && declined === undefined;
+          const budgetRestart = overStreamBudget && (overPhysical || declined === undefined);
+          if (declined) {
+            const { decline, previewed } = declined;
+            this.emitTrace({
+              type: 'inference:restart_declined',
+              agentName: agent.name,
+              reason: decline.reason,
+              previewed,
+              inputTokens: agent.lastStreamInputTokens,
+              maxStreamTokens: agent.maxStreamTokens,
+              ...(decline.finalTokens !== undefined ? { finalTokens: decline.finalTokens } : {}),
+              ...(decline.budgetTokens !== undefined ? { budgetTokens: decline.budgetTokens } : {}),
+              ...(decline.clearedBy !== undefined ? { clearedBy: [...decline.clearedBy] } : {}),
+            });
+          }
+
           // Under `speech.locus: 'delivery'` incoming traffic never moves the
           // pin — so when someone addresses the agent mid-turn from another
           // channel, the agent must be told who and from where, or a neutral
@@ -19705,7 +19791,7 @@ export class AgentFramework {
           const boundaryMode = this.proseRoutingOf(agent);
           const routesLocus = (boundaryMode === 'locus' || boundaryMode === 'hybrid') && !silentTurn;
           const noticesElsewhere = (this.speechLocus === 'delivery' && routesLocus) || (boundaryMode === 'locked' && !silentTurn);
-          if (noticesElsewhere && !shouldEndTurn && !overBudget && currentState.stream) {
+          if (noticesElsewhere && !shouldEndTurn && !budgetRestart && currentState.stream) {
             const routing = this.routingOf(agent.name);
             for (const inj of [...midTurnInjections]) {
               const m = inj.metadata as Record<string, unknown> | undefined;
@@ -19738,8 +19824,9 @@ export class AgentFramework {
           // the 2026-07-21 Cairn hijack protection is unchanged; this extends
           // the ratified addressed-outranks-ambient principle from turn start
           // to boundaries. Locus mode only (explicit mode has no pin).
-          // Skipped on endTurn/overBudget: no further prose this stream, and
-          // a stale "for this turn" notice would be pure noise.
+          // Skipped at a boundary that ends the turn or restarts it past
+          // maxStreamTokens (budgetRestart): no further prose this stream,
+          // and a stale "for this turn" notice would be pure noise.
           //
           // The notice rides the SAME injection batch — stored right after
           // the flushed messages and appended to midTurnInjections — so the
@@ -19751,7 +19838,7 @@ export class AgentFramework {
           // agent's mode, so its boundary neither re-pins nor notes. The
           // trigger is this stream's: its start holds the agent's turn token
           // while the agent waits on this round's tools.
-          if (this.speechLocus === 'latest-inbound' && routesLocus && !shouldEndTurn && !overBudget && currentState.stream) {
+          if (this.speechLocus === 'latest-inbound' && routesLocus && !shouldEndTurn && !budgetRestart && currentState.stream) {
             // Two signals qualify an injection to move the pin (n=6 + n=7):
             //  - chat:addressed — someone explicitly spoke TO the agent
             //    (mention / reply / DM);
@@ -19864,9 +19951,6 @@ export class AgentFramework {
             if (restarted) this.emitTrace({
               type: 'inference:stream_restarted',
               agentName: agent.name,
-              // 'physical_window' only when the budget check alone would
-              // have let the doomed request through — overBudget keeps its
-              // established label for existing consumers.
               reason: overBudget ? 'context_budget' : 'physical_window',
               inputTokens: overBudget ? agent.lastStreamInputTokens : projectedRealTokens,
               budget: overBudget ? agent.maxStreamTokens : (agent.physicalWindowTokens ?? 0),
@@ -30837,8 +30921,6 @@ export class AgentFramework {
             this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
-            // The stream's accumulated fresh input, which is what the
-            // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;
 
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL
@@ -36023,9 +36105,12 @@ export class AgentFramework {
     // failure (a provider's 400, say) already says what it is, and its
     // message is the provider's text, which can quote anything, including
     // these phrases from the agent's own context.
+    const decline = errorType === 'context_length' && agent ? this.restartDeclines?.get(agent) : undefined;
+    const afterDecline = decline !== undefined && decline.streamId === agent?.streamId;
     const overBudget =
       errorType === 'over_budget' ||
       errorType === 'context_refusal' ||
+      afterDecline ||
       // Decided on the whole reason: presentation bounds never change it.
       (errorType === undefined && /exceed hard budget|no summary covers/i.test(wholeReason));
     // Observability: a refused compile means the agent cannot think AT ALL
@@ -36040,12 +36125,16 @@ export class AgentFramework {
       : !agent ? 'unavailable (no agent handle)'
       : this.kickOverBudgetDrain(agentName, agent);
     if (overBudget) {
+      const opening = afterDecline
+        ? `the provider refused a request as too long on a stream whose maxStreamTokens restart was declined, since ${decline?.reason === 'uncovered_drop' ? 'its compile would drop messages no summary covers' : "its compile wouldn't fit"}`
+        : `compile refused (${errorType ?? 'unclassified'})`;
+      const close = ` — drain breaker ${drainState}; ` + (afterDecline
+        ? `if this persists, set physicalWindowTokens below the provider's window.`
+        : `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`);
       this.opsAlert(
         'context-refusal',
         agentName,
-        `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
-        `drain breaker ${drainState}; ` +
-        `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
+        `${opening}: ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)}${close}`,
         { skipLog: true },
       );
     }
