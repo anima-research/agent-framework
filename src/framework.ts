@@ -36186,6 +36186,7 @@ export class AgentFramework {
       ...(answers ? {
         channelId: answers.channel.channelId,
         channelServerId: answers.channel.serverId,
+        addressed: true,
         ...(answers.messageId ? { answersMessageId: answers.messageId } : {}),
       } : {}),
       ...this.wakeChannelsMark(routing),
