@@ -703,4 +703,28 @@ describe('messageQuietPeriod in the scheduler', () => {
       await framework.stop();
     }
   });
+
+  it("a read-drop that empties a pass keeps the hold of a burst whose newer wake is queued (b9034c4 review, 4)", async () => {
+    const { framework, internals, traces } = await start({ quietMs: 5_000 });
+    const x = framework as unknown as { rowDone(agent: unknown, row: string, to: unknown): boolean };
+    const room = { channelId: 'discord:g:room', channelServerId: 'discord' };
+    const seen: string[] = [];
+    let readNow = false;
+    x.rowDone = (_agent, row) => {
+      seen.push(row);
+      if (row !== 'row-1' || !readNow) return false;
+      if (!internals.pendingRequests.some((r) => r.readsRow === 'row-2')) wake(internals, { ...room, readsRow: 'row-2' });
+      return true;
+    };
+    try {
+      wake(internals, { ...room, readsRow: 'row-1' });
+      await waitFor(() => heldKeys(traces).length >= 1, 'the hold', 2_000);
+      readNow = true;
+      await waitFor(() => seen.filter((row) => row === 'row-2').length >= 2, 'two passes over the newer wake', 3_000);
+      assert.deepEqual(released(traces), [], 'the burst still waits, so its hold goes on');
+      assert.deepEqual(heldKeys(traces), [key('discord:g:room')], 'one hold, not a second one for the newer wake');
+    } finally {
+      await framework.stop();
+    }
+  });
 });

@@ -23366,7 +23366,7 @@ export class AgentFramework {
         console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
-          this.pruneQuietHolds(agentName, new Set(), now);
+          this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName), now);
           this.endPendingPrimary(agentName);
           continue;
         }
