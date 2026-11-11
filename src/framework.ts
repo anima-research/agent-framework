@@ -29451,6 +29451,12 @@ export class AgentFramework {
             const privateThinkKept = privateThinkWithheld > 0 && silencedPrivateThinkRounds.size > 0
               ? runsBesideThink - splitProseRuns(withoutRoundsProse(response.content, new Set([...refusedOnly, ...silencedPrivateThinkRounds]))).length
               : 0;
+            // Those of them kept back because a watched script hadn't returned:
+            // the native path's withhold counts a round's prose as suppressed
+            // then, whatever the routing, and never routes it to be counted again.
+            const unreturnedWithheld = privateThinkWithheld > 0 && unreturnedScriptRounds.size > 0
+              ? runsBesideThink - splitProseRuns(withoutRoundsProse(response.content, new Set([...refusedOnly, ...unreturnedScriptRounds]))).length
+              : 0;
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
             // queued rounds are.
@@ -29757,6 +29763,7 @@ export class AgentFramework {
                   this.recordProseSuppression(streamRouting, privateThinkWithheld);
                 } else {
                   streamRouting.keptPrivate += privateThinkKept;
+                  if (unreturnedWithheld > 0) this.recordProseSuppression(streamRouting, unreturnedWithheld);
                 }
               }
 
