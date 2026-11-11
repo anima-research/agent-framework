@@ -62,8 +62,9 @@ export function splitProseRuns(content: readonly ContentBlock[]): string[] {
  * round's `tool_result` blocks. So a round with no prose still counts, two
  * calls of one round (their `tool_use` blocks come before any result) stay
  * one round, and a round is found by its place, whatever its text holds.
- * Other rounds' text, every non-text block and the text after the last round
- * stay.
+ * Text after a round's calls with no results after them (a response that
+ * completed while they went unanswered) is after that round. Other rounds'
+ * text, every non-text block and the text after the last round stay.
  */
 export function withoutRoundsProse(
   content: readonly ContentBlock[],
@@ -71,15 +72,21 @@ export function withoutRoundsProse(
 ): ContentBlock[] {
   let round = 0;
   let afterResults = false;
+  let afterCalls = false;
   return content.filter((block) => {
     if (block.type === 'tool_result') {
       afterResults = true;
       return true;
     }
-    if (afterResults) {
+    // Text after a round's calls with no results between them is a response
+    // that completed while those calls went unanswered: it's the text after
+    // that round, as the native path's terminal content takes it.
+    if (afterResults || (afterCalls && block.type === 'text')) {
       round++;
       afterResults = false;
+      afterCalls = false;
     }
+    if (block.type === 'tool_use') afterCalls = true;
     return !(block.type === 'text' && rounds.has(round));
   });
 }
