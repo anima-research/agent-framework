@@ -22330,10 +22330,10 @@ export class AgentFramework {
     this.cancelCoalescedWakes(subject, !this.quietPeriod);
     await this.queueCoalescedWakes(occ);
     if (since.size > 0) {
-      for (const r of this.pendingRequests) {
+      this.forEachQueuedRequest((r) => {
         const was = r.coalescingSubject === subject ? since.get(r.agentName) : undefined;
         if (was !== undefined) carryQuietSince(r, was);
-      }
+      });
     }
     if (this.quietPeriod) for (const agentName of [...(this.quietHolds?.keys() ?? [])]) this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName));
   }

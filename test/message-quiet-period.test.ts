@@ -603,4 +603,52 @@ describe('messageQuietPeriod in the scheduler', () => {
       assert.ok(!existsSync(storePath) || readdirSync(storePath).length === 0, `a refused config leaves no store behind: ${JSON.stringify(bad)}`);
     }
   });
+
+  type Replacing = {
+    pendingRequests: InferenceRequest[];
+    passRequests: Set<Map<string, InferenceRequest[]>>;
+    budgetHolds: Map<string, { wakes: InferenceRequest[] }>;
+    cancelCoalescedWakes(subject: string): void;
+    queueCoalescedWakes(occ: unknown): Promise<void>;
+    wakeForCoalescedBatch(occ: unknown): Promise<void>;
+  };
+  /** A quiesced framework whose coalesced notices queue a wake through
+   *  `place`, for the replacement-age tests. */
+  async function replacing(place: (x: Replacing, wake: InferenceRequest) => void) {
+    const started = await start({ quietMs: 10_000, maxWaitMs: 10_000 });
+    const x = started.internals as unknown as Replacing;
+    await (started.framework as unknown as { quiesce(o?: unknown): Promise<unknown> }).quiesce();
+    const box = { subject: '' };
+    const cancel = x.cancelCoalescedWakes.bind(started.framework);
+    x.cancelCoalescedWakes = (s: string) => { box.subject = s; cancel(s); };
+    x.queueCoalescedWakes = async () => {
+      place(x, message(Date.now(), { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: box.subject }));
+    };
+    const occ = { serverId: 'x', binding: 'b', scope: 's', key: 'k' };
+    await x.wakeForCoalescedBatch(occ);
+    x.pendingRequests.length = 0;
+    const old = message(Date.now() - 9_000, { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: box.subject });
+    const capLeft = (wake: InferenceRequest) => [...quietSplit([wake], Date.now(), { quietMs: 10_000, maxWaitMs: 10_000 }).waiting.values()][0];
+    return { ...started, x, occ, old, capLeft };
+  }
+
+  it("a replacement already in a pass's hands when the age is carried still carries it (b9034c4 review, 3)", async () => {
+    let placed: InferenceRequest | undefined;
+    const pass = new Map<string, InferenceRequest[]>();
+    const { framework, x, occ, old, capLeft } = await replacing((x, wake) => {
+      placed = wake;
+      if (x.passRequests.has(pass)) pass.set('agent', [wake]);
+      else x.pendingRequests.push(wake);
+    });
+    try {
+      x.pendingRequests.push(old);
+      x.passRequests.add(pass);
+      await x.wakeForCoalescedBatch(occ);
+      const left = capLeft(placed!);
+      assert.ok(left === undefined || left < 2_000, `the cap counts from the first wake: ${left} ms left`);
+    } finally {
+      x.passRequests.delete(pass);
+      await framework.stop();
+    }
+  });
 });
