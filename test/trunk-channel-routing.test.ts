@@ -32,7 +32,7 @@ import type {
   EventResponse,
 } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, RECORD_DELIVERED } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { MembraneError } from '@animalabs/membrane';
@@ -162,7 +162,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i = internals(framework);
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,
@@ -228,7 +228,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i = internals(framework);
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,
@@ -299,7 +299,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const asked: string[] = [];
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,
@@ -323,7 +323,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i2 = internals(fw2);
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,
@@ -348,7 +348,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i3 = internals(fw3);
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,
@@ -386,7 +386,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       const asked: string[] = [];
       internals(framework).channelRegistry = {
         ensureChannelRegistered: () => {},
-        noteDelivered: () => false,
+        [RECORD_DELIVERED]: () => false,
         isChannelOpen: () => false,
         // A reply leaves this channel closed: the agent closed or declined it.
         speechOpens: (c: { serverId: string; channelId: string }) => { asked.push(`${c.serverId}/${c.channelId}`); return false; },
@@ -419,7 +419,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i = internals(framework);
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,
@@ -460,7 +460,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const i = internals(framework);
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,
@@ -511,7 +511,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     };
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
-      noteDelivered: () => false,
+      [RECORD_DELIVERED]: () => false,
       isChannelOpen: () => false,
       speechOpens: () => true,
       getDesiredState: () => undefined,

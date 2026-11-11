@@ -688,6 +688,8 @@ export function destinationKey(to: ChannelRef): string {
   return JSON.stringify([to.serverId, to.channelId]);
 }
 
+export const RECORD_DELIVERED = Symbol('recordDelivered');
+
 /** Whether two refs name the same channel. Two absent refs are the same:
  *  neither names a channel. */
 export function sameChannel(a: ChannelRef | null | undefined, b: ChannelRef | null | undefined): boolean {
@@ -2456,10 +2458,13 @@ export class ChannelRegistry {
    * count at arrival and at acceptance (markAccepted): a message that
    * arrived before its server's removal and is admitted once the server
    * registers the channel again sets the anchor here, as a message delivered
-   * on a live channel, where main's would set nothing. Returns whether it set
-   * the anchor.
+   * on a live channel, where main's would set nothing.
    */
-  noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): boolean {
+  noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): void {
+    this[RECORD_DELIVERED](channel, messageId, threadId, tags, firstView);
+  }
+
+  [RECORD_DELIVERED](channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): boolean {
     // A marker is ABOUT a message, not one the agent replies to: it leaves
     // the anchor where it was (#157), and so does a chat:system notice (a
     // join, the weather), which is about the place (isMarkerTagged). An edit
