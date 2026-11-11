@@ -62,41 +62,24 @@ export function splitProseRuns(content: readonly ContentBlock[]): string[] {
  * round's `tool_result` blocks. So a round with no prose still counts, two
  * calls of one round (their `tool_use` blocks come before any result) stay
  * one round, and a round is found by its place, whatever its text holds.
- * Text between two calls of one round is that round's; text after a round's
- * last call with no results after it (a response that completed while the
- * call went unanswered) is after that round. Other rounds' text, every
- * non-text block and the text after the last round stay.
+ * Other rounds' text, every non-text block and the text after the last round
+ * stay.
  */
 export function withoutRoundsProse(
   content: readonly ContentBlock[],
   rounds: ReadonlySet<number>,
 ): ContentBlock[] {
-  // Whether a call comes after each place before the next results (or the
-  // end): text between two calls of one round is that round's.
-  const callAhead: boolean[] = new Array(content.length).fill(false);
-  for (let i = content.length - 2, ahead = false; i >= 0; i--) {
-    const next = content[i + 1]!.type;
-    if (next === 'tool_use') ahead = true;
-    else if (next === 'tool_result') ahead = false;
-    callAhead[i] = ahead;
-  }
   let round = 0;
   let afterResults = false;
-  let afterCalls = false;
-  return content.filter((block, i) => {
+  return content.filter((block) => {
     if (block.type === 'tool_result') {
       afterResults = true;
       return true;
     }
-    // Text after a round's last call with no results after it is a response
-    // that completed while that call went unanswered: it's the text after the
-    // round, as the native path's terminal content takes it.
-    if (afterResults || (afterCalls && block.type === 'text' && !callAhead[i])) {
+    if (afterResults) {
       round++;
       afterResults = false;
-      afterCalls = false;
     }
-    if (block.type === 'tool_use') afterCalls = true;
     return !(block.type === 'text' && rounds.has(round));
   });
 }

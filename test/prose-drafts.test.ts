@@ -3276,17 +3276,18 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
   });
 
   // A stream that completes while the think round's call is still unanswered
-  // (finding 3 of the review of 8dbd802ba3e6): the text after the call is the
-  // turn's trailing prose, as the native path's terminal content has it, not
-  // the private round's, though no result marks where the round ended.
+  // (finding 3 of the review of 8dbd802ba3e6): the native path routes the text
+  // after the call as trailing prose. The fallback keeps it back with the
+  // round, since content that ends at an unanswered call can't be told from a
+  // round cut off at max_tokens, whose text after the call is the round's own.
   for (const xml of [false, true]) {
-    it(`${xml ? 'XML tool mode' : 'native mode'}: completed while a private think is unanswered, the text after the call still goes out`, async () => {
+    it(`${xml ? 'XML tool mode: completed while a private think is unanswered, the text after the call stays back with its round' : 'native mode: completed while a private think is unanswered, the text after the call goes out'}`, async () => {
       const h = await harness({ xml, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
       try {
         const round = [text('Private beside think.'), call('t1', 'think', { content: 'hmm' }), text('Trailing after the call.')];
         completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] } as NormalizedResponse);
         await h.turn([createMockResponse(round, 'tool_use')]);
-        assert.deepEqual(h.publishes().map((p) => p.text), ['Trailing after the call.']);
+        assert.deepEqual(h.publishes().map((p) => p.text), xml ? [] : ['Trailing after the call.']);
         assert.deepEqual(h.drafts(), [], 'never drafted');
       } finally {
         await h.close();
@@ -3630,13 +3631,14 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         const hangs = `await tools.think({ content: "hmm" }); await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
         const round = [text(LINE), script('ce1', hangs)];
         // The send reaches the host only after the think returned.
-        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse([...round, text('After.')]), toolCalls: [] }, () => h.sends().length === 1);
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] }, () => h.sends().length === 1);
         await h.turn([createMockResponse(round, 'tool_use')]);
         assert.equal(gate.missed, false, 'the stream completed after the script got past its think to the send');
         assert.deepEqual(inRoom(h), []);
-        // The trailing line reached the turn's end and is held where the send may have
-        // posted: the delivery ran, and the round's own line was never drafted.
-        assert.deepEqual(held(h), [['After.', 'explicit-send']]);
+        assert.deepEqual(held(h), [], 'never drafted');
+        // The turn reached its end's delivery, which counts the round kept back.
+        assert.ok(h.texts().some((t) => t.startsWith('[delivered]') && t.includes('suppressed')),
+          JSON.stringify(h.texts().filter((t) => t.startsWith('[delivered]'))));
       } finally {
         await h.close();
       }
@@ -3653,13 +3655,14 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.sendMode('hang');
         const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
         const round = [text(LINE), script('ce1', hangs)];
-        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse([...round, text('After.')]), toolCalls: [] }, () => h.sends().length === 1);
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] }, () => h.sends().length === 1);
         await h.turn([createMockResponse(round, 'tool_use')]);
         assert.equal(gate.missed, false, 'the stream completed after the script\'s send reached the host');
         assert.deepEqual(inRoom(h), []);
-        // The trailing line reached the turn's end and is held where the send may have
-        // posted: the delivery ran, and the round's own line was never drafted.
-        assert.deepEqual(held(h), [['After.', 'explicit-send']]);
+        assert.deepEqual(held(h), [], 'never drafted');
+        // The turn reached its end's delivery, which counts the round kept back.
+        assert.ok(h.texts().some((t) => t.startsWith('[delivered]') && t.includes('suppressed')),
+          JSON.stringify(h.texts().filter((t) => t.startsWith('[delivered]'))));
       } finally {
         await h.close();
       }
@@ -3671,13 +3674,14 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.sendMode('hang');
         const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
         const round = [text(LINE), call('t1', 'think', { content: 'hmm' }), script('ce1', hangs)];
-        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse([...round, text('After.')]), toolCalls: [] }, () => h.sends().length === 1);
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] }, () => h.sends().length === 1);
         await h.turn([createMockResponse(round, 'tool_use')]);
         assert.equal(gate.missed, false, "the stream completed after the script's send reached the host");
         assert.deepEqual(inRoom(h), []);
-        // The trailing line reached the turn's end and is held where the send may have
-        // posted: the delivery ran, and the round's own line was never drafted.
-        assert.deepEqual(held(h), [['After.', 'explicit-send']]);
+        assert.deepEqual(held(h), [], 'never drafted');
+        // The turn reached its end's delivery, which counts the round kept back.
+        assert.ok(h.texts().some((t) => t.startsWith('[delivered]') && t.includes('suppressed')),
+          JSON.stringify(h.texts().filter((t) => t.startsWith('[delivered]'))));
       } finally {
         await h.close();
       }

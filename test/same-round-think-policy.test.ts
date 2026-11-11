@@ -185,7 +185,7 @@ class LegacyNoRoundContentStream {
   private pendingResolve: (() => void) | null = null;
   private deliveredComplete = false;
 
-  /** `trailing`: text the completion carries after the round's calls. */
+  /** `trailing`: text the completion carries after the round's calls and their results. */
   constructor(private readonly trailing?: string) {}
 
   provideToolResults(_results: unknown[]): void {
@@ -222,7 +222,11 @@ class LegacyNoRoundContentStream {
       type: 'complete',
       response: createMockResponse([
         ...makeToolRound(TILDE_PREFACE_80),
-        ...(this.trailing ? [{ type: 'text', text: this.trailing } as ContentBlock] : []),
+        ...(this.trailing ? [
+          { type: 'tool_result', toolUseId: 'think-1', content: 'ok' },
+          { type: 'tool_result', toolUseId: 'read-1', content: 'ok' },
+          { type: 'text', text: this.trailing },
+        ] as ContentBlock[] : []),
       ]),
     } as StreamEvent;
   }
@@ -1027,15 +1031,15 @@ describe('same-round think text policy', () => {
   // case pinned as "legacy behavior remains unchanged". The think description
   // speaks of the same native round, and this path has no native rounds, so
   // the turn-end delivery now drops the round's text by its place, as the
-  // native path does as the round ends. The text after the round's calls goes
+  // native path does as the round ends. The text after the round's results goes
   // out, which shows the turn reached that delivery.
   it('legacy/no-roundContent: a private policy withholds the text beside think()', async () => {
-    const membrane = new LegacyNoRoundContentMembrane('after the calls');
+    const membrane = new LegacyNoRoundContentMembrane('after the results');
     const { dir, framework, routed } = await createFramework({ policy: 'private', membrane });
     try {
       trigger(framework);
       await framework.runUntilIdle();
-      assert.deepEqual(routed, ['after the calls']);
+      assert.deepEqual(routed, ['after the results']);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
