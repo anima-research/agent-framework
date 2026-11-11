@@ -980,15 +980,15 @@ const quietPeriodOf = (value: unknown): { quietMs: number; maxWaitMs: number } |
  * channel neither delays another channel's turn nor takes its reply.
  */
 export function quietBurstKey(r: InferenceRequest): string {
-  return r.channelId === undefined
-    ? `source\u0000${r.source}`
-    : `channel\u0000${r.channelServerId ?? r.source}\u0000${r.channelId}`;
+  return JSON.stringify(r.channelId === undefined
+    ? ['source', r.source]
+    : ['channel', r.channelServerId ?? r.source, r.channelId]);
 }
 
 /** A burst key for a log line: `channel discord:g:salon` or `source tsm`,
  *  each part shown as logValue shows it, so an id can't forge a line. */
 function describeQuietBurst(key: string): string {
-  const [kind, ...rest] = key.split('\u0000');
+  const [kind, ...rest] = JSON.parse(key) as string[];
   return `${kind} ${rest.map((part) => logValue(part)).join(':')}`;
 }
 

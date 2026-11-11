@@ -766,4 +766,10 @@ describe('messageQuietPeriod in the scheduler', () => {
     f.quietPeriod = undefined;
     assert.doesNotMatch(f.upcomingWakesFor('agent')[0]!.what, /quiet period/, 'with the option off, it is due as soon as the agent is free');
   });
+
+  it("a burst's key is printable: no NUL, the parts as a JSON array (b9034c4 review, 27)", () => {
+    assert.equal(key('discord:g:room'), '["channel","discord","discord:g:room"]');
+    assert.equal(quietBurstKey(message(0, { source: 'tsm' })), '["source","tsm"]');
+    assert.ok(!key('a\u0000b').includes('\u0000'), 'an id holding NUL is escaped');
+  });
 });

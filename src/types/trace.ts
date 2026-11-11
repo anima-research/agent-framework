@@ -774,9 +774,10 @@ export type TraceEvent =
   // Message quiet period (FrameworkConfig.messageQuietPeriod)
   /** An idle agent's turn is held for a burst of message wakes: one event
    *  when the hold begins, naming the burst (a channel's, `channel`, server
-   *  and id, or a channel-less source's, `source`, name; the parts joined by
-   *  NUL) and how long until it is ready as of this pass (0 for a burst
-   *  ready now that waits only for another burst's turn to start first). */
+   *  and id, or a channel-less source's, `source`, name; the parts as a JSON
+   *  array, such as `["channel","discord","g1:room"]`) and how long until it
+   *  is ready as of this pass (0 for a burst ready now that waits only for
+   *  another burst's turn to start first). */
   | (TraceEventBase & {
       type: 'quiet-period:held';
       agentName: string;
