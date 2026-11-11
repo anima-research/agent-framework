@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 
-/** `value` as JSON with each object's keys sorted, so it doesn't depend on their order. */
 export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (value && typeof value === 'object') {
