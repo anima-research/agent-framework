@@ -330,6 +330,59 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
     }
   });
 
+  // A start parked behind an auxiliary call keeps its trigger in its own
+  // closure, where no withdrawal reaches it, so a notice to its own subject
+  // during the park queues a fresh wake for that subject. The start still
+  // takes the batch it was woken for, as without the option: its turn reads
+  // it, and the fresh wake is withdrawn as the batch is taken (R5-1).
+  for (const on of [true, false]) {
+    for (const mixed of [false, true]) {
+      it(`a ${mixed ? "start merging the batch's wake with another wake naming its channel" : 'batch-only start'}, parked behind an auxiliary call, takes its own batch though a notice to it lands during the park (R5-1, option ${on ? 'on' : 'off'})`, async () => {
+        const f = await fixture({
+          framework: { ...(on ? { messageQuietPeriod: { quietMs: 600 } } : {}), gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
+          mcpl: {},
+        });
+        try {
+          f.alwaysRespond();
+          await f.register('room');
+          await f.register('general');
+          await f.framework.start();
+          const x = f.framework as unknown as { providerGate(agent: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> }; pendingRequests: InferenceRequest[] };
+          const gate = x.providerGate('agent');
+          gate.auxiliaryInFlight++;
+          if (mixed) {
+            // A wake that isn't a message's, naming the batch's channel,
+            // queued beside the batch's wake before any pass: the start
+            // merges them (MERGED_BATCH), so it isn't batch-only and has no
+            // causes.
+            const fw = f.framework as unknown as { queueCoalescedWakes(...args: unknown[]): Promise<void> };
+            const queue = fw.queueCoalescedWakes.bind(fw);
+            fw.queueCoalescedWakes = async (...args) => {
+              await queue(...args);
+              fw.queueCoalescedWakes = queue;
+              const wake = x.pendingRequests.find((r) => r.coalescingSubject !== undefined)!;
+              x.pendingRequests.push({ agentName: 'agent', reason: 'self-wake', source: wake.source, channelId: wake.channelId, channelServerId: wake.channelServerId, timestamp: Date.now() });
+            };
+          }
+          await f.send('push/event', batch('b1', 'GENQ batch question', 'general'));
+          await waitFor(() => gate.idleWaiters.length > 0, 'the start parked');
+          assert.equal(f.membrane.calls.length, 0, 'the start is parked');
+          await f.send('push/event', { ...batch('b2', 'GENQ more', 'general'), coalesce: { channelId: 'general', key: 'doc', deferred: true } });
+          await sleep(100);
+          gate.auxiliaryInFlight = 0;
+          for (const resolve of gate.idleWaiters.splice(0)) resolve();
+          await waitFor(() => f.published.length >= 1, "general's answer", 6_000);
+          await sleep(1_500);
+          assert.deepEqual(f.published.map((p) => p.channelId), ['general'], 'one turn, in the channel that was asked');
+          const carries = f.membrane.calls.map((c) => JSON.stringify((c as { messages?: unknown }).messages).includes('document_diff'));
+          assert.deepEqual(carries, [true], 'the turn read the batch it was started for');
+        } finally {
+          await f.close();
+        }
+      });
+    }
+  }
+
   it("a batch that opens for an existing subject while another channel's turn is assembling is left for its own turn, in its channel", async () => {
     const f = await fixture({
       framework: { messageQuietPeriod: { quietMs: 600 }, gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,

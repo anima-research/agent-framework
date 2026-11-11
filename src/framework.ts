@@ -1513,6 +1513,15 @@ function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined 
   return (request as MarkedRequest)[MERGED_BATCH];
 }
 
+function ownSubjects(trigger: InferenceRequest | undefined): Set<string> {
+  const own = new Set<string>();
+  for (const r of trigger ? [trigger, ...(mergedBatch(trigger) ?? [])] : []) {
+    if (r.coalescingSubject !== undefined) own.add(r.coalescingSubject);
+    for (const subject of r.coalescingBatchSubjects ?? []) own.add(subject);
+  }
+  return own;
+}
+
 /** The wakes of a merged start's batch (MERGED_BATCH): its requests that
  *  don't carry the turn on. */
 function mergedWakes(request: InferenceRequest): InferenceRequest[] {
@@ -22495,13 +22504,17 @@ export class AgentFramework {
    *  wake waits for a turn of its own (held, or ready and waiting its turn),
    *  so this start's assembly leaves the batch (PushCoalescer.assemble's
    *  `leave`). Read from the queue, not from the hold map, so a replacement
-   *  notice in flight or a hold not yet traced can't open the door. The
-   *  start's own causes are never left: assemble keeps them whatever this
-   *  says. `isMessageWake` is defensive here: a queued coalesced wake is one
-   *  by construction. */
-  private quietLeaves(agentName: string): ((subject: string) => boolean) | undefined {
+   *  notice in flight or a hold not yet traced can't open the door. A
+   *  subject the start was woken for (`own`: its trigger's and its merged
+   *  wakes') is never left, whether its wakes were batch-only or merged with
+   *  another wake: a notice that queues a fresh wake for it while the start
+   *  is parked or assembling would otherwise send this turn out without the
+   *  content it was started for. `isMessageWake` is defensive here: a queued
+   *  coalesced wake is one by construction. */
+  private quietLeaves(agentName: string, own: ReadonlySet<string>): ((subject: string) => boolean) | undefined {
     if (!this.quietPeriod) return undefined;
     return (subject) => {
+      if (own.has(subject)) return false;
       let queued = false;
       this.forEachQueuedRequest((r) => {
         if (r.agentName === agentName && r.coalescingSubject === subject && isMessageWake(r)) queued = true;
@@ -28364,7 +28377,7 @@ export class AgentFramework {
         // A batch whose wake a message quiet period holds for a turn of its
         // own is left for that turn (quietLeaves): taken here, its
         // channel's question could only be answered in this turn's channel.
-        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects, this.quietLeaves(agent.name));
+        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects, this.quietLeaves(agent.name, ownSubjects(trigger)));
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       } finally {

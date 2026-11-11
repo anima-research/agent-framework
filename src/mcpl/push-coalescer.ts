@@ -1056,9 +1056,9 @@ export class PushCoalescer<E = unknown> {
    * batch: whether the host holds its wake for a turn of its own (a message
    * quiet period's held bursts), so that turn, not this one, consumes it.
    * It is asked under the lock, at the take, so a batch that opened while
-   * this assembly ran is left too. A cause is never left, and a render
-   * already running is still joined. With nothing held, every pending batch
-   * is taken, as before.
+   * this assembly ran is left too. The host never says it of a subject its
+   * own turn was started for, and a render already running is still
+   * joined. With nothing held, every pending batch is taken, as before.
    */
   async assemble(agentName: string, causes: readonly string[] = [], leave?: (subject: string) => boolean): Promise<AssemblyResult> {
     const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
@@ -1121,8 +1121,8 @@ export class PushCoalescer<E = unknown> {
    * the turn's causes (`cause`), the batch is gone. Returns undefined when
    * the batch was not this assembly's to decide on: there is none and it
    * wasn't a cause, the subject moved on during the audience lookup, the
-   * host holds its wake for a turn of its own (`leave`, never for a cause),
-   * or the host is stopping.
+   * host holds its wake for a turn of its own (`leave`), or the host is
+   * stopping.
    */
   private async freeze(subject: string, agentName: string, cause = false, leave?: (subject: string) => boolean): Promise<{ done: Promise<void>; rendering: Rendering<E>; joined?: true } | 'declined' | undefined> {
     if (this.suspended) return undefined;
@@ -1157,7 +1157,7 @@ export class PushCoalescer<E = unknown> {
     // its audience since. This turn has nothing of it to show. The batch stays
     // pending; nothing here wakes its current audience.
     if (!audience.includes(agentName)) return 'declined';
-    if (!cause && leave?.(subject)) return undefined;
+    if (leave?.(subject)) return undefined;
     state.batch = undefined;
     this.host.cancelWake(subject);
     if (!this.host.authorized(batch.latest)) {
