@@ -23420,11 +23420,11 @@ export class AgentFramework {
         // lets the start through (below), with how long each was held.
         for (const [key, cause] of split.started) if (held?.has(key)) (quietRelease ??= new Map()).set(key, cause);
       }
-      if (split.hold.length > 0) this.pendingRequests.push(...split.hold);
+      if (split.hold.length > 0) appendAll(this.pendingRequests, split.hold);
       if (split.start.length === 0) continue;
       if (split.hold.length > 0) {
         requests.length = 0;
-        requests.push(...split.start);
+        appendAll(requests, split.start);
       }
 
       // Check policy
