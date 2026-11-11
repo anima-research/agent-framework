@@ -2717,7 +2717,7 @@ export class ChannelRegistry {
     // Incoming: the message servers are told the agent is replying to (incomingFor). The
     // anchor is independent of the speech rule: under `speech.locus:
     // 'delivery'` the latest inbound is no fallback for where prose lands,
-    // but it is still the message the agent is replying to.
+    // but servers are still told it's the message the agent is replying to.
     const incoming = this.incomingFor(agentName);
     if (incoming && incoming.channel.serverId === serverId) {
       context.incoming = {
