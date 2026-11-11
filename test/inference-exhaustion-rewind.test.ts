@@ -115,6 +115,21 @@ test("the breaker's retry of a turn its batch gave no channel keeps the batch's 
   assert.deepEqual(fw.pendingRequests[0].wakeChannels, channels);
 });
 
+test("the breaker's retry of a turn that answered a message and gathered a batch's channels keeps both", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const channels = [room, { serverId: 'discord', channelId: 'discord:g:side' }];
+  fw.turnRouting = new Map([['cairn', { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.equal(retry.reason, 'inference-failure-rewind-retry');
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], ['discord:g:room', 'discord', 'm-7'], 'the answered message and its channel');
+  assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
+});
+
 test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
   const { fw, messages, added, restore } = makeHarness({ messages: [
     { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },
