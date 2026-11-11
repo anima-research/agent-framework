@@ -962,14 +962,14 @@ const turnRearmDelays = (value: unknown): readonly number[] => {
  *  0 or more, maxWaitMs defaulting to 30 s; anything else refuses the config. */
 const quietPeriodOf = (value: unknown): { quietMs: number; maxWaitMs: number } | undefined => {
   if (value === undefined) return undefined;
-  const bad = (): never => {
+  const bad = (shown: string): never => {
     throw new Error('FrameworkConfig.messageQuietPeriod must be { quietMs, maxWaitMs? }, each a finite number ' +
-      `of ms, 0 or more, not ${shownValue(value)}`);
+      `of ms, 0 or more, not ${shown}`);
   };
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return bad();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return bad(shownValue(value));
   const { quietMs, maxWaitMs } = value as { quietMs?: unknown; maxWaitMs?: unknown };
-  if (typeof quietMs !== 'number' || !Number.isFinite(quietMs) || quietMs < 0) return bad();
-  if (maxWaitMs !== undefined && (typeof maxWaitMs !== 'number' || !Number.isFinite(maxWaitMs) || maxWaitMs < 0)) return bad();
+  if (typeof quietMs !== 'number' || !Number.isFinite(quietMs) || quietMs < 0) return bad(`quietMs ${shownValue(quietMs)}`);
+  if (maxWaitMs !== undefined && (typeof maxWaitMs !== 'number' || !Number.isFinite(maxWaitMs) || maxWaitMs < 0)) return bad(`maxWaitMs ${shownValue(maxWaitMs)}`);
   return { quietMs, maxWaitMs: maxWaitMs ?? 30_000 };
 };
 

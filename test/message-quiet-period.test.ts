@@ -772,4 +772,20 @@ describe('messageQuietPeriod in the scheduler', () => {
     assert.equal(quietBurstKey(message(0, { source: 'tsm' })), '["source","tsm"]');
     assert.ok(!key('a\u0000b').includes('\u0000'), 'an id holding NUL is escaped');
   });
+
+  it("refuses a bad quiet period naming the field and the value as given (b9034c4 review, 28)", async () => {
+    mkdirSync(TMP, { recursive: true });
+    for (const [bad, shown] of [[{ quietMs: Number.NaN }, /not quietMs NaN/], [{ quietMs: 10, maxWaitMs: Number.POSITIVE_INFINITY }, /not maxWaitMs Infinity/]] as const) {
+      await assert.rejects(
+        AgentFramework.create({
+          storePath: join(TMP, `store-bad-${Math.random().toString(36).slice(2)}`),
+          membrane: new MockMembrane().asMembrane(),
+          agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+          modules: [],
+          messageQuietPeriod: bad as unknown as { quietMs: number },
+        }),
+        shown,
+      );
+    }
+  });
 });
