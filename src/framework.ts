@@ -6632,7 +6632,6 @@ export class AgentFramework {
     for (const name of [...(this.budgetHolds?.keys() ?? [])]) {
       step(() => this.dropBudgetHold(name, { kind: 'shutdown', why: 'the framework is stopping' }));
     }
-    for (const name of [...(this.quietHolds?.keys() ?? [])]) step(() => this.pruneQuietHolds(name, new Set()));
     // An open logical turn doesn't survive a stop.
     this.openLogical.clear();
 
@@ -6726,6 +6725,7 @@ export class AgentFramework {
     await waitFor(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []);
 
     await waitFor(withLeftovers('loop', this.loopPromise ? [{ label: 'event loop', promise: this.loopPromise }] : []), 'loop');
+    for (const name of [...(this.quietHolds?.keys() ?? [])]) step(() => this.pruneQuietHolds(name, new Set()));
 
     // Once the waits above have settled, nothing drives an ephemeral run: no
     // turn starts after stop() begins, every stream it found was cancelled

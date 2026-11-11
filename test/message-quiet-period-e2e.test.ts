@@ -386,6 +386,50 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
     }
   }
 
+  it("a stop while a pass awaits one agent's start still ends, as gone, the hold the pass then makes for another agent's burst (R5-3)", async () => {
+    const f = await fixture({
+      framework: { messageQuietPeriod: { quietMs: 600 }, gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'helper', model: 'test', systemPrompt: 'test' }],
+      mcpl: {},
+    });
+    try {
+      f.alwaysRespond();
+      const render: { release?: () => void } = {};
+      f.renderer(async () => {
+        await new Promise<void>((resolve) => { render.release = resolve; });
+        return { content: [{ type: 'text', text: 'document_diff' }] };
+      });
+      const traces: Array<{ type: string; agentName?: string; burst?: string; cause?: string }> = [];
+      f.framework.onTrace((e) => { traces.push(e as never); });
+      await f.register('general');
+      await f.framework.start();
+      // The agent's start merges its batch's wake with a wake that isn't a
+      // message's, so it starts at once and its assembly waits on the render;
+      // the helper's message wake, queued in the same pass, comes after it.
+      const x = f.framework as unknown as { pendingRequests: InferenceRequest[]; queueCoalescedWakes(...args: unknown[]): Promise<void> };
+      const queue = x.queueCoalescedWakes.bind(x);
+      x.queueCoalescedWakes = async (...args) => {
+        await queue(...args);
+        x.queueCoalescedWakes = queue;
+        const wake = x.pendingRequests.find((r) => r.agentName === 'agent' && r.coalescingSubject !== undefined)!;
+        x.pendingRequests.push({ agentName: 'agent', reason: 'self-wake', source: wake.source, channelId: wake.channelId, channelServerId: wake.channelServerId, timestamp: Date.now() });
+        x.pendingRequests.push({ agentName: 'helper', reason: 'mcpl:channel-incoming', source: wake.source, channelId: 'helper-room', channelServerId: wake.channelServerId, timestamp: Date.now() });
+      };
+      await f.send('push/event', batch('b1', 'GENQ batch question', 'general'));
+      await waitFor(() => render.release !== undefined, "the agent's assembly rendering");
+      const stopping = f.framework.stop();
+      await sleep(200);
+      render.release!();
+      await stopping;
+      const held = traces.filter((e) => e.type === 'quiet-period:held').map((e) => `${e.agentName} ${e.burst}`);
+      const released = traces.filter((e) => e.type === 'quiet-period:released').map((e) => `${e.agentName} ${e.burst}`);
+      assert.ok(held.some((h) => h.startsWith('helper ')), `the pass held the helper's burst after the stop began: ${JSON.stringify(traces.filter((e) => e.type.startsWith('quiet-period')))}`);
+      assert.deepEqual(released.sort(), held.sort(), 'every hold traced is released');
+    } finally {
+      await f.close();
+    }
+  });
+
   it("a batch that opens for an existing subject while another channel's turn is assembling is left for its own turn, in its channel", async () => {
     const f = await fixture({
       framework: { messageQuietPeriod: { quietMs: 600 }, gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
