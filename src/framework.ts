@@ -1325,7 +1325,7 @@ interface TurnCarry {
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: true };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
@@ -23219,9 +23219,10 @@ export class AgentFramework {
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
       //   1. the most recent ADDRESSED channel wins (mention / reply / DM —
-      //      someone explicitly spoke TO the agent);
-      //   2. else a rewind's retry whose message isn't in what the agent is
-      //      sent (RETRY_RANK);
+      //      someone explicitly spoke TO the agent), a rewind's retry whose
+      //      message is still in what the agent is sent ranking with them
+      //      (RETRY_RANK 'sent');
+      //   2. else a rewind's retry whose message isn't (RETRY_RANK 'aside');
       //   3. else the most recent channel-bearing request (ambient message in
       //      an open channel — legacy last-inbound semantics).
       // A chat:system notice (RFC-001 rev 3: weather in a world, someone
@@ -23254,6 +23255,7 @@ export class AgentFramework {
       // its wake was queued first.
       let continuationReq: InferenceRequest | undefined;
       let retryReq: InferenceRequest | undefined;
+      let sawAddressed = false;
       for (const r of requests) {
         if (!r.channelId || r.systemNotice) continue;
         if (r.reason === AUTO_CONTINUE_REASON) {
@@ -23261,8 +23263,10 @@ export class AgentFramework {
           continue;
         }
         if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
-        if (r.addressed && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
-        if ((r as MarkedRequest)[RETRY_RANK] && (!retryReq || eventAt(r) >= eventAt(retryReq))) retryReq = r;
+        if (r.addressed) sawAddressed = true;
+        const rank = (r as MarkedRequest)[RETRY_RANK];
+        if ((r.addressed || rank === 'sent') && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
+        if (rank === 'aside' && (!retryReq || eventAt(r) >= eventAt(retryReq))) retryReq = r;
       }
       const channelReq = addressedReq ?? retryReq ?? ambientReq ?? continuationReq;
       // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
@@ -23325,7 +23329,7 @@ export class AgentFramework {
         wakeChannels: wakeChannelsOf(requests.some(bringsOwnChannels) ? requests.filter(hasOwnCauseForRun) : requests),
         // Only the mark this batch decided, never one requests[0] carried.
         autoContinueRun: continuationMark,
-        addressed: addressedReq !== undefined,
+        addressed: sawAddressed,
         // The channel above is never a notice's, so neither is the mark:
         // inherited from requests[0], it would hide that message's channel
         // from the selection if this start were merged again.
@@ -36201,7 +36205,7 @@ export class AgentFramework {
       ...(answers ? {
         channelId: answers.channel.channelId,
         channelServerId: answers.channel.serverId,
-        ...(this.stillSent(agentName, answers.messageId) ? { addressed: true } : { [RETRY_RANK]: true as const }),
+        [RETRY_RANK]: this.stillSent(agentName, answers.messageId) ? 'sent' as const : 'aside' as const,
         ...(answers.messageId ? { answersMessageId: answers.messageId } : {}),
       } : {}),
       ...this.wakeChannelsMark(routing),
