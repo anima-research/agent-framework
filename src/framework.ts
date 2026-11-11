@@ -1087,6 +1087,7 @@ interface CoalescedChannelEvent {
    *  CoalescedOccurrence.firstView). */
   firstView?: boolean;
   eventIdAsMessageId?: true;
+  ambientPush?: true;
   /** A batch's recovery after a delivery that may have stored the message
    *  (FrameworkWriteOptions.mayBeStored). */
   mayBeStored?: true;
@@ -20365,9 +20366,9 @@ export class AgentFramework {
    */
   private noteDeliveredOrPark(event: {
     serverId: string; channelId: string; messageId: string; threadId?: string; tags?: string[];
-    eventId?: string; coalescingSubject?: string; firstView?: boolean; assemblingFor?: string; eventIdAsMessageId?: true;
+    eventId?: string; coalescingSubject?: string; firstView?: boolean; assemblingFor?: string; eventIdAsMessageId?: true; ambientPush?: true;
   }): void {
-    if (event.assemblingFor !== undefined || event.eventIdAsMessageId) return;
+    if (event.assemblingFor !== undefined || event.eventIdAsMessageId || event.ambientPush) return;
     // On the server the message came from (noteDelivered).
     const anchor = { channel: { serverId: event.serverId, channelId: event.channelId }, messageId: event.messageId, threadId: event.threadId, tags: event.tags, firstView: event.firstView === true, seq: ++this.deliverySeq };
     if (event.coalescingSubject && typeof event.eventId === 'string') {
@@ -22107,6 +22108,7 @@ export class AgentFramework {
         targetAgents: push.targetAgents,
         coalescingSubject,
         eventId: occ.eventId,
+        ...(isAmbient(push.tags) ? { ambientPush: true as const } : {}),
         ...narrowing,
         ...firstViewMark,
         ...mayBeStored,
@@ -22617,9 +22619,10 @@ export class AgentFramework {
         this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: triggerChannel?.channelId ?? '' });
       }
       const origin = event.origin ?? {};
-      if (decision.locus && triggerChannel && !isAmbient(event.tags) && this.mcplServerRegistry?.getServer(event.serverId)
+      if (decision.locus && triggerChannel && this.mcplServerRegistry?.getServer(event.serverId)
         && typeof origin.messageId === 'string' && origin.messageId) {
         this.noteDeliveredOrPark({
+          ...(isAmbient(event.tags) ? { ambientPush: true as const } : {}),
           serverId: event.serverId,
           channelId: triggerChannel.channelId,
           messageId: origin.messageId,
