@@ -6620,6 +6620,7 @@ export class AgentFramework {
     for (const name of [...(this.budgetHolds?.keys() ?? [])]) {
       step(() => this.dropBudgetHold(name, { kind: 'shutdown', why: 'the framework is stopping' }));
     }
+    for (const name of [...(this.quietHolds?.keys() ?? [])]) step(() => this.pruneQuietHolds(name, new Set()));
     // An open logical turn doesn't survive a stop.
     this.openLogical.clear();
 
@@ -13528,7 +13529,7 @@ export class AgentFramework {
     this.activeTurnTriggers.delete(name);
     this.logicalTurnToolCalls.delete(agent);
     this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== name);
-    this.quietHolds?.delete(name);
+    this.pruneQuietHolds(name, new Set());
     this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(name);
     this.proseSpeechChains.delete(name);
@@ -22452,7 +22453,8 @@ export class AgentFramework {
    *  cause `gone`. `queuedKeys` are the bursts still in its queue. Called
    *  wherever an agent's queued requests are taken away without a start: a
    *  withdrawal, a read-drop or a policy skip that empties its batch, the
-   *  pass's sweep of agents with nothing queued, and the split itself. */
+   *  pass's sweep of agents with nothing queued, the split itself, an
+   *  agent's removal or disposal, and the framework's stop. */
   private pruneQuietHolds(agentName: string, queuedKeys: ReadonlySet<string>, now = Date.now()): void {
     const held = this.quietHolds?.get(agentName);
     if (!held) return;

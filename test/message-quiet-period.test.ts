@@ -727,4 +727,12 @@ describe('messageQuietPeriod in the scheduler', () => {
       await framework.stop();
     }
   });
+
+  it("a held burst's hold ends as gone when the framework stops (b9034c4 review, 6)", async () => {
+    const { framework, internals, traces } = await start({ quietMs: 5_000 });
+    wake(internals, { channelId: 'discord:g:room', channelServerId: 'discord' });
+    await waitFor(() => heldKeys(traces).length >= 1, 'the hold', 2_000);
+    await framework.stop();
+    assert.deepEqual(released(traces), [[key('discord:g:room'), 'gone']]);
+  });
 });

@@ -789,7 +789,8 @@ export type TraceEvent =
    *  ended: `quiet` (quietMs since its newest wake), `cap` (maxWaitMs since
    *  its oldest), `other-wake` (a wake that is no message started it), or
    *  `gone` (its wakes left the queue without a start: withdrawn, dropped as
-   *  read, or skipped by policy; `wakes` is 0). A burst that starts the
+   *  read, skipped by policy, or dropped as its agent ended or the framework
+   *  stopped; `wakes` is 0). A burst that starts the
    *  first time it is seen (already past its deadline, as the first of a
    *  backlog after a busy turn) emits neither trace. */
   | (TraceEventBase & {
