@@ -3167,6 +3167,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         assert.deepEqual(h.drafts().map((d) => d.text), ['After the send.'], "the think's round is never drafted");
         assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note']);
         const receipts = h.texts().filter((t) => t.startsWith('[delivered]'));
+        assert.equal(receipts.length, 1, `one receipt for the turn: ${JSON.stringify(receipts)}`);
         assert.ok(!receipts.some((t) => t.includes('kept private')), `no kept-private count: ${JSON.stringify(receipts)}`);
       } finally {
         await h.close();
@@ -3200,14 +3201,22 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
   }
 
   // Each round counts by whether the turn was silenced as it ended, so of two
-  // private rounds only the one with the send is counted, on both paths.
+  // private rounds only the one with the send is counted, on both paths. The
+  // second round has two segments (an all-refused attempt splits it) and the
+  // first one, so the count says which was counted (finding 8 of the review
+  // of 8dbd802ba3e6).
   for (const xml of [false, true]) {
     it(`${xml ? 'XML tool mode' : 'native mode'}: of two private think rounds, only the one the turn was silenced at is counted`, async () => {
       const h = await harness({ xml, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
       try {
         const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
         const first = [text('First beside think.'), call('t1', 'think', { content: 'hmm' })];
-        const second = [text('Second beside think.'), call('t2', 'think', { content: 'hmm' }), explicitSend('s1')];
+        const second = [
+          text('Second, before the attempt.'),
+          { type: 'tool_attempt', rawXml: '<invoke name="send_message"><parameter name="x">' } as unknown as ContentBlock,
+          { type: 'tool_notice', notices: [{ ordinal: 0, kind: 'refused', message: 'boundary' }] } as unknown as ContentBlock,
+          text('Second beside think.'), call('t2', 'think', { content: 'hmm' }), explicitSend('s1'),
+        ];
         await h.turn([
           createMockResponse(first, 'tool_use'),
           createMockResponse(second, 'tool_use'),
@@ -3215,9 +3224,12 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
             ? { ...createMockResponse([...first, done('t1'), ...second, done('t2'), done('s1')]), toolCalls: [] }
             : createMockResponse([]),
         ]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], "neither round's prose goes out");
+        assert.deepEqual(h.drafts(), [], 'neither is drafted');
+        const receipts = h.texts().filter((t) => t.startsWith('[delivered]'));
         assert.ok(
-          h.texts().some((t) => t.includes('1 plain-speech segment(s) kept private')),
-          JSON.stringify(h.texts().filter((t) => t.startsWith('[delivered]'))),
+          receipts.some((t) => t.includes('2 plain-speech segment(s) kept private')),
+          `the silenced round's two segments, not the first round's one: ${JSON.stringify(receipts)}`,
         );
       } finally {
         await h.close();
@@ -3243,8 +3255,6 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
-  // An all-refused XML attempt isn't a tool round, so the prose before it is
-  // no round's: it goes out, though the think round after it has the same place.
   // routeRound only logs an unsilenced private-think round's prose: it counts
   // nothing, so no receipt line says it was kept private.
   it('XML tool mode: a private think in a turn nothing silences is withheld and counted nowhere, as in native mode', async () => {
@@ -3258,6 +3268,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.deepEqual(h.drafts(), [], 'never drafted');
       assert.deepEqual(h.publishes().map((p) => p.text), ['After the think.'], 'only the prose after it goes out');
       const receipts = h.texts().filter((t) => t.startsWith('[delivered]'));
+      assert.equal(receipts.length, 1, `one receipt for the turn: ${JSON.stringify(receipts)}`);
       assert.ok(!receipts.some((t) => t.includes('kept private')), `no kept-private count: ${JSON.stringify(receipts)}`);
     } finally {
       await h.close();
@@ -3276,6 +3287,33 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] } as NormalizedResponse);
         await h.turn([createMockResponse(round, 'tool_use')]);
         assert.deepEqual(h.publishes().map((p) => p.text), ['Trailing after the call.']);
+        assert.deepEqual(h.drafts(), [], 'never drafted');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  // An all-refused XML attempt isn't a tool round, so the prose before it is
+  // the next round's, and a private think in that round keeps it back with the
+  // round's own, on both paths (finding 13 of the review of 8dbd802ba3e6).
+  for (const xml of [false, true]) {
+    it(`${xml ? 'XML tool mode' : 'native mode'}: the prose before an all-refused attempt stays back with the private think's round it opens`, async () => {
+      const h = await harness({ xml, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+        const round = [
+          text('Before the attempt.'),
+          { type: 'tool_attempt', rawXml: '<invoke name="send_message"><parameter name="x">' } as unknown as ContentBlock,
+          { type: 'tool_notice', notices: [{ ordinal: 0, kind: 'refused', message: 'boundary' }] } as unknown as ContentBlock,
+          text('Beside think.'),
+          call('t1', 'think', { content: 'hmm' }),
+        ];
+        await h.turn([
+          createMockResponse(round, 'tool_use'),
+          xml ? { ...createMockResponse([...round, done('t1'), text('After.')]), toolCalls: [] } : createMockResponse([text('After.')]),
+        ]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['After.']);
         assert.deepEqual(h.drafts(), [], 'never drafted');
       } finally {
         await h.close();
@@ -3592,11 +3630,13 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         const hangs = `await tools.think({ content: "hmm" }); await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
         const round = [text(LINE), script('ce1', hangs)];
         // The send reaches the host only after the think returned.
-        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] }, () => h.sends().length === 1);
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse([...round, text('After.')]), toolCalls: [] }, () => h.sends().length === 1);
         await h.turn([createMockResponse(round, 'tool_use')]);
         assert.equal(gate.missed, false, 'the stream completed after the script got past its think to the send');
         assert.deepEqual(inRoom(h), []);
-        assert.deepEqual(held(h), [], 'never drafted');
+        // The trailing line reached the turn's end and is held where the send may have
+        // posted: the delivery ran, and the round's own line was never drafted.
+        assert.deepEqual(held(h), [['After.', 'explicit-send']]);
       } finally {
         await h.close();
       }
@@ -3613,11 +3653,13 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.sendMode('hang');
         const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
         const round = [text(LINE), script('ce1', hangs)];
-        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] }, () => h.sends().length === 1);
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse([...round, text('After.')]), toolCalls: [] }, () => h.sends().length === 1);
         await h.turn([createMockResponse(round, 'tool_use')]);
         assert.equal(gate.missed, false, 'the stream completed after the script\'s send reached the host');
         assert.deepEqual(inRoom(h), []);
-        assert.deepEqual(held(h), [], 'never drafted');
+        // The trailing line reached the turn's end and is held where the send may have
+        // posted: the delivery ran, and the round's own line was never drafted.
+        assert.deepEqual(held(h), [['After.', 'explicit-send']]);
       } finally {
         await h.close();
       }
@@ -3629,10 +3671,13 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.sendMode('hang');
         const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
         const round = [text(LINE), call('t1', 'think', { content: 'hmm' }), script('ce1', hangs)];
-        completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] });
+        const gate = completeWhileWaiting(h.membrane, { ...createMockResponse([...round, text('After.')]), toolCalls: [] }, () => h.sends().length === 1);
         await h.turn([createMockResponse(round, 'tool_use')]);
+        assert.equal(gate.missed, false, "the stream completed after the script's send reached the host");
         assert.deepEqual(inRoom(h), []);
-        assert.deepEqual(held(h), [], 'never drafted');
+        // The trailing line reached the turn's end and is held where the send may have
+        // posted: the delivery ran, and the round's own line was never drafted.
+        assert.deepEqual(held(h), [['After.', 'explicit-send']]);
       } finally {
         await h.close();
       }

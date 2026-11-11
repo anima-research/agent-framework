@@ -185,6 +185,9 @@ class LegacyNoRoundContentStream {
   private pendingResolve: (() => void) | null = null;
   private deliveredComplete = false;
 
+  /** `trailing`: text the completion carries after the round's calls. */
+  constructor(private readonly trailing?: string) {}
+
   provideToolResults(_results: unknown[]): void {
     const resolve = this.pendingResolve;
     this.pendingResolve = null;
@@ -217,7 +220,10 @@ class LegacyNoRoundContentStream {
     if (this.deliveredComplete) return;
     yield {
       type: 'complete',
-      response: createMockResponse(makeToolRound(TILDE_PREFACE_80)),
+      response: createMockResponse([
+        ...makeToolRound(TILDE_PREFACE_80),
+        ...(this.trailing ? [{ type: 'text', text: this.trailing } as ContentBlock] : []),
+      ]),
     } as StreamEvent;
   }
 }
@@ -225,9 +231,11 @@ class LegacyNoRoundContentStream {
 class LegacyNoRoundContentMembrane {
   calls: NormalizedRequest[] = [];
 
+  constructor(private readonly trailing?: string) {}
+
   streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
-    return new LegacyNoRoundContentStream() as unknown as YieldingStream;
+    return new LegacyNoRoundContentStream(this.trailing) as unknown as YieldingStream;
   }
 }
 
@@ -1016,16 +1024,18 @@ describe('same-round think text policy', () => {
 
   // #296: the fallback path (no roundContent: XML tool mode, older membranes)
   // used to route the text beside think() under a private policy, which this
-  // case pinned as "legacy behavior remains unchanged". The policy text makes
-  // no exception for it, so the turn-end delivery now drops that round's text
-  // by its place, as the native path does as the round ends.
+  // case pinned as "legacy behavior remains unchanged". The think description
+  // speaks of the same native round, and this path has no native rounds, so
+  // the turn-end delivery now drops the round's text by its place, as the
+  // native path does as the round ends. The text after the round's calls goes
+  // out, which shows the turn reached that delivery.
   it('legacy/no-roundContent: a private policy withholds the text beside think()', async () => {
-    const membrane = new LegacyNoRoundContentMembrane();
+    const membrane = new LegacyNoRoundContentMembrane('after the calls');
     const { dir, framework, routed } = await createFramework({ policy: 'private', membrane });
     try {
       trigger(framework);
       await framework.runUntilIdle();
-      assert.deepEqual(routed, []);
+      assert.deepEqual(routed, ['after the calls']);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
