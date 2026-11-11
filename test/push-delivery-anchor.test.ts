@@ -51,6 +51,28 @@ describe('a push that delivers a new message becomes the latest delivered inboun
     assert.equal(typeof HostRegistry.prototype.noteDelivered, 'function');
   });
 
+  it('a wrap of framework.channels.noteDelivered that calls through sees each admitted delivery, from the channel lane and the push lane, and the latest inbound still moves', async (t) => {
+    const { f, fw, origin } = await rig(t, NO_WAKES);
+    const channels = f.framework.channels!;
+    const note = channels.noteDelivered.bind(channels);
+    const seen: string[] = [];
+    channels.noteDelivered = (channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView?: boolean) => {
+      seen.push(messageId);
+      note(channel, messageId, threadId, tags, firstView);
+    };
+    await f.send('channels/incoming', {
+      messages: [{ channelId: ROOM, messageId: 'm-room', timestamp: TS, author: { id: 'U1', name: 'Antra' }, tags: ADDRESSED, content: [{ type: 'text', text: 'in room' }] }],
+    });
+    await f.framework.runUntilIdle();
+    await f.send('push/event', {
+      featureSet: 'doc', eventId: 'e-admin', timestamp: TS, origin: origin(ADMIN, 'm-admin'), tags: ADDRESSED,
+      payload: { content: [{ type: 'text', text: '@agent in admin' }] },
+    });
+    await f.framework.runUntilIdle();
+    assert.deepEqual(seen, ['m-room', 'm-admin']);
+    assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-admin');
+  });
+
   it('under \'latest-inbound\', a mention pushed from a closed channel moves the fallback locus and the reply anchor, thread included, and an edit pushed after it doesn\'t', async (t) => {
     const { f, fw, origin } = await rig(t, { ...NO_WAKES, speech: { locus: 'latest-inbound' } });
     await f.send('channels/incoming', {
@@ -225,6 +247,33 @@ describe('a push that delivers a new message becomes the latest delivered inboun
       assert.match(JSON.stringify(resent), /"accepted":true/, 'premise: the resend is accepted');
       assert.equal(fw.parkedAnchors.size, 0, 'premise: its acceptance took the parked anchor');
       assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-newer');
+    });
+
+    it(`on the ${lane} lane, a newer message whose note a wrap of framework.channels.noteDelivered swallows doesn't keep an older coalesced create, committed after it, from becoming the latest inbound`, async (t) => {
+      const { f, fw, origin } = await rig(t, NO_WAKES);
+      const channels = f.framework.channels!;
+      const note = channels.noteDelivered.bind(channels);
+      channels.noteDelivered = (channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView?: boolean) => {
+        if (messageId !== 'm-newer') note(channel, messageId, threadId, tags, firstView);
+      };
+      const host = (fw as unknown as Host).pushCoalescer.host;
+      const commit = host.commit.bind(host);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let holdOnce = true;
+      let holding = false;
+      host.commit = async () => { if (holdOnce) { holdOnce = false; holding = true; await held; } return commit(); };
+      const [method, params] = coalescedCreate(origin);
+      const sent = f.send(method, params);
+      await eventually(() => holding, 'the create delivered, its commit held');
+      assert.equal(fw.parkedAnchors.size, 1, 'premise: the older message\'s anchor is parked');
+      await newer(f);
+      await f.framework.runUntilIdle();
+      assert.ok(f.context().includes('the newer message'), 'premise: the newer message was delivered');
+      assert.equal(fw.channelRegistry.incomingFor('agent'), undefined, 'premise: the swallowed note set nothing');
+      release();
+      assert.match(JSON.stringify(await sent), /"accepted":true/, 'premise: the create is accepted');
+      assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-older');
     });
 
     it(`on the ${lane} lane, a message delivered while a coalesced create waits for its commit stays the latest inbound`, async (t) => {
