@@ -20676,6 +20676,8 @@ export class AgentFramework {
       triggerInference?: boolean;
       coalescingSubject?: string;
       mayBeStored?: true;
+      eventIdAsMessageId?: true;
+      ambientPush?: true;
     },
     messageMetadata: Record<string, unknown>,
     admission: AdmissionDecision,
