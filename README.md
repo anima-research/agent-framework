@@ -109,7 +109,7 @@ system text, is read either way. Where a cache read costs a tenth of the input
 price, a tenth of a request's input tokens carried that way costs in reads,
 about every 115 to 190 requests, what rewriting the whole input costs beyond
 reading it. On Opus 5.5 and Sonnet 5.5 that's every 240 to 390 requests, and
-on Fable 5.1 every 615 to 990. Each range runs from the 5-minute write to the
+on Fable 5.1 every 490 to 790. Each range runs from the 5-minute write to the
 1-hour. The share a consolidation waits for counts the rows, so a removed
 tool's definition doesn't count toward it. A
 replacement is a block of system text already declared that's dropped or

@@ -160,7 +160,7 @@ export interface AgentConfig {
    *   tenth of a request's input tokens carried that way costs in reads,
    *   about every 115 to 190 requests, what rewriting the whole input costs
    *   beyond reading it. On Opus 5.5 and Sonnet 5.5 that's every 240 to 390
-   *   requests, and on Fable 5.1 every 615 to 990. Each range runs from the
+   *   requests, and on Fable 5.1 every 490 to 790. Each range runs from the
    *   5-minute write to the 1-hour. The share a consolidation waits for
    *   counts the rows, so a removed tool's definition doesn't count toward
    *   it. Only for models that
@@ -214,8 +214,9 @@ export interface AgentConfig {
    * head do, and, with `thinkingBinding.binds: true`, its compile binds
    * thinking under that head. Elsewhere it sends the tools
    * its caller passes and the current system text, and leaves the agent's
-   * own change rows out of its request: under `'entries'` it carries a
-   * host's change rows as the agent's requests do, and on its head it
+   * own change rows out of its request, though its compile holds them, as
+   * a compile kept to its head holds a host's: under `'entries'` it carries
+   * a host's change rows as the agent's requests do, and on its head it
    * carries none. Where what the caller passes differs from what the
    * agent's head and own rows declare, with `thinkingBinding.binds: true`
    * its compile binds thinking under an identity none of the agent's own

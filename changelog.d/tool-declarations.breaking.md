@@ -6,6 +6,6 @@
   - **Migration:** add an entry for each of the three.
   - **Unchanged:** every other trace type, and their fields. No sibling package needs a new version.
 - **Hosts that handle every `presentation:retracted` reason:** `PresentationRetractReason` has a new member, `'head-moved'`.
-  - **Who needs to act:** a host whose code covers each value the trace's `reason` can take, such as an exhaustive `switch`. It meets `'head-moved'` when a move of an agent's recorded head takes that agent's own system changes out of the record, and they leave another agent's window that held them, such as one that observes the agent. The `head:moved` trace after it says which move it was.
+  - **Who needs to act:** a host whose code covers each value the trace's `reason` can take, such as an exhaustive `switch`. It meets `'head-moved'` when a move of an agent's recorded head takes that agent's own system changes out of the record, and they leave another agent's window that held them, such as one that observes the agent. The `head:moved` trace after it says which move it was, and none comes where no head was recorded and the new one couldn't be stored.
   - **Migration:** handle `'head-moved'`, or let a default branch take it. It needs no sibling version beyond this release's own ranges.
   - **Unchanged:** the other reasons, and the trace's fields.
