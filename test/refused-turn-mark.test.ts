@@ -478,6 +478,24 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(r.records[2]?.locus, ROOM, 'the first retry, refused, names that channel too');
   });
 
+  it('an /unstick that gives up: the refusal it gives up on marks the shed turn\'s message', async (t) => {
+    const r = await rig(t, manual);
+    await r.answered(ROOM, 'm-1');
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-2');
+    await eventually(() => r.records.length === 1, 'm-2 refused');
+    await r.f.framework.runUntilIdle();
+    const reactions = () => r.marked().filter(([name]) => name === 'add_reaction');
+    await eventually(() => reactions().length === 1, "m-2's own refusal is marked");
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([refusal()]));
+    assert.equal((await unstick(r, 1)).ok, true, 'premise: the unstick started');
+    await eventually(() => r.records.length === 3, 'the unstick run and its retry are both refused');
+    await r.f.framework.runUntilIdle();
+    await eventually(() => reactions().length === 2, 'the refusal the unstick gives up on is marked');
+    assert.deepEqual(reactions(), [['add_reaction', 'room', 'm-2'], ['add_reaction', 'room', 'm-2']], "on the shed turn's message, in its channel");
+    assert.deepEqual(r.records.map((x) => x?.locus), [ROOM, ROOM, ROOM], 'and every refusal names that channel');
+  });
+
   it('an /unstick whose agent\'s last turn answered no message: its retry has no channel, and is told so', async (t) => {
     const r = await rig(t, manual);
     await r.answered(ROOM, 'm-1');

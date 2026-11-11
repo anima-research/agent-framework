@@ -2,6 +2,7 @@ import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 
 const ROOM = 'discord:g1:room';
 const ADMIN = 'discord:g1:admin';
@@ -62,6 +63,85 @@ describe('a push that delivers a new message becomes the latest delivered inboun
     });
     await f.framework.runUntilIdle();
     assert.equal(fw.channelRegistry.resolveLocus('agent')?.channelId, ADMIN);
+  });
+
+  it('under \'latest-inbound\', an ambient push from a closed channel moves neither the fallback locus nor the reply anchor, so a timer\'s turn speaks where it did and opens nothing', async (t) => {
+    const { f, fw, origin } = await rig(t, { ...NO_WAKES, speech: { locus: 'latest-inbound' } });
+    await f.send('channels/incoming', {
+      messages: [{ channelId: ROOM, messageId: 'm-room', timestamp: TS, author: { id: 'U1', name: 'Antra' }, tags: ADDRESSED, content: [{ type: 'text', text: 'in room' }] }],
+    });
+    await f.framework.runUntilIdle();
+    assert.equal(fw.channelRegistry.resolveLocus('agent')?.channelId, ROOM, 'premise: the room message is the latest inbound');
+
+    await f.send('push/event', {
+      featureSet: 'doc', eventId: 'e-ambient', timestamp: TS, origin: origin(ADMIN, 'm-ambient'), tags: ['chat:ambient', 'chat:from-human'],
+      payload: { content: [{ type: 'text', text: 'chatter in admin' }] },
+    });
+    await f.framework.runUntilIdle();
+    assert.ok(f.context().includes('chatter in admin'), 'premise: the ambient push was delivered');
+    assert.equal(fw.channelRegistry.resolveLocus('agent')?.channelId, ROOM);
+    assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-room');
+
+    const before = f.published.length;
+    (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'agent', reason: 'timer', source: 'test', timestamp: Date.now() });
+    await eventually(() => f.published.length > before, "the timer's turn spoke");
+    await f.framework.runUntilIdle();
+    assert.deepEqual(f.published.slice(before).map((p) => p.channelId), [ROOM], "the timer's turn speaks in the room");
+    assert.notEqual(fw.channelRegistry.getDesiredState('editor', ADMIN), 'open', 'and admin stays closed');
+  });
+
+  it('under \'latest-inbound\', a push its server tagged with nothing counts, as a message no tag calls ambient', async (t) => {
+    const { f, fw, origin } = await rig(t, { ...NO_WAKES, speech: { locus: 'latest-inbound' } });
+    await f.send('channels/incoming', {
+      messages: [{ channelId: ROOM, messageId: 'm-room', timestamp: TS, author: { id: 'U1', name: 'Antra' }, tags: ADDRESSED, content: [{ type: 'text', text: 'in room' }] }],
+    });
+    await f.framework.runUntilIdle();
+    assert.equal(fw.channelRegistry.resolveLocus('agent')?.channelId, ROOM, 'premise: the room message is the latest inbound');
+
+    await f.send('push/event', {
+      featureSet: 'doc', eventId: 'e-untagged', timestamp: TS, origin: origin(ADMIN, 'm-untagged'),
+      payload: { content: [{ type: 'text', text: 'untagged in admin' }] },
+    });
+    await f.framework.runUntilIdle();
+    assert.equal(fw.channelRegistry.resolveLocus('agent')?.channelId, ADMIN);
+    assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-untagged');
+  });
+
+  it('a push its server was removed before it was processed sets nothing: one queued behind a slow module while its server disconnects', async (t) => {
+    let reached = false;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const slow: Module = {
+      name: 'slow',
+      async start(_ctx: ModuleContext) {},
+      async stop() {},
+      getTools(): ToolDefinition[] { return []; },
+      async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: '' }; },
+      async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+        if (event.type === 'mcpl:channel-incoming' && (event as unknown as { messageId?: string }).messageId === 'm-room') { reached = true; await held; }
+        return {};
+      },
+    };
+    const { f, fw, origin } = await rig(t, { ...NO_WAKES, modules: [slow], speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig>);
+    const servers = (f.framework as unknown as { mcplServerRegistry: { getServer(id: string): unknown } }).mcplServerRegistry;
+    await f.send('channels/incoming', {
+      messages: [{ channelId: ROOM, messageId: 'm-room', timestamp: TS, author: { id: 'U1', name: 'Antra' }, tags: ADDRESSED, content: [{ type: 'text', text: 'in room' }] }],
+    });
+    await eventually(() => reached, 'the slow module holds the loop on the room message');
+    try {
+      await f.send('push/event', {
+        featureSet: 'doc', eventId: 'e-admin', timestamp: TS, origin: origin(ADMIN, 'm-admin'), tags: ADDRESSED,
+        payload: { content: [{ type: 'text', text: '@agent in admin' }] },
+      });
+      await f.framework.disconnectMcplServer('editor');
+      assert.equal(servers.getServer('editor'), null, 'premise: the server is removed while its push waits');
+      assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, undefined, 'premise: the removal cleared its message');
+    } finally {
+      release();
+    }
+    await f.framework.runUntilIdle();
+    assert.ok(f.context().includes('@agent in admin'), 'premise: the push was processed after the removal');
+    assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, undefined, 'and its message did not become the latest inbound');
   });
 
   it('a channel-scoped coalesced create from a closed channel is the latest inbound once accepted, and nothing stays parked', async (t) => {
