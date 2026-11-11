@@ -1301,6 +1301,7 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
+const RETRY_RANK: unique symbol = Symbol('retry-rank');
 /**
  * The rows a batched wake's line can name (the gate's BATCH_LINE_ROWS), on
  * the wake of every agent the batch wakes: a fresh start of the turn it
@@ -1324,7 +1325,7 @@ interface TurnCarry {
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[] };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: true };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
@@ -23242,6 +23243,7 @@ export class AgentFramework {
       // message that arrived meanwhile, ambient included, outranks it, though
       // its wake was queued first.
       let continuationReq: InferenceRequest | undefined;
+      let retryReq: InferenceRequest | undefined;
       for (const r of requests) {
         if (!r.channelId || r.systemNotice) continue;
         if (r.reason === AUTO_CONTINUE_REASON) {
@@ -23250,8 +23252,9 @@ export class AgentFramework {
         }
         if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
         if (r.addressed && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
+        if ((r as MarkedRequest)[RETRY_RANK] && (!retryReq || eventAt(r) >= eventAt(retryReq))) retryReq = r;
       }
-      const channelReq = addressedReq ?? ambientReq ?? continuationReq;
+      const channelReq = addressedReq ?? retryReq ?? ambientReq ?? continuationReq;
       // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
       // is its own provenance, even when it names no author (a push event
       // can route without an author id): borrowing another request's author
@@ -23259,7 +23262,7 @@ export class AgentFramework {
       // Otherwise from the routing winner when it carries one; else from the
       // most recent request that does (ambient gate wakes name a counterparty
       // without setting a locus), ordered by the event's own time.
-      let provReq: InferenceRequest | undefined = addressedReq
+      let provReq: InferenceRequest | undefined = addressedReq ?? retryReq
         ?? (channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined);
       if (!provReq) {
         for (const r of requests) {
@@ -36176,7 +36179,7 @@ export class AgentFramework {
     this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry', this.turnRouting.get(agent.name)));
   }
 
-  private rewindRetry(agentName: string, reason: string, routing: TurnRouting | undefined): InferenceRequest {
+  private rewindRetry(agentName: string, reason: string, routing: TurnRouting | undefined): MarkedRequest {
     const answers = routing?.answers;
     return {
       agentName,
@@ -36186,11 +36189,21 @@ export class AgentFramework {
       ...(answers ? {
         channelId: answers.channel.channelId,
         channelServerId: answers.channel.serverId,
-        addressed: true,
+        ...(this.stillSent(agentName, answers.messageId) ? { addressed: true } : { [RETRY_RANK]: true as const }),
         ...(answers.messageId ? { answersMessageId: answers.messageId } : {}),
       } : {}),
       ...this.wakeChannelsMark(routing),
     };
+  }
+
+  private stillSent(agentName: string, messageId: string | undefined): boolean {
+    const agent = this.agents.get(agentName);
+    if (!agent || messageId === undefined) return false;
+    const cm = agent.getContextManager();
+    return (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages()).some((m) => {
+      const id = (m.metadata as { messageId?: unknown } | undefined)?.messageId;
+      return id !== undefined && id !== null && String(id) === messageId;
+    });
   }
 
   // ==========================================================================
