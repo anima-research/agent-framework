@@ -65,10 +65,10 @@ async function boot(opts: { changes?: boolean } = {}) {
   } as never);
   write('antra', [text('another word')]);
   if (opts.changes) {
-    // A host's change row, and one each resident stamped as its own.
+    // A host's change row, and one each resident and the subconscious stamped as its own.
     const change = (tool: string) => [{ type: 'system_change', defineTools: [{ name: tool, description: tool, inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock];
     write('Host', change('host_tool'));
-    for (const name of ['mira', 'oren']) write('system', change(`${name}_tool`), { system: true, kind: 'system-change', agent: name });
+    for (const name of ['mira', 'oren', 'Subconscious']) write('system', change(`${name}_tool`), { system: true, kind: 'system-change', agent: name });
   }
   // The held row and oren's injection are 'elsewhere' for mira (and the
   // injection for the subconscious), so no presentation point takes them
@@ -161,7 +161,7 @@ describe('the open shapes of a resident and the subconscious (#291, AF-5)', () =
     assert.ok(oren.includes('change:host_tool') && oren.includes('change:oren_tool') && !oren.includes('change:mira_tool'), `premise: oren, under 'entries', compiles the host's change and its own, not mira's: ${JSON.stringify(oren)}`);
     assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('oren', { toolDeclarations: 'entries' }), strategy: new PassthroughStrategy() })), oren, "oren's");
     const sub = await h.live('Subconscious');
-    assert.ok(sub.includes('a held word') && !sub.some((t) => t.startsWith('change:')), `premise: the subconscious compiles no change row not its own: ${JSON.stringify(sub)}`);
+    assert.ok(sub.includes('a held word') && sub.includes('change:Subconscious_tool') && sub.filter((t) => t.startsWith('change:')).length === 1, `premise: the subconscious compiles its own change row and no other: ${JSON.stringify(sub)}`);
     assert.deepEqual(await h.compiled(await h.open(subconsciousContextOptions({ serves: 'mira' }))), sub, "the subconscious's");
   });
 
