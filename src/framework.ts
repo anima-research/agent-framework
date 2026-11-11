@@ -7467,6 +7467,7 @@ export class AgentFramework {
     // Read the kept request's carry before marking it.
     const keptCarry = turnCarryOf(same);
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    carryQuietSince(same, Math.min(quietSince(same), quietSince(request)));
     const wait = budgetWaitOf(request);
     if (wait && !budgetWaitOf(same)) (same as MarkedRequest)[BUDGET_WAIT] = wait;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request

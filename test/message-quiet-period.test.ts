@@ -735,4 +735,15 @@ describe('messageQuietPeriod in the scheduler', () => {
     await framework.stop();
     assert.deepEqual(released(traces), [[key('discord:g:room'), 'gone']]);
   });
+
+  it("a hold that keeps one of two equal wakes keeps the older age the other carried (b9034c4 review, 15)", () => {
+    const f = Object.create(AgentFramework.prototype) as { holdRequest(held: InferenceRequest[], request: InferenceRequest): void };
+    const kept = inChannel(T0 + 5_000, 'g:room');
+    const older = inChannel(T0 + 5_000, 'g:room');
+    carryQuietSinceForTests(older, T0);
+    const held = [kept];
+    f.holdRequest(held, older);
+    assert.equal(held.length, 1, 'one of the two equal wakes is kept');
+    assert.equal(remaining(held, T0 + 5_500, { quietMs: 2_000, maxWaitMs: 5_000 }), 0, 'the cap counts from the older age');
+  });
 });
