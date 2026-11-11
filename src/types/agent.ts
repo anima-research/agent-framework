@@ -669,6 +669,17 @@ export interface InferenceRequest {
    *  the wake starts no turn. A row stored and not yet presented to the
    *  agent keeps its wake. */
   readsRow?: string;
+  /** The platform id of the one message this wake is for, in its channel
+   *  (`channelId`). The framework sets it on a wake for one message from a
+   *  channel or a push, the onboarding wake included, and carries it onto a
+   *  rewind's retry and `/unstick`'s run. If the turn it opens is refused,
+   *  no rewind takes the refusal and the turn isn't an ephemeral run's, the
+   *  refusal reaction goes on that message (on a Discord channel). Left out for a wake that is for no
+   *  single message: a batch, the gate's included even when it holds one
+   *  message, and a module's wake; and left off a re-armed turn that speaks
+   *  in another channel than the message's. Wakes for different messages
+   *  merged into one start answer neither. */
+  answersMessageId?: string;
   /** Host-owned: this wake's sole cause is these rows, a batched wake's
    *  writes (WakeProvenance.writes): the message of its own of each event
    *  that has one, and the batch's line where one was written. The wake starts no turn once each

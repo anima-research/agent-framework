@@ -200,7 +200,9 @@ export interface FrameworkConfig {
    *   so in a `[routing]` notice.
    * - `'latest-inbound'`: the previous rule. The most recent delivered
    *   inbound message is a global fallback locus for turns without one, and
-   *   an addressed message injected mid-turn re-pins the turn's locus.
+   *   an addressed message injected mid-turn re-pins the turn's locus. A
+   *   pushed message counts unless it's ambient (tagged `chat:ambient`, where
+   *   `chat:addressed` wins): an ambient push never moves the locus.
    *
    * Held traffic never moves the locus under either rule. Under either, a
    * turn the agent's own timer starts takes `unpromptedChannel` where it's

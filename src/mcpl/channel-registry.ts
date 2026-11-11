@@ -688,6 +688,8 @@ export function destinationKey(to: ChannelRef): string {
   return JSON.stringify([to.serverId, to.channelId]);
 }
 
+export const ANCHOR_SETS = Symbol('anchorSets');
+
 /** Whether two refs name the same channel. Two absent refs are the same:
  *  neither names a channel. */
 export function sameChannel(a: ChannelRef | null | undefined, b: ChannelRef | null | undefined): boolean {
@@ -1383,6 +1385,7 @@ export class ChannelRegistry {
   /** The same message's id and thread, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
+  [ANCHOR_SETS] = 0;
 
   /** Per-channel typing indicator timers, by destinationKey, with the
    *  channel each one types in. */
@@ -2469,6 +2472,7 @@ export class ChannelRegistry {
     this.defaultPublishChannel = { serverId: channel.serverId, channelId: channel.channelId };
     this.defaultPublishMessageId = messageId;
     this.defaultPublishThreadId = threadId;
+    this[ANCHOR_SETS]++;
   }
 
   /**
@@ -2647,15 +2651,15 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * The message the agent is replying to, with its channel: the most recent
-   * delivered inbound message (noteDelivered) that isn't a reaction, reaction removal, edit or deletion
+   * The message servers are told the agent is replying to, with its channel:
+   * the most recent delivered inbound message (noteDelivered) that isn't a reaction, reaction removal, edit or deletion
    * marker, apart from an edit the coalescer delivers on acceptance as the
-   * agent's first view. Left process-global: per-channel inbound tracking
+   * agent's first view. It isn't always the message a turn answers
+   * (TurnRouting.answers), which a refusal's mark reads. Left process-global: per-channel inbound tracking
    * (the right messageId for a fork's own channel) is a separate concern from
-   * the outbound routing fix. An ephemeral run has none (takesGlobalFallback),
-   * so a subagent's refusal marks no one else's channel. Nor has a turn that
-   * deliberately has no channel (activeChannelResolver's null): woken for a
-   * channel id two servers register, it isn't replying to the latest inbound
+   * the outbound routing fix. An ephemeral run has none (takesGlobalFallback).
+   * Nor has a turn that deliberately has no channel (activeChannelResolver's
+   * null): woken for a channel id two servers register, it isn't replying to the latest inbound
    * message, which may be anywhere. A fork's turn always has a channel, its
    * home, so it's taken to be replying to the latest inbound message as every
    * fork's turn is, in explicit mode as in locus mode, where its locus is
@@ -2712,10 +2716,10 @@ export class ChannelRegistry {
 
     const context: ChannelContext = {};
 
-    // Incoming: the message the agent is replying to (incomingFor). The
+    // Incoming: the message servers are told the agent is replying to (incomingFor). The
     // anchor is independent of the speech rule: under `speech.locus:
     // 'delivery'` the latest inbound is no fallback for where prose lands,
-    // but it is still the message the agent is replying to.
+    // but servers are still told it's the message the agent is replying to.
     const incoming = this.incomingFor(agentName);
     if (incoming && incoming.channel.serverId === serverId) {
       context.incoming = {
@@ -2768,7 +2772,7 @@ export class ChannelRegistry {
     // server's channel with its id isn't taken for it. Its message and
     // thread go, as on main, so no message on a server that's gone is given
     // as the one an agent replies to (incomingFor), to that server added
-    // back or to a refusal's reaction.
+    // back.
     if (this.defaultPublishChannel?.serverId === serverId) {
       this.defaultPublishMessageId = null;
       this.defaultPublishThreadId = undefined;
