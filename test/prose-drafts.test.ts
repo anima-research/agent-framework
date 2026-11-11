@@ -3260,6 +3260,25 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
+  // A stream that completes while the think round's call is still unanswered
+  // (finding 3 of the review of 8dbd802ba3e6): the text after the call is the
+  // turn's trailing prose, as the native path's terminal content has it, not
+  // the private round's, though no result marks where the round ended.
+  for (const xml of [false, true]) {
+    it(`${xml ? 'XML tool mode' : 'native mode'}: completed while a private think is unanswered, the text after the call still goes out`, async () => {
+      const h = await harness({ xml, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        const round = [text('Private beside think.'), call('t1', 'think', { content: 'hmm' }), text('Trailing after the call.')];
+        completeWhileWaiting(h.membrane, { ...createMockResponse(round), toolCalls: [] } as NormalizedResponse);
+        await h.turn([createMockResponse(round, 'tool_use')]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['Trailing after the call.']);
+        assert.deepEqual(h.drafts(), [], 'never drafted');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
   // Under disabled routing, routeRound records a private-think round's prose
   // as suppressed before it looks at the policy, so the fallback does too, and
   // only the withheld round's segment joins the trailing one.
