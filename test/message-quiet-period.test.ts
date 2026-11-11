@@ -746,4 +746,24 @@ describe('messageQuietPeriod in the scheduler', () => {
     assert.equal(held.length, 1, 'one of the two equal wakes is kept');
     assert.equal(remaining(held, T0 + 5_500, { quietMs: 2_000, maxWaitMs: 5_000 }), 0, 'the cap counts from the older age');
   });
+
+  it("the reply judge is told the earliest a held burst's queued wake can start (b9034c4 review, 25)", () => {
+    const f = Object.create(AgentFramework.prototype) as {
+      pendingRequests: InferenceRequest[];
+      quietPeriod: { quietMs: number; maxWaitMs: number } | undefined;
+      providerAccelerationCooldowns: Map<string, unknown>;
+      heartbeatWakesFor(agentName: string): unknown[];
+      upcomingWakesFor(agentName: string): Array<{ at?: number; kind?: string; what: string }>;
+    };
+    f.providerAccelerationCooldowns = new Map();
+    f.heartbeatWakesFor = () => [];
+    f.pendingRequests = [inChannel(Date.now() - 500, 'g:room')];
+    f.quietPeriod = { quietMs: 2_000, maxWaitMs: 10_000 };
+    const [held] = f.upcomingWakesFor('agent');
+    assert.equal(held?.kind, 'queued');
+    assert.equal(held?.at, undefined, 'no time of its own: a busy agent starts it when free, if that is later');
+    assert.match(held!.what, /, held by the message quiet period, not before [12] s$/, 'the earliest start, busy or idle');
+    f.quietPeriod = undefined;
+    assert.doesNotMatch(f.upcomingWakesFor('agent')[0]!.what, /quiet period/, 'with the option off, it is due as soon as the agent is free');
+  });
 });

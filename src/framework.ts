@@ -7057,7 +7057,9 @@ export class AgentFramework {
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
-   * request already queued for it, which runs as soon as the agent is free,
+   * request already queued for it, which runs as soon as the agent is free
+   * (under a message quiet period, not before the first of its bursts is
+   * ready),
    * and turns a provider cooldown holds until its end. Either only may wake
    * the agent when each request reads rows (readsRow, readsRows) and nothing
    * else, or is a start merged from such wakes (droppableAsRead), since the
@@ -7070,10 +7072,14 @@ export class AgentFramework {
     const queued = this.pendingRequests.filter((r) => r.agentName === agentName);
     if (queued.length > 0) {
       const reason = queued[0]!.reason;
+      const now = Date.now();
+      const split = this.quietPeriod ? quietSplit(queued, now, this.quietPeriod) : undefined;
+      const heldMs = split && split.start.length === 0 && split.waiting.size > 0 ? Math.min(...split.waiting.values()) : undefined;
       wakes.push({
         certain: queued.some((r) => !droppableAsRead(r)),
         kind: 'queued',
-        what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})`,
+        what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})` +
+          (heldMs !== undefined ? `, held by the message quiet period, not before ${Math.round(heldMs / 1000)} s` : ''),
       });
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
