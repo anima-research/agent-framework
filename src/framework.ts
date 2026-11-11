@@ -22462,12 +22462,14 @@ export class AgentFramework {
     if (held.size === 0) this.quietHolds.delete(agentName);
   }
 
-  /** Every request queued for a start: in the queue, in a pass's hands, or
-   *  held by a provider's cooldown. */
+  /** Every request queued for a start: in the queue, in a pass's hands,
+   *  held by a provider's cooldown, or held by a budget hold. A new place a
+   *  queued request can wait adds itself here. */
   private forEachQueuedRequest(fn: (r: InferenceRequest) => void): void {
     this.pendingRequests.forEach(fn);
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(fn);
     for (const cooldown of this.providerAccelerationCooldowns?.values() ?? []) cooldown.heldRequests.forEach(fn);
+    for (const hold of this.budgetHolds?.values() ?? []) hold.wakes.forEach(fn);
   }
 
   /** The burst keys of an agent's queued message wakes, for pruneQuietHolds. */

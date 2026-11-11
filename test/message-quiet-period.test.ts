@@ -525,17 +525,19 @@ describe('messageQuietPeriod in the scheduler', () => {
     }
   });
 
-  it('queuedQuietKeys reads the queue, a pass\'s hands and a provider cooldown (R3-6, R4-2)', () => {
+  it('queuedQuietKeys reads the queue, a pass\'s hands, a provider cooldown and a budget hold (R3-6, R4-2)', () => {
     // slimepriestess's pin: fails under each half of the lookup removed.
     const wake = (channelId: string) => ({ agentName: 'a', reason: 'mcpl:channel-incoming', source: 'discord', channelId, timestamp: 1 });
     const f = Object.create(AgentFramework.prototype) as {
       pendingRequests: unknown[]; passRequests: Set<Map<string, unknown[]>>; providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }>;
+      budgetHolds: Map<string, { wakes: unknown[] }>;
       queuedQuietKeys(agent: string): Set<string>;
     };
     f.pendingRequests = [wake('queued')];
     f.passRequests = new Set([new Map([['a', [wake('in-a-pass')]]])]);
     f.providerAccelerationCooldowns = new Map([['p', { heldRequests: [wake('cooling')] }]]);
-    assert.equal(f.queuedQuietKeys('a').size, 3);
+    f.budgetHolds = new Map([['a', { wakes: [wake('budget-held')] }]]);
+    assert.equal(f.queuedQuietKeys('a').size, 4);
   });
 
   it("a coalesced batch's later notices keep one hold: no gone between them, one released at the end (R4-1b)", async () => {
@@ -648,6 +650,22 @@ describe('messageQuietPeriod in the scheduler', () => {
       assert.ok(left === undefined || left < 2_000, `the cap counts from the first wake: ${left} ms left`);
     } finally {
       x.passRequests.delete(pass);
+      await framework.stop();
+    }
+  });
+
+  it("a replacement carries the age of a wake a budget hold kept (b9034c4 review, 5)", async () => {
+    const { framework, x, occ, old, capLeft } = await replacing((x, wake) => { x.pendingRequests.push(wake); });
+    try {
+      x.budgetHolds.set('agent', { wakes: [old] });
+      await x.wakeForCoalescedBatch(occ);
+      assert.deepEqual(x.budgetHolds.get('agent')?.wakes, [], "the withdrawal took the held wake");
+      const mine = x.pendingRequests.filter((r) => r.coalescingSubject === old.coalescingSubject);
+      assert.equal(mine.length, 1);
+      const left = capLeft(mine[0]!);
+      assert.ok(left === undefined || left < 2_000, `the cap counts from the first wake: ${left} ms left`);
+    } finally {
+      x.budgetHolds.delete('agent');
       await framework.stop();
     }
   });
