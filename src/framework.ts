@@ -22669,7 +22669,7 @@ export class AgentFramework {
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           ...this.readsRowFor(placement, agentName),
-          ...this.answersOn({ messageId: typeof event.origin?.messageId === 'string' ? event.origin.messageId : undefined, tags: event.tags, firstView: event.firstView }),
+          ...(triggerChannel ? this.answersOn({ messageId: typeof event.origin?.messageId === 'string' ? event.origin.messageId : undefined, tags: event.tags, firstView: event.firstView }) : {}),
         });
       }
     }
@@ -41862,7 +41862,6 @@ export class AgentFramework {
     recipients: readonly string[];
     /** Where the event came from, so a turn it wakes speaks there (as the lane's own wake would). */
     channelId?: string;
-    /** The message the event delivered, which a turn it wakes answers (as the lane's own wake would). */
     answersMessageId?: string;
   }): void {
     try {
