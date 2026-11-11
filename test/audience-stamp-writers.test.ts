@@ -442,7 +442,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.noticeUnnoticedDrafts': { count: 1, when: 'turn', what: "a start's drafts notice" },
   'framework.ts AgentFramework.noticeHeadMoves': { count: 1, when: 'turn', what: "a start's workspace head-move notice" },
   'framework.ts AgentFramework.writeAutoContinueNotice': { count: 1, when: 'turn', what: "a continuation's [continue] row, at its start" },
-  'framework.ts AgentFramework.placeWakeLines': { count: 1, when: 'turn', what: "a batched wake's line, at its start" },
+  'framework.ts AgentFramework.placeBatchLine': { count: 1, when: 'turn', what: "a batched wake's line, at its start" },
   'framework.ts AgentFramework.runPuppetToolCall': { count: 2, when: 'held-back', what: "the puppet's pair: under its own reservation, or held back once a turn replaced it" },
   'framework.ts AgentFramework.appendProseDeliveryReceipt': { count: 1, when: 'end', what: "a stream's delivery receipt, after its last request" },
   'framework.ts AgentFramework.driveStream': { count: 2, when: 'end', what: "the contained tool-wrapper prose marker, and main's cut-off tool-block notice" },
@@ -450,6 +450,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.noteInferenceExhausted': { count: 1, when: 'end', what: "an exhausted turn's [inference-failed] marker" },
   'framework.ts AgentFramework.settleDeliberateCancel': { count: 1, when: 'held-back', what: "a stop's [turn-interrupted] marker, held back once the stream no longer owns the agent" },
   'framework.ts AgentFramework.sweepExpiredConversations': { count: 1, when: 'held-back', what: "a fork's closure prompt, held back while a turn of the fork's is alive" },
+  'framework.ts AgentFramework.storeBudgetHoldNote': { count: 1, when: 'held-back', what: "a budget wait's note at its release, held back while a turn of the agent's is alive" },
   // #844's design question 1: a notice about the agent's own speech, so an
   // undo takes it with the turn. Written mid-round, before the boundary
   // whose stream hears it, so it is held back while the turn is alive.

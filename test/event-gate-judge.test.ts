@@ -2,7 +2,14 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { EventGate } from '../src/gate/event-gate.js';
+import { MembraneError } from '@animalabs/membrane';
+import * as gateModule from '../src/gate/event-gate.js';
+import { EventGate, type WakeWrite, type WritePlacement } from '../src/gate/event-gate.js';
+import { JudgeFailure } from '../src/gate/reply-judge.js';
+
+/** The gate's internal mark of the rows a batched wake's line can name, read
+ *  loosely so this file still runs, red, against a gate without it. */
+const BATCH_LINE_ROWS: symbol = (gateModule as unknown as { BATCH_LINE_ROWS?: symbol }).BATCH_LINE_ROWS ?? Symbol('no line rows');
 import type { GateConfig, GateEventInfo, JudgeFn, JudgeRequest, JudgeVerdict } from '../src/gate/types.js';
 import type { ToolDefinition } from '../src/types/index.js';
 
@@ -50,21 +57,22 @@ function scriptedJudge() {
   };
 }
 
-function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[] } = {}) {
+function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[]; isAnswered?: (after: WritePlacement) => boolean } = {}) {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const wakes: Array<{ agentName: string; reason: string }> = [];
+  const wakes: Array<{ agentName: string; reason: string; writes?: WakeWrite[]; lineRows?: unknown }> = [];
   const gate = new EventGate({
     configPath,
     emitTrace: (e) => traces.push(e as { type: string }),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
-    requestInference: (a, r) => wakes.push({ agentName: a, reason: r }),
+    requestInference: (a, r, _s, p) => wakes.push({ agentName: a, reason: r, ...(p?.writes ? { writes: p.writes } : {}), ...(p && BATCH_LINE_ROWS in p ? { lineRows: (p as Record<symbol, unknown>)[BATCH_LINE_ROWS] } : {}) }),
     getAgentNames: () => ['agent'],
     ...(opts.judge ? { judge: opts.judge } : {}),
     ...(opts.judgeTimeoutMs !== undefined ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
     ...(opts.judgeOnError ? { judgeOnError: opts.judgeOnError } : {}),
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.residents ? { changesJudgedContext: (name: string) => opts.residents!.includes(name) } : {}),
+    ...(opts.isAnswered ? { isAnswered: opts.isAnswered } : {}),
   });
   return { gate, traces, messages, wakes };
 }
@@ -137,6 +145,127 @@ describe('judge rules: reading', () => {
 });
 
 describe('judge rules: verdicts', () => {
+  for (const answeredRows of [[], ['row-1']] as const) {
+    it(`a reply with ${answeredRows.length ? 'an event the host says is already answered keeps the wake: it carries no writes' : 'no event the host says is answered carries each event\'s write to the wake'}, and no line either way`, async () => {
+      const judge = scriptedJudge();
+      const answered = new Set<string>(answeredRows);
+      const { gate, wakes, messages } = makeGate(writeConfig(`reply-split-${answeredRows.length}.json`, JUDGED), {
+        judge: judge.fn, isAnswered: (after) => answered.has(after.messageId!),
+      });
+      gate.evaluate(chat('already answered'), { agent: 'agent', messageId: 'row-1' });
+      gate.evaluate(chat('still open'), { agent: 'agent', messageId: 'row-2' });
+      await until(() => judge.waiting() === 1, 'the judge is asked');
+      judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+      await until(() => wakes.length === 1, 'the wake');
+      assert.strictEqual(messages.length, 0, 'messages stored at arrival get no line');
+      if (answeredRows.length === 0) {
+        assert.deepStrictEqual(wakes[0]!.writes?.map((w) => w.after), [{ agent: 'agent', messageId: 'row-1' }, { agent: 'agent', messageId: 'row-2' }]);
+      } else {
+        assert.strictEqual(wakes[0]!.writes, undefined, 'the wake has nothing to drop it by');
+      }
+      gate.dispose();
+    });
+  }
+
+  it("a reply with an event the host says is already answered: the wake carries no writes, but its line rows still name both events' rows", async () => {
+    const judge = scriptedJudge();
+    const answered = new Set<string>(['row-1']);
+    const { gate, wakes } = makeGate(writeConfig('reply-line-rows.json', JUDGED), {
+      judge: judge.fn, isAnswered: (after) => answered.has(after.messageId!),
+    });
+    gate.evaluate(chat('already answered'), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(chat('still open'), { agent: 'agent', messageId: 'row-2' });
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.strictEqual(wakes[0]!.writes, undefined, 'premise: the answered event keeps the wake');
+    assert.deepStrictEqual(wakes[0]!.lineRows, [{ agent: 'agent', messageId: 'row-1' }, { agent: 'agent', messageId: 'row-2' }]);
+    gate.dispose();
+  });
+
+  it("a reply to a batch with nothing in the window to name: its wake still carries line rows, none, so a merge with another batch's wake keeps that batch's line", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('reply-no-line-rows.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('a push with no stored message of its own'));
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    judge.answer({ reply: true, reason: 'worth a look', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.deepStrictEqual(wakes[0]!.lineRows, []);
+    gate.dispose();
+  });
+
+  it('a reply asks isAnswered only about events with a stored write, never an unfilled placement', async () => {
+    const judge = scriptedJudge();
+    const asked: WritePlacement[] = [];
+    const { gate, wakes } = makeGate(writeConfig('reply-asked-writes.json', JUDGED), {
+      judge: judge.fn, isAnswered: (after) => { asked.push(after); return false; },
+    });
+    gate.evaluate(chat('never placed'), { agent: '' });
+    gate.evaluate(chat('placed'), { agent: 'agent', messageId: 'row-2' });
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.deepStrictEqual(asked, [{ agent: 'agent', messageId: 'row-2' }]);
+    gate.dispose();
+  });
+
+  it('a reply asks isAnswered when the judge answers: an event answered while the judge read keeps the wake', async () => {
+    const judge = scriptedJudge();
+    const answered = new Set<string>();
+    const { gate, wakes } = makeGate(writeConfig('reply-asked-late.json', JUDGED), {
+      judge: judge.fn, isAnswered: (after) => answered.has(after.messageId!),
+    });
+    gate.evaluate(chat('answered while the judge read'), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(chat('still open'), { agent: 'agent', messageId: 'row-2' });
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    answered.add('row-1');
+    judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.strictEqual(wakes[0]!.writes, undefined, 'the answered event keeps the wake, so it carries no writes');
+    gate.dispose();
+  });
+
+  for (const [doubt, isAnswered] of [
+    ['no isAnswered', undefined],
+    ['an isAnswered that throws', () => { throw new Error('no'); }],
+    ['an isAnswered that answers neither true nor false', (() => undefined) as unknown as () => boolean],
+    ['an isAnswered that says answered', () => true],
+  ] as const) {
+    it(`with ${doubt}, a reply's events count as answered when it was given: the wake carries no writes`, async () => {
+      const judge = scriptedJudge();
+      const { gate, wakes } = makeGate(writeConfig('reply-written.json', JUDGED), {
+        judge: judge.fn, ...(isAnswered ? { isAnswered } : {}),
+      });
+      gate.evaluate(chat('is anyone around?'), { agent: 'agent', messageId: 'row-1' });
+      await until(() => judge.waiting() === 1, 'the judge is asked');
+      judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+      await until(() => wakes.length === 1, 'the wake');
+      assert.strictEqual(wakes[0]!.writes, undefined);
+      gate.dispose();
+    });
+  }
+
+  for (const how of ['no judge wired', 'a judge that fails, onError "wake"'] as const) {
+    it(`with ${how}, a judge rule's batch carries its events' writes to the wake, and the channel a reply is owed in, as a debounce's does`, async () => {
+      const judge = scriptedJudge();
+      const { gate, wakes, messages } = makeGate(writeConfig('no-verdict.json', {
+        policies: [{ name: 'addressed', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 100 } } }],
+      }), {
+        ...(how === 'no judge wired' ? {} : { judge: judge.fn }), isAnswered: () => true,
+      });
+      gate.evaluate(chat('is anyone around?', { eventType: 'mcpl:channel-incoming', tags: ['chat:addressed'] }), { agent: 'agent', messageId: 'row-1' });
+      if (how !== 'no judge wired') {
+        await until(() => judge.waiting() === 1, 'the judge is asked');
+        judge.fail(new Error('judge down'));
+      }
+      await until(() => wakes.length === 1, 'the wake');
+      assert.strictEqual(messages.length, 0);
+      assert.deepStrictEqual(wakes[0]!.writes?.map(({ after, replyTo }) => ({ after, replyTo })),
+        [{ after: { agent: 'agent', messageId: 'row-1' }, replyTo: { serverId: 'discord', channelId: 'c1' } }]);
+      gate.dispose();
+    });
+  }
+
   it('reply wakes the agent with the batch, and the judge is shown the batch and the instructions', async () => {
     const judge = scriptedJudge();
     const { gate, wakes, messages, traces } = makeGate(writeConfig('reply.json', JUDGED), { judge: judge.fn });
@@ -154,8 +283,8 @@ describe('judge rules: verdicts', () => {
 
     judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1234 });
     await until(() => wakes.length === 1, 'the wake');
-    assert.deepStrictEqual(wakes, [{ agentName: 'agent', reason: 'gate:debounce' }]);
-    assert.strictEqual(messages.length, 1);
+    assert.deepStrictEqual(wakes, [{ agentName: 'agent', reason: 'gate:debounce', lineRows: [] }], 'a batch wake, whose line has nothing to name');
+    assert.strictEqual(messages.length, 0, 'events stored at arrival get no line');
     const verdict = traces.find((t) => t.type === 'gate:judge-verdict');
     assert.ok(verdict);
     assert.strictEqual(verdict.verdict, 'reply');
@@ -431,6 +560,39 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
+  // About twice the most a spread can pass as call arguments on Node 24.22.2
+  // (between 124,887 and 125,498 elements).
+  const PAST_A_SPREAD = 250_000;
+  for (const route of ['held while a turn runs', 'queued while the judge decides'] as const) {
+    it(`a quiet period's batch longer than a spread can pass, ${route}, keeps its newest`, async () => {
+      const judge = scriptedJudge();
+      const { gate } = makeGate(writeConfig(`spread-${route.split(' ')[0]}.json`, {
+        policies: [{ name: 'busy', match: {}, behavior: { judge: { debounceMs: 100 } } }],
+      }), { judge: judge.fn, judgeTimeoutMs: 600_000 });
+      const original = console.error;
+      console.error = () => {};
+      try {
+        const state = () => gate.getStatus().policies[0]!.judgeState!;
+        if (route === 'held while a turn runs') gate.onInferenceStarted('agent');
+        gate.evaluate(chat('first'));
+        if (route === 'queued while the judge decides') await until(() => judge.requests.length === 1, 'the judge to decide the first batch');
+        else await until(() => state().heldCount === 1, 'the first batch to be held');
+        for (let i = 0; i < PAST_A_SPREAD; i++) gate.evaluate(chat(`b${i}`));
+        await until(() => state().pendingCount === 0, 'the flood to end its quiet period');
+        if (route === 'queued while the judge decides') assert.ok(state().judging && judge.requests.length === 1, 'premise: the flood waits for the judge');
+        else assert.strictEqual(state().heldCount, 100, 'premise: the flood is held with the first batch');
+      } finally {
+        console.error = original;
+      }
+      if (route === 'held while a turn runs') gate.onInferenceEnded('agent');
+      else judge.answer({ reply: false, reason: 'not yet' });
+      await until(() => judge.requests.length === (route === 'held while a turn runs' ? 1 : 2), 'the newest events to be judged');
+      assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content),
+        Array.from({ length: 100 }, (_, i) => `b${PAST_A_SPREAD - 100 + i}`));
+      gate.dispose();
+    });
+  }
+
   it('gate_status names a judge that keeps failing', async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('streak.json', JUDGED), { judge: judge.fn });
@@ -446,12 +608,101 @@ describe('judge rules: timing', () => {
     } finally {
       console.error = original;
     }
-    assert.ok(gate.getStatus().errors.some((e) => e.includes('failed its last 3 requests') && e.includes('400 model not found')));
+    assert.ok(gate.getStatus().errors.some((e) => e.includes('failed its last 3 requests (the newest: the call failed)')), JSON.stringify(gate.getStatus().errors));
+    assert.ok(!gate.getStatus().errors.some((e) => e.includes('400 model not found')), "gate_status doesn't quote an error the framework didn't write");
     gate.evaluate(chat('ok'));
     await until(() => judge.waiting() === 1, 'the judge is asked');
     judge.answer({ reply: false, reason: 'fine' });
     await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the verdict');
     assert.ok(!gate.getStatus().errors.some((e) => e.includes('failed its last')));
+    gate.dispose();
+  });
+
+  it("a judge that fails on a provider's error shows the framework's words in gate_status, and stderr keeps the provider's", async () => {
+    const SENTINEL = 'zz-provider-words-7f3a';
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('provider-words.json', JUDGED), { judge: judge.fn });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        gate.evaluate(chat(`m${i}`));
+        await until(() => judge.waiting() === 1, 'the judge is asked');
+        judge.fail(new MembraneError({ type: 'server', retryable: true, httpStatus: 529, message: `Overloaded: ${SENTINEL}`, rawError: undefined }));
+        await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === i + 1, 'the failure counted');
+      }
+    } finally {
+      console.error = original;
+    }
+    const status = gate.getStatus();
+    assert.strictEqual(status.policies[0]!.judgeState!.last!.reason, 'the model call failed (server, HTTP 529)');
+    assert.ok(status.errors.some((e) => e.includes('failed its last 3 requests (the newest: the model call failed (server, HTTP 529))')), JSON.stringify(status.errors));
+    assert.ok(!JSON.stringify(status).includes(SENTINEL), JSON.stringify(status));
+    assert.ok(logged.some((line) => line.includes(SENTINEL)), "stderr keeps the provider's words");
+    gate.dispose();
+  });
+
+  it("a judge the gate times out shows the gate's own words in gate_status", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('timeout-words.json', JUDGED), { judge: judge.fn, judgeTimeoutMs: 50 });
+    const original = console.error;
+    console.error = () => {};
+    try {
+      gate.evaluate(chat('hello'));
+      await until(() => wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
+    gate.dispose();
+  });
+
+  it("a judge whose answer held no verdict is shown in the framework's words, and stderr keeps what the answer said", async () => {
+    const SENTINEL = 'zz-judge-words-7f3a';
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('no-verdict-words.json', JUDGED), { judge: judge.fn });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        gate.evaluate(chat(`m${i}`));
+        await until(() => judge.waiting() === 1, 'the judge is asked');
+        judge.fail(new JudgeFailure("the judge's answer held no verdict", `stop: refusal, text: "${SENTINEL}"`));
+        await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === i + 1, 'the failure counted');
+      }
+    } finally {
+      console.error = original;
+    }
+    const status = gate.getStatus();
+    assert.strictEqual(status.policies[0]!.judgeState!.last!.reason, "the judge's answer held no verdict");
+    assert.ok(status.errors.some((e) => e.includes("(the newest: the judge's answer held no verdict)")), JSON.stringify(status.errors));
+    assert.ok(!JSON.stringify(status).includes(SENTINEL) && !JSON.stringify(status).includes('refusal'), JSON.stringify(status));
+    assert.ok(logged.some((line) => line.includes(SENTINEL)), 'stderr keeps what the answer said');
+    gate.dispose();
+  });
+
+  it("a judge that rejects as soon as it's stopped still shows the gate's timeout, in gate_status and on stderr", async () => {
+    let asked = 0;
+    let stopped = 0;
+    const fn: JudgeFn = (request) => new Promise<JudgeVerdict>((_, reject) => {
+      asked++;
+      request.signal.addEventListener('abort', () => { stopped++; reject(new DOMException('This operation was aborted', 'AbortError')); });
+    });
+    const { gate, wakes } = makeGate(writeConfig('abort-aware-timeout.json', JUDGED), { judge: fn, judgeTimeoutMs: 50 });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      gate.evaluate(chat('hello'));
+      await until(() => wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.last!.reason, 'the judge took more than 50 ms');
+    assert.ok(logged.some((line) => line.includes('the reply judge failed (the judge took more than 50 ms)')), JSON.stringify(logged));
+    assert.deepEqual({ asked, stopped }, { asked: 1, stopped: 1 }, 'the judge was asked once, and the gate stopped it');
     gate.dispose();
   });
 
@@ -471,14 +722,14 @@ describe('judge rules: timing', () => {
   it('a refused call under the default onError wakes the agent with the events queued behind it', async () => {
     const refusal = Object.assign(new Error("scout's provider calls are held"), { providerAdmission: 'deferred' as const });
     const judge = scriptedJudge();
-    const { gate, wakes, messages } = makeGate(writeConfig('refused-queued.json', JUDGED), { judge: judge.fn });
-    gate.evaluate(chat('first'));
+    const { gate, wakes } = makeGate(writeConfig('refused-queued.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('first'), { agent: 'agent', messageId: 'row-1' });
     await until(() => judge.waiting() === 1, 'the judge call');
-    gate.evaluate(chat('second'));
+    gate.evaluate(chat('second'), { agent: 'agent', messageId: 'row-2' });
     await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the second event to queue behind the call');
     judge.fail(refusal);
     await until(() => wakes.length === 1, 'the wake');
-    assert.match(JSON.stringify(messages.at(-1)!.content), /Gate: 2 events matched/);
+    assert.deepStrictEqual(wakes[0]!.writes?.map((w) => w.after.messageId), ['row-1', 'row-2'], 'the wake is for both events');
     gate.dispose();
   });
 
@@ -500,7 +751,7 @@ describe('judge rules: timing', () => {
     assert.strictEqual(wakes.length, 0);
     const state = gate.getStatus().policies[0]!.judgeState!;
     assert.deepStrictEqual(state.verdicts, { reply: 0, wait: 0, error: 1 });
-    assert.strictEqual(state.last?.reason, 'provider down');
+    assert.strictEqual(state.last?.reason, 'the call failed', "an error the framework didn't write is shown in its words");
     judge.answer({ reply: false, reason: 'nothing for the agent' });
     gate.dispose();
   });
@@ -697,6 +948,60 @@ describe('judge rules: what waiting leaves the agent with', () => {
     const selfWake = wakes.find((w) => w.what.includes('skip_reply'))!;
     assert.ok(Math.abs(selfWake.at! - (t0 + 600_000)) < 2_000, String(selfWake.at! - t0));
     assert.ok(!wakes.some((w) => w.what.includes('"ambient"')), "the rule being judged isn't listed");
+    gate.dispose();
+  });
+
+  const toAgent = { agent: 'agent', messageId: 'row-1' };
+  for (const [what, writes, woken, certain] of [
+    ['its one event written to the agent it wakes only may wake it, since an answered batch starts no turn', [toAgent], ['agent'], false],
+    ['each of its events written to the agent it wakes only may wake it', [toAgent, { agent: 'agent', messageId: 'row-2' }], ['agent'], false],
+    ['with an event given no write, it wakes the agent: the framework has no write to drop the wake by', [toAgent, undefined], ['agent'], true],
+    ["with an event written to another agent's window, it wakes the agent", [{ agent: 'other', messageId: 'row-1' }], ['agent'], true],
+    ['with a write that names no agent, it wakes the agent', [{ messageId: 'row-1' }], ['agent'], true],
+    ["it wakes a co-resident, whom the delivery agent's answer doesn't take it from", [toAgent], ['agent', 'other'], true],
+  ] as const) {
+    it(`tells the judge of a pending debounced batch: ${what}`, () => {
+      const { gate } = makeGate(writeConfig('upcoming-written.json', {
+        policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+      }));
+      writes.forEach((after: WritePlacement | undefined, i) => {
+        gate.evaluate({ content: `notes-${i}.md`, eventType: 'workspace:modified', serverId: '', channelId: '' }, after);
+      });
+      const n = writes.length;
+      assert.deepStrictEqual(gate.upcomingWakes([...woken]).map((w) => [w.what, w.certain]),
+        [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]]);
+      gate.dispose();
+    });
+  }
+
+  it("tells the judge of a pending debounced batch split by recipient: each agent's wake is told by the events delivery gives it", () => {
+    const { gate } = makeGate(writeConfig('upcoming-split.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+    }));
+    gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate({ content: 'b.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['other'] }, { agent: 'other', messageId: 'row-2' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false], "the agent's wake has its own event's write alone");
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [false], "and so has the other's");
+    gate.dispose();
+  });
+
+  it("tells the judge of a pending debounced batch split by recipient: an agent given none of its events doesn't make the wake certain", () => {
+    const { gate } = makeGate(writeConfig('upcoming-split-none.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+    }));
+    gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [false], "the other agent is given no event, so delivery doesn't wake it");
+    gate.dispose();
+  });
+
+  it("tells the judge of a pending debounced batch split by recipient: one agent's event with no write wakes that agent", () => {
+    const { gate } = makeGate(writeConfig('upcoming-split-unwritten.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
+    }));
+    gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate({ content: 'b.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['other'] });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [true]);
     gate.dispose();
   });
 

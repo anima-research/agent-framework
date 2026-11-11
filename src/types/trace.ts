@@ -136,12 +136,37 @@ export type TraceEvent =
        *  timers, so a stalled event loop can end it later. Absent for a wait
        *  too long for a date. */
       until?: number;
+      /** The try the wait leads to, as the error policy counts tries
+       *  against `maxTries`: each failed start counts, sent or not, the count
+       *  starts over when a provider hold queues the turn again, and a
+       *  deadline's retries count that call's expiries. The policy's place in
+       *  its schedule, not a count of sends. Absent from a framework before
+       *  this field. */
+      nextTry?: number;
+      /** The most tries the error policy allows (ErrorAction.maxTries), when it
+       *  says so as a positive whole number. A turn re-armed after it ran out of
+       *  tries ends at its second deadline expiry with no completed round,
+       *  transient failure or message said to it between them, whatever this
+       *  says. */
+      maxTries?: number;
+      /** What the error policy retries the failure as (ErrorAction.retryClass),
+       *  such as `overloaded`, when it says. A longer one than 128 characters
+       *  is shown as its start and end around a note of how much was left out. */
+      retryClass?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
+      /**
+       * The reason the agent's `[inference-failed]` note may give, before the
+       * note's own 600-character cut, and bounded as `error` is. Present only
+       * when the failure's message holds no provider's text: a progress
+       * bound's cut, a stream's abort, or context-manager's refusal of a
+       * compile. Absent otherwise, and a note then gives no reason.
+       */
+      shownReason?: string;
       /** Whether membrane classified the failure as retryable (observability). */
       retryable?: boolean;
       /**
@@ -155,6 +180,55 @@ export type TraceEvent =
       httpStatus?: number;
       /** The provider's own error code, when it sent one (at most 128 characters). */
       providerErrorCode?: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A start whose compile was refused for budget while compression was
+       * pending waits in the agent's budget hold, idle, instead of failing
+       * (#304). It follows the refused attempt's `inference:failed`. Once
+       * something the refused compile depends on has changed (compression's
+       * progress, nothing left pending, a surgery or an undo, the agent's
+       * budget or live context settings, or a quiesce's end), the hold ends,
+       * the held requests are queued, and its note is stored as the agent's
+       * own row, entering its window at once or, while a turn of the agent's
+       * is alive, at its next presentation point; a failed write stores
+       * none. Their start's own compile is the check: refused again while
+       * compression is pending, it waits in a new hold, with a new
+       * `inference:held`. `inference:hold_ended` follows each, once. An
+       * ephemeral run's start, and one before the framework's `start()`,
+       * never waits.
+       */
+      type: 'inference:held';
+      agentName: string;
+      /** 'over_budget', or 'context_refusal' when no summary covers a span the compile would drop. */
+      errorType: 'over_budget' | 'context_refusal';
+      /** The refusal's message, bounded as a trace event's `error` is (2,000 characters). */
+      error: string;
+      /** The refused compile's budget and size in tokens, when context-manager gave them. */
+      budget?: number;
+      actual?: number;
+      /** When this hold started (epoch ms). A wait held again after its
+       *  release starts a new hold; its `context-refusal` alert and the note
+       *  count from the wait's first hold. */
+      since: number;
+      /** Requests the hold holds as it starts: the refused start's own. */
+      heldRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'inference:hold_ended';
+      agentName: string;
+      /**
+       * 'released': something the refused compile depends on changed, so the
+       * held requests were queued and their start's compile is the check.
+       * 'stopped': the held turn was ended by `abortInference()`, `stop()` or
+       * its agent's end, reported after its `inference:aborted`. 'removed': a
+       * surgery or an undo removed what the held turn stood on, reported after
+       * its `inference:aborted`, and the wakes that joined it go back to the
+       * queue.
+       */
+      outcome: 'released' | 'stopped' | 'removed';
+      /** Since the hold started (`inference:held`'s `since`). */
+      waitedMs: number;
     })
 
   // Streaming inference lifecycle
@@ -605,8 +679,9 @@ export type TraceEvent =
   | (TraceEventBase & {
       /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
        *  `reply` or `wait` as the judge answered, `error` when it failed,
-       *  timed out or answered nothing usable; `woke` is whether the batch
-       *  then woke the agent (an error does by the host's onError).
+       *  timed out or answered nothing usable; `woke` is whether the gate
+       *  goes on to deliver the batch to wake the agent (an error's is by the
+       *  host's onError). JudgeConfig says when such a delivery starts no turn.
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';
@@ -619,19 +694,6 @@ export type TraceEvent =
       inputTokens?: number;
       cacheReadTokens?: number;
       outputTokens?: number;
-    })
-  | (TraceEventBase & {
-      /** A batched wake's turn started without its `[Gate: …]` line (the
-       *  gate hands the line to the wake when its message is the newest at
-       *  the fire, EventGate isNewestEntry, and the turn's start decides).
-       *  `reason`: `newest`, on the delivery agent's start the message was
-       *  still the newest entry in the window; `held`, the host was
-       *  quiesced, so no line could be written then. */
-      type: 'gate:wake-line-omitted';
-      reason: 'newest' | 'held';
-      policyNames: string[];
-      eventType: string;
-      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'gate:config-reloaded';
@@ -1043,14 +1105,19 @@ export type TraceEvent =
   // this stream, not a separate system. See connectome docs/observability.md.
   | (TraceEventBase & {
       type: 'ops:alert';
-      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | … */
+      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | …
+       *  A kind ending in `-clear` ends the alert of the kind before it:
+       *  'context-refusal-clear' is raised when a budget hold whose wait
+       *  raised 'context-refusal' ends with its turn stopped or removed, so
+       *  the waiting start doesn't run. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
       /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record),
-       *  bounded field by field as that record is. */
+      /** Kind-specific structured payload (mirrors the failures.log record,
+       *  where the alert writes one: a budget hold's 'context-refusal' and its
+       *  clear write none), bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 
@@ -1560,7 +1627,7 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
 
 /**
  * Listener for trace events.
