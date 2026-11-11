@@ -165,6 +165,15 @@ describe('the open shapes of a resident and the subconscious (#291, AF-5)', () =
     assert.deepEqual(await h.compiled(await h.open(subconsciousContextOptions({ serves: 'mira' }))), sub, "the subconscious's");
   });
 
+  it("an inspection's reopen of a resident keeps a host's change rows and its own, which its compile on 'head' leaves out", async () => {
+    const h = await boot({ changes: true });
+    const live = await h.live('mira');
+    assert.ok(!live.some((t) => t.startsWith('change:')), `premise: mira, on 'head', compiles no change row: ${JSON.stringify(live)}`);
+    const reopened = await h.compiled(await h.reopen('mira'));
+    assert.deepEqual(reopened.filter((t) => t.startsWith('change:')), ['change:host_tool', 'change:mira_tool'], "the host's change row and mira's own, not oren's");
+    assert.deepEqual(reopened.filter((t) => !t.startsWith('change:')), live, 'and otherwise the view its live one had');
+  });
+
   it("an ended agent's context reopens with the view its live one had", async () => {
     const h = await boot();
     // A reopen of the live agents' records, which is what an ended one's is.

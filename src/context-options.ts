@@ -2,7 +2,9 @@
  * How the framework opens a resident's context and the persistent
  * subconscious's (#291, AF-5): which slot each reads, and what its view
  * leaves out. The framework opens its live agents with these, and opens an
- * ended one's context again with the same view (reopenAgentContext). A host
+ * ended one's context again with the same view (reopenAgentContext), except
+ * that an inspection's reopen keeps a host's change rows and the agent's
+ * own, which a compile on `'head'` leaves out. A host
  * that opens one of these contexts itself, to audit a store say, opens it
  * with them too, so what it reads is what the agent's compiles read (the
  * requests then send other agents' rounds as a transcript, `foreignRounds`,
