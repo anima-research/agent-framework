@@ -45,7 +45,7 @@ async function boot(opts: { changes?: boolean } = {}) {
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'),
     membrane: new MockMembrane().asMembrane(),
-    agents: ['mira', 'oren'].map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, ...(opts.changes && name === 'oren' ? { toolDeclarations: 'entries' } : {}) })),
+    agents: ['mira', 'oren'].map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, ...(opts.changes && name === 'oren' ? { toolDeclarations: 'entries', selfParticipants: ['oren-old'] } : {}) })),
     subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for mira.' },
     modules: [],
     syncIntervalMs: 0,
@@ -65,7 +65,7 @@ async function boot(opts: { changes?: boolean } = {}) {
   if (opts.changes) {
     const change = (tool: string) => [{ type: 'system_change', defineTools: [{ name: tool, description: tool, inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock];
     write('Host', change('host_tool'));
-    for (const name of ['mira', 'oren', 'Subconscious']) write('system', change(`${name}_tool`), { system: true, kind: 'system-change', agent: name });
+    for (const name of ['mira', 'oren', 'oren-old', 'Subconscious']) write('system', change(`${name}_tool`), { system: true, kind: 'system-change', agent: name });
   }
   // The held row and oren's injection are 'elsewhere' for mira (and the
   // injection for the subconscious), so no presentation point takes them
@@ -155,8 +155,8 @@ describe('the open shapes of a resident and the subconscious (#291, AF-5)', () =
     assert.ok(mira.includes('a word for both') && !mira.some((t) => t.startsWith('change:')), `premise: mira, on 'head', compiles no change row: ${JSON.stringify(mira)}`);
     assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('mira'), strategy: new PassthroughStrategy() })), mira, "mira's");
     const oren = await h.live('oren');
-    assert.ok(oren.includes('change:host_tool') && oren.includes('change:oren_tool') && !oren.includes('change:mira_tool'), `premise: oren, under 'entries', compiles the host's change and its own, not mira's: ${JSON.stringify(oren)}`);
-    assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('oren', { toolDeclarations: 'entries' }), strategy: new PassthroughStrategy() })), oren, "oren's");
+    assert.ok(oren.includes('change:host_tool') && oren.includes('change:oren_tool') && oren.includes('change:oren-old_tool') && !oren.includes('change:mira_tool'), `premise: oren, under 'entries', compiles the host's change and its own, its self participant's included, not mira's: ${JSON.stringify(oren)}`);
+    assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('oren', { toolDeclarations: 'entries', selfParticipants: ['oren-old'] }), strategy: new PassthroughStrategy() })), oren, "oren's");
     const sub = await h.live('Subconscious');
     assert.ok(sub.includes('a held word') && sub.includes('change:Subconscious_tool') && sub.filter((t) => t.startsWith('change:')).length === 1, `premise: the subconscious compiles its own change row and no other: ${JSON.stringify(sub)}`);
     assert.deepEqual(await h.compiled(await h.open(subconsciousContextOptions({ serves: 'mira' }))), sub, "the subconscious's");
