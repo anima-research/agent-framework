@@ -366,13 +366,15 @@ function failWhileToolsRun(membrane: MockMembrane, atRound = 1): void {
 }
 
 /**
- * The next stream yields its round's tool-calls and then completes at once
- * (or once `ready` holds; `missed` says it never did), its calls unanswered: a stream that ends while the
- * framework still waits for tools.
+ * The next stream yields its round's tool-calls (its `atRound`th round's, the
+ * first by default) and then completes at once (or once `ready` holds;
+ * `missed` says it never did, and stays true where the stream never reached
+ * that round), its calls unanswered: a stream that ends while the framework
+ * still waits for tools.
  */
-function completeWhileWaiting(membrane: MockMembrane, response: NormalizedResponse, ready?: () => boolean): { missed: boolean } {
+function completeWhileWaiting(membrane: MockMembrane, response: NormalizedResponse, ready?: () => boolean, atRound = 1): { missed: boolean } {
   const streamYielding = membrane.streamYielding.bind(membrane);
-  const gate = { missed: false };
+  const gate = { missed: ready !== undefined };
   let used = false;
   (membrane as unknown as { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream }).streamYielding = (request, options) => {
     const inner = streamYielding(request, options);
@@ -385,18 +387,20 @@ function completeWhileWaiting(membrane: MockMembrane, response: NormalizedRespon
       get pendingToolCallIds() { return inner.pendingToolCallIds; },
       get toolDepth() { return inner.toolDepth; },
       async *[Symbol.asyncIterator]() {
+        let rounds = 0;
         for await (const event of inner) {
           yield event;
-          if (event.type === 'tool-calls') {
+          if (event.type === 'tool-calls' && ++rounds === atRound) {
             // `ready`: complete only once it holds, as when a script's call
             // has reached the host, so the case shows what it says it does.
             // A gate that never opens is the case's failure, not the stream's:
             // the turn still completes, and the case asserts !gate.missed.
             const started = Date.now();
             while (ready && !ready()) {
-              if (Date.now() - started > 10_000) { gate.missed = true; break; }
+              if (Date.now() - started > 10_000) break;
               await new Promise((r) => setTimeout(r, 10));
             }
+            if (ready?.()) gate.missed = false;
             yield { type: 'complete', response } as StreamEvent;
             return;
           }
@@ -3633,6 +3637,38 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         await h.close();
       }
     });
+
+    // A round kept back because its watched script hadn't returned counts as
+    // suppressed on the fallback path too, as the native path's withhold counts
+    // it (finding 11 of the review of 8dbd802ba3e6), whether or not an earlier
+    // send silenced the turn.
+    for (const silenced of [false, true]) {
+      it(`${mode}: a later round whose watched script hasn't returned is counted alike in native and XML tool mode${silenced ? ', after a send' : ''}`, async () => {
+        const receipts: string[][] = [];
+        for (const xml of [false, true]) {
+          const h = await harness({ xml, agents: [{ name: 'scout', proseRouting: mode, sameRoundThinkTextPolicy: 'private' }], sendTool: true, codeExecution: true });
+          try {
+            await h.sendMode('hang');
+            const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+            const hangs = `await tools["discord--send_message"]({ channelId: ${JSON.stringify(GENERAL)}, text: "x" });`;
+            const first = silenced ? [text('First.'), send('s1', GENERAL)] : [text('First.'), call('t1', 'think', { content: 'hmm' })];
+            const firstId = silenced ? 's1' : 't1';
+            const later = [text(LINE), script('ce1', hangs)];
+            const gate = completeWhileWaiting(h.membrane,
+              { ...createMockResponse(xml ? [...first, done(firstId), ...later] : later), toolCalls: [] } as NormalizedResponse,
+              () => h.sends().length === (silenced ? 2 : 1), 2);
+            await h.turn([createMockResponse(first, 'tool_use'), createMockResponse(later, 'tool_use')]);
+            assert.equal(gate.missed, false, "the stream completed after the later round's script sent");
+            assert.ok(!inRoom(h).includes(LINE), 'the later round stays back');
+            receipts.push(h.texts().filter((t) => t.startsWith('[delivered]')).map((t) => t.replace(/d-\S+/g, 'd-*')));
+          } finally {
+            await h.close();
+          }
+        }
+        assert.ok(receipts[0]!.some((t) => t.includes('suppressed')), `native counts it: ${JSON.stringify(receipts[0])}`);
+        assert.deepEqual(receipts[1], receipts[0], 'the fallback counts it as native does');
+      });
+    }
 
     it(`${mode}: a round withheld while its script runs still holds the turn's later speech to where its sends may post`, async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }], sendTool: true, codeExecution: true });
