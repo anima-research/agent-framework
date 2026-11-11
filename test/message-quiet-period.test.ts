@@ -736,6 +736,18 @@ describe('messageQuietPeriod in the scheduler', () => {
     assert.deepEqual(released(traces), [[key('discord:g:room'), 'gone']]);
   });
 
+  it("a held burst's hold ends as gone when its agent is stopped (releaseAgentRuntime; R5-5)", async () => {
+    const { framework, internals, traces } = await start({ quietMs: 5_000 }, ['agent', 'helper']);
+    try {
+      wake(internals, { agentName: 'helper', channelId: 'discord:g:room', channelServerId: 'discord' });
+      await waitFor(() => heldKeys(traces).length >= 1, 'the hold', 2_000);
+      framework.stopAgent('helper');
+      assert.deepEqual(released(traces), [[key('discord:g:room'), 'gone']]);
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("a hold that keeps one of two equal wakes keeps the older age the other carried (b9034c4 review, 15)", () => {
     const f = Object.create(AgentFramework.prototype) as { holdRequest(held: InferenceRequest[], request: InferenceRequest): void };
     const kept = inChannel(T0 + 5_000, 'g:room');
