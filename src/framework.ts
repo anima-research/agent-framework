@@ -20375,7 +20375,7 @@ export class AgentFramework {
       if (this.parkedAnchors.size > 1000) this.parkedAnchors.delete(this.parkedAnchors.keys().next().value!);
       return;
     }
-    if (this.channelRegistry?.recordDelivered(anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView)) this.anchorSeq = anchor.seq;
+    if (this.channelRegistry?.noteDelivered(anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView)) this.anchorSeq = anchor.seq;
   }
 
   private async handleMcplChannelIncoming(event: {
@@ -21977,7 +21977,7 @@ export class AgentFramework {
     const parked = this.parkedAnchors.get(key);
     if (parked) {
       this.parkedAnchors.delete(key);
-      if (parked.seq > this.anchorSeq && this.channelRegistry?.recordDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView)) {
+      if (parked.seq > this.anchorSeq && this.channelRegistry?.noteDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView)) {
         this.anchorSeq = parked.seq;
       }
     }

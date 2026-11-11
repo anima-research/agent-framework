@@ -2456,17 +2456,10 @@ export class ChannelRegistry {
    * count at arrival and at acceptance (markAccepted): a message that
    * arrived before its server's removal and is admitted once the server
    * registers the channel again sets the anchor here, as a message delivered
-   * on a live channel, where main's would set nothing.
+   * on a live channel, where main's would set nothing. Returns whether it set
+   * the anchor.
    */
-  noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): void {
-    this.recordDelivered(channel, messageId, threadId, tags, firstView);
-  }
-
-  /**
-   * noteDelivered, returning whether it set the anchor.
-   * @internal For the framework's parked-anchor commits; not a host API.
-   */
-  recordDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): boolean {
+  noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): boolean {
     // A marker is ABOUT a message, not one the agent replies to: it leaves
     // the anchor where it was (#157), and so does a chat:system notice (a
     // join, the weather), which is about the place (isMarkerTagged). An edit
@@ -2656,10 +2649,11 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * The message the agent is replying to, with its channel: the most recent
-   * delivered inbound message (noteDelivered) that isn't a reaction, reaction removal, edit or deletion
+   * The message servers are told the agent is replying to, with its channel:
+   * the most recent delivered inbound message (noteDelivered) that isn't a reaction, reaction removal, edit or deletion
    * marker, apart from an edit the coalescer delivers on acceptance as the
-   * agent's first view. Left process-global: per-channel inbound tracking
+   * agent's first view. It isn't always the message a turn answers
+   * (TurnRouting.answers), which a refusal's mark reads. Left process-global: per-channel inbound tracking
    * (the right messageId for a fork's own channel) is a separate concern from
    * the outbound routing fix. An ephemeral run has none (takesGlobalFallback).
    * Nor has a turn that deliberately has no channel (activeChannelResolver's
@@ -2720,7 +2714,7 @@ export class ChannelRegistry {
 
     const context: ChannelContext = {};
 
-    // Incoming: the message the agent is replying to (incomingFor). The
+    // Incoming: the message servers are told the agent is replying to (incomingFor). The
     // anchor is independent of the speech rule: under `speech.locus:
     // 'delivery'` the latest inbound is no fallback for where prose lands,
     // but it is still the message the agent is replying to.
