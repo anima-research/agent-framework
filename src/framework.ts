@@ -22616,7 +22616,8 @@ export class AgentFramework {
         this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: triggerChannel?.channelId ?? '' });
       }
       const origin = event.origin ?? {};
-      if (decision.locus && triggerChannel && typeof origin.messageId === 'string' && origin.messageId) {
+      if (decision.locus && triggerChannel && !isAmbient(event.tags) && this.mcplServerRegistry?.getServer(event.serverId)
+        && typeof origin.messageId === 'string' && origin.messageId) {
         this.noteDeliveredOrPark({
           serverId: event.serverId,
           channelId: triggerChannel.channelId,
