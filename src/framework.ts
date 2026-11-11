@@ -28120,11 +28120,21 @@ export class AgentFramework {
       trigger = own;
     }
 
-    // Record turn checkpoint before inference (only on first attempt, not retries)
+    // Record turn checkpoint before inference (only on first attempt, not
+    // retries). A start that carries the logical turn on records none: a
+    // budget restart at a tool boundary, a tool-result-guard retry, the
+    // direct API's tool_results_ready, or a held call's retry (TURN_RETRY).
+    // Each is attempt 0 of its own stream, and each took a checkpoint, so an
+    // undo after one took back only the rows since that start: the reply,
+    // with the round's tool call and its result left in the window (#1013).
+    // The turn's first start recorded the checkpoint the undo walks back to;
+    // a budget refusal of a continuation has none of its own to drop.
     let checkpoint: RecordedTurnCheckpoint | undefined;
     let compileBaseline: BudgetHoldBaseline | undefined;
-    if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
-      checkpoint = this.recordTurnCheckpoint(agent.name);
+    if (attempt === 0) {
+      if (!(trigger && (isTurnContinuation(trigger.reason) || isTurnRetry(trigger)))) {
+        checkpoint = this.recordTurnCheckpoint(agent.name);
+      }
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 
