@@ -25,8 +25,6 @@ import { persistentReaderName } from '../src/tune-out/tools.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
-// A system change row compiles to no text, so it reads as a tag naming the
-// tools it defines, and a compile that differs only in change rows differs here.
 const textsOf = (messages: ReadonlyArray<{ content: ReadonlyArray<{ type: string; text?: string; defineTools?: ReadonlyArray<{ name: string }> }> }>) =>
   messages.map((m) => m.content.map((b) => (b.type === 'text' ? b.text ?? ''
     : b.type === 'system_change' ? `change:${(b.defineTools ?? []).map((t) => t.name).join(',')}` : '')).join('')).filter((t) => t !== '');
@@ -65,7 +63,6 @@ async function boot(opts: { changes?: boolean } = {}) {
   } as never);
   write('antra', [text('another word')]);
   if (opts.changes) {
-    // A host's change row, and one each resident and the subconscious stamped as its own.
     const change = (tool: string) => [{ type: 'system_change', defineTools: [{ name: tool, description: tool, inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock];
     write('Host', change('host_tool'));
     for (const name of ['mira', 'oren', 'Subconscious']) write('system', change(`${name}_tool`), { system: true, kind: 'system-change', agent: name });
