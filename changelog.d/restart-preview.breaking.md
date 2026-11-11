@@ -23,9 +23,15 @@
     registered agent's turn while the framework runs, and never an ephemeral
     run's. Now the stream goes on with the turn's rounds whole, and the turn
     isn't held. An ephemeral run's compression doesn't wait on a provider
-    gate, so compression landing while its stream goes on moves the kept
-    decline's counts, and a later boundary takes the restart if its compile
-    then fits.
+    gate, so compression that lands while its stream goes on makes a later
+    boundary preview again, and that boundary takes the restart if its
+    compile then fits. For an agent the hold can take, a restart is also
+    declined where its compile would itself queue the work that makes room:
+    the newest closed chunks, which the queue holds back until a compile
+    demands them (one by default, `l1HoldbackChunks`), or a merge. A preview
+    names compression only for work already queued, so it names none there.
+    Before this release that restart was taken, its compile refused, and the
+    turn waited in the hold for that work.
   - **What it costs:** under a strategy that previews, each preview runs the
     compile's select, synchronously, so nothing else on the host's event
     loop runs meanwhile. A restart taken after a preview that selected runs
