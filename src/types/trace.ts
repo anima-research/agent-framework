@@ -785,15 +785,18 @@ export type TraceEvent =
       wakes: number;
       readyInMs: number;
     })
-  /** A held burst's hold ends, paired with its `quiet-period:held`: how
-   *  many of its wakes start the turn, how long the hold lasted, and why it
-   *  ended: `quiet` (quietMs since its newest wake), `cap` (maxWaitMs since
-   *  its oldest), `other-wake` (a wake that is no message started it), or
-   *  `gone` (its wakes left the queue without a start: withdrawn, dropped as
-   *  read, skipped by policy, or dropped as its agent ended or the framework
-   *  stopped; `wakes` is 0). A burst that starts the
-   *  first time it is seen (already past its deadline, as the first of a
-   *  backlog after a busy turn) emits neither trace. */
+  /** The quiet period stops holding a burst, paired with its
+   *  `quiet-period:held`: how many of its wakes go to the start, how long
+   *  the hold lasted, and why it ended: `quiet` (quietMs since its newest
+   *  wake), `cap` (maxWaitMs since its oldest), `other-wake` (a wake that is
+   *  no message started it), or `gone` (its wakes left the queue without a
+   *  start: withdrawn, dropped as read, skipped by policy, or dropped as its
+   *  agent ended or the framework stopped; `wakes` is 0). A start can still
+   *  wait on something else after this (an auxiliary call, a quiesce, a
+   *  provider's hold), and one that goes back to the queue can be held and
+   *  traced again, as a pair of its own. A burst that starts the first time
+   *  it is seen (already past its deadline, as the first of a backlog after
+   *  a busy turn) emits neither trace. */
   | (TraceEventBase & {
       type: 'quiet-period:released';
       agentName: string;

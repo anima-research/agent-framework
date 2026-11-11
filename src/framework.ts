@@ -992,7 +992,7 @@ function describeQuietBurst(key: string): string {
   return `${kind} ${rest.map((part) => logValue(part)).join(':')}`;
 }
 
-/** Why a held burst's turn starts (quiet-period:released). */
+/** Why the quiet period stops holding a burst (quiet-period:released). */
 export type QuietReleaseCause = 'quiet' | 'cap' | 'other-wake' | 'gone';
 
 /** What an idle agent's queued requests do under a message quiet period. */
@@ -23416,8 +23416,8 @@ export class AgentFramework {
           this.emitTrace({ type: 'quiet-period:held', agentName, burst: key, wakes, readyInMs: leftMs });
           console.error(`[quiet-period] agent=${agentName}: holding the turn for a message burst (${wakes} wake(s) so far, ${describeQuietBurst(key)})`);
         }
-        // The bursts this start ends the hold of: traced once the start is
-        // accepted (below), with how long each was held.
+        // The bursts this start ends the hold of: traced once the policy
+        // lets the start through (below), with how long each was held.
         for (const [key, cause] of split.started) if (held?.has(key)) (quietRelease ??= new Map()).set(key, cause);
       }
       if (split.hold.length > 0) this.pendingRequests.push(...split.hold);
@@ -23628,7 +23628,7 @@ export class AgentFramework {
       // it takes its token it stands for them all.
       if (requests.length > 1 && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
-      // The start is accepted: the bursts whose hold it ends are traced
+      // The start goes to admission: the bursts whose hold it ends are traced
       // (quiet-period:released), paired with their quiet-period:held.
       if (quietRelease) {
         const held = this.quietHolds?.get(agentName);
