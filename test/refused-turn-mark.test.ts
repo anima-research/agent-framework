@@ -439,6 +439,61 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(r.records[1]!.locus, ROOM);
   });
 
+  const manual = { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', refusalHandling: { retries: 0, autoRewind: false, maxRewinds: 1 } }], framework: { gate: QUIET_AMBIENT } as never };
+  const unstick = (r: Awaited<ReturnType<typeof rig>>, maxRewinds?: number) => (r.f.framework as unknown as { handleHostCommand(s: string, p: Record<string, unknown>): Promise<{ ok: boolean }> })
+    .handleHostCommand('editor', { command: 'unstick', agentName: 'agent', channelId: ADMIN, ...(maxRewinds ? { maxRewinds } : {}) });
+
+  it('an /unstick from another channel: its run answers the refused message, and its retry speaks in that message\'s channel', async (t) => {
+    const r = await rig(t, manual);
+    await r.answered(ROOM, 'm-1');
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-2');
+    await eventually(() => r.records.length === 1, 'm-2 refused');
+    await r.f.framework.runUntilIdle();
+    const before = r.f.membrane.calls.length;
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the unstick')]));
+    assert.equal((await unstick(r)).ok, true, 'premise: the unstick started');
+    await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the unstick')), "the unstick's retry answered");
+    assert.equal(r.f.membrane.calls.length, before + 2, "premise: the unstick's run and its retry each made one call");
+    const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the unstick'));
+    assert.equal(post?.channelId, ROOM, "the retry speaks in the refused message's channel, not the command's");
+    assert.doesNotMatch(JSON.stringify(r.f.membrane.calls[before + 1]!.messages), /Your plain speech currently has no channel/, 'and its request names a channel to speak in');
+    assert.equal(r.records[1]?.locus, ROOM, "the unstick's run, refused, names that channel");
+  });
+
+  it('an /unstick that sheds two turns: the retry still answers the newest shed turn\'s message, not the older one\'s', async (t) => {
+    const r = await rig(t, manual);
+    await r.answered(GENERAL, 'm-1');
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-2');
+    await eventually(() => r.records.length === 1, 'm-2 refused');
+    await r.f.framework.runUntilIdle();
+    const before = r.f.membrane.calls.length;
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after two sheds')]));
+    assert.equal((await unstick(r, 2)).ok, true, 'premise: the unstick started');
+    await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after two sheds')), "the second retry answered");
+    assert.equal(r.f.membrane.calls.length, before + 3, "premise: the unstick's run, its first retry and its second each made one call");
+    const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after two sheds'));
+    assert.equal(post?.channelId, ROOM, "the second retry speaks in m-2's channel, though the second shed took m-1's exchange in general");
+    assert.equal(r.records[2]?.locus, ROOM, 'the first retry, refused, names that channel too');
+  });
+
+  it('an /unstick whose agent\'s last turn answered no message: its retry has no channel, and is told so', async (t) => {
+    const r = await rig(t, manual);
+    await r.answered(ROOM, 'm-1');
+    r.streams.push(() => new MockYieldingStream([answer('the timer turn')]));
+    (r.f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'agent', reason: 'timer', source: 'test', timestamp: Date.now() });
+    await eventually(() => r.f.membrane.calls.length >= 2, 'the timer turn');
+    await r.f.framework.runUntilIdle();
+    const before = r.f.membrane.calls.length;
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the unstick')]));
+    assert.equal((await unstick(r)).ok, true, 'premise: the unstick started');
+    await eventually(() => r.f.membrane.calls.length === before + 2, "the unstick's run and its retry");
+    await r.f.framework.runUntilIdle();
+    assert.match(JSON.stringify(r.f.membrane.calls[before + 1]!.messages), /Your plain speech currently has no channel/, "the retry's request says its speech has no channel");
+    assert.equal(r.records.at(-1)?.locus, null, "the unstick's run, refused, names no channel");
+  });
+
   it('the poison-history breaker\'s retry speaks in the failed message\'s channel', async (t) => {
     const r = await rig(t, { framework: { gate: QUIET_AMBIENT } as never });
     await r.answered(ROOM, 'm-1');
