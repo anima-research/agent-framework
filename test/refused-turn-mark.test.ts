@@ -401,14 +401,16 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.records.length === 2 && r.marks.length === 2, 'control: both residents\' turns for m-1, refused and marked, the second\'s after its wait');
     assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']]);
     await r.f.framework.runUntilIdle();
-    waits.set('agent', 'test', 1000, 'a stated wait');
-    waits.set('second', 'test', 1000, 'a stated wait');
+    waits.set('agent', 'test', 600_000, 'a stated wait');
+    waits.set('second', 'test', 600_000, 'a stated wait');
     const now = Date.now();
     const clock = t.mock.method(Date, 'now', () => now);
     await r.f.send('channels/incoming', { messages: [message('m-2'), message('m-3')] });
     await eventually(() => held('second') === 1 && held('agent') === 2,
       'premise: the second resident\'s hold keeps its two wakes as one, the first resident\'s apart');
     clock.mock.restore();
+    r.f.framework.releaseProviderWait('agent', 'test', 'test');
+    r.f.framework.releaseProviderWait('second', 'test', 'test');
     await eventually(() => r.records.length === 4, 'both residents\' turns for m-2 and m-3, refused after their waits');
     await r.markSent();
     assert.deepEqual(r.records.slice(2).map((record) => record.agent).sort(), ['agent', 'second']);
@@ -477,6 +479,29 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await Promise.all(reacting);
     assert.deepEqual(r.records.map((x) => x.locus), [null, null]);
     assert.deepEqual(r.marked(), []);
+  });
+
+  it('a refusal rewind\'s retry merged at its start with a later ambient wake from another channel still speaks in the refused message\'s channel', async (t) => {
+    const r = await rig(t, rewinding);
+    await r.answered(ROOM, 'm-1');
+    const fw = r.f.framework as unknown as { pendingRequests: Array<Record<string, unknown>>; rewindRetry(...args: unknown[]): Record<string, unknown> };
+    const rewindRetry = fw.rewindRetry.bind(fw);
+    let queuedBehind = false;
+    t.mock.method(fw, 'rewindRetry', (...args: unknown[]) => {
+      const retry = rewindRetry(...args);
+      if (!queuedBehind) {
+        queuedBehind = true;
+        fw.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'editor', timestamp: (retry.timestamp as number) + 1, channelId: GENERAL, channelServerId: 'editor', ambient: true });
+      }
+      return retry;
+    });
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the rewind')]));
+    await r.incoming(ROOM, 'm-2');
+    await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the rewind')), 'the retry\'s answer published');
+    assert.ok(queuedBehind, 'premise: an ambient wake from general was queued behind the retry');
+    assert.equal(r.f.membrane.calls.length, 3, 'premise: the retry and the ambient wake started one turn');
+    const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind'));
+    assert.equal(post?.channelId, ROOM);
   });
 
   it('a refusal rewind\'s retry speaks in the refused message\'s channel', async (t) => {

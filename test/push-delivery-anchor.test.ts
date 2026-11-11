@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { ChannelRegistry, type ChannelRef } from '../src/mcpl/channel-registry.js';
 
 const ROOM = 'discord:g1:room';
 const ADMIN = 'discord:g1:admin';
@@ -39,7 +40,17 @@ async function rig(t: TestContext, framework: Partial<FrameworkConfig>) {
 
 const NO_WAKES = { gate: { config: { policies: [], default: 'defer' }, onboarding: false } } as unknown as Partial<FrameworkConfig>;
 
+class HostRegistry extends ChannelRegistry {
+  override noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): void {
+    super.noteDelivered(channel, messageId, threadId, tags, firstView);
+  }
+}
+
 describe('a push that delivers a new message becomes the latest delivered inbound', () => {
+  it('a host\'s registry may override noteDelivered with a void return, as on main', () => {
+    assert.equal(typeof HostRegistry.prototype.noteDelivered, 'function');
+  });
+
   it('under \'latest-inbound\', a mention pushed from a closed channel moves the fallback locus and the reply anchor, thread included, and an edit pushed after it doesn\'t', async (t) => {
     const { f, fw, origin } = await rig(t, { ...NO_WAKES, speech: { locus: 'latest-inbound' } });
     await f.send('channels/incoming', {
