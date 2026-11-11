@@ -606,6 +606,45 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     }
   });
 
+  it("sends a host's change row through the direct API on an 'entries' agent whose caller passes tools other than its head", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-direct-other-'));
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+      membrane.calls.push(request);
+      return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
+    };
+    let directSent: NormalizedRequest | undefined;
+    membrane.stream = async (request: NormalizedRequest): Promise<NormalizedResponse> => {
+      directSent = request;
+      return createMockResponse([{ type: 'text', text: 'direct' }]);
+    };
+    const host = new HostChange();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries' }],
+      modules: [new Input(), host], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => { traces.push(event); });
+    framework.start();
+    try {
+      assert.ok(await pollUntil(() => host.ctx !== null));
+      host.ctx!.addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock]);
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} } as unknown as ProcessEvent);
+      assert.ok(await pollUntil(() => traces.some((t) => t.type === 'inference:completed')), 'the first turn ended');
+      assert.equal(carriesChange(membrane.calls[0]!), true, "the premise: the turn sent the host's change");
+      const other = { name: 'yy_tool', description: 'YY', inputSchema: { type: 'object' as const, properties: {} } };
+      await framework.getAgent('resident')!.runInference([...(membrane.calls[0]!.tools ?? []), other]).catch(() => undefined);
+      assert.ok(directSent, 'the direct request went out');
+      assert.ok((directSent!.tools ?? []).some((t) => t.name === 'yy_tool'), "the premise: it went on the caller's tools, not the recorded head");
+      assert.equal(carriesChange(directSent!), true, "and it carries the host's change row, as the agent's requests do");
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   describe("the direct API on an 'entries' agent, by what its caller passes against its head and own change rows", () => {
     async function directAfter(turns: string[][], passed: (calls: readonly NormalizedRequest[]) => unknown[], binds = true) {
       const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-direct-own-'));
