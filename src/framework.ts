@@ -132,7 +132,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { isProseTargetToken, parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, RECORD_DELIVERED, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, ANCHOR_SETS, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import {
@@ -20377,7 +20377,15 @@ export class AgentFramework {
       if (this.parkedAnchors.size > 1000) this.parkedAnchors.delete(this.parkedAnchors.keys().next().value!);
       return;
     }
-    if (this.channelRegistry?.[RECORD_DELIVERED](anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView)) this.anchorSeq = anchor.seq;
+    if (this.noteAnchor(anchor)) this.anchorSeq = anchor.seq;
+  }
+
+  private noteAnchor(anchor: { channel: ChannelRef; messageId: string; threadId?: string; tags?: unknown; firstView: boolean }): boolean {
+    const registry = this.channelRegistry;
+    if (!registry) return false;
+    const sets = registry[ANCHOR_SETS];
+    registry.noteDelivered(anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView);
+    return registry[ANCHOR_SETS] !== sets;
   }
 
   private async handleMcplChannelIncoming(event: {
@@ -21981,7 +21989,7 @@ export class AgentFramework {
     const parked = this.parkedAnchors.get(key);
     if (parked) {
       this.parkedAnchors.delete(key);
-      if (parked.seq > this.anchorSeq && this.channelRegistry?.[RECORD_DELIVERED](parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView)) {
+      if (parked.seq > this.anchorSeq && this.noteAnchor({ ...parked, firstView: parked.firstView || firstView })) {
         this.anchorSeq = parked.seq;
       }
     }

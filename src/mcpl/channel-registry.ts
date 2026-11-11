@@ -688,7 +688,7 @@ export function destinationKey(to: ChannelRef): string {
   return JSON.stringify([to.serverId, to.channelId]);
 }
 
-export const RECORD_DELIVERED = Symbol('recordDelivered');
+export const ANCHOR_SETS = Symbol('anchorSets');
 
 /** Whether two refs name the same channel. Two absent refs are the same:
  *  neither names a channel. */
@@ -1385,6 +1385,7 @@ export class ChannelRegistry {
   /** The same message's id and thread, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
+  [ANCHOR_SETS] = 0;
 
   /** Per-channel typing indicator timers, by destinationKey, with the
    *  channel each one types in. */
@@ -2461,21 +2462,17 @@ export class ChannelRegistry {
    * on a live channel, where main's would set nothing.
    */
   noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): void {
-    this[RECORD_DELIVERED](channel, messageId, threadId, tags, firstView);
-  }
-
-  [RECORD_DELIVERED](channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): boolean {
     // A marker is ABOUT a message, not one the agent replies to: it leaves
     // the anchor where it was (#157), and so does a chat:system notice (a
     // join, the weather), which is about the place (isMarkerTagged). An edit
     // the coalescer delivered as the agent's first view of its message counts
     // as that message.
-    if (isMarkerTagged(tags, firstView)) return false;
-    if (!this.entryAt(channel)) return false;
+    if (isMarkerTagged(tags, firstView)) return;
+    if (!this.entryAt(channel)) return;
     this.defaultPublishChannel = { serverId: channel.serverId, channelId: channel.channelId };
     this.defaultPublishMessageId = messageId;
     this.defaultPublishThreadId = threadId;
-    return true;
+    this[ANCHOR_SETS]++;
   }
 
   /**
