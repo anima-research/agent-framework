@@ -1052,25 +1052,24 @@ export class PushCoalescer<E = unknown> {
    * another's render waits for it, so its compile shows the content, without
    * taking it as its own.
    *
-   * `leave` are subjects this assembly must not take: those whose wakes the
-   * host holds for a turn of their own (a message quiet period's held
-   * bursts), so that turn, not this one, consumes them. A cause is never
-   * left. With nothing held, every pending batch is taken, as before.
+   * `leave` says of a subject whether this assembly must not take its
+   * batch: whether the host holds its wake for a turn of its own (a message
+   * quiet period's held bursts), so that turn, not this one, consumes it.
+   * It is asked under the lock, at the take, so a batch that opened while
+   * this assembly ran is left too. A cause is never left, and a render
+   * already running is still joined. With nothing held, every pending batch
+   * is taken, as before.
    */
-  async assemble(agentName: string, causes: readonly string[] = [], leave?: ReadonlySet<string>): Promise<AssemblyResult> {
+  async assemble(agentName: string, causes: readonly string[] = [], leave?: (subject: string) => boolean): Promise<AssemblyResult> {
     const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
     if (this.suspended) return result;
     const work: Promise<void>[] = [];
     const wanted = new Set(causes);
     for (const subject of new Set([...this.subjects.keys(), ...causes])) {
-      // A cause is never left: defensive, since the host builds `leave` from
-      // wakes still queued, and a cause's wake has left the queue to start
-      // this turn.
-      if (leave?.has(subject) && !wanted.has(subject)) continue;
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
       // and the settlement itself needs the lock.
-      const started = await this.locked(() => this.freeze(subject, agentName, wanted.has(subject)));
+      const started = await this.locked(() => this.freeze(subject, agentName, wanted.has(subject), leave));
       if (started === 'declined') result.settled.add(subject);
       else if (started) {
         work.push(started.done.then(() => {
@@ -1121,10 +1120,11 @@ export class PushCoalescer<E = unknown> {
    * be made durable (the batch is kept for its recovery wake); or, for one of
    * the turn's causes (`cause`), the batch is gone. Returns undefined when
    * the batch was not this assembly's to decide on: there is none and it
-   * wasn't a cause, the subject moved on during the audience lookup, or the
-   * host is stopping.
+   * wasn't a cause, the subject moved on during the audience lookup, the
+   * host holds its wake for a turn of its own (`leave`, never for a cause),
+   * or the host is stopping.
    */
-  private async freeze(subject: string, agentName: string, cause = false): Promise<{ done: Promise<void>; rendering: Rendering<E>; joined?: true } | 'declined' | undefined> {
+  private async freeze(subject: string, agentName: string, cause = false, leave?: (subject: string) => boolean): Promise<{ done: Promise<void>; rendering: Rendering<E>; joined?: true } | 'declined' | undefined> {
     if (this.suspended) return undefined;
     const state = this.subjects.get(subject);
     // The batch whose wake started this turn is gone: a retraction or a
@@ -1157,6 +1157,7 @@ export class PushCoalescer<E = unknown> {
     // its audience since. This turn has nothing of it to show. The batch stays
     // pending; nothing here wakes its current audience.
     if (!audience.includes(agentName)) return 'declined';
+    if (!cause && leave?.(subject)) return undefined;
     state.batch = undefined;
     this.host.cancelWake(subject);
     if (!this.host.authorized(batch.latest)) {

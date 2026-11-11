@@ -22318,7 +22318,8 @@ export class AgentFramework {
     // `maxWaitMs` from its first wake; and the burst's hold isn't ended by
     // the withdrawal (no prune inside it), only re-read once the new wake is
     // queued, so a replacement traces no `gone`, and a start assembling in
-    // between still leaves the batch (quietLeftSubjects reads the queue).
+    // between still leaves the batch (quietLeaves reads the queue at the
+    // take, under the coalescer's lock, which this notice holds).
     const since = new Map<string, number>();
     if (this.quietPeriod) {
       this.forEachQueuedRequest((r) => {
@@ -22476,21 +22477,24 @@ export class AgentFramework {
     return keys;
   }
 
-  /** Under a message quiet period, the coalescing subjects of `agentName`'s
-   *  message wakes still queued as its turn starts: each waits for a turn of
-   *  its own (held, or ready and waiting its turn), so this start's assembly
-   *  leaves their batches (PushCoalescer.assemble's `leave`). Read from the
-   *  queue, not from the hold map, so a replacement notice in flight or a
-   *  hold not yet traced can't open the door. The start's own causes are
-   *  never left: assemble keeps them whatever this says. `isMessageWake`
-   *  is defensive here: a queued coalesced wake is one by construction. */
-  private quietLeftSubjects(agentName: string): Set<string> | undefined {
+  /** Under a message quiet period, asks, as a subject's batch is about to be
+   *  taken, whether `agentName` still has a message wake queued for it: that
+   *  wake waits for a turn of its own (held, or ready and waiting its turn),
+   *  so this start's assembly leaves the batch (PushCoalescer.assemble's
+   *  `leave`). Read from the queue, not from the hold map, so a replacement
+   *  notice in flight or a hold not yet traced can't open the door. The
+   *  start's own causes are never left: assemble keeps them whatever this
+   *  says. `isMessageWake` is defensive here: a queued coalesced wake is one
+   *  by construction. */
+  private quietLeaves(agentName: string): ((subject: string) => boolean) | undefined {
     if (!this.quietPeriod) return undefined;
-    const subjects = new Set<string>();
-    this.forEachQueuedRequest((r) => {
-      if (r.agentName === agentName && r.coalescingSubject !== undefined && isMessageWake(r)) subjects.add(r.coalescingSubject);
-    });
-    return subjects.size > 0 ? subjects : undefined;
+    return (subject) => {
+      let queued = false;
+      this.forEachQueuedRequest((r) => {
+        if (r.agentName === agentName && r.coalescingSubject === subject && isMessageWake(r)) queued = true;
+      });
+      return queued;
+    };
   }
 
   /** Withdraw unstarted wakes whose sole cause is this subject (§4.2), and
@@ -28345,9 +28349,9 @@ export class AgentFramework {
       this.assembling.add(agent.name);
       try {
         // A batch whose wake a message quiet period holds for a turn of its
-        // own is left for that turn (quietHeldSubjects): taken here, its
+        // own is left for that turn (quietLeaves): taken here, its
         // channel's question could only be answered in this turn's channel.
-        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects, this.quietLeftSubjects(agent.name));
+        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects, this.quietLeaves(agent.name));
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       } finally {

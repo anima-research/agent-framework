@@ -18,8 +18,9 @@
   result) isn't held: it starts now with at most one channel's burst, the
   others still waiting; the heartbeat is no message wake. A backlog past its
   deadlines after a busy turn starts one turn per channel, oldest first.
-  `PushCoalescer.assemble` takes a `leave` set of subjects a turn's assembly
-  must not take. The
+  `PushCoalescer.assemble` takes a `leave` check, asked of each subject as
+  its batch would be taken, for the batches a turn's assembly must not take.
+  The
   hold is traced (`quiet-period:held`, `quiet-period:released`). Held wakes
   are queued wakes: a `stop()` within the hold drops them, and the message,
   stored at ingress, waits in context for the next wake. (#179, carried by

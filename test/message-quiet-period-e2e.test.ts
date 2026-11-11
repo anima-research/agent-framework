@@ -255,7 +255,7 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
   }
 
   it("with the option off, a start parked behind an auxiliary call assembles the batch that arrived meanwhile, as without the option (slimepriestess's pin)", async () => {
-    // Pins `quietLeftSubjects`' `if (!this.quietPeriod) return undefined;`:
+    // Pins `quietLeaves`' `if (!this.quietPeriod) return undefined;`:
     // without it, a host that never set the option would leave every queued
     // batch for a later turn, where main's start takes it.
     const f = await fixture({
@@ -325,6 +325,54 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
       assert.deepEqual(f.published.map((p) => p.channelId), ['room', 'general'], 'general was asked, so general is answered');
       const carries = f.membrane.calls.map((c) => JSON.stringify((c as { messages?: unknown }).messages).includes('document_diff'));
       assert.deepEqual(carries, [false, true], "the room's turn left the batch though a notice replaced its wake while the start was parked");
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("a batch that opens for an existing subject while another channel's turn is assembling is left for its own turn, in its channel", async () => {
+    const f = await fixture({
+      framework: { messageQuietPeriod: { quietMs: 600 }, gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
+      mcpl: {},
+    });
+    try {
+      f.alwaysRespond();
+      f.renderer(async (params) => ({ content: [{ type: 'text', text: `document_diff ${JSON.stringify(params)}` }] }));
+      await f.register('room');
+      await f.register('general');
+      await f.framework.start();
+      await f.send('push/event', batch('room-1', 'ROOMQ first', 'room'));
+      await waitFor(() => f.published.length >= 1, "the room's first answer", 6_000);
+      await f.send('push/event', batch('general-1', 'GENQ first', 'general'));
+      await waitFor(() => f.published.length >= 2, "general's first answer", 6_000);
+      const x = f.framework as unknown as {
+        assembling: Set<string>;
+        pushCoalescer: { host: { audience(occurrence: { eventId: string }): Promise<string[]> }; accept(occurrence: unknown): Promise<unknown> };
+      };
+      const coalescer = x.pushCoalescer;
+      const audience = coalescer.host.audience.bind(coalescer.host);
+      const accept = coalescer.accept.bind(coalescer);
+      const hold: { release?: () => void; queued?: true } = {};
+      coalescer.host.audience = async (occurrence) => {
+        if (!hold.release && occurrence.eventId === 'room-2' && x.assembling.has('agent')) await new Promise<void>((resolve) => { hold.release = resolve; });
+        return audience(occurrence);
+      };
+      coalescer.accept = (occurrence) => {
+        const accepted = accept(occurrence);
+        if (hold.release) hold.queued = true;
+        return accepted;
+      };
+      const before = f.membrane.calls.length;
+      await f.send('push/event', { ...batch('room-2', 'ROOMQ second', 'room'), coalesce: { channelId: 'room', key: 'doc', deferred: true } });
+      await waitFor(() => hold.release !== undefined, "the room's turn assembling its batch");
+      const general = f.send('push/event', { ...batch('general-2', 'GENQ second', 'general'), coalesce: { channelId: 'general', key: 'doc', deferred: true } });
+      await waitFor(() => hold.queued === true, "general's notice queued behind the assembly");
+      hold.release!();
+      await general;
+      await waitFor(() => f.published.length >= 4, "general's turn of its own", 6_000);
+      assert.deepEqual(f.published.slice(2).map((p) => p.channelId), ['room', 'general'], 'general was asked, so general is answered');
+      const reads = f.membrane.calls.slice(before).map((c) => JSON.stringify((c as { messages?: unknown }).messages));
+      assert.deepEqual(reads.map((m) => m.includes('general-2')), [false, true], "the room's turn left general's batch, and general's turn read it");
     } finally {
       await f.close();
     }
