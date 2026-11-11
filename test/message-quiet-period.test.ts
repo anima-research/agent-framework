@@ -669,4 +669,38 @@ describe('messageQuietPeriod in the scheduler', () => {
       await framework.stop();
     }
   });
+
+  /** The mark a start merged from several requests carries (MERGED_BATCH),
+   *  read off a start a pass merges. */
+  async function mergedBatchKey(): Promise<symbol> {
+    const { framework, internals } = await start();
+    const x = framework as unknown as { startAgentStream(agent: unknown, trigger?: InferenceRequest): Promise<void> };
+    let key: symbol | undefined;
+    x.startAgentStream = async (_agent, trigger) => { key ??= Object.getOwnPropertySymbols(trigger ?? {}).find((k) => k.description === 'merged-batch'); };
+    try {
+      wake(internals, { reason: 'self-wake', source: 'gate' });
+      wake(internals, { reason: 'operator', source: 'api', addressed: true });
+      await waitFor(() => key !== undefined, 'a merged start', 2_000);
+      return key!;
+    } finally {
+      await framework.stop();
+    }
+  }
+
+  it("a replacement carries the age of a wake merged into a start (b9034c4 review, 8)", async () => {
+    const MERGED = await mergedBatchKey();
+    const { framework, x, occ, old, capLeft } = await replacing((x, wake) => { x.pendingRequests.push(wake); });
+    try {
+      const merged = message(Date.now(), { reason: 'self-wake', source: 'gate' });
+      (merged as unknown as Record<symbol, unknown>)[MERGED] = [old, message(Date.now(), { reason: 'self-wake', source: 'gate' })];
+      x.pendingRequests.push(merged);
+      await x.wakeForCoalescedBatch(occ);
+      const mine = x.pendingRequests.filter((r) => r.coalescingSubject === old.coalescingSubject);
+      assert.equal(mine.length, 1);
+      const left = capLeft(mine[0]!);
+      assert.ok(left === undefined || left < 2_000, `the cap counts from the first wake: ${left} ms left`);
+    } finally {
+      await framework.stop();
+    }
+  });
 });

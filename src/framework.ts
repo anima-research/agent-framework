@@ -22323,8 +22323,10 @@ export class AgentFramework {
     const since = new Map<string, number>();
     if (this.quietPeriod) {
       this.forEachQueuedRequest((r) => {
-        if (r.coalescingSubject !== subject) return;
-        since.set(r.agentName, Math.min(since.get(r.agentName) ?? Infinity, quietSince(r)));
+        for (const w of [r, ...(mergedBatch(r) ?? [])]) {
+          if (w.coalescingSubject !== subject) continue;
+          since.set(w.agentName, Math.min(since.get(w.agentName) ?? Infinity, quietSince(w)));
+        }
       });
     }
     this.cancelCoalescedWakes(subject, !this.quietPeriod);
