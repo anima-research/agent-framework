@@ -147,9 +147,22 @@ for (const [kind, carriers] of CARRIER_ROWS) {
     const marker = added.find(isRewindMarker);
     assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
   });
+
+  test(`at the threshold, a row of another participant's holding only ${kind} after the newest turn stays`, () => {
+    const { fw, messages, restore } = makeHarness({ messages: [
+      { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+      { id: 'a1', participant: 'agent', content: [{ type: 'text', text: 'an answer' }] },
+      { id: 'o1', participant: 'scout', content: [...carriers] },
+    ] });
+    try {
+      for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    } finally { restore(); }
+    assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u1', 'o1'],
+      "the agent's turn is gone, and another participant's carrier-only row, which no request of the agent's sends, stays");
+  });
 }
 
-test('nothing left to shed but a row holding only a provider item with no turn before it: the log names that row, which requests still send', () => {
+test("nothing left to shed but a row holding only a provider item with no turn before it: the log names that row, which the agent's requests still carry", () => {
   const { fw, removed, errs, restore } = makeHarness({ messages: [
     { id: 'mk', participant: 'user', content: [{ type: 'text', text: 'sys' }], metadata: { system: true } },
     { id: 'c1', participant: 'agent', content: [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1' } }] },
@@ -160,7 +173,7 @@ test('nothing left to shed but a row holding only a provider item with no turn b
   assert.equal(removed.length, 0, 'premise: the shed takes nothing');
   const line = errs.find((e) => e.includes('nothing left to shed'));
   assert.ok(line, `the breaker logs that it has nothing left to shed: ${errs.join(' | ')}`);
-  assert.match(line!, /a message holding only a provider's stored items, which requests still send/, line);
+  assert.match(line!, /a message holding only a provider's stored items, which the agent's requests still carry/, line);
   assert.doesNotMatch(line!, /rows a request leaves empty\. Manual/, 'not that every row left is one a request leaves empty');
 });
 

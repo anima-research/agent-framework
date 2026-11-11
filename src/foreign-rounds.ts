@@ -7,8 +7,9 @@
  * agent derived or forked from such a watcher inherits them, sent in its
  * mode. A co-resident's rows stored before audience stamps, which a window
  * written down from the record keeps, reach an agent that observes no one
- * too: they go out as stored there, as earlier releases sent them, but for a
- * provider's stored items (rawForeignRowAsSent). An agent
+ * too: they go out as stored there, as earlier releases sent them, but for
+ * the provider items membrane stores on an empty text block
+ * (rawForeignRowAsSent). An agent
  * sent others' rounds as a transcript is sent those as one, read by their
  * participant.
  * Those rounds are stored as the other agent's: its signed thinking, its

@@ -3,8 +3,8 @@
  * server-tool blocks, is stored on a carrier: an exactly empty text block whose `rawItem` is the item. A turn's
  * first request carries the carriers of the turns before it, and membrane's formatters decide per provider what
  * goes out: the Responses formatter sends the item, the native formatter sends a server-tool block in an assistant
- * turn when server blocks are on and leaves out the rest, and the XML and completions formatters leave it out. None
- * sends an empty text block.
+ * turn when server blocks are on and leaves out the rest, the XML formatter leaves it out in XML tool mode, and the
+ * completions formatter leaves it out. None sends an empty text block.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';

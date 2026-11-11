@@ -151,6 +151,36 @@ describe('presentation points (#291)', () => {
     });
   }
 
+  for (const [label, content, heardAsInput] of [
+    ["another agent's row of provider items alone", [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_scout', encrypted_content: 'enc' } } as ContentBlock], false],
+    ["another agent's row of words", [text('a word from scout')], true],
+  ] as const) {
+    it(`a boundary that hears ${label} ${heardAsInput ? 'takes it as new input' : "takes nothing it wasn't sent as new input"}: the input signal and the prompt stamp`, async () => {
+      const h = await boot();
+      const fw = h.framework as unknown as { midTurnInputSignals: Set<string>; turnPrompts: WeakMap<object, unknown> };
+      const signals: string[] = [];
+      const addSignal = fw.midTurnInputSignals.add.bind(fw.midTurnInputSignals);
+      fw.midTurnInputSignals.add = (name: string) => { signals.push(name); return addSignal(name); };
+      let promptDeletes = 0;
+      const deletePrompt = fw.turnPrompts.delete.bind(fw.turnPrompts);
+      fw.turnPrompts.delete = (key: object) => { promptDeletes++; return deletePrompt(key); };
+
+      h.membrane.script('mira', round('c1', [text('looking')], 'wait', { gate: 'm' }), final([text('done')]));
+      h.framework.start();
+      h.framework.pushEvent(input('go', ['mira']));
+      await until(() => h.gates.entered.has('m'), "mira's round waiting on its tool");
+      h.internals.addMessage('scout', [...content], { messageId: 'heard-77' } as MessageMetadata, { forAgent: 'mira' });
+      // From the boundary on: the turn's start sets or clears its own stamp.
+      signals.length = 0;
+      promptDeletes = 0;
+      h.gates.release('m');
+      await h.framework.runUntilIdle();
+
+      assert.equal(signals.includes('mira'), heardAsInput, heardAsInput ? 'the boundary signals new input' : 'no new input signal for a row the agent was sent nothing of');
+      assert.equal(promptDeletes > 0, heardAsInput, heardAsInput ? "the next round's rows lose the turn's prompt stamp" : "the turn's prompt stamp stays");
+    });
+  }
+
   it("a write during a live turn is stored at once, out of the window and with no clock; its boundary hears it, and a row it cuts enters at the turn's end", async () => {
     const h = await boot({ clock: true });
     h.membrane.script('mira', round('c1', [text('looking')], 'wait', { gate: 'm' }), final([text('done')]));

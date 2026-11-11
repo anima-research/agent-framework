@@ -582,7 +582,8 @@ export class Agent {
 
   /**
    * How another agent's rounds go out in this agent's requests (#291, answer
-   * 13): `'raw'`, as stored but for a provider's stored items, or
+   * 13): `'raw'`, as stored but for the provider items membrane stores on an
+   * empty text block (a carrier), or
    * `'transcript'` (foreign-rounds.ts), a line per call and per result and
    * no thinking, the same in every compile and
    * in what a tool boundary injects. The framework sets it, once the
@@ -594,8 +595,8 @@ export class Agent {
    * other agent reads no other agent's
    * rounds, but for a co-resident's rows stored before audience stamps,
    * which a window written down from the record keeps and which go out as
-   * stored ('raw'), as earlier releases sent them, but for a provider's
-   * stored items (rawForeignRowAsSent).
+   * stored ('raw'), as earlier releases sent them, but for the provider
+   * items membrane stores on an empty text block (rawForeignRowAsSent).
    */
   private foreignRounds: 'raw' | 'transcript' = 'raw';
 

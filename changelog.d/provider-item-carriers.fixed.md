@@ -42,7 +42,7 @@
     it, in the same step and counted as that one turn, since its items may be
     what the provider refuses. One with no turn before it that the request
     carried is never shed, and where nothing else is left to shed, the shed's
-    log names it as a message requests still send.
+    log names it as a message the agent's requests still carry.
   - The framework doesn't resume a paused Anthropic turn (`pause_turn`)
     itself. A round stored as server-tool blocks alone, which every request
     left out before, is now carried but isn't counted as the agent's turn: a

@@ -48,7 +48,7 @@ function makeAgentHarness(messages: any[]) {
   };
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.rewindEpisode = new Map();
-  const agent = { name: 'labclaude', getContextManager: () => cm };
+  const agent = { name: 'labclaude', getContextManager: () => cm, isOwnParticipant: (participant: string) => participant === 'labclaude' };
   return { fw, agent, removed, added, edited, messages };
 }
 
@@ -131,6 +131,19 @@ for (const [kind, , carriers] of CARRIER_ROWS) {
     const { fw, agent, removed } = makeAgentHarness(msgs);
     fw.shedNewestTurn(agent, new Set(['u1', 'a1']));
     assert.deepEqual(removed, ['a1']);
+  });
+
+  test(`shed: another participant's carrier-only row holding ${kind} after the turn stays, though the refused request's compile listed it`, () => {
+    const msgs = [
+      { id: 'u1', participant: 'simulect', content: [{ type: 'text', text: 'q' }], metadata: { messageId: '1' } },
+      { id: 'a1', participant: 'labclaude', content: [{ type: 'text', text: 'my answer' }] },
+      { id: 'c1', participant: 'scout', content: [...carriers] },
+    ];
+    const { fw, agent, removed, messages } = makeAgentHarness(msgs);
+    const rec = fw.shedNewestTurn(agent, new Set(['u1', 'a1', 'c1']));
+    assert.deepEqual(removed, ['a1'], "no request of the agent's sends another participant's carriers, so the shed leaves them");
+    assert.deepEqual([...rec.removedIds], ['a1']);
+    assert.deepEqual(messages.map((m: { id: string }) => m.id), ['u1', 'c1']);
   });
 }
 

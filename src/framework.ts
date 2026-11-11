@@ -14329,12 +14329,13 @@ export class AgentFramework {
    * by each body's first message id), only a message that request carried
    * counts, or the stored result of a call it carried, which goes with that
    * call as one exchange. A row that holds no turn (holdsTurn) is passed
-   * over: one holding only provider items' carriers that the agent is sent
-   * (with `carried`, that the refused request carried) goes with the turn
-   * before it, in the same step, since its items may be what the provider
-   * refuses, and one holding nothing a request sends is left in place. It
-   * adds no
-   * marker; the caller keeps one consolidated marker for the episode
+   * over: the agent's own row holding only provider items' carriers (with
+   * `carried`, one the refused request carried) goes with the turn before
+   * it, in the same step, since its items may be what the provider refuses;
+   * the agent's requests send none of another participant's carriers
+   * (rawForeignRowAsSent, foreignRowAsSent), so such a row of theirs
+   * stays, as does one holding nothing a request sends. It adds no marker;
+   * the caller keeps one consolidated marker for the episode
    * (updateRewindMarker). The returned record's descriptor says what was
    * set aside and its size, never the content. Returns null when nothing
    * that counts is left.
@@ -14420,15 +14421,19 @@ export class AgentFramework {
       .filter((b) => typeOf(b) === 'text')
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
-    // A body after the turn that holds only provider items' carriers goes with
-    // it in the same step: its items may be what the provider rejects.
+    // The agent's own body after the turn that holds only provider items'
+    // carriers goes with it in the same step: its items may be what the
+    // provider rejects. The agent's requests send none of another
+    // participant's carriers, so such a body of theirs stays.
     const carrierBodies: Array<{ from: number; to: number }> = [];
     for (let j = idx + 1; j < all.length; j++) {
       const body = bodyRangeIn(all, j);
       const rows = all.slice(body.from, body.to + 1);
       const onlyCarriers = rows.every((m) => !Array.isArray(m.content) || !holdsTurn(m.content))
         && rows.some((m) => Array.isArray(m.content) && m.content.some(carriesRawItem));
-      if (onlyCarriers && !passedOver(all[body.to]!) && wasCarried(body.from, body.to)) carrierBodies.push(body);
+      if (onlyCarriers && agent.isOwnParticipant(all[body.to]!.participant) && !passedOver(all[body.to]!) && wasCarried(body.from, body.to)) {
+        carrierBodies.push(body);
+      }
       j = body.to;
     }
 
@@ -18938,7 +18943,10 @@ export class AgentFramework {
           // clear the send suppression: nothing new was said to the agent.
           // An edit the coalescer marks as the agent's first view is the
           // message it replaced, so it does (isConversationalInjection).
-          if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
+          // A row the agent is sent nothing of (unsent) is no new input,
+          // here, for the prompt stamp below, or for the addressed-elsewhere
+          // notice or the re-pin.
+          if (midTurnInjections.some((inj) => !inj.unsent && isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
           }
 
@@ -18950,7 +18958,7 @@ export class AgentFramework {
           // prompt from
           // what it sends. (The routing notice below rides only an injection
           // already here.)
-          if (midTurnInjections.length > 0) {
+          if (midTurnInjections.some((inj) => !inj.unsent)) {
             const turnTrigger = this.activeTurnTriggers.get(agent.name);
             if (turnTrigger) this.turnPrompts.delete(turnTrigger);
           }
@@ -19017,7 +19025,7 @@ export class AgentFramework {
             const routing = this.routingOf(agent.name);
             for (const inj of [...midTurnInjections]) {
               const m = inj.metadata as Record<string, unknown> | undefined;
-              if (!isConversationalInjection(inj.metadata)) continue;
+              if (inj.unsent || !isConversationalInjection(inj.metadata)) continue;
               if (typeof m?.channelId !== 'string') continue;
               if (!isAddressedMessage(m.tags as string[] | undefined)) continue;
               // Its channel as a re-pin reads it (repinChannel): on the
@@ -19081,7 +19089,7 @@ export class AgentFramework {
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: ChannelRef | undefined;
-            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
+            for (const inj of midTurnInjections) if (!inj.unsent) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
             if (newLocus) {
               // What this boundary just stored is newer than any arrival the
               // turn holds, so the arrivals can't move the locus back.
@@ -35315,7 +35323,7 @@ export class AgentFramework {
       console.error(
         `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
         (itemsLeft
-          ? `history holds only system markers, rows a request leaves empty, and a message holding only a provider's stored items, which requests still send and a shed doesn't take. Manual repair needed.`
+          ? `history holds only system markers, rows a request leaves empty, and a message holding only a provider's stored items, which the agent's requests still carry and a shed doesn't take. Manual repair needed.`
           : `history holds only system markers and rows a request leaves empty. Manual repair needed.`),
       );
       return;
