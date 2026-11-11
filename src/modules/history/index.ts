@@ -740,7 +740,8 @@ export class HistoryModule implements Module {
           'readable string (a call of a tool the framework names for sending, editing or saying a message, such as ' +
           'send_message, as its name and its words when it carries words, such as "[telegram--send_message] …", its name ending ", error" when its result, stored after it, is flagged as an error; ' +
           'other tool_use/tool_result/thinking/images as bracketed labels, a tool_result flagged as an error ending ", error"); ' +
-          'format:"raw" returns the content blocks unmodified. ' +
+          'format:"raw" returns the content blocks unmodified, except that a system change comes back as its type alone ' +
+          '(what it declared may be another agent\'s tools and system text, so it is withheld). ' +
           'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
           'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
           'after it, in the anchor\'s own channel unless channelId/allChannels says otherwise; from/to/offset/limit ' +
@@ -2796,8 +2797,12 @@ function projectMessage(msg: StoredMessage, format: 'text' | 'raw', failedOf: (m
     author: authorName(msg),
     channelId: getChannelId(msg) ?? null,
     ...windowField(mark),
-    content: format === 'raw' ? msg.content : flattenContent(msg.content, failedOf(msg)),
+    content: format === 'raw' ? msg.content.map(withoutDeclarations) : flattenContent(msg.content, failedOf(msg)),
   };
+}
+
+function withoutDeclarations(block: ContentBlock): ContentBlock {
+  return block.type === 'system_change' ? ({ type: 'system_change' } as ContentBlock) : block;
 }
 
 const NO_FAILURES: ReadonlySet<string> = new Set();
@@ -2847,6 +2852,8 @@ function blockLabel(block: ContentBlock, failed: ReadonlySet<string> = NO_FAILUR
       return '[audio]';
     case 'video':
       return '[video]';
+    case 'system_change':
+      return '[system change]';
     default:
       // Exhaustiveness guard: a future ContentBlock variant falls back to a
       // generic label instead of a compile error at a call site far from here.

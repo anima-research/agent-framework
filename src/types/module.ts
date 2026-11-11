@@ -569,7 +569,8 @@ export interface ModuleContext {
    * summary), while its window holds it. windowStatusOf answers before
    * the view's filter, and a window written down from the record the
    * residents share can hold rows the view never sends: another agent's
-   * stored context injection, and, for an agent whose view leaves held
+   * stored context injection or system change, every system change for an
+   * agent on its head, and, for an agent whose view leaves held
    * traffic out (a resident), a row a tune-out holds from the residents. A
    * row the agent is shown is one windowStatusOf reads `'in'` and this
    * keeps. It reads the view the agent's context was opened with

@@ -81,6 +81,65 @@ An agent that can't use `toolsets--open` and `toolsets--act` gets no host
 toolsets: every tool it may call stays in its tool list, except module
 utilities, which are never in a tool list (it can still call one by name).
 
+**Tool declarations.** By default every request carries the agent's current
+tools and system text, so a change to either rewrites the provider's cache
+from the head, and an agent the framework builds leaves the system changes
+in its context out of its compile (the subconscious, which reads only its
+own, takes those out once its record, if any, is cleared). With `toolDeclarations: 'entries'`, for models that take
+mid-conversation system messages on the native formatter, a request carries
+a recorded head instead, and each later change to the tools, or addition to
+the system text, is stored in the agent's context as a system change where
+it took effect. A replacement of system text, and a consolidation once the
+changes reach a tenth of the request, move the head to what's current, with
+one write. The share is in characters of JSON on both sides, of the request as
+it's sent (another agent's rounds as this agent is sent them), leaving out
+what a provider doesn't price by its characters (a base64 source's data, a
+generated image's, a redacted thinking block's, a thinking block's signature
+and a block's provider-native `rawItem`) and what a request on the native
+formatter doesn't send (a parsed block's `rawXml` and `rawXmlImagesAt`, a
+call's `unparseableInput` and a block's `tokenEstimate`). Those fields are
+left out of any object with a string `type`, so a tool call's input or a
+tool's schema that holds one beside such a `type` counts without it, though
+it's sent. JSON runs denser than prose, so tool changes read as a smaller
+share than they would in tokens, and a move comes somewhat later. Carried
+changes are read on every request. What that adds over `'head'` is what a move
+would take out: the old definition of a tool since replaced or removed, which
+the head keeps, and the rows' wrapping. An added tool's definition, or added
+system text, is read either way. Where a cache read costs a tenth of the input
+price, a tenth of a request's input tokens carried that way costs in reads,
+about every 115 to 190 requests, what rewriting the whole input costs beyond
+reading it. On Opus 5.5 and Sonnet 5.5 that's every 240 to 390 requests, and
+on Fable 5.1 every 490 to 790. Each range runs from the 5-minute write to the
+1-hour. The share a consolidation waits for counts the rows, so a removed
+tool's definition doesn't count toward it. A
+replacement is a block of system text already declared that's dropped or
+edited (an added block is a change, and order doesn't count), so `'entries'`
+saves writes only while those blocks stay as they are: one whose text changes
+every request moves the head every request. A change row a host stores is the
+host's to remove, unless its metadata is the agent's change metadata
+(`systemChangeMetadata(agent.name)`), which makes it the agent's own, so the
+agent's moves take it out. A request
+carrying a change that ends with a refusal membrane recognises, or with a 400
+it doesn't file as context overflow or an account refusal, whatever caused it,
+goes again on the agent's current head, and the agent keeps to its head until
+it's built again, its record and then its own change rows taken out (a record
+the store can't clear keeps them until it can), so an unrelated 400, such as
+one for an oversized image, ends its `'entries'` too. Either raises an operator
+line (`head-resend`), naming the remedy for a refused change. A consolidation waits
+for a compile that already rewrites the changes; past a fifth of the request,
+or when a compile is refused over budget, or for dropping messages no summary
+covers, with changes kept, it happens anyway, with an operator line.
+`thinkingBinding.binds` says whether the model binds its thinking to
+everything before it. Unless it's `false`, such a compile must keep no
+thinking before the first message it renders anew (its `firstChanged`). With
+`true`, each compile is told the head the request carries, so the context
+manager leaves out the thinking a move of the head would send under a prefix
+it wasn't signed under. Left out, the requests after a forced move still carry
+that thinking. With `dropBlock`, the provider drops it from each of them.
+Without it, an account that enforces the binding refuses them, and one that
+doesn't decides for itself. The host chooses both settings from what it knows
+of the model; neither is a runtime setting.
+
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.
 Framework-created ephemeral and conversation identities fail closed while
@@ -148,7 +207,7 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
-A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows of the agent's window (#291) that it sees after both the newest of its own messages there and its consumed watermark, in the window's order, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. Those are the rows presented to it since the mark, a row stored before the mark and presented after it included, and a row presented to it again, also when the mark was taken before its window was written down; a row stored and not yet presented is in neither its window nor the pin. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins, or an agent whose configuration sets `turnInputsPin: false`.
+A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows of the agent's window (#291) that it sees after both the newest of its own messages there and its consumed watermark, in the window's order, starting at the first such row that holds more than tool results and isn't a system change, and removes the pin when the turn ends. Those are the rows presented to it since the mark, a row stored before the mark and presented after it included, and a row presented to it again, also when the mark was taken before its window was written down; a row stored and not yet presented is in neither its window nor the pin. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins, or an agent whose configuration sets `turnInputsPin: false`.
 
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
@@ -614,7 +673,8 @@ says so. A server `toolPrefix` of `toolsets` is refused.
 
 With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
-enter it, since every change to the list rebuilds the prompt cache. The
+enter it, since on `'head'`, the default, every change to the list rebuilds
+the prompt cache. The
 framework registers a `toolsets` module with four constant tools at creation,
 for every agent (the host's own toolsets need them too, below), so the tool
 list doesn't change when a server starts to present:
@@ -1027,14 +1087,19 @@ separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages` (on the slot's owner, for a row of a slot
 the agent observes, which the refusal names), or, for those with a Discord message id,
 the host's `hide` by it, run on the agent whose own slot holds the row (the
-refusal names it), takes them out. A row holding a result of a call at or
+refusal names it), takes them out. The refusal counts and names the messages
+among them and never a system change row, which it doesn't advise removing;
+a target followed in its write by change rows alone is refused saying so. A row holding a result of a call at or
 before the target (a tool boundary presents a round's reply and its results
 in one write) isn't advised for suppression, which would leave the call
 without its result: the refusal says to roll back before the call. The preview's `neverPresented` counts the messages it
 removes that no live agent is shown: no window holds them, or only windows
-whose view leaves them out (a row a tune-out holds); a message that may be in
+whose view or request leaves them out (a row a tune-out holds, or a system
+change row for an agent on its head); a message that may be in
 a window that couldn't be read isn't counted, and is logged. The host command's
-`/undo n` counts back over the rows of the agent's own slot in its window. A
+`/undo n` counts back over the rows of the agent's own slot in its window,
+every row but system change rows: the change rows among the last n go with
+them uncounted. A
 removal in place
 (a `hide`, a suppression on its fork, a module's or the coalescer's removal)
 takes the rows out of every other live agent's window on that branch that

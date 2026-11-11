@@ -121,6 +121,48 @@ export type TraceEvent =
       stack?: string;
     })
   | (TraceEventBase & {
+      type: 'head:declared';
+      agentName: string;
+      /** Tools the change withdrew and offered, by name. */
+      removed: string[];
+      defined: string[];
+      /** Blocks of system text it added. */
+      addedSystem: number;
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** What moved the head to what's current: the first request under
+       *  'entries', a replacement of system text, a consolidation, or a
+       *  request on the head that found changes left from an earlier period. */
+      why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
+      /** The change rows removed, since the head now holds what they
+       *  declared, or what they declared is no longer current. */
+      changesRemoved: number;
+      /** For a consolidation: the changes' characters as JSON, and those of the request they reached a share of. */
+      changeChars?: number;
+      requestChars?: number;
+      /** A consolidation no compile made free: past a fifth of the request
+       *  ('share'), or at a compile refused over budget, or for dropping
+       *  messages no summary covers, with changes kept
+       *  ('budget'). A whole write. With `thinkingBinding.binds: true`, the
+       *  request's thinking is left out. With `binds` left out, the requests
+       *  after it still carry it: with `dropBlock` the provider drops it, and
+       *  without it an account that enforces the binding refuses them, and
+       *  one that doesn't decides for itself. */
+      forced?: 'share' | 'budget';
+    })
+  | (TraceEventBase & {
+      /** A request whose system change was refused goes again on the head. */
+      type: 'head:resend';
+      agentName: string;
+      /** The refusal's message, bounded as every trace event's `error` is (2,000 characters). */
+      error: string;
+      /** How many of the agent's replies it noted to go without their thinking, which was signed under a prefix that
+       *  held a system change its requests on the head leave out. */
+      thinkingSetAside: number;
+    })
+  | (TraceEventBase & {
       /**
        * A turn waiting out its error policy's delay before a retry says so:
        * as the wait begins, with when it is due to end, and again every 60
@@ -1570,8 +1612,11 @@ export type TraceEvent =
        * window only: the rows it removed leave this agent's window too, each
        * at its own place, so no other row's place moves (`hide`, `suppress` on its
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
-       * a start finished, `resume`, and a refusal rewind's shed from a
-       * window that is still the record, `rewind`), or that no live context
+       * a start finished, `resume`, a refusal rewind's shed from a window
+       * that is still the record, `rewind`, and an agent's own system changes
+       * a move of its head took out, `head-moved`, the `head:moved` trace
+       * after it saying why, or none where the head couldn't be stored and
+       * none was recorded), or that no live context
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
        * inference failure's shed on a presented window: the rows leave the
        * agent's own window as an undone turn's do, and stay in the record.
@@ -1627,7 +1672,7 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection' | 'head-moved';
 
 /**
  * Listener for trace events.

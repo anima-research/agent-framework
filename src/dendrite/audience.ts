@@ -300,7 +300,7 @@ export function presentLandedThenRethrow(
 }
 
 /** The rows of a write whose add threw that the store holds, by its error (presentLandedThenRethrow). */
-function storedOfThrownWrite(error: unknown, holds: ((id: MessageId) => boolean) | undefined): MessageId[] {
+export function storedOfThrownWrite(error: unknown, holds: ((id: MessageId) => boolean) | undefined): MessageId[] {
   if (error instanceof WriteLandedError) return [...error.landed];
   if (!(error instanceof WriteOutcomeUnknownError)) return [];
   let unknown: MessageId[] = [];

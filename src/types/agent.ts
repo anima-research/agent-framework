@@ -127,6 +127,114 @@ export interface AgentConfig {
   cacheTtl?: '5m' | '1h';
 
   /**
+   * How a request declares the agent's tools and system text.
+   *
+   * - `'head'` (default): every request carries the current tools and system
+   *   text, as before. A change to either rewrites the provider's cache from
+   *   the head. Every change row in the agent's context is left out of the
+   *   request.
+   * - `'entries'`: a request carries a fixed head, recorded once, and each
+   *   later change to the tools, or addition to the system text, goes into
+   *   the context as a system change at the point it took effect, which the
+   *   provider reads without rewriting what came before. A replacement of
+   *   system text, and consolidation once changes reach a tenth of the request
+   *   at a compile that already rewrites them, or a fifth at any compile,
+   *   move the head to what's current, with one write. The share is in
+   *   characters of JSON on both sides: the changes', and the request's, its
+   *   head's tools and system text and its messages as it sends them
+   *   (another agent's rounds as this agent is sent them), leaving out what a
+   *   provider doesn't price by its characters (a base64 source's data, a
+   *   generated image's, a redacted thinking block's, a thinking block's
+   *   signature and a block's provider-native `rawItem`) and what a request
+   *   on the native formatter doesn't send (a parsed block's `rawXml` and
+   *   `rawXmlImagesAt`, a call's `unparseableInput` and a block's
+   *   `tokenEstimate`), from any object with a string `type`, so a tool
+   *   call's input or a tool's schema holding one beside such a `type` counts
+   *   without it, though it's sent. JSON runs denser than prose, so tool changes read as
+   *   a smaller share than they would in tokens, and a move comes somewhat
+   *   later. Carried changes are read on every request. What that adds over
+   *   `'head'` is what a move would take out: the old definition of a tool
+   *   since replaced or removed, which the head keeps, and the rows'
+   *   wrapping. An added tool's definition, or added system text, is read
+   *   either way. Where a cache read costs a tenth of the input price, a
+   *   tenth of a request's input tokens carried that way costs in reads,
+   *   about every 115 to 190 requests, what rewriting the whole input costs
+   *   beyond reading it. On Opus 5.5 and Sonnet 5.5 that's every 240 to 390
+   *   requests, and on Fable 5.1 every 490 to 790. Each range runs from the
+   *   5-minute write to the 1-hour. The share a consolidation waits for
+   *   counts the rows, so a removed tool's definition doesn't count toward
+   *   it. Only for models that
+   *   take mid-conversation system messages on the native formatter: the
+   *   host's model records say which. Membrane refuses a system change before
+   *   sending it unless the formatter's `rendersSystemChanges` and the
+   *   adapter's `sendsSystemChanges` both hold, as the native formatter's and
+   *   the Anthropic adapter's do; an adapter wrapped in another needs the
+   *   wrapper to declare `sendsSystemChanges` too. A refused change keeps the
+   *   agent to its head until it's built again. The agent's own change rows are those stored with its
+   *   `systemChangeMetadata(name)`, or with one of its `selfParticipants`'
+   *   (see `selfParticipants`), and for an agent that shares another's
+   *   context on a branch of its own, those its source counts as its own.
+   *   A change row a host writes without such metadata goes out as written,
+   *   and the agent neither folds it onto its head, consolidates it nor
+   *   removes it, but declares nothing such a row already carries: it's the
+   *   host's to remove. System text is compared block by block, in any
+   *   order: an added block is declared as a change,
+   *   and a block already declared that's dropped or edited is a
+   *   replacement. So this saves writes only while the blocks already
+   *   declared stay as they are: a block whose text changes every request,
+   *   such as one carrying a timestamp, moves the head at every request,
+   *   rewriting the cache as on `'head'`, storing the whole head again and,
+   *   with kv-unified or `thinkingBinding.binds: true`, compiling again.
+   *
+   * What the framework adds: it leaves change rows out of the compile of an
+   * agent configured `'head'`, so they take none of its budget (the
+   * subconscious's compile, which leaves out every change row but its own,
+   * holds its own until a request on the head clears its record, if any, and
+   * takes them out); it keeps
+   * a resident's and a conversation fork's recorded head in its store, so a
+   * restart keeps it (an ephemeral agent's, a resumed one's included, is kept
+   * in memory, per branch, so a resumed agent adopts its current head at its
+   * first request, and a run on a branch it has no head for adopts there);
+   * and when a request carrying a change
+   * ends with a refusal membrane recognises, or with a 400 it doesn't file
+   * as context overflow or an account refusal (`type` `context_length` or
+   * `auth`), whether or not the change caused it, the request goes again on
+   * the agent's head, which it keeps to until it's built again, and an
+   * operator line (`head-resend`) says so. Kept to its
+   * head, it leaves every change row out of its request, and takes its own
+   * out of its context once its record is cleared (a record the store can't
+   * clear keeps them until it can), while its compile, made as an
+   * `'entries'` agent's, holds a host's change rows, which take its budget,
+   * until it's built again. An Agent used without the framework
+   * keeps its head in memory, per branch of its context, and has no such resend. The direct API
+   * (runInference) declares nothing. On an `'entries'` agent with a recorded
+   * head, where the tools its caller passes and the current system text are
+   * what that head and the agent's own change rows declare, its request goes
+   * on that head with every change row, as the agent's own requests on that
+   * head do, and, with `thinkingBinding.binds: true`, its compile binds
+   * thinking under that head. Elsewhere it sends the tools
+   * its caller passes and the current system text, and leaves the agent's
+   * own change rows out of its request, though its compile holds them, as
+   * a compile kept to its head holds a host's: under `'entries'` it carries
+   * a host's change rows as the agent's requests do, and on its head it
+   * carries none. Where what the caller passes differs from what the
+   * agent's head and own rows declare, with `thinkingBinding.binds: true`
+   * its compile binds thinking under an identity none of the agent's own
+   * requests has, so it sets aside the thinking before it, as the next
+   * request the agent makes does. With `binds` left out, the direct request
+   * there carries the thinking signed after the first change row it leaves
+   * out, and all of it where the heads differ, under a prefix it wasn't
+   * signed under: with
+   * `dropBlock` the provider drops it, and without it an account that
+   * enforces the binding refuses the request, and one that doesn't decides
+   * for itself.
+   *
+   * Turning it on is a choice from those records, not a runtime toggle, so
+   * it isn't one of the agent's runtime settings.
+   */
+  toolDeclarations?: 'head' | 'entries';
+
+  /**
    * Whether to emit prompt-cache markers (cache_control) on requests.
    * Default true (Anthropic API). Set false for transports that reject
    * cache_control — e.g. Bedrock legacy Claude models, which fail with
@@ -235,45 +343,74 @@ export interface AgentConfig {
     dropBlock?: boolean;
     /**
      * Whether this agent's model binds its signed thinking to the
-     * conversation before it, as the host knows from its own model records.
-     * A context manager that keeps a record of what each branch sent can
-     * then leave out thinking whose earlier conversation changed before the
-     * provider sees it. Set:
-     * - each compile the agent sends tells the context manager so
-     *   (`thinkingBinding`: `binds`, `dropBlock` as set here, and the agent's
-     *   name as the `participant` whose replies are its own), with digests
-     *   of what the request carries ahead of its messages (`identity`: the
-     *   system text with its system-position injections, the tools in the
-     *   order sent, the model, and the thinking config, `maxTokens`,
-     *   `providerParams` and `prefillUserMessage`);
-     * - each framework stream tells the context manager which stored rows
-     *   its later rounds and its last reply carried as stored
-     *   (`noteRequestSent`), naming the compile it was built from, so their
-     *   thinking is kept at the next compile. The direct API
-     *   (`runInference`) notes nothing, so each of its replies' thinking is
-     *   left out at the compile after it's stored;
-     * - with `dropBlock` set too, each framework stream tells the context
-     *   manager which stored replies' thinking the provider reports dropping
-     *   (`noteThinkingDropped`), naming the compile it was built from, so
-     *   once a note lands, the next compile sends those replies without their
-     *   thinking;
-     * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
-     *   starts a new stream mid-turn, since the new stream's compile can take
-     *   the turn's earlier reasoning out of the request;
-     * - with `dropBlock` set too, where a compile reports where the branch's
-     *   record began (`thinkingRecordedAfter`), a block the provider drops
-     *   that the record doesn't account for raises the
-     *   `thinking-binding-loss` ops alert, once per incident and again if a
-     *   call drops more. The provider reports drops only on a request that
-     *   carries the drop control; without it, such a block is refused;
-     * - the agent is told nothing of reasoning left out or dropped: no line
-     *   about the mechanics of its own memory or reasoning is put in its
-     *   context. Hosts can observe compiles' strips through
-     *   `Agent.onThinkingStrip`;
-     * The record and the notes
-     * vouch for requests as agent-framework hands them to membrane, so a
-     * membrane `beforeRequest` hook that changes a request must change every
-     * request alike. Default false: compiles and streams are as they were.
+     * conversation before it, so that a change to anything before a thinking
+     * block sets it aside, as the host knows from its own model records. One
+     * fact with three states, each feature taking its own safe side where
+     * it's left out:
+     * - `true`: the host declares that the model binds. What relies on the
+     *   declaration is on (`declaresBinding`, agent.ts):
+     *   - each compile the agent sends tells the context manager so
+     *     (`thinkingBinding`: `binds`, `dropBlock` as set here, and the
+     *     agent's name as the `participant` whose replies are its own), with
+     *     digests of what the request carries ahead of its messages
+     *     (`identity`: the system text with its system-position injections,
+     *     the tools in the order sent, the model, and the thinking config,
+     *     `maxTokens`, `providerParams` and `prefillUserMessage`). Under
+     *     `toolDeclarations: 'entries'` these are the recorded head's, which
+     *     the request carries, so a declared change leaves them as they were,
+     *     and a move of the head changes them wherever it changes what the
+     *     request carries ahead of its messages, and then the compile for
+     *     the new head leaves out every thinking block;
+     *   - each framework stream tells the context manager which stored rows
+     *     its later rounds and its last reply carried as stored
+     *     (`noteRequestSent`), naming the compile it was built from, so their
+     *     thinking is kept at the next compile. The direct API
+     *     (`runInference`) notes nothing, so each of its replies' thinking is
+     *     left out at the compile after it's stored;
+     *   - with `dropBlock` set too, each framework stream tells the context
+     *     manager which stored replies' thinking the provider reports
+     *     dropping (`noteThinkingDropped`), naming the compile it was built
+     *     from, so once a note lands, the next compile sends those replies
+     *     without their thinking;
+     *   - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
+     *     starts a new stream mid-turn, since the new stream's compile can
+     *     take the turn's earlier reasoning out of the request;
+     *   - with `dropBlock` set too, where a compile reports where the
+     *     branch's record began (`thinkingRecordedAfter`), a block the
+     *     provider drops that the record doesn't account for raises the
+     *     `thinking-binding-loss` ops alert, once per incident and again if a
+     *     call drops more. The provider reports drops only on a request that
+     *     carries the drop control; without it, such a block is refused;
+     *   - the agent is told nothing of reasoning left out or dropped: no
+     *     line about the mechanics of its own memory or reasoning is put in
+     *     its context. Hosts can observe compiles' strips through
+     *     `Agent.onThinkingStrip`.
+     *
+     *   The record and the notes vouch for requests as agent-framework hands
+     *   them to membrane, so a membrane `beforeRequest` hook that changes a
+     *   request must change every request alike.
+     * - `false`: the host says the model doesn't bind. Compiles and streams
+     *   are as they were, and nothing is held back to keep thinking.
+     * - Left out: not declared. What relies on the declaration stays off, as
+     *   with `false`, and a choice that could set kept thinking aside is made
+     *   as for a model that binds (`mayBindThinking`, agent.ts), as with
+     *   `true`.
+     *
+     * The choice that reads `mayBindThinking` is consolidation under
+     * `toolDeclarations: 'entries'`: a model that may bind consolidates for
+     * free only where no thinking sits before the compile's `firstChanged`
+     * (the first message that compile renders differently from the last
+     * one; the compile's own change already moved the prefix of everything
+     * from there on, so a move adds no loss of its own there).
+     * Past a fifth of the request, or when a compile is refused over budget,
+     * or for dropping messages no summary covers, with changes kept, it
+     * consolidates anyway. With `true`, the compile for the new head leaves
+     * that thinking out. Left out, the request still carries it, under a
+     * prefix it wasn't signed under. With `dropBlock`, the provider drops it
+     * from each request that carries it. Without it, an account that enforces
+     * the binding refuses each such request, and one that doesn't decides for
+     * itself. The host's model records carry `binds`, beside "takes
+     * entries".
      */
     binds?: boolean;
   };
@@ -366,8 +503,12 @@ export interface AgentConfig {
    * Stored participants that are this agent's own voice, in addition to its
    * name: their turns are presented to the model as this agent's assistant
    * turns. A derived agent sets this to the agent it inherited from, so the
-   * parent's turns read as its own history. Model-facing role assignment
-   * only, applied at request assembly — stored authorship is never rewritten.
+   * parent's turns read as its own history. Stored authorship is never
+   * rewritten. A system change stored with one of these names' change
+   * metadata is this agent's own too: its view keeps it, and a move of its
+   * head takes it out of the agent's own context, as does a request on the
+   * head that clears a recorded head or whose compile holds one of the
+   * agent's own change rows.
    */
   selfParticipants?: string[];
 

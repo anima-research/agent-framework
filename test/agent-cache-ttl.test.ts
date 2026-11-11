@@ -6,9 +6,9 @@ import type { ContextManager } from '@animalabs/context-manager';
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 import { createMockResponse } from './helpers/mock-membrane.js';
 
-/** buildActivationRequest only needs compile(); membrane is never touched. */
 const stubContextManager = {
   compile: async () => ({ messages: [], systemInjections: [] }),
+  currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
 } as unknown as ContextManager;
 
 function createAgent(config: Partial<AgentConfig>): Agent {
@@ -58,6 +58,7 @@ describe('the direct API sends the agent request settings', () => {
   const directContextManager = {
     compile: async () => ({ messages: [], systemInjections: [] }),
     addMessage: () => 'reply',
+    currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
   } as unknown as ContextManager;
 
   /** An agent whose membrane records each request runInference sends. */

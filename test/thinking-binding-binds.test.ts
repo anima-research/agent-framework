@@ -32,6 +32,7 @@ function recording(): { contextManager: ContextManager; seen: Opts[] } {
       };
     },
     addMessage: () => 'reply',
+    currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
   } as unknown as ContextManager;
   return { contextManager, seen };
 }

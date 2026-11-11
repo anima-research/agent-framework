@@ -128,6 +128,7 @@ describe('compiles that are never sent', () => {
         options.push(opts);
         return { messages: [{ participant: 'user', content: [{ type: 'text', text: 'hello' }] }], systemInjections: [] };
       },
+      currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
     } as unknown as ContextManager;
     const agent = new Agent({ name: 'resident', model: 'test', systemPrompt: 'system' }, cm, {} as Membrane);
     await agent.buildActivationRequest([], undefined, undefined, [], { dryRun: true });

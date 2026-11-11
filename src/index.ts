@@ -6,6 +6,7 @@ export { AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPo
 export { isReasoningLoss } from './reasoning-loss.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
+export { isSystemChangeMessage, systemChangeMetadata } from './system-changes.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';

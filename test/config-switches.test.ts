@@ -39,10 +39,10 @@ const agentWith = (settings: Record<string, unknown>) => ({
   ...settings,
 });
 
-/** An Agent built directly, as a caller importing the class can. Building an
- *  activation request needs only compile(), and membrane is never touched. */
+/** An Agent built directly, as a caller importing the class can. */
 const stubContextManager = {
   compile: async () => ({ messages: [], systemInjections: [] }),
+  currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
 } as unknown as ContextManager;
 const newAgent = (settings: Record<string, unknown>) =>
   new Agent(agentWith(settings) as never, stubContextManager, {} as Membrane);
