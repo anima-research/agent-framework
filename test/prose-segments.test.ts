@@ -123,3 +123,39 @@ test('withoutRoundsProse counts a round with no prose, first or between others, 
   assert.deepEqual(splitProseSegments(withoutRoundsProse(between, new Set([2]))), ['ONE', 'LAST'], 'THREE is round 2, after round 1 with no prose');
   assert.deepEqual(splitProseSegments(withoutRoundsProse(between, new Set([1]))), ['ONE', 'THREE', 'LAST'], 'round 1 has no prose to drop');
 });
+
+test('withoutRoundsProse keeps text between two calls of one round, and text after its last unanswered call, in that round', () => {
+  // Text between calls of one round (native content without roundContent, or
+  // a first response cut off at max_tokens) stays that round's, and the later
+  // rounds keep their places.
+  const interleaved: ContentBlock[] = [
+    textBlock('A0'), toolUse('t1'), textBlock('B0'), toolUse('t2'), toolResult('t1'), toolResult('t2'),
+    textBlock('C1'), toolUse('t3'), toolResult('t3'),
+    textBlock('D'),
+  ];
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(interleaved, new Set([0, 1]))), ['D']);
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(interleaved, new Set([1]))), ['A0', 'B0', 'D']);
+  const blankBetween: ContentBlock[] = [
+    textBlock('A0'), toolUse('t1'), textBlock('\n'), toolUse('t2'), toolResult('t1'), toolResult('t2'),
+    textBlock('C1'), toolUse('t3'), toolResult('t3'),
+    textBlock('D'),
+  ];
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(blankBetween, new Set([1]))), ['A0', 'D']);
+  // A cut-off first response: both calls are round 0's, results or not.
+  const cut: ContentBlock[] = [textBlock('A0'), toolUse('t1'), textBlock('B0'), toolUse('t2')];
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(cut, new Set([0]))), []);
+  // Text after a round's last call with no results after it stays the round's:
+  // content that ends at an unanswered call can't be told from a round cut
+  // off at max_tokens, whose text after the call is the round's own.
+  const unanswered: ContentBlock[] = [textBlock('P0'), toolUse('t1'), textBlock('AFTER')];
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(unanswered, new Set([0]))), []);
+  const laterUnanswered: ContentBlock[] = [
+    textBlock('P0'), toolUse('t1'), toolResult('t1'),
+    textBlock('P1'), toolUse('t2'), textBlock('AFTER'),
+  ];
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(laterUnanswered, new Set([1]))), ['P0']);
+  // Text between a round's last call and its results stays the round's too.
+  const beforeResults: ContentBlock[] = [textBlock('P0'), toolUse('t1'), textBlock('MID'), toolResult('t1'), textBlock('P1'), toolUse('t2'), toolResult('t2'), textBlock('LAST')];
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(beforeResults, new Set([1]))), ['P0', 'MID', 'LAST']);
+  assert.deepEqual(splitProseSegments(withoutRoundsProse(beforeResults, new Set([0]))), ['P1', 'LAST']);
+});

@@ -13,7 +13,6 @@ export interface CutOffRound {
   start: number;
   calls: CutOffCall[];
   unnamed: boolean;
-  xml: boolean;
 }
 
 /**
@@ -40,8 +39,7 @@ export function cutOffRound(response: NormalizedResponse): CutOffRound | undefin
     ...(unparseableInput !== undefined ? { unparseableInput } : {}),
   }));
   const unnamed = !!cut && calls.length === 0;
-  const xml = !!cut || uses.some((block) => (block as { rawXml?: string }).rawXml !== undefined);
-  return calls.length > 0 || unnamed ? { content, start, calls, unnamed, xml } : undefined;
+  return calls.length > 0 || unnamed ? { content, start, calls, unnamed } : undefined;
 }
 
 /**
