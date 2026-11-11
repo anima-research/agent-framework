@@ -23212,7 +23212,9 @@ export class AgentFramework {
       // (messages arrived in >1 channel while the agent was busy/idle):
       //   1. the most recent ADDRESSED channel wins (mention / reply / DM —
       //      someone explicitly spoke TO the agent);
-      //   2. else the most recent channel-bearing request (ambient message in
+      //   2. else a rewind's retry whose message isn't in what the agent is
+      //      sent (RETRY_RANK);
+      //   3. else the most recent channel-bearing request (ambient message in
       //      an open channel — legacy last-inbound semantics).
       // A chat:system notice (RFC-001 rev 3: weather in a world, someone
       // joining) names no channel at all: nobody spoke there, so a turn it
@@ -23259,6 +23261,8 @@ export class AgentFramework {
       // is its own provenance, even when it names no author (a push event
       // can route without an author id): borrowing another request's author
       // would credit the turn to someone who did not address the agent.
+      // So is a ranked retry (RETRY_RANK): it stands for the rewound turn,
+      // not for another request's author.
       // Otherwise from the routing winner when it carries one; else from the
       // most recent request that does (ambient gate wakes name a counterparty
       // without setting a locus), ordered by the event's own time.
