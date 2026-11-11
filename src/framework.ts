@@ -5438,12 +5438,12 @@ export class AgentFramework {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     resolveInferenceBounds(config.inferenceBounds);
-    if (quietPeriodOf(config.messageQuietPeriod) && config.speech?.locus === 'latest-inbound') {
+    if ((quietPeriodOf(config.messageQuietPeriod)?.quietMs ?? 0) > 0 && config.speech?.locus === 'latest-inbound') {
       // Under latest-inbound, a held message is the latest delivered inbound,
       // so a turn with no channel of its own would speak in a held channel
       // and read-drop that channel's burst: the one-turn-per-burst promise
       // can't hold there, so the pair is refused rather than half-kept.
-      throw new Error("FrameworkConfig.messageQuietPeriod can't be used with speech.locus 'latest-inbound': a held message would become a turn's fallback locus. Use the default 'delivery' locus.");
+      throw new Error("FrameworkConfig.messageQuietPeriod can't be used with speech.locus 'latest-inbound': a held message would become a turn's fallback locus. Use the default 'delivery' locus, or leave messageQuietPeriod out.");
     }
     assertFrameworkSwitches(config);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);

@@ -7,7 +7,8 @@
   oldest; it then starts a turn with its wakes alone, and other channels'
   bursts wait their own turns, so chatter in one channel neither delays
   another's turn nor, for locus-routed prose under the default `speech.locus:
-  'delivery'`, takes its reply. Refused with `speech.locus: 'latest-inbound'`. Each message's
+  'delivery'`, takes its reply. A `quietMs` above 0 is refused with
+  `speech.locus: 'latest-inbound'`. Each message's
   own decision stays what the gate gives it: who wakes a sleeping agent,
   where a reply goes, what tune-out and conversation routing see. Held
   messages are in context, so another burst's turn can read them: an ambient

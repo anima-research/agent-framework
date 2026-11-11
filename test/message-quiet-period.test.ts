@@ -788,4 +788,20 @@ describe('messageQuietPeriod in the scheduler', () => {
       );
     }
   });
+
+  it("refuses latest-inbound only where a hold can happen, naming both ways out (b9034c4 review, 29)", async () => {
+    assert.deepEqual(quietSplit([inChannel(T0, 'g:room'), inChannel(T0, 'g:general')], T0, { quietMs: 0, maxWaitMs: 10_000 }).hold, [], 'at quietMs 0 nothing is held');
+    mkdirSync(TMP, { recursive: true });
+    const create = (quietMs: number) => AgentFramework.create({
+      storePath: join(TMP, `store-li-${quietMs}-${Math.random().toString(36).slice(2)}`),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+      modules: [],
+      messageQuietPeriod: { quietMs },
+      speech: { locus: 'latest-inbound' },
+    });
+    await assert.rejects(create(500), /Use the default 'delivery' locus, or leave messageQuietPeriod out/);
+    const framework = await create(0);
+    await framework.stop();
+  });
 });

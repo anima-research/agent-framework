@@ -438,9 +438,9 @@ export interface FrameworkConfig {
    * their own turns. So chatter in one channel neither delays another
    * channel's turn nor takes its reply, and, for locus-routed prose
    * (`proseRouting` `locus` or `hybrid`) under the default `speech.locus:
-   * 'delivery'`, each channel's turn speaks in its own channel. The option
-   * is refused with `speech.locus: 'latest-inbound'`, where a held message
-   * would become a turn's fallback locus; a locked agent speaks at its lock,
+   * 'delivery'`, each channel's turn speaks in its own channel. A `quietMs`
+   * above 0 is refused with `speech.locus: 'latest-inbound'`, where a held
+   * message would become a turn's fallback locus; a locked agent speaks at its lock,
    * and explicit and disabled routing deliver no unprefixed prose, as
    * always. A
    * message wake is a channel message's or a server event's
