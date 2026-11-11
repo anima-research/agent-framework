@@ -466,7 +466,7 @@ export interface FrameworkConfig {
    * and at most one channel's burst (the channel it names, else the ready
    * burst that waited longest), the other channels' bursts still waiting. A
    * backlog that waited out a busy turn longer than its deadlines starts one
-   * turn per channel, oldest first, where `main` starts one merged turn. The
+   * turn per channel, oldest first, where it starts one merged turn without the option. The
    * hold is observable as `quiet-period:held` and `quiet-period:released`
    * traces. Held wakes live only in the queue: as with any queued wake,
    * `stop()` within the hold drops them, and the message, stored at ingress,
