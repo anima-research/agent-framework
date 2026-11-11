@@ -505,8 +505,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
   });
 
   const lookup = { fixture: { tools: [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object' } }] } };
-  const heldRefusal = async (r: Awaited<ReturnType<typeof rig>>, responses: ReturnType<typeof createMockResponse>[]) => {
-    r.f.membrane.supportsInjectedMessages = false;
+  const heldRefusal = async (r: Awaited<ReturnType<typeof rig>>, responses: ReturnType<typeof createMockResponse>[], injects = true) => {
     const fw = r.f.framework as unknown as { rewindRetry(...args: unknown[]): Record<string, unknown>; createFrameworkState(): { getPendingRequests(): Array<Record<string, unknown>> } };
     const rewindRetry = fw.rewindRetry.bind(fw);
     const retries: Array<Record<string, unknown> | undefined> = [];
@@ -517,7 +516,8 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     };
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
-    r.streams.push(() => new HeldStream(released, responses), () => new MockYieldingStream([answer('the answer after the rewind')]));
+    let held!: HeldStream;
+    r.streams.push(() => (held = new HeldStream(released, responses, injects)), () => new MockYieldingStream([answer('the answer after the rewind')]));
     await r.incoming(ROOM, 'm-a');
     await eventually(() => r.f.membrane.calls.length === 1, 'the turn for m-a, held');
     await r.incoming(GENERAL, 'm-b');
@@ -528,7 +528,8 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(r.f.membrane.calls.length, 2, 'premise: the retry and m-b\'s wake started one turn');
     const sent = JSON.stringify(r.f.membrane.calls[1]!.messages);
     assert.ok(retries.length === 1 && retries[0], 'premise: getPendingRequests() showed the queued retry once');
-    return { hasA: sent.includes('message m-a'), hasB: sent.includes('message m-b'), post: r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind')), retry: retries[0]! };
+    const injected = JSON.stringify(held.receivedToolResultOptions).includes('message m-b');
+    return { hasA: sent.includes('message m-a'), hasB: sent.includes('message m-b'), injected, post: r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind')), retry: retries[0]! };
   };
 
   it('a refused first round\'s retry merged with an addressed wake from another channel queued while it ran: the rewind set the retry\'s message aside, so the turn speaks in the other message\'s channel', async (t) => {
@@ -538,16 +539,29 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(seen.post?.channelId, GENERAL);
   });
 
-  it('a retry after a refused tool round merged with an addressed wake from another channel queued while it ran: the retry\'s message stays, so the turn speaks in its channel', async (t) => {
+  it('a retry after a refused tool round on a stream that takes injected messages, merged with an addressed wake from another channel queued while it ran: the other message joins the refused round and the rewind sets it aside, so the turn speaks in the retry\'s channel', async (t) => {
     const r = await rig(t, { ...rewinding, ...lookup });
     const call = { type: 'tool_use', id: 'look-1', name: 'mcpl--editor--lookup', input: {} } as ContentBlock;
     const seen = await heldRefusal(r, [
       createMockResponse([{ type: 'text', text: 'let me look' }, call], 'tool_use'),
       { ...createMockResponse([{ type: 'text', text: 'let me look' }, call, { type: 'tool_result', toolUseId: 'look-1', content: 'what the tool saw' } as ContentBlock], 'refusal'), toolCalls: [] },
     ]);
+    assert.ok(seen.injected, 'premise: m-b was injected into the refused round');
     assert.ok(seen.hasA && !seen.hasB, 'premise: the retry\'s request shows m-a and not m-b');
     assert.equal(seen.post?.channelId, ROOM);
     assert.equal(seen.retry!.addressed, undefined, 'a retry is no message that addressed the agent, as getPendingRequests() shows it');
+  });
+
+  it('a retry after a refused tool round on a stream that takes no injected messages, merged with an addressed wake from another channel queued before it: both messages stay, and the retry speaks in its channel', async (t) => {
+    const r = await rig(t, { ...rewinding, ...lookup });
+    const call = { type: 'tool_use', id: 'look-1', name: 'mcpl--editor--lookup', input: {} } as ContentBlock;
+    const seen = await heldRefusal(r, [
+      createMockResponse([{ type: 'text', text: 'let me look' }, call], 'tool_use'),
+      { ...createMockResponse([{ type: 'text', text: 'let me look' }, call, { type: 'tool_result', toolUseId: 'look-1', content: 'what the tool saw' } as ContentBlock], 'refusal'), toolCalls: [] },
+    ], false);
+    assert.ok(!seen.injected, 'premise: m-b was not injected into the refused round');
+    assert.ok(seen.hasA && seen.hasB, 'premise: the retry\'s request shows m-a and m-b');
+    assert.equal(seen.post?.channelId, ROOM);
   });
 
   it('a retry after a refused tool round, its message still sent, merged with a later ambient wake from another channel: the turn speaks in the retry\'s channel, and its start isn\'t marked addressed', async (t) => {
