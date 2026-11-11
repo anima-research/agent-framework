@@ -254,12 +254,14 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
     });
   }
 
-  it("with the option off, a start parked behind an auxiliary call assembles the batch that arrived meanwhile, as without the option (slimepriestess's pin)", async () => {
+  for (const quiet of [undefined, { quietMs: 0 }]) {
+  it(`with the option ${quiet ? 'at quietMs 0' : 'off'}, a start parked behind an auxiliary call assembles the batch that arrived meanwhile, as without the option (slimepriestess's pin${quiet ? ', R5-2' : ''})`, async () => {
     // Pins `quietLeaves`' `if (!this.quietPeriod) return undefined;`:
     // without it, a host that never set the option would leave every queued
-    // batch for a later turn, where main's start takes it.
+    // batch for a later turn, where main's start takes it. A quietMs of 0
+    // holds nothing, so it reads as off there too, not only in quietSplit.
     const f = await fixture({
-      framework: { gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
+      framework: { ...(quiet ? { messageQuietPeriod: quiet } : {}), gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
       mcpl: {},
     });
     try {
@@ -290,6 +292,7 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
       await f.close();
     }
   });
+  }
 
   it("a notice to the held batch while the other burst's start is parked behind an auxiliary call: still left for its own turn (R4-1a)", async () => {
     const f = await fixture({

@@ -959,7 +959,9 @@ const turnRearmDelays = (value: unknown): readonly number[] => {
 };
 
 /** FrameworkConfig.messageQuietPeriod, read once: both numbers finite and
- *  0 or more, maxWaitMs defaulting to 30 s; anything else refuses the config. */
+ *  0 or more, maxWaitMs defaulting to 30 s; anything else refuses the config.
+ *  A quietMs of 0 holds nothing, so it reads as off (undefined), and every
+ *  reader of the option sees it so. */
 const quietPeriodOf = (value: unknown): { quietMs: number; maxWaitMs: number } | undefined => {
   if (value === undefined) return undefined;
   const bad = (shown: string): never => {
@@ -970,6 +972,7 @@ const quietPeriodOf = (value: unknown): { quietMs: number; maxWaitMs: number } |
   const { quietMs, maxWaitMs } = value as { quietMs?: unknown; maxWaitMs?: unknown };
   if (typeof quietMs !== 'number' || !Number.isFinite(quietMs) || quietMs < 0) return bad(`quietMs ${shownValue(quietMs)}`);
   if (maxWaitMs !== undefined && (typeof maxWaitMs !== 'number' || !Number.isFinite(maxWaitMs) || maxWaitMs < 0)) return bad(`maxWaitMs ${shownValue(maxWaitMs)}`);
+  if (quietMs === 0) return undefined;
   return { quietMs, maxWaitMs: maxWaitMs ?? 30_000 };
 };
 
@@ -5447,7 +5450,7 @@ export class AgentFramework {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     resolveInferenceBounds(config.inferenceBounds);
-    if ((quietPeriodOf(config.messageQuietPeriod)?.quietMs ?? 0) > 0 && config.speech?.locus === 'latest-inbound') {
+    if (quietPeriodOf(config.messageQuietPeriod) && config.speech?.locus === 'latest-inbound') {
       // Under latest-inbound, a held message is the latest delivered inbound,
       // so a turn with no channel of its own would speak in a held channel
       // and read-drop that channel's burst: the one-turn-per-burst promise

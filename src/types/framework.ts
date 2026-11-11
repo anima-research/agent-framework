@@ -442,7 +442,8 @@ export interface FrameworkConfig {
    * channel's turn nor takes its reply, and, for locus-routed prose
    * (`proseRouting` `locus` or `hybrid`) under the default `speech.locus:
    * 'delivery'`, each channel's turn speaks in its own channel. A `quietMs`
-   * above 0 is refused with `speech.locus: 'latest-inbound'`, where a held
+   * of 0 holds nothing and is the same as leaving the option out; one above
+   * 0 is refused with `speech.locus: 'latest-inbound'`, where a held
    * message would become a turn's fallback locus; a locked agent speaks at its lock,
    * and explicit and disabled routing deliver no unprefixed prose, as
    * always. A
