@@ -67,3 +67,9 @@
   clock row doesn't, while the rows after the messages are among the 32
   newest the check reads. This holds in a presented window and in one still
   in legacy mode.
+- `residentContextOptions(name)`, with no options, opens a view that leaves
+  out every system change row, as a resident on its head, the default,
+  compiles; it kept them before. `subconsciousContextOptions` opens a view
+  that leaves out every change row not the subconscious's own, as the live
+  subconscious's does. A host that opens a context with them reads what the
+  agent's compile reads where the store holds change rows too.

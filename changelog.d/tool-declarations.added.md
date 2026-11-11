@@ -101,3 +101,9 @@
   reader or as a reader fork, declares its tools and system text on its
   head, whatever the resident's `toolDeclarations`. A reader fork on the
   resident's own model keeps the resident's setting.
+- `residentContextOptions` takes the agent's `toolDeclarations` and
+  `selfParticipants` as an optional second argument
+  (`residentContextOptions(name, { toolDeclarations, selfParticipants })`),
+  so a host that opens a resident's context itself reads the change rows
+  that agent's compile reads: under `'entries'`, a host's and its own, and
+  not another agent's.

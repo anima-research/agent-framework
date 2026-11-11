@@ -19,15 +19,19 @@
  *   (heldFromResidents), what a suppress rule hid (suppressedRow), and the
  *   other residents' stored context injections (isAnotherAgentsInjection):
  *   their context, which they share the slot with it but never its
- *   conversation. Both views also omit legacy reasoning-loss notices.
+ *   conversation, and the system change rows its compile leaves out: on
+ *   `'head'` every one, and under `'entries'` another agent's (pass its
+ *   `toolDeclarations` and `selfParticipants`). Both views also omit legacy
+ *   reasoning-loss notices.
  * - The subconscious keeps its rows in a slot of its own,
  *   `subconscious/<serves>`, and reads the residents' slot beside it
  *   (`auxiliaryMessageViews: [{}]`), held traffic included, which is what it
  *   reads for. With the presentation index the residents' rows enter its
  *   window by its observe edge's rule, and the merged slot is still the
  *   record its window is presented from. Its view leaves out only the
- *   residents' stored context injections and what a suppress rule hid,
- *   in this shared view, along with legacy notices. Its strategy is a windowed
+ *   residents' stored context injections, what a suppress rule hid and
+ *   every system change row not its own, in this shared view, along with
+ *   legacy notices. Its strategy is a windowed
  *   passthrough, anchored at the oldest active tune-out's start, or at an
  *   earlier start kept in force: a cancelled tune-out's, kept while another
  *   stays active and across a restart, until the next enter sets the oldest
@@ -41,6 +45,8 @@ import { isReasoningLoss } from './reasoning-loss.js';
 import { heldFromResidents, suppressedRow } from './dendrite/audience.js';
 import { persistentReaderName } from './tune-out/tools.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
+import { isOthersSystemChange, isSystemChangeMessage, isSystemChangeNotOwn } from './system-changes.js';
+import type { AgentConfig } from './types/agent.js';
 
 /** ContextManager.open's options over a store the caller gives: everything but the store. */
 export type ContextManagerOpenOptions = Omit<Extract<ContextManagerConfig, { store: unknown }>, 'store'>;
@@ -67,11 +73,25 @@ export function subconsciousViewFilter(messageOrName: Pick<StoredMessage, 'metad
     && !isReasoningLoss(message.metadata);
 }
 
-/** The options a resident named `agentName` is opened with: the residents' slot, through its view. The caller gives its strategy. */
-export function residentContextOptions(agentName: string): ContextManagerOpenOptions {
+/**
+ * The options a resident named `agentName` is opened with: the residents'
+ * slot, through its view. The caller gives its strategy. Pass the agent's
+ * `toolDeclarations` and `selfParticipants`, as its configuration sets
+ * them: on `'head'`, the default, its view leaves out every system change
+ * row, and under `'entries'` the ones another agent stamped as its own,
+ * keeping a host's and those stamped with its name or a self participant.
+ */
+export function residentContextOptions(
+  agentName: string,
+  options: { toolDeclarations?: AgentConfig['toolDeclarations']; selfParticipants?: readonly string[] } = {},
+): ContextManagerOpenOptions {
+  const sees = residentViewFilter(agentName);
+  const own = new Set([agentName, ...(options.selfParticipants ?? [])]);
   return {
     namespace: `agents/${agentName}`,
-    viewFilter: residentViewFilter(agentName),
+    viewFilter: options.toolDeclarations === 'entries'
+      ? (message) => sees(message) && !isOthersSystemChange(message, (name) => own.has(name))
+      : (message) => sees(message) && !isSystemChangeMessage(message),
   };
 }
 
@@ -93,11 +113,12 @@ export function subconsciousContextOptions(options: {
   maxMessageTokens?: number;
 }): ContextManagerOpenOptions {
   const name = persistentReaderName(options);
+  const sees = subconsciousViewFilter(name);
   return {
     namespace: `subconscious/${options.serves}`,
     isolate: true,
     auxiliaryMessageViews: [{}],
-    viewFilter: subconsciousViewFilter(name),
+    viewFilter: (message) => sees(message) && !isSystemChangeNotOwn(message, (agent) => agent === name),
     strategy: new WindowedPassthroughStrategy({
       reAnchorFraction: options.reAnchorFraction,
       maxMessageTokens: options.maxMessageTokens,
