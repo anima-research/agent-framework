@@ -28,6 +28,10 @@ export interface MainRefusalBridge {
   takeOwnership(handler: MainRefusalHandler): () => void;
   isCurrent(refusal: MainRefusal): boolean;
   serverBinding(serverId: string): string | undefined;
-  /** Process-local config/connection identity. A replacement requires a new handover. */
+  /** Process-local config OBJECT + connection OBJECT identity, NOT transportEpoch,
+   * child PID, reconnect detection, or security/realm/executable attestation.
+   * In-place crash/reconnect preserves it; object replacement changes it.
+   * Companion Host V1 has no runtime rearm: replacement requires a fresh full
+   * Host process restart with normal config prepare/install, not another install. */
   serverEpoch(serverId: string): string | undefined;
 }

@@ -16,9 +16,25 @@ removal). It is not a new incident service or general host executor.
   and `rewind: 'handled' | 'unhandled'`. Only the latter may produce a reaction.
 - `isCurrent(signal)` rejects a removed/replaced agent instance.
 - `serverBinding(id)` checks the original inbound source's endpoint binding;
-  `serverEpoch(id)` additionally identifies the current config/connection within
-  this process. Replacing either requires a new handover/preflight. Neither is a
-  published provenance link or a persistent identity.
+  `serverEpoch(id)` identifies the config **object** plus connection **object**
+  within this process. It is not a transport epoch, child PID, reconnect detector,
+  or security/realm/executable attestation. Automatic in-place crash/reconnect
+  keeps these objects and this identity even when `transportEpoch` and the child
+  PID change. Object replacement (for example `restartMcplServer`, including
+  deploy/restart, or disconnect+connect) changes the identity instead.
+  Neither value is a published provenance link or a persistent identity.
+
+The companion Host V1 snapshots these identities at install. After a selected
+connector's config/connection object is replaced, later reactions on that server
+fail closed with a local status only. Whole-framework ownership remains held;
+there is **no legacy fallback**. The Host startup wiring discards the disposer
+and provides no runtime reinstall/rearm API. A **fresh full Host process restart
+with normal config prepare/install is necessary** after selected connector object
+replacement/restart/deploy; another install in the running process is not a
+recovery path. An already issued ADD cannot be undone. This documents the
+conservative lifetime limitation, not a liveness fix. Automatic in-place
+crash/reconnect is different and does not itself invalidate the V1 snapshot;
+normal per-signal binding/schema/suppression checks still apply.
 
 The signal is made only on the main stream's final refusal path, after membrane
 has exhausted its provider retries and after the existing rewind decision. A
@@ -26,6 +42,8 @@ handled rewind is reported without an effect; its retry keeps the original
 origin. Auxiliary `complete()` calls and ephemeral/subagent runs do not enter this
 handoff. Provider retry execution itself is membrane's responsibility; mock
 stream tests do not qualify a real provider.
+Auxiliary exclusion is source-reviewed (the signal is only in the main final
+stream branch), not behavior-proven by a direct call to a mock's `complete()`.
 
 ## Origin, not cause
 

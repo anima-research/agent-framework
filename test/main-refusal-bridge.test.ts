@@ -103,7 +103,7 @@ test('ambiguous admitted batch is unknown even in one channel; first and second 
   } finally { await r.close(); }
 });
 
-test('context-only content wakes nobody; nonmessage wakes have unknown origin; aux complete does not signal', async () => {
+test('context-only content wakes nobody; nonmessage wakes have unknown origin', async () => {
   const r = await rig();
   try {
     r.framework.pushEvent(incoming('A', undefined, { triggerInference: false }));
@@ -111,9 +111,6 @@ test('context-only content wakes nobody; nonmessage wakes have unknown origin; a
     r.membrane.pushResponse(refused());
     r.framework.pushEvent(incoming('reaction', undefined, { tags: ['chat:reaction'] }));
     await r.framework.runUntilIdle(); assert.equal(r.signals.length, 1); assert.equal(r.signals[0].origin, undefined);
-    r.membrane.pushResponse(refused());
-    await r.membrane.complete({} as NormalizedRequest);
-    assert.equal(r.signals.length, 1);
   } finally { await r.close(); }
 });
 
