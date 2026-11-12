@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, type ProcessEvent } from '../src/index.js';
 import type { EventGate } from '../src/gate/event-gate.js';
 import type { ChannelToolOrigin } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -61,10 +61,10 @@ function fixture(agents: string[] = ['agent']) {
   const configPath = join(dir, 'gate.json');
   const journalPath = join(dir, 'gate.wake-intents.json');
   const journal = (): Journal => JSON.parse(readFileSync(journalPath, 'utf8'));
-  const create = async (membrane: MockMembrane, extras: Record<string, unknown> = {}) => AgentFramework.create({
+  const create = async (membrane: MockMembrane, extras: Record<string, unknown> = {}, agentNames: string[] = agents) => AgentFramework.create({
     storePath,
     membrane: membrane.asMembrane(),
-    agents: agents.map((name) => ({ name, model: 'test-model', systemPrompt: 'test' })),
+    agents: agentNames.map((name) => ({ name, model: 'test-model', systemPrompt: 'test' })),
     modules: [],
     gate: { config: { policies: [], default: 'always' }, configPath },
     ...extras,
@@ -75,19 +75,19 @@ function fixture(agents: string[] = ['agent']) {
 /** A sleep and a self-wake set in one framework, which is then stopped.
  *  A self-wake is at least 1 s (armSelfWake clamps), so an "overdue" test
  *  waits 1.2 s after the stop. */
-async function setAndStop(fx: ReturnType<typeof fixture>, seconds: number): Promise<void> {
+async function setAndStop(fx: ReturnType<typeof fixture>, seconds: number, agent = 'agent'): Promise<void> {
   const membrane = new MockMembrane();
   const framework = await fx.create(membrane);
   framework.start();
-  const slept = await framework.executeToolCall({ id: 's1', name: 'sleep', input: { seconds, announce: false }, callerAgentName: 'agent' });
+  const slept = await framework.executeToolCall({ id: 's1', name: 'sleep', input: { seconds, announce: false }, callerAgentName: agent });
   assert.equal(slept.success, true, JSON.stringify(slept));
-  const armed = internals(framework).eventGate.armSelfWake('agent', seconds, 'skip_reply');
+  const armed = internals(framework).eventGate.armSelfWake(agent, seconds, 'skip_reply');
   assert.equal(armed.armed, true);
   assert.equal(armed.durable, true);
   await framework.stop();
   const written = fx.journal();
-  assert.equal(written.sleep?.agentName, 'agent');
-  assert.deepEqual(written.selfWakes.map((w) => w.agentName), ['agent']);
+  assert.equal(written.sleep?.agentName, agent);
+  assert.deepEqual(written.selfWakes.map((w) => w.agentName), [agent]);
 }
 
 test('a sleep and a self-wake survive a restart: restored at create(), armed at start(), and served at their time', async () => {
@@ -238,39 +238,83 @@ test('a resume() that throws after un-quiescing, then a retry, still admits the 
   }
 });
 
-test('a wake falling due while stop() is held open stays in the journal', async () => {
+test('a wake falling due while stop() waits for the loop stays in the journal', async () => {
+  // The window stop()'s stopWakeTimers() step protects is the one between
+  // its first synchronous steps and the gate's dispose(): the awaits for the
+  // loop, the streams and the operator operations. A module's stop() runs
+  // after dispose(), where dispose() has cleared the timers on its own, so a
+  // stop held there sees nothing (R6-1). Held here in the loop, in a
+  // module's onProcess, with a wake falling due meanwhile: without the step,
+  // the wake fires into the stopping framework and leaves the journal.
   const fx = fixture();
   try {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
+    let holding = false;
     const membrane = new MockMembrane();
     const framework = await fx.create(membrane, {
       modules: [{
         name: 'holder',
         async start() {},
-        // Module stops run after the gate's timers are stopped and the queue
-        // closes: a stop() held here is one with a wake falling due inside.
-        async stop() { await held; },
+        async stop() {},
         getTools: () => [],
         async handleToolCall() { return { success: false }; },
-        async onProcess() { return {}; },
+        async onProcess(event: { type: string }) {
+          if (event.type === 'external-message') { holding = true; await held; }
+          return {};
+        },
       }],
     });
     framework.start();
+    framework.pushEvent({
+      type: 'external-message', source: 'test', content: [{ type: 'text', text: 'hold the loop' }], metadata: {}, triggerInference: false,
+    } as unknown as ProcessEvent);
+    await waitFor('the loop to be held in onProcess', () => holding);
     const gate = internals(framework).eventGate;
     assert.equal(gate.armSelfWake('agent', 1, 'skip_reply').durable, true);
-    const slept = await framework.executeToolCall({ id: 's1', name: 'sleep', input: { seconds: 1.1, announce: false }, callerAgentName: 'agent' });
-    assert.equal(slept.success, true);
-    const turnsBefore = membrane.calls.length;
+    assert.equal(gate.setSleep(1.1, undefined, 'agent').durable, true);
+    const requestsBefore = internals(framework).pendingRequests.length;
     const stopping = framework.stop();
     await sleepMs(1_500);
     const kept = fx.journal();
     assert.equal(kept.selfWakes.length, 1, 'the self-wake, due during the stop, is still journaled');
     assert.ok(kept.sleep, 'the sleep, ended during the stop, is still journaled');
-    assert.equal(membrane.calls.length, turnsBefore, 'no wake served during the stop');
+    assert.equal(internals(framework).pendingRequests.length, requestsBefore, 'no wake requested during the stop');
+    assert.equal(membrane.calls.length, 0, 'no wake served');
     release();
     await stopping;
     assert.equal(fx.journal().selfWakes.length, 1, 'and after it');
+  } finally {
+    fx.close();
+  }
+});
+
+test("a renamed agent's restored sleep is ended at create(), before any input is gated, and leaves the journal at start()", async () => {
+  // R5-4, R6-2, R6-4: the gate's hasAgent is wired to framework.agents, and
+  // the check runs at restore, in memory, so the stale sleep mutes nothing
+  // between create() and start(); the journal loses it at admission.
+  const fx = fixture(['old']);
+  try {
+    await setAndStop(fx, 3_600, 'old');
+    assert.equal(fx.journal().sleep?.agentName, 'old');
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let framework: AgentFramework | undefined;
+    try {
+      framework = await fx.create(new MockMembrane(), {}, ['new']);
+      const gate = internals(framework).eventGate;
+      assert.equal(gate.getSleepState(), null, "the absent agent's sleep is gone from the gate before start()");
+      assert.deepEqual(gate.upcomingWakes(['new']), [], 'and its self-wake');
+      assert.ok(fx.journal().sleep, 'the journal still holds it: restore writes nothing');
+      assert.ok(logged.some((l) => /ending the restored sleep of "old"/.test(l)), logged.join('\n'));
+      framework.start();
+      assert.equal(fx.journal().sleep, undefined, 'admission wrote the journal without it');
+      assert.deepEqual(fx.journal().selfWakes, []);
+    } finally {
+      console.error = quiet;
+      await framework?.stop();
+    }
   } finally {
     fx.close();
   }

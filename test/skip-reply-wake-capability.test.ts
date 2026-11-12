@@ -434,6 +434,24 @@ describe('the channel registry\'s skip_reply confirmation names the wake the gat
     assert.equal(await noteOf({}), 'Turn ended; nothing sent.', 'a skip with no wake has no self-wake to cancel');
   });
 
+  it('says the wake could not be journaled when the framework reports wakeDurable: false, and only beside a wake', async () => {
+    // R6-2: the sentence itself, at the registry; the framework test pins the
+    // handoff that sets wakeDurable.
+    const registry = new ChannelRegistry(
+      {} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { eventGatePresent: true },
+    );
+    const noteOf = async (input: Record<string, unknown>, wakeDurable?: boolean) => ((await registry.handleChannelToolCall(
+      'skip_reply', input, { kind: 'agent', agentName: 'agent', ...(wakeDurable === undefined ? {} : { wakeDurable }) },
+    )) as { data?: { note?: string } }).data?.note;
+    assert.equal(
+      await noteOf({ wake_in_seconds: 60 }, false),
+      'Turn ended; nothing sent. Self-wake in ~60s unless something wakes you first. This wake could not be journaled: a host restart before it fires would lose it.',
+    );
+    assert.equal(await noteOf({ wake_in_seconds: 60 }, true), 'Turn ended; nothing sent. Self-wake in ~60s unless something wakes you first.');
+    assert.equal(await noteOf({ wake_in_seconds: 60 }), 'Turn ended; nothing sent. Self-wake in ~60s unless something wakes you first.', 'absent reads as journaled');
+    assert.equal(await noteOf({}, false), 'Turn ended; nothing sent.', 'no wake, nothing to journal');
+  });
+
   it('a call whose input is null is an ordinary skip, where it used to throw reading wake_in_seconds', async () => {
     const registry = new ChannelRegistry(
       {} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { eventGatePresent: true },

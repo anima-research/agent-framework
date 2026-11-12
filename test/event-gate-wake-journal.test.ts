@@ -22,7 +22,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventGate } from '../src/gate/event-gate.js';
 
@@ -432,9 +432,12 @@ describe('EventGate wake journal', () => {
       // agent counts as present too (hasAgent, not getAgentNames).
       const { gate, inferenceRequests } = makeGate({ configPath, now: () => now, agents: [], hasAgent: (name) => name === 'new-name' });
       gate.restoreWakeIntents();
-      assert.ok(gate.getSleepState(), 'restored, the sleep suppresses until admission');
+      // Dropped at restore, in memory, so the stale sleep mutes nothing before
+      // admission (R6-4); the journal still holds it, as restore writes nothing.
+      assert.strictEqual(gate.getSleepState(), null, 'the absent agent\'s sleep is ended at restore');
+      assert.ok(JSON.parse(readFileSync(join(TMP_DIR, 'gate.wake-intents.json'), 'utf8')).sleep, 'the journal still holds it until admission');
       gate.admitOverdueWakeIntents();
-      assert.strictEqual(gate.getSleepState(), null, 'the absent agent\'s sleep is ended');
+      assert.strictEqual(gate.getSleepState(), null, 'the absent agent\'s sleep stays ended');
       assert.strictEqual(inferenceRequests.length, 0, 'ended, not woken: there is no one to wake');
       assert.deepStrictEqual(gate.upcomingWakes(['new-name']).map((w) => w.kind), ['self-wake'], 'the present agent\'s self-wake is armed');
       const written = journal(gate);
@@ -494,25 +497,62 @@ describe('EventGate wake journal', () => {
     }
   });
 
-  it('a sleep its own reader would skip is not journaled, and says so', () => {
+  it('a sleep past the largest Date is clamped to it, journaled, and refuses no later write', () => {
+    // R6-6: a deadline past the reader's bound (8.64e15 ms) used to fail the
+    // write for the whole state, and every later journal write with it.
     const configPath = join(TMP_DIR, 'gate.json');
     const now = 1_700_000_000_000;
+    const { gate } = makeGate({ configPath, now: () => now, agents: ['agent', 'agent2'] });
+    const set = gate.setSleep(9e12, undefined, 'agent');
+    assert.strictEqual(set.until, 8.64e15, 'clamped');
+    assert.strictEqual(set.durable, true);
+    assert.strictEqual(journal(gate).sleep?.wakeAt, 8.64e15);
+    assert.strictEqual(gate.armSelfWake('agent2', 60, 'skip_reply').durable, true, "another agent's self-wake is journaled all the same");
+    assert.strictEqual(journal(gate).selfWakes.length, 1);
+    gate.dispose();
+  });
+
+  it('after stopWakeTimers(), a sleep set by a late turn arms no timer: it ends at the next start, not in the stopping process', async () => {
+    // R6-2: the wakeTimersStopped check in armSleepWake.
+    const configPath = join(TMP_DIR, 'gate.json');
     const original = console.error;
     console.error = () => {};
     try {
-      const { gate } = makeGate({ configPath, now: () => now });
-      gate.armSelfWake('agent', 60, 'skip_reply');
-      // Past the reader's bound (8.64e15 ms, the largest Date): the sleep
-      // holds in this process, and the journal keeps what it had.
-      const set = gate.setSleep(9e12, undefined, 'agent');
-      assert.strictEqual(set.durable, false);
-      assert.ok(gate.getSleepState(), 'the sleep is set in memory');
-      const written = journal(gate);
-      assert.strictEqual(written.sleep, undefined, 'not written');
-      assert.strictEqual(written.selfWakes.length, 1, 'the earlier journal stands');
+      const { gate, inferenceRequests } = makeGate({ configPath });
+      gate.stopWakeTimers();
+      assert.strictEqual(gate.setSleep(0.2, undefined, 'agent').durable, true, 'journaled for the next start');
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      assert.strictEqual(inferenceRequests.length, 0, 'no wake fired in the stopping process');
+      assert.ok(journal(gate).sleep, 'the sleep is still journaled');
       gate.dispose();
     } finally {
       console.error = original;
+    }
+  });
+
+  it("a journal the process can't read (EACCES) is left as it is: no write reaches it, and every receipt says durable: false", { skip: typeof process.getuid === 'function' && process.getuid() === 0 ? 'root reads any file' : false }, () => {
+    // R6-2: the directory case (below) fails every write at the rename
+    // whether or not the read-failed flag is set; a mode-000 file in a
+    // writable directory is overwritten by the rename unless the flag holds.
+    const configPath = join(TMP_DIR, 'gate.json');
+    const journalPath = join(TMP_DIR, 'gate.wake-intents.json');
+    const bytes = JSON.stringify({ version: 1, sleep: { agentName: 'agent', armedAt: 1, wakeAt: 8.64e15, source: 'sleep' }, selfWakes: [] });
+    writeFileSync(journalPath, bytes, { mode: 0o000 });
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const { gate } = makeGate({ configPath });
+      gate.restoreWakeIntents();
+      gate.admitOverdueWakeIntents();
+      assert.strictEqual(gate.getSleepState(), null, 'nothing restored from a journal that could not be read');
+      assert.strictEqual(gate.setSleep(60, undefined, 'agent').durable, false);
+      assert.strictEqual(gate.endSleep().durable, false);
+      chmodSync(journalPath, 0o600);
+      assert.strictEqual(readFileSync(journalPath, 'utf8'), bytes, 'the unreadable journal is byte for byte what it was');
+      gate.dispose();
+    } finally {
+      console.error = original;
+      try { chmodSync(journalPath, 0o600); } catch { /* gone */ }
     }
   });
 

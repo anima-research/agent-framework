@@ -6016,12 +6016,14 @@ export class AgentFramework {
    * heartbeat on and the same heartbeat state file (heartbeat.statePath, or
    * its default), it keeps the heartbeat's schedule as it reads it from that
    * file: a tick or a reminder that fell due meanwhile fires once, shortly
-   * after it starts. What an instance holds only in memory is lost with it,
-   * as on a process restart: an agent's sleep and its wake, a self-wake, the
-   * inference requests still queued (a budget restart, a heartbeat's wake, a
-   * nudge), a re-armed turn's wait and count, and the redo stack. #627 is
-   * about keeping a sleep and a self-wake across a restart. To pause and
-   * resume one framework in place, use quiesce() and resume().
+   * after it starts. With a gate on the same config path, it keeps an agent's
+   * sleep and its self-wakes the same way, from the gate's wake journal
+   * (#627): create() restores them, and start() arms those still ahead and
+   * wakes the agent for those whose time passed. What an instance holds
+   * only in memory is lost with it, as on a process restart: the inference
+   * requests still queued (a budget restart, a heartbeat's wake, a nudge), a
+   * re-armed turn's wait and count, and the redo stack. To pause and resume
+   * one framework in place, use quiesce() and resume().
    */
   start(): void {
     // Before the running check: stop() claims its attempt before it clears
@@ -6040,11 +6042,6 @@ export class AgentFramework {
     this.heartbeat?.start();
     this.suppressionReview?.start();
     this.loopPromise = this.runLoop();
-    // The loop is running, so a wake's request becomes a turn: arm the
-    // restored sleep and self-wakes still ahead, and serve those whose time
-    // passed while the host was down. A quiesced boot keeps them for its
-    // resume(); a start() refused after a stop never reaches here.
-    this.eventGate?.admitOverdueWakeIntents();
 
     // Start periodic sync timer (if enabled)
     if (this.syncIntervalMs > 0) {
@@ -6065,6 +6062,19 @@ export class AgentFramework {
       // Do not make a restored queue wait a full interval before its first
       // attempt. MCPL/module initialization has completed before start().
       this.startQueuedMaintenance();
+    }
+
+    // Last, once the loop and the timers are up: arm the restored sleep and
+    // self-wakes still ahead, and serve those whose time passed while the
+    // host was down; the loop makes a wake's request a turn. A quiesced boot
+    // keeps them for its resume(); a start() refused after a stop never
+    // reaches here. A throw out of a wake's notice (a store write) is logged
+    // and leaves start() whole, with the sync and maintenance timers armed:
+    // the intent stays in the journal for the next start. (R5-3, R6-7)
+    try {
+      this.eventGate?.admitOverdueWakeIntents();
+    } catch (error) {
+      console.error('[gate] wake journal: admitting the restored wakes at start failed; they stay in the journal:', error);
     }
   }
 
@@ -9867,8 +9877,9 @@ export class AgentFramework {
       // Serving means the restored wakes are armed and the overdue served:
       // the first resume did that in its `finally`, and admission is safe to
       // repeat (a stopped host's gate ignores it), so a retry after a resume
-      // that threw holds no wake back either way.
-      this.eventGate?.admitOverdueWakeIntents();
+      // that threw holds no wake back either way. Only once start() ran: a
+      // resume() before it must not admit what start() hasn't (R5-3, R6-7).
+      if (this.running) this.eventGate?.admitOverdueWakeIntents();
       return this.getHostModeStatus();
     }
     // A surgery switches or forks the branch while it holds the store, and a
@@ -9968,7 +9979,7 @@ export class AgentFramework {
       // the future ones a quiesced boot restored get their timers. In
       // `finally` for the same reason: a record clear that throws (ENOSPC)
       // leaves the host serving, and serving means its wakes are armed.
-      if (!this.quiesced) this.eventGate?.admitOverdueWakeIntents();
+      if (!this.quiesced && this.running) this.eventGate?.admitOverdueWakeIntents();
 
       this.emitTrace({
         type: 'host:resume',
@@ -41323,7 +41334,7 @@ export class AgentFramework {
         success: true,
         data: {
           woke,
-          ...(durable === false ? { note: 'This wake could not be journaled: a host restart would resume the sleep until its deadline. Call wake again to retry.' } : {}),
+          ...(durable === false ? { note: 'This wake could not be journaled: a host restart would resume the sleep until its deadline. If the journal is only out of reach for the moment, calling wake again retries; a host that could not read its journal at start writes none until it restarts.' } : {}),
         },
       });
       return;

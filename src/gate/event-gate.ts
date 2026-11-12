@@ -241,6 +241,36 @@ interface PersistedWakeIntent {
   note?: string;
 }
 
+/** The largest time a Date holds, and so the journal reader takes: a wake
+ *  set past it is clamped here, so what's set is what's journaled. */
+const MAX_WAKE_AT = 8.64e15;
+function clampWakeAt(at: number): number {
+  return Number.isFinite(at) ? Math.min(at, MAX_WAKE_AT) : MAX_WAKE_AT;
+}
+
+/** Syncs the journal's directory after a rename, so the entry reaches the
+ *  disk, as the framework's syncRecoveryDirectory does for the host-mode
+ *  record: win32 is left out, and so is a sync refused with EINVAL or EBADF,
+ *  the answer where the filesystem can't sync a directory. Any other failure
+ *  is logged; the rename itself held, so the write still counts as durable
+ *  against a crash. (R6-3) */
+function syncWakeJournalDirectory(directory: string, journal: string): void {
+  if (process.platform === 'win32') return;
+  try {
+    const fd = openSync(directory, 'r');
+    try {
+      fsyncSync(fd);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EINVAL' && code !== 'EBADF') throw err;
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    console.error(`[gate] wake journal: ${journal}'s directory could not be synced after the write (${errorText(err)}); the journal is on disk, but a power loss before the directory syncs on its own could lose it`);
+  }
+}
+
 /** The wake journal's shape (EventGate.wakeJournalPath). */
 interface PersistedWakeState {
   version: 1;
@@ -251,7 +281,7 @@ interface PersistedWakeState {
 function validWakeIntent(value: unknown, allowAnonymous: boolean): value is PersistedWakeIntent {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
-  const validTime = (t: unknown): t is number => typeof t === 'number' && Number.isFinite(t) && Math.abs(t) <= 8.64e15;
+  const validTime = (t: unknown): t is number => typeof t === 'number' && Number.isFinite(t) && Math.abs(t) <= MAX_WAKE_AT;
   return (allowAnonymous ? v.agentName === undefined || typeof v.agentName === 'string' : typeof v.agentName === 'string')
     && validTime(v.armedAt)
     && validTime(v.wakeAt)
@@ -2417,9 +2447,13 @@ export class EventGate {
    *  process writes no journal, answering `durable: false`, rather than
    *  overwrite wakes it couldn't read. */
   private wakeJournalReadFailed = false;
-  // From stopWakeTimers() on (the host's stop(), before it closes its queue),
-  // no wake timer fires or is armed: a wake due in the stop's own gap would
-  // be requested of a queue about to close, and lost. The intents stay.
+  /** Restore dropped an absent agent's intents in memory; the journal still
+   *  holds them until the first admission writes it (R6-4). */
+  private wakeJournalStale = false;
+  // From stopWakeTimers() on (the host's stop(), in its first steps), no wake
+  // timer fires or is armed: a wake firing during the stop would queue a
+  // request in pendingRequests, which the stop never serves, and leave the
+  // journal, lost to the restart. The intents stay. (R4-1, R6-5)
   private wakeTimersStopped = false;
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
@@ -4808,7 +4842,10 @@ export class EventGate {
   setSleep(seconds: number, note?: string, agentName?: string): { until: number; durable: boolean } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     this.sleepArmedAt = this.now();
-    this.sleepUntil = this.sleepArmedAt + ms;
+    // Clamped to the largest Date (8.64e15 ms), the journal reader's bound:
+    // a deadline past it can't be journaled (R5-9) or formatted, and a sleep
+    // of ~285,000 years ends no sooner for the clamp. (R6-6)
+    this.sleepUntil = clampWakeAt(this.sleepArmedAt + ms);
     this.sleepNote = note;
     this.sleepAgent = agentName;
     this.sleepSuppressed = 0;
@@ -4875,7 +4912,7 @@ export class EventGate {
     // (admitOverdueWakeIntents).
     if (this.disposed) return { inMs: ms, armed: false, durable: false };
     const armedAt = this.now();
-    this.selfWakeDue.set(agentName, { at: armedAt + ms, source, armedAt });
+    this.selfWakeDue.set(agentName, { at: clampWakeAt(armedAt + ms), source, armedAt });
     this.armSelfWakeTimer(agentName);
     const durable = this.tryPersistWakeState('setting a self-wake');
     this.emitTrace({
@@ -5064,6 +5101,12 @@ export class EventGate {
       console.error(`[gate] wake journal: ${state.sleep ? `a sleep until ${new Date(state.sleep.wakeAt).toISOString()}` : 'no sleep'}`
         + `, ${n} self-wake${n === 1 ? '' : 's'} restored`);
     }
+    // An absent agent's sleep or self-wake is dropped here, in memory, so a
+    // restored sleep of a renamed agent mutes nothing between this restore
+    // and the start's admission (inbound MCPL traffic is gated from create()
+    // on). The journal is written at admission, as restore writes nothing.
+    // (R6-4)
+    if (this.dropWakeIntentsOfAbsentAgents()) this.wakeJournalStale = true;
   }
 
   /**
@@ -5078,7 +5121,13 @@ export class EventGate {
    */
   admitOverdueWakeIntents(): void {
     if (this.disposed || this.wakeTimersStopped || this.quiesced) return;
-    this.dropWakeIntentsOfAbsentAgents();
+    // Restore dropped an absent agent's intents in memory (R6-4); the first
+    // admission writes the journal without them. A rename after restore
+    // (agentGone) has its own path, so this finds nothing more.
+    if (this.dropWakeIntentsOfAbsentAgents() || this.wakeJournalStale) {
+      this.wakeJournalStale = false;
+      this.tryPersistWakeState('dropping wakes of absent agents');
+    }
     const now = this.now();
     if (this.sleepUntil > 0) {
       if (this.sleepUntil > now) {
@@ -5107,7 +5156,7 @@ export class EventGate {
    * wake a name that no longer exists. The check is against the framework's
    * agents, not the gate's recipients: a non-recipient agent may sleep too.
    */
-  private dropWakeIntentsOfAbsentAgents(): void {
+  private dropWakeIntentsOfAbsentAgents(): boolean {
     let changed = false;
     if (this.sleepUntil > 0 && this.sleepAgent !== undefined && !this.hasAgentFn(this.sleepAgent)) {
       console.error(`[gate] wake journal: ending the restored sleep of "${this.sleepAgent}", an agent this host doesn't have`);
@@ -5126,7 +5175,7 @@ export class EventGate {
       this.selfWakeDue.delete(agentName);
       changed = true;
     }
-    if (changed) this.tryPersistWakeState('dropping wakes of absent agents');
+    return changed;
   }
 
   /**
@@ -5230,10 +5279,12 @@ export class EventGate {
       }
     }
     mkdirSync(dirname(this.wakeStatePath), { recursive: true });
-    // A name of this writer's own, and the bytes on disk before the rename:
-    // a `durable: true` answered to the agent means the journal survives a
-    // power loss, not only a crash. A write that fails takes its temp file
-    // with it, so ENOSPC doesn't leave one per attempt beside the config.
+    // A name of this writer's own, the bytes on disk before the rename, and
+    // the directory entry synced after it, as the framework's host-mode
+    // record is written: a `durable: true` answered to the agent means the
+    // journal survives a power loss, not only a crash, where the filesystem
+    // syncs a directory (R6-3). A write that fails takes its temp file with
+    // it, so ENOSPC doesn't leave one per attempt beside the config.
     const tmp = `${this.wakeStatePath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
     const fd = openSync(tmp, 'w', 0o600);
     try {
@@ -5248,6 +5299,7 @@ export class EventGate {
       try { unlinkSync(tmp); } catch { /* already gone, or the same disk fault */ }
       throw error;
     }
+    syncWakeJournalDirectory(dirname(this.wakeStatePath), this.wakeStatePath);
   }
 
   /** persistWakeState, with a failure logged (once per action) rather than
