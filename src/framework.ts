@@ -22845,13 +22845,15 @@ export class AgentFramework {
   };
 
   private static readonly HOLD_CLAIM_TEXT: Record<HoldClaim, string> = {
-    'from-round': ', from this round on, is held as drafts until a new message reaches you or this turn ends,',
-    turn: ' this turn is held as drafts until this turn ends,',
+    'from-round': ", from this round until a new message reaches you or this turn ends, isn't sent: it's kept as drafts you can resend, " +
+      'except speech a round keeps private, as one with skip_reply or a private think does.',
+    turn: " this turn isn't sent: it's kept as drafts you can resend, except speech a round keeps private, as one with skip_reply does; " +
+      'a skip_reply that ends the turn keeps all of it private.',
   };
 
   private sendHoldLine(reach: SendReach, claim: HoldClaim): string | undefined {
     if (reach.kind === 'nowhere') return undefined;
-    const held = `${AgentFramework.HOLD_CLAIM_TEXT[claim]} except in a round that keeps its speech private.`;
+    const held = AgentFramework.HOLD_CLAIM_TEXT[claim];
     if (reach.kind === 'channel') return `Your plain speech to ${this.channelShown(reach.to)}${held}`;
     if (reach.why === 'no-answer') return undefined;
     return `The framework can't tell ${reach.why === 'error' ? 'whether or where' : 'where'} this posted (${AgentFramework.UNKNOWN_REACH_TEXT[reach.why]}), ` +
@@ -22860,14 +22862,16 @@ export class AgentFramework {
 
   private static withHoldLine(result: ToolResult, line: string): void {
     const data = result.data;
-    const noData = data === undefined || data === null;
+    const noData = data === undefined || data === null || data === '';
+    const tagged = `[${NOTICE_TAG.routing}] ${line}`;
     if (result.isError || (noData && typeof result.error === 'string' && result.error !== '')) {
-      result.error = result.error ? `${result.error}\n${line}` : line;
+      result.error = result.error ? `${result.error}\n\n${tagged}` : line;
     } else if (noData) result.data = line;
-    else if (typeof data === 'string' || typeof data === 'number' || typeof data === 'boolean') result.data = `${data}\n${line}`;
+    else if (typeof data === 'string' || typeof data === 'number' || typeof data === 'boolean') result.data = `${data}\n\n${tagged}`;
     else if (Array.isArray(data)) {
-      if (isContentArray(data, result.dataIsContent)) result.data = [...data, { type: 'text', text: line }];
-    } else if (typeof data === 'object') result.data = { ...data, routing: line };
+      if (isContentArray(data, result.dataIsContent)) result.data = [...data, { type: 'text', text: tagged }];
+      else result.data = [...data, tagged];
+    } else if (typeof data === 'object') result.data = { routing: line, ...data };
   }
 
   private sendHoldText(hold: SendHold, target: ChannelRef | null, when: number | 'end' | 'turn'): string {
@@ -23783,10 +23787,15 @@ export class AgentFramework {
     // settleTurnDrafts records each one as noticed, and no later catch-up
     // names one the text left out.
     const idList = (ds: Draft[]): string => ds.map((d) => d.id).join(', ');
+    const byReason = (ds: Draft[]): string => {
+      const groups = new Map<DraftReason, Draft[]>();
+      for (const d of ds) groups.set(d.reason, [...(groups.get(d.reason) ?? []), d]);
+      return [...groups].map(([reason, group]) => `${idList(group)} (${AgentFramework.DRAFT_REASON_SHORT[reason]})`).join('; ');
+    };
     const held = inState('held');
     if (held.length > 0) {
       notes.push(
-        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${held.map((d) => `${d.id} (${AgentFramework.DRAFT_REASON_SHORT[d.reason]})`).join(', ')} ` +
+        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${byReason(held)} ` +
         '(not sent — drafts can resend them unchanged, or dismiss them)',
       );
     }
@@ -28966,6 +28975,7 @@ export class AgentFramework {
               // it waits, one whose code names no routing tool included.
               const sends = new Map<string, SendReach | undefined>(sendCallIds.map((id) => [id, undefined]));
               const claim = holdClaimOf(roundCalls, liveProseRouting);
+              const lined = new Set<string>();
               const answered = (): RoundCall[] => [
                 ...roundCalls.map((c, i) => (sends.has(calls[i]!.id) ? { ...c, reach: sends.get(calls[i]!.id) } : c)),
                 ...[...round.scripts.values()].flat(),
@@ -28982,7 +28992,14 @@ export class AgentFramework {
                 scriptsReturned: () => {
                   if (waits()) decidable = true;
                 },
-                holdLine: (reach) => (silence === 'private' || !claim ? undefined : this.sendHoldLine(reach, claim)),
+                holdLine: (reach) => {
+                  if (silence === 'private' || !claim) return undefined;
+                  const place = reach.kind === 'channel' ? destinationKey(reach.to) : reach.kind;
+                  if (lined.has(place)) return undefined;
+                  const line = this.sendHoldLine(reach, claim);
+                  if (line) lined.add(place);
+                  return line;
+                },
                 route: () => {
                   // Only while this stream still owns the agent and waits on
                   // the round: a turn replaced, reset or cancelled meanwhile
