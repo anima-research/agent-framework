@@ -11,6 +11,7 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
+import { mergeRefusalOrigins } from '../main-refusal-origin.js';
 import { NOTICE_TAG } from '../notice-tags.js';
 import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-text.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -4264,7 +4265,12 @@ export class EventGate {
     // channel last saw any traffic. Ambient-only batches set no locus, and
     // name the channels they came from (`batchChannels`).
     const chosen = wakeProvenance(events);
-    const provenance: MarkedProvenance = { ...chosen, ...(writes ? { writes } : {}), [BATCH_LINE_ROWS]: lineRows };
+    const provenance: MarkedProvenance = {
+      ...chosen,
+      // Refusal origin merges EVERY admitted cause, never the speech winner.
+      ...mergeRefusalOrigins(events.map(e => e.after ?? {})),
+      ...(writes ? { writes } : {}), [BATCH_LINE_ROWS]: lineRows,
+    };
     for (const agentName of woken) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
       woke?.push(agentName);

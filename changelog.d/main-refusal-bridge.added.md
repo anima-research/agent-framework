@@ -1,0 +1,1 @@
+- Add an optional local main-final-refusal bridge with frozen trusted admission origins and explicit whole-framework reaction ownership. Omitted ownership retains legacy Discord reactions; unknown/ambiguous origins never receive a host-driver reaction. No dependency or version bump.

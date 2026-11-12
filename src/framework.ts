@@ -1,3 +1,5 @@
+import type { MainRefusal, MainRefusalOrigin, MainRefusalHandler, MainRefusalBridge } from './main-refusal.js';
+import { admittedRefusalOrigin, refusalOriginMark, refusalOriginOf, mergeRefusalOrigins } from './main-refusal-origin.js';
 import { isReasoningLoss } from './reasoning-loss.js';
 export { residentViewFilter, subconsciousViewFilter } from './context-options.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
@@ -162,7 +164,7 @@ import type {
   PolicyEpoch,
   RegistrySnapshot,
 } from './dendrite/index.js';
-import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, readInboundSource, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, suppliedValue } from './supplied-text.js';
 import { NOTICE_TAG } from './notice-tags.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
@@ -1470,6 +1472,8 @@ interface TurnRouting {
    * from another's.
    */
   turnId: number;
+  /** Admission snapshot; never follows the mutable speech locus. */
+  refusalOrigin?: MainRefusalOrigin;
   /**
    * The channel whose message triggered the turn (item-3 redux), which the
    * locus is resolved from when the turn opens, and which the channel
@@ -4459,6 +4463,45 @@ export class AgentFramework {
    *  seam, unset here: the receipt work (shelf-354) assigns it inside the
    *  framework, and tests set it by cast. */
   private inboundAcceptanceObserver?: InboundAcceptanceObserver;
+  private mainRefusalHandler?: MainRefusalHandler;
+  private readonly refusalInstances = new WeakMap<object, string>();
+
+  /** Explicit whole-framework handover; never inferred from one server config. */
+  getMainRefusalBridge(): MainRefusalBridge {
+    return {
+      version: 1,
+      takeOwnership: (handler) => {
+        if (this.mainRefusalHandler) throw new Error('Main refusal reactions already have a host owner');
+        this.mainRefusalHandler = handler;
+        return () => { if (this.mainRefusalHandler === handler) this.mainRefusalHandler = undefined; };
+      },
+      isCurrent: (refusal) => {
+        const agent = this.agents.get(refusal.agentName);
+        return agent !== undefined && this.refusalInstances.get(agent) === refusal.agentInstanceId;
+      },
+      serverBinding: (id) => this.mcplServerConfigs.has(id) ? this.coalescingBinding(id) : undefined,
+      serverEpoch: (id) => {
+        const config = this.mcplServerConfigs.get(id);
+        const connection = this.modernServers().get(id) ?? this.mcplServerRegistry?.getServer(id);
+        return config && connection ? `${this.refusalInstance(config)}:${this.refusalInstance(connection)}` : undefined;
+      },
+    };
+  }
+
+  private refusalInstance(agent: object): string {
+    let id = this.refusalInstances.get(agent);
+    if (!id) { id = randomUUID(); this.refusalInstances.set(agent, id); }
+    return id;
+  }
+
+  private async dispatchMainRefusal(refusal: MainRefusal): Promise<void> {
+    if (!this.mainRefusalHandler) {
+      if (refusal.rewind === 'unhandled') await this.reactToRefusal(refusal.agentName, refusal.category);
+      return;
+    }
+    try { await this.mainRefusalHandler(refusal); }
+    catch { console.error('[inference-refusal] host handler failed; no retry or legacy fallback'); }
+  }
   // The framework ends a stream at a tool boundary from handleProcessEvent:
   // an endTurn result, or a context-budget or physical-window restart. Each
   // live stream registers here how to record that end (its usage, its log
@@ -5729,6 +5772,7 @@ export class AgentFramework {
         },
         requestInference: (agentName, reason, source, provenance, after) => {
           const request: MarkedRequest = {
+            ...refusalOriginMark(refusalOriginOf(provenance)),
             agentName, reason, source, timestamp: Date.now(),
             ...(provenance?.writes ? framework.readsRowsFor(provenance.writes, agentName) : framework.readsRowFor(after, agentName)),
             // The rows the batch's line can name, on every agent's wake: each
@@ -20504,6 +20548,9 @@ export class AgentFramework {
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
+    if (!decision.held && !decision.suppressed && event.triggerInference !== false) {
+      Object.assign(placement, admittedRefusalOrigin(source, event.tags, event.firstView));
+    }
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
       // (cadence tally, suppressed-mention ack, reader wake) follows.
@@ -20548,6 +20595,7 @@ export class AgentFramework {
         if (decision.wake) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
+            ...admittedRefusalOrigin(source, event.tags, event.firstView),
             channelId: event.channelId, channelServerId: event.serverId,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
             addressed,
@@ -20629,6 +20677,7 @@ export class AgentFramework {
         if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
           agentName,
+          ...admittedRefusalOrigin(source, event.tags, event.firstView),
           reason: 'mcpl:channel-incoming',
           source: event.serverId,
           timestamp: Date.now(),
@@ -20755,6 +20804,7 @@ export class AgentFramework {
     if (trigger) {
       this.pendingRequests.push({
         agentName: agent.name,
+        ...admittedRefusalOrigin(readInboundSource(messageMetadata), event.tags, messageMetadata.firstView === true),
         reason: 'mcpl:channel-incoming',
         source: event.serverId,
         timestamp: Date.now(),
@@ -22575,6 +22625,9 @@ export class AgentFramework {
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
+    if (!silentHeartbeat && !decision.held && !decision.suppressed && event.triggerInference !== false) {
+      Object.assign(placement, admittedRefusalOrigin(source, event.tags, event.firstView));
+    }
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
       this.tuneOutCoordinator?.recordHeld(
@@ -22610,6 +22663,7 @@ export class AgentFramework {
       for (const agentName of decision.recipients) {
         this.pendingRequests.push({
           agentName,
+          ...(!silentHeartbeat ? admittedRefusalOrigin(source, event.tags, event.firstView) : {}),
           reason: 'mcpl:push-event',
           source: event.serverId,
           timestamp: Date.now(),
@@ -23234,6 +23288,7 @@ export class AgentFramework {
       const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
       const merged: MarkedRequest = {
         ...trigger,
+        ...mergeRefusalOrigins(requests),
         coalescingBatch: batchOnly || undefined,
         coalescingBatchSubjects: batchOnly
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
@@ -28178,6 +28233,7 @@ export class AgentFramework {
       }
     }
     if (opensTurn) {
+      routing.refusalOrigin = refusalOriginOf(trigger);
       const head = agent.branchHead();
       if (head && !routing.start) routing.start = head;
       const triggerRows = wakeRows(this.activeTurnTriggers.get(agent.name));
@@ -30155,6 +30211,11 @@ export class AgentFramework {
               return;
             }
 
+            const refusalContext = Object.freeze({
+              agentName: agent.name, agentInstanceId: this.refusalInstance(agent),
+              turnId: streamRouting.turnId, origin: streamRouting.refusalOrigin,
+            });
+
             // Reset agent state before emitting inference:completed. Traces are
             // observability-only, but external synchronous listeners should
             // still see the terminal state at the terminal trace boundary.
@@ -30233,6 +30294,7 @@ export class AgentFramework {
                 this.pendingRequests.push({
                   agentName: agent.name,
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
+                  ...refusalOriginMark(streamRouting.refusalOrigin),
                   source: 'framework',
                   timestamp: Date.now(),
                   ...this.wakeChannelsMark(streamRouting),
@@ -30282,8 +30344,11 @@ export class AgentFramework {
               // is suppressed at the surface via
               // DISCORD_SUPPRESSED_REACTIONS_BASELINE; without that, marking a
               // refusal feeds the next one.)
-              if (!handledByRewind) {
-                void this.reactToRefusal(agent.name, category);
+              // Ephemeral/subagent runs retain legacy no-reaction parity.
+              if (this.usedEphemeralAgentNames.get(agent.name) !== 'run') {
+                void this.dispatchMainRefusal(Object.freeze({
+                  ...refusalContext, category, rewind: handledByRewind ? 'handled' : 'unhandled',
+                }));
               }
             } else {
               this.endRefusalEpisode(agent.name);
