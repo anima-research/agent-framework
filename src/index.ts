@@ -225,3 +225,5 @@ export {
   type SilentHeartbeatStamp,
   type SilentHeartbeatTick,
 } from './silent-heartbeat.js';
+
+export type { MainRefusal, MainRefusalOrigin, MainRefusalHandler, MainRefusalBridge } from './main-refusal.js';
