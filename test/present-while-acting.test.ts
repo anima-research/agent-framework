@@ -2412,7 +2412,7 @@ describe('present while acting', () => {
       .proseDrafts.open('assistant').reverse();
     assert.deepEqual(drafts.map((d) => d.text), ['the reply that silencing will eat', 'trailing prose, also suppressed (sticky)']);
     assert.deepEqual(receipts, [
-      `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => `${d.id} (explicit send in its turn)`).join(', ')} ` +
+      `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} (explicit send in its turn) ` +
         '(not sent — drafts can resend them unchanged, or dismiss them)',
     ]);
 
@@ -2457,7 +2457,7 @@ describe('present while acting', () => {
         .proseDrafts.open('assistant').reverse();
       assert.deepEqual(drafts.map((d) => d.text), ['adjacent prose that must NOT auto-publish', 'trailing prose, also suppressed (sticky)']);
       assert.deepEqual(receipts, [
-        `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => `${d.id} (explicit send in its turn)`).join(', ')} ` +
+        `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} (explicit send in its turn) ` +
           '(not sent — drafts can resend them unchanged, or dismiss them)',
       ], `${verb}: suppression is visible in the receipt`);
 

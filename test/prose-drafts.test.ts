@@ -408,7 +408,7 @@ function onSecondStream(membrane: MockMembrane, response: NormalizedResponse): v
 }
 
 async function harness(opts: {
-  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
+  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'locked' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
   xml?: boolean;
   roundPreamble?: boolean;
   retries?: number;
@@ -608,7 +608,7 @@ describe('held prose drafts, end to end', () => {
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
-      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.map((id) => `${id} (explicit send in its turn)`).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
+      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (explicit send in its turn) (not sent — drafts can resend them unchanged, or dismiss them)`);
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
@@ -682,7 +682,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
       assert.equal(
         h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => `${d.id} (explicit send in its turn)`).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (explicit send in its turn) (not sent — drafts can resend them unchanged, or dismiss them)`,
       );
     } finally {
       await h.close();
@@ -4855,8 +4855,8 @@ describe('the held-draft notice written mid-turn', () => {
 
 describe("an explicit send's result says what it holds", () => {
   const PLACE = `#room \\(Guild One\\) \\(${ROOM}\\)`;
-  const FROM_ROUND = ', from this round on, is held as drafts until a new message reaches you or this turn ends, except in a round that keeps its speech private\\.';
-  const TURN = ' this turn is held as drafts until this turn ends, except in a round that keeps its speech private\\.';
+  const FROM_ROUND = ", from this round until a new message reaches you or this turn ends, isn't sent: it's kept as drafts you can resend, except speech a round keeps private, as one with skip_reply or a private think does\\.";
+  const TURN = " this turn isn't sent: it's kept as drafts you can resend, except speech a round keeps private, as one with skip_reply does; a skip_reply that ends the turn keeps all of it private\\.";
   const resultOf = (h: Awaited<ReturnType<typeof harness>>, id: string): string => {
     const block = h.messages().flatMap((m) => m.content)
       .find((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === id) as { content?: unknown } | undefined;
@@ -4867,14 +4867,14 @@ describe("an explicit send's result says what it holds", () => {
     return JSON.stringify(content);
   };
 
-  it('native: a send to a place says the plain speech there, from this round on, is held until a new message or the turn ends, after its own answer\'s fields', async () => {
+  it('native: a send to a place says the plain speech there, from this round until a new message or the turn ends, is kept as drafts, ahead of its own answer\'s fields', async () => {
     const h = await harness();
     try {
       await h.turn([createMockResponse([text('sent it.'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
       assert.equal(h.drafts()[0]?.text, 'sent it.', 'premise: the line beside the send is held');
       const answer = JSON.parse(resultOf(h, 's1')) as Record<string, unknown>;
       assert.match(String(answer.routing), new RegExp(`^Your plain speech to ${PLACE}${FROM_ROUND}$`));
-      assert.ok(Object.keys(answer).length > 1 && Object.keys(answer).at(-1) === 'routing', `the publish's own answer keeps its fields, and the line follows them: ${Object.keys(answer).join(', ')}`);
+      assert.ok(Object.keys(answer).length > 1 && Object.keys(answer)[0] === 'routing', `the publish's own answer keeps its fields, and the line comes first, as channel_open's does: ${Object.keys(answer).join(', ')}`);
     } finally {
       await h.close();
     }
@@ -4889,6 +4889,76 @@ describe("an explicit send's result says what it holds", () => {
       ]);
       assert.equal(h.drafts().length, 2, 'premise: both rounds\' speech is held');
       assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE}${TURN}`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML: a send, then skip_reply in a later round, keeps the whole turn private, as the line says", async () => {
+    const h = await harness({ xml: true });
+    try {
+      const skip = call('k1', 'skip_reply', {});
+      const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+      await h.turn([
+        createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('Signing off.'), skip], 'tool_use'),
+        { ...createMockResponse([text('Beside the send.'), explicitSend('s1'), done('s1'), text('Signing off.'), skip, done('k1')]), toolCalls: [] },
+      ]);
+      assert.deepEqual(h.drafts(), [], 'premise: an accepted skip_reply anywhere in an XML turn keeps all its speech private');
+      assert.match(resultOf(h, 's1'), new RegExp(`Your plain speech to ${PLACE}${TURN}`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('hybrid: a send beside an envelope to its place says that place\'s plain speech is kept as drafts, and holds it', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text(`>>>${ROOM} Beside words.`), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Beside words.', 'explicit-send']], 'premise: the envelope beside the send is held');
+      const answer = JSON.parse(resultOf(h, 's1')) as Record<string, unknown>;
+      assert.match(String(answer.routing), new RegExp(`^Your plain speech to ${PLACE}${FROM_ROUND}$`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('locked: a send says its place\'s plain speech is kept as drafts', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'locked' }] });
+    try {
+      await h.turn([createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'premise: only the send went out');
+      const answer = JSON.parse(resultOf(h, 's1')) as Record<string, unknown>;
+      assert.match(String(answer.routing), new RegExp(`^Your plain speech to ${PLACE}${FROM_ROUND}$`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a send whose answer names a channel the framework doesn't know says why it can't tell where", async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('delivered', 'discord:g1:nowhere');
+    try {
+      await h.turn([createMockResponse([text('done, messaged them.'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
+      assert.equal(h.drafts()[0]?.text, 'done, messaged them.', 'premise: the line is held');
+      assert.match(resultOf(h, 's1'), new RegExp(`\\[routing\\] The framework can't tell where this posted \\(its answer named a channel the framework couldn't match to one it knows\\), so your plain speech anywhere${FROM_ROUND}$`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a second send to the same place in one round adds no second line; a send in a later round adds its own', async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('sent both.'), explicitSend('s1'), explicitSend('s2')], 'tool_use'),
+        createMockResponse([text('and one more.'), explicitSend('s3')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.equal(h.publishes().filter((p) => p.text === 'an explicit note').length, 3, 'premise: all three sends went out');
+      assert.match(String((JSON.parse(resultOf(h, 's1')) as Record<string, unknown>).routing), new RegExp(`^Your plain speech to ${PLACE}${FROM_ROUND}$`));
+      assert.equal((JSON.parse(resultOf(h, 's2')) as Record<string, unknown>).routing, undefined, 'the same place, the same round: no second line');
+      assert.match(String((JSON.parse(resultOf(h, 's3')) as Record<string, unknown>).routing), new RegExp(`^Your plain speech to ${PLACE}${FROM_ROUND}$`), 'a later round: its own line');
     } finally {
       await h.close();
     }
@@ -4917,7 +4987,7 @@ describe("an explicit send's result says what it holds", () => {
     try {
       await h.turn([createMockResponse([text('done, messaged them.'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
       assert.equal(h.drafts()[0]?.text, 'done, messaged them.', 'premise: the line is held');
-      assert.match(resultOf(h, 's1'), new RegExp(`^sent\\nThe framework can't tell where this posted \\(its answer named no channel the framework reads\\), so your plain speech anywhere${FROM_ROUND}$`), "the line follows the send's own answer");
+      assert.match(resultOf(h, 's1'), new RegExp(`^sent\\n\\n\\[routing\\] The framework can't tell where this posted \\(its answer named no channel the framework reads\\), so your plain speech anywhere${FROM_ROUND}$`), "the line follows the send's own answer");
     } finally {
       await h.close();
     }
@@ -4929,7 +4999,7 @@ describe("an explicit send's result says what it holds", () => {
     try {
       await h.turn([createMockResponse([text('done, messaged them.'), unplacedSend('s1')], 'tool_use'), createMockResponse([])]);
       assert.equal(h.drafts()[0]?.text, 'done, messaged them.', 'premise: the line is held');
-      assert.match(resultOf(h, 's1'), /Discord refused part 2\. Attempted destination: \S+\nThe framework can't tell whether or where this posted \(it answered with an error\), so your plain speech anywhere, from this round on, is held as drafts until a new message reaches you or this turn ends, except in a round that keeps its speech private\./);
+      assert.match(resultOf(h, 's1'), new RegExp(`Discord refused part 2\\. Attempted destination: \\S+\\n\\n\\[routing\\] The framework can't tell whether or where this posted \\(it answered with an error\\), so your plain speech anywhere${FROM_ROUND}`));
     } finally {
       await h.close();
     }
@@ -4990,7 +5060,7 @@ describe("an explicit send's result says what it holds", () => {
       assert.ok(held, 'premise: a draft is held');
       await h.turn([createMockResponse([text('resending it now'), drafts('r1', { action: 'resend', draftIds: [held!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
       assert.ok(!h.drafts().some((d) => d.text === 'resending it now'), "premise: a resend with no other send keeps its round's narration, holding none");
-      assert.match(resultOf(h, 'r1'), new RegExp(`^${held!.id}: delivered to ${PLACE}, message \\S+\\.\\nYour plain speech to ${PLACE}${FROM_ROUND}$`), "the resend's own answer, then the line");
+      assert.match(resultOf(h, 'r1'), new RegExp(`^${held!.id}: delivered to ${PLACE}, message \\S+\\.\\n\\[routing\\] Your plain speech to ${PLACE}${FROM_ROUND}$`), "the resend's own text block, then the line as a tagged block of its own");
     } finally {
       await h.close();
     }
@@ -5108,18 +5178,19 @@ describe("an explicit send's result says what it holds", () => {
       const h = await harness({ modules: [new SayModule({ success: false, isError: true, error: 'delivery uncertain', data: 'details' })] });
       try {
         await h.turn([createMockResponse([text('said it.'), say('s1')], 'tool_use'), createMockResponse([])]);
-        assert.match(resultOf(h, 's1'), new RegExp(`^delivery uncertain\\nThe framework can't tell whether or where this posted \\(it answered with an error\\), ${ANYWHERE}$`));
+        assert.match(resultOf(h, 's1'), new RegExp(`^delivery uncertain\\n\\n\\[routing\\] The framework can't tell whether or where this posted \\(it answered with an error\\), ${ANYWHERE}$`));
       } finally {
         await h.close();
       }
     });
 
-    it('an answer of null, a number or a boolean takes the line where it is read', async () => {
+    it('an answer of null, an empty string, a number or a boolean takes the line where it is read', async () => {
       const cases: Array<[ToolResult, string]> = [
         [{ success: true, data: null }, ''],
-        [{ success: true, data: 42 }, '42\\n'],
-        [{ success: true, data: true }, 'true\\n'],
-        [{ success: true, data: null, error: 'delivery uncertain' }, 'delivery uncertain\\n'],
+        [{ success: true, data: 42 }, '42\\n\\n\\[routing\\] '],
+        [{ success: true, data: true }, 'true\\n\\n\\[routing\\] '],
+        [{ success: true, data: null, error: 'delivery uncertain' }, 'delivery uncertain\\n\\n\\[routing\\] '],
+        [{ success: true, data: '' }, ''],
       ];
       for (const [answer, before] of cases) {
         const h = await harness({ modules: [new SayModule(answer)] });
@@ -5133,13 +5204,40 @@ describe("an explicit send's result says what it holds", () => {
       }
     });
 
-    it("an array of records that isn't content gains no record of the line", async () => {
+    it("an object answer takes the line first, as channel_open's does, and its own routing field wins", async () => {
+      for (const [data, own] of [[{ ok: true }, undefined], [{ ok: true, routing: 'module own routing' }, 'module own routing']] as const) {
+        const h = await harness({ modules: [new SayModule({ success: true, data: { ...data } })] });
+        try {
+          await h.turn([createMockResponse([text('said it.'), say('s1')], 'tool_use'), createMockResponse([])]);
+          const answer = JSON.parse(resultOf(h, 's1')) as Record<string, unknown>;
+          assert.deepEqual(Object.keys(answer), ['routing', 'ok'], `the line's field comes first (${JSON.stringify(data)})`);
+          if (own) assert.equal(answer.routing, own, "the module's own routing field wins");
+          else assert.match(String(answer.routing), new RegExp(`^The framework can't tell where this posted \\(its answer named no channel the framework reads\\), ${ANYWHERE}$`));
+        } finally {
+          await h.close();
+        }
+      }
+    });
+
+    it('a content answer gains the line as a tagged text block after its own', async () => {
+      const h = await harness({ modules: [new SayModule({ success: true, data: [{ type: 'text', text: 'sent' }], dataIsContent: true })] });
+      try {
+        await h.turn([createMockResponse([text('said it.'), say('s1')], 'tool_use'), createMockResponse([])]);
+        assert.match(resultOf(h, 's1'), new RegExp(`^sent\\n\\[routing\\] The framework can't tell where this posted \\(its answer named no channel the framework reads\\), ${ANYWHERE}$`));
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("an array of records that isn't content gains the line as one more element, tagged, after its records", async () => {
       const h = await harness({ modules: [new SayModule({ success: true, data: [{ messageId: '123' }] })] });
       try {
         await h.turn([createMockResponse([text('said it.'), say('s1')], 'tool_use'), createMockResponse([])]);
         assert.equal(h.drafts()[0]?.text, 'said it.', 'premise: the line beside the send is held');
-        assert.doesNotMatch(resultOf(h, 's1'), /plain speech|"type": ?"text"/);
-        assert.match(resultOf(h, 's1'), /"messageId": ?"123"/, "premise: the tool's own records are its result");
+        const answer = JSON.parse(resultOf(h, 's1')) as unknown[];
+        assert.deepEqual(answer[0], { messageId: '123' }, "the tool's own records come first, as it answered them");
+        assert.equal(answer.length, 2);
+        assert.match(String(answer[1]), new RegExp(`^\\[routing\\] The framework can't tell where this posted \\(its answer named no channel the framework reads\\), ${ANYWHERE}$`));
       } finally {
         await h.close();
       }
