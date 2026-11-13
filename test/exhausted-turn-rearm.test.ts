@@ -1037,16 +1037,40 @@ test("a turn ended by a throw outside its stream's failure handling ends its run
   const membrane = new ScriptedMembrane((n) => (n === 1 || n === 2 ? statedWait(250) : undefined));
   const r = await resident(t, membrane);
   const alerts = () => r.traces.filter((tr) => tr.type === 'ops:alert' && tr.kind === 'provider-wait');
-  const internal = r.fw as unknown as { recordTurnCheckpoint: (name: string) => void };
+  // The held call's retry records no checkpoint (#1013), so the throw comes
+  // from the head-move notice every start takes.
+  const internal = r.fw as unknown as { noticeHeadMoves: (agent: unknown) => void };
   r.say('zz-question');
   await waitFor(() => membrane.sends.length === 1 && r.admission().providerAdmission.heldRequests === 1, 'hold 1');
-  const record = internal.recordTurnCheckpoint;
-  internal.recordTurnCheckpoint = () => { internal.recordTurnCheckpoint = record; throw new Error('zz checkpoint fault'); };
+  const notice = internal.noticeHeadMoves;
+  internal.noticeHeadMoves = () => { internal.noticeHeadMoves = notice; throw new Error('zz head-move fault'); };
   t.mock.timers.tick(70 * 60_000);
-  await waitFor(() => r.admission().providerAdmission.heldRequests === 0 && internal.recordTurnCheckpoint === record, 'the retry to start and throw');
+  await waitFor(() => r.admission().providerAdmission.heldRequests === 0 && internal.noticeHeadMoves === notice, 'the retry to start and throw');
   r.say('zz-second');
   await waitFor(() => membrane.sends.length === 2 && r.admission().providerAdmission.heldRequests === 1, 'the next turn held');
   assert.equal(alerts().length, 0, "the next turn's run starts with it");
+});
+
+test("an undo after a held call's retry takes the whole turn back: the retry records no checkpoint of its own (#1013)", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n === 1 ? statedWait(250) : undefined));
+  const r = await resident(t, membrane);
+  const cm = r.fw.getAgent('resident')!.getContextManager();
+  r.say('zz-question');
+  await waitFor(() => membrane.sends.length === 1 && r.admission().providerAdmission.heldRequests === 1, 'the first call held');
+  // The turn's first start has run and recorded its checkpoint (the message
+  // that woke it is before the checkpoint, as every turn's is); what the
+  // turn adds from here, through the retry, is what the undo takes back.
+  const before = cm.indexLength();
+  t.mock.timers.tick(70 * 60_000);
+  await waitFor(() => r.count('inference:completed') === 1, 'the retry to answer');
+  assert.equal(membrane.sends.length, 2, 'the retry was a second send');
+  assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 1, 'one logical turn, one checkpoint');
+  const added = cm.indexLength() - before;
+  assert.ok(added > 0, 'the turn added rows');
+  const undone = r.fw.undoLastTurn('resident');
+  assert.equal(undone.undone, true);
+  assert.equal(undone.window?.retracted, added, 'everything the turn added since its first start left the window');
+  assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 0);
 });
 
 test('a run whose latest hold ran past the hour, with no later hold to alert at, alerts when its turn ends', async (t) => {
