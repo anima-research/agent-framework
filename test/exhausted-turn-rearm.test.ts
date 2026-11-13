@@ -1055,17 +1055,21 @@ test("an undo after a held call's retry takes the whole turn back: the retry rec
   const membrane = new ScriptedMembrane((n) => (n === 1 ? statedWait(250) : undefined));
   const r = await resident(t, membrane);
   const cm = r.fw.getAgent('resident')!.getContextManager();
-  const before = cm.indexLength();
   r.say('zz-question');
   await waitFor(() => membrane.sends.length === 1 && r.admission().providerAdmission.heldRequests === 1, 'the first call held');
+  // The turn's first start has run and recorded its checkpoint (the message
+  // that woke it is before the checkpoint, as every turn's is); what the
+  // turn adds from here, through the retry, is what the undo takes back.
+  const before = cm.indexLength();
   t.mock.timers.tick(70 * 60_000);
   await waitFor(() => r.count('inference:completed') === 1, 'the retry to answer');
+  assert.equal(membrane.sends.length, 2, 'the retry was a second send');
   assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 1, 'one logical turn, one checkpoint');
   const added = cm.indexLength() - before;
   assert.ok(added > 0, 'the turn added rows');
   const undone = r.fw.undoLastTurn('resident');
   assert.equal(undone.undone, true);
-  assert.equal(undone.window?.retracted, added, 'the whole turn left the window, the message that started it included');
+  assert.equal(undone.window?.retracted, added, 'everything the turn added since its first start left the window');
   assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 0);
 });
 
