@@ -1813,17 +1813,19 @@ describe('present while acting', () => {
     feedStart(framework, 2, [{ type: 'text', text: 'A new turn.' }] as ContentBlock[]);
     const internals = framework as unknown as {
       openLogical: Map<string, unknown>;
-      recordTurnCheckpoint(agentName: string): void;
+      budgetWaitEnded(agent: unknown, trigger: unknown): boolean;
     };
 
     trigger(framework);
     await framework.runUntilIdle();
     assert.equal(internals.openLogical.has('assistant'), true, 'the held turn is open');
-    // The deferred compile's checkpoint fails before the start takes the turn.
-    const checkpoint = internals.recordTurnCheckpoint.bind(framework);
-    internals.recordTurnCheckpoint = () => { throw new Error('checkpoint failed'); };
-    await assert.rejects(release(framework), /checkpoint failed/);
-    internals.recordTurnCheckpoint = checkpoint;
+    // The retry records no checkpoint (#1013); the start fails at the budget
+    // wait's end, a step every attempt-0 start takes before it takes the
+    // turn's routing.
+    const budgetWaitEnded = internals.budgetWaitEnded.bind(framework);
+    internals.budgetWaitEnded = () => { throw new Error('budget wait failed'); };
+    await assert.rejects(release(framework), /budget wait failed/);
+    internals.budgetWaitEnded = budgetWaitEnded;
     trigger(framework);
     await framework.runUntilIdle();
 
