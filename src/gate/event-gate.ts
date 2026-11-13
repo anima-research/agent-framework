@@ -5304,10 +5304,12 @@ export class EventGate {
       skipped.add('sleep');
       delete state.sleep;
     }
-    state.selfWakes = state.selfWakes.filter((entry) => {
+    state.selfWakes = state.selfWakes.filter((entry: PersistedWakeIntent) => {
+      // Read before the guard: a failed type guard narrows `entry` to never.
+      const { agentName, wakeAt } = entry;
       if (validWakeIntent(entry, false)) return true;
-      console.error(`[gate] wake journal: the self-wake of "${entry.agentName}" (wakeAt ${entry.wakeAt}) is one the journal's reader would skip, so it is not written`);
-      skipped.add(`self-wake:${entry.agentName}`);
+      console.error(`[gate] wake journal: the self-wake of "${agentName}" (wakeAt ${wakeAt}) is one the journal's reader would skip, so it is not written`);
+      skipped.add(`self-wake:${agentName}`);
       return false;
     });
     mkdirSync(dirname(this.wakeStatePath), { recursive: true });
