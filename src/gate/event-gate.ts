@@ -256,18 +256,22 @@ function clampWakeAt(at: number): number {
  *  against a crash. (R6-3) */
 function syncWakeJournalDirectory(directory: string, journal: string): void {
   if (process.platform === 'win32') return;
-  try {
-    const fd = openSync(directory, 'r');
+  // The directory and its parent, as the framework's host-mode record is
+  // written: the directory's own entry is new when this write made it. (R7-4)
+  for (const path of [directory, dirname(directory)]) {
     try {
-      fsyncSync(fd);
+      const fd = openSync(path, 'r');
+      try {
+        fsyncSync(fd);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EINVAL' && code !== 'EBADF') throw err;
+      } finally {
+        closeSync(fd);
+      }
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'EINVAL' && code !== 'EBADF') throw err;
-    } finally {
-      closeSync(fd);
+      console.error(`[gate] wake journal: ${journal}'s directory ${path} could not be synced after the write (${errorText(err)}); the journal is on disk, but a power loss before the directory syncs on its own could lose it`);
     }
-  } catch (err) {
-    console.error(`[gate] wake journal: ${journal}'s directory could not be synced after the write (${errorText(err)}); the journal is on disk, but a power loss before the directory syncs on its own could lose it`);
   }
 }
 
@@ -4846,7 +4850,10 @@ export class EventGate {
     // a deadline past it can't be journaled (R5-9) or formatted, and a sleep
     // of ~285,000 years ends no sooner for the clamp. (R6-6)
     this.sleepUntil = clampWakeAt(this.sleepArmedAt + ms);
-    this.sleepNote = note;
+    // Only a string is a note: the tool's schema says so, but a model can
+    // fill the optional field with null or a number, and the journal's
+    // reader takes a string or nothing. (R7-1)
+    this.sleepNote = typeof note === 'string' ? note : undefined;
     this.sleepAgent = agentName;
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
@@ -4855,7 +4862,7 @@ export class EventGate {
     // dispose(), after which nothing arms it. The timer goes first: a journal
     // write that fails must not leave a sleep set with nothing to end it.
     this.armSleepWake();
-    const durable = this.tryPersistWakeState('setting a sleep');
+    const durable = this.tryPersistWakeState('setting a sleep', 'sleep');
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -4914,7 +4921,7 @@ export class EventGate {
     const armedAt = this.now();
     this.selfWakeDue.set(agentName, { at: clampWakeAt(armedAt + ms), source, armedAt });
     this.armSelfWakeTimer(agentName);
-    const durable = this.tryPersistWakeState('setting a self-wake');
+    const durable = this.tryPersistWakeState('setting a self-wake', `self-wake:${agentName}`);
     this.emitTrace({
       type: 'gate:decision',
       eventType: 'selfwake:set',
@@ -4927,9 +4934,13 @@ export class EventGate {
 
   /**
    * Arm the timer for `agentName`'s intent in selfWakeDue, replacing a
-   * pending one, for the time the intent has left (at most an hour, so one
-   * timer holds it). Nothing is armed once the gate is disposed or its wake
-   * timers are stopped: the intent stays for the next start.
+   * pending one, for the time the intent has left: a live arm is at most an
+   * hour ahead, a restored one as far as the journal says, so the timer runs
+   * in steps of MAX_TIMER_MS and re-reads the clock when a step ends, firing
+   * only once the deadline has come (a clock set back between boots would
+   * otherwise fire it early, R7-5). Nothing is armed once the gate is
+   * disposed or its wake timers are stopped: the intent stays for the next
+   * start.
    */
   private armSelfWakeTimer(agentName: string): void {
     const prev = this.selfWakeTimers.get(agentName);
@@ -4941,6 +4952,7 @@ export class EventGate {
     const timer = setTimeout(() => {
       this.selfWakeTimers.delete(agentName);
       if (this.selfWakeDue.get(agentName) !== due) return;
+      if (due.at > this.now()) { this.armSelfWakeTimer(agentName); return; }
       this.fireSelfWake(agentName, due);
     }, Math.min(remaining, MAX_TIMER_MS));
     this.selfWakeTimers.set(agentName, timer);
@@ -5124,16 +5136,20 @@ export class EventGate {
     // Restore dropped an absent agent's intents in memory (R6-4); the first
     // admission writes the journal without them. A rename after restore
     // (agentGone) has its own path, so this finds nothing more.
+    // The flag stays set until a write succeeds, so a write that fails here
+    // is retried at the next admission or by the next write. (R7-6)
     if (this.dropWakeIntentsOfAbsentAgents() || this.wakeJournalStale) {
-      this.wakeJournalStale = false;
-      this.tryPersistWakeState('dropping wakes of absent agents');
+      this.wakeJournalStale = !this.tryPersistWakeState('dropping wakes of absent agents');
     }
+    // Each intent on its own: a notice that throws (a store write failing)
+    // is logged and its intent kept for the next admission or start, and the
+    // intents after it are still armed or served. (R7-3)
     const now = this.now();
     if (this.sleepUntil > 0) {
       if (this.sleepUntil > now) {
         if (!this.sleepTimer) this.armSleepWake();
       } else {
-        this.wakeFromSleep('sleep-expired while the host was down or quiesced');
+        this.admitting('the restored sleep', () => this.wakeFromSleep('sleep-expired while the host was down or quiesced'));
       }
     }
     for (const [agentName, due] of [...this.selfWakeDue]) {
@@ -5142,8 +5158,16 @@ export class EventGate {
       } else {
         const timer = this.selfWakeTimers.get(agentName);
         if (timer) { clearTimeout(timer); this.selfWakeTimers.delete(agentName); }
-        this.fireSelfWake(agentName, due, true);
+        this.admitting(`the restored self-wake of "${agentName}"`, () => this.fireSelfWake(agentName, due, true));
       }
+    }
+  }
+
+  private admitting(what: string, serve: () => void): void {
+    try {
+      serve();
+    } catch (error) {
+      console.error(`[gate] wake journal: serving ${what} failed, so it stays in the journal for the next start: ${errorText(error)}`);
     }
   }
 
@@ -5247,8 +5271,9 @@ export class EventGate {
   }
 
   /** Write the journal as the gate's sleep and self-wakes stand: a temp file
-   *  renamed into place, so a crash mid-write leaves the previous journal. */
-  private persistWakeState(): void {
+   *  renamed into place, so a crash mid-write leaves the previous journal.
+   *  Returns the entries left out: those the reader would skip. */
+  private persistWakeState(): Set<string> {
     const state: PersistedWakeState = {
       version: 1,
       ...(this.sleepUntil > 0 ? {
@@ -5267,17 +5292,24 @@ export class EventGate {
     if (this.wakeJournalReadFailed) {
       throw new Error('the journal could not be read at start, so it is not written');
     }
-    // What the reader would skip is not written: a sleep past the reader's
-    // bound (setSleep of ~285,000 years) would answer `durable: true` and be
-    // gone at the next boot.
+    // What the reader would skip is left out and logged, and the rest is
+    // written: one entry the reader wouldn't take (none can arise from
+    // setSleep or armSelfWake, which clamp the deadline and keep only a
+    // string note; this is the last guard) must not refuse every other
+    // agent's write for as long as it lasts. Its own caller is told
+    // `durable: false` (tryPersistWakeState). (R5-9, R6-6, R7-1)
+    const skipped = new Set<string>();
     if (state.sleep && !validWakeIntent(state.sleep, true)) {
-      throw new Error(`the sleep (wakeAt ${(state.sleep as PersistedWakeIntent).wakeAt}) is one the journal's reader would skip`);
+      console.error(`[gate] wake journal: the sleep (wakeAt ${(state.sleep as PersistedWakeIntent).wakeAt}, note ${JSON.stringify((state.sleep as PersistedWakeIntent).note)}) is one the journal's reader would skip, so it is not written`);
+      skipped.add('sleep');
+      delete state.sleep;
     }
-    for (const entry of state.selfWakes) {
-      if (!validWakeIntent(entry, false)) {
-        throw new Error(`the self-wake of "${(entry as PersistedWakeIntent).agentName}" (wakeAt ${(entry as PersistedWakeIntent).wakeAt}) is one the journal's reader would skip`);
-      }
-    }
+    state.selfWakes = state.selfWakes.filter((entry) => {
+      if (validWakeIntent(entry, false)) return true;
+      console.error(`[gate] wake journal: the self-wake of "${entry.agentName}" (wakeAt ${entry.wakeAt}) is one the journal's reader would skip, so it is not written`);
+      skipped.add(`self-wake:${entry.agentName}`);
+      return false;
+    });
     mkdirSync(dirname(this.wakeStatePath), { recursive: true });
     // A name of this writer's own, the bytes on disk before the rename, and
     // the directory entry synced after it, as the framework's host-mode
@@ -5300,15 +5332,18 @@ export class EventGate {
       throw error;
     }
     syncWakeJournalDirectory(dirname(this.wakeStatePath), this.wakeStatePath);
+    return skipped;
   }
 
   /** persistWakeState, with a failure logged (once per action) rather than
    *  thrown: the live timer stays authoritative, and the caller tells the
-   *  agent its wake may not survive a restart. */
-  private tryPersistWakeState(action: string): boolean {
+   *  agent its wake may not survive a restart. `subject` names the caller's
+   *  own entry (`sleep`, `self-wake:<agent>`): a write that had to leave it
+   *  out is no durable write for that caller, whatever else it wrote. */
+  private tryPersistWakeState(action: string, subject?: string): boolean {
     try {
-      this.persistWakeState();
-      return true;
+      const skipped = this.persistWakeState();
+      return subject === undefined || !skipped.has(subject);
     } catch (error) {
       console.error(`[gate] wake journal: write failed while ${action}, so the wake may not survive a restart: ${errorText(error)}`);
       return false;

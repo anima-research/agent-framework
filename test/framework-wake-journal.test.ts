@@ -8,6 +8,9 @@
  *   - a quiesced boot serves nothing; resume() serves each wake once, and a
  *     resume() that threw and is retried still admits;
  *   - a wake falling due while stop() is held open stays in the journal;
+ *   - an overdue wake is served ahead of a request queued before start();
+ *   - a resume() before start() admits nothing, and a throw out of
+ *     admission leaves start() whole;
  *   - the receipts: a `sleep`, a `wake` and a `skip_reply` whose journal
  *     write failed say so.
  * Each of these is one line in framework.ts that a merge can lose with CI
@@ -275,15 +278,100 @@ test('a wake falling due while stop() waits for the loop stays in the journal', 
     assert.equal(gate.setSleep(1.1, undefined, 'agent').durable, true);
     const requestsBefore = internals(framework).pendingRequests.length;
     const stopping = framework.stop();
-    await sleepMs(1_500);
-    const kept = fx.journal();
-    assert.equal(kept.selfWakes.length, 1, 'the self-wake, due during the stop, is still journaled');
-    assert.ok(kept.sleep, 'the sleep, ended during the stop, is still journaled');
-    assert.equal(internals(framework).pendingRequests.length, requestsBefore, 'no wake requested during the stop');
-    assert.equal(membrane.calls.length, 0, 'no wake served');
-    release();
-    await stopping;
+    try {
+      await sleepMs(1_500);
+      const kept = fx.journal();
+      assert.equal(kept.selfWakes.length, 1, 'the self-wake, due during the stop, is still journaled');
+      assert.ok(kept.sleep, 'the sleep, ended during the stop, is still journaled');
+      assert.equal(internals(framework).pendingRequests.length, requestsBefore, 'no wake requested during the stop');
+      assert.equal(membrane.calls.length, 0, 'no wake served');
+    } finally {
+      // Released whatever the assertions said, so a failure here doesn't hold
+      // the stop and the loop for the rest of the file (R7-7).
+      release();
+      await stopping;
+    }
     assert.equal(fx.journal().selfWakes.length, 1, 'and after it');
+  } finally {
+    fx.close();
+  }
+});
+
+test('an overdue self-wake is served ahead of a request queued before start(), so its notice reaches the turn', async () => {
+  // The loop's first pass runs synchronously inside start(): a request already
+  // queued (catch-up traffic between create() and start()) would start its
+  // turn there, and the turn's start cancels the agent's self-wake. Admission
+  // runs before the loop, so the wake's request is first (R7-2).
+  const fx = fixture();
+  try {
+    await setAndStop(fx, 0.3);
+    await sleepMs(1_200);
+    const membrane = new MockMembrane();
+    answers(membrane, 3);
+    const framework = await fx.create(membrane);
+    try {
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'queued before start' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      framework.start();
+      await waitFor('a turn', () => membrane.calls.length > 0);
+      const seen = JSON.stringify(membrane.calls);
+      assert.ok(seen.includes('the host was down or quiesced then'), 'the recovered self-wake\'s notice is in the window the model saw');
+      assert.deepEqual(fx.journal().selfWakes, [], 'served, not cancelled');
+    } finally {
+      await framework.stop();
+    }
+  } finally {
+    fx.close();
+  }
+});
+
+test('a resume() before start() admits nothing; start() does, and a throw out of admission leaves start() whole', async () => {
+  const fx = fixture();
+  try {
+    await setAndStop(fx, 0.2);
+    await sleepMs(1_200);
+    mkdirSync(join(fx.storePath, 'recovery'), { recursive: true });
+    writeFileSync(join(fx.storePath, 'recovery', 'host-mode.json'), JSON.stringify({ version: 1, quiesced: true, reason: 'test' }));
+    const membrane = new MockMembrane();
+    answers(membrane, 3);
+    const framework = await fx.create(membrane);
+    try {
+      assert.equal(framework.getHostModeStatus().quiesced, true);
+      // Un-quiesced before start(): both of resume()'s admissions are guarded
+      // on `running`, so the journal is untouched and nothing is requested
+      // until start() (R5-3, R6-7, R7-7).
+      await framework.resume();
+      assert.equal(framework.getHostModeStatus().quiesced, false);
+      assert.ok(fx.journal().sleep, 'the overdue sleep still waits in the journal');
+      assert.equal(fx.journal().selfWakes.length, 1);
+      assert.equal(internals(framework).pendingRequests.length, 0, 'nothing requested before start()');
+      assert.equal(membrane.calls.length, 0);
+      // start() admits under a catch of its own: with admission throwing,
+      // start() still brings the loop up.
+      const gate = internals(framework).eventGate;
+      const admit = gate.admitOverdueWakeIntents.bind(gate);
+      let threw = false;
+      gate.admitOverdueWakeIntents = () => { threw = true; throw new Error('admission refused for the test'); };
+      const logged: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        assert.doesNotThrow(() => framework.start());
+      } finally {
+        console.error = original;
+        gate.admitOverdueWakeIntents = admit;
+      }
+      assert.equal(threw, true);
+      assert.ok(logged.some((l) => l.includes('admitting the restored wakes at start failed')), logged.join('\n'));
+      assert.ok(fx.journal().sleep, 'the intents stay in the journal');
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'is the loop up?' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      await waitFor('the loop to serve a turn after the failed admission', () => membrane.calls.length > 0);
+    } finally {
+      await framework.stop();
+    }
   } finally {
     fx.close();
   }

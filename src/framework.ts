@@ -6041,6 +6041,22 @@ export class AgentFramework {
     }
     this.heartbeat?.start();
     this.suppressionReview?.start();
+    // Just before the loop: arm the restored sleep and self-wakes still
+    // ahead, and serve those whose time passed while the host was down, so
+    // an overdue wake's request joins the loop's first pass, ahead of a
+    // request queued between create() and start() (catch-up traffic on
+    // reconnect, which would otherwise start its turn in that first pass,
+    // synchronous from here, and cancel the self-wake before it was served,
+    // R7-2). start() is synchronous, so nothing can stop the framework
+    // between admission and the loop (R5-3); a quiesced boot keeps the
+    // intents for its resume(), and a start() refused after a stop never
+    // reaches here. The gate serves each intent under its own catch (R7-3);
+    // this one keeps start() whole against anything else. (R6-7)
+    try {
+      this.eventGate?.admitOverdueWakeIntents();
+    } catch (error) {
+      console.error('[gate] wake journal: admitting the restored wakes at start failed; they stay in the journal:', error);
+    }
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -6064,18 +6080,6 @@ export class AgentFramework {
       this.startQueuedMaintenance();
     }
 
-    // Last, once the loop and the timers are up: arm the restored sleep and
-    // self-wakes still ahead, and serve those whose time passed while the
-    // host was down; the loop makes a wake's request a turn. A quiesced boot
-    // keeps them for its resume(); a start() refused after a stop never
-    // reaches here. A throw out of a wake's notice (a store write) is logged
-    // and leaves start() whole, with the sync and maintenance timers armed:
-    // the intent stays in the journal for the next start. (R5-3, R6-7)
-    try {
-      this.eventGate?.admitOverdueWakeIntents();
-    } catch (error) {
-      console.error('[gate] wake journal: admitting the restored wakes at start failed; they stay in the journal:', error);
-    }
   }
 
   /**
@@ -41346,7 +41350,11 @@ export class AgentFramework {
       return;
     }
 
-    const { until, durable } = gate.setSleep(seconds, input.message, agentName);
+    // Only a string is a message: the schema says so, but a model can fill
+    // the optional field with null or a number, which the journal couldn't
+    // take and the announcement shouldn't carry. (R7-1)
+    const message = typeof input.message === 'string' ? input.message : undefined;
+    const { until, durable } = gate.setSleep(seconds, message, agentName);
     const announce = input.announce !== false; // default true
     const human =
       seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`
@@ -41381,7 +41389,7 @@ export class AgentFramework {
         }
         return `💤 Going quiet for ${human}. I'll still see messages${staysClosed ? ' addressed to me' : ''}, but won't respond until I wake.`;
       };
-      const announcement = (channel: ChannelRef | null): string => input.message ?? defaultWords(channel);
+      const announcement = (channel: ChannelRef | null): string => message ?? defaultWords(channel);
       const agent = this.agents.get(agentName);
       const callingTurn = this.callingTurnOf(agentName, call);
       // The latest start's trigger is the calling turn's only where the

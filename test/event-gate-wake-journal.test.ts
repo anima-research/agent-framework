@@ -16,7 +16,7 @@
  *     aside; one the process can't read at all is left alone and not
  *     written over;
  *   - a restored sleep or self-wake naming an agent this host doesn't have
- *     is ended at admission.
+ *     is ended at restore, and leaves the journal at admission.
  * The framework's wiring of these is pinned in framework-wake-journal.test.ts.
  */
 
@@ -413,7 +413,7 @@ describe('EventGate wake journal', () => {
     }
   });
 
-  it("a restored sleep or self-wake naming an agent this host doesn't have is ended at admission, and the journal says so", () => {
+  it("a restored sleep or self-wake naming an agent this host doesn't have is ended at restore, and leaves the journal at admission", () => {
     const configPath = join(TMP_DIR, 'gate.json');
     const now = 1_700_000_000_000;
     writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
@@ -577,5 +577,102 @@ describe('EventGate wake journal', () => {
     } finally {
       console.error = original;
     }
+  });
+
+  it("a sleep whose note isn't a string is journaled without one, and refuses no other agent's write", () => {
+    // The tool's schema says string; a model can send null or 42. Before,
+    // the writer refused the whole state over it, for as long as the sleep
+    // lasted (R7-1).
+    const { gate } = makeGate({ configPath: join(TMP_DIR, 'gate.json'), agents: ['agent', 'agent2'] });
+    assert.strictEqual(gate.armSelfWake('agent2', 600, 'skip_reply').durable, true);
+    assert.strictEqual(gate.setSleep(3600, null as unknown as string, 'agent').durable, true);
+    assert.strictEqual(journal(gate).sleep?.note, undefined);
+    assert.strictEqual(gate.getSleepState()?.note, undefined);
+    assert.strictEqual(gate.setSleep(3600, 42 as unknown as string, 'agent').durable, true);
+    assert.strictEqual(gate.armSelfWake('agent2', 900, 'skip_reply').durable, true);
+    assert.strictEqual(journal(gate).selfWakes.length, 1);
+    gate.dispose();
+  });
+
+  it("an entry the reader wouldn't take is left out of the write and logged; the rest is written, and only its own caller hears durable: false", () => {
+    // None can arise from setSleep or armSelfWake now; the writer's last
+    // guard is pinned by forcing one (R6-6, R7-1).
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const { gate } = makeGate({ configPath: join(TMP_DIR, 'gate.json'), agents: ['agent', 'agent2'] });
+      assert.strictEqual(gate.setSleep(3600, 'back soon', 'agent').durable, true);
+      (gate as unknown as { sleepNote: unknown }).sleepNote = 42;
+      assert.strictEqual(gate.armSelfWake('agent2', 600, 'skip_reply').durable, true, "another agent's write is durable");
+      const written = journal(gate);
+      assert.strictEqual(written.sleep, undefined, 'the sleep the reader would skip is left out');
+      assert.deepStrictEqual(written.selfWakes.map((w) => w.agentName), ['agent2'], 'the self-wake is written');
+      assert.ok(logged.some((l) => l.includes("is one the journal's reader would skip, so it is not written")), logged.join('\n'));
+      // Its own caller is told: the same write, asked for the sleep's sake.
+      const persist = gate as unknown as { tryPersistWakeState(action: string, subject?: string): boolean };
+      assert.strictEqual(persist.tryPersistWakeState('a test', 'sleep'), false);
+      assert.strictEqual(persist.tryPersistWakeState('a test', 'self-wake:agent2'), true);
+      assert.strictEqual(persist.tryPersistWakeState('a test'), true);
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it('a restored self-wake whose notice throws stays in the journal, and the others are still served (R7-3)', () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      let now = 1_000_000;
+      const first = makeGate({ configPath, agents: ['agent', 'agent2'], now: () => now });
+      first.gate.armSelfWake('agent', 60, 'skip_reply');
+      first.gate.armSelfWake('agent2', 60, 'skip_reply');
+      first.gate.dispose();
+      now += 120_000;
+      const inferenceRequests: Array<{ agentName: string }> = [];
+      const gate = new EventGate({
+        configPath,
+        emitTrace: () => {},
+        addMessage: (_p, _c, _m, forAgent) => {
+          if (forAgent === 'agent') throw new Error('store write refused');
+          return '';
+        },
+        requestInference: (a) => inferenceRequests.push({ agentName: a }),
+        getAgentNames: () => ['agent', 'agent2'],
+        now: () => now,
+      });
+      gate.admitOverdueWakeIntents();
+      assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['agent2'], 'the other self-wake is served');
+      assert.deepStrictEqual(journal(gate).selfWakes.map((w) => w.agentName), ['agent'], 'the one that threw stays for the next start');
+      assert.ok(logged.some((l) => l.includes('serving the restored self-wake of "agent" failed')), logged.join('\n'));
+      gate.dispose();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("a restored self-wake's timer re-reads the clock when its step ends, and re-arms while the deadline is ahead (R7-5)", async () => {
+    const configPath = join(TMP_DIR, 'gate.json');
+    let now = 1_000_000;
+    const first = makeGate({ configPath, now: () => now });
+    first.gate.armSelfWake('agent', 3600, 'skip_reply');
+    first.gate.dispose();
+    // The restored intent is an hour ahead by the clock, but the timer step
+    // (min(remaining, MAX_TIMER_MS)) is what the test can wait for: make the
+    // clock say "due" only at the second step.
+    const { gate, inferenceRequests } = makeGate({ configPath, now: () => now });
+    (gate as unknown as { now: () => number }).now = () => now;
+    now += 3_600_000 - 50; // 50 ms before the deadline by the clock
+    gate.admitOverdueWakeIntents();
+    assert.strictEqual(inferenceRequests.length, 0);
+    // Set the clock back: the step ends, the deadline is ahead again, no fire.
+    now -= 600_000;
+    await new Promise((r) => setTimeout(r, 120));
+    assert.strictEqual(inferenceRequests.length, 0, 'fired early on a clock set back');
+    assert.strictEqual(journal(gate).selfWakes.length, 1, 'still journaled, re-armed');
+    gate.dispose();
   });
 });
