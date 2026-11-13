@@ -13,7 +13,8 @@
 
 import { NOTICE_TAG } from '../notice-tags.js';
 import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-text.js';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { SuppressScripts, type SuppressScriptEvent } from './suppress-scripts.js';
@@ -248,6 +249,68 @@ export interface WakeProvenance {
    *  with no id yet) can't be judged done: AgentFramework then keeps the
    *  wake, for every write of the batch. */
   writes?: WakeWrite[];
+}
+
+/** One wake the journal keeps: a sleep (no `agentName` when it names none) or an agent's self-wake. */
+interface PersistedWakeIntent {
+  agentName?: string;
+  armedAt: number;
+  wakeAt: number;
+  source: string;
+  note?: string;
+}
+
+/** The largest time a Date holds, and so the journal reader takes: a wake
+ *  set past it is clamped here, so what's set is what's journaled. */
+const MAX_WAKE_AT = 8.64e15;
+function clampWakeAt(at: number): number {
+  return Number.isFinite(at) ? Math.min(at, MAX_WAKE_AT) : MAX_WAKE_AT;
+}
+
+/** Syncs the journal's directory after a rename, so the entry reaches the
+ *  disk, as the framework's syncRecoveryDirectory does for the host-mode
+ *  record: win32 is left out, and so is a sync refused with EINVAL or EBADF,
+ *  the answer where the filesystem can't sync a directory. Any other failure
+ *  is logged; the rename itself held, so the write still counts as durable
+ *  against a crash. (R6-3) */
+function syncWakeJournalDirectory(directory: string, journal: string): void {
+  if (process.platform === 'win32') return;
+  // The directory and its parent, as the framework's host-mode record is
+  // written: the directory's own entry is new when this write made it. (R7-4)
+  for (const path of [directory, dirname(directory)]) {
+    try {
+      const fd = openSync(path, 'r');
+      try {
+        fsyncSync(fd);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EINVAL' && code !== 'EBADF') throw err;
+      } finally {
+        closeSync(fd);
+      }
+    } catch (err) {
+      console.error(`[gate] wake journal: ${journal}'s directory ${path} could not be synced after the write (${errorText(err)}); the journal is on disk, but a power loss before the directory syncs on its own could lose it`);
+    }
+  }
+}
+
+/** The wake journal's shape (EventGate.wakeJournalPath). */
+interface PersistedWakeState {
+  version: 1;
+  sleep?: PersistedWakeIntent;
+  selfWakes: PersistedWakeIntent[];
+}
+
+function validWakeIntent(value: unknown, allowAnonymous: boolean): value is PersistedWakeIntent {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  const validTime = (t: unknown): t is number => typeof t === 'number' && Number.isFinite(t) && Math.abs(t) <= MAX_WAKE_AT;
+  return (allowAnonymous ? v.agentName === undefined || typeof v.agentName === 'string' : typeof v.agentName === 'string')
+    && validTime(v.armedAt)
+    && validTime(v.wakeAt)
+    && v.wakeAt >= v.armedAt
+    && typeof v.source === 'string'
+    && (v.note === undefined || typeof v.note === 'string');
 }
 
 interface DebounceState {
@@ -2389,10 +2452,32 @@ export class EventGate {
   // self-wake (an external wake supersedes it; the timer would otherwise
   // land as a redundant empty wake right after the turn).
   private selfWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** When each agent's pending self-wake fires, and what armed it
-   *  (upcomingWakes). Read only while its timer is in selfWakeTimers, so an
-   *  entry a fire or a cancel left behind says nothing. */
-  private selfWakeDue = new Map<string, { at: number; source: string }>();
+  /** Each agent's pending self-wake: when it fires, what armed it and when
+   *  (upcomingWakes, the wake journal). An entry is the intent itself: it
+   *  goes when the wake fires or a turn start or agentGone cancels it, and it
+   *  outlives dispose(), so a restart finds it in the journal. */
+  private selfWakeDue = new Map<string, { at: number; source: string; armedAt: number }>();
+  /** When the current sleep was set (the wake journal). */
+  private sleepArmedAt = 0;
+  /** The wake journal, `<gate stem>.wake-intents.json` beside the gate's
+   *  config: the sleep and the self-wakes set, so a restart or a stop arms
+   *  them again, and delivers the ones whose time passed meanwhile
+   *  (restoreWakeIntents, admitOverdueWakeIntents). */
+  private readonly wakeStatePath: string;
+  private wakeIntentsRestored = false;
+  /** Set when the journal exists but couldn't be read for a reason other
+   *  than its content (EACCES, EIO): the file is left as it is and this
+   *  process writes no journal, answering `durable: false`, rather than
+   *  overwrite wakes it couldn't read. */
+  private wakeJournalReadFailed = false;
+  /** Restore dropped an absent agent's intents in memory; the journal still
+   *  holds them until the first admission writes it (R6-4). */
+  private wakeJournalStale = false;
+  // From stopWakeTimers() on (the host's stop(), in its first steps), no wake
+  // timer fires or is armed: a wake firing during the stop would queue a
+  // request in pendingRequests, which the stop never serves, and leave the
+  // journal, lost to the restart. The intents stay. (R4-1, R6-5)
+  private wakeTimersStopped = false;
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
@@ -2420,6 +2505,7 @@ export class EventGate {
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
+  private hasAgentFn: (agentName: string) => boolean;
   /** Delivery-time re-check: is this channel held from the recipients now? */
   private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
@@ -2447,6 +2533,12 @@ export class EventGate {
      *  message is answered. */
     requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
     getAgentNames: () => string[];
+    /** Whether the framework has an agent of this name, recipient or not:
+     *  admission ends a restored sleep or self-wake naming an agent this
+     *  boot doesn't have (a rename between restarts), which would otherwise
+     *  quiet the whole gate for the sleep's length and wake no one. Left
+     *  out, every restored name is taken as present. */
+    hasAgent?: (agentName: string) => boolean;
     /**
      * Whether a channel is held from the recipients (a tune-out epoch in
      * force). A held event never enters a batch — admission runs before the
@@ -2502,6 +2594,7 @@ export class EventGate {
     eventTypesFrom?: EventTypesFrom;
   }) {
     this.configPath = opts.configPath;
+    this.wakeStatePath = join(dirname(opts.configPath), `${basename(opts.configPath, '.json')}.wake-intents.json`);
     // Before the rules are read: a start's merge can clear a rule's state, its script's included.
     this.suppressScripts = new SuppressScripts({
       statePath: join(dirname(opts.configPath), 'suppress-state.json'),
@@ -2512,6 +2605,7 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.hasAgentFn = opts.hasAgent ?? (() => true);
     this.isHeldFn = opts.isHeld ?? (() => false);
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
@@ -4599,11 +4693,18 @@ export class EventGate {
     // A turn is starting — whatever caused it supersedes any pending
     // self-wake. (Arming happens MID-turn via skip_reply, i.e. after this
     // ran for the arming turn, so a fresh arm always survives its own turn.)
+    this.cancelSelfWake(agentName, 'a turn start superseding a self-wake');
+  }
+
+  /** Drop `agentName`'s pending self-wake, timer and intent, and write the
+   *  journal when there was one to drop. */
+  private cancelSelfWake(agentName: string, action: string): void {
     const selfWake = this.selfWakeTimers.get(agentName);
     if (selfWake) {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
+    if (this.selfWakeDue.delete(agentName)) this.tryPersistWakeState(action);
   }
 
   /** A turn that continues another (a budget restart, a tool-result-guard
@@ -4626,11 +4727,13 @@ export class EventGate {
   /**
    * Host quiesce suppression (issue #122). While set, debounce firings buffer
    * instead of writing gate messages into context; clearing it flushes the
-   * buffer through the same path a turn's end uses. Self-wake and sleep-expiry
-   * timers deliberately do NOT route through this — their inference requests
-   * are per-agent targeted pushes that the framework's quiesce wake gate parks
-   * and releases at resume, whereas the buffer's deliverEvents wakes every
-   * agent a batch is for.
+   * buffer through the same path a turn's end uses. A self-wake or a sleep
+   * that falls due meanwhile doesn't go through this buffer either: its
+   * timer fires and finds the gate quiesced, and the intent stays, in memory
+   * and in the wake journal, until the host's resume() calls
+   * admitOverdueWakeIntents(), which wakes the agent then (a per-agent
+   * request, unlike the buffer's deliverEvents, which wakes every agent a
+   * batch is for). Clearing the flag alone admits nothing.
    */
   setQuiesced(quiesced: boolean): void {
     if (this.quiesced === quiesced) return;
@@ -4728,18 +4831,29 @@ export class EventGate {
   // Sleep
   // =========================================================================
 
-  /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
-  setSleep(seconds: number, note?: string, agentName?: string): { until: number } {
+  /** Begin (or extend) a sleep window of `seconds`. Returns the wake time,
+   *  and whether the sleep reached the wake journal (`durable`): one that
+   *  didn't is kept by this process alone, and a restart loses it. */
+  setSleep(seconds: number, note?: string, agentName?: string): { until: number; durable: boolean } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
-    this.sleepUntil = this.now() + ms;
-    this.sleepNote = note;
+    this.sleepArmedAt = this.now();
+    // Clamped to the largest Date (8.64e15 ms), the journal reader's bound:
+    // a deadline past it can't be journaled (R5-9) or formatted, and a sleep
+    // of ~285,000 years ends no sooner for the clamp. (R6-6)
+    this.sleepUntil = clampWakeAt(this.sleepArmedAt + ms);
+    // Only a string is a note: the tool's schema says so, but a model can
+    // fill the optional field with null or a number, and the journal's
+    // reader takes a string or nothing. (R7-1)
+    this.sleepNote = typeof note === 'string' ? note : undefined;
     this.sleepAgent = agentName;
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
     // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
-    // dispose(), after which nothing arms it.
+    // dispose(), after which nothing arms it. The timer goes first: a journal
+    // write that fails must not leave a sleep set with nothing to end it.
     this.armSleepWake();
+    const durable = this.tryPersistWakeState('setting a sleep', 'sleep');
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -4748,18 +4862,19 @@ export class EventGate {
       trigger: false,
       behavior: 'skip',
     });
-    return { until: this.sleepUntil };
+    return { until: this.sleepUntil, durable };
   }
 
   /**
    * Arm the sleep's wake for its end by the gate's own clock. One timer holds
    * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
    * and wakeFromSleep reads the clock as each one fires. Nothing is armed
-   * once the gate is disposed.
+   * once the gate is disposed or its wake timers are stopped (stopWakeTimers):
+   * the sleep then stays, in memory and in the journal, for the next start.
    */
   private armSleepWake(): void {
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
-    if (this.disposed) return;
+    if (this.disposed || this.wakeTimersStopped) return;
     const remaining = Math.max(0, this.sleepUntil - this.now());
     this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), Math.min(remaining, MAX_TIMER_MS));
   }
@@ -4770,11 +4885,8 @@ export class EventGate {
    * quieting every agent and then wake a name that no longer exists.
    */
   agentGone(agentName: string): void {
-    const selfWake = this.selfWakeTimers.get(agentName);
-    if (selfWake) {
-      clearTimeout(selfWake);
-      this.selfWakeTimers.delete(agentName);
-    }
+    // Its intent goes with it, or a restart would wake the gone name.
+    this.cancelSelfWake(agentName, "ending a gone agent's self-wake");
     if (this.sleepAgent === agentName) this.clearSleep();
   }
 
@@ -4789,50 +4901,18 @@ export class EventGate {
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean; durable: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
-    // A stopped framework's late turn arms no timer (disposed). A self-wake
-    // doesn't outlive a stop, as dispose() clearing the pending ones says.
-    if (this.disposed) return { inMs: ms, armed: false };
-    const prev = this.selfWakeTimers.get(agentName);
-    if (prev) clearTimeout(prev);
-    const timer = setTimeout(() => {
-      this.selfWakeTimers.delete(agentName);
-      this.emitTrace({
-        type: 'gate:decision',
-        eventType: 'selfwake:fired',
-        matchedPolicy: 'self-wake',
-        trigger: true,
-        behavior: 'always',
-      });
-      // Compact in-window notice: without it the wake turn contains nothing
-      // new, so the agent can't tell WHAT woke it (its own timer vs. a
-      // heartbeat) or WHEN. One line, timestamped to the second. Added
-      // before the inference request so it rides the wake turn: it is stored
-      // at once, and while a turn of the agent's is alive it is kept out of
-      // the window until the agent's next presentation point.
-      const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
-      // Deliver the notice into the WAKING agent's window — a self-wake
-      // armed by a non-primary agent (e.g. a subconscious cadence) must not
-      // narrate itself into the primary's context. Its wake goes with it: an
-      // agent that heard the notice during a turn was awake when its timer
-      // fired, and the host drops the wake once a request that carried the
-      // notice is answered.
-      const placement: WritePlacement = {};
-      this.addMessageFn('user', [{
-        type: 'text',
-        text: `[${NOTICE_TAG.selfWake}] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
-      }], { source: 'gate:self-wake' }, agentName, placement);
-      this.requestInferenceFn(
-        agentName,
-        `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
-        'self-wake',
-        undefined,
-        placement,
-      );
-    }, ms);
-    this.selfWakeTimers.set(agentName, timer);
-    this.selfWakeDue.set(agentName, { at: this.now() + ms, source });
+    // A stopped framework's late turn arms no timer and journals no intent
+    // (disposed): nothing asked for after a stop() reaches the next start().
+    // Intents armed before the stop stay in the journal; the next start
+    // restores them (restoreWakeIntents) and its admission arms them again
+    // (admitOverdueWakeIntents).
+    if (this.disposed) return { inMs: ms, armed: false, durable: false };
+    const armedAt = this.now();
+    this.selfWakeDue.set(agentName, { at: clampWakeAt(armedAt + ms), source, armedAt });
+    this.armSelfWakeTimer(agentName);
+    const durable = this.tryPersistWakeState('setting a self-wake', `self-wake:${agentName}`);
     this.emitTrace({
       type: 'gate:decision',
       eventType: 'selfwake:set',
@@ -4840,17 +4920,114 @@ export class EventGate {
       trigger: false,
       behavior: 'skip',
     });
-    return { inMs: ms, armed: true };
+    return { inMs: ms, armed: true, durable };
+  }
+
+  /**
+   * Arm the timer for `agentName`'s intent in selfWakeDue, replacing a
+   * pending one, for the time the intent has left: a live arm is at most an
+   * hour ahead, a restored one as far as the journal says, so a deadline
+   * past one step of MAX_TIMER_MS is held in steps that re-read the clock
+   * (R7-5). Nothing is armed once the gate is disposed or its wake timers
+   * are stopped: the intent stays for the next start.
+   */
+  private armSelfWakeTimer(agentName: string): void {
+    const prev = this.selfWakeTimers.get(agentName);
+    if (prev) { clearTimeout(prev); this.selfWakeTimers.delete(agentName); }
+    if (this.disposed || this.wakeTimersStopped) return;
+    const due = this.selfWakeDue.get(agentName);
+    if (!due) return;
+    const remaining = Math.max(0, due.at - this.now());
+    // A deadline more than one step away is held in steps, and each step's
+    // end re-reads the clock: a clock set back between boots would otherwise
+    // fire a restored wake early (R7-5). A deadline within one step fires when
+    // its timer does, as a live arm always did.
+    const stepped = remaining > MAX_TIMER_MS;
+    const timer = setTimeout(() => {
+      this.selfWakeTimers.delete(agentName);
+      if (this.selfWakeDue.get(agentName) !== due) return;
+      if (stepped && due.at > this.now()) { this.armSelfWakeTimer(agentName); return; }
+      this.fireSelfWake(agentName, due);
+    }, Math.min(remaining, MAX_TIMER_MS));
+    this.selfWakeTimers.set(agentName, timer);
+  }
+
+  /**
+   * `agentName`'s self-wake is due. While the host is quiesced the intent
+   * stays, timer and all: its wake would be parked in memory, which a
+   * restart mid-quiesce loses, so resume delivers it instead
+   * (admitOverdueWakeIntents). Otherwise the notice and the wake go first,
+   * and the intent leaves the journal once they have: a delete whose write
+   * fails leaves the entry, which replays once at the next start, as a
+   * recovery. The notice, the request and the delete run in one synchronous
+   * step, so the gap that promise doesn't cover is the one after it: a
+   * request still waiting in pendingRequests when the host stops is lost,
+   * which is why the framework admits restored intents only once its loop
+   * runs (start()), not at create().
+   */
+  private fireSelfWake(agentName: string, due: { at: number; source: string; armedAt: number }, recovered = false): void {
+    if (this.quiesced) return;
+    const seconds = Math.round((due.at - due.armedAt) / 1000);
+    this.emitTrace({
+      type: 'gate:decision',
+      eventType: 'selfwake:fired',
+      matchedPolicy: 'self-wake',
+      trigger: true,
+      behavior: 'always',
+    });
+    // Compact in-window notice: without it the wake turn contains nothing
+    // new, so the agent can't tell WHAT woke it (its own timer vs. a
+    // heartbeat) or WHEN. One line, timestamped to the second. Added
+    // before the inference request so it rides the wake turn: it is stored
+    // at once, and while a turn of the agent's is alive it is kept out of
+    // the window until the agent's next presentation point.
+    const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
+    // Deliver the notice into the WAKING agent's window — a self-wake
+    // armed by a non-primary agent (e.g. a subconscious cadence) must not
+    // narrate itself into the primary's context. Its wake goes with it: an
+    // agent that heard the notice during a turn was awake when its timer
+    // fired, and the host drops the wake once a request that carried the
+    // notice is answered.
+    const placement: WritePlacement = {};
+    const late = recovered
+      ? ` (due ${new Date(due.at).toISOString().slice(0, 19)}Z; the host was down or quiesced then)`
+      : '';
+    this.addMessageFn('user', [{
+      type: 'text',
+      text: `[${NOTICE_TAG.selfWake}] your ${due.source} timer (${seconds}s) elapsed${late} — now ${nowIso}`,
+    }], { source: 'gate:self-wake', ...(recovered ? { recovered: true } : {}) }, agentName, placement);
+    this.requestInferenceFn(
+      agentName,
+      `self-scheduled wake (${due.source}, ${seconds}s${recovered ? ', recovered' : ''})`,
+      'self-wake',
+      undefined,
+      placement,
+    );
+    if (this.selfWakeDue.get(agentName) === due) {
+      this.selfWakeDue.delete(agentName);
+      this.tryPersistWakeState('a self-wake firing');
+    }
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
   clearSleep(): boolean {
+    return this.endSleep().woke;
+  }
+
+  /** End sleep immediately: `woke` says whether the agent was asleep, and
+   *  `durable` whether the end reached the journal. One that didn't leaves
+   *  the sleep in the journal, so a restart would sleep again until the old
+   *  deadline; the journal is written whether or not a sleep was set, so a
+   *  `wake` called again after one whose write failed takes it out. */
+  endSleep(): { woke: boolean; durable: boolean } {
     const wasAsleep = this.sleepUntil > this.now();
     this.sleepUntil = 0;
+    this.sleepArmedAt = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
-    return wasAsleep;
+    const durable = this.tryPersistWakeState('clearing a sleep');
+    return { woke: wasAsleep, durable };
   }
 
   /**
@@ -4870,9 +5047,16 @@ export class EventGate {
       this.armSleepWake();
       return;
     }
+    // A sleep ending while the host is quiesced stays, in memory and in the
+    // journal: its wake would be parked in memory, which a restart loses, so
+    // resume ends it instead (admitOverdueWakeIntents). Its deadline has
+    // passed, so it suppresses nothing from here on; the quiesce is what
+    // holds events meanwhile.
+    if (this.quiesced) return;
     const note = this.sleepNote;
     const agent = this.sleepAgent;
     this.sleepUntil = 0;
+    this.sleepArmedAt = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
     this.emitTrace({
@@ -4885,6 +5069,281 @@ export class EventGate {
     const detail = note ? `${reason}: ${note}` : reason;
     const targets = agent ? [agent] : this.getAgentNamesFn();
     for (const a of targets) this.requestInferenceFn(a, detail, 'sleep');
+    // After the wakes, as fireSelfWake: a crash before this line ends the
+    // sleep again at the next start, with its wake, rather than losing it.
+    this.tryPersistWakeState('a sleep ending');
+  }
+
+  // =========================================================================
+  // Wake journal: the sleep and self-wakes set, across a stop or a crash
+  // =========================================================================
+
+  /**
+   * Take the journal's sleep and self-wakes as this gate's, without arming
+   * anything or writing the journal, so an agent's sleep suppresses from the
+   * start, before input flows. admitOverdueWakeIntents() then arms the ones
+   * still ahead and delivers the ones whose time passed. Reads the journal
+   * once; one whose content can't be read is set aside (`.corrupt`) and
+   * logged, and the gate starts with no wake set; one the process can't
+   * read at all (EACCES, EIO) is left where it is and not written over.
+   */
+  restoreWakeIntents(): void {
+    if (this.wakeIntentsRestored) return;
+    this.wakeIntentsRestored = true;
+    const state = this.readWakeState();
+    if (!state) return;
+    if (state.sleep) {
+      this.sleepUntil = state.sleep.wakeAt;
+      this.sleepArmedAt = state.sleep.armedAt;
+      this.sleepNote = state.sleep.note;
+      this.sleepAgent = state.sleep.agentName;
+      this.sleepSuppressed = 0;
+    }
+    for (const intent of state.selfWakes) {
+      this.selfWakeDue.set(intent.agentName!, { at: intent.wakeAt, source: intent.source, armedAt: intent.armedAt });
+    }
+    const n = state.selfWakes.length;
+    if (state.sleep || n > 0) {
+      console.error(`[gate] wake journal: ${state.sleep ? `a sleep until ${new Date(state.sleep.wakeAt).toISOString()}` : 'no sleep'}`
+        + `, ${n} self-wake${n === 1 ? '' : 's'} restored`);
+    }
+    // An absent agent's sleep or self-wake is dropped here, in memory, so a
+    // restored sleep of a renamed agent mutes nothing between this restore
+    // and the start's admission (inbound MCPL traffic is gated from create()
+    // on). The journal is written at admission, as restore writes nothing.
+    // (R6-4)
+    if (this.dropWakeIntentsOfAbsentAgents()) this.wakeJournalStale = true;
+  }
+
+  /**
+   * Arm the restored intents still ahead, and deliver those whose time
+   * passed while the host was down or quiesced: the sleep's end wakes its
+   * agent (or every recipient, as a sleep with no agent named does), and an
+   * overdue self-wake fires as its timer would have, its notice saying it
+   * is late. Called once a start can serve a wake, and at each resume; a
+   * quiesced gate delivers nothing and keeps the intents for the resume.
+   * An intent already armed or already delivered is left alone, so the
+   * call is safe to repeat.
+   */
+  admitOverdueWakeIntents(): void {
+    if (this.disposed || this.wakeTimersStopped || this.quiesced) return;
+    // Restore dropped an absent agent's intents in memory (R6-4); the first
+    // admission writes the journal without them. A rename after restore
+    // (agentGone) has its own path, so this finds nothing more.
+    // The flag stays set until a write succeeds, so a write that fails here
+    // is retried at the next admission or by the next write. (R7-6)
+    if (this.dropWakeIntentsOfAbsentAgents() || this.wakeJournalStale) {
+      this.wakeJournalStale = !this.tryPersistWakeState('dropping wakes of absent agents');
+    }
+    // Each intent on its own: a notice that throws (a store write failing)
+    // is logged and its intent kept for the next admission or start, and the
+    // intents after it are still armed or served. (R7-3)
+    const now = this.now();
+    if (this.sleepUntil > 0) {
+      if (this.sleepUntil > now) {
+        if (!this.sleepTimer) this.armSleepWake();
+      } else {
+        this.admitting('the restored sleep', () => this.wakeFromSleep('sleep-expired while the host was down or quiesced'));
+      }
+    }
+    for (const [agentName, due] of [...this.selfWakeDue]) {
+      if (due.at > now) {
+        if (!this.selfWakeTimers.has(agentName)) this.armSelfWakeTimer(agentName);
+      } else {
+        const timer = this.selfWakeTimers.get(agentName);
+        if (timer) { clearTimeout(timer); this.selfWakeTimers.delete(agentName); }
+        this.admitting(`the restored self-wake of "${agentName}"`, () => this.fireSelfWake(agentName, due, true));
+      }
+    }
+  }
+
+  private admitting(what: string, serve: () => void): void {
+    try {
+      serve();
+    } catch (error) {
+      console.error(`[gate] wake journal: serving ${what} failed, so it stays in the journal for the next start: ${errorText(error)}`);
+    }
+  }
+
+  /**
+   * End a restored sleep, and drop restored self-wakes, that name an agent
+   * this boot doesn't have (renamed or removed in the recipe between
+   * restarts). A sleep's suppression is the whole gate's, whoever slept, and
+   * agentGone ends a sleep for the same reason at runtime; a restored one
+   * would otherwise quiet every agent for the rest of its window and then
+   * wake a name that no longer exists. The check is against the framework's
+   * agents, not the gate's recipients: a non-recipient agent may sleep too.
+   */
+  private dropWakeIntentsOfAbsentAgents(): boolean {
+    let changed = false;
+    if (this.sleepUntil > 0 && this.sleepAgent !== undefined && !this.hasAgentFn(this.sleepAgent)) {
+      console.error(`[gate] wake journal: ending the restored sleep of "${this.sleepAgent}", an agent this host doesn't have`);
+      this.sleepUntil = 0;
+      this.sleepArmedAt = 0;
+      this.sleepNote = undefined;
+      this.sleepAgent = undefined;
+      if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+      changed = true;
+    }
+    for (const agentName of [...this.selfWakeDue.keys()]) {
+      if (this.hasAgentFn(agentName)) continue;
+      console.error(`[gate] wake journal: dropping the restored self-wake of "${agentName}", an agent this host doesn't have`);
+      const timer = this.selfWakeTimers.get(agentName);
+      if (timer) { clearTimeout(timer); this.selfWakeTimers.delete(agentName); }
+      this.selfWakeDue.delete(agentName);
+      changed = true;
+    }
+    return changed;
+  }
+
+  /**
+   * The host is stopping: no wake timer fires or is armed from here on, and
+   * the intents stay, in memory and in the journal, for the next start.
+   * Called in stop()'s first steps: a wake firing during the stop would have
+   * its request queued in pendingRequests, which the stop never serves, and
+   * its intent taken from the journal, lost to the restart.
+   */
+  stopWakeTimers(): void {
+    this.wakeTimersStopped = true;
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    for (const timer of this.selfWakeTimers.values()) clearTimeout(timer);
+    this.selfWakeTimers.clear();
+  }
+
+  /** Where the wake journal is kept (tests, diagnostics). */
+  get wakeJournalPath(): string {
+    return this.wakeStatePath;
+  }
+
+  private readWakeState(): PersistedWakeState | null {
+    // Only ENOENT means "no journal". Any other read error (EACCES from a
+    // journal written by another user, EIO, EMFILE) says nothing about the
+    // content, so the file stays as it is and this process writes no
+    // journal: a fresh one would lose the wakes it couldn't read.
+    let text: string;
+    try {
+      text = readFileSync(this.wakeStatePath, 'utf8');
+    } catch (error) {
+      if (isMissing(error)) return null;
+      this.wakeJournalReadFailed = true;
+      console.error(`[gate] wake journal: read failed (${errorText(error)}); the file is left in place, and this process won't write the journal, so wakes set now may not survive a restart`);
+      return null;
+    }
+    try {
+      const raw = JSON.parse(text) as Record<string, unknown>;
+      if (raw === null || typeof raw !== 'object' || raw.version !== 1 || !Array.isArray(raw.selfWakes)) {
+        throw new Error('not a version 1 wake journal');
+      }
+      // An entry's note is the agent's own words: a skipped entry is named
+      // by its place and its keys, not quoted.
+      const describe = (entry: unknown): string => entry && typeof entry === 'object'
+        ? `keys ${Object.keys(entry as object).join(', ') || '(none)'}`
+        : `a ${entry === null ? 'null' : typeof entry}`;
+      const selfWakes = raw.selfWakes.filter((entry, i) => {
+        const valid = validWakeIntent(entry, false);
+        if (!valid) console.error(`[gate] wake journal: skipping self-wake entry ${i}, which isn't one the gate can read (${describe(entry)})`);
+        return valid;
+      }) as PersistedWakeIntent[];
+      let sleep: PersistedWakeIntent | undefined;
+      if (raw.sleep !== undefined) {
+        if (validWakeIntent(raw.sleep, true)) sleep = raw.sleep;
+        else console.error(`[gate] wake journal: skipping the sleep entry, which isn't one the gate can read (${describe(raw.sleep)})`);
+      }
+      return { version: 1, ...(sleep ? { sleep } : {}), selfWakes };
+    } catch (error) {
+      // One copy is kept for a look, the latest: a journal that keeps
+      // breaking doesn't fill the disk with copies.
+      const quarantine = `${this.wakeStatePath}.corrupt`;
+      try {
+        renameSync(this.wakeStatePath, quarantine);
+        console.error(`[gate] wake journal unreadable, set aside as ${quarantine} (replacing an earlier copy, if any): ${errorText(error)}`);
+      } catch (renameError) {
+        console.error(`[gate] wake journal unreadable (${errorText(error)}), and setting it aside failed: ${errorText(renameError)}`);
+      }
+      return null;
+    }
+  }
+
+  /** Write the journal as the gate's sleep and self-wakes stand: a temp file
+   *  renamed into place, so a crash mid-write leaves the previous journal.
+   *  Returns the entries left out: those the reader would skip. */
+  private persistWakeState(): Set<string> {
+    const state: PersistedWakeState = {
+      version: 1,
+      ...(this.sleepUntil > 0 ? {
+        sleep: {
+          ...(this.sleepAgent !== undefined ? { agentName: this.sleepAgent } : {}),
+          armedAt: this.sleepArmedAt,
+          wakeAt: this.sleepUntil,
+          source: 'sleep',
+          ...(this.sleepNote !== undefined ? { note: this.sleepNote } : {}),
+        },
+      } : {}),
+      selfWakes: [...this.selfWakeDue].map(([agentName, due]) => ({
+        agentName, armedAt: due.armedAt, wakeAt: due.at, source: due.source,
+      })),
+    };
+    if (this.wakeJournalReadFailed) {
+      throw new Error('the journal could not be read at start, so it is not written');
+    }
+    // What the reader would skip is left out and logged, and the rest is
+    // written: one entry the reader wouldn't take (none can arise from
+    // setSleep or armSelfWake, which clamp the deadline and keep only a
+    // string note; this is the last guard) must not refuse every other
+    // agent's write for as long as it lasts. Its own caller is told
+    // `durable: false` (tryPersistWakeState). (R5-9, R6-6, R7-1)
+    const skipped = new Set<string>();
+    if (state.sleep && !validWakeIntent(state.sleep, true)) {
+      console.error(`[gate] wake journal: the sleep (wakeAt ${(state.sleep as PersistedWakeIntent).wakeAt}, note ${JSON.stringify((state.sleep as PersistedWakeIntent).note)}) is one the journal's reader would skip, so it is not written`);
+      skipped.add('sleep');
+      delete state.sleep;
+    }
+    state.selfWakes = state.selfWakes.filter((entry: PersistedWakeIntent) => {
+      // Read before the guard: a failed type guard narrows `entry` to never.
+      const { agentName, wakeAt } = entry;
+      if (validWakeIntent(entry, false)) return true;
+      console.error(`[gate] wake journal: the self-wake of "${agentName}" (wakeAt ${wakeAt}) is one the journal's reader would skip, so it is not written`);
+      skipped.add(`self-wake:${agentName}`);
+      return false;
+    });
+    mkdirSync(dirname(this.wakeStatePath), { recursive: true });
+    // A name of this writer's own, the bytes on disk before the rename, and
+    // the directory entry synced after it, as the framework's host-mode
+    // record is written: a `durable: true` answered to the agent means the
+    // journal survives a power loss, not only a crash, where the filesystem
+    // syncs a directory (R6-3). A write that fails takes its temp file with
+    // it, so ENOSPC doesn't leave one per attempt beside the config.
+    const tmp = `${this.wakeStatePath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+    const fd = openSync(tmp, 'w', 0o600);
+    try {
+      try {
+        writeSync(fd, JSON.stringify(state, null, 2) + '\n');
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, this.wakeStatePath);
+    } catch (error) {
+      try { unlinkSync(tmp); } catch { /* already gone, or the same disk fault */ }
+      throw error;
+    }
+    syncWakeJournalDirectory(dirname(this.wakeStatePath), this.wakeStatePath);
+    return skipped;
+  }
+
+  /** persistWakeState, with a failure logged (once per action) rather than
+   *  thrown: the live timer stays authoritative, and the caller tells the
+   *  agent its wake may not survive a restart. `subject` names the caller's
+   *  own entry (`sleep`, `self-wake:<agent>`): a write that had to leave it
+   *  out is no durable write for that caller, whatever else it wrote. */
+  private tryPersistWakeState(action: string, subject?: string): boolean {
+    try {
+      const skipped = this.persistWakeState();
+      return subject === undefined || !skipped.has(subject);
+    } catch (error) {
+      console.error(`[gate] wake journal: write failed while ${action}, so the wake may not survive a restart: ${errorText(error)}`);
+      return false;
+    }
   }
 
   /** Current sleep state, or null if awake. */
@@ -5145,7 +5604,9 @@ export class EventGate {
       clearTimeout(timer);
     }
     this.selfWakeTimers.clear();
-    this.selfWakeDue.clear();
+    // The self-wakes' intents stay, as the sleep's does: the journal holds
+    // them for the next start, and upcomingWakes reads an entry only while
+    // its timer is armed.
     // The sleep stays, with its note and agent, and its timer goes: fired
     // after a stop(), its wake reached a framework that had stopped, and the
     // timer held the process until the sleep's end. Nothing arms one after
