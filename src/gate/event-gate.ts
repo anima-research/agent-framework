@@ -4935,12 +4935,10 @@ export class EventGate {
   /**
    * Arm the timer for `agentName`'s intent in selfWakeDue, replacing a
    * pending one, for the time the intent has left: a live arm is at most an
-   * hour ahead, a restored one as far as the journal says, so the timer runs
-   * in steps of MAX_TIMER_MS and re-reads the clock when a step ends, firing
-   * only once the deadline has come (a clock set back between boots would
-   * otherwise fire it early, R7-5). Nothing is armed once the gate is
-   * disposed or its wake timers are stopped: the intent stays for the next
-   * start.
+   * hour ahead, a restored one as far as the journal says, so a deadline
+   * past one step of MAX_TIMER_MS is held in steps that re-read the clock
+   * (R7-5). Nothing is armed once the gate is disposed or its wake timers
+   * are stopped: the intent stays for the next start.
    */
   private armSelfWakeTimer(agentName: string): void {
     const prev = this.selfWakeTimers.get(agentName);
@@ -4949,10 +4947,15 @@ export class EventGate {
     const due = this.selfWakeDue.get(agentName);
     if (!due) return;
     const remaining = Math.max(0, due.at - this.now());
+    // A deadline more than one step away is held in steps, and each step's
+    // end re-reads the clock: a clock set back between boots would otherwise
+    // fire a restored wake early (R7-5). A deadline within one step fires when
+    // its timer does, as a live arm always did.
+    const stepped = remaining > MAX_TIMER_MS;
     const timer = setTimeout(() => {
       this.selfWakeTimers.delete(agentName);
       if (this.selfWakeDue.get(agentName) !== due) return;
-      if (due.at > this.now()) { this.armSelfWakeTimer(agentName); return; }
+      if (stepped && due.at > this.now()) { this.armSelfWakeTimer(agentName); return; }
       this.fireSelfWake(agentName, due);
     }, Math.min(remaining, MAX_TIMER_MS));
     this.selfWakeTimers.set(agentName, timer);

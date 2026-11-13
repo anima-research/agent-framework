@@ -326,7 +326,7 @@ test('an overdue self-wake is served ahead of a request queued before start(), s
   }
 });
 
-test('a resume() before start() admits nothing; start() does, and a throw out of admission leaves start() whole', async () => {
+test('a resume() before start() admits nothing; start() does', async () => {
   const fx = fixture();
   try {
     await setAndStop(fx, 0.2);
@@ -334,7 +334,7 @@ test('a resume() before start() admits nothing; start() does, and a throw out of
     mkdirSync(join(fx.storePath, 'recovery'), { recursive: true });
     writeFileSync(join(fx.storePath, 'recovery', 'host-mode.json'), JSON.stringify({ version: 1, quiesced: true, reason: 'test' }));
     const membrane = new MockMembrane();
-    answers(membrane, 3);
+    answers(membrane, 2);
     const framework = await fx.create(membrane);
     try {
       assert.equal(framework.getHostModeStatus().quiesced, true);
@@ -347,8 +347,27 @@ test('a resume() before start() admits nothing; start() does, and a throw out of
       assert.equal(fx.journal().selfWakes.length, 1);
       assert.equal(internals(framework).pendingRequests.length, 0, 'nothing requested before start()');
       assert.equal(membrane.calls.length, 0);
-      // start() admits under a catch of its own: with admission throwing,
-      // start() still brings the loop up.
+      framework.start();
+      assert.equal(fx.journal().sleep, undefined, 'start() served the sleep');
+      assert.deepEqual(fx.journal().selfWakes, [], 'and the self-wake');
+      await waitFor('the wakes to become a turn', () => membrane.calls.length > 0);
+    } finally {
+      await framework.stop();
+    }
+  } finally {
+    fx.close();
+  }
+});
+
+test('a throw out of admission is logged and leaves start() whole: the loop is up and the intents stay in the journal', async () => {
+  const fx = fixture();
+  try {
+    await setAndStop(fx, 0.2);
+    await sleepMs(1_200);
+    const membrane = new MockMembrane();
+    answers(membrane, 2);
+    const framework = await fx.create(membrane);
+    try {
       const gate = internals(framework).eventGate;
       const admit = gate.admitOverdueWakeIntents.bind(gate);
       let threw = false;
@@ -365,6 +384,7 @@ test('a resume() before start() admits nothing; start() does, and a throw out of
       assert.equal(threw, true);
       assert.ok(logged.some((l) => l.includes('admitting the restored wakes at start failed')), logged.join('\n'));
       assert.ok(fx.journal().sleep, 'the intents stay in the journal');
+      assert.equal(fx.journal().selfWakes.length, 1);
       framework.pushEvent({
         type: 'external-message', source: 'test', content: [{ type: 'text', text: 'is the loop up?' }], metadata: {}, triggerInference: true,
       } as unknown as ProcessEvent);

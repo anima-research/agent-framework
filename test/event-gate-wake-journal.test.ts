@@ -644,6 +644,7 @@ describe('EventGate wake journal', () => {
         getAgentNames: () => ['agent', 'agent2'],
         now: () => now,
       });
+      gate.restoreWakeIntents();
       gate.admitOverdueWakeIntents();
       assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['agent2'], 'the other self-wake is served');
       assert.deepStrictEqual(journal(gate).selfWakes.map((w) => w.agentName), ['agent'], 'the one that threw stays for the next start');
@@ -654,25 +655,39 @@ describe('EventGate wake journal', () => {
     }
   });
 
-  it("a restored self-wake's timer re-reads the clock when its step ends, and re-arms while the deadline is ahead (R7-5)", async () => {
+  it("a restored self-wake past one timer step re-reads the clock when the step ends, and re-arms while the deadline is ahead (R7-5)", async () => {
+    // A journal written by hand: a self-wake 30 days ahead, more than one
+    // step (MAX_TIMER_MS, about 24.8 days). Its first step ends with the
+    // deadline still ahead by the clock, so it re-arms rather than fires.
     const configPath = join(TMP_DIR, 'gate.json');
+    const { gate: pathOf } = makeGate({ configPath });
+    const journalPath = pathOf.wakeJournalPath;
+    pathOf.dispose();
     let now = 1_000_000;
-    const first = makeGate({ configPath, now: () => now });
-    first.gate.armSelfWake('agent', 3600, 'skip_reply');
-    first.gate.dispose();
-    // The restored intent is an hour ahead by the clock, but the timer step
-    // (min(remaining, MAX_TIMER_MS)) is what the test can wait for: make the
-    // clock say "due" only at the second step.
+    const thirtyDays = 30 * 24 * 3_600_000;
+    writeFileSync(journalPath, JSON.stringify({
+      version: 1, selfWakes: [{ agentName: 'agent', armedAt: now, wakeAt: now + thirtyDays, source: 'skip_reply' }],
+    }));
     const { gate, inferenceRequests } = makeGate({ configPath, now: () => now });
-    (gate as unknown as { now: () => number }).now = () => now;
-    now += 3_600_000 - 50; // 50 ms before the deadline by the clock
+    gate.restoreWakeIntents();
+    // Make the first step end at once: the clock stands where the step was
+    // computed, so the deadline is still ahead when it ends.
+    const timers = gate as unknown as { selfWakeTimers: Map<string, ReturnType<typeof setTimeout>> };
     gate.admitOverdueWakeIntents();
-    assert.strictEqual(inferenceRequests.length, 0);
-    // Set the clock back: the step ends, the deadline is ahead again, no fire.
-    now -= 600_000;
-    await new Promise((r) => setTimeout(r, 120));
-    assert.strictEqual(inferenceRequests.length, 0, 'fired early on a clock set back');
-    assert.strictEqual(journal(gate).selfWakes.length, 1, 'still journaled, re-armed');
+    assert.strictEqual(timers.selfWakeTimers.size, 1, 'armed in steps');
+    const step = timers.selfWakeTimers.get('agent')!;
+    // Fire the step's callback now, as the real step would in 24.8 days.
+    clearTimeout(step);
+    (step as unknown as { _onTimeout: () => void })._onTimeout();
+    assert.strictEqual(inferenceRequests.length, 0, 'not fired: the deadline is ahead by the clock');
+    assert.strictEqual(timers.selfWakeTimers.size, 1, 're-armed for the next step');
+    assert.strictEqual(journal(gate).selfWakes.length, 1, 'still journaled');
+    // With the clock at the deadline, the step's end fires it.
+    now += thirtyDays;
+    const next = timers.selfWakeTimers.get('agent')!;
+    clearTimeout(next);
+    (next as unknown as { _onTimeout: () => void })._onTimeout();
+    assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['agent']);
     gate.dispose();
   });
 });
