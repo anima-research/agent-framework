@@ -25,6 +25,7 @@ import assert from 'node:assert';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventGate } from '../src/gate/event-gate.js';
+import { MAX_TIMER_MS } from '../src/deadline-timer.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-wake-journal');
 
@@ -655,10 +656,11 @@ describe('EventGate wake journal', () => {
     }
   });
 
-  it("a restored self-wake past one timer step re-reads the clock when the step ends, and re-arms while the deadline is ahead (R7-5)", async () => {
+  it("a restored self-wake past one timer step re-reads the clock when the step ends, and re-arms while the deadline is ahead (R7-5)", (t) => {
     // A journal written by hand: a self-wake 30 days ahead, more than one
-    // step (MAX_TIMER_MS, about 24.8 days). Its first step ends with the
-    // deadline still ahead by the clock, so it re-arms rather than fires.
+    // step (MAX_TIMER_MS, about 24.8 days). The steps run on mocked timers;
+    // the gate's clock is the test's. The first step ends with the deadline
+    // still ahead by that clock, so it re-arms rather than fires.
     const configPath = join(TMP_DIR, 'gate.json');
     const { gate: pathOf } = makeGate({ configPath });
     const journalPath = pathOf.wakeJournalPath;
@@ -668,26 +670,23 @@ describe('EventGate wake journal', () => {
     writeFileSync(journalPath, JSON.stringify({
       version: 1, selfWakes: [{ agentName: 'agent', armedAt: now, wakeAt: now + thirtyDays, source: 'skip_reply' }],
     }));
-    const { gate, inferenceRequests } = makeGate({ configPath, now: () => now });
-    gate.restoreWakeIntents();
-    // Make the first step end at once: the clock stands where the step was
-    // computed, so the deadline is still ahead when it ends.
-    const timers = gate as unknown as { selfWakeTimers: Map<string, ReturnType<typeof setTimeout>> };
-    gate.admitOverdueWakeIntents();
-    assert.strictEqual(timers.selfWakeTimers.size, 1, 'armed in steps');
-    const step = timers.selfWakeTimers.get('agent')!;
-    // Fire the step's callback now, as the real step would in 24.8 days.
-    clearTimeout(step);
-    (step as unknown as { _onTimeout: () => void })._onTimeout();
-    assert.strictEqual(inferenceRequests.length, 0, 'not fired: the deadline is ahead by the clock');
-    assert.strictEqual(timers.selfWakeTimers.size, 1, 're-armed for the next step');
-    assert.strictEqual(journal(gate).selfWakes.length, 1, 'still journaled');
-    // With the clock at the deadline, the step's end fires it.
-    now += thirtyDays;
-    const next = timers.selfWakeTimers.get('agent')!;
-    clearTimeout(next);
-    (next as unknown as { _onTimeout: () => void })._onTimeout();
-    assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['agent']);
-    gate.dispose();
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const { gate, inferenceRequests } = makeGate({ configPath, now: () => now });
+      gate.restoreWakeIntents();
+      gate.admitOverdueWakeIntents();
+      // The first step ends; the clock still says the deadline is ahead.
+      t.mock.timers.tick(MAX_TIMER_MS);
+      assert.strictEqual(inferenceRequests.length, 0, 'not fired: the deadline is ahead by the clock');
+      assert.strictEqual(journal(gate).selfWakes.length, 1, 'still journaled, re-armed');
+      // The clock reaches the deadline; the next step's end fires it.
+      now += thirtyDays;
+      t.mock.timers.tick(MAX_TIMER_MS);
+      assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['agent']);
+      assert.deepStrictEqual(journal(gate).selfWakes, []);
+      gate.dispose();
+    } finally {
+      t.mock.timers.reset();
+    }
   });
 });

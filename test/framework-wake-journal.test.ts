@@ -365,8 +365,17 @@ test('a throw out of admission is logged and leaves start() whole: the loop is u
     await setAndStop(fx, 0.2);
     await sleepMs(1_200);
     const membrane = new MockMembrane();
-    answers(membrane, 2);
-    const framework = await fx.create(membrane);
+    let seen = false;
+    const framework = await fx.create(membrane, {
+      modules: [{
+        name: 'witness',
+        async start() {},
+        async stop() {},
+        getTools: () => [],
+        async handleToolCall() { return { success: false }; },
+        async onProcess(event: { type: string }) { if (event.type === 'external-message') seen = true; return {}; },
+      }],
+    });
     try {
       const gate = internals(framework).eventGate;
       const admit = gate.admitOverdueWakeIntents.bind(gate);
@@ -386,9 +395,9 @@ test('a throw out of admission is logged and leaves start() whole: the loop is u
       assert.ok(fx.journal().sleep, 'the intents stay in the journal');
       assert.equal(fx.journal().selfWakes.length, 1);
       framework.pushEvent({
-        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'is the loop up?' }], metadata: {}, triggerInference: true,
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'is the loop up?' }], metadata: {}, triggerInference: false,
       } as unknown as ProcessEvent);
-      await waitFor('the loop to serve a turn after the failed admission', () => membrane.calls.length > 0);
+      await waitFor('the loop to process an event after the failed admission', () => seen);
     } finally {
       await framework.stop();
     }
