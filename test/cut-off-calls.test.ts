@@ -600,3 +600,43 @@ describe('an ephemeral run whose response ends at the output limit with calls in
     }
   });
 });
+
+// #640 R1-1: under the private think policy, a round whose block is cut off
+// before the last call's name is read whole may be a think's, so its words are
+// kept back, failing closed; a partial name that can't be `think` routes as
+// before.
+describe("XML tools: a cut that leaves the last call's name undecided, under the private think policy", () => {
+  const PRIVATE = { sameRoundThinkTextPolicy: 'private' };
+
+  it("keeps back a round's words when its block is cut inside the first call's name", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="thi', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("keeps back a round's words when the cut is inside a second call's name, after a whole one", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n<invoke name="thi', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.moves, [], 'the cut-off round runs nothing');
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("keeps back only the cut round's words after an earlier round that ran", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_calls>\n<invoke name="thi', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.moves, [{ dir: 'east' }]);
+    assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+  });
+
+  it("keeps back a round's words when the cut is after the name but before its tag closes", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="think"', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("routes a round's words when the partial name can't become think", async () => {
+    const run = await turn('xml', [{ xml: 'Heading north now.\n\n<function_calls>\n<invoke name="robo', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, ['Heading north now.', NEXT]);
+  });
+
+  it("routes the same cut's words under the public policy", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="thi', stop: 'max_tokens' }]);
+    assert.deepEqual(run.routed, ['Private musing.', NEXT]);
+  });
+});
