@@ -4024,6 +4024,47 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
+    // #640 R1-2: a round the turn-end delivery drops by its place, as a
+    // private think's, isn't speech left unposted: no notice asks to send it.
+    const thinkRound = () => createMockResponse([text(SPEECH), call('t1', 'think', { thought: 'hm' })], 'tool_use');
+
+    it("a failure after a private think's round writes no notice inviting its words out", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, retries: 0, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        breakAfterToolRound(h.membrane, 'error');
+        await h.turn([thinkRound()]);
+        assert.equal(published(h, SPEECH).length, 0);
+        assert.deepEqual(notices(h), []);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("a budget restart after a private think's round carries no notice in the continuation's request", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private', maxStreamTokens: 5 }] });
+      try {
+        onSecondStream(h.membrane, createMockResponse([text(AFTER)]));
+        await h.turn([thinkRound()]);
+        assert.equal(h.membrane.calls.length, 2, 'premise: the stream restarted once');
+        assert.ok(!asks(h.membrane.calls[1]), "the continuation's request carries no notice");
+        assert.deepEqual(notices(h), []);
+        assert.equal(published(h, SPEECH).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("a failure after a think's round under the public policy still names its words", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, retries: 0 });
+      try {
+        breakAfterToolRound(h.membrane, 'error');
+        await h.turn([thinkRound()]);
+        assert.equal(notices(h).length, 1, notices(h).join('\n'));
+      } finally {
+        await h.close();
+      }
+    });
+
     it("a tool-result guard's retry after the round carries the notice in the retried request", async () => {
       const h = await harness({ xml: true, roundPreamble: true, agents: [{ name: 'scout', toolResultGuard: true }] });
       try {
