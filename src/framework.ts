@@ -4927,6 +4927,10 @@ export class AgentFramework {
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
   private readonly pendingRoundSent = new WeakMap<ContentBlock[], ContentBlock[] | null>();
+  /** Pending rounds' blocks whose words the turn-end delivery drops by their place, a private think's: their
+   *  words aren't speech left unposted, so the tool boundary's flush writes no `[speech-not-posted]` for them
+   *  (#640 R1-2). Filled where the round is added to privateThinkRounds, before the flush. */
+  private readonly privateRoundBlocks = new WeakSet<ContentBlock[]>();
   /** Per agent, a round that called code_execution or sent, and waits for
    *  those calls' results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -18794,6 +18798,7 @@ export class AgentFramework {
             this.endStatedWaitRun(agent.name);
           }
           if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent
+            && !this.privateRoundBlocks.has(pendingBlocks!)
             && pendingBlocks!.some((b) => b.type === 'text' && (b as { text?: string }).text?.trim())) {
             flushedTurn.unpostedSpeech = true;
           }
@@ -28840,7 +28845,10 @@ export class AgentFramework {
               const hasSameRoundPrivateThink =
                 toolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (hasSameRoundPrivateThink) privateThinkRounds.add(toolRound);
+              if (hasSameRoundPrivateThink) {
+                privateThinkRounds.add(toolRound);
+                this.privateRoundBlocks.add(assistantBlocks);
+              }
               // A refused skip_reply, called directly or from the round's
               // script, keeps its own round private and silences nothing
               // after it (roundCallOf): the silence before it, and the
@@ -28996,6 +29004,7 @@ export class AgentFramework {
                   // end would route its prose, that prose stays back.
                   if (requestSnapshot.sameRoundThinkTextPolicy === 'private') {
                     privateThinkRounds.add(toolRound);
+                    this.privateRoundBlocks.add(assistantBlocks);
                     unreturnedScriptRounds.add(toolRound);
                   }
                   if (roundSegments.length === 0) return;
