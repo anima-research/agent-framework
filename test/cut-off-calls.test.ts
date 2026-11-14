@@ -630,6 +630,11 @@ describe("XML tools: a cut that leaves the last call's name undecided, under the
     assert.deepEqual(run.routed, [NEXT]);
   });
 
+  it("keeps back a round's words when the block is cut before its first tag", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
   it("routes a round's words when the partial name can't become think", async () => {
     const run = await turn('xml', [{ xml: 'Heading north now.\n\n<function_calls>\n<invoke name="robo', stop: 'max_tokens' }], PRIVATE);
     assert.deepEqual(run.routed, ['Heading north now.', NEXT]);

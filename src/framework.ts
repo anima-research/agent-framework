@@ -29279,8 +29279,18 @@ export class AgentFramework {
             const cutIds = new Set(cut?.calls.map((call) => call.id));
             const cutCalls = cut?.calls.map((call) => this.roundCallOf(agent.name, call, true)) ?? [];
             const cutPrivate = cutCalls.some((call) => call.refused);
+            // Under the private policy a round the cut left undecided is kept
+            // back as a think's is, erring only toward keeping words private
+            // (#640 R1-1): the cut came inside a tag that could still have
+            // become think's, or no call was named and no unfinished tag rules
+            // think out. A partial name that can't be think's routes as before.
             const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut
-              && cut.calls.some((call) => call.name === 'think');
+              && (cut.calls.some((call) => call.name === 'think') || cut.nextCall === 'may'
+                || (cut.unnamed && cut.nextCall === 'none'));
+            // An undecided cut with no call in it counts no round, so its words
+            // are kept back by their place here (the XML fallback only: native
+            // calls carry their whole name from their start).
+            const heldUndecided = cutThinkPrivate && !!cut?.unnamed && !liveProseRouting;
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
             if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
               generationLost = true;
@@ -29305,6 +29315,10 @@ export class AgentFramework {
                 `(${cut.calls.map((call) => call.name).join(', ')}); stored with refused results, not run`,
               );
             } else if (cut?.unnamed) {
+              if (heldUndecided) {
+                privateThinkRounds.add(toolRounds);
+                if (silence) silencedPrivateThinkRounds.add(toolRounds);
+              }
               console.error(
                 `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside a tool-call block before any call was named; nothing ran`,
               );
@@ -29406,8 +29420,11 @@ export class AgentFramework {
               ? []
               : response.content.filter(isTextBlock);
 
-            const speechContent = hadToolCalls ? [] : allText;
-            const thoughts = hadToolCalls ? allText : [];
+            // The words of an undecided cut kept back by their place are a
+            // round's, as a cut think's are, even where no call ran.
+            const proseTurn = hadToolCalls || heldUndecided;
+            const speechContent = proseTurn ? [] : allText;
+            const thoughts = proseTurn ? allText : [];
 
             // Explicit text is admitted as its round ends, before anything
             // below waits (a module's speech callback, the turn's earlier
@@ -29427,7 +29444,7 @@ export class AgentFramework {
                 ? splitProseRuns(response.content)
                 : speechRun.trim() ? [speechRun] : [];
             const finalSpeechSegments = finalSpeechRuns.map((run) => run.trim());
-            const finalRuns = hadToolCalls && allText.length > 0
+            const finalRuns = proseTurn && allText.length > 0
               ? splitProseRuns(liveProseRouting
                 ? terminalContent
                 : withoutRoundsProse(response.content, new Set([...refusedWakeRounds, ...privateThinkRounds])))
@@ -29439,7 +29456,7 @@ export class AgentFramework {
             // A round that's both a private think's and a refused call's counts
             // as the think's, as it does natively.
             const refusedOnly = new Set([...refusedWakeRounds].filter((r) => !privateThinkRounds.has(r)));
-            const runsBesideThink = !liveProseRouting && hadToolCalls && privateThinkRounds.size > 0
+            const runsBesideThink = !liveProseRouting && proseTurn && privateThinkRounds.size > 0
               ? splitProseRuns(withoutRoundsProse(response.content, refusedOnly)).length
               : 0;
             const privateThinkWithheld = runsBesideThink > 0 ? runsBesideThink - finalRuns.length : 0;
@@ -29707,7 +29724,7 @@ export class AgentFramework {
                   }
                 }
               }
-            } else if (this.channelRegistry && hadToolCalls && allText.length > 0) {
+            } else if (this.channelRegistry && proseTurn && allText.length > 0) {
               // Tool-call turn that also produced prose. When live routing was
               // active (native roundContent), each mid-turn round's prose was
               // already delivered when that round yielded — only the TRAILING

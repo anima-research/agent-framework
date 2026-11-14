@@ -13,6 +13,14 @@ export interface CutOffRound {
   start: number;
   calls: CutOffCall[];
   unnamed: boolean;
+  /**
+   * In XML tool mode, what the tag the cut came inside says of a call that
+   * might have followed: `may` where it could still have become `think`'s
+   * head (`<invoke name="thi`, or a name read whole before its tag closed),
+   * `not` where it can't (`<invoke name="robo`), `none` where the cut came
+   * between tags. Native responses are always `none`.
+   */
+  nextCall: 'may' | 'not' | 'none';
 }
 
 /**
@@ -32,14 +40,15 @@ export function cutOffRound(response: NormalizedResponse): CutOffRound | undefin
     else if (block.type === 'tool_result' && callIds.has(block.toolUseId)) start = index + 1;
   });
   const cut = response.details?.stop?.unclosedToolBlock ? cutToolBlock(response.content, start) : undefined;
-  const content = cut ?? response.content;
+  const content = cut?.content ?? response.content;
   const uses = content.slice(start).filter((block): block is ContentBlock & { type: 'tool_use' } => block.type === 'tool_use');
   const calls = uses.map(({ id, name, input, unparseableInput }) => ({
     id, name, input,
     ...(unparseableInput !== undefined ? { unparseableInput } : {}),
   }));
   const unnamed = !!cut && calls.length === 0;
-  return calls.length > 0 || unnamed ? { content, start, calls, unnamed } : undefined;
+  const nextCall = cut?.nextCall ?? 'none';
+  return calls.length > 0 || unnamed ? { content, start, calls, unnamed, nextCall } : undefined;
 }
 
 /**
@@ -61,8 +70,23 @@ const OPENER = /<(antml:)?function_calls(>|[^>]*$)/g;
 const CLOSER = /<\/(antml:)?function_calls>/g;
 const NAME_HEAD = /<(antml:)?invoke\s+name=(["'])((?:(?!\2).)+)\2\s*\/?>/g;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/;
+// The opening tags a think call can have, which a tag cut off at the output
+// limit may still have been on its way to.
+const THINK_HEADS = ['', 'antml:'].flatMap((ns) => ['"', "'"].map((q) => `<${ns}invoke name=${q}think${q}>`));
 
-function cutToolBlock(content: ContentBlock[], start: number): ContentBlock[] | undefined {
+/**
+ * What the text after a block's last whole name head ends in: `none` unless
+ * it ends in a tag not yet closed by `>`; then `may` where that tag's text
+ * (whitespace runs read as one space) begins one of THINK_HEADS, else `not`.
+ */
+function nextCallOf(tail: string): 'may' | 'not' | 'none' {
+  const at = tail.lastIndexOf('<');
+  if (at < 0 || tail.indexOf('>', at) >= 0) return 'none';
+  const tag = tail.slice(at).replace(/\s+/g, ' ').trimEnd();
+  return THINK_HEADS.some((head) => head.startsWith(tag)) ? 'may' : 'not';
+}
+
+function cutToolBlock(content: ContentBlock[], start: number): { content: ContentBlock[]; nextCall: 'may' | 'not' | 'none' } | undefined {
   const texts = content.map((block, index) => ({ block, index }))
     .filter((entry): entry is { block: ContentBlock & { type: 'text' }; index: number } => entry.index >= start && entry.block.type === 'text');
   const joined = texts.map(({ block }) => block.text).join('');
@@ -92,5 +116,8 @@ function cutToolBlock(content: ContentBlock[], start: number): ContentBlock[] | 
   const prose: ContentBlock[] = at > 0 ? [{ type: 'text', text: holder.block.text.slice(0, at) }] : [];
   const kept = content.slice(holder.index + 1)
     .filter((block) => block.type === 'thinking' || block.type === 'redacted_thinking' || block.type === 'tool_use');
-  return [...content.slice(0, holder.index), ...prose, ...kept, ...calls];
+  const lastHead = [...blockText.matchAll(NAME_HEAD)].at(-1);
+  // From past the last whole name head, or past the opener's own `<`.
+  const nextCall = nextCallOf(blockText.slice(lastHead ? lastHead.index + lastHead[0].length : 1));
+  return { content: [...content.slice(0, holder.index), ...prose, ...kept, ...calls], nextCall };
 }
