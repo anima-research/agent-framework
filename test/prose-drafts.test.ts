@@ -3695,7 +3695,9 @@ describe('an explicit send holds plain speech only where it may have posted', ()
       it(`${mode}: a later round whose watched script hasn't returned is counted alike in native and XML tool mode${silenced ? ', after a send' : ''}`, async () => {
         const receipts: string[][] = [];
         for (const xml of [false, true]) {
-          const h = await harness({ xml, agents: [{ name: 'scout', proseRouting: mode, sameRoundThinkTextPolicy: 'private' }], sendTool: true, codeExecution: true });
+          // A hung send waits out the request timeout: a short one keeps these
+          // variants from waiting out the default 60 s twice (#640 R1-3).
+          const h = await harness({ xml, agents: [{ name: 'scout', proseRouting: mode, sameRoundThinkTextPolicy: 'private' }], sendTool: true, codeExecution: true, requestTimeoutMs: 1_000 });
           try {
             await h.sendMode('hang');
             const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
