@@ -27,17 +27,18 @@ const incoming = (id: string, channel = 'discord:g:A', extra = {}) => ({
   author: { id: 'u', name: 'User' }, content: [{ type: 'text' as const, text: 'fixture' }],
   timestamp: new Date().toISOString(), tags: ['chat:addressed'], triggerInference: true, ...extra,
 });
-async function rig(autoRewind = false, batch = false) {
+async function rig(autoRewind = false, batch = false, owner = true, resident = false) {
   const dir = mkdtempSync(join(tmpdir(), 'main-refusal-'));
   const membrane = new SingleStreamMembrane();
   const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'agent', model: 'mock', systemPrompt: 'fixture', refusalHandling: { autoRewind, maxRewinds: 1 } }],
+    agents: [{ name: 'agent', model: 'mock', systemPrompt: 'fixture', refusalHandling: { autoRewind, maxRewinds: 1 } },
+      ...(resident ? [{ name: 'resident', model: 'mock', systemPrompt: 'fixture' }] : [])],
     ...(batch ? { gate: { configPath: join(dir, 'gate.json'), config: { policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' as const }, onboarding: false } } : {}),
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
   const signals: MainRefusal[] = [];
   const bridge = framework.getMainRefusalBridge();
-  const restore = bridge.takeOwnership(r => { signals.push(r); });
+  const restore = owner ? bridge.takeOwnership(r => { signals.push(r); }) : () => {};
   return { framework, membrane, signals, bridge, restore, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -172,5 +173,128 @@ test('an ambient-tagged actual wake is eligible, and message-body/metadata claim
     assert.equal(r.signals.length, 1);
     assert.equal(r.signals[0].origin?.messageRef, 'A');
     assert.equal(r.signals[0].origin?.serverId, 'server');
+  } finally { await r.close(); }
+});
+
+for (const autoRewind of [false, true]) {
+  test(`no owner dispatches legacy only for the final unhandled refusal (rewind=${autoRewind})`, async (t) => {
+    const r = await rig(autoRewind, false, false);
+    const legacy = t.mock.method(r.framework as unknown as {
+      reactToRefusal(agent: string, category: string): Promise<void>;
+    }, 'reactToRefusal', async () => {});
+    try {
+      r.membrane.pushResponse(refused());
+      if (autoRewind) r.membrane.pushResponse(refused());
+      r.framework.pushEvent(incoming('A'));
+      await r.framework.runUntilIdle();
+      assert.equal(r.membrane.calls.length, autoRewind ? 2 : 1);
+      assert.deepEqual(legacy.mock.calls.map(c => c.arguments), [['agent', 'bio']]);
+    } finally { await r.close(); }
+  });
+}
+
+test('disposing an owner restores legacy dispatch at the final-stream call site', async (t) => {
+  const r = await rig();
+  const legacy = t.mock.method(r.framework as unknown as {
+    reactToRefusal(agent: string, category: string): Promise<void>;
+  }, 'reactToRefusal', async () => {});
+  try {
+    r.membrane.pushResponse(refused()); r.framework.pushEvent(incoming('A'));
+    await r.framework.runUntilIdle();
+    assert.equal(r.signals.length, 1); assert.equal(legacy.mock.callCount(), 0);
+    r.restore();
+    r.membrane.pushResponse(refused()); r.framework.pushEvent(incoming('B'));
+    await r.framework.runUntilIdle();
+    assert.equal(r.signals.length, 1);
+    assert.deepEqual(legacy.mock.calls.map(c => c.arguments), [['agent', 'bio']]);
+  } finally { await r.close(); }
+});
+
+for (const asyncFailure of [false, true]) {
+  test(`owner failure is contained and correlated without legacy fallback (async=${asyncFailure})`, async (t) => {
+    const r = await rig();
+    const legacy = t.mock.method(r.framework as unknown as {
+      reactToRefusal(agent: string, category: string): Promise<void>;
+    }, 'reactToRefusal', async () => {});
+    const errors = t.mock.method(console, 'error', () => {});
+    let signal: MainRefusal | undefined;
+    try {
+      r.restore();
+      r.bridge.takeOwnership(s => {
+        signal = s;
+        if (asyncFailure) return Promise.reject('rejected owner');
+        throw new Error('boom');
+      });
+      r.membrane.pushResponse(refused()); r.framework.pushEvent(incoming('A'));
+      await r.framework.runUntilIdle();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(signal);
+      assert.equal(legacy.mock.callCount(), 0);
+      assert.equal(r.membrane.calls.length, 1);
+      assert.ok(errors.mock.calls.some(c => c.arguments[0] ===
+        `[inference-refusal] host handler failed (agent=agent turn=${signal!.turnId}): ${asyncFailure ? 'rejected owner' : 'boom'}; no retry or legacy fallback`));
+      // node:test also fails this test for an unhandled rejection.
+    } finally { await r.close(); }
+  });
+}
+
+test('push-lane message origin comes from the admitted connector envelope', async () => {
+  const r = await rig();
+  try {
+    r.membrane.pushResponse(refused());
+    r.framework.pushEvent({
+      type: 'mcpl:push-event', serverId: 'server', featureSet: 'chat', eventId: 'not-the-message',
+      timestamp: new Date().toISOString(), inferenceId: 'fixture',
+      content: [{ type: 'text', text: 'hello' }], tags: ['chat:addressed'], triggerInference: true,
+      origin: { mcplChannelId: 'discord:g:A', messageId: 'push-A' },
+    });
+    await r.framework.runUntilIdle();
+    assert.equal(r.signals.length, 1);
+    assert.equal(r.signals[0].origin?.messageRef, 'push-A');
+    assert.equal(r.signals[0].origin?.channelId, 'discord:g:A');
+  } finally { await r.close(); }
+});
+
+test('rewind retry merged with a new inbound message has unknown origin', async () => {
+  const r = await rig(true);
+  let release!: () => void;
+  try {
+    r.membrane.hold = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { r.membrane.started = resolve; });
+    r.membrane.pushResponse(refused()); r.membrane.pushResponse(refused());
+    r.framework.pushEvent(incoming('A'));
+    const run = r.framework.runUntilIdle();
+    await started;
+    const admitted = new Promise<void>(resolve => {
+      r.framework.onTrace(e => { if (e.type === 'admission:decided' && e.messageId === 'B') resolve(); });
+    });
+    r.framework.pushEvent(incoming('B'));
+    await admitted;
+    release(); await run;
+    assert.deepEqual(r.signals.map(s => s.rewind), ['handled', 'unhandled']);
+    assert.equal(r.signals[0].origin?.messageRef, 'A');
+    assert.equal(r.signals[1].origin, undefined);
+  } finally { release?.(); await r.close(); }
+});
+
+test('quiesce coalesces distinct addressed co-resident wakes without selecting the newest origin', async () => {
+  const r = await rig(false, false, true, true);
+  try {
+    await r.framework.quiesce();
+    r.framework.pushEvent(incoming('A', undefined, { targetAgents: ['agent', 'resident'] }));
+    r.framework.pushEvent(incoming('B', undefined, { targetAgents: ['agent', 'resident'] }));
+    await r.framework.runUntilIdle();
+    assert.equal(r.membrane.calls.length, 0);
+    const pending = (r.framework as unknown as {
+      pendingRequests: Array<{ agentName: string; readsRow?: string }>;
+    }).pendingRequests.filter(p => p.agentName === 'resident');
+    assert.equal(pending.length, 1, 'the co-resident wakes actually collapsed');
+    assert.equal(pending[0].readsRow, undefined, 'co-resident does not own the delivery row');
+    r.membrane.pushResponse(refused()); r.membrane.pushResponse(refused());
+    await r.framework.resume();
+    await r.framework.runUntilIdle();
+    const signals = r.signals.filter(s => s.agentName === 'resident');
+    assert.equal(signals.length, 1);
+    assert.equal(signals[0].origin, undefined);
   } finally { await r.close(); }
 });

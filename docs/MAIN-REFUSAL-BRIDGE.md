@@ -1,10 +1,9 @@
-# Local main-refusal handover prototype
+# Experimental main-refusal bridge
 
-This is an unreleased, optional companion API for connectome-host. It changes no
-package versions, dependencies, provider retry policy, routing, CM purpose
-classification, or ops refusal-streak threshold. Omission preserves the existing
-Discord special case (including its category map, last-resort behavior and no
-removal). It is not a new incident service or general host executor.
+This experimental, optional API hands main-refusal reaction ownership to a host.
+Omission preserves the existing Discord special case (including its category
+map, last-resort behavior and no removal). Provider retry policy and the ops
+refusal-streak threshold are unchanged.
 
 `framework.getMainRefusalBridge()` returns a version-1 narrow facet:
 
@@ -24,23 +23,11 @@ removal). It is not a new incident service or general host executor.
   deploy/restart, or disconnect+connect) changes the identity instead.
   Neither value is a published provenance link or a persistent identity.
 
-The companion Host V1 snapshots these identities at install. After a selected
-connector's config/connection object is replaced, later reactions on that server
-fail closed with a local status only. Whole-framework ownership remains held;
-there is **no legacy fallback**. The Host startup wiring discards the disposer
-and provides no runtime reinstall/rearm API. A **fresh full Host process restart
-with normal config prepare/install is necessary** after selected connector object
-replacement/restart/deploy; another install in the running process is not a
-recovery path. An already issued ADD cannot be undone. This documents the
-conservative lifetime limitation, not a liveness fix. Automatic in-place
-crash/reconnect is different and does not itself invalidate the V1 snapshot;
-normal per-signal binding/schema/suppression checks still apply.
-
 The signal is made only on the main stream's final refusal path, after membrane
 has exhausted its provider retries and after the existing rewind decision. A
 handled rewind is reported without an effect; its retry keeps the original
-origin. Auxiliary `complete()` calls and ephemeral/subagent runs do not enter this
-handoff. Provider retry execution itself is membrane's responsibility; mock
+origin. Auxiliary `complete()` calls and ephemeral agents in `run` mode do not enter
+this handoff. Ephemeral conversations do enter it, matching legacy behavior. Provider retry execution itself is membrane's responsibility; mock
 stream tests do not qualify a real provider.
 Auxiliary exclusion is source-reviewed (the signal is only in the main final
 stream branch), not behavior-proven by a direct call to a mock's `complete()`.
@@ -52,7 +39,8 @@ channel, and thread (if supplied) from its trusted ingestion envelope, **not** f
 message text, event UUIDs, routing winners, channel_open, or `incomingFor`.
 Direct wake branches use the actual admission decision. An ambient tag does not
 negate a real wake. Debounced/judged gate deliveries merge private admission
-marks over **all** batch events, independently of the gate's speech-locus winner.
+marks over **all** batch events, independently of the gate's speech-locus winner
+(subject to the missing-provenance limitations below).
 Exactly one distinct known eligible scoped message can be named; two distinct
 messages or any unknown cause are ambiguous. Duplicate delivery of the same
 scoped message is one. Nonmessage markers, context-only traffic, and heartbeats
@@ -66,15 +54,18 @@ reaction work does not look up a newer target.
 Conservative limitations: restored/foreign wakes without the private admission
 mark, deferred RFC-006 batches whose content is materialized at assembly rather
 than delivered as a marked wake, and incomplete gate provenance are unknown.
+Two additional paths currently lose the mark and therefore report unknown:
+wake onboarding, and judged events answered while judging (their placement moves
+from `after` to `named`, which the origin merge does not read).
+These are documented limitations, not changes to the origin model; reconciling
+that model with the per-turn answer model in #947 remains an owner decision.
 There is no reconstructed origin from stored text or the latest channel. This
 reports request processing status, not the culprit or cause of a refusal.
 
 ## Failure semantics
 
 A host owner's failure is logged and contained. It neither falls back to legacy
-reactions nor requests inference. For the first refusal with unknown origin or
-unsupported driver the companion host logs a local diagnostic only: the existing
-ops home notice starts at streak two and is **not** first-refusal home coverage.
-The host owns bounded ADD-only dedup/effects; this API promises neither exactly
-once nor durable cross-process/cross-host dedup. Disposing cannot retract an
-already issued effect. It never removes reactions.
+reactions nor requests inference. The existing ops home notice starts at streak
+two, independently of this handoff. Hosts own their effect and deduplication policies; this API promises
+neither exactly-once effects nor durable cross-process/cross-host deduplication.
+Disposing restores legacy ownership but cannot retract an already issued effect.

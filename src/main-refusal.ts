@@ -22,7 +22,9 @@ export type MainRefusalHandler = (refusal: MainRefusal) => void | Promise<void>;
 
 /** Optional host facet. Taking ownership replaces ALL built-in refusal reactions,
  * not only selected servers. Disposing restores legacy behavior. Observation and
- * effect failures must not request inference. No durable/exactly-once guarantee. */
+ * effect failures must not request inference. No durable/exactly-once guarantee.
+ * @experimental
+ */
 export interface MainRefusalBridge {
   readonly version: 1;
   takeOwnership(handler: MainRefusalHandler): () => void;
@@ -30,8 +32,6 @@ export interface MainRefusalBridge {
   serverBinding(serverId: string): string | undefined;
   /** Process-local config OBJECT + connection OBJECT identity, NOT transportEpoch,
    * child PID, reconnect detection, or security/realm/executable attestation.
-   * In-place crash/reconnect preserves it; object replacement changes it.
-   * Companion Host V1 has no runtime rearm: replacement requires a fresh full
-   * Host process restart with normal config prepare/install, not another install. */
+   * In-place crash/reconnect preserves it; object replacement changes it. */
   serverEpoch(serverId: string): string | undefined;
 }

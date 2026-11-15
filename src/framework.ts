@@ -4466,7 +4466,9 @@ export class AgentFramework {
   private mainRefusalHandler?: MainRefusalHandler;
   private readonly refusalInstances = new WeakMap<object, string>();
 
-  /** Explicit whole-framework handover; never inferred from one server config. */
+  /** Explicit whole-framework handover; never inferred from one server config.
+   * @experimental
+   */
   getMainRefusalBridge(): MainRefusalBridge {
     return {
       version: 1,
@@ -4500,7 +4502,9 @@ export class AgentFramework {
       return;
     }
     try { await this.mainRefusalHandler(refusal); }
-    catch { console.error('[inference-refusal] host handler failed; no retry or legacy fallback'); }
+    catch (err) {
+      console.error(`[inference-refusal] host handler failed (agent=${refusal.agentName} turn=${refusal.turnId}): ${err instanceof Error ? err.message : String(err)}; no retry or legacy fallback`);
+    }
   }
   // The framework ends a stream at a tool boundary from handleProcessEvent:
   // an endTurn result, or a context-budget or physical-window restart. Each
@@ -23025,6 +23029,7 @@ export class AgentFramework {
           const channels = pair ? wakeChannelsOf(pair) : undefined;
           if (channels) kept.wakeChannels = channels;
           if (pair) {
+            Object.assign(kept, mergeRefusalOrigins(pair));
             const rows = this.mergedBatchRows(kept.agentName, pair);
             if (rows) (kept as MarkedRequest)[BATCH_ROWS] = rows;
             else delete (kept as MarkedRequest)[BATCH_ROWS];
