@@ -644,4 +644,31 @@ describe("XML tools: a cut that leaves the last call's name undecided, under the
     const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="thi', stop: 'max_tokens' }]);
     assert.deepEqual(run.routed, ['Private musing.', NEXT]);
   });
+
+  // #640 R2-2: membrane's grammar takes a self-closing head as a whole call,
+  // and think's thought is optional, so a cut between its `/` and `>` may be
+  // think's too.
+  for (const [label, head] of [['<invoke name="think"/', '<invoke name="think"/'], ['<invoke name="think" /', '<invoke name="think" /']] as const) {
+    it(`keeps back a round's words when the cut is inside a self-closing think head (${label})`, async () => {
+      const run = await turn('xml', [{ xml: `Private musing.\n\n<function_calls>\n${head}`, stop: 'max_tokens' }], PRIVATE);
+      assert.deepEqual(run.routed, [NEXT]);
+    });
+  }
+
+  it("routes a self-closing head's cut words under the public policy", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="think"/', stop: 'max_tokens' }]);
+    assert.deepEqual(run.routed, ['Private musing.', NEXT]);
+  });
+
+  // #640 R2-3: the rule starts at a whole `<function_calls` opener. Membrane
+  // reads a cut as inside a tool block only from there (endsWithPartialToolBlock),
+  // and a response cut sooner can't be told from prose here: the framework
+  // learns a turn is XML only from a round that has no roundContent. So these
+  // route, the tag's fragment with them (membrane's), under either policy.
+  for (const tail of ['<function_call', '<'] as const) {
+    it(`routes a round cut before its opener is whole (${tail}), under the private policy too`, async () => {
+      const run = await turn('xml', [{ xml: `Private musing.\n\n${tail}`, stop: 'max_tokens' }], PRIVATE);
+      assert.deepEqual(run.routed, [`Private musing.\n\n${tail}`, NEXT]);
+    });
+  }
 });
