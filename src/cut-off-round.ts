@@ -71,8 +71,10 @@ const CLOSER = /<\/(antml:)?function_calls>/g;
 const NAME_HEAD = /<(antml:)?invoke\s+name=(["'])((?:(?!\2).)+)\2\s*\/?>/g;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/;
 // The opening tags a think call can have, which a tag cut off at the output
-// limit may still have been on its way to.
-const THINK_HEADS = ['', 'antml:'].flatMap((ns) => ['"', "'"].map((q) => `<${ns}invoke name=${q}think${q}>`));
+// limit may still have been on its way to: closed by `>`, or self-closed, as
+// NAME_HEAD and membrane's grammar both read it (think's thought is optional).
+const THINK_HEADS = ['', 'antml:'].flatMap((ns) => ['"', "'"].flatMap((q) =>
+  ['>', '/>', ' />'].map((close) => `<${ns}invoke name=${q}think${q}${close}`)));
 
 /**
  * What the text after a block's last whole name head ends in: `none` unless

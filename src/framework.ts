@@ -1539,6 +1539,8 @@ interface TurnRouting {
   roundsRan?: true;
   unflushedRounds?: number;
   unpostedSpeech?: true;
+  /** A flushed round's words stayed private (privateRoundBlocks): the notice says so, when there is one. */
+  privateSpeechKept?: true;
   privateEnd?: true;
   silent?: true;
   liveSpeech?: true;
@@ -4928,8 +4930,9 @@ export class AgentFramework {
    *  the blocks themselves, so it goes wherever they go. */
   private readonly pendingRoundSent = new WeakMap<ContentBlock[], ContentBlock[] | null>();
   /** Pending rounds' blocks whose words the turn-end delivery drops by their place, a private think's: their
-   *  words aren't speech left unposted, so the tool boundary's flush writes no `[speech-not-posted]` for them
-   *  (#640 R1-2). Filled where the round is added to privateThinkRounds, before the flush. */
+   *  words aren't speech left unposted, so the tool boundary's flush asks no `[speech-not-posted]` notice for them
+   *  (#640 R1-2), and one another round asks for says they stay private (R2-1). Filled where the round is added to
+   *  privateThinkRounds, before the flush. */
   private readonly privateRoundBlocks = new WeakSet<ContentBlock[]>();
   /** Per agent, a round that called code_execution or sent, and waits for
    *  those calls' results before its prose is routed (ScriptRound). */
@@ -18798,9 +18801,12 @@ export class AgentFramework {
             this.endStatedWaitRun(agent.name);
           }
           if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent
-            && !this.privateRoundBlocks.has(pendingBlocks!)
             && pendingBlocks!.some((b) => b.type === 'text' && (b as { text?: string }).text?.trim())) {
-            flushedTurn.unpostedSpeech = true;
+            // A private round's words aren't speech left unposted, but the
+            // notice covers the turn's rounds, so it names them as private
+            // when another round's words were left unposted (#640 R2-1).
+            if (this.privateRoundBlocks.has(pendingBlocks!)) flushedTurn.privateSpeechKept = true;
+            else flushedTurn.unpostedSpeech = true;
           }
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id), tc.name)
@@ -23869,13 +23875,17 @@ export class AgentFramework {
         [{
           type: 'text',
           text: `[${NOTICE_TAG.speechNotPosted}] Nothing you wrote before your tool calls in the rounds just above was posted. ` +
-            `If any of it should go out, send it again.`,
+            (routing.privateSpeechKept
+              ? "What you wrote in a round that called think, or whose script hadn't returned, stays private under your " +
+                'same-round think policy, so leave it out; if anything else should go out, send it again.'
+              : 'If any of it should go out, send it again.'),
         }],
         { system: true, kind: 'speech-not-posted' } as MessageMetadata,
         undefined,
         present,
       );
       delete routing.unpostedSpeech;
+      delete routing.privateSpeechKept;
     } catch (err) {
       console.error(`[speech-not-posted] could not record the notice for ${agent.name}:`, err);
     }
@@ -29504,6 +29514,7 @@ export class AgentFramework {
             // Speech dispatch happens after but doesn't depend on the status
             // field.
             delete streamRouting.unpostedSpeech;
+            delete streamRouting.privateSpeechKept;
             agent.reset();
             if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, {
@@ -33153,6 +33164,7 @@ export class AgentFramework {
           if (skipping) {
             skipping.privateEnd = true;
             delete skipping.unpostedSpeech;
+            delete skipping.privateSpeechKept;
           }
           const wake = readSkipReplyWake(enrichedCall.input);
           if (wake.kind === 'wake' && this.eventGate) {
