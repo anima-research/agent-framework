@@ -666,7 +666,7 @@ describe("XML tools: a cut that leaves the last call's name undecided, under the
   // round is held from `<f` (or `<a`) on. A stream's first response gives no
   // such sign, and membrane reads a cut as inside a tool block only from the
   // whole opener, so there it routes, the tag's fragment with it (membrane's).
-  for (const tail of ['<function_call', '<f', '<function_cal'] as const) {
+  for (const tail of ['<function_call', '<f', '<function_cal', '<function_ca'] as const) {
     it(`keeps back a later round cut inside its opener's name (${tail}), after an XML round`, async () => {
       const run = await turn('xml', [XML_EAST_ROUND, { xml: `Private musing.\n\n${tail}`, stop: 'max_tokens' }], PRIVATE);
       assert.deepEqual(run.moves, [{ dir: 'east' }]);

@@ -23876,8 +23876,8 @@ export class AgentFramework {
           type: 'text',
           text: `[${NOTICE_TAG.speechNotPosted}] Nothing you wrote before your tool calls in the rounds just above was posted. ` +
             (routing.privateSpeechKept
-              ? "What you wrote in a round that called think, or whose script hadn't returned, stays private under your " +
-                'same-round think policy, so leave it out; if anything else should go out, send it again.'
+              ? 'What you wrote beside think in those rounds stays private under your same-round think policy, so leave it ' +
+                'out; if anything else should go out, send it again.'
               : 'If any of it should go out, send it again.'),
         }],
         { system: true, kind: 'speech-not-posted' } as MessageMetadata,
@@ -28407,6 +28407,10 @@ export class AgentFramework {
     // historical whole-turn routing so fallback-mode prose is still
     // delivered exactly once, at turn end.
     let liveProseRouting = false;
+    // A round of this stream came on membrane's XML tool path, which declares
+    // it can't carry injected messages: from then on a response cut inside a
+    // tool block's opener can be told from prose (#640 R2-3).
+    let xmlRoundSeen = false;
     // What the turn's first request had read, taken at its round: on the
     // fallback path the prose routed at the turn's end is the whole turn's,
     // so it's credited with this, which every round's words come after.
@@ -28778,11 +28782,9 @@ export class AgentFramework {
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
             // prefill path. The tool boundary reads it from the agent's state.
-            agent.enterWaitingForTools(
-              calls,
-              stream,
-              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages,
-            );
+            const carriesInjected = (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages;
+            if (carriesInjected === false) xmlRoundSeen = true;
+            agent.enterWaitingForTools(calls, stream, carriesInjected);
 
             // Speak-while-acting: route THIS round's prose to the locus NOW
             // instead of batching every segment to the end of the turn. Long
@@ -29293,7 +29295,9 @@ export class AgentFramework {
               }
             }
 
-            const cut = waitedAtComplete ? undefined : cutOffRound(response);
+            const cut = waitedAtComplete ? undefined : cutOffRound(response, {
+              partialOpener: xmlRoundSeen && requestSnapshot.sameRoundThinkTextPolicy === 'private',
+            });
             if (cut) response = { ...response, content: cut.content };
             const cutIds = new Set(cut?.calls.map((call) => call.id));
             const cutCalls = cut?.calls.map((call) => this.roundCallOf(agent.name, call, true)) ?? [];

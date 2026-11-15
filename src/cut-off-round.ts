@@ -31,7 +31,7 @@ export interface CutOffRound {
  * and the round begins after the last result that answers one of the
  * response's calls.
  */
-export function cutOffRound(response: NormalizedResponse): CutOffRound | undefined {
+export function cutOffRound(response: NormalizedResponse, opts: { partialOpener?: boolean } = {}): CutOffRound | undefined {
   if (response.stopReason !== 'max_tokens') return undefined;
   const callIds = new Set<string>();
   let start = 0;
@@ -39,7 +39,8 @@ export function cutOffRound(response: NormalizedResponse): CutOffRound | undefin
     if (block.type === 'tool_use') callIds.add(block.id);
     else if (block.type === 'tool_result' && callIds.has(block.toolUseId)) start = index + 1;
   });
-  const cut = response.details?.stop?.unclosedToolBlock ? cutToolBlock(response.content, start) : undefined;
+  const cut = response.details?.stop?.unclosedToolBlock ? cutToolBlock(response.content, start)
+    : opts.partialOpener ? cutPartialOpener(response.content, start) : undefined;
   const content = cut?.content ?? response.content;
   const uses = content.slice(start).filter((block): block is ContentBlock & { type: 'tool_use' } => block.type === 'tool_use');
   const calls = uses.map(({ id, name, input, unparseableInput }) => ({
@@ -86,6 +87,31 @@ function nextCallOf(tail: string): 'may' | 'not' | 'none' {
   if (at < 0 || tail.indexOf('>', at) >= 0) return 'none';
   const tag = tail.slice(at).replace(/\s+/g, ' ').trimEnd();
   return THINK_HEADS.some((head) => head.startsWith(tag)) ? 'may' : 'not';
+}
+
+const OPENERS = ['', 'antml:'].map((ns) => `<${ns}function_calls>`);
+
+/**
+ * A response that ended inside a tool block's opener before its name was
+ * whole (`<f` … `<function_calls`, or the `antml:` form from `<a`), which
+ * membrane doesn't read as a tool block (endsWithPartialToolBlock needs the
+ * whole name). Only for a stream already known to be on the XML path
+ * (cutOffRound's partialOpener): the round's last text loses the fragment,
+ * and no call was named.
+ */
+function cutPartialOpener(content: ContentBlock[], start: number): { content: ContentBlock[]; nextCall: 'none' } | undefined {
+  let index = content.length - 1;
+  while (index >= start && content[index]!.type !== 'text') index--;
+  if (index < start) return undefined;
+  const text = (content[index] as ContentBlock & { type: 'text' }).text;
+  const at = text.lastIndexOf('<');
+  const tail = text.slice(at);
+  if (at < 0 || tail.length < 2 || !OPENERS.some((opener) => opener.startsWith(tail))) return undefined;
+  const prose = text.slice(0, at);
+  return {
+    content: [...content.slice(0, index), ...(prose ? [{ type: 'text', text: prose } as ContentBlock] : []), ...content.slice(index + 1)],
+    nextCall: 'none',
+  };
 }
 
 function cutToolBlock(content: ContentBlock[], start: number): { content: ContentBlock[]; nextCall: 'may' | 'not' | 'none' } | undefined {

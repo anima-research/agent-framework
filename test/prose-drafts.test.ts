@@ -4070,7 +4070,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     // round's words went unposted and another's stayed private beside a
     // think, the notice says the private ones stay private.
     const PRIVATE = 'The words written beside a private think.';
-    const KEPT = 'What you wrote in a round that called think, or whose script hadn\'t returned, stays private under your same-round think policy, so leave it out; if anything else should go out, send it again.';
+    const KEPT = 'What you wrote beside think in those rounds stays private under your same-round think policy, so leave it out; if anything else should go out, send it again.';
     const MIXED_NOTICE = `${NOTICE} Nothing you wrote before your tool calls in the rounds just above was posted. ${KEPT}`;
     const PLAIN_NOTICE = `${NOTICE} Nothing you wrote before your tool calls in the rounds just above was posted. If any of it should go out, send it again.`;
     const mixedRounds = () => [
