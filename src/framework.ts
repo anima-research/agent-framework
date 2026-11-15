@@ -27980,7 +27980,10 @@ export class AgentFramework {
     // Fresh turns only: a context-budget restart continues the same logical
     // turn, and presenting there would insert messages between its rounds.
     // Before recordTurnCheckpoint: these are the turn's inputs, not its
-    // products — undoing the turn must not take them out.
+    // products, and an undo of the turn leaves them. A held call's retry
+    // (TURN_RETRY) is the exception: it presents what arrived during its hold
+    // but records no checkpoint after it, so an undo takes those rows out
+    // with the turn, and others' rows are presented again at the next start.
     // A clock row due (storeDueClock) goes ahead of the turn's inputs, so a
     // turn starts with a current clock, a silent heartbeat's tick (which
     // stores no row of its own) included, unless storeDueClock writes none:
@@ -28120,17 +28123,15 @@ export class AgentFramework {
       trigger = own;
     }
 
-    // Record turn checkpoint before inference (only on first attempt, not
-    // retries). A start that carries the logical turn on (continuesTurn)
-    // records none: a budget restart at a tool boundary, or a held call's
-    // retry (TURN_RETRY), each attempt 0 of a stream of its own, each took a
-    // checkpoint, so an undo after one took back only the rows since that
-    // start: the reply, with the round's tool call and its result left in
-    // the window (#1013). The turn's first start recorded the checkpoint the
-    // undo walks back to; a budget refusal of a continuation has none of its
-    // own to drop. The direct API's tool_results_ready keeps its checkpoint:
-    // that path (Agent.runInference) records none of its own, so this one is
-    // the only checkpoint the round has.
+    // Record the turn's checkpoint at its first start only. A later attempt
+    // of a start, and a start that carries the logical turn on (continuesTurn:
+    // a budget restart, a tool-result-guard retry, a held call's retry),
+    // record none, so an undo walks back to the turn's first start (#1013); a
+    // budget refusal of a continuation has none of its own to drop. A
+    // tool_results_ready that starts on its own records one: the direct API's
+    // round (Agent.runInference) records none, so it is that round's only
+    // checkpoint. Merged into a restart's or guard retry's batch, it starts as
+    // that request and its rows fall under that turn's checkpoint.
     let checkpoint: RecordedTurnCheckpoint | undefined;
     let compileBaseline: BudgetHoldBaseline | undefined;
     if (attempt === 0) {

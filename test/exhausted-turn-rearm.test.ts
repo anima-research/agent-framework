@@ -1051,25 +1051,24 @@ test("a turn ended by a throw outside its stream's failure handling ends its run
   assert.equal(alerts().length, 0, "the next turn's run starts with it");
 });
 
-test("an undo after a held call's retry takes the whole turn back: the retry records no checkpoint of its own (#1013)", async (t) => {
-  const membrane = new ScriptedMembrane((n) => (n === 1 ? statedWait(250) : undefined));
+test("an undo after a held call's retry takes the turn's tool round back with the reply (#1013)", async (t) => {
+  // The round runs, the stated wait holds the next call, and the retry answers:
+  // one logical turn. Before, the retry recorded a checkpoint of its own, so
+  // the undo took the reply alone and left the call and its result in the
+  // window (undoDepth 2, 1 row retracted, both tool blocks kept).
+  const membrane = new ScriptedMembrane((n) => (n === 1 ? 'tool round, then a stated wait' : undefined));
   const r = await resident(t, membrane);
   const cm = r.fw.getAgent('resident')!.getContextManager();
+  const toolBlocks = () => cm.getPresentedMessages().flatMap((m) => m.content)
+    .filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
   r.say('zz-question');
-  await waitFor(() => membrane.sends.length === 1 && r.admission().providerAdmission.heldRequests === 1, 'the first call held');
-  // The turn's first start has run and recorded its checkpoint (the message
-  // that woke it is before the checkpoint, as every turn's is); what the
-  // turn adds from here, through the retry, is what the undo takes back.
-  const before = cm.indexLength();
+  await waitFor(() => membrane.sends.length === 1 && r.admission().providerAdmission.heldRequests === 1, 'held after its tool round');
   t.mock.timers.tick(70 * 60_000);
   await waitFor(() => r.count('inference:completed') === 1, 'the retry to answer');
-  assert.equal(membrane.sends.length, 2, 'the retry was a second send');
+  assert.equal(toolBlocks(), 2, 'the round ran: its call and its result are in the window');
   assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 1, 'one logical turn, one checkpoint');
-  const added = cm.indexLength() - before;
-  assert.ok(added > 0, 'the turn added rows');
-  const undone = r.fw.undoLastTurn('resident');
-  assert.equal(undone.undone, true);
-  assert.equal(undone.window?.retracted, added, 'everything the turn added since its first start left the window');
+  assert.equal(r.fw.undoLastTurn('resident').undone, true);
+  assert.equal(toolBlocks(), 0, "the round's call and its result left with the reply");
   assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 0);
 });
 
