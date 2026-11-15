@@ -98,7 +98,7 @@ test('ambiguous admitted batch is unknown even in one channel; first and second 
     r.membrane.pushResponse(refused()); r.framework.pushEvent(incoming('C'));
     await r.framework.runUntilIdle(); await new Promise(resolve => setTimeout(resolve, 150));
     await r.framework.runUntilIdle();
-    assert.equal(r.signals.length, 2); assert.equal(r.signals[1].origin?.messageRef, 'C');
+    assert.equal(r.signals.length, 2); assert.equal(r.signals[1].origin, undefined, 'even a singleton gate batch answers no one message');
     assert.equal(alerts.length, 1, 'existing streak-two ops policy is unchanged');
     assert.notEqual(r.signals[0].turnId, r.signals[1].turnId);
   } finally { await r.close(); }
@@ -119,10 +119,12 @@ test('rewind-handled signal skips effects, unhandled retry retains original admi
   const r = await rig(true);
   try {
     r.membrane.pushResponse(refused()); r.membrane.pushResponse(refused());
-    r.framework.pushEvent(incoming('A'));
+    r.framework.pushEvent(incoming('A', undefined, { threadId: 'thread-A' }));
     await r.framework.runUntilIdle();
     assert.deepEqual(r.signals.map(s => s.rewind), ['handled', 'unhandled']);
     assert.deepEqual(r.signals.map(s => s.origin?.messageRef), ['A', 'A']);
+    assert.equal(r.signals[0].origin?.threadId, 'thread-A');
+    assert.deepEqual(r.signals[1].origin, r.signals[0].origin, 'rewindRetry carries binding and thread as well as the answer id');
   } finally { await r.close(); }
 });
 

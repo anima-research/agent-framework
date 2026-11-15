@@ -1,8 +1,8 @@
 # Experimental main-refusal bridge
 
 This experimental, optional API hands main-refusal reaction ownership to a host.
-Omission preserves the existing Discord special case (including its category
-map, last-resort behavior and no removal). Provider retry policy and the ops
+Omission retains the built-in Discord reaction (including its category map and
+no removal), now targeting the per-turn answer rather than the latest inbound message. Provider retry policy and the ops
 refusal-streak threshold are unchanged.
 
 `framework.getMainRefusalBridge()` returns a version-1 narrow facet:
@@ -11,7 +11,7 @@ refusal-streak threshold are unchanged.
   that framework. Only one owner is allowed. The returned disposer restores
   legacy ownership. Installing a Zulip driver does not imply this handover.
 - The handler receives a frozen `MainRefusal`: agent name, process-local agent
-  instance identity, logical turn id, category, frozen admission origin if known,
+  instance identity, logical turn id, category, frozen answer provenance if known,
   and `rewind: 'handled' | 'unhandled'`. Only the latter may produce a reaction.
 - `isCurrent(signal)` rejects a removed/replaced agent instance.
 - `serverBinding(id)` checks the original inbound source's endpoint binding;
@@ -34,33 +34,48 @@ stream branch), not behavior-proven by a direct call to a mock's `complete()`.
 
 ## Origin, not cause
 
-The framework takes an opaque message reference, server/endpoint binding,
-channel, and thread (if supplied) from its trusted ingestion envelope, **not** from
-message text, event UUIDs, routing winners, channel_open, or `incomingFor`.
-Direct wake branches use the actual admission decision. An ambient tag does not
-negate a real wake. Debounced/judged gate deliveries merge private admission
-marks over **all** batch events, independently of the gate's speech-locus winner
-(subject to the missing-provenance limitations below).
-Exactly one distinct known eligible scoped message can be named; two distinct
-messages or any unknown cause are ambiguous. Duplicate delivery of the same
-scoped message is one. Nonmessage markers, context-only traffic, and heartbeats
-cannot supply an effect target. An edit counts only on an admitted first view.
+The bridge derives its origin from the same per-turn `routing.answers` /
+`answersMessageId` used by the built-in reaction. The private admission mark
+only enriches that answer with endpoint binding and thread provenance; it
+cannot select a different message. These fields come from the trusted ingestion
+envelope, not message text, event UUIDs, channel_open, or `incomingFor`.
 
-An open turn keeps its snapshot despite new inbound messages, locus moves,
-resumes and provider/framework continuations. The main completion captures its
-agent/instance/turn snapshot before reset/settlement/terminal traces. Later
-reaction work does not look up a newer target.
+Direct message wakes (including wake onboarding) can name a message. An ambient
+tag does not negate a real wake. Gate batches — debounced, judged, or deferred —
+answer no single message, **even a singleton batch**. This includes a judged
+event answered while judging: moving its placement from `after` to `named`
+does not turn the batch into a direct-message wake.
+Merged wakes for distinct messages answer neither. Nonmessage markers,
+context-only traffic, and heartbeats supply no target. An edit counts only on
+an admitted first view.
 
-Conservative limitations: restored/foreign wakes without the private admission
-mark, deferred RFC-006 batches whose content is materialized at assembly rather
-than delivered as a marked wake, and incomplete gate provenance are unknown.
-Two additional paths currently lose the mark and therefore report unknown:
-wake onboarding, and judged events answered while judging (their placement moves
-from `after` to `named`, which the origin merge does not read).
-These are documented limitations, not changes to the origin model; reconciling
-that model with the per-turn answer model in #947 remains an owner decision.
-There is no reconstructed origin from stored text or the latest channel. This
-reports request processing status, not the culprit or cause of a refusal.
+An open turn keeps its answer despite new inbound messages, locus moves, and
+provider/framework continuations. Rewind retries (including unstick and
+inference-failure rewinds) carry the answer and its admission provenance through
+`rewindRetry`. A new inbound wake merged with a retry can clear the answer.
+An exhausted turn re-armed to speak in another channel clears the message
+answer, so neither owner path marks the old message there.
+
+Restored/foreign requests without trusted admission provenance can name an
+answer for internal routing but cannot supply the bridge's endpoint binding;
+their bridge origin remains unknown. There is no reconstruction from stored
+text or the latest channel. This reports the message answered, not the culprit
+or cause of a refusal. The main completion captures the answer before
+reset/settlement/terminal traces; later host work never looks up a newer target.
+
+## Relationship to #947
+
+This PR carries a minimal compatible subset of #947 at `1192bca9`: per-turn
+answers, their scheduler/rewind carry, gate-batch and re-arm policies, and answer-
+based built-in reactions. It is **not stacked** on that unmerged PR. Its separate
+delivery-anchor changes are not required by the bridge and are not included.
+#1018 can land without #947. If it lands first, #947 must drop its duplicate
+answer-routing hunks and retain the bridge's `answers.origin` / `rewindRetry`
+provenance extension. If #947 lands first, rebase #1018 over those same shared
+hunks before merging. This is semantic compatibility, not a promise that Git
+will resolve all overlapping edits automatically. Review #947's remaining
+anchor work separately. The public host facet remains
+version 1 with unchanged types and methods.
 
 ## Failure semantics
 

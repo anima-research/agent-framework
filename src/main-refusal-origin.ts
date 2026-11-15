@@ -7,7 +7,7 @@ const ORIGIN = Symbol('admitted-main-refusal-origin');
 type Mark = { [ORIGIN]?: MainRefusalOrigin };
 
 /** Mark only trusted admitted content. A mark confers no wake: it is consumed
- * only by a direct admission.wake branch or an actual gate batch delivery. */
+ * only by a direct wake (including onboarding). Gate batches answer no message. */
 export function admittedRefusalOrigin(source: InboundSource | undefined, tags?: readonly string[], firstView = false): Mark {
   if (!source || source.kind !== 'channel' || !source.messageId || !source.binding) return {};
   if (tags?.some(t => ['chat:reaction', 'chat:reaction-remove', 'chat:deleted', 'chat:system'].includes(t)
