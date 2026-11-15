@@ -660,13 +660,32 @@ describe("XML tools: a cut that leaves the last call's name undecided, under the
     assert.deepEqual(run.routed, ['Private musing.', NEXT]);
   });
 
-  // #640 R2-3: the rule starts at a whole `<function_calls` opener. Membrane
-  // reads a cut as inside a tool block only from there (endsWithPartialToolBlock),
-  // and a response cut sooner can't be told from prose here: the framework
-  // learns a turn is XML only from a round that has no roundContent. So these
-  // route, the tag's fragment with them (membrane's), under either policy.
+  // #640 R2-3: once a stream's earlier round came on membrane's XML path
+  // (which declares it can't carry injected messages), a cut inside the
+  // opener's own name is a tool block's too, so under the private policy the
+  // round is held from `<f` (or `<a`) on. A stream's first response gives no
+  // such sign, and membrane reads a cut as inside a tool block only from the
+  // whole opener, so there it routes, the tag's fragment with it (membrane's).
+  for (const tail of ['<function_call', '<f', '<function_cal'] as const) {
+    it(`keeps back a later round cut inside its opener's name (${tail}), after an XML round`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, { xml: `Private musing.\n\n${tail}`, stop: 'max_tokens' }], PRIVATE);
+      assert.deepEqual(run.moves, [{ dir: 'east' }]);
+      assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+    });
+  }
+
+  it("routes a later round's words when the cut leaves only a '<', after an XML round", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, ['First I step east.', 'Private musing.\n\n<', NEXT]);
+  });
+
+  it("routes a later round cut inside its opener's name under the public policy", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_call', stop: 'max_tokens' }]);
+    assert.deepEqual(run.routed, ['First I step east.', 'Private musing.\n\n<function_call', NEXT]);
+  });
+
   for (const tail of ['<function_call', '<'] as const) {
-    it(`routes a round cut before its opener is whole (${tail}), under the private policy too`, async () => {
+    it(`routes a stream's first response cut before its opener is whole (${tail}), under the private policy too`, async () => {
       const run = await turn('xml', [{ xml: `Private musing.\n\n${tail}`, stop: 'max_tokens' }], PRIVATE);
       assert.deepEqual(run.routed, [`Private musing.\n\n${tail}`, NEXT]);
     });
