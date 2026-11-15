@@ -284,6 +284,8 @@ function breakAfterToolRound(
     fromStart?: boolean;
     stopEnds?: 'aborted' | 'error' | 'silent' | 'throw';
     stream?: number;
+    /** The tool round of the stream that the break comes after (1 when unset); the rounds before it run as usual. */
+    round?: number;
     failure?: () => Error;
     beforeFailure?: () => void | Promise<void>;
   } = {},
@@ -296,8 +298,14 @@ function breakAfterToolRound(
     let resultsGiven = false;
     let cancelled = false;
     let wake: (() => void) | undefined;
+    let rounds = 0;
+    const breaking = () => rounds >= (opts.round ?? 1);
     return {
-      provideToolResults: () => { resultsGiven = true; wake?.(); },
+      provideToolResults: (...args: Parameters<YieldingStream['provideToolResults']>) => {
+        if (!breaking()) return inner.provideToolResults(...args);
+        resultsGiven = true;
+        wake?.();
+      },
       cancel: () => { cancelled = true; wake?.(); },
       get isWaitingForTools() { return !resultsGiven && inner.isWaitingForTools; },
       get pendingToolCallIds() { return resultsGiven ? [] : inner.pendingToolCallIds; },
@@ -311,6 +319,8 @@ function breakAfterToolRound(
         for await (const event of inner) {
           yield event;
           if (event.type !== 'tool-calls') continue;
+          rounds++;
+          if (!breaking()) continue;
           while (!resultsGiven && !cancelled) await new Promise<void>((resolve) => { wake = resolve; });
           if (how === 'error' && !cancelled) { await opts.beforeFailure?.(); yield failure(); return; }
           if (how === 'throw' && !cancelled) {
@@ -4051,6 +4061,71 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         assert.ok(!asks(h.membrane.calls[1]), "the continuation's request carries no notice");
         assert.deepEqual(notices(h), []);
         assert.equal(published(h, SPEECH).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
+    // #640 R2-1: one notice covers a turn's rounds, so in a turn where one
+    // round's words went unposted and another's stayed private beside a
+    // think, the notice says the private ones stay private.
+    const PRIVATE = 'The words written beside a private think.';
+    const KEPT = 'What you wrote in a round that called think, or whose script hadn\'t returned, stays private under your same-round think policy, so leave it out; if anything else should go out, send it again.';
+    const MIXED_NOTICE = `${NOTICE} Nothing you wrote before your tool calls in the rounds just above was posted. ${KEPT}`;
+    const PLAIN_NOTICE = `${NOTICE} Nothing you wrote before your tool calls in the rounds just above was posted. If any of it should go out, send it again.`;
+    const mixedRounds = () => [
+      createMockResponse([text(SPEECH), call('l1', 'channel_list', {})], 'tool_use'),
+      createMockResponse([text(PRIVATE), call('t1', 'think', { thought: 'hm' })], 'tool_use'),
+    ];
+
+    it("a failure after a mixed turn's private round names its words as private, not to be sent again", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, retries: 0, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        breakAfterToolRound(h.membrane, 'error', { round: 2 });
+        await h.turn(mixedRounds());
+        assert.equal(published(h, SPEECH).length, 0);
+        assert.equal(published(h, PRIVATE).length, 0);
+        assert.deepEqual(notices(h), [MIXED_NOTICE]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("a budget restart after a mixed turn's private round carries the private sentence in the continuation's request", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private', maxStreamTokens: 5 }] });
+      try {
+        const [first, second] = mixedRounds();
+        first!.usage = { inputTokens: 1, outputTokens: 1 };
+        onSecondStream(h.membrane, createMockResponse([text(AFTER)]));
+        await h.turn([first!, second!]);
+        assert.equal(h.membrane.calls.length, 2, 'premise: the stream restarted once, after the second round');
+        assert.ok(JSON.stringify(h.membrane.calls[1]?.messages ?? []).includes(KEPT), "the continuation's request names the private words");
+        assert.deepEqual(notices(h), [MIXED_NOTICE]);
+        assert.equal(published(h, PRIVATE).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("the same mixed turn under the public policy names all its words, with no private sentence", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, retries: 0 });
+      try {
+        breakAfterToolRound(h.membrane, 'error', { round: 2 });
+        await h.turn(mixedRounds());
+        assert.deepEqual(notices(h), [PLAIN_NOTICE]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("the native twin of the mixed turn posts the first round live and writes no notice", async () => {
+      const h = await harness({ roundPreamble: true, retries: 0, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        breakAfterToolRound(h.membrane, 'error', { round: 2 });
+        await h.turn(mixedRounds());
+        assert.equal(published(h, SPEECH).length, 1, "round 1's words went out live");
+        assert.equal(published(h, PRIVATE).length, 0);
+        assert.deepEqual(notices(h), []);
       } finally {
         await h.close();
       }
