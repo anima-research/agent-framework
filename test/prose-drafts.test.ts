@@ -4107,6 +4107,23 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
+    it("a later notice in the continuation names only its own rounds, once the restart's notice took the private sentence", async () => {
+      const h = await harness({ xml: true, roundPreamble: true, retries: 0, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private', maxStreamTokens: 5 }] });
+      try {
+        const [first, second] = mixedRounds();
+        first!.usage = { inputTokens: 1, outputTokens: 1 };
+        const later = createMockResponse([text(AFTER), call('l2', 'channel_list', {})], 'tool_use');
+        later.usage = { inputTokens: 1, outputTokens: 1 };
+        breakAfterToolRound(h.membrane, 'error', { stream: 2 });
+        onSecondStream(h.membrane, later);
+        await h.turn([first!, second!]);
+        assert.equal(h.membrane.calls.length, 2, 'premise: one restart, then the continuation failed after its round');
+        assert.deepEqual(notices(h), [MIXED_NOTICE, PLAIN_NOTICE]);
+      } finally {
+        await h.close();
+      }
+    });
+
     it("the same mixed turn under the public policy names all its words, with no private sentence", async () => {
       const h = await harness({ xml: true, roundPreamble: true, retries: 0 });
       try {
