@@ -12,14 +12,14 @@ import { TOOL_RESULT_GUARD_AUDIT_STATE } from '../src/tool-result-guard.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 
 type Block = { text: string } | { thinking: string } | { call: string; json: string[]; whole: boolean };
-type Reply = { blocks: Block[]; stop: 'max_tokens' | 'tool_use' | 'end_turn' } | { xml: string; stop: 'max_tokens' | 'stop_sequence' | 'end_turn' };
+type Reply = { blocks: Block[]; stop: 'max_tokens' | 'tool_use' | 'end_turn' } | { xml: string; stop: 'max_tokens' | 'stop_sequence' | 'end_turn' } | { fail: number };
 
 const NEXT = 'The next answer.';
 const RAN_NOT = "didn't run, because the response it was in was cut off at the output limit";
 const ADVICE = 'send less in one response';
 const UNNAMED = '[tool-boundary] Your response was cut off at the output limit inside a tool-call block, before any call in it was named, so nothing ran.';
 
-function sse(reply: Reply): string {
+function sse(reply: Exclude<Reply, { fail: number }>): string {
   const out: string[] = [];
   const event = (type: string, data: Record<string, unknown>) => out.push(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
   event('message_start', { message: { id: 'msg_test', type: 'message', role: 'assistant', model: 'test', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1 } } });
@@ -80,7 +80,7 @@ interface Run {
   audit: Array<Record<string, any>>;
 }
 
-async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}): Promise<Run> {
+async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: { registry?: boolean } = {}): Promise<Run> {
   const requests: string[] = [];
   const queue = [...replies];
   const server: Server = createServer((req, res) => {
@@ -94,6 +94,11 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       }
       requests.push(raw);
       const reply = queue.shift() ?? (mode === 'xml' ? { xml: NEXT, stop: 'end_turn' as const } : { blocks: [{ text: NEXT }], stop: 'end_turn' as const });
+      if ('fail' in reply) {
+        res.writeHead(reply.fail, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'test failure' } }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end(sse(reply));
     });
@@ -137,9 +142,11 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       return { success: true, endTurn: true, data: { skipped: true } };
     },
   };
-  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
-    get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
-  });
+  if (opts.registry !== false) {
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+      get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+    });
+  }
   const failedTraces: Run['failedTraces'] = [];
   framework.onTrace((event) => {
     if (event.type === 'tool:failed') failedTraces.push(event as Run['failedTraces'][number]);
@@ -691,4 +698,92 @@ describe("XML tools: a cut that leaves the last call's name undecided, under the
       assert.deepEqual(run.routed, [`Private musing.\n\n${tail}`, NEXT]);
     });
   }
+});
+
+// #640 R3: the same-round think policy's words in the configurations the R2
+// tests didn't vary: a framework with no channel registry (no MCPL servers),
+// a stream restarted after an XML round, and a cut that leaves its round's
+// words held without saying so.
+describe("the private think policy without a channel registry, across a restart, and when a cut holds a round", () => {
+  const PRIVATE = { sameRoundThinkTextPolicy: 'private' };
+  const SPEECH_NOT_POSTED = '[speech-not-posted]';
+  const PLAIN = 'If any of it should go out, send it again.';
+  const KEPT = 'stays private under your same-round think policy';
+  const XML_THINK_ROUND: Reply = { xml: 'Private musing.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  const notices = (run: Run) => run.rows.flatMap((row) => row.content)
+    .filter((block) => block.type === 'text' && String(block.text).startsWith(SPEECH_NOT_POSTED)).map((block) => String(block.text));
+
+  // R3-1: with no registry the private marks were set after the registry's
+  // return, so a private round read as speech left unposted.
+  it("a restart after a private think round writes no notice inviting its words out, with no registry", async () => {
+    const run = await turn('xml', [XML_THINK_ROUND], { ...PRIVATE, maxStreamTokens: 5 }, { registry: false });
+    assert.ok(run.requests.length >= 2, 'premise: the stream restarted after the round');
+    assert.ok(!run.requests[1]!.includes(PLAIN), 'the continuation does not ask for the private words again');
+    assert.deepEqual(notices(run).filter((n) => n.includes(PLAIN)), []);
+  });
+
+  it("a failure after a private think round writes no notice inviting its words out, with no registry", async () => {
+    const run = await turn('xml', [XML_THINK_ROUND, { fail: 400 }], { ...PRIVATE, retries: 0 }, { registry: false });
+    assert.deepEqual(notices(run).filter((n) => n.includes(PLAIN)), [], notices(run).join(' | '));
+  });
+
+  it("a failure after a mixed turn names the private round's words as private, with no registry", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, XML_THINK_ROUND, { fail: 400 }], { ...PRIVATE, retries: 0 }, { registry: false });
+    assert.equal(notices(run).length, 1, notices(run).join(' | '));
+    assert.ok(notices(run)[0]!.includes(KEPT), notices(run)[0]);
+  });
+
+  it("the public twin of the mixed failure names all its words, with no registry", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, XML_THINK_ROUND, { fail: 400 }], { retries: 0 }, { registry: false });
+    assert.equal(notices(run).length, 1, notices(run).join(' | '));
+    assert.ok(notices(run)[0]!.includes(PLAIN) && !notices(run)[0]!.includes(KEPT), notices(run)[0]);
+  });
+
+  // R3-2: a turn that has shown it is on the XML path stays so across its
+  // streams, so a restart's first response cut inside its opener is held.
+  it("keeps back a restart's first response cut inside its opener's name, after an XML round", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_call', stop: 'max_tokens' }], { ...PRIVATE, maxStreamTokens: 5 });
+    assert.ok(run.requests.length >= 3, 'premise: the stream restarted after the first round');
+    // A restart on the XML path leaves round 1's words to the restart's notice; only the next answer routes.
+    assert.deepEqual(run.routed, [NEXT]);
+    assert.ok(!replyTexts(run).some((t) => t.includes('<function_call')), replyTexts(run).join(' | '));
+  });
+
+  it("routes a restart's first response cut inside its opener under the public policy", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_call', stop: 'max_tokens' }], { maxStreamTokens: 5 });
+    assert.deepEqual(run.routed, ['Private musing.\n\n<function_call', NEXT]);
+  });
+
+  // R3-3: a round held because the cut left its next call undecided says so,
+  // beside the cut's notice or its refused results, since the agent may not
+  // have been writing beside think.
+  const HELD = "wasn't posted either";
+  const afterCut = (run: Run) => run.requests.slice(2).join('\n');
+  it("says the held round's words weren't posted when an unnamed cut holds them", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+    assert.ok(afterCut(run).includes(HELD), 'the agent is told its words were kept back');
+    assert.ok(!afterCut(run).includes('draft'), 'and is promised no draft');
+  });
+
+  it("says the held round's words weren't posted beside a named cut's refused results", async () => {
+    const run = await turn('xml', [{ xml: 'Heading north, everyone.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">north</parameter>\n</invoke>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+    assert.ok(run.requests[1]!.includes(HELD), 'the agent is told its words were kept back');
+  });
+
+  it("says nothing of held words when the cut's words were routed (a name that can't be think)", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north.\n\n<function_calls>\n<invoke name="robo', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words under the public policy", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }]);
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words when the cut call was think's own", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">h', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(!afterCut(run).includes(HELD));
+  });
 });
