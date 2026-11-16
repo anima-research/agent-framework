@@ -36182,7 +36182,7 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     return (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages()).some((m) => {
       const row = m.metadata as { messageId?: unknown; serverId?: unknown; channelId?: unknown } | undefined;
-      return row?.messageId !== undefined && row.messageId !== null && String(row.messageId) === answers.messageId
+      return isConversationalInjection(m.metadata) && row?.messageId !== undefined && row.messageId !== null && String(row.messageId) === answers.messageId
         && row.serverId === answers.channel.serverId && row.channelId === answers.channel.channelId;
     });
   }
