@@ -3370,6 +3370,17 @@ interface RewindRecord {
   removedIds: MessageId[];
 }
 
+/** How an agent's `/unstick` came out, as `unstick-outcome` answers it: at the
+ *  session's end, or at a turn that fails inside the session, which ends
+ *  nothing (`turn-failed`). Labels only: a refusal's category, a failed
+ *  turn's type and HTTP status, never a provider's sentence. */
+interface UnstickAnswer {
+  outcome: 'cleared' | 'gave-up' | 'turn-failed' | 'agent-ended' | 'host-stopped';
+  /** The turns the session had set aside when it answered. */
+  rewinds: number;
+  cause?: { kind: 'refusal'; category: string } | { kind: 'failure'; type?: string; status?: number };
+}
+
 interface Deferred<T> {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -4649,6 +4660,10 @@ export class AgentFramework {
     serverId: string;
     channelId: string;
   }> = new Map();
+  /** Each agent's kept `/unstick` answer, and the `unstick-outcome` requests
+   *  that wait for its next one (see answerUnstick). */
+  private unstickAnswers = new Map<string, UnstickAnswer>();
+  private unstickWaiters = new Map<string, Set<(answer: UnstickAnswer) => void>>();
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
@@ -13289,7 +13304,12 @@ export class AgentFramework {
     this.refusalStreak.delete(name);
     this.refusalRewinds.delete(name);
     this.rewindEpisode.delete(name);
-    if (this.forcedRewind.delete(name)) console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
+    const session = this.forcedRewind.get(name);
+    if (session) {
+      this.forcedRewind.delete(name);
+      console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
+      this.answerUnstick(name, { outcome: 'agent-ended', rewinds: session.removed.length });
+    }
   }
 
   /**
@@ -15225,6 +15245,21 @@ export class AgentFramework {
         `${category ? ` category=${logValue(category)}` : ''}`,
     );
     if (s.channelId) void this.postToChannel(s.serverId, s.channelId, content);
+    this.answerUnstick(agentName, success
+      ? { outcome: 'cleared', rewinds: n }
+      : { outcome: 'gave-up', rewinds: n, ...(category !== undefined ? { cause: { kind: 'refusal' as const, category } } : {}) });
+  }
+
+  /** Answer the agent's waiting `unstick-outcome` requests. A session's end
+   *  is kept for every request after it, until the agent's next `/unstick`;
+   *  a `turn-failed` is kept only when no request waits, until one takes it.
+   *  Either replaces what was kept. */
+  private answerUnstick(agentName: string, answer: UnstickAnswer): void {
+    const waiters = this.unstickWaiters.get(agentName);
+    this.unstickWaiters.delete(agentName);
+    if (answer.outcome !== 'turn-failed' || !waiters?.size) this.unstickAnswers.set(agentName, answer);
+    else this.unstickAnswers.delete(agentName);
+    for (const resolve of waiters ?? []) resolve(answer);
   }
 
   /** Best-effort send_message to a raw channel via a named MCPL server. */
@@ -15310,6 +15345,15 @@ export class AgentFramework {
    *   nudge — run inference on the current context with NO new events
    *   (see `nudgeAgent`).
    *
+   *   unstick-outcome — how the agent's `/unstick` came out, as labels
+   *   (UnstickAnswer). An `unstick` acknowledgement carries `outcome: true`
+   *   and `agentName`, the agent this request names. Each request is answered
+   *   once, at the next of the session's end or a turn that fails inside the
+   *   session, which ends nothing. An end is kept for every request after it,
+   *   until the agent's next `unstick`; a failed turn no request waited for
+   *   is kept for the first that comes. While it waits it holds back no
+   *   other command, and a stop answers it `host-stopped`.
+   *
    *   quiesce — enter host maintenance mode (issue #122): park wakes, pause
    *   MCPL data planes, drain in-flight turns (optionally `abandon` on
    *   timeout). Host-scoped, no agentName.
@@ -15374,6 +15418,13 @@ export class AgentFramework {
      *  outcome report is posted to the channel asynchronously. */
     started?: boolean;
     cap?: number;
+    /** For `unstick`: true, since `unstick-outcome` answers for it, with
+     *  `agentName`, the agent its session is on. For `unstick-outcome`: how
+     *  it came out (UnstickAnswer), with `rewinds` and `cause`. */
+    outcome?: true | UnstickAnswer['outcome'];
+    agentName?: string;
+    rewinds?: number;
+    cause?: UnstickAnswer['cause'];
     /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
      *  until resume rather than running. */
     quiesced?: boolean;
@@ -15390,6 +15441,7 @@ export class AgentFramework {
       params.command !== 'undo' &&
       params.command !== 'hide' &&
       params.command !== 'unstick' &&
+      params.command !== 'unstick-outcome' &&
       params.command !== 'nudge' &&
       params.command !== 'quiesce' &&
       params.command !== 'resume' &&
@@ -15500,6 +15552,29 @@ export class AgentFramework {
         `(server=${serverId}): ${released.length} wait(s) lifted`);
       return { ok: true, released };
     }
+    // unstick-outcome names its agent, as the unstick acknowledgement does,
+    // and is answered for an agent that has since ended.
+    if (params.command === 'unstick-outcome') {
+      const name = params.agentName;
+      if (typeof name !== 'string' || name === '') {
+        return { ok: false, error: 'unstick-outcome: agentName must name the agent, as the unstick acknowledgement does' };
+      }
+      const kept = this.unstickAnswers.get(name);
+      if (kept) {
+        if (kept.outcome === 'turn-failed') this.unstickAnswers.delete(name);
+        return { ok: true, ...kept };
+      }
+      const session = this.forcedRewind.get(name);
+      if (!session) return { ok: false, error: `unstick-outcome: ${name} has no /unstick to answer for` };
+      // The wait holds back no other command, and ends when a stop begins.
+      let resolve!: (answer: UnstickAnswer) => void;
+      const next = new Promise<UnstickAnswer>((r) => { resolve = r; });
+      this.unstickWaiters.set(name, (this.unstickWaiters.get(name) ?? new Set()).add(resolve));
+      const answer = await this.untilStopBegins(next);
+      if (answer) return { ok: true, ...answer };
+      this.unstickWaiters.get(name)?.delete(resolve);
+      return { ok: true, outcome: 'host-stopped', rewinds: session.removed.length };
+    }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
     if (!agentName || !this.agents.has(agentName)) {
@@ -15528,6 +15603,7 @@ export class AgentFramework {
       }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
+      this.unstickAnswers.delete(agentName);
       this.forcedRewind.set(agentName, {
         remaining: cap,
         removed: [],
@@ -15552,7 +15628,7 @@ export class AgentFramework {
         params: { cap },
         result: { started: true, ...(this.quiesced ? { quiesced: true } : {}) },
       });
-      return { ok: true, started: true, cap, ...(this.quiesced ? { quiesced: true } : {}) };
+      return { ok: true, started: true, cap, outcome: true, agentName, ...(this.quiesced ? { quiesced: true } : {}) };
     }
 
     // hide: redact a single message (or an inclusive range) from the active
@@ -35965,6 +36041,21 @@ export class AgentFramework {
     // what connectome-doctor reads. Legacy fields kept; `kind` and the
     // classification fields are additive.
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
+
+    // (1c) A turn that fails inside an `/unstick` session answers its waiting
+    // `unstick-outcome` with the labels, and ends nothing (acorn-2751).
+    const unstick = this.forcedRewind.get(agentName);
+    if (unstick) {
+      this.answerUnstick(agentName, {
+        outcome: 'turn-failed',
+        rewinds: unstick.removed.length,
+        cause: {
+          kind: 'failure',
+          ...(errorType !== undefined ? { type: errorType } : {}),
+          ...(httpStatus !== undefined ? { status: httpStatus } : {}),
+        },
+      });
+    }
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
