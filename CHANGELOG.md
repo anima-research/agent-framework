@@ -12,6 +12,22 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.33.3 — 2026-11-16
+
+### Added
+
+- `InferenceLogEntry` and `InferenceLogSummary` gain `errorWords`: the entry's `error` in the framework's words, with no provider's text, which `health--snapshot` shows. Entries written before this release have none.
+
+- `inference:exhausted` traces carry `shownReason`, the reason the `[inference-failed]` note may give, where the framework, membrane's progress bounds or context-manager wrote the failure's message. A trace listener gets it bounded as it gets `error`.
+
+### Changed
+
+- `health--snapshot` lists each recent failed inference in the framework's words, from the inference log's new `errorWords`, such as "the model call failed (invalid_request, HTTP 400)". In 0.33.2 it gave the log's `error`, the failure's message cut to 400 characters, which a provider can fill with anything. An entry written before this release shows `null`.
+- `gate_status` gives a failed reply judge's reason, as its rule's last verdict and in its note on a judge that keeps failing, in the framework's words, such as "the model call failed (server, HTTP 529)", or "the call failed" for an error the framework didn't write. The judge's own reasons, such as its timeout, read as before, except that an answer with no verdict reads "the judge's answer held no verdict", without the answer's stop reason or text, and a judge the gate times out reads as timed out even when it rejects as it's stopped. In 0.33.2 both gave the error's message. stderr still does, with the answer's stop reason and its text, cut to 120 characters with its head and tail kept. `ReplyJudge` rejects an answer with no verdict with those words as its message, and the stop reason and the text, cut to 120 characters with its head and tail kept, on the error's `detail`.
+- A script that a failed turn stops is given the failure in the framework's words as its reason, such as "the model call failed (invalid_request, HTTP 400)". In 0.33.2 it was given the failure's message. `runEphemeralToCompletion`'s rejection for a failed turn still carries the failure's own message.
+
+- A failed turn's `[inference-failed]` note gives a reason again where the framework, membrane's progress bounds or context-manager wrote the failure's message: a progress bound's cut, whose message names the bound that ran out and the host's setting for it; a compile that context-manager refuses; and a stream's abort, as "Stream aborted: <reason>". The reason follows the note's account of the turn, after "Reason:", cut to 600 characters. In 0.33.2 the note gave no reason for these. Every other failure's note still gives none, since a provider can fill its message with anything, and so does a deadline expiry that membrane throws, whose message names no bound.
+
 ## 0.33.2 — 2026-11-16
 
 ### Changed
