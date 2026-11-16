@@ -264,6 +264,12 @@ export function assertAgentSwitches(config: AgentConfig): void {
     '\'transcript\' or leaving it out sends the rounds of an agent it observes as a line per call and result, ' +
       'without their thinking, and \'raw\' sends them as stored',
   );
+  assertOneOfSetting(
+    `${agent} sameRoundSkipReplyTextPolicy`,
+    config.sameRoundSkipReplyTextPolicy,
+    ['private', 'ask'],
+    '\'private\' or leaving it out keeps text beside skip_reply private, and \'ask\' holds it as a draft and asks once where it goes',
+  );
   resolveAutoContinue(config);
 }
 

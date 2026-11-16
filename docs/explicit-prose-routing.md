@@ -46,8 +46,9 @@ them the same way.
   provider-capacity hold defers the turn to. A round kept private (one that
   calls `skip_reply`, or has a same-round private think) sets no target,
   except that under `sameRoundSkipReplyTextPolicy: 'ask'` a round that calls
-  `skip_reply` sets the target its envelopes name, and what it would have
-  posted or bounced is held as a draft. A
+  `skip_reply`, with no same-round private think, sets the target its
+  envelopes name, and what it would have posted or bounced is held as a
+  draft. A
   target its server declared inbound-only is refused and clears the turn's
   target, so later unprefixed segments bounce until a new `>>` target.
   Cross-turn, nothing is implicit.

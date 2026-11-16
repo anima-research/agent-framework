@@ -23401,9 +23401,10 @@ export class AgentFramework {
    * the same native round, where that policy applies: an XML-mode round has
    * no verbatim content to route live, so its prose is routed at the turn's
    * end as ordinary speech) keeps it private —
-   * counted for the receipt, never drafted. `segments` are the runs exactly
-   * as written (splitProseRuns), so a draft keeps the resident's words byte
-   * for byte. What it holds, keeps or moves is the round's turn's
+   * counted for the receipt, never drafted, but where `round.skipHold` asks
+   * for a skip_reply round's text as drafts (sameRoundSkipReplyTextPolicy).
+   * `segments` are the runs exactly as written (splitProseRuns), so a draft
+   * keeps the resident's words byte for byte. What it holds, keeps or moves is the round's turn's
    * (round.routing), whenever the hold runs. Hybrid speech under a send goes
    * through routeSilencedHybrid.
    */
@@ -23449,6 +23450,7 @@ export class AgentFramework {
     round: ProseRound,
     locus: ChannelRef | null,
     when: number | 'end' | 'turn',
+    keptBy?: SendsReached,
   ): Promise<boolean> {
     if (segments.length === 0) return false;
     const routing = round.routing;
@@ -23540,12 +23542,13 @@ export class AgentFramework {
     let heldAny = false;
     for (const { hold: sendHold, target, parts } of runs) {
       const at = target ? { target } : {};
+      const kept = sendHold === 'skip' && !!keptBy && !!sendHoldAt(keptBy, target);
       const held = sendHold === 'skip'
-        ? this.holdProseDrafts(agent, parts, 'skip-reply', { ...round, ...at })
+        ? this.holdProseDrafts(agent, kept ? parts.filter((p) => p.deliberate) : parts, 'skip-reply', { ...round, ...at })
         : draftsCause
           ? this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because: this.sendHoldText(sendHold, target, when), ...at })
           : this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because: this.sendHoldText(sendHold, target, when), ...at });
-      if (draftsCause) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
+      if (draftsCause || kept) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
       heldAny = held.length > 0 || heldAny;
     }
     // The turn's receipt names them by their state at turn end; each was
@@ -29635,7 +29638,10 @@ export class AgentFramework {
               const draftsCause = draftsRound
                 && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
-              const skipHeld = skipAsks && !hasSameRoundPrivateThink && calls.some((c) => c.cause === 'private') ? [] as SkipHeld[] : undefined;
+              const unskipped = draftsCause ? mergeSilence(before, roundSilenceOf(calls.filter((c) => c.cause !== 'private'), toolRound)) : null;
+              const keptBy = unskipped && unskipped !== 'private' ? unskipped : undefined;
+              const keptAtLocus = !!keptBy && turnProseRouting !== 'hybrid' && turnProseRouting !== 'explicit' && !!sendHoldAt(keptBy, roundLocus);
+              const skipHeld = skipAsks && !hasSameRoundPrivateThink && !keptAtLocus && calls.some((c) => c.cause === 'private') ? [] as SkipHeld[] : undefined;
               const skipFields = skipHeld ? { skipHold: skipHeld, ...(askingCall ? { notice: 'later' as const } : {}) } : {};
               if (roundSegments.length === 0 || !skipHeld) settleAsk([]);
               if (roundSegments.length === 0) return;
@@ -29649,7 +29655,7 @@ export class AgentFramework {
                   chainSpeech(
                     routingSpeech(async () => {
                       try {
-                        await this.routeSilencedHybrid(agent, roundRuns, 'skip', false, { ...holdOpts, ...skipFields }, roundLocus, toolRound);
+                        await this.routeSilencedHybrid(agent, roundRuns, 'skip', false, { ...holdOpts, ...skipFields }, roundLocus, toolRound, keptBy);
                       } finally {
                         settleAsk(skipHeld);
                       }
@@ -29680,9 +29686,10 @@ export class AgentFramework {
                 // silencing does not apply: unprefixed prose bounces, and
                 // prefixed prose is deliberate. skip_reply does: its round's
                 // envelopes all stay in the context (deliverProseEnvelope's
-                // keepPrivate), as the tool promises, and skip_reply then
-                // ends the turn at this round's tool results, unless it was
-                // refused, when the turn goes on to its next round.
+                // keepPrivate), as the tool promises, or under
+                // sameRoundSkipReplyTextPolicy 'ask' are held (skipHold), and
+                // skip_reply then ends the turn at this round's tool results,
+                // unless it was refused, when the turn goes on to its next round.
                 if (!hasSameRoundPrivateThink) {
                   const keepPrivate = toolNames.some((n) => bareToolName(n) === 'skip_reply');
                   console.error(
@@ -29790,12 +29797,14 @@ export class AgentFramework {
             for (const call of calls) {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
-              // `started` goes out once dispatch returns. Refusal sites inside
-              // dispatch run synchronously and call refuse() first, so a call
-              // the host refuses produces no events.
+              // `started` goes out once dispatch returns, or for a skip_reply
+              // the guard asks about, once its answer runs it. Refusal sites
+              // inside dispatch run synchronously and call refuse() first, as
+              // the guard's refusal does, so a call the host refuses produces
+              // no events.
               this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call, streamRouting.turnId);
-              this.toolLifecycleEmitter?.open(agent.name, call.id);
+              if (call !== calls[askingAt]) this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             if (scriptCallIds.length === 0 && sendCallIds.length === 0) routeRound(roundCalls);
@@ -33674,8 +33683,9 @@ export class AgentFramework {
       "to end it and keep the draft, call skip_reply again, with wake_in_seconds again if you set a wake. " +
       "A line meant only for yourself fits in skip_reply's reason.";
     console.error(`[skip-reply] agent=${agentName} skip_reply refused once (sameRoundSkipReplyTextPolicy=ask): its round's text is held as ${drafts.map((d) => d.id).join(', ')}`);
+    const result = this.refusedResult(agentName, call.id, error);
     this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
-    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels', result: { success: false, error, isError: true } });
+    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels', result });
   }
 
   private toolRoute(call: ToolCall, actor: string | undefined): ToolRoute {
@@ -33927,8 +33937,13 @@ export class AgentFramework {
           this.skipReplyAsks.delete(key);
           if (asked) {
             void asked.then((held) => {
-              if (held.length > 0) this.refuseSkipReplyOnce(agentName, enrichedCall, held);
-              else this.runSkipReply(agentName, enrichedCall);
+              if (!this.agents.get(agentName)?.getPendingToolIds().includes(enrichedCall.id)) return;
+              if (held.length > 0) {
+                this.refuseSkipReplyOnce(agentName, enrichedCall, held);
+                return;
+              }
+              this.toolLifecycleEmitter?.open(agentName, enrichedCall.id);
+              this.runSkipReply(agentName, enrichedCall);
             });
           } else {
             this.runSkipReply(agentName, enrichedCall);
