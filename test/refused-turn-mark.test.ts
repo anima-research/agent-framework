@@ -566,6 +566,15 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     });
   }
 
+  it('a refused first round\'s retry, where a reaction to its message is still in what the agent is sent: a reaction isn\'t the message, so the turn speaks in the other message\'s channel', async (t) => {
+    const r = await rig(t, rewinding);
+    r.f.framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: 'a reaction to m-a' }], { serverId: 'editor', channelId: ROOM, messageId: 'm-a', tags: ['chat:reaction'] });
+    r.f.present();
+    const seen = await heldRefusal(r, [refusal()]);
+    assert.ok(!seen.hasA && seen.hasB && seen.sent.includes('a reaction to m-a'), 'premise: the retry\'s request shows m-b and the reaction, and not m-a');
+    assert.equal(seen.post?.channelId, GENERAL);
+  });
+
   it('a retry after a refused tool round on a stream that takes injected messages, merged with an addressed wake from another channel queued while it ran: the other message joins the refused round and the rewind sets it aside, so the turn speaks in the retry\'s channel', async (t) => {
     const r = await rig(t, { ...rewinding, ...lookup });
     const call = { type: 'tool_use', id: 'look-1', name: 'mcpl--editor--lookup', input: {} } as ContentBlock;
@@ -808,6 +817,31 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await eventually(() => r.stored('m-c'), 'm-c stored while the retry is alive');
     release();
     await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the breaker')), 'the retry\'s answer published');
+    const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the breaker'));
+    assert.equal(post?.channelId, ROOM);
+  });
+
+  it('the poison-history breaker\'s retry speaks in the failed message\'s channel, though silent heartbeat starts failed after it', async (t) => {
+    const r = await rig(t, { framework: { gate: QUIET_AMBIENT } as never });
+    await r.answered(ROOM, 'm-1');
+    r.streams.push(() => new FailedCall(), () => new FailedCall(), () => new FailedCall(),
+      () => new MockYieldingStream([answer('the answer after the breaker')]));
+    const before = r.f.membrane.calls.length;
+    await r.incoming(ROOM, 'm-2');
+    await eventually(() => r.f.membrane.calls.length === before + 1, 'the failed turn for m-2');
+    await r.f.framework.runUntilIdle();
+    for (const tick of ['hb-1', 'hb-2']) {
+      const at = r.f.membrane.calls.length;
+      (r.f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+        suppressProse: true, silentHeartbeat: { eventId: tick, serverId: 'heartbeat' },
+      });
+      await eventually(() => r.f.membrane.calls.length === at + 1, `the failed silent start ${tick}`);
+      await r.f.framework.runUntilIdle();
+    }
+    await eventually(() => r.f.membrane.calls.length === before + 4, "the breaker's retry ran");
+    await r.f.framework.runUntilIdle();
+    assert.ok(r.f.context().includes('[turns-set-aside]'), 'premise: the breaker set turns aside');
     const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the breaker'));
     assert.equal(post?.channelId, ROOM);
   });
