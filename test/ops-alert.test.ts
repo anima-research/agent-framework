@@ -16,6 +16,7 @@ function makeHarness() {
   fw.refusalStats = new Map();
   fw.refusalStreak = new Map();
   fw.consecutiveInferenceFailures = new Map<string, number>();
+  fw.breakerProbes = new Set();
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
   fw.lastInferenceAt = new Map<string, object>();

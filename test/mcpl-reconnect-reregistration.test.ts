@@ -107,6 +107,7 @@ async function makeHarness() {
   fw.operatorOperations = new Set();
   fw.traceListeners = [];
   fw.consecutiveInferenceFailures = new Map();
+  fw.breakerProbes = new Set();
   fw.exhaustionRewinds = new Map();
   fw.agents = new Map();
   fw.mcplTools = [];
