@@ -27,7 +27,7 @@
 
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
-import type { JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
+import type { FailedLastTurn, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
 export class JudgeFailure extends Error {
   readonly detail?: string;
@@ -94,6 +94,10 @@ export interface ReplyJudgeDeps {
    *  timers the request carries: wakes the framework has queued or holds. A
    *  provider that throws counts as knowing of none. */
   upcomingWakes?: (agentName: string) => UpcomingWake[] | Promise<UpcomingWake[]>;
+  /** The agent's last turn, when it failed and no turn has started since:
+   *  the judge is then told that what woke it may be unanswered. A provider
+   *  that throws counts as no failed turn. */
+  failedLastTurn?: (agentName: string) => FailedLastTurn | undefined;
 }
 
 /** One message of the agent's context, rendered. */

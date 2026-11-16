@@ -675,6 +675,72 @@ test("a judge rule's wake while the agent waits is judged as usual, and the judg
   assert.ok(Number(when[1]) >= leastLeft && Number(when[1]) <= mostLeft, `and when it comes: in ${when[1]} s, between ${leastLeft} and ${mostLeft}`);
 });
 
+async function judgedResident(t: TestContext, membrane: ScriptedMembrane) {
+  const dir = mkdtempSync(join(tmpdir(), 'turn-rearm-gate-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return resident(t, membrane, { exhaustedTurnRearmMs: false, gate: { configPath: join(dir, 'gate.json'),
+    config: { policies: [{ name: 'judged', match: {}, behavior: { judge: { debounceMs: 100 } } }] } } });
+}
+const judgeWasTold = (request: NormalizedRequest) => request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join('\n');
+const FAILED_TURN_LINE = /<if_you_wait>\nresident's last turn, \d+s ago, failed and may not have answered all of what woke it\.\n/;
+const ANY_FAILED_TURN_LINE = /last turn, \d+[sm] ago, failed/;
+
+test("a turn that did nothing and failed: the judge's next request opens what waiting leaves with the failed turn", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : undefined));
+  const r = await judgedResident(t, membrane);
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 1, 'the turn to end exhausted');
+  assert.equal(membrane.judged.length, 1);
+  assert.doesNotMatch(judgeWasTold(membrane.judged[0]!), ANY_FAILED_TURN_LINE, 'premise: before the failure the judge is told of none');
+  assert.equal(r.markers(), 0, 'premise: a turn that did nothing writes the agent no note');
+  r.say('zz-second');
+  await waitFor(() => membrane.judged.length === 2, 'the next batch to go to the judge');
+  assert.match(judgeWasTold(membrane.judged[1]!), FAILED_TURN_LINE);
+});
+
+test("a turn started after the failure: the judge's next request isn't told of the failure", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : undefined));
+  const r = await judgedResident(t, membrane);
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 1, 'the turn to end exhausted');
+  r.say('zz-second');
+  await waitFor(() => r.count('inference:completed') === 1, 'the judged wake to start a turn that answers');
+  assert.match(judgeWasTold(membrane.judged[1]!), FAILED_TURN_LINE, 'premise: the batch before that turn was told of the failure');
+  r.say('zz-third');
+  await waitFor(() => membrane.judged.length === 3, 'the next batch to go to the judge');
+  assert.doesNotMatch(judgeWasTold(membrane.judged[2]!), ANY_FAILED_TURN_LINE);
+});
+
+for (const silent of [false, true]) {
+  test(`a ${silent ? 'silent ' : ''}start that throws before its stream, at its turn checkpoint, is a failed last turn the judge is told of`, async (t) => {
+    const membrane = new ScriptedMembrane(() => undefined);
+    const r = await judgedResident(t, membrane);
+    const internal = r.fw as unknown as {
+      recordTurnCheckpoint(agentName: string): unknown;
+      activeTurnTriggers: Map<string, { suppressProse?: boolean } | undefined>;
+    };
+    const record = internal.recordTurnCheckpoint.bind(r.fw);
+    let suppressed: boolean | undefined;
+    let threw = false;
+    internal.recordTurnCheckpoint = () => {
+      internal.recordTurnCheckpoint = record;
+      suppressed = internal.activeTurnTriggers.get('resident')?.suppressProse;
+      threw = true;
+      throw new Error('zz checkpoint refused');
+    };
+    if (silent) queue(r, { reason: 'zz-silent-tick', suppressProse: true });
+    else r.say('zz-question');
+    await waitFor(() => threw, 'the start to throw at its checkpoint');
+    assert.equal(suppressed === true, silent, "premise: the failing start's trigger kept suppressProse when it had it");
+    assert.equal(membrane.sends.length, 0, 'premise: the start threw before sending anything');
+    assert.equal(r.count('inference:exhausted'), 0, 'premise: no inference failed');
+    const before = membrane.judged.length;
+    r.say('zz-second');
+    await waitFor(() => membrane.judged.length === before + 1, 'the next batch to go to the judge');
+    assert.match(judgeWasTold(membrane.judged[before]!), FAILED_TURN_LINE);
+  });
+}
+
 test("a message stored in the residents' shared slot starts the count again for each resident that reads it", async (t) => {
   const membrane = new ScriptedMembrane(() => serverError);
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100], agents: [
