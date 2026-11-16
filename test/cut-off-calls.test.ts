@@ -763,7 +763,8 @@ describe("the private think policy without a channel registry, across a restart,
     const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
     assert.deepEqual(run.routed, ['First I step east.', NEXT]);
     assert.ok(afterCut(run).includes(HELD), 'the agent is told its words were kept back');
-    assert.ok(!afterCut(run).includes('draft'), 'and is promised no draft');
+    const notice = run.rows.flatMap((row) => row.content).map((block) => String(block.text ?? '')).find((text) => text.includes(HELD));
+    assert.ok(notice && !/draft/i.test(notice), `and is promised no draft: ${notice}`);
   });
 
   it("says the held round's words weren't posted beside a named cut's refused results", async () => {
