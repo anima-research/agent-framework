@@ -529,7 +529,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     const sent = JSON.stringify(r.f.membrane.calls[1]!.messages);
     assert.ok(retries.length === 1 && retries[0], 'premise: getPendingRequests() showed the queued retry once');
     const injected = JSON.stringify(held.receivedToolResultOptions).includes('message m-b');
-    return { hasA: sent.includes('message m-a'), hasB: sent.includes('message m-b'), injected, post: r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind')), retry: retries[0]! };
+    return { sent, hasA: sent.includes('message m-a'), hasB: sent.includes('message m-b'), injected, post: r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind')), retry: retries[0]! };
   };
 
   it('a refused first round\'s retry merged with an addressed wake from another channel queued while it ran: the rewind set the retry\'s message aside, so the turn speaks in the other message\'s channel', async (t) => {
@@ -538,6 +538,17 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.ok(!seen.hasA && seen.hasB, 'premise: the retry\'s request shows m-b and not m-a');
     assert.equal(seen.post?.channelId, GENERAL);
   });
+
+  for (const [where, row] of [['another server', { serverId: 'other', channelId: ROOM }], ['another channel', { serverId: 'editor', channelId: GENERAL }]] as const) {
+    it(`a refused first round's retry, where a row from ${where} has its message's id: the rewind set the retry's message aside, so the turn speaks in the other message's channel`, async (t) => {
+      const r = await rig(t, rewinding);
+      r.f.framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: 'the same id elsewhere' }], { ...row, messageId: 'm-a' });
+      r.f.present();
+      const seen = await heldRefusal(r, [refusal()]);
+      assert.ok(!seen.hasA && seen.hasB && seen.sent.includes('the same id elsewhere'), 'premise: the retry\'s request shows m-b and the other row with m-a\'s id, and not m-a');
+      assert.equal(seen.post?.channelId, GENERAL);
+    });
+  }
 
   it('a retry after a refused tool round on a stream that takes injected messages, merged with an addressed wake from another channel queued while it ran: the other message joins the refused round and the rewind sets it aside, so the turn speaks in the retry\'s channel', async (t) => {
     const r = await rig(t, { ...rewinding, ...lookup });
