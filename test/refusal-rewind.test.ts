@@ -208,6 +208,44 @@ const markerOf = (request: NormalizedRequest) => {
   return said.includes('[refusal-rewind]') ? said : undefined;
 };
 
+test("a refusal's rewind tells the agent its turns couldn't be completed, with no filter or category after its tag, and the record keeps the category", async () => {
+  const SENTINEL = 'zz-provider-category-7f3a';
+  const refusal = { ...refused(), raw: { request: {}, response: { stop_details: { category: SENTINEL } } } } as unknown as NormalizedResponse;
+  const rig = await rewindRig([[], [refusal]], { autoRewind: true, maxRewinds: 3 });
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 3);
+    assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
+    const retry = rig.requests[2]!;
+    const marker = markerOf(retry) ?? '';
+    const opening = '[refusal-rewind] ';
+    assert.ok(marker.includes(
+      `${opening}The 1 most recent turn(s) were set aside because the requests that carried them couldn't be completed. ` +
+      "Their content isn't shown here, and the originals remain in the raw record. You are clear to continue",
+    ), marker);
+    assert.doesNotMatch(marker.replace(opening, ''), /refus|filter|categor/i);
+    assert.ok(!rig.texts(retry).some((t) => t.includes(SENTINEL)), 'the retry carries none of the category');
+    const row = rig.stored().find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
+    assert.equal((row?.metadata as { category?: string } | undefined)?.category, SENTINEL, 'the record keeps it');
+  } finally { await rig.close(); }
+});
+
+test("an unstick that gives up tells its channel its requests couldn't be completed, and only stderr names the category", () => {
+  const SENTINEL = 'zz-provider-category-7f3a';
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.forcedRewind = new Map([['scout', { remaining: 0, removed: [{ descriptor: 'an incoming message from simulect (7 chars)' }], serverId: 'srv', channelId: 'room' }]]);
+  const posted: string[] = [];
+  fw.postToChannel = async (_serverId: string, _channelId: string, content: string) => { posted.push(content); };
+  const errs: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => { errs.push(args.map(String).join(' ')); };
+  try {
+    fw.finishUnstick('scout', false, SENTINEL);
+  } finally { console.error = orig; }
+  assert.deepEqual(posted, ["⚠️ Couldn't unstick **scout** — its requests still couldn't be completed after 1 rewind(s).\n• an incoming message from simulect (7 chars)"]);
+  assert.ok(errs.some((line) => line.startsWith('[unstick] agent=scout gave up') && line.includes(SENTINEL)), errs.join('\n'));
+});
+
 for (const partial of [undefined, 'Here is the start of an answer']) {
   const kind = partial ? ', with partial text on the refused reply' : '';
   test(`after one refusal on a message${kind}, the retry doesn't carry that message and the marker says 1`, async () => {

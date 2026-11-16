@@ -253,6 +253,7 @@ interface Turn {
   arrivals: number[];
   traces: Array<{ type: string; error?: unknown }>;
   markers: string[];
+  reasons: unknown[];
   errors: Error[];
   idle: boolean;
   endedAt: number;
@@ -289,9 +290,10 @@ async function turn(plays: Play[], options: { openai?: boolean; inferenceBounds?
     }
     idle = (await within(fw.runUntilIdle().then(() => 'idle' as const), options.waitMs ?? 15_000)) === 'idle';
     const endedAt = Date.now();
-    const rows = (fw.getAgent('resident')!.getContextManager() as unknown as { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> }).getAllMessages();
+    const rows = (fw.getAgent('resident')!.getContextManager() as unknown as { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }>; metadata?: { kind?: string; reason?: unknown } }> }).getAllMessages();
     const markers = rows.flatMap((row) => row.content).flatMap((block) => block.type === 'text' && block.text?.startsWith('[inference-failed]') ? [block.text] : []);
-    return { requests: stand.requests(), arrivals: [...stand.arrivals], traces, markers, errors, idle, endedAt, stoppedInWait, requestsWhenStopped };
+    const reasons = rows.flatMap((row) => row.metadata?.kind === 'inference-failed' ? [row.metadata.reason] : []);
+    return { requests: stand.requests(), arrivals: [...stand.arrivals], traces, markers, reasons, errors, idle, endedAt, stoppedInWait, requestsWhenStopped };
   } finally {
     console.error = error;
     await fw.stop();
@@ -458,11 +460,14 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     }
   });
 
-  it('a turn its cuts end tells the agent the call timed out, that the call was made again and timed out again, why, the host setting for that bound, and that a reply still owed can be given now', async () => {
+  it('a turn its cuts end tells the agent the call timed out, that the call was made again and timed out again, and that a reply still owed can be given now; why, with the host setting for that bound, is in the note\'s metadata', async () => {
     const t = await turn(['quiet-before-content']);
     assert.equal(t.markers.length, 1);
-    assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call timed out and produced no response, so nothing was sent\. The call was made again, and it timed out again\. Reason: No content within 0\.3s of the send/);
-    assert.match(t.markers[0]!, /\(the host's setting for this bound: `inferenceBounds\.progressBounds\.beforeContentMs`\)\. If a reply is still owed from that turn, you can give it now\.$/);
+    assert.equal(t.markers[0], '[inference-failed] Your previous turn did not complete: the model call timed out and produced no response, so nothing was sent. ' +
+      'The call was made again, and it timed out again. If a reply is still owed from that turn, you can give it now.');
+    assert.equal(t.reasons.length, 1);
+    assert.match(String(t.reasons[0]), /^No content within 0\.3s of the send/);
+    assert.match(String(t.reasons[0]), /\(the host's setting for this bound: `inferenceBounds\.progressBounds\.beforeContentMs`\)$/);
   });
 
   it('a host schedule that gives a deadline expiry two fresh calls says the call was made again, with no count', async () => {
@@ -470,7 +475,7 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     const t = await turn(['quiet-before-content', 'quiet-before-content', 'quiet-before-content', 'whole'], { retries });
     assert.equal(t.requests, 3);
     assert.equal(t.markers.length, 1);
-    assert.match(t.markers[0]!, /so nothing was sent\. The call was made again, and it timed out again\. Reason: /);
+    assert.match(t.markers[0]!, /so nothing was sent\. The call was made again, and it timed out again\. If a reply/);
     assert.doesNotMatch(t.markers[0]!, /once more|more times/);
   });
 
@@ -478,7 +483,8 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     const t = await turn(['quiet-before-content', 'error500', 'quiet-before-content', 'quiet-before-content', 'whole']);
     assert.equal(t.requests, 4, 'a cut, its fresh call\'s 500, a retry cut, and that cut\'s fresh call cut too');
     assert.equal(t.markers.length, 1);
-    assert.match(t.markers[0]!, /so nothing was sent\. The call was made again, and it timed out again\. Reason: No content within 0\.3s of the send/);
+    assert.match(t.markers[0]!, /so nothing was sent\. The call was made again, and it timed out again\. If a reply/);
+    assert.match(String(t.reasons[0]), /^No content within 0\.3s of the send/);
     assert.doesNotMatch(t.markers[0]!, /once more|more times/);
   });
 
@@ -486,7 +492,7 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     const t = await turn(['error408']);
     assert.equal(t.requests, 3);
     assert.equal(t.markers.length, 1);
-    assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call timed out \(timeout, HTTP 408\) and produced no response, so nothing was sent\. Reason: /);
+    assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: the model call timed out \(timeout, HTTP 408\) and produced no response, so nothing was sent\. If a reply/);
     assert.doesNotMatch(t.markers[0]!, /made again/);
     assert.match(t.markers[0]!, /\. If a reply is still owed from that turn, you can give it now\.$/);
   });
@@ -496,7 +502,8 @@ describe('inference bounds: a stalled turn call ends at its bound', () => {
     assert.equal(t.requests, 3);
     assert.equal(t.markers.length, 1);
     assert.match(t.markers[0]!, /^\[inference-failed\] Your previous turn did not complete: its last call timed out\. The call was made again, and it timed out again\. Its earlier rounds ran, and their tool calls ran as their results show\./);
-    assert.match(t.markers[0]!, /Reason: No content within 0\.3s of the send/);
+    assert.doesNotMatch(t.markers[0]!, /Reason:|No content within/);
+    assert.match(String(t.reasons[0]), /^No content within 0\.3s of the send/);
     assert.match(t.markers[0]!, /\. If a reply is still owed from that turn, you can give it now\.$/);
   });
 

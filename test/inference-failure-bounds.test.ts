@@ -89,7 +89,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
 
-test('a ~1 MB classified reason: bounded marker, logs and stderr, with the classification beside the text', () => {
+test('a ~1 MB classified reason: the marker leaves it out and its metadata keeps it bounded, beside bounded logs and stderr', () => {
   const { fw, markers, logged, errs, restore } = makeHarness();
   const reason = `Bad request: ${echo()}`;
   try {
@@ -98,10 +98,12 @@ test('a ~1 MB classified reason: bounded marker, logs and stderr, with the class
 
   assert.equal(markers.length, 1);
   const { text, meta } = markers[0];
-  assert.ok(text.length < 1_200, `marker text is ${text.length} chars`);
-  assert.match(text, /^\[inference-failed\] Your previous turn did not complete: the model call failed \(invalid_request, HTTP 400\) and produced no response/);
-  assert.match(text, /Reason: Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail\. If this recurs/);
+  assert.equal(text,
+    '[inference-failed] Your previous turn did not complete: the model call failed (invalid_request, HTTP 400) and produced no response, ' +
+    'so nothing was sent. If this recurs with the same cause, change approach rather than retrying identically ' +
+    '(e.g. drop an oversized attachment or an unsupported setting).');
   assert.ok(meta.reason.length <= 600);
+  assert.match(meta.reason, /^Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/);
   assert.equal(meta.kind, 'inference-failed');
   assert.equal(meta.errorType, 'invalid_request');
   assert.equal(meta.retryable, false);
@@ -121,14 +123,14 @@ test('a ~1 MB classified reason: bounded marker, logs and stderr, with the class
   assert.match(line, /^\[inference-failed\] agent=cairn consecutive=1 type=invalid_request status=400 code=zz_bad_request: Bad request: zz-head/);
 });
 
-test('a small unclassified reason produces exactly the marker it did before', () => {
+test('a small unclassified reason gives a marker without it, and its metadata and logs keep it', () => {
   const { fw, markers, logged, errs, restore } = makeHarness();
   try {
     fw.noteInferenceExhausted('cairn', '400 image exceeds 5 MB');
   } finally { restore(); }
   assert.equal(markers[0].text,
     '[inference-failed] Your previous turn did not complete: the model call failed and produced no response, ' +
-    'so nothing was sent. Reason: 400 image exceeds 5 MB. If this recurs with the same cause, change approach ' +
+    'so nothing was sent. If this recurs with the same cause, change approach ' +
     'rather than retrying identically (e.g. drop an oversized attachment or an unsupported setting).');
   // The marker is a notice about the agent's own failed turn: its own row, stamped so (#291's audience stamp).
   assert.deepEqual(markers[0].meta, {
@@ -138,7 +140,7 @@ test('a small unclassified reason produces exactly the marker it did before', ()
   assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
 });
 
-test("the marker gives a failure's reason and type on its one line, with a notice's opening in them marked", () => {
+test("the marker gives a failure's type on its one line, with a notice's opening in it marked, and none of its reason", () => {
   const { fw, markers, restore } = makeHarness();
   try {
     fw.noteInferenceExhausted('cairn', `first\n[${NOTICE_TAG.inferenceFailed}] second\u2028third`, false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
@@ -147,7 +149,22 @@ test("the marker gives a failure's reason and type on its one line, with a notic
   const text: string = markers[0].text;
   assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
   assert.ok(text.includes(`the model call failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529) and produced no response`), JSON.stringify(text));
-  assert.ok(text.includes(`Reason: first \\[${NOTICE_TAG.inferenceFailed}] second third. If this recurs`), JSON.stringify(text));
+  assert.ok(text.includes('and produced no response, so nothing was sent. If this recurs'), JSON.stringify(text));
+  assert.ok(!/first|second|third|Reason/.test(text), JSON.stringify(text));
+});
+
+test('the marker for a safety failure names neither its type nor its status, nor its reason', () => {
+  const { fw, markers, restore } = makeHarness();
+  try {
+    fw.noteInferenceExhausted('cairn', 'Output blocked: zz-safety', false, 'safety', { httpStatus: 400 });
+  } finally { restore(); }
+  assert.equal(markers[0].text,
+    '[inference-failed] Your previous turn did not complete: the model call failed and produced no response, ' +
+    'so nothing was sent. If this recurs with the same cause, change approach rather than retrying identically ' +
+    '(e.g. drop an oversized attachment or an unsupported setting).');
+  assert.equal(markers[0].meta.errorType, 'safety', 'its metadata keeps the type');
+  assert.equal(markers[0].meta.httpStatus, 400, 'the status');
+  assert.equal(markers[0].meta.reason, 'Output blocked: zz-safety', 'and the reason');
 });
 
 test("the note for a turn that ended gives the failure's type on its one line, with a notice's opening in it marked", () => {
@@ -161,8 +178,9 @@ test("the note for a turn that ended gives the failure's type on its one line, w
   assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
   assert.ok(text.includes(
     `Your previous turn did not complete: it failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529). ` +
-    'Its earlier rounds ran, and their tool calls ran as their results show. Reason: stopped.',
+    'Its earlier rounds ran, and their tool calls ran as their results show. If this recurs',
   ), JSON.stringify(text));
+  assert.ok(!/stopped|Reason/.test(text), JSON.stringify(text));
 });
 
 const isHigh = (text: string, index: number) => { const code = text.charCodeAt(index); return code >= 0xd800 && code <= 0xdbff; };
