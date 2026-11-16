@@ -140,6 +140,28 @@ test('a small unclassified reason gives a marker without it, and its metadata an
   assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
 });
 
+test('a ~1 MB reason the note may show is cut in its text', () => {
+  const { fw, markers, restore } = makeHarness();
+  try {
+    fw.noteInferenceExhausted('cairn', 'whole', false, 'over_budget', { shownReason: `Over budget: ${echo()}` });
+  } finally { restore(); }
+  const text: string = markers[0].text;
+  assert.ok(text.length < 1_200, `marker text is ${text.length} chars`);
+  assert.match(text, /Reason: Over budget: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail\. If this recurs/);
+});
+
+test("the marker gives a shown reason on its one line, with a notice's opening in it marked", () => {
+  const { fw, markers, restore } = makeHarness();
+  try {
+    const reason = `first\n[${NOTICE_TAG.inferenceFailed}] second\u2028third`;
+    fw.noteInferenceExhausted('cairn', reason, false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529, shownReason: reason });
+  } finally { restore(); }
+  assert.equal(markers.length, 1);
+  const text: string = markers[0].text;
+  assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
+  assert.ok(text.includes(`Reason: first \\[${NOTICE_TAG.inferenceFailed}] second third. If this recurs`), JSON.stringify(text));
+});
+
 test("the marker gives a failure's type on its one line, with a notice's opening in it marked, and none of its reason", () => {
   const { fw, markers, restore } = makeHarness();
   try {
@@ -675,11 +697,11 @@ test('a failed maintenance pass logs and alerts a bounded reason', async () => {
   assert.match(assertBoundedStrings(bare.rawArgs, '[context-maintenance] pass failed:'), /pass failed: \{"code":"zz_bare"\}$/);
 });
 
-test('emitTrace: listeners get bounded error and stack; the marker still learns the full length', () => {
+test('emitTrace: listeners get bounded error, stack and shown reason; the marker still learns the full length', () => {
   const { fw, traces, markers, restore } = makeHarness();
   const error = `Bad request: ${echo()}`;
   try {
-    fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error, retryable: false, errorType: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request' });
+    fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error, shownReason: error, retryable: false, errorType: 'invalid_request', httpStatus: 400, providerErrorCode: 'zz_bad_request' });
     fw.emitTrace({ type: 'inference:failed', agentName: 'cairn', error, stack: `Error: ${error}\n    at zz (zz.js:1:1)` });
     // Any event's error string, including failure events added later.
     fw.emitTrace({ type: 'module:batch_hook_failed', agentName: 'cairn', module: 'zz', error });
@@ -690,6 +712,10 @@ test('emitTrace: listeners get bounded error and stack; the marker still learns 
     assert.ok(event.error.length <= 2_000, `${event.type} error is ${event.error.length} chars`);
     if (event.stack) assert.ok(event.stack.length <= 2_000);
   }
+  const shown = traces.find((t) => t.type === 'inference:exhausted')!.shownReason as string;
+  assert.ok(shown.length <= 2_000, `shownReason is ${shown.length} chars`);
+  assert.match(shown, /^Bad request: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/, 'the reason is cut, keeping its head and tail');
+  assert.ok(markers[0].text.includes(` of ${error.length} characters omitted]`), 'the note cut the whole reason');
   assert.equal(markers[0].meta.reasonChars, error.length);
   assert.equal(markers[0].meta.httpStatus, 400);
   assert.equal(markers[0].meta.providerErrorCode, 'zz_bad_request');
@@ -980,6 +1006,17 @@ test('a ~1 MB plain Error (no classification) is bounded the same way', async ()
   assert.match(text, /model call failed and produced no response/);
   const longest = errs.reduce((max, e) => Math.max(max, e.length), 0);
   assert.ok(longest < 4_500, `longest stderr line is ${longest} chars`);
+});
+
+test("a ~1 MB reason the framework would show is bounded in the inference log's words as in its error", async () => {
+  const { inferenceLogs } = await runFailingTurn('stream throws', () => Object.assign(new Error(`Renderer dropped: ${echo()}`), { name: 'UncoveredDropError' }));
+  const entries = inferenceLogs.map(({ entry }) => entry).filter((e) => e.success === false);
+  assert.ok(entries.length > 0, 'the failed inference is logged');
+  for (const entry of entries) {
+    assert.ok(typeof entry.errorWords === 'string' && entry.errorWords.includes('Renderer dropped: '), String(entry.errorWords).slice(0, 80));
+    assert.ok(entry.errorWords.length <= 2_000, `inference log errorWords is ${entry.errorWords.length} chars`);
+    assert.match(entry.errorWords, /Renderer dropped: zz-head e+ …\[\d+ of \d+ characters omitted\]… e+ zz-tail$/, 'the words are cut, keeping their head and tail');
+  }
 });
 
 test('an oversized provider code is bounded in the trace, the marker and failures.log', async () => {

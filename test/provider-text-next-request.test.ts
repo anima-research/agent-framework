@@ -8,25 +8,27 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, 
 import { AgentFramework } from '../src/framework.js';
 import type { ErrorPolicy, EventResponse, Module, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { AutobiographicalStrategy } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, OverBudgetError } from '@animalabs/context-manager';
 
 const CATEGORY = 'zz-category-5c1e';
 const EXPLANATION = 'zz-explanation-5c1e';
 const MESSAGE = 'zz-provider-message-5c1e';
 
-type Outcome = 'reply' | 'refusal' | 'invalid';
+type Outcome = 'reply' | 'refusal' | 'invalid' | 'cut' | 'abort';
 
-class ErrorStream implements YieldingStream {
+class EventStream implements YieldingStream {
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
   toolDepth = 0;
-  constructor(private readonly error: Error) {}
+  constructor(private readonly event: StreamEvent) {}
   provideToolResults(): void { throw new Error('not waiting'); }
   cancel(): void {}
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-    yield { type: 'error', error: this.error } as StreamEvent;
+    yield this.event;
   }
 }
+
+const CUT = 'No content within 5s of the send';
 
 class ScriptedMembrane extends MockMembrane {
   readonly requests: NormalizedRequest[] = [];
@@ -35,11 +37,13 @@ class ScriptedMembrane extends MockMembrane {
     this.requests.push(structuredClone(request));
     const outcome = this.script.shift() ?? 'reply';
     if (outcome === 'invalid') {
-      return new ErrorStream(new MembraneError({
+      return new EventStream({ type: 'error', error: new MembraneError({
         type: 'invalid_request', retryable: false, httpStatus: 400,
         message: `Bad request: ${MESSAGE}`, rawError: { body: MESSAGE },
-      }));
+      }) } as StreamEvent);
     }
+    if (outcome === 'cut') return new EventStream({ type: 'aborted', reason: 'timeout', message: CUT } as StreamEvent);
+    if (outcome === 'abort') return new EventStream({ type: 'aborted', reason: 'error' } as StreamEvent);
     const response = outcome === 'refusal'
       ? { ...createMockResponse([], 'refusal'), raw: { request: {}, response: { stop_details: { category: CATEGORY, explanation: EXPLANATION } } } } as unknown as NormalizedResponse
       : createMockResponse([{ type: 'text', text: `reply ${this.requests.length}` } as ContentBlock]);
@@ -168,3 +172,67 @@ for (const [label, strategy] of STRATEGIES) {
     });
   });
 }
+
+const REASON = ' Reason: ';
+
+function noteIn(requests: NormalizedRequest[]): string {
+  for (const request of requests) {
+    const whole = JSON.stringify(request);
+    const at = whole.indexOf(FAILED_TURN_NOTE);
+    if (at !== -1) return JSON.parse(`"${whole.slice(at, whole.indexOf('"', at + FAILED_TURN_NOTE.length))}"`) as string;
+  }
+  assert.fail("the premise: a later request carries the failed turn's note");
+}
+
+test("after a progress bound's cut, the agent's next request gives the cut's own message as the note's reason, with the host's setting", async () => {
+  await withRig(['cut', 'cut', 'reply'], undefined, async (rig) => {
+    await rig.say('hello 0', 1);
+    await rig.say('hello 1', 3);
+    const note = noteIn(rig.requests.slice(1));
+    assert.ok(note.includes(`${REASON}${CUT} (the host's setting for this bound: \`inferenceBounds.progressBounds.beforeContentMs\`).`), note);
+  });
+});
+
+test("after a compile that context-manager refuses, the agent's next request gives the refusal's own message as the note's reason", async () => {
+  const refusal = new OverBudgetError({
+    budget: 4000, actual: 8000,
+    diagnostics: { headTokens: 1, tailTokens: 2, middleTokens: 3, middleChunkCount: 1, deepestLevel: 1 },
+  });
+  await withRig(['reply', 'reply'], undefined, async (rig) => {
+    await rig.say('hello 0', 1);
+    const manager = rig.framework.getAgent('scout')!.getContextManager() as unknown as { compile: (...args: unknown[]) => unknown };
+    const compile = manager.compile.bind(manager);
+    let refusing = true;
+    let refused = 0;
+    manager.compile = (...args: unknown[]) => {
+      if (refusing) { refused++; throw refusal; }
+      return compile(...args);
+    };
+    await rig.say('hello 1', 1);
+    refusing = false;
+    assert.ok(refused > 0, 'the premise: the second turn\'s compile was refused');
+    assert.ok(rig.stored().some((m) => m.metadata?.kind === 'inference-failed'), "the premise: the refused turn's note was written");
+    await rig.say('hello 2', 2);
+    const note = noteIn(rig.requests.slice(1));
+    assert.ok(note.includes(`${REASON}${refusal.message}`), note);
+  });
+});
+
+test("after a stream's abort, the agent's next request gives the abort as the note's reason", async () => {
+  await withRig(['abort', 'reply', 'reply'], undefined, async (rig) => {
+    await rig.say('hello 0', 1);
+    await rig.say('hello 1', 3);
+    const note = noteIn(rig.requests.slice(1));
+    assert.ok(note.includes(`${REASON}Stream aborted: error.`), note);
+  });
+});
+
+test("after a provider's failure, the note gives no reason", async () => {
+  await withRig(['invalid', 'reply'], undefined, async (rig) => {
+    await rig.say('hello 0', 1);
+    await rig.say('hello 1', 2);
+    const note = noteIn(rig.requests.slice(1));
+    assert.ok(!note.includes(REASON), note);
+    assert.ok(note.includes('(invalid_request, HTTP 400)'), note);
+  });
+});
