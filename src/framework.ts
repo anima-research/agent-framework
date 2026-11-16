@@ -27487,6 +27487,7 @@ export class AgentFramework {
       routing.silent = true;
       if (continued?.roundsRan) routing.roundsRan = true;
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
+      if (continued?.xmlPathSeen) routing.xmlPathSeen = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -29325,8 +29326,14 @@ export class AgentFramework {
             const heldUndecided = cutThinkPrivate && !!cut?.unnamed && !liveProseRouting;
             // Words held only because the cut left the next call undecided
             // (not a think the round named) may have been meant to go out, so
-            // the agent is told they weren't posted (#640 R3-3).
-            const heldUnsaid = cutThinkPrivate && !liveProseRouting && !cut!.calls.some((call) => call.name === 'think')
+            // the agent is told they weren't posted (#640 R3-3): only where
+            // they would otherwise have gone out, since the sentence names the
+            // policy as the cause. Disabled routing (a silent turn's too),
+            // explicit routing, no channels and a refused call in the round
+            // keep them back on their own.
+            const heldUnsaid = cutThinkPrivate && !liveProseRouting && !cutPrivate && !!this.channelRegistry
+              && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')
+              && !cut!.calls.some((call) => call.name === 'think')
               && cut!.content.slice(cut!.start).some((b) => b.type === 'text' && !!(b as { text?: string }).text?.trim());
             const HELD_UNSAID = 'What you wrote before it wasn\'t posted either: under your same-round think policy it\'s kept back ' +
               'in case it was written beside think, and nothing keeps it for you to send later. If that call wasn\'t think, ' +
