@@ -3747,10 +3747,6 @@ function failureDescription(error: unknown): string {
 
 const UNDESCRIBED_FAILURE = `[${NOTICE_TAG.undescribedFailure}]`;
 
-function failureShown(text: string): string {
-  return text === UNDESCRIBED_FAILURE ? text : suppliedValue(text);
-}
-
 /**
  * A bounded string describing a failure, for logs that would otherwise print
  * the error object; it is one line unless one of its parts has newlines, as a
@@ -14482,17 +14478,10 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const ep = this.rewindEpisode.get(agent.name);
     const count = (ep?.count ?? 0) + 1;
-    const why = cause === 'refusal'
-      ? `the model refused on them (content filter: ${failureShown(category)}). Their content is ` +
-        `not reproduced here (so this note can't re-trigger the filter); the ` +
-        `originals remain in the raw record`
-      : `the model API kept refusing the requests that carried them (${failureShown(category)}), ` +
-        `so that the conversation could go on. Their content is not reproduced ` +
-        `here (so this note can't trigger the same refusal); the originals remain ` +
-        `in the raw record`;
     const text =
       `[${NOTICE_TAG.refusalRewind}] The ${count} most recent turn(s) were set aside because ` +
-      `${why}. You are clear to continue — if you ` +
+      `the requests that carried them couldn't be completed. Their content isn't shown here, ` +
+      `and the originals remain in the raw record. You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
@@ -14540,10 +14529,10 @@ export class AgentFramework {
       : '';
     const content = success
       ? `🔧 Unstuck **${agentName}** — shed ${n} turn(s); the model responded.${list}`
-      : `⚠️ Couldn't unstick **${agentName}** — still refusing after ${n} rewind(s)` +
-        `${category ? ` (category=${category})` : ''}.${list}`;
+      : `⚠️ Couldn't unstick **${agentName}** — its requests still couldn't be completed after ${n} rewind(s).${list}`;
     console.error(
-      `[unstick] agent=${agentName} ${success ? 'succeeded' : 'gave up'} after ${n} rewind(s)`,
+      `[unstick] agent=${agentName} ${success ? 'succeeded' : 'gave up'} after ${n} rewind(s)` +
+        `${category ? ` category=${logValue(category)}` : ''}`,
     );
     if (s.channelId) void this.postToChannel(s.serverId, s.channelId, content);
   }
@@ -35048,10 +35037,11 @@ export class AgentFramework {
     // sink below gets an excerpt cut from the whole reason at its own bound
     // (boundFailureText, so its marker states the whole length): the stderr
     // line, failures.log and the hard-down alert FAILURE_TEXT_MAX_CHARS, the
-    // [inference-failed] marker FAILURE_MARKER_REASON_MAX_CHARS, the status's
-    // lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS, and
-    // the rewind marker REWIND_MARKER_REASON_MAX_CHARS. The classification
-    // travels as structured fields beside the text.
+    // [inference-failed] marker's metadata FAILURE_MARKER_REASON_MAX_CHARS, the
+    // status's lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS,
+    // and the rewind marker's metadata REWIND_MARKER_REASON_MAX_CHARS. The
+    // classification travels as structured fields beside the text. Neither
+    // marker's text quotes the reason.
     //
     // A reason that isn't a string (the stream paths always pass a message)
     // is described rather than allowed to throw before anything is recorded.
@@ -35099,7 +35089,7 @@ export class AgentFramework {
     const agent = this.agents.get(agentName);
     if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
-      const causeParts = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+      const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
       const cause = timedOut && causeParts.length === 1 ? '' : causeParts.join(', ');
       try {
@@ -35116,11 +35106,11 @@ export class AgentFramework {
                   `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
                   `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
                   `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
-                  `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''} Reason: `
+                  `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}`
                 : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
                   `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
-                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''} Reason: `) +
-              `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
+                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''}`) +
+              ` ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
