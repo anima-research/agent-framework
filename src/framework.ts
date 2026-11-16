@@ -27983,7 +27983,8 @@ export class AgentFramework {
     // products, and an undo of the turn leaves them. A held call's retry
     // (TURN_RETRY) is the exception: it presents what arrived during its hold
     // but records no checkpoint after it, so an undo takes those rows out
-    // with the turn, and others' rows are presented again at the next start.
+    // with the turn, and others' rows return as arrivals: the agent's next
+    // presentation point shows them again, its next start at the latest.
     // A clock row due (storeDueClock) goes ahead of the turn's inputs, so a
     // turn starts with a current clock, a silent heartbeat's tick (which
     // stores no row of its own) included, unless storeDueClock writes none:
