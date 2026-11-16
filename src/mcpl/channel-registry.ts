@@ -688,8 +688,6 @@ export function destinationKey(to: ChannelRef): string {
   return JSON.stringify([to.serverId, to.channelId]);
 }
 
-export const ANCHOR_SETS = Symbol('anchorSets');
-
 /** Whether two refs name the same channel. Two absent refs are the same:
  *  neither names a channel. */
 export function sameChannel(a: ChannelRef | null | undefined, b: ChannelRef | null | undefined): boolean {
@@ -1385,7 +1383,6 @@ export class ChannelRegistry {
   /** The same message's id and thread, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
-  [ANCHOR_SETS] = 0;
 
   /** Per-channel typing indicator timers, by destinationKey, with the
    *  channel each one types in. */
@@ -2472,7 +2469,6 @@ export class ChannelRegistry {
     this.defaultPublishChannel = { serverId: channel.serverId, channelId: channel.channelId };
     this.defaultPublishMessageId = messageId;
     this.defaultPublishThreadId = threadId;
-    this[ANCHOR_SETS]++;
   }
 
   /**

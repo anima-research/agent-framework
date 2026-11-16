@@ -132,7 +132,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { isProseTargetToken, parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, ANCHOR_SETS, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, NO_CHANNEL_EXAMPLE, NO_PERSON_EXAMPLE, qualifiedChannelName, sameChannel, type ChannelRef, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import {
@@ -1087,7 +1087,6 @@ interface CoalescedChannelEvent {
    *  CoalescedOccurrence.firstView). */
   firstView?: boolean;
   eventIdAsMessageId?: true;
-  ambientPush?: true;
   /** A batch's recovery after a delivery that may have stored the message
    *  (FrameworkWriteOptions.mayBeStored). */
   mayBeStored?: true;
@@ -4680,9 +4679,7 @@ export class AgentFramework {
    * retry the receipt answers, which delivers nothing again, commits the one
    * its first attempt parked. Keyed by server and event id; bounded.
    */
-  private parkedAnchors: Map<string, { channel: ChannelRef; messageId: string; threadId?: string; tags?: string[]; firstView: boolean; seq: number }> = new Map();
-  private deliverySeq = 0;
-  private anchorSeq = 0;
+  private parkedAnchors: Map<string, { channel: ChannelRef; messageId: string; threadId?: string; tags?: string[]; firstView: boolean }> = new Map();
   /** `tuneOut.announce`: the excepted channel hears the all-except scope open and close. */
   private tuneOutAnnounce = true;
   /** `speech.locus`: where prose goes when nothing names a destination (see FrameworkConfig). */
@@ -20361,31 +20358,22 @@ export class AgentFramework {
   /**
    * A delivered inbound message becomes the latest delivered inbound (the
    * channel context's reply anchor; the legacy speech fallback) through the
-   * registry's noteDelivered — at once for a plain delivery, on either lane,
-   * whose acceptance the registry answers synchronously; parked for a
-   * coalesced one until its acceptance is acknowledged (see parkedAnchors).
+   * registry's noteDelivered — at once for a plain channels/incoming, whose
+   * acceptance the registry answers synchronously; parked for a coalesced one
+   * until its acceptance is acknowledged (see parkedAnchors).
    */
   private noteDeliveredOrPark(event: {
     serverId: string; channelId: string; messageId: string; threadId?: string; tags?: string[];
-    eventId?: string; coalescingSubject?: string; firstView?: boolean; assemblingFor?: string; eventIdAsMessageId?: true; ambientPush?: true;
+    eventId?: string; coalescingSubject?: string; firstView?: boolean;
   }): void {
-    if (event.assemblingFor !== undefined || event.eventIdAsMessageId || event.ambientPush) return;
     // On the server the message came from (noteDelivered).
-    const anchor = { channel: { serverId: event.serverId, channelId: event.channelId }, messageId: event.messageId, threadId: event.threadId, tags: event.tags, firstView: event.firstView === true, seq: ++this.deliverySeq };
+    const anchor = { channel: { serverId: event.serverId, channelId: event.channelId }, messageId: event.messageId, threadId: event.threadId, tags: event.tags, firstView: event.firstView === true };
     if (event.coalescingSubject && typeof event.eventId === 'string') {
-      this.parkedAnchors.set(JSON.stringify([event.serverId, event.eventId]), anchor);
+      this.parkedAnchors.set(`${event.serverId}:${event.eventId}`, anchor);
       if (this.parkedAnchors.size > 1000) this.parkedAnchors.delete(this.parkedAnchors.keys().next().value!);
       return;
     }
-    if (this.noteAnchor(anchor)) this.anchorSeq = anchor.seq;
-  }
-
-  private noteAnchor(anchor: { channel: ChannelRef; messageId: string; threadId?: string; tags?: unknown; firstView: boolean }): boolean {
-    const registry = this.channelRegistry;
-    if (!registry) return false;
-    const sets = registry[ANCHOR_SETS];
-    registry.noteDelivered(anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView);
-    return registry[ANCHOR_SETS] !== sets;
+    this.channelRegistry?.noteDelivered(anchor.channel, anchor.messageId, anchor.threadId, anchor.tags, anchor.firstView);
   }
 
   private async handleMcplChannelIncoming(event: {
@@ -20686,7 +20674,6 @@ export class AgentFramework {
       coalescingSubject?: string;
       mayBeStored?: true;
       eventIdAsMessageId?: true;
-      ambientPush?: true;
     },
     messageMetadata: Record<string, unknown>,
     admission: AdmissionDecision,
@@ -21912,7 +21899,14 @@ export class AgentFramework {
       // answers leaves the anchor where a marker would, as the host already
       // counts what was stored before a restart as shown: every agent's
       // shown watermark starts at the head at boot.
-      const firstView = this.commitParkedAnchor(serverId, message.eventId);
+      const firstView = this.pushCoalescer.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId);
+      // Acknowledged: the anchor the delivery parked is committed now (and a
+      // retry answered from the receipt commits its first attempt's).
+      const parked = this.parkedAnchors.get(`${serverId}:${message.eventId}`);
+      if (parked) {
+        this.parkedAnchors.delete(`${serverId}:${message.eventId}`);
+        this.channelRegistry?.noteDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView === true);
+      }
       return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
     });
   }
@@ -21955,7 +21949,7 @@ export class AgentFramework {
             deferred: !!c.deferred,
           })
         : this.pushSource(event, { deferred: !!c.deferred });
-      const result = await this.pushCoalescer.accept({
+      return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
         featureSet: params.featureSet,
@@ -21978,22 +21972,7 @@ export class AgentFramework {
         } : {}),
         event: { lane: 'push', event: { ...event, inboundSource } },
       });
-      this.commitParkedAnchor(serverId, params.eventId);
-      return result;
     });
-  }
-
-  private commitParkedAnchor(serverId: string, eventId: string): boolean {
-    const firstView = this.pushCoalescer?.receiptFirstView(serverId, this.coalescingBinding(serverId), eventId) === true;
-    const key = JSON.stringify([serverId, eventId]);
-    const parked = this.parkedAnchors.get(key);
-    if (parked) {
-      this.parkedAnchors.delete(key);
-      if (parked.seq > this.anchorSeq && this.noteAnchor({ ...parked, firstView: parked.firstView || firstView })) {
-        this.anchorSeq = parked.seq;
-      }
-    }
-    return firstView;
   }
 
   /** §3.2: a channel-scoped push needs what a channels/incoming message needs. */
@@ -22119,7 +22098,6 @@ export class AgentFramework {
         targetAgents: push.targetAgents,
         coalescingSubject,
         eventId: occ.eventId,
-        ...(isAmbient(push.tags) ? { ambientPush: true as const } : {}),
         ...narrowing,
         ...firstViewMark,
         ...mayBeStored,
@@ -22628,22 +22606,6 @@ export class AgentFramework {
       if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
       if (suppressedBy) {
         this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: triggerChannel?.channelId ?? '' });
-      }
-      const origin = event.origin ?? {};
-      if (decision.locus && triggerChannel && this.mcplServerRegistry?.getServer(event.serverId)
-        && typeof origin.messageId === 'string' && origin.messageId) {
-        this.noteDeliveredOrPark({
-          ...(isAmbient(event.tags) ? { ambientPush: true as const } : {}),
-          serverId: event.serverId,
-          channelId: triggerChannel.channelId,
-          messageId: origin.messageId,
-          threadId: typeof origin.threadId === 'string' && origin.threadId ? origin.threadId : undefined,
-          tags: event.tags,
-          eventId: event.eventId,
-          coalescingSubject: event.coalescingSubject,
-          firstView: event.firstView,
-          assemblingFor: event.assemblingFor,
-        });
       }
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
