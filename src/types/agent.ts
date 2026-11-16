@@ -677,8 +677,10 @@ export interface InferenceRequest {
    *  refusal reaction goes on that message (on a Discord channel). Left out for a wake that is for no
    *  single message: a batch, the gate's included even when it holds one
    *  message, and a module's wake; and left off a re-armed turn that speaks
-   *  in another channel than the message's. Wakes for different messages
-   *  merged into one start answer neither. */
+   *  in another channel than the message's. A start merged from wakes that
+   *  don't all answer the same message, in the same channel, answers none:
+   *  wakes for two messages, or a message's wake merged with one that
+   *  answers no message, such as a timer's or a reaction's. */
   answersMessageId?: string;
   /** Host-owned: this wake's sole cause is these rows, a batched wake's
    *  writes (WakeProvenance.writes): the message of its own of each event
