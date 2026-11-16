@@ -1,0 +1,1 @@
+- `InferenceLogEntry` and `InferenceLogSummary` gain `errorWords`: the entry's `error` in the framework's words, with no provider's text, which `health--snapshot` shows. Entries written before this release have none.

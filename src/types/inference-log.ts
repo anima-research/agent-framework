@@ -54,6 +54,7 @@ export interface InferenceLogSummary {
   requestId: string;
   success: boolean;
   error?: string;
+  errorWords?: string;
   durationMs: number;
   tokenUsage?: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
   stopReason?: string;
