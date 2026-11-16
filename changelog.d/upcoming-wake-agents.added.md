@@ -1,0 +1,1 @@
+- `UpcomingWake.agents`: the agents an upcoming wake would wake, of those its asker named. The gate's `upcomingWakes` sets it on each self-wake, sleep's end and pending batch, and the reply judge keeps only the wakes that name the agent it reads, or name none.

@@ -3589,6 +3589,9 @@ export class EventGate {
 
     if (typeof policy.behavior === 'object') {
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
+        if (info.recipients !== undefined && info.recipients.length === 0) {
+          return { trigger: true, policyName: policy.name, behavior: policy.behavior };
+        }
         this.handleDebounce(policy, info, after);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
       }
@@ -3741,7 +3744,7 @@ export class EventGate {
     if (b === 'always') return true;
     if (b === 'defer' || b === 'skip') return false;
     if (typeof b === 'object') {
-      if ('debounce' in b || 'judge' in b) return false; // batches; never triggers inline
+      if ('debounce' in b || 'judge' in b) return info.recipients !== undefined && info.recipients.length === 0;
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
         const key = this.resolveKey(info, cfg.keyBy);
@@ -4215,11 +4218,11 @@ export class EventGate {
       deliveredTracking(woke, names, () => this.deliverBatch(events, names, undefined, woke));
       return;
     }
-    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
-    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
+    const recipients = new Set(this.getAgentNamesFn());
+    const woken = this.wokenBy(events);
     const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
     for (const agentName of woken) {
-      const seen = events.filter((e) => e.recipients === undefined || e.recipients.includes(agentName));
+      const seen = events.filter((e) => (e.recipients === undefined ? recipients.has(agentName) : e.recipients.includes(agentName)));
       const key = seen.map((e) => events.indexOf(e)).join(',');
       const group = groups.get(key) ?? { agents: [], events: seen };
       group.agents.push(agentName);
@@ -4228,6 +4231,12 @@ export class EventGate {
     deliveredTracking(woke, [...woken], () => {
       for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents, woke);
     });
+  }
+
+  private wokenBy(events: readonly PendingEvent[]): Set<string> {
+    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
+    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
+    return woken;
   }
 
   private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[], woke?: string[]): void {
@@ -4384,13 +4393,15 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy`. A debounce's batch wakes the
-   * agent when it fires. It only may where each of `agentNames` is given none
-   * of its events, or each event delivery gives that agent has a message of its
-   * own whose write was placed for it. A host whose scheduler drops such a wake
+   * agent when it fires. It only may for an agent given none of its events, or
+   * one whose every event delivery gives it a message of its own whose write
+   * was placed for it. A host whose scheduler drops such a wake
    * by its WakeProvenance.writes, as AgentFramework's does, starts no turn for
    * an agent that has read and answered every one. A judge
-   * rule's batch goes to the judge, so it only may. A batch, and a sleep with
-   * no agent named, reach the gate's recipients alone.
+   * rule's batch goes to the judge, so it only may. A batch counts for the
+   * agents it would wake (wokenBy); a sleep with no agent named reaches the
+   * gate's recipients alone. Each wake names, in `agents`, those of
+   * `agentNames` it would wake.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4398,29 +4409,35 @@ export class EventGate {
     for (const name of agentNames) {
       const due = this.selfWakeDue.get(name);
       if (due && this.selfWakeTimers.has(name)) {
-        wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
+        wakes.push({ at: due.at, certain: true, kind: 'self-wake', what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer`, agents: [name] });
       }
     }
     const recipients = this.getAgentNamesFn();
-    const recipient = agentNames.some((name) => recipients.includes(name));
-    if (this.sleepUntil > now && (this.sleepAgent === undefined ? recipient : agentNames.includes(this.sleepAgent))) {
-      wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep' });
+    const sleepers = agentNames.filter((name) => (this.sleepAgent === undefined ? recipients.includes(name) : name === this.sleepAgent));
+    if (this.sleepUntil > now && sleepers.length > 0) {
+      wakes.push({ at: this.sleepUntil, certain: true, kind: 'sleep-end', what: 'the end of its sleep', agents: sleepers });
     }
     for (const [name, state] of this.debounceTimers) {
-      if (!recipient || name === exceptPolicy || state.events.length === 0) continue;
+      if (name === exceptPolicy || state.events.length === 0) continue;
+      const woken = this.wokenBy(state.events);
+      const agents = agentNames.filter((agentName) => woken.has(agentName));
+      if (agents.length === 0) continue;
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
-      wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : {
-            at: state.dueAt,
-            certain: agentNames.some((agent) => {
-              const seen = state.events.filter((e) => e.recipients === undefined || e.recipients.includes(agent));
-              return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent);
-            }),
-            kind: 'debounce',
-            what: `rule ${quotedValue(name)}'s debounced batch of ${batch}`,
-          });
+      if (state.judge) {
+        wakes.push({ at: state.dueAt, certain: false, kind: 'judge-batch', what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge`, agents });
+        continue;
+      }
+      const shown = agents.map((agent) => {
+        const seen = state.events.filter((e) => (e.recipients === undefined ? recipients.includes(agent) : e.recipients.includes(agent)));
+        return { agent, n: seen.length, certain: seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent) };
+      });
+      for (const certain of [true, false]) {
+        for (const count of new Set(shown.filter((a) => a.certain === certain).map((a) => a.n))) {
+          const group = shown.filter((a) => a.certain === certain && a.n === count).map((a) => a.agent);
+          wakes.push({ at: state.dueAt, certain, kind: 'debounce', what: `rule ${quotedValue(name)}'s debounced batch of ${count} ${count === 1 ? 'event' : 'events'}`, agents: group });
+        }
+      }
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }

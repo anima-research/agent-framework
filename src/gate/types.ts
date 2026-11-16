@@ -402,13 +402,21 @@ export interface UpcomingWake {
    *  each have a message of its own written to its window
    *  (WakeProvenance.writes), or a queued wake that reads rows, or a start
    *  merged from wakes that each read rows, starts no turn once the agent
-   *  has read and answered them. */
+   *  has read and answered them. True or false of every agent `agents`
+   *  names: a batch certain for some and not others is a wake for each. */
   certain: boolean;
-  /** What it is, as the judge is told ("its own skip_reply timer"). */
+  /** What it is, as the judge is told ("its own skip_reply timer"). For a
+   *  debounced batch it counts the events delivery gives the agents it
+   *  names, so a batch giving them different counts is a wake for each
+   *  count. */
   what: string;
   /** What it is, in a word that quotes nothing, for healthSnapshot: `what` can
    *  quote a reminder or a queue reason. The judge isn't told it. */
   kind?: UpcomingWakeKind;
+  /** The agents it would wake, of those its asker named. A judge reading one
+   *  agent's context is told only the wakes that name that agent, and those
+   *  that name none: a wake with no list is for the agent it was asked for. */
+  agents?: string[];
 }
 
 /** What the gate asks the reply judge for one batch. */
@@ -520,11 +528,52 @@ export interface GateEventInfo {
   paths?: string[];
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
-  /** The agents admission delivered a targeted event to (its targetAgents).
-   *  A debounced batch wakes each agent with the events it may see, those
-   *  naming it and those naming no agent, and agents that may see the same
-   *  events share one line. Absent for an untargeted event, whose batch wakes
-   *  every agent getAgentNames lists. */
+  /** Whom the event is for, which decides whom a batch holding it shows it
+   *  to and wakes. Admission sets it for a targeted MCPL event (its
+   *  targetAgents that are registered). The framework sets it for a module's
+   *  response asking inference for named agents, to an event other than an
+   *  MCPL push or channel message, which admission gated as it arrived:
+   *  those its source can trigger that read the slot its messages land in
+   *  and whose view shows a message it stores, where it stores any. A
+   *  resident's view leaves out a message held from the residents and a
+   *  subconscious's keeps it, so a response storing held messages alone
+   *  names, of the agents it asks for, a subconscious and not a resident,
+   *  and the framework wakes no named agent its view shuts out.
+   *  - Untargeted (absent): shown to every agent getAgentNames lists, and
+   *    wakes them. A batch of untargeted events alone stores its line as a
+   *    write that names no agent.
+   *  - Named (a non-empty list): shown to the agents it names, and wakes
+   *    them, whether getAgentNames lists them or not.
+   *  - An empty list: for no one in a batch. It joins no batch, so a batch
+   *    wakes no one for it, and it neither restarts a batch's quiet period
+   *    nor takes room in it. A rule that batches lets it through, and one
+   *    that doesn't decides on it as on any event; whom the caller then wakes
+   *    is the caller's: the framework wakes a named agent that reads no slot
+   *    of the residents', such as an isolated job, as it does any named
+   *    agent, when its view shows a message the response stores, where it
+   *    stores any, and admission, given a batching rule's pass, wakes no one
+   *    for a targeted MCPL event none of whose targets is registered.
+   *  In a batch holding named events, each agent the batch wakes is shown the
+   *  untargeted events if getAgentNames lists it, and the named events that
+   *  name it. Agents shown the same events share one line, stored for them.
+   *  A batch due for delivery, a debounce's or one the judge let through,
+   *  waits in one buffer while an agent infers or the host is quiesced, and
+   *  the buffer's batches are delivered together, as one batch; it keeps its
+   *  newest events up to its cap, and the oldest it drops are shown to no
+   *  one. A judge rule's batch that fires while a resident's turn runs, or
+   *  while the host is quiesced, is held for the judge with the rule's other
+   *  held events, up to a cap of its own, and so is one whose judging such a
+   *  turn stops. An event whose channel is held when its batch is delivered
+   *  is dropped: shown to no one and woken for by no one. A delivery that
+   *  throws drops its batch for the agents it hadn't woken.
+   *  While the gate sleeps, an event is skipped before any rule, whatever its
+   *  recipients, unless it is the heartbeat's or a privileged author's.
+   *  An agent's upcoming wakes count a rule's pending batch only when the
+   *  batch would wake that agent. A judge rule's batch is judged as a whole,
+   *  for the agents getAgentNames lists. A batch queued while the judge
+   *  decides goes with it when the judge answers reply (or fails, under
+   *  onError "wake"), and is judged afresh when it answers wait (or fails,
+   *  under onError "skip"). */
   recipients?: readonly string[];
   /**
    * Set when the framework asked whether the event is suppressed before it

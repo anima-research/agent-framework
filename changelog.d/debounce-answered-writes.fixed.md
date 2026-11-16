@@ -16,10 +16,10 @@
   before it has answered what that round read. This covers MCPL channel
   messages, those routed to a conversation fork included, and pushes,
   message-mode heartbeat ticks and reminders, and module events whose response
-  stored exactly one message, for every agent, where neither the event nor the
-  message names a channel and the event isn't console or API input. A module
-  message stored only for the agents its response asked inference for, or one
-  held from the residents, is quoted, as before. An event with no message of
+  stored exactly one message, for every agent or only for the agents it asked
+  inference for, where neither the event nor the message names a channel and
+  the event isn't console or API input. A module message held from the
+  residents is quoted, as before. An event with no message of
   its own keeps the wake,
   unless a turn already under way read and answered the batch's line, which
   quotes it. A silent heartbeat tick stores nothing and isn't quoted, so it
