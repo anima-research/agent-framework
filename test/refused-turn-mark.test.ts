@@ -208,6 +208,25 @@ describe('a refused turn is marked on the message it answers, and its failure na
     assert.equal(r.records[0]!.locus, GENERAL);
   });
 
+  it('a turn re-armed after its continuation ran out of retries answers the message its turn answered: its refusal marks that message', async (t) => {
+    const r = await rig(t, {
+      framework: {
+        errorPolicy: { maxRetries: 2, onInferenceError: (e: unknown, _a: unknown, attempt: number) => ((e as { retryable?: boolean }).retryable !== false && attempt < 2 ? { retry: true, delayMs: 5 } : { retry: false }) },
+        exhaustedTurnRearmMs: [50],
+      } as never,
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', refusalHandling: { retries: 0, autoRewind: false } }],
+    });
+    await r.answered(ROOM, 'm-1');
+    const before = r.f.membrane.calls.length;
+    r.streams.push(() => new FailedCall('server'), () => new FailedCall('server'), () => new FailedCall('server'), () => new MockYieldingStream([refusal()]));
+    (r.f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'agent', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+    await eventually(() => r.records.length === 1, 'the re-armed turn, refused');
+    assert.equal(r.f.membrane.calls.length, before + 4, "premise: the continuation's three failed sends, then the re-armed one");
+    await r.markSent();
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1']]);
+    assert.equal(r.records[0]!.locus, ROOM);
+  });
+
   it('a correction delivered to the conversation fork that holds its message, as the agent\'s first view of it: its refused turn marks that message', async (t) => {
     const r = await rig(t, { framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never });
     await r.answered(ROOM, 'm-1');
