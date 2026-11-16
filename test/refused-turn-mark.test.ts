@@ -688,6 +688,36 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(r.records[1]?.locus, ROOM, "the unstick's run, refused, names that channel");
   });
 
+  for (const silent of [true, false]) {
+    it(`an /unstick after a ${silent ? 'silent ' : ''}heartbeat turn, which answers no message: its run answers the refused message, and its retry speaks in that message's channel`, async (t) => {
+      const r = await rig(t, manual);
+      await r.answered(ROOM, 'm-1');
+      r.streams.push(() => new MockYieldingStream([refusal()]));
+      await r.incoming(ROOM, 'm-2');
+      await eventually(() => r.records.length === 1, 'm-2 refused');
+      await r.f.framework.runUntilIdle();
+      const tickAt = r.f.membrane.calls.length;
+      r.streams.push(() => new MockYieldingStream([answer('the tick')]));
+      (r.f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+        ...(silent ? { suppressProse: true, silentHeartbeat: { eventId: 'hb-1', serverId: 'heartbeat' } } : {}),
+      });
+      await eventually(() => r.f.membrane.calls.length === tickAt + 1, 'the tick ran');
+      await r.f.framework.runUntilIdle();
+      const latest = (r.f.framework as unknown as { turnRouting: Map<string, { silent?: true; heartbeat?: true; answers?: unknown }> }).turnRouting.get('agent');
+      assert.ok(latest?.[silent ? 'silent' : 'heartbeat'] && !latest.answers, "premise: the tick's routing, which answers nothing, is the agent's latest");
+      const before = r.f.membrane.calls.length;
+      r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the unstick')]));
+      assert.equal((await unstick(r)).ok, true, 'premise: the unstick started');
+      await eventually(() => r.f.membrane.calls.length === before + 2, "the unstick's run and its retry");
+      await r.f.framework.runUntilIdle();
+      const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the unstick'));
+      assert.equal(post?.channelId, ROOM, "the retry speaks in the refused message's channel");
+      assert.doesNotMatch(JSON.stringify(r.f.membrane.calls[before + 1]!.messages), /Your plain speech currently has no channel/, 'and its request names a channel to speak in');
+      assert.equal(r.records.at(-1)?.locus, ROOM, "the unstick's run, refused, names that channel");
+    });
+  }
+
   it('an /unstick that sheds two turns: the retry still answers the newest shed turn\'s message, not the older one\'s', async (t) => {
     const r = await rig(t, manual);
     await r.answered(GENERAL, 'm-1');
@@ -723,19 +753,23 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.deepEqual(r.records.map((x) => x?.locus), [ROOM, ROOM, ROOM], 'and every refusal names that channel');
   });
 
-  it('an /unstick whose agent\'s last turn answered no message: its retry has no channel, and is told so', async (t) => {
+  it('an /unstick whose agent has answered no message: its run has no channel, and takes the agent\'s latest turn\'s wake channels', async (t) => {
     const r = await rig(t, manual);
-    await r.answered(ROOM, 'm-1');
+    const fw = r.f.framework as unknown as { pendingRequests: unknown[]; rewindRetry(...args: unknown[]): Record<string, unknown> };
+    const rewindRetry = fw.rewindRetry.bind(fw);
+    const runs: Array<Record<string, unknown>> = [];
+    t.mock.method(fw, 'rewindRetry', (...args: unknown[]) => { const retry = rewindRetry(...args); if (retry.reason === 'unstick') runs.push(retry); return retry; });
     r.streams.push(() => new MockYieldingStream([answer('the timer turn')]));
-    (r.f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'agent', reason: 'timer', source: 'test', timestamp: Date.now() });
-    await eventually(() => r.f.membrane.calls.length >= 2, 'the timer turn');
+    fw.pendingRequests.push({ agentName: 'agent', reason: 'timer', source: 'test', timestamp: Date.now(), wakeChannels: [{ serverId: 'editor', channelId: GENERAL }] });
+    await eventually(() => r.f.membrane.calls.length >= 1, 'the timer turn');
     await r.f.framework.runUntilIdle();
     const before = r.f.membrane.calls.length;
     r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the unstick')]));
     assert.equal((await unstick(r)).ok, true, 'premise: the unstick started');
     await eventually(() => r.f.membrane.calls.length === before + 2, "the unstick's run and its retry");
     await r.f.framework.runUntilIdle();
-    assert.match(JSON.stringify(r.f.membrane.calls[before + 1]!.messages), /Your plain speech currently has no channel/, "the retry's request says its speech has no channel");
+    assert.equal(runs.length, 1, "premise: the unstick's run was made once");
+    assert.deepEqual([runs[0]!.channelId, runs[0]!.wakeChannels], [undefined, [{ serverId: 'editor', channelId: GENERAL }]], "the unstick's run has no channel, and the timer turn's wake channels");
     assert.equal(r.records.at(-1)?.locus, null, "the unstick's run, refused, names no channel");
   });
 
