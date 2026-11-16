@@ -44,7 +44,10 @@ them the same way.
   unprefixed segments of the SAME turn, including those a later stream of it
   writes, such as a framework retry's, a budget restart's or the compile a
   provider-capacity hold defers the turn to. A round kept private (one that
-  calls `skip_reply`, or has a same-round private think) sets no target. A
+  calls `skip_reply`, or has a same-round private think) sets no target,
+  except that under `sameRoundSkipReplyTextPolicy: 'ask'` a round that calls
+  `skip_reply` sets the target its envelopes name, and what it would have
+  posted or bounced is held as a draft. A
   target its server declared inbound-only is refused and clears the turn's
   target, so later unprefixed segments bounce until a new `>>` target.
   Cross-turn, nothing is implicit.

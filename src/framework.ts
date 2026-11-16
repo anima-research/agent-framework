@@ -29592,10 +29592,13 @@ export class AgentFramework {
               this.skipReplyAsks.set(`${agent.name}\u0000${calls[askingAt]!.id}`, new Promise((resolve) => { answerAsk = resolve; }));
             }
             let askedSilence: TurnSilence | null = null;
+            const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
+              && agent.state.status === 'waiting_for_tools';
             const settleAsk = (held: SkipHeld[]): void => {
               const answer = answerAsk;
               if (!answer) return;
               answerAsk = undefined;
+              if (!waits()) return;
               if (held.length > 0) {
                 streamRouting.skipReplyAsked = true;
                 silenceBeforeRefusal = askedSilence;
@@ -29741,8 +29744,6 @@ export class AgentFramework {
                 ...roundCalls.map((c, i) => (sends.has(calls[i]!.id) ? { ...c, reach: sends.get(calls[i]!.id) } : c)),
                 ...[...round.scripts.values()].flat(),
               ];
-              const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
-                && agent.state.status === 'waiting_for_tools';
               let decidable = scriptCallIds.length === 0;
               const round: ScriptRound = {
                 agent,
@@ -29773,7 +29774,6 @@ export class AgentFramework {
                     routeRound(answered());
                     return;
                   }
-                  settleAsk([]);
                   const reached = sendsOf(answered(), toolRound);
                   silence = mergeSilence(silence, reached);
                   turnSends = mergeSends(turnSends, reached);
