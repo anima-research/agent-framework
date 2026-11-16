@@ -63,7 +63,9 @@ export type DraftReason =
   /** The speech had no destination (no route this turn, or a failed envelope). */
   | 'no-destination'
   /** An explicit/hybrid routing prefix was missing, malformed or unresolvable. */
-  | 'bounced';
+  | 'bounced'
+  /** A `skip_reply` in its round kept it back, under `sameRoundSkipReplyTextPolicy: 'ask'`. */
+  | 'skip-reply';
 
 export interface DraftAttemptOutcome {
   status: PublishOutcome['status'];

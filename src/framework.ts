@@ -23653,12 +23653,14 @@ export class AgentFramework {
     'explicit-send': 'an explicit send in its turn held it back',
     'no-destination': 'it had no destination: plain speech with no target waits for one',
     bounced: 'its routing prefix bounced',
+    'skip-reply': 'a skip_reply in its round held it back',
   };
 
   private static readonly DRAFT_REASON_SHORT: Record<DraftReason, string> = {
     'explicit-send': 'explicit send in its turn',
     'no-destination': 'no destination',
     bounced: 'routing prefix bounced',
+    'skip-reply': 'skip_reply in its round',
   };
 
   private draftsHeldNotice(

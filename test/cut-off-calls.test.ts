@@ -272,6 +272,15 @@ describe('native tools: a response that ends at the output limit with calls in i
     assert.equal(run.requests.length, 2);
   });
 
+  it("under sameRoundSkipReplyTextPolicy 'ask', holds a cut-off skip_reply's round as a draft, and runs nothing", async () => {
+    const run = await turn('native', [{ blocks: [{ text: 'A note for the room.' }, { call: 'skip_reply', json: ['{"wake_in_sec'], whole: false }], stop: 'max_tokens' }], { sameRoundSkipReplyTextPolicy: 'ask' });
+    assert.equal(run.skipReplies, 0);
+    assertRefusedPair(run, [{ name: 'skip_reply', says: RAN_NOT }]);
+    assert.deepEqual(run.routed, [NEXT]);
+    const texts = run.rows.flatMap((row) => row.content.filter((block) => block.type === 'text').map((block) => block.text as string));
+    assert.ok(texts.some((t) => t.startsWith('[delivered]') && /held as drafts? d-/.test(t)), texts.filter((t) => t.startsWith('[')).join(' | '));
+  });
+
   it('keeps a cut-off skip_reply\'s round private after an earlier round published its words', async () => {
     const run = await turn('native', [EAST_ROUND, { blocks: [{ text: 'A note to myself, not for the room.' }, { call: 'skip_reply', json: ['{"wake_in_sec'], whole: false }], stop: 'max_tokens' }]);
     assert.equal(run.skipReplies, 0);

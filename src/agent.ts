@@ -375,6 +375,7 @@ export class Agent {
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
+  readonly sameRoundSkipReplyTextPolicy: AgentConfig['sameRoundSkipReplyTextPolicy'];
   /** The participant name this agent's turns are presented under (see AgentConfig.presentAs). */
   readonly presentAs: string;
   /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
@@ -512,6 +513,7 @@ export class Agent {
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.sameRoundSkipReplyTextPolicy = config.sameRoundSkipReplyTextPolicy;
     this.presentAs = config.presentAs ?? config.name;
     this.ownParticipants = new Set([config.name, ...(config.selfParticipants ?? [])]);
     this.deniedAtDispatch = new Set(config.denyToolsAtDispatch ?? []);
