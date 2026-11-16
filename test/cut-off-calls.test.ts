@@ -778,6 +778,12 @@ describe("the private think policy without a channel registry, across a restart,
     assert.ok(!afterCut(run).includes(HELD));
   });
 
+  it("says nothing of held words when the cut round wrote none", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '<function_calls>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
   it("says nothing of held words under the public policy", async () => {
     const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }]);
     assert.ok(!afterCut(run).includes(HELD));
