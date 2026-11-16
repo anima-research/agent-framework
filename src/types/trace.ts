@@ -679,14 +679,23 @@ export type TraceEvent =
   | (TraceEventBase & {
       /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
        *  `reply` or `wait` as the judge answered, `error` when it failed,
-       *  timed out or answered nothing usable; `woke` is whether the gate
-       *  goes on to deliver the batch to wake the agent (an error's is by the
-       *  host's onError). JudgeConfig says when such a delivery starts no turn.
+       *  timed out or answered nothing usable, `refused` when the framework
+       *  refused to send the call's request (a hold on the agent's provider
+       *  calls or on the judge's model, a turn of the agent's waiting for
+       *  compression, a surgery's hold on the store, or a stopping
+       *  framework), which for a call asked once more after the
+       *  provider refused its first request as too long is its second;
+       *  `woke` is whether the gate goes on to deliver the batch to wake the
+       *  agent (an error's or a refusal's is by the host's onError: under
+       *  "skip" a refused batch is held to the refusal's stated end or a
+       *  release, then goes back to the judge, and not every refusal of a
+       *  held batch is traced, as `ReplyJudgeOptions.onError` says).
+       *  JudgeConfig says when such a delivery starts no turn.
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';
       policyName: string;
-      verdict: 'reply' | 'wait' | 'error';
+      verdict: 'reply' | 'wait' | 'error' | 'refused';
       woke: boolean;
       eventCount: number;
       durationMs: number;
@@ -694,6 +703,10 @@ export type TraceEvent =
       inputTokens?: number;
       cacheReadTokens?: number;
       outputTokens?: number;
+      /** For a refusal: the hold that refused the call, as the framework words it, with any provider's reason in it marked as supplied text. */
+      hold?: string;
+      /** For a refusal: when its hold said it ends (ms), when it said. */
+      until?: number;
     })
   | (TraceEventBase & {
       type: 'gate:config-reloaded';

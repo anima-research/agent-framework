@@ -2306,7 +2306,7 @@ test("a batch whose line quoting an event can't be written is named in the log a
   t.after(() => gate.dispose());
   assert.equal(gate.evaluate(event([], 'clock:reminder')).trigger, false, 'premise: the event waits in the debounce batch');
   t.mock.timers.tick(1000);
-  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (store unavailable), so the batch is dropped']);
+  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered ("store unavailable"), so the batch is dropped']);
   assert.deepEqual(wakes, []);
 });
 
@@ -2334,7 +2334,7 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
   assert.equal(gate.evaluate(MENTION).trigger, false, 'the event waits in the debounce batch');
   gate.evaluate(MENTION);
   t.mock.timers.tick(1000);
-  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 2 events couldn\'t be delivered (no agent to deliver to), so the batch is dropped']);
+  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 2 events couldn\'t be delivered ("no agent to deliver to"), so the batch is dropped']);
   assert.deepEqual(delivered, []);
 
   // Held for the turn of the agent whose wake_add_rule changed the rule, and sent once it ends.
@@ -2503,7 +2503,7 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   assert.deepEqual(names(gate), ['mentions'], 'and is in force');
   assert.deepEqual(
     logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
-    ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
+    ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered ("no agent to deliver to"), so the batch is dropped'],
   );
   const state = gate as unknown as { rateLimitBuckets: Map<string, unknown>; debounceTimers: Map<string, unknown> };
   assert.equal(state.rateLimitBuckets.has('limited'), false, "limited's spent bucket is cleared, though quiet's batch came first");
@@ -2533,7 +2533,7 @@ test("a reload whose pending batch can't be delivered still puts the new rules i
   assert.deepEqual(names(gate), ['mentions']);
   assert.deepEqual(
     logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
-    ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
+    ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered ("no agent to deliver to"), so the batch is dropped'],
   );
   assert.equal((gate as unknown as { debounceTimers: Map<string, unknown> }).debounceTimers.has('quiet'), false, 'nothing is left behind');
 });

@@ -831,7 +831,7 @@ describe('judge rules and the answered-batch drop', () => {
 
   for (const [how, error, traced] of [
     ['fails', new Error('judge down'), ['error']],
-    ['makes no call, its admission refused', Object.assign(new Error('admission deferred'), { providerAdmission: 'deferred' }), []],
+    ['makes no call, its admission refused', Object.assign(new Error('admission deferred'), { providerAdmission: 'deferred' }), ['refused']],
   ] as const) {
     it(`a judge that ${how}, with onError "wake", delivers a batch the agent answered as a debounce: no turn`, async () => {
       const { f, asked, verdicts, answeredMidTurn } = await judged(true, { tool: true });

@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -6,6 +6,8 @@ import { MembraneError } from '@animalabs/membrane';
 import * as gateModule from '../src/gate/event-gate.js';
 import { EventGate, type WakeWrite, type WritePlacement } from '../src/gate/event-gate.js';
 import { JudgeFailure } from '../src/gate/reply-judge.js';
+import { firstSentence } from '../src/mcpl/tool-signature.js';
+import { MAX_TIMER_MS } from '../src/deadline-timer.js';
 
 /** The gate's internal mark of the rows a batched wake's line can name, read
  *  loosely so this file still runs, red, against a gate without it. */
@@ -22,27 +24,91 @@ function writeConfig(name: string, config: unknown): string {
   return path;
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const LONGER_THAN_ANY_START_MS = 60_000;
-async function until(done: () => boolean, what: string, withinMs = 5_000): Promise<void> {
-  const by = Date.now() + withinMs;
-  while (!done()) {
-    if (Date.now() > by) assert.fail(`timed out waiting for ${what}`);
-    await sleep(5);
+async function settle(): Promise<void> {
+  for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+let clockMocked = false;
+
+function useRealClock(): void {
+  mock.timers.reset();
+  clockMocked = false;
+}
+
+const STEP_MS = 5;
+
+async function advance(ms: number): Promise<void> {
+  if (!clockMocked) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    return;
+  }
+  for (let stepped = 0; stepped < ms; stepped += STEP_MS) {
+    mock.timers.tick(Math.min(STEP_MS, ms - stepped));
+    await settle();
   }
 }
 
-/** A judge whose verdicts the test hands out, one per request, in order. */
+const refusalEnd = (gate: EventGate, rule = 'ambient'): number => (gate as unknown as { judgeHeld: Map<string, { refusal: { until: number } }> }).judgeHeld.get(rule)!.refusal.until;
+
+async function lastMillisecond(end: number, before: () => void): Promise<void> {
+  assert.ok(end - Date.now() >= 1, `premise: ${end - Date.now()} ms left before the end, at least 1`);
+  await advance(end - Date.now() - 1);
+  before();
+  await advance(1);
+}
+
+async function byThisMillisecond(done: () => boolean, what: string): Promise<void> {
+  const by = performance.now() + 5_000;
+  while (!done() && performance.now() < by) {
+    mock.timers.tick(0);
+    await settle();
+  }
+  assert.ok(done(), `${what}, without the clock moving on`);
+}
+
+function answersTaken(gate: EventGate): () => number {
+  const internal = gate as unknown as { finishJudging: (...args: unknown[]) => void };
+  const finish = internal.finishJudging.bind(gate);
+  let taken = 0;
+  internal.finishJudging = (...args: unknown[]) => {
+    taken++;
+    finish(...args);
+  };
+  return () => taken;
+}
+
+const LONGER_THAN_ANY_START_MS = 60_000;
+async function until(done: () => boolean, what: string, withinMs = 5_000): Promise<void> {
+  const by = Date.now() + withinMs;
+  await settle();
+  while (!done()) {
+    if (Date.now() >= by) assert.fail(`timed out waiting for ${what}`);
+    await advance(STEP_MS);
+  }
+}
+
+async function idle(framework: { runUntilIdle(): Promise<unknown> }, what = 'the framework to be idle'): Promise<void> {
+  let settled = false;
+  let failure: unknown;
+  void framework.runUntilIdle().then(() => { settled = true; }, (err: unknown) => { failure = err; settled = true; });
+  await until(() => settled, what, 60_000);
+  if (failure !== undefined) throw failure;
+}
+
+/** A judge whose verdicts the test hands out, one per request. */
 function scriptedJudge() {
   const requests: JudgeRequest[] = [];
+  const askedAt: number[] = [];
   const pending: Array<{ resolve: (v: JudgeVerdict) => void; reject: (e: unknown) => void }> = [];
   const fn: JudgeFn = (request) => {
     requests.push(request);
+    askedAt.push(Date.now());
     return new Promise<JudgeVerdict>((resolve, reject) => pending.push({ resolve, reject }));
   };
   return {
     fn,
     requests,
+    askedAt,
     answer(verdict: JudgeVerdict) {
       const next = pending.shift();
       assert.ok(next, 'a judge request is waiting');
@@ -53,17 +119,35 @@ function scriptedJudge() {
       assert.ok(next, 'a judge request is waiting');
       next.reject(err);
     },
+    answerAt(index: number, verdict: JudgeVerdict) {
+      const [next] = pending.splice(index, 1);
+      assert.ok(next, `a judge request is waiting at ${index}`);
+      next.resolve(verdict);
+    },
+    failAt(index: number, err: unknown) {
+      const [next] = pending.splice(index, 1);
+      assert.ok(next, `a judge request is waiting at ${index}`);
+      next.reject(err);
+    },
     waiting: () => pending.length,
   };
 }
 
-function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[]; isAnswered?: (after: WritePlacement) => boolean } = {}) {
+function makeGate(configPath: string, opts: {
+  judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[];
+  isHeld?: (serverId: string | undefined, channelId: string | undefined) => boolean;
+  onTrace?: (trace: { type: string; [k: string]: unknown }) => void;
+  isAnswered?: (after: WritePlacement) => boolean;
+} = {}) {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
   const wakes: Array<{ agentName: string; reason: string; writes?: WakeWrite[]; lineRows?: unknown }> = [];
-  const gate = new EventGate({
+  const gate: EventGate = new EventGate({
     configPath,
-    emitTrace: (e) => traces.push(e as { type: string }),
+    emitTrace: (e) => {
+      traces.push(e as { type: string });
+      opts.onTrace?.(e as { type: string });
+    },
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
     requestInference: (a, r, _s, p) => wakes.push({ agentName: a, reason: r, ...(p?.writes ? { writes: p.writes } : {}), ...(p && BATCH_LINE_ROWS in p ? { lineRows: (p as Record<symbol, unknown>)[BATCH_LINE_ROWS] } : {}) }),
     getAgentNames: () => ['agent'],
@@ -72,6 +156,7 @@ function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: 
     ...(opts.judgeOnError ? { judgeOnError: opts.judgeOnError } : {}),
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.residents ? { changesJudgedContext: (name: string) => opts.residents!.includes(name) } : {}),
+    ...(opts.isHeld ? { isHeld: opts.isHeld } : {}),
     ...(opts.isAnswered ? { isAnswered: opts.isAnswered } : {}),
   });
   return { gate, traces, messages, wakes };
@@ -94,8 +179,13 @@ const JUDGED: GateConfig = {
   ],
 };
 
-beforeEach(() => mkdirSync(TMP_DIR, { recursive: true }));
+beforeEach(() => {
+  mkdirSync(TMP_DIR, { recursive: true });
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  clockMocked = true;
+});
 afterEach(() => {
+  useRealClock();
   if (existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true, force: true });
 });
 
@@ -271,6 +361,7 @@ describe('judge rules: verdicts', () => {
     const { gate, wakes, messages, traces } = makeGate(writeConfig('reply.json', JUDGED), { judge: judge.fn });
     gate.evaluate(chat('is anyone around?'));
     gate.evaluate(chat('anyone?'));
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
     assert.strictEqual(judge.requests.length, 1);
     const req = judge.requests[0]!;
@@ -282,6 +373,7 @@ describe('judge rules: verdicts', () => {
     assert.strictEqual(wakes.length, 0, 'no wake before the verdict');
 
     judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1234 });
+    await advance(10);
     await until(() => wakes.length === 1, 'the wake');
     assert.deepStrictEqual(wakes, [{ agentName: 'agent', reason: 'gate:debounce', lineRows: [] }], 'a batch wake, whose line has nothing to name');
     assert.strictEqual(messages.length, 0, 'events stored at arrival get no line');
@@ -291,9 +383,24 @@ describe('judge rules: verdicts', () => {
     assert.strictEqual(verdict.woke, true);
     assert.strictEqual('reason' in verdict, false, "the judge's reason isn't traced");
     const state = gate.getStatus().policies[0]!.judgeState!;
-    assert.deepStrictEqual(state.verdicts, { reply: 1, wait: 0, error: 0 });
+    assert.deepStrictEqual(state.verdicts, { reply: 1, wait: 0, error: 0, refused: 0 });
     assert.strictEqual(state.last!.reason, 'a direct question');
     assert.strictEqual(state.last!.inputTokens, 1234);
+    gate.dispose();
+  });
+
+  it('a wait on an event outside MCPL writes nothing either, as defer doesn\'t', async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes, messages } = makeGate(writeConfig('wait-module-event.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { judge: { debounceMs: 30 } } }],
+    }), { judge: judge.fn });
+    gate.evaluate({ content: 'notes.md changed', eventType: 'workspace:modified', serverId: 'workspace', channelId: '' });
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.answer({ reply: false, reason: 'nothing to answer' });
+    await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the verdict applied');
+    await advance(50);
+    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(wakes.length, 0);
     gate.dispose();
   });
 
@@ -312,13 +419,15 @@ describe('judge rules: verdicts', () => {
     const judge = scriptedJudge();
     const { gate, wakes, messages } = makeGate(writeConfig('wait.json', JUDGED), { judge: judge.fn });
     gate.evaluate(chat('lol'));
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
     judge.answer({ reply: false, reason: 'banter between others' });
+    await advance(10);
     await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the verdict');
     assert.strictEqual(wakes.length, 0);
     assert.strictEqual(messages.length, 0);
     const state = gate.getStatus().policies[0]!.judgeState!;
-    assert.deepStrictEqual(state.verdicts, { reply: 0, wait: 1, error: 0 });
+    assert.deepStrictEqual(state.verdicts, { reply: 0, wait: 1, error: 0, refused: 0 });
     assert.strictEqual(state.last!.verdict, 'wait');
     gate.dispose();
   });
@@ -331,8 +440,10 @@ describe('judge rules: verdicts', () => {
     console.error = (...args: unknown[]) => { errors.push(args); };
     try {
       gate.evaluate(chat('hello'));
+      await advance(160);
       await until(() => judge.waiting() === 1, 'the judge is asked');
       judge.fail(new Error('provider down'));
+      await advance(10);
       await until(() => wakes.length === 1, 'the wake');
     } finally {
       console.error = original;
@@ -343,6 +454,25 @@ describe('judge rules: verdicts', () => {
     gate.dispose();
   });
 
+  it('a failed judge under onError "skip" does not wake', async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('fail-skip.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    const original = console.error;
+    console.error = () => {};
+    try {
+      gate.evaluate(chat('hello'));
+      await advance(160);
+      await until(() => judge.waiting() === 1, 'the judge is asked');
+      judge.fail(new Error('provider down'));
+      await advance(10);
+      await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === 1, 'the failure counted');
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(wakes.length, 0);
+    gate.dispose();
+  });
+
   it('a judge that takes too long is timed out, its request aborted, and the agent woken', async () => {
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('timeout.json', JUDGED), { judge: judge.fn, judgeTimeoutMs: 50 });
@@ -350,7 +480,7 @@ describe('judge rules: verdicts', () => {
     console.error = () => {};
     try {
       gate.evaluate(chat('hello'));
-      await until(() => judge.requests[0]?.signal.aborted === true && wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
+      await until(() => wakes.length === 1, 'the timed-out judge to wake the agent');
     } finally {
       console.error = original;
     }
@@ -358,7 +488,7 @@ describe('judge rules: verdicts', () => {
     assert.strictEqual(wakes.length, 1);
     // A verdict after the timeout changes nothing.
     judge.answer({ reply: true, reason: 'late' });
-    await sleep(10);
+    await advance(10);
     assert.strictEqual(wakes.length, 1);
     gate.dispose();
   });
@@ -370,8 +500,10 @@ describe('judge rules: verdicts', () => {
     console.error = () => {};
     try {
       gate.evaluate(chat('hello'));
+      await advance(160);
       await until(() => judge.waiting() === 1, 'the judge is asked');
       judge.answer({ reason: 'hm' } as unknown as JudgeVerdict);
+      await advance(10);
       await until(() => wakes.length === 1, 'the wake');
     } finally {
       console.error = original;
@@ -388,11 +520,14 @@ describe('judge rules: timing', () => {
     const { gate, wakes } = makeGate(writeConfig('held.json', JUDGED), { judge: judge.fn });
     gate.onInferenceStarted('agent');
     gate.evaluate(chat('hello'));
+    await advance(160);
     await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the batch held');
     assert.strictEqual(judge.requests.length, 0, 'not judged mid-turn');
     gate.onInferenceEnded('agent');
+    await advance(10);
     await until(() => judge.requests.length === 1, 'the judge is asked after the turn');
     judge.answer({ reply: true, reason: 'ok' });
+    await advance(10);
     await until(() => wakes.length === 1, 'the wake');
     gate.dispose();
   });
@@ -404,15 +539,16 @@ describe('judge rules: timing', () => {
     await until(() => judge.requests.length === 1, 'the judge to be asked');
     gate.onInferenceStarted('agent');
     assert.strictEqual(judge.requests[0]!.signal.aborted, true);
+    const taken = answersTaken(gate);
     judge.answer({ reply: true, reason: 'late' });
-    await sleep(10);
+    await until(() => taken() === 1, "the gate to take the stopped call's late answer");
     assert.strictEqual(wakes.length, 0, 'a stopped call wakes nothing');
     assert.strictEqual(judge.requests.length, 1, 'not judged again mid-turn');
-    assert.deepStrictEqual(gate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 0, wait: 0, error: 0 }, 'a stopped call is no verdict and no error');
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 0, wait: 0, error: 0, refused: 0 }, 'a stopped call is no verdict and no error');
     gate.onInferenceEnded('agent');
     await until(() => judge.requests.length === 2, 'the judge to be asked after the turn');
     judge.answer({ reply: false, reason: 'already answered' });
-    await sleep(10);
+    await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the WAIT verdict counted');
     assert.strictEqual(wakes.length, 0);
     assert.strictEqual(judge.requests.length, 2, 'one call after the turn');
     gate.dispose();
@@ -426,11 +562,19 @@ describe('judge rules: timing', () => {
     gate.onInferenceStarted('agent');
     gate.onInferenceEnded('agent');
     await until(() => judge.requests.length === 2, 'the judge to be asked after the turn');
+    const internal = gate as unknown as { finishJudging(...args: unknown[]): void };
+    const finish = internal.finishJudging.bind(gate);
+    let finished = 0;
+    internal.finishJudging = (...args: unknown[]) => {
+      finished++;
+      finish(...args);
+    };
     judge.answer({ reply: false, reason: 'stale' });
     judge.answer({ reply: true, reason: 'still' });
-    await sleep(10);
+    await until(() => finished === 2, 'both answers to be handled');
     assert.strictEqual(wakes.length, 1);
     assert.strictEqual(judge.requests.length, 2);
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 1, wait: 0, error: 0, refused: 0 }, "only the later call's REPLY counts");
     gate.dispose();
   });
 
@@ -443,11 +587,12 @@ describe('judge rules: timing', () => {
     assert.strictEqual(judge.requests[0]!.signal.aborted, true);
     gate.onInferenceEnded('helper');
     await until(() => judge.requests.length === 2, 'the judge to be asked after the turn');
+    const taken = answersTaken(gate);
     judge.answer({ reply: true, reason: 'stopped, so ignored' });
     judge.answer({ reply: false, reason: 'helper answered' });
-    await sleep(10);
+    await until(() => taken() === 2 && gate.getStatus().policies.some((p) => p.judgeState?.verdicts.wait === 1), 'the gate to take both answers, the second as its WAIT');
     assert.strictEqual(wakes.length, 0);
-    assert.deepStrictEqual(gate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 0, wait: 1, error: 0 });
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 0, wait: 1, error: 0, refused: 0 });
     gate.dispose();
   });
 
@@ -487,11 +632,12 @@ describe('judge rules: timing', () => {
     gate.onInferenceStarted('subconscious');
     assert.strictEqual(judge.requests[0]!.signal.aborted, false);
     judge.answer({ reply: true, reason: 'asked' });
-    await sleep(10);
+    await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.reply === 1, 'the REPLY verdict counted');
     assert.strictEqual(judge.requests.length, 1, 'not judged again');
     assert.strictEqual(wakes.length, 0, 'the wake waits, as every batched wake does, while any turn runs');
     gate.onInferenceEnded('fork');
     gate.onInferenceEnded('subconscious');
+    await advance(10);
     await until(() => wakes.length === 1, 'the wake');
     gate.dispose();
   });
@@ -500,16 +646,20 @@ describe('judge rules: timing', () => {
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('quiesce.json', JUDGED), { judge: judge.fn });
     gate.evaluate(chat('hello'));
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
     gate.setQuiesced(true);
     assert.strictEqual(judge.requests[0]!.signal.aborted, true);
+    const taken = answersTaken(gate);
     judge.answer({ reply: true, reason: 'late' });
-    await sleep(10);
+    await until(() => taken() === 1, "the gate to take the stopped call's late answer");
     assert.strictEqual(wakes.length, 0);
     assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.heldCount, 1);
     gate.setQuiesced(false);
+    await advance(10);
     await until(() => judge.requests.length === 2, 'the judge is asked at resume');
     judge.answer({ reply: true, reason: 'now' });
+    await advance(10);
     await until(() => wakes.length === 1, 'the wake');
     gate.dispose();
   });
@@ -524,12 +674,14 @@ describe('judge rules: timing', () => {
     try {
       gate.onInferenceStarted('agent');
       for (let i = 0; i < 150; i++) gate.evaluate(chat(`m${i}`));
+      await advance(160);
       await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 100, 'the batch held');
     } finally {
       console.error = original;
     }
     assert.strictEqual(gate.inferenceDiagnostics().droppedJudgeEvents, 50);
     gate.onInferenceEnded('agent');
+    await advance(10);
     await until(() => judge.requests.length === 1, 'the judge is asked after the turn');
     assert.strictEqual(judge.requests[0]!.events[0]!.content, 'm50');
     gate.dispose();
@@ -544,20 +696,65 @@ describe('judge rules: timing', () => {
     console.error = () => {};
     try {
       for (let i = 0; i < 100; i++) gate.evaluate(chat(`a${i}`));
+      await advance(160);
       await until(() => judge.waiting() === 1, 'the judge is asked');
       assert.strictEqual(judge.requests[0]!.events.length, 100);
       for (let i = 0; i < 120; i++) gate.evaluate(chat(`b${i}`));
+      await advance(160);
       await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the b batch to queue behind the call');
     } finally {
       console.error = original;
     }
     judge.answer({ reply: false, reason: 'not yet' });
+    await advance(10);
     await until(() => judge.requests.length === 2, 'the queued batch to be judged');
     const next = judge.requests[1]!.events.map((e) => e.content);
     assert.strictEqual(next.length, 100);
     assert.strictEqual(next[0], 'b20');
     assert.strictEqual(next.at(-1), 'b119', 'the newest is kept');
     gate.dispose();
+  });
+
+  it("a refused call's log line names the events queued behind the call, which go with its batch, and the oldest events the cap dropped as it held them", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('cap-refused.json', {
+      policies: [{ name: 'busy', match: {}, behavior: { judge: { debounceMs: 100 } } }],
+    }), { judge: judge.fn, judgeOnError: 'skip' });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 100; i++) gate.evaluate(chat(`a${i}`));
+      await until(() => judge.waiting() === 1, 'the judge is asked');
+      for (let i = 0; i < 100; i++) gate.evaluate(chat(`b${i}`));
+      await advance(160);
+      await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the b batch to queue behind the call');
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await settle();
+    } finally {
+      console.error = original;
+    }
+    const line = logged.find((l) => l.includes("the reply judge's call was refused"));
+    assert.ok(line?.includes("its batch of 100 events, with 100 more queued behind the call, is held while the judge's calls are refused, the rule's oldest 100 events dropped at the cap"), JSON.stringify(logged));
+    assert.strictEqual(gate.getStatus().policies[0]!.judgeState!.heldCount, 100, 'premise: the cap kept 100');
+    gate.dispose();
+    const small = scriptedJudge();
+    const { gate: one } = makeGate(writeConfig('refused-call-queued.json', JUDGED), { judge: small.fn, judgeOnError: 'skip' });
+    one.evaluate(chat('first'));
+    await until(() => small.waiting() === 1, 'the judge call');
+    one.evaluate(chat('second'));
+    await advance(160);
+    const internal = one as unknown as { judging: Map<string, { queued: unknown[] }> };
+    assert.strictEqual(internal.judging.get('ambient')?.queued.length, 1, 'premise: the second batch waits behind the call');
+    const errors = await logDuring(async () => {
+      small.fail(refusal("scout's provider calls are held", 60_000));
+      await settle();
+    });
+    assert.deepStrictEqual(errors.filter((l) => l.includes('[gate] Rule')), [
+      `[gate] Rule "ambient": the reply judge's call was refused (scout's provider calls are held), so its batch of 1 event, with 1 more queued behind the call, is held while the judge's calls are refused (judge onError "skip")`,
+    ]);
+    assert.strictEqual(judgeState(one).heldCount, 2, 'the queued batch goes with its batch');
+    one.dispose();
   });
 
   // About twice the most a spread can pass as call arguments on Node 24.22.2
@@ -601,8 +798,10 @@ describe('judge rules: timing', () => {
     try {
       for (let i = 0; i < 3; i++) {
         gate.evaluate(chat(`m${i}`));
+        await advance(160);
         await until(() => judge.waiting() === 1, 'the judge is asked');
         judge.fail(new Error('400 model not found'));
+        await advance(10);
         await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === i + 1, 'the failure counted');
       }
     } finally {
@@ -611,8 +810,10 @@ describe('judge rules: timing', () => {
     assert.ok(gate.getStatus().errors.some((e) => e.includes('failed its last 3 requests (the newest: the call failed)')), JSON.stringify(gate.getStatus().errors));
     assert.ok(!gate.getStatus().errors.some((e) => e.includes('400 model not found')), "gate_status doesn't quote an error the framework didn't write");
     gate.evaluate(chat('ok'));
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
     judge.answer({ reply: false, reason: 'fine' });
+    await advance(10);
     await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the verdict');
     assert.ok(!gate.getStatus().errors.some((e) => e.includes('failed its last')));
     gate.dispose();
@@ -706,54 +907,764 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
-  it('a judge that made no call, refused under a hold, decides by onError and counts no failure', async () => {
-    const refusal = Object.assign(new Error("scout's provider calls are held"), { providerAdmission: 'deferred' as const });
-    const { gate, wakes, traces } = makeGate(writeConfig('refused.json', JUDGED), { judge: async () => { throw refusal; } });
-    for (let i = 0; i < 3; i++) {
-      gate.evaluate(chat(`hello ${i}`));
-      await until(() => wakes.length === i + 1, 'the fail-open wake');
+  const refusal = (text: string, retryAfterMs?: number) =>
+    Object.assign(new Error(text), { providerAdmission: 'deferred' as const, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) });
+  const judgeState = (gate: EventGate) => gate.getStatus().policies[0]!.judgeState!;
+  const logDuring = async (step: () => Promise<void>): Promise<string[]> => {
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      await step();
+    } finally {
+      console.error = original;
     }
-    assert.deepStrictEqual(gate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 0, wait: 0, error: 0 });
-    assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('reply judge has failed')), false, 'gate_status names no failing judge');
-    assert.strictEqual(traces.some((t) => t.type === 'gate:judge-verdict'), false);
+    return logged;
+  };
+
+  it("a refused call is traced and counted as a refusal, apart from failures, with its hold and stated end, and under onError 'wake', where nothing is held, gate_status names no refusal", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes, traces } = makeGate(writeConfig('refused.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('hello'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    const refusedAt = Date.now();
+    const logged = await logDuring(async () => {
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => wakes.length === 1, 'the fail-open wake');
+    });
+    const seenAt = Date.now();
+    assert.ok(logged.some((l) => l.includes('so its batch of 1 event goes to delivery without the judge')), JSON.stringify(logged));
+    const state = judgeState(gate);
+    assert.deepStrictEqual(state.verdicts, { reply: 0, wait: 0, error: 0, refused: 1 });
+    assert.strictEqual(state.last?.verdict, 'refused');
+    assert.strictEqual(state.last?.reason, 'the framework refused to send the call', "gate_status gives the framework's words");
+    const verdict = traces.find((t) => t.type === 'gate:judge-verdict')!;
+    assert.strictEqual(verdict.verdict, 'refused');
+    assert.strictEqual(verdict.woke, true);
+    assert.match(String(verdict.hold), /provider calls are held/);
+    assert.ok(Number(verdict.until) >= refusedAt + 60_000 && Number(verdict.until) <= seenAt + 60_000, `the trace's stated end: ${String(verdict.until)}`);
+    const errors = gate.getStatus().errors;
+    assert.strictEqual(errors.some((e) => e.includes('reply judge has failed')), false, 'gate_status names no failing judge');
+    assert.strictEqual(errors.some((e) => e.includes('refused')), false, JSON.stringify(errors));
+    gate.dispose();
+  });
+
+  it("under onError 'wake', each batch is asked about though an earlier call was refused, and each refused batch, one held for a turn among them, wakes the agent and is logged and traced", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes, traces } = makeGate(writeConfig('refused-wake.json', JUDGED), { judge: judge.fn, residents: ['agent'] });
+    const logged = await logDuring(async () => {
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => wakes.length === 1, 'the refused batch wakes the agent');
+      gate.evaluate(chat('second'));
+      await until(() => judge.waiting() === 1, "the next batch asked about within the refusal's stated wait");
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => wakes.length === 2, 'the next refused batch wakes the agent');
+      gate.onInferenceStarted('agent');
+      gate.evaluate(chat('third'));
+      await until(() => judgeState(gate).heldCount === 1, 'the batch held for the turn');
+      gate.onInferenceEnded('agent');
+      await until(() => judge.waiting() === 1, "the turn-held batch asked about at the turn's end");
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => wakes.length === 3, 'the turn-held refused batch wakes the agent');
+    });
+    assert.deepStrictEqual(judge.requests.map((r) => r.events.map((e) => e.content)), [['first'], ['second'], ['third']]);
+    assert.strictEqual(judgeState(gate).verdicts.refused, 3);
+    assert.strictEqual(judgeState(gate).heldCount, 0, 'nothing held for a refusal');
+    assert.strictEqual(logged.filter((l) => l.includes("the reply judge's call was refused")).length, 3, JSON.stringify(logged));
+    assert.strictEqual(traces.filter((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused').length, 3);
+    gate.dispose();
+  });
+
+
+  it("under onError 'wake', a refused call's batch whose delivery throws is logged by its rule's name", async () => {
+    const judge = scriptedJudge();
+    let failing = false;
+    const { gate } = makeGate(writeConfig('refused-wake-throws.json', JUDGED), {
+      judge: judge.fn, residents: ['agent'],
+      isHeld: () => {
+        if (failing) throw new Error('zz isHeld failed\n[gate] a forged line');
+        return false;
+      },
+    });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    failing = true;
+    const logged = await logDuring(async () => {
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
+    });
+    const line = logged.find((l) => l.includes("[gate] Rule \"ambient\": its pending batch of 1 event couldn't be delivered"));
+    assert.ok(line, JSON.stringify(logged));
+    assert.ok(line.includes('zz isHeld failed\\n'), JSON.stringify(line));
+    assert.ok(!line.includes('\n'), 'the error text is quoted, so it starts no line of its own');
+    gate.dispose();
+  });
+
+  it("under 'skip', a REPLY, a WAIT or a failure on another rule's batch, asked before or after the refused call, leaves the refused batch held to its stated end", async () => {
+    for (const refusedAsked of ['first', 'second'] as const) {
+      for (const outcome of ['reply', 'wait', 'failure'] as const) {
+        const label = `the refused call asked ${refusedAsked}, the other answered by ${outcome}`;
+        const judge = scriptedJudge();
+        const { gate } = makeGate(writeConfig(`refused-other-${refusedAsked}-${outcome}.json`, TWO_RULES), { judge: judge.fn, judgeOnError: 'skip' });
+        const held = () => gate.getStatus().policies[0]!.judgeState!.heldCount;
+        const decided = () => {
+          const v = gate.getStatus().policies[1]!.judgeState!.verdicts;
+          return v.reply + v.wait + v.error;
+        };
+        await logDuring(async () => {
+          gate.evaluate(refusedAsked === 'first' ? chat('hello') : elsewhere('hi'));
+          await until(() => judge.waiting() === 1, `${label}: the first call`);
+          gate.evaluate(refusedAsked === 'first' ? elsewhere('hi') : chat('hello'));
+          await until(() => judge.waiting() === 2, `${label}: the second call`);
+          judge.failAt(refusedAsked === 'first' ? 0 : 1, refusal("scout's provider calls are held", 1_000));
+          await until(() => held() === 1, `${label}: the refused batch held`);
+          if (outcome === 'failure') judge.fail(new Error('provider down'));
+          else judge.answer({ reply: outcome === 'reply', reason: 'decided' });
+          await until(() => decided() === 1, `${label}: the other call decided`);
+          await advance(50);
+        });
+        assert.strictEqual(judge.requests.length, 2, `${label}: the held batch isn't asked again`);
+        assert.strictEqual(held(), 1, `${label}: still held`);
+        assert.ok(gate.getStatus().errors.some((e) => e.startsWith(`Rule "first"'s reply judge call was refused`)), `${label}: ${JSON.stringify(gate.getStatus().errors)}`);
+        await until(() => judge.waiting() === 1, `${label}: asked again at the refusal's stated end`);
+        assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['hello'], label);
+        judge.answer({ reply: false, reason: 'chatter' });
+        gate.dispose();
+      }
+    }
+  });
+
+
+  const refusedOnce = async (onError: 'wake' | 'skip', file: string, opts: { config?: GateConfig; waitMs?: number | null; isHeld?: (serverId: string | undefined, channelId: string | undefined) => boolean } = {}) => {
+    const judge = scriptedJudge();
+    const made = makeGate(writeConfig(file, opts.config ?? JUDGED), { judge: judge.fn, judgeOnError: onError, residents: ['agent'], ...(opts.isHeld ? { isHeld: opts.isHeld } : {}) });
+    made.gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(opts.waitMs === null ? refusal('a live surgery for scout holds the store') : refusal("scout's provider calls are held", opts.waitMs ?? 60_000));
+    await until(() => judgeState(made.gate).verdicts.refused === 1, 'the refusal recorded');
+    return { ...made, judge };
+  };
+  const twoRules = (later: { name: string; debounceMs: number }): GateConfig => ({
+    policies: [
+      { name: 'soon', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } },
+      { name: later.name, match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: later.debounceMs } } },
+    ],
+  });
+  const dueOf = (gate: EventGate, name: string) => (gate as unknown as { debounceTimers: Map<string, { dueAt: number }> }).debounceTimers.get(name)!.dueAt;
+  const listed = (gate: EventGate) => gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]);
+
+  it("under onError 'wake', after a refused call the wake list gives each judge rule's collecting batch as going to the judge at its due time, a maybe", async () => {
+    const { gate } = await refusedOnce('wake', 'refused-wake-listed.json', { config: twoRules({ name: 'later', debounceMs: 120_000 }) });
+    gate.evaluate(chat('second'));
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    assert.deepStrictEqual(listed(gate), [
+      ['rule "soon"\'s batch of 1 event goes to the judge', false, dueOf(gate, 'soon')],
+      ['rule "later"\'s batch of 1 event goes to the judge', false, dueOf(gate, 'later')],
+    ]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.kind), ['judge-batch', 'judge-batch']);
+    gate.dispose();
+  });
+
+  it("under onError 'skip', the wake list gives a batch held for a refusal at the refusal's stated end, and past it while a turn holds it, and each judge rule's collecting batch as going to the judge, joining its rule's held batch", async () => {
+    {
+      const { gate } = await refusedOnce('skip', 'refused-skip-listed.json', { config: twoRules({ name: 'later', debounceMs: 120_000 }) });
+      gate.evaluate(chat('second'));
+      gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+      const end = refusalEnd(gate, 'soon');
+      assert.deepStrictEqual(listed(gate), [
+        ['rule "soon"\'s batch of 1 event, which joins its held batch when it fires, goes to the judge', false, dueOf(gate, 'soon')],
+        ['rule "soon"\'s batch of 1 event, held for the judge while its calls are refused', false, end],
+        ['rule "later"\'s batch of 1 event goes to the judge', false, dueOf(gate, 'later')],
+      ]);
+      gate.dispose();
+    }
+    {
+      const { gate } = await refusedOnce('skip', 'refused-skip-turn-listed.json');
+      gate.evaluate(chat('second'));
+      const end = refusalEnd(gate);
+      const due = dueOf(gate, 'ambient');
+      const joins = 'rule "ambient"\'s batch of 1 event, which joins its held batch when it fires, goes to the judge';
+      const held = 'rule "ambient"\'s batch of 1 event, held for the judge while its calls are refused';
+      assert.deepStrictEqual(listed(gate), [[joins, false, due], [held, false, end]], 'premise: no turn runs');
+      assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.kind), ['judge-batch', 'judge-batch']);
+      gate.onInferenceStarted('agent');
+      assert.deepStrictEqual(listed(gate), [
+        [joins, false, due],
+        [`${held} and, past the refusal's end, while a turn holds it`, false, end],
+      ]);
+      gate.dispose();
+    }
+    {
+      const { gate, judge } = await refusedOnce('skip', 'refused-no-end-joins.json', { waitMs: null });
+      gate.evaluate(chat('second'));
+      assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.what), [
+        'rule "ambient"\'s batch of 1 event, which joins its held batch when it fires, goes to the judge',
+        'rule "ambient"\'s batch of 1 event, held for the judge',
+      ]);
+      await until(() => judge.waiting() === 1, 'the next batch asked');
+      assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second'], 'premise: the ask takes the held batch in');
+      judge.answer({ reply: false, reason: 'chatter' });
+      gate.dispose();
+    }
+  });
+
+
+
+  it("lists a judge rule's batch as debounced when no judge is wired, since it's delivered as a debounce's is", () => {
+    const { gate } = makeGate(writeConfig('no-judge-listed.json', JUDGED), { residents: ['agent'] });
+    gate.evaluate(chat('hello'));
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [['rule "ambient"\'s debounced batch of 1 event', true]]);
     gate.dispose();
   });
 
   it('a refused call under the default onError wakes the agent with the events queued behind it', async () => {
-    const refusal = Object.assign(new Error("scout's provider calls are held"), { providerAdmission: 'deferred' as const });
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('refused-queued.json', JUDGED), { judge: judge.fn });
     gate.evaluate(chat('first'), { agent: 'agent', messageId: 'row-1' });
     await until(() => judge.waiting() === 1, 'the judge call');
     gate.evaluate(chat('second'), { agent: 'agent', messageId: 'row-2' });
-    await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the second event to queue behind the call');
-    judge.fail(refusal);
+    await until(() => judgeState(gate).pendingCount === 0, 'the second event to queue behind the call');
+    judge.fail(refusal("scout's provider calls are held", 60_000));
     await until(() => wakes.length === 1, 'the wake');
     assert.deepStrictEqual(wakes[0]!.writes?.map((w) => w.after.messageId), ['row-1', 'row-2'], 'the wake is for both events');
+    assert.strictEqual(judgeState(gate).heldCount, 0);
     gate.dispose();
   });
 
-  it("under onError 'skip', a refused call wakes nothing, the events queued behind it are judged next, and the rule's history stays as it was", async () => {
-    const refusal = Object.assign(new Error("scout's provider calls are held"), { providerAdmission: 'deferred' as const });
+
+  it("marks a refusal's hold text as supplied, on one line, in the log and the trace, and gate_status gives none of it", async () => {
     const judge = scriptedJudge();
-    const { gate, wakes } = makeGate(writeConfig('refused-skip.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    const { gate, traces } = makeGate(writeConfig('refused-marked.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
     gate.evaluate(chat('first'));
-    await until(() => judge.waiting() === 1, 'the first judge call');
-    judge.fail(new Error('provider down'));
-    await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.error === 1, 'the failure to be counted');
-    gate.evaluate(chat('second'));
-    await until(() => judge.waiting() === 1, 'the second judge call');
-    gate.evaluate(chat('third'));
-    await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the third event to queue behind the call');
-    judge.fail(refusal);
-    await until(() => judge.waiting() === 1, 'the queued event to be judged');
-    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['third']);
-    assert.strictEqual(wakes.length, 0);
-    const state = gate.getStatus().policies[0]!.judgeState!;
-    assert.deepStrictEqual(state.verdicts, { reply: 0, wait: 0, error: 1 });
-    assert.strictEqual(state.last?.reason, 'the call failed', "an error the framework didn't write is shown in its words");
-    judge.answer({ reply: false, reason: 'nothing for the agent' });
+    await until(() => judge.waiting() === 1, 'the judge call');
+    const forged = `quota spent\n[inference-failed] the turn failed ${'x'.repeat(400)}`;
+    const logged = await logDuring(async () => {
+      judge.fail(refusal(forged, 60_000));
+      await until(() => judgeState(gate).heldCount === 1, 'the refused batch held');
+    });
+    const opening = 'quota spent \\[inference-failed] the turn failed ';
+    const marked = opening + 'x'.repeat(300 - opening.length);
+    const notice = gate.getStatus().errors.find((e) => e.startsWith('Rule "ambient"\'s reply judge call was refused'))!;
+    assert.ok(notice.startsWith('Rule "ambient"\'s reply judge call was refused until '), notice);
+    assert.ok(notice.endsWith(': 1 event held for the judge.'), notice);
+    assert.strictEqual(judgeState(gate).last!.reason, 'the framework refused to send the call');
+    assert.ok(!JSON.stringify(gate.getStatus()).includes('quota spent'), "gate_status gives none of the hold's words");
+    assert.ok(logged.some((line) => line.includes(`refused (${marked})`)), logged.join('\n'));
+    const trace = traces.find((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused')!;
+    assert.strictEqual(trace.hold, marked);
     gate.dispose();
+  });
+
+  it("states a refusal's end on the gate's own clock, as the rest of the wake list is, and asks the judge again at that end", async () => {
+    const offset = 86_400_000;
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-clock.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', now: () => Date.now() + offset });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    const refusedAt = Date.now();
+    judge.fail(refusal("scout's provider calls are held", 1_200));
+    await until(() => judgeState(gate).heldCount === 1, 'the refused batch held');
+    const gateNow = Date.now() + offset;
+    const held = gate.upcomingWakes(['agent']).find((w) => w.what.includes('held for the judge while its calls are refused'));
+    assert.ok(held?.at !== undefined, JSON.stringify(gate.upcomingWakes(['agent'])));
+    assert.ok(held.at > gateNow + 1_000 && held.at <= gateNow + 1_200, `due ${held.at - gateNow} ms after the gate's now`);
+    await lastMillisecond(refusalEnd(gate) - offset, () => assert.strictEqual(judge.requests.length, 1, 'not asked a millisecond before the stated wait ends'));
+    assert.strictEqual(judge.waiting(), 1, "the held batch judged at the refusal's end");
+    assert.ok(judge.askedAt[1]! - refusedAt >= 1_200, `asked again ${judge.askedAt[1]! - refusedAt} ms on, not before the stated wait ends`);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under onError 'skip', a refused call holds its batch, with the events queued behind it, and the judge decides it once the refusal's stated wait ends", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes, traces } = makeGate(writeConfig('refused-skip.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', isAnswered: () => false });
+    gate.evaluate(chat('first'), { agent: 'agent', messageId: 'row-1' });
+    await until(() => judge.waiting() === 1, 'the judge call');
+    gate.evaluate(chat('second'), { agent: 'agent', messageId: 'row-2' });
+    await until(() => judgeState(gate).pendingCount === 0, 'the second event to queue behind the call');
+    const refusedAt = Date.now();
+    judge.fail(refusal('claude-haiku-5-5 is held for scout', 1_200));
+    await until(() => judgeState(gate).heldCount === 2, 'the batch and its queue to be held');
+    assert.strictEqual(wakes.length, 0);
+    assert.strictEqual(traces.filter((t) => t.type === 'gate:judge-verdict').at(-1)!.woke, false);
+    assert.ok(gate.getStatus().errors.some((e) => e.startsWith('Rule "ambient"\'s reply judge call was refused until ') && e.endsWith(': 2 events held for the judge.')), JSON.stringify(gate.getStatus().errors));
+    await lastMillisecond(refusalEnd(gate), () => assert.strictEqual(judge.requests.length, 1, 'not asked a millisecond before the stated wait ends'));
+    assert.strictEqual(judge.waiting(), 1, 'the held batch judged as the wait ends');
+    assert.ok(judge.askedAt[1]! - refusedAt >= 1_200, `asked again ${judge.askedAt[1]! - refusedAt} ms on, not before the stated wait ends`);
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
+    judge.answer({ reply: true, reason: 'a question' });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('claude-haiku-5-5 is held for scout')), false, 'the refusal is over');
+    assert.deepStrictEqual(wakes[0]!.writes?.map((w) => w.after.messageId), ['row-1', 'row-2'], 'the wake is for both events');
+    assert.deepStrictEqual(judgeState(gate).verdicts, { reply: 1, wait: 0, error: 0, refused: 1 });
+    gate.dispose();
+  });
+
+  it("under 'skip', a batch refused again when it's judged again is held again, to the new refusal's end, and its second refusal is counted but neither logged nor traced", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes, traces } = makeGate(writeConfig('refused-again.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    let againAt = 0;
+    const logged = await logDuring(async () => {
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      judge.fail(refusal("scout's provider calls are held", 1_000));
+      await until(() => judge.waiting() === 1, "the batch judged again at the refusal's end", 4_000);
+      againAt = Date.now();
+      judge.fail(refusal("scout's provider calls are held", 1_000));
+      await until(() => judgeState(gate).verdicts.refused === 2, 'the second refusal recorded');
+    });
+    assert.strictEqual(logged.filter((l) => l.includes("the reply judge's call was refused")).length, 1, JSON.stringify(logged));
+    assert.strictEqual(traces.filter((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused').length, 1);
+    await lastMillisecond(refusalEnd(gate), () => assert.strictEqual(judge.requests.length, 2, "not asked a millisecond before the second refusal's end"));
+    assert.strictEqual(judge.waiting(), 1, 'judged as the second refusal ends');
+    assert.ok(judge.askedAt[2]! - againAt >= 1_000, `held to the second refusal's end (${judge.askedAt[2]! - againAt} ms)`);
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first']);
+    judge.answer({ reply: false, reason: 'chatter' });
+    await advance(20);
+    assert.strictEqual(wakes.length, 0);
+    assert.deepStrictEqual(judgeState(gate).verdicts, { reply: 0, wait: 1, error: 0, refused: 2 });
+    gate.dispose();
+  });
+
+  it("under 'skip', a batch its rule fires while its batch is held for a refusal's stated wait takes the held batch in and is asked; refused again, the whole is held to the new refusal's end, and that refusal is counted but neither logged nor traced", async () => {
+    const judge = scriptedJudge();
+    const { gate, traces } = makeGate(writeConfig('refused-joins.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    let againAt = 0;
+    const logged = await logDuring(async () => {
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+      gate.evaluate(chat('second'));
+      await until(() => judge.waiting() === 1, 'the new batch asked, with the held one');
+      assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
+      assert.strictEqual(judgeState(gate).heldCount, 0, 'the held batch taken into the call');
+      againAt = Date.now();
+      judge.fail(refusal("scout's provider calls are held", 1_000));
+      await until(() => judgeState(gate).heldCount === 2, 'the whole held again');
+    });
+    await lastMillisecond(refusalEnd(gate), () => assert.strictEqual(judge.requests.length, 2, "not asked a millisecond before the new refusal's end"));
+    assert.strictEqual(judge.waiting(), 1, "the whole asked at the new refusal's end");
+    assert.ok(judge.askedAt[2]! - againAt >= 1_000, `asked again ${judge.askedAt[2]! - againAt} ms after the second refusal`);
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
+    assert.strictEqual(judgeState(gate).verdicts.refused, 2);
+    assert.strictEqual(logged.filter((l) => l.includes("the reply judge's call was refused")).length, 1, JSON.stringify(logged));
+    assert.strictEqual(traces.filter((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused').length, 1);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under 'skip', a held batch's first refusal after a turn stops a call that took it in is logged and traced, as its first refusal was", async () => {
+    const judge = scriptedJudge();
+    const { gate, traces } = makeGate(writeConfig('refused-stopped.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', residents: ['agent'] });
+    const logged = await logDuring(async () => {
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      judge.fail(refusal('a live surgery for scout holds the store'));
+      await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+      gate.evaluate(chat('second'));
+      await until(() => judge.waiting() === 1, 'the next batch asked, with the held one');
+      gate.onInferenceStarted('agent');
+      await until(() => judgeState(gate).heldCount === 2, 'the call stopped by the turn, its batch held');
+      gate.onInferenceEnded('agent');
+      await until(() => judge.requests.length === 3, "asked again at the turn's end");
+      assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
+      judge.failAt(1, refusal('a live surgery for scout holds the store'));
+      await until(() => judgeState(gate).verdicts.refused === 2, 'the refusal after the stop recorded');
+    });
+    assert.strictEqual(logged.filter((l) => l.includes("the reply judge's call was refused")).length, 2, JSON.stringify(logged));
+    assert.strictEqual(traces.filter((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused').length, 2);
+    gate.dispose();
+  });
+
+  it("under 'skip', a held batch's first refusal after a release is logged and traced with its own hold, and gate_status names the batch it holds", async () => {
+    const judge = scriptedJudge();
+    const { gate, traces } = makeGate(writeConfig('refused-after-release-logged.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    const logged = await logDuring(async () => {
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+      gate.judgeRefusalsMayHaveLifted();
+      await until(() => judge.waiting() === 1, 'asked again at the release');
+      judge.fail(refusal('a live surgery for scout holds the store'));
+      await until(() => judgeState(gate).verdicts.refused === 2, 'the refusal after the release recorded');
+    });
+    const lines = logged.filter((l) => l.includes("the reply judge's call was refused"));
+    assert.strictEqual(lines.length, 2, JSON.stringify(logged));
+    assert.ok(lines[1]!.includes('(a live surgery for scout holds the store)'), lines[1]);
+    assert.deepStrictEqual(traces.filter((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused').map((t) => t.hold), ["scout's provider calls are held", 'a live surgery for scout holds the store']);
+    assert.ok(gate.getStatus().errors.includes('Rule "ambient"\'s reply judge call was refused: 1 event held for the judge.'), JSON.stringify(gate.getStatus().errors));
+    gate.dispose();
+  });
+
+  it("under 'skip', a held batch's first refusal after a release that comes while a call that took it in is out is logged and traced with its own hold", async () => {
+    const judge = scriptedJudge();
+    const { gate, traces } = makeGate(writeConfig('refused-release-in-flight.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    const logged = await logDuring(async () => {
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      judge.fail(refusal('a live surgery for scout holds the store'));
+      await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+      gate.evaluate(chat('second'));
+      await until(() => judge.waiting() === 1, 'the next batch asked, with the held one');
+      assert.strictEqual(judgeState(gate).heldCount, 0, 'premise: the held batch is in the call');
+      gate.judgeRefusalsMayHaveLifted();
+      judge.fail(refusal("scout's provider calls are held", 60_000));
+      await until(() => judgeState(gate).verdicts.refused === 2, 'the refusal after the release recorded');
+    });
+    const lines = logged.filter((l) => l.includes("the reply judge's call was refused"));
+    assert.strictEqual(lines.length, 2, JSON.stringify(logged));
+    assert.ok(lines[1]!.includes("(scout's provider calls are held)"), lines[1]);
+    assert.deepStrictEqual(traces.filter((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused').map((t) => t.hold), ['a live surgery for scout holds the store', "scout's provider calls are held"]);
+    gate.dispose();
+  });
+
+  it("under 'skip', a refusal that states no end holds its batch through turns' ends until the framework says a hold ended, but a batch its rule fires during a turn takes it in and is asked as the turn ends", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-no-end.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', residents: ['agent'] });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal('a live surgery for scout holds the store'));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    assert.ok(gate.getStatus().errors.includes('Rule "ambient"\'s reply judge call was refused: 1 event held for the judge.'), JSON.stringify(gate.getStatus().errors));
+    gate.onInferenceStarted('agent');
+    gate.onInferenceEnded('agent');
+    await advance(100);
+    assert.strictEqual(judge.requests.length, 1, "a turn's end with nothing new from the rule doesn't ask again");
+    gate.onInferenceStarted('agent');
+    gate.evaluate(chat('during'));
+    await until(() => judgeState(gate).heldCount === 2, 'the batch that fired during the turn held with it');
+    assert.strictEqual(judge.requests.length, 1, 'nothing is asked while the turn runs');
+    gate.onInferenceEnded('agent');
+    await until(() => judge.waiting() === 1, "the whole asked as the turn ends, since its rule fired");
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'during']);
+    judge.fail(refusal('a live surgery for scout holds the store'));
+    await until(() => judgeState(gate).verdicts.refused === 2 && judgeState(gate).heldCount === 2, 'refused again, held again');
+    gate.onInferenceStarted('agent');
+    gate.onInferenceEnded('agent');
+    await advance(100);
+    assert.strictEqual(judge.requests.length, 2, "again a turn's end with nothing new doesn't ask");
+    gate.judgeRefusalsMayHaveLifted();
+    await until(() => judge.waiting() === 1, 'the held batch judged once a hold ends');
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'during']);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under 'skip', a refusal a call reports after the framework said a hold ended, while the call was out, doesn't hold its batch: it's asked again, and refused again it's counted, not logged or traced again", async () => {
+    const judge = scriptedJudge();
+    const { gate, traces } = makeGate(writeConfig('refused-after-release-in-flight.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    const logged = await logDuring(async () => {
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      gate.judgeRefusalsMayHaveLifted();
+      judge.fail(refusal('a live surgery for scout holds the store'));
+      await until(() => judge.waiting() === 1 && judge.requests.length === 2, 'asked again, since a hold ended while the call was out');
+      judge.fail(refusal('a live surgery for scout holds the store'));
+      await until(() => judgeState(gate).verdicts.refused === 2 && judgeState(gate).heldCount === 1, 'refused again, and held');
+    });
+    assert.deepStrictEqual(judge.requests[1]!.events.map((e) => e.content), ['first']);
+    assert.strictEqual(logged.filter((l) => l.includes("the reply judge's call was refused")).length, 1, JSON.stringify(logged));
+    assert.strictEqual(traces.filter((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused').length, 1);
+    gate.judgeRefusalsMayHaveLifted();
+    await until(() => judge.waiting() === 1, 'asked at the release');
+    judge.answer({ reply: false, reason: 'chatter' });
+    await until(() => judgeState(gate).verdicts.wait === 1, 'the verdict applied');
+    assert.strictEqual(judgeState(gate).heldCount, 0);
+    assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('refused')), false, JSON.stringify(gate.getStatus().errors));
+    gate.dispose();
+  });
+
+  it("under 'skip', a batch asked while a refusal with no end holds its rule's batch takes the held events in, and a verdict on it leaves nothing held", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-later-call.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal('a live surgery for scout holds the store'));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    assert.ok(gate.getStatus().errors.some((e) => e.startsWith('Rule "ambient"\'s reply judge call was refused')), 'gate_status names the refusal');
+    gate.evaluate(chat('second'));
+    await until(() => judge.waiting() === 1, "the later batch's call");
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
+    assert.strictEqual(judgeState(gate).heldCount, 0);
+    judge.answer({ reply: false, reason: 'chatter' });
+    await until(() => judgeState(gate).verdicts.wait === 1, 'the verdict applied');
+    await advance(50);
+    assert.strictEqual(judge.requests.length, 2, 'nothing is left to ask');
+    assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('refused')), false, JSON.stringify(gate.getStatus().errors));
+    gate.dispose();
+  });
+
+  const TWO_RULES = {
+    policies: [
+      { name: 'first', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 30 } } },
+      { name: 'second', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 30 } } },
+    ],
+  };
+  const elsewhere = (content: string): GateEventInfo => ({ content, eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+
+  it("under 'skip', a batch asked while a refusal with no end holds its rule's batch keeps the newest 100 events of the two", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-take-in-cap.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    await logDuring(async () => {
+      for (let i = 0; i < 60; i++) gate.evaluate(chat(`old ${i}`));
+      await until(() => judge.waiting() === 1, 'the first call');
+      judge.fail(refusal('a live surgery for scout holds the store'));
+      await until(() => judgeState(gate).heldCount === 60, 'the refused batch held');
+      for (let i = 0; i < 60; i++) gate.evaluate(chat(`new ${i}`));
+      await until(() => judge.waiting() === 1, "the later batch's call");
+    });
+    const asked = judge.requests.at(-1)!.events.map((e) => e.content);
+    assert.deepStrictEqual(asked, [...Array.from({ length: 40 }, (_, i) => `old ${i + 20}`), ...Array.from({ length: 60 }, (_, i) => `new ${i}`)]);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("while a rule's batch is held for a refusal with no end, the judge asked about another rule's batch is told what the held one waits for", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-listed.json', TWO_RULES), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('hello'));
+    await until(() => judge.waiting() === 1, "first's call");
+    judge.fail(refusal('a live surgery for scout holds the store'));
+    await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, "first's batch held");
+    gate.evaluate(elsewhere('hi'));
+    await until(() => judge.waiting() === 1, "second's call");
+    assert.deepStrictEqual(judge.requests.at(-1)!.upcomingWakes, [{
+      certain: false, kind: 'judge-batch', when: "with its rule's next batch, or once the hold on its calls is released, and no turn or quiesce holds it", what: 'rule "first"\'s batch of 1 event, held for the judge',
+    }]);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+
+
+  it("under 'skip', a batch that took in its rule's batch held for a refusal with no end, and whose call then fails, is dropped with the held events, logged as dropped, and nothing is left held", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-later-fails.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal('a live surgery for scout holds the store'));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    gate.evaluate(chat('second'));
+    await until(() => judge.waiting() === 1, "the later batch's call");
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
+    const logged = await logDuring(async () => {
+      judge.fail(new Error('provider down'));
+      await until(() => judgeState(gate).verdicts.error === 1, 'the failure recorded');
+    });
+    assert.ok(logged.some((line) => line.includes('so its batch of 2 events is dropped without waking the agent (judge onError "skip")')), logged.join('\n'));
+    assert.strictEqual(judgeState(gate).heldCount, 0);
+    assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('refused')), false, JSON.stringify(gate.getStatus().errors));
+    gate.dispose();
+  });
+
+  it("a release a trace listener makes as it hears of a refusal releases the refused batch", async () => {
+    const judge = scriptedJudge();
+    let release: (() => void) | undefined;
+    const { gate } = makeGate(writeConfig('refused-release-in-trace.json', JUDGED), {
+      judge: judge.fn, judgeOnError: 'skip',
+      onTrace: (t) => { if (t.type === 'gate:judge-verdict' && t.verdict === 'refused') release?.(); },
+    });
+    release = () => gate.judgeRefusalsMayHaveLifted();
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal('claude-haiku-5-5 is held for scout until released'));
+    await until(() => judge.waiting() === 1, 'the refused batch judged on the release its trace prompted');
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first']);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("gate_status names each rule's batch held for a refusal, in rule order, and each goes back to the judge at its own refusal's stated end", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-two-rules.json', TWO_RULES), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('hello'));
+    await until(() => judge.waiting() === 1, "first's call");
+    gate.evaluate(elsewhere('hi'));
+    await until(() => judge.waiting() === 2, "second's call, asked after first's");
+    await logDuring(async () => {
+      judge.failAt(1, refusal("scout's provider calls are held", 60_000));
+      await until(() => gate.getStatus().policies[1]!.judgeState!.heldCount === 1, "second's batch held");
+      judge.failAt(0, refusal('claude-haiku-5-5 is held for scout', 1_000));
+      await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, "first's batch held, after second's");
+    });
+    const iso = (rule: string) => new Date(refusalEnd(gate, rule)).toISOString();
+    assert.ok(gate.getStatus().errors.includes(
+      `Rule "first"'s reply judge call was refused until ${iso('first')}: 1 event held for the judge.`
+      + ` Rule "second"'s reply judge call was refused until ${iso('second')}: 1 event held for the judge.`,
+    ), JSON.stringify(gate.getStatus().errors));
+    await until(() => judge.waiting() === 1, "first's batch asked again at its own refusal's end");
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['hello']);
+    assert.strictEqual(gate.getStatus().policies[1]!.judgeState!.heldCount, 1, "second's batch still held to its own end");
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+
+  it("a batch refused again after taking in its rule's held batch is held whole, with the events queued behind it, in order", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-order-held.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('a1'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal('a live surgery for scout holds the store'));
+    await until(() => judgeState(gate).heldCount === 1, 'a1 held');
+    gate.evaluate(chat('a2'));
+    await until(() => judge.waiting() === 1, "a2's call, which a refusal with no end allows");
+    gate.evaluate(chat('a3'));
+    await until(() => judgeState(gate).pendingCount === 0 && judge.requests.length === 2, 'a3 to queue behind a2');
+    await advance(80);
+    judge.fail(refusal('a live surgery for scout holds the store'));
+    await until(() => judgeState(gate).heldCount === 3, 'a1, a2 and a3 held');
+    gate.judgeRefusalsMayHaveLifted();
+    await until(() => judge.waiting() === 1, 'the held batch judged');
+    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['a1', 'a2', 'a3']);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under 'skip', a turn that ends while a refusal with an end holds leaves the held batch held", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-turn.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', residents: ['agent'] });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    const refusedAt = Date.now();
+    judge.fail(refusal("scout's provider calls are held", 1_200));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    gate.onInferenceStarted('agent');
+    gate.onInferenceEnded('agent');
+    await lastMillisecond(refusalEnd(gate), () => assert.strictEqual(judge.requests.length, 1, 'not asked a millisecond before the stated wait ends'));
+    assert.strictEqual(judge.waiting(), 1, "judged at the refusal's end");
+    assert.ok(judge.askedAt[1]! - refusedAt >= 1_200, `the turn's end sent nothing to a judge still refused (asked ${judge.askedAt[1]! - refusedAt} ms on)`);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under 'skip', a batch held for a refusal whose stated wait ends while the host is quiesced goes back to the judge once the quiesce clears", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-quiesced.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 1_200));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    gate.setQuiesced(true);
+    await advance(refusalEnd(gate) - Date.now() + 100);
+    assert.strictEqual(judge.requests.length, 1, 'not asked while the host is quiesced, though the stated wait has ended');
+    assert.strictEqual(judgeState(gate).heldCount, 1, 'still held');
+    assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('refused')), false, "past the refusal's end, gate_status names it no longer");
+    gate.setQuiesced(false);
+    await until(() => judge.waiting() === 1, 'judged once the quiesce clears');
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under 'skip', a refusal whose stated wait is no finite number of ms states no end", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-infinite.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal('claude-haiku-5-5 is held for scout until released', Infinity));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    assert.ok(gate.getStatus().errors.includes('Rule "ambient"\'s reply judge call was refused: 1 event held for the judge.'), JSON.stringify(gate.getStatus().errors));
+    await advance(1_300);
+    assert.strictEqual(judge.requests.length, 1, 'not asked again while the hold lasts');
+    gate.judgeRefusalsMayHaveLifted();
+    await until(() => judge.waiting() === 1, 'judged once the hold is released');
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("a refusal is counted apart from the failing streak: between or after its failures it neither counts toward the streak nor resets it, and a success does", async () => {
+    const fail = new Error('provider down');
+    const refused = () => refusal('a live surgery for scout holds the store');
+    const plain = (n: number) => `failed its last ${n} requests (the newest: `;
+    const cases: Array<[string, Array<unknown | JudgeVerdict>, Record<number, string>]> = [
+      ['between', [fail, refused(), fail, fail], { 3: plain(3) }],
+      ['after', [fail, fail, fail, refused()], { 2: plain(3), 3: plain(3) }],
+      ['outside', [refused(), fail, fail, fail, fail, refused(), { reply: false, reason: 'chatter' }, fail, fail, fail], { 3: plain(3), 5: plain(4), 9: plain(3) }],
+    ];
+    for (const [name, steps, said] of cases) {
+      const judge = scriptedJudge();
+      const { gate } = makeGate(writeConfig(`refused-streak-${name}.json`, JUDGED), { judge: judge.fn });
+      const failing = () => gate.getStatus().errors.find((e) => e.includes('reply judge has failed its last'));
+      for (const [i, step] of steps.entries()) {
+        gate.evaluate(chat(`hello ${i}`));
+        await until(() => judge.waiting() === 1, `${name}: judge call ${i}`);
+        if (step && typeof step === 'object' && 'reply' in step) judge.answer(step as JudgeVerdict);
+        else judge.fail(step);
+        await advance(20);
+        if (said[i] !== undefined) assert.ok(failing()?.includes(said[i]!), `${name}, after step ${i}: ${String(failing())}`);
+      }
+      if (name === 'between') assert.deepStrictEqual([judgeState(gate).verdicts.error, judgeState(gate).verdicts.refused], [3, 1], 'the refusal is counted, and the errors before it stay counted');
+      gate.dispose();
+    }
+  });
+
+  it("under onError 'wake', a refusal that states no end leaves gate_status naming none, its rule's last verdict shows it, and the next batch is asked about", async () => {
+    const judge = scriptedJudge();
+    const { gate, wakes } = makeGate(writeConfig('refused-wake-no-end.json', JUDGED), { judge: judge.fn });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    await logDuring(async () => {
+      judge.fail(refusal('a live surgery for scout holds the store'));
+      await until(() => wakes.length === 1, 'the refused batch wakes the agent');
+    });
+    assert.strictEqual(gate.getStatus().errors.some((e) => e.includes('refused')), false, JSON.stringify(gate.getStatus().errors));
+    assert.deepStrictEqual([judgeState(gate).last?.verdict, judgeState(gate).last?.reason], ['refused', 'the framework refused to send the call']);
+    gate.evaluate(chat('second'));
+    await until(() => judge.waiting() === 1, 'the next batch is asked');
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("under 'skip', a stated wait longer than one timer can run holds the batch rather than ask again at once, and one past what a date can name states no end", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-long.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    const delays: number[] = [];
+    const timeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((handler: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      delays.push(ms ?? 0);
+      return timeout(handler, ms, ...args);
+    }) as typeof setTimeout;
+    try {
+      judge.fail(refusal("scout's provider calls are held", 3_000_000_000));
+      await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+      assert.ok(gate.getStatus().errors.some((e) => e.startsWith('Rule "ambient"\'s reply judge call was refused until ')), JSON.stringify(gate.getStatus().errors));
+      assert.ok(delays.length > 0 && delays.every((ms) => ms <= MAX_TIMER_MS), `no timer is set past what Node can hold: ${delays.join(', ')}`);
+      const armed = delays.length;
+      mock.timers.tick(MAX_TIMER_MS);
+      await settle();
+      assert.strictEqual(judge.requests.length, 1, "not asked again when the first timer fires");
+      assert.deepStrictEqual(delays.slice(armed), [3_000_000_000 - MAX_TIMER_MS], 'a timer is armed for exactly the rest of the wait');
+      mock.timers.tick(3_000_000_000 - MAX_TIMER_MS - 1);
+      await settle();
+      assert.strictEqual(judge.requests.length, 1, 'not asked a millisecond before the wait ends');
+      mock.timers.tick(1);
+      await settle();
+      assert.strictEqual(judge.waiting(), 1, 'asked once the stated wait ends');
+    } finally {
+      globalThis.setTimeout = timeout;
+    }
+    judge.fail(refusal("scout's provider calls are held", 1e16));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held again');
+    assert.ok(gate.getStatus().errors.includes("Rule \"ambient\"'s reply judge call was refused: 1 event held for the judge."), JSON.stringify(gate.getStatus().errors));
+    gate.dispose();
+  });
+
+  it("a batch held for a refusal is never judged once the gate is disposed", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-dispose.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 1_000));
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
+    gate.dispose();
+    await advance(1_300);
+    assert.strictEqual(judge.requests.length, 1);
   });
 
   it('a null verdict from a custom judge decides by onError rather than dropping the batch', async () => {
@@ -763,8 +1674,10 @@ describe('judge rules: timing', () => {
     console.error = () => {};
     try {
       gate.evaluate(chat('hello'));
+      await advance(160);
       await until(() => judge.waiting() === 1, 'the judge is asked');
       judge.answer(null as unknown as JudgeVerdict);
+      await advance(10);
       await until(() => wakes.length === 1, 'the wake');
     } finally {
       console.error = original;
@@ -775,15 +1688,19 @@ describe('judge rules: timing', () => {
 
   it('a batch that fires while the judge decides waits for the verdict: delivered with it on reply', async () => {
     const judge = scriptedJudge();
-    const { gate, wakes } = makeGate(writeConfig('queued-reply.json', JUDGED), { judge: judge.fn });
-    gate.evaluate(chat('one'));
+    const { gate, wakes } = makeGate(writeConfig('queued-reply.json', JUDGED), { judge: judge.fn, isAnswered: () => false });
+    gate.evaluate(chat('one'), { agent: 'agent', messageId: 'row-1' });
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
-    gate.evaluate(chat('two'));
+    gate.evaluate(chat('two', { channelId: 'c2', metadata: { authorId: 'u1', channelName: 'beds' } }), { agent: 'agent', messageId: 'row-2' });
+    await advance(160);
     await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the second batch to queue behind the call');
     assert.strictEqual(judge.requests.length, 1, 'one request at a time per rule');
     judge.answer({ reply: true, reason: 'ok' });
+    await advance(10);
     await until(() => wakes.length === 1, 'the wake');
     assert.strictEqual(judge.requests.length, 1);
+    assert.deepStrictEqual(wakes[0]!.writes?.map((w) => w.after.messageId), ['row-1', 'row-2'], 'the queued batch is delivered with the judged one');
     gate.dispose();
   });
 
@@ -791,13 +1708,17 @@ describe('judge rules: timing', () => {
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('queued-wait.json', JUDGED), { judge: judge.fn });
     gate.evaluate(chat('one'));
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
     gate.evaluate(chat('two'));
+    await advance(160);
     await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the second batch to queue behind the call');
     judge.answer({ reply: false, reason: 'not yet' });
+    await advance(10);
     await until(() => judge.requests.length === 2, 'the queued batch to be judged');
     assert.deepStrictEqual(judge.requests[1]!.events.map((e) => e.content), ['two']);
     judge.answer({ reply: true, reason: 'now' });
+    await advance(10);
     await until(() => wakes.length === 1, 'the wake');
     gate.dispose();
   });
@@ -811,7 +1732,7 @@ describe('judge rules: timing', () => {
     for (let i = 0; i < 3; i++) {
       gate.evaluate(chat(`m${i}`));
       clock += 60_000;
-      await sleep(30);
+      await advance(30);
     }
     assert.strictEqual(judge.requests.length, 0, 'not judged before the cap');
     gate.evaluate(chat('m3'));
@@ -824,11 +1745,13 @@ describe('judge rules: timing', () => {
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('dispose.json', JUDGED), { judge: judge.fn });
     gate.evaluate(chat('hello'));
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
     gate.dispose();
     assert.strictEqual(judge.requests[0]!.signal.aborted, true);
+    const taken = answersTaken(gate);
     judge.answer({ reply: true, reason: 'late' });
-    await sleep(10);
+    await until(() => taken() === 1, "the gate to take the stopped call's late answer");
     assert.strictEqual(wakes.length, 0);
   });
 });
@@ -847,6 +1770,35 @@ describe('judge rules changed or removed while a batch waits', () => {
     gate.dispose();
   });
 
+  const waiting = (instructions: string) => ({
+    policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 60_000, instructions } } }],
+  });
+
+  it("a batch whose rule's instructions are edited in gate.json while it waits is judged by the edited instructions", async () => {
+    const judge = scriptedJudge();
+    const path = writeConfig('changed-reload.json', waiting('Wake me for questions.'));
+    const { gate } = makeGate(path, { judge: judge.fn });
+    gate.evaluate(chat('lol'));
+    assert.strictEqual(judge.requests.length, 0, 'the batch waits on its debounce');
+    writeFileSync(path, JSON.stringify(waiting('Wake me for jokes.'), null, 2));
+    (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+    gate.evaluate(chat('another'));
+    await until(() => judge.requests.length === 1, 'the changed rule\'s pending batch to go to the judge');
+    assert.strictEqual(judge.requests[0]!.instructions, 'Wake me for jokes.');
+    assert.deepStrictEqual(judge.requests[0]!.events.map((e) => e.content), ['lol']);
+    gate.dispose();
+  });
+
+  it("a batch whose rule's instructions are rewritten through addPolicy, which wake_add_rule calls, while it waits is judged by the new instructions", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('changed-write.json', waiting('Wake me for questions.')), { judge: judge.fn });
+    gate.evaluate(chat('lol'));
+    gate.addPolicy({ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 60_000, instructions: 'Wake me for jokes.' } } });
+    await until(() => judge.requests.length === 1, 'the changed rule\'s pending batch to go to the judge');
+    assert.strictEqual(judge.requests[0]!.instructions, 'Wake me for jokes.');
+    gate.dispose();
+  });
+
   it('a rule removed while its judge call is out: the late verdict still decides its batch, and leaves no record for a rule of the same name', async () => {
     const judge = scriptedJudge();
     const { gate, wakes } = makeGate(writeConfig('removed-inflight.json', JUDGED), { judge: judge.fn });
@@ -856,7 +1808,7 @@ describe('judge rules changed or removed while a batch waits', () => {
     judge.answer({ reply: true, reason: 'asked' });
     await until(() => wakes.length === 1, 'the wake');
     gate.addPolicy({ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } });
-    assert.deepStrictEqual(gate.getStatus().policies.find((p) => p.name === 'ambient')!.judgeState!.verdicts, { reply: 0, wait: 0, error: 0 });
+    assert.deepStrictEqual(gate.getStatus().policies.find((p) => p.name === 'ambient')!.judgeState!.verdicts, { reply: 0, wait: 0, error: 0, refused: 0 });
     gate.dispose();
   });
 });
@@ -893,38 +1845,38 @@ describe('judge rules: mentions and rule order', () => {
     gate.onInferenceEnded('agent');
     await until(() => judge.requests.length === 2, 'the batch to be judged after the turn');
     assert.deepStrictEqual(judge.requests[1]!.events.map((e) => e.content), ['lol']);
+    const taken = answersTaken(gate);
     judge.answer({ reply: true, reason: 'stopped, so ignored' });
     judge.answer({ reply: false, reason: 'the turn answered it' });
-    await sleep(10);
+    await until(() => taken() === 2 && gate.getStatus().policies.some((p) => p.judgeState?.verdicts.wait === 1), 'the gate to take both answers, the second as its WAIT');
     assert.strictEqual(wakes.length, 0);
     gate.dispose();
   });
 
-  it('leaves a debounce rule, and a judge rule with no judge wired, to their quiet period, and the probe agrees', (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+  it('leaves a debounce rule, and a judge rule with no judge wired, to their quiet period, and the probe agrees', () => {
     const debounced = makeGate(writeConfig('addressed-debounce.json', {
       policies: [{ name: 'batched', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } }],
     }), { judge: scriptedJudge().fn });
     assert.strictEqual(debounced.gate.probe(addressed('agent?')).trigger, false);
     assert.strictEqual(debounced.gate.evaluate(addressed('agent?')).trigger, false);
-    t.mock.timers.tick(99);
+    mock.timers.tick(99);
     assert.strictEqual(debounced.wakes.length, 0, 'not before its 100 ms quiet period');
-    t.mock.timers.tick(1);
+    mock.timers.tick(1);
     assert.strictEqual(debounced.wakes.length, 1, 'at its quiet period');
     debounced.gate.dispose();
     const unwired = makeGate(writeConfig('addressed-unwired.json', JUDGED));
     assert.strictEqual(unwired.gate.probe(addressed('agent?')).trigger, false);
     assert.strictEqual(unwired.gate.evaluate(addressed('agent?')).trigger, false);
-    t.mock.timers.tick(99);
+    mock.timers.tick(99);
     assert.strictEqual(unwired.wakes.length, 0, 'not before its 100 ms quiet period');
-    t.mock.timers.tick(1);
+    mock.timers.tick(1);
     assert.strictEqual(unwired.wakes.length, 1, 'at its quiet period');
     unwired.gate.dispose();
   });
 });
 
 describe('judge rules: what waiting leaves the agent with', () => {
-  it("tells the judge the gate's own timers: a self-wake, a sleep's end, other rules' batches, not the rule it judges", async () => {
+  it("tells the judge the gate's own timers: a self-wake, other rules' batches, not the batch it judges", async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('upcoming.json', {
       policies: [
@@ -938,16 +1890,193 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
     gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
     gate.evaluate(chat('hello'));
+    await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
     const wakes = judge.requests[0]!.upcomingWakes!;
-    assert.deepStrictEqual(wakes.map((w) => [w.what, w.certain]), [
-      ['rule "files"\'s debounced batch of 1 event', true],
-      ['rule "other-room"\'s batch of 1 event goes to the judge', false],
-      ['its own skip_reply timer', true],
+    assert.deepStrictEqual(wakes.map((w) => [w.what, w.certain, w.kind]), [
+      ['rule "files"\'s debounced batch of 1 event', true, 'debounce'],
+      ['rule "other-room"\'s batch of 1 event goes to the judge', false, 'judge-batch'],
+      ['its own skip_reply timer', true, 'self-wake'],
     ]);
     const selfWake = wakes.find((w) => w.what.includes('skip_reply'))!;
-    assert.ok(Math.abs(selfWake.at! - (t0 + 600_000)) < 2_000, String(selfWake.at! - t0));
-    assert.ok(!wakes.some((w) => w.what.includes('"ambient"')), "the rule being judged isn't listed");
+    assert.strictEqual(selfWake.at, t0 + 600_000);
+    assert.ok(!wakes.some((w) => w.what.includes('"ambient"')), "the batch being judged isn't listed");
+    gate.dispose();
+  });
+
+  it("tells the judge another judge rule's batch the judge is deciding, with what queued behind it", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-deciding.json', {
+      policies: [
+        { name: 'first', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 50 } } },
+        { name: 'second', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 400 } } },
+      ],
+    }), { judge: judge.fn });
+    gate.evaluate(chat('hello'));
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    await until(() => judge.requests.length === 1, "first's batch to go to the judge");
+    assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
+      ['rule "second"\'s batch of 1 event goes to the judge', false],
+    ]);
+    gate.evaluate(chat('and again'));
+    await until(() => judge.requests.length === 2, "second's batch to go to the judge while first's is decided");
+    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
+      ['once the judge decides it', 'rule "first"\'s batch of 1 event, which the judge is deciding, with 1 event queued behind it, sent to the judge unless the call wakes the agent', false],
+    ]);
+    judge.answer({ reply: false, reason: 'chatter' });
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("tells the judge the events buffered behind a turn that doesn't change the context it reads, and upcomingWakes leaves out a given rule's", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-buffered.json', {
+      policies: [
+        { name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 30 } },
+        { name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 150 } } },
+      ],
+    }), { judge: judge.fn, residents: ['agent'] });
+    gate.onInferenceStarted('fork');
+    gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
+    gate.evaluate(chat('hello'));
+    await until(() => judge.requests.length === 1, 'the judge rule\'s batch to go to the judge during the fork\'s turn');
+    assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1, 'premise: the debounced batch is buffered behind the fork\'s turn');
+    assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
+      ["once no turn runs and the host isn't quiesced", '1 event buffered for delivery', true],
+    ]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient').map((w) => w.what), ['1 event buffered for delivery']);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'files').map((w) => w.what), ['rule "ambient"\'s batch of 1 event, which the judge is deciding'], "rule files' buffered events are left out with it");
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("tells the judge each batch still held when the held batches are judged in turn", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-held.json', {
+      policies: [
+        { name: 'first', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 30 } } },
+        { name: 'second', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 30 } } },
+      ],
+    }), { judge: judge.fn, residents: ['agent'] });
+    gate.onInferenceStarted('agent');
+    gate.evaluate(chat('hello'));
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    await until(() => gate.getStatus().policies.every((p) => p.judgeState!.heldCount === 1), 'both batches held for the turn');
+    gate.onInferenceEnded('agent');
+    await until(() => judge.requests.length === 2, 'both held batches to go to the judge');
+    assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
+      ['rule "second"\'s batch of 1 event, held for the judge', false],
+    ]);
+    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
+      ['once the judge decides it', 'rule "first"\'s batch of 1 event, which the judge is deciding', false],
+    ]);
+    judge.answer({ reply: false, reason: 'chatter' });
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("upcomingWakes, given a rule's name, leaves out that rule's batches, whether collected, decided or held", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-except.json', {
+      policies: [
+        { name: 'first', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 50 } } },
+        { name: 'second', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 120000 } } },
+      ],
+    }), { judge: judge.fn, residents: ['agent'] });
+    const listed = (exceptPolicy?: string) => gate.upcomingWakes(['agent'], exceptPolicy).map((w) => w.what);
+    gate.evaluate(chat('hello'));
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    await until(() => judge.requests.length === 1, "first's batch to go to the judge");
+    assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
+    assert.deepStrictEqual(listed('second'), ['rule "first"\'s batch of 1 event, which the judge is deciding']);
+    gate.onInferenceStarted('agent');
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'second'), [{ certain: false, kind: 'judge-batch', when: 'once no turn or quiesce holds it', what: 'rule "first"\'s batch of 1 event, held for the judge' }]);
+    assert.deepStrictEqual(listed('first'), ['rule "second"\'s batch of 1 event goes to the judge']);
+    assert.deepStrictEqual(listed(), ['rule "second"\'s batch of 1 event goes to the judge', 'rule "first"\'s batch of 1 event, held for the judge'],
+      'the wake with a time first, and the one due when no turn holds it last');
+    gate.dispose();
+  });
+
+  it("lists events buffered while the host is quiesced, as certain, due once no turn runs and the host isn't quiesced", async () => {
+    const { gate } = makeGate(writeConfig('upcoming-quiesced.json', {
+      policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 30 } }],
+    }));
+    gate.setQuiesced(true);
+    gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
+    await until(() => gate.inferenceDiagnostics().bufferedEvents === 1, 'the fired batch buffered while the host is quiesced');
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']), [{ certain: true, kind: 'debounce', when: "once no turn runs and the host isn't quiesced", what: '1 event buffered for delivery' }]);
+    gate.dispose();
+  });
+
+  for (const [what, writes, certain] of [
+    ['each written to the agent only may wake it, since an answered wake starts no turn', [{ agent: 'agent', messageId: 'row-1' }, { agent: 'agent', messageId: 'row-2' }], false],
+    ['with an event given no write, they wake it: the framework has no write to drop the wake by', [{ agent: 'agent', messageId: 'row-1' }, undefined], true],
+  ] as const) {
+    it(`lists events buffered while the host is quiesced as a debounced batch's: ${what}`, async () => {
+      const { gate } = makeGate(writeConfig('upcoming-quiesced-written.json', {
+        policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 30 } }],
+      }));
+      gate.setQuiesced(true);
+      writes.forEach((after: WritePlacement | undefined, i) => {
+        gate.evaluate({ content: `notes-${i}.md`, eventType: 'workspace:modified', serverId: '', channelId: '' }, after);
+      });
+      await until(() => gate.inferenceDiagnostics().bufferedEvents === 2, 'the fired batch buffered while the host is quiesced');
+      assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [['2 events buffered for delivery', certain]]);
+      gate.dispose();
+    });
+  }
+
+  it('leaves out of the buffered count an event whose channel is held now', async () => {
+    let tunedOut = false;
+    const { gate } = makeGate(writeConfig('upcoming-buffered-held.json', {
+      policies: [{ name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 30 } }],
+    }), { isHeld: (serverId, channelId) => tunedOut && serverId === 'discord' && channelId === 'c-held' });
+    gate.setQuiesced(true);
+    gate.evaluate({ content: 'hello', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c-held' });
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c-open' });
+    await until(() => gate.inferenceDiagnostics().bufferedEvents === 2, 'both events buffered while the host is quiesced');
+    assert.strictEqual(gate.upcomingWakes(['agent'])[0]?.what, '2 events buffered for delivery', 'premise: both are listed before the tune-out');
+    tunedOut = true;
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']), [{ certain: true, kind: 'debounce', when: "once no turn runs and the host isn't quiesced", what: '1 event buffered for delivery' }]);
+    gate.dispose();
+  });
+
+  it("tells the judge its own rule's events buffered behind a turn, as certain", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-own-buffered.json', {
+      policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 50 } } }],
+    }), { judge: judge.fn, residents: ['agent'] });
+    gate.onInferenceStarted('fork');
+    gate.evaluate(chat('hello'));
+    await until(() => judge.requests.length === 1, "the batch's call during the fork's turn");
+    judge.answer({ reply: true, reason: 'addressed' });
+    await until(() => gate.inferenceDiagnostics().bufferedEvents === 1, "the replied batch buffered behind the fork's turn");
+    gate.evaluate(chat('again'));
+    await until(() => judge.requests.length === 2, 'the next batch asked');
+    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
+      ["once no turn runs and the host isn't quiesced", '1 event buffered for delivery', true],
+    ]);
+    judge.answer({ reply: false, reason: 'chatter' });
+    gate.dispose();
+  });
+
+  it("tells the judge its own rule's next batch, collecting while a held one is asked", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-own-next.json', {
+      policies: [{ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } }],
+    }), { judge: judge.fn, residents: ['agent'] });
+    gate.onInferenceStarted('agent');
+    gate.evaluate(chat('first'));
+    await until(() => gate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the first batch held for the turn');
+    gate.evaluate(chat('second'));
+    gate.onInferenceEnded('agent');
+    await until(() => judge.requests.length === 1, 'the held batch asked once the turn ends');
+    assert.deepStrictEqual(judge.requests[0]!.events.map((e) => e.content), ['first']);
+    assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
+      ['rule "ambient"\'s batch of 1 event goes to the judge', false],
+    ]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent'], 'ambient'), []);
+    judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
 
@@ -1033,6 +2162,34 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
+  it("gives an agent the gate doesn't wake no batch held for the judge, buffered, or being decided", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('upcoming-roles-judged.json', {
+      policies: [
+        ...JUDGED.policies,
+        { name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 100 } },
+      ],
+    }), { judge: judge.fn });
+    const listed = (name: string) => gate.upcomingWakes([name]).map((w) => [w.kind, w.when]);
+    gate.setQuiesced(true);
+    gate.evaluate(chat('hello'));
+    gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
+    await advance(160);
+    assert.deepStrictEqual(listed('agent'), [
+      ['judge-batch', 'once no turn or quiesce holds it'],
+      ['debounce', "once no turn runs and the host isn't quiesced"],
+    ], 'premise: the quiesce holds one batch for the judge and buffers the other');
+    assert.deepStrictEqual(listed('a-worker'), []);
+    gate.setQuiesced(false);
+    await settle();
+    assert.strictEqual(judge.requests.length, 1, 'premise: the held batch went to the judge');
+    assert.deepStrictEqual(listed('agent'), [['judge-batch', 'once the judge decides it']]);
+    assert.deepStrictEqual(listed('a-worker'), []);
+    judge.answer({ reply: false, reason: 'nothing to answer' });
+    await settle();
+    gate.dispose();
+  });
+
   it("lists a sleep's end, and nothing once a self-wake has been cancelled by a turn", () => {
     const { gate } = makeGate(writeConfig('upcoming-sleep.json', JUDGED));
     gate.armSelfWake('agent', 60);
@@ -1051,6 +2208,7 @@ describe('judge rules without a judge', () => {
     const { gate, wakes } = makeGate(writeConfig('unwired.json', JUDGED));
     assert.ok(gate.getStatus().errors.some((e) => e.includes('wires no reply judge')));
     gate.evaluate(chat('hello'));
+    await advance(160);
     await until(() => wakes.length === 1, 'the wake');
     gate.dispose();
   });
@@ -1077,6 +2235,7 @@ async function judgeFramework(t: { after: (fn: () => Promise<void>) => void }, j
     ...extra,
   });
   t.after(async () => {
+    useRealClock();
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -1084,7 +2243,7 @@ async function judgeFramework(t: { after: (fn: () => Promise<void>) => void }, j
     membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'add', name: 'wake_add_rule', input }], 'tool_use'));
     membrane.pushResponse(createMockResponse([]));
     assert.strictEqual(framework.nudgeAgent('scout').ok, true);
-    await framework.runUntilIdle();
+    await idle(framework);
     const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
     return round![0]!;
   };
@@ -1124,7 +2283,17 @@ describe('wake_add_rule with judge', () => {
     const shown = await call(example);
     assert.strictEqual(shown.isError, false, shown.content);
     assert.strictEqual(JSON.parse(shown.content).ignoredFields, undefined, 'every field the example gives is read');
-    assert.match(toolNamed('wake_remove_rule').description, /A judge rule's batch.*still goes to the judge, by the rule as it was\./);
+    const removal = toolNamed('wake_remove_rule').description;
+    assert.match(firstSentence(removal), /a judge rule's pending batches still go where the rule as it was sends them\.$/,
+      "the first sentence, all the settings toolset shows of it, says what becomes of a removed rule's pending batches");
+    assert.match(removal, /A judge rule's batch is pending while it waits out its quiet period, is held or is being judged\./);
+  });
+
+  it("tells an agent with the judge that a wait adds nothing to its context, and what was stored as it arrived stays stored for when it's next woken", async (t) => {
+    const { wakeAddRule } = await judgeFramework(t, {});
+    const judge = (wakeAddRule().inputSchema.properties as Record<string, { description: string }>).judge!;
+    assert.ok(judge.description.includes('When it says wait, you aren\'t woken, and as for "defer", nothing more is added to your context: what was stored as it arrived stays stored for when you\'re next woken.'), judge.description);
+    assert.ok(!judge.description.includes('stay in your context'), judge.description);
   });
 
   it("refuses a judge out of range in the agent's own terms: judge, not gate.json's behavior.judge", async (t) => {
@@ -1189,7 +2358,7 @@ describe('wake_add_rule with judge', () => {
     const before = membrane.calls.length;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'here' }]));
     assert.strictEqual(framework.nudgeAgent('scout').ok, true);
-    await Promise.race([framework.runUntilIdle(), sleep(3000)]);
+    await idle(framework);
     assert.ok(membrane.calls.length > before, 'the turn sent its request while the judge call was still out');
     hanging.abort();
     await asked;
@@ -1264,7 +2433,7 @@ describe('wake_add_rule with judge', () => {
     const streams = membrane.calls.length;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'here' }]));
     assert.strictEqual(framework.nudgeAgent('scout').ok, true);
-    await Promise.race([framework.runUntilIdle(), sleep(3_000)]);
+    await idle(framework);
     assert.ok(membrane.calls.length > streams, "the agent's turn sent its request");
     const refused = await request().then(() => undefined, (err: unknown) => err);
     assert.strictEqual((refused as { providerAdmission?: unknown } | undefined)?.providerAdmission, 'deferred');
@@ -1289,6 +2458,7 @@ describe('wake_add_rule with judge', () => {
       agentNames: ['scout'],
       signal: stop.signal,
     });
+    await advance(20);
     await until(() => inFlight, "the judge's call to be out");
     stop.abort();
     await assert.rejects(asked, /aborted/);
@@ -1361,7 +2531,7 @@ describe('wake_add_rule with judge', () => {
 });
 
 describe('the framework wires the reply judge', () => {
-  async function frameworkWith(t: { after: (fn: () => Promise<void> | void) => void }, gate: Record<string, unknown>) {
+  async function frameworkWith(t: { after: (fn: () => Promise<void> | void) => void }, gate: Record<string, unknown>, names: string[] = ['scout']) {
     const { AgentFramework } = await import('../src/index.js');
     const { MockMembrane } = await import('./helpers/mock-membrane.js');
     const { mkdtempSync } = await import('node:fs');
@@ -1371,22 +2541,18 @@ describe('the framework wires the reply judge', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      agents: names.map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, proseRouting: 'disabled' as const })),
       modules: [],
       gate: { configPath: join(dir, 'gate.json'), ...gate },
     });
     t.after(async () => {
+      useRealClock();
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     });
     const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
     return { framework, membrane, eventGate };
   }
-
-  const until = async (check: () => boolean, label: string) => {
-    for (let i = 0; i < 200 && !check(); i++) await sleep(20);
-    assert.ok(check(), label);
-  };
 
   it("asks the host's membrane, on the judge's model, about the primary's context, and wakes it on reply", async (t) => {
     const { createMockResponse } = await import('./helpers/mock-membrane.js');
@@ -1411,8 +2577,441 @@ describe('the framework wires the reply judge', () => {
     assert.ok(shown.includes('You are scout.'), "the primary's previewed request is the document");
     assert.ok(shown.includes('is scout around?'));
     await until(() => eventGate.getStatus().policies[0]!.judgeState!.verdicts.reply === 1, 'the verdict was recorded');
-    await framework.runUntilIdle();
+    await idle(framework);
     assert.ok(membrane.calls.length >= 2, 'the reply woke the agent for a turn');
+  });
+
+  it("under onError 'skip', a batch whose judge call a provider wait on the judge's model refused, before reading the agent's context, is held, and judged once an operator releases the wait", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { onError: 'skip' } });
+    const internal = framework as unknown as { recordProviderWait(agentName: string, model: string, error: Error): unknown };
+    const wait = new MembraneError({ type: 'rate_limit', retryable: true, retryAfterMs: 600_000, message: 'slow down', rawError: { status: 429 } });
+    assert.ok(internal.recordProviderWait('scout', 'claude-haiku-5-5', wait), "premise: the judge's model waits");
+    const reader = framework as unknown as { previewActivation: (agentName: string) => Promise<unknown> };
+    const preview = reader.previewActivation.bind(framework);
+    let previews = 0;
+    reader.previewActivation = (agentName) => { previews++; return preview(agentName); };
+    const original = console.error;
+    console.error = () => {};
+    try {
+      eventGate.evaluate(chat('is scout around?'));
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the refused batch to be held');
+      assert.strictEqual(membrane.calls.length, 0, 'no judge call was made');
+      assert.strictEqual(previews, 0, "a call the framework would refuse reads none of the agent's context");
+      assert.strictEqual(eventGate.getStatus().policies[0]!.judgeState!.verdicts.refused, 1);
+      assert.ok(eventGate.getStatus().errors.some((e) => e.startsWith('Rule "ambient"\'s reply judge call was refused until ')), 'gate_status names the refusal and its end');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'REPLY: asked directly' }]));
+      membrane.pushResponse(createMockResponse([]));
+      framework.releaseProviderWait('scout', 'claude-haiku-5-5');
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.verdicts.reply === 1, 'the held batch judged once the wait is released');
+      assert.strictEqual(previews, 1, 'the admitted call reads the context');
+      assert.strictEqual(membrane.calls[0]!.assistantParticipant, 'reply-judge');
+      const shown = membrane.calls[0]!.messages.map((m) => (m.content[0] as { text: string }).text).join('\n');
+      assert.ok(shown.includes('is scout around?'));
+      await idle(framework);
+      assert.ok(membrane.calls.length >= 2, 'the reply woke the agent for a turn');
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("under onError 'skip', a judge call admitted before the agent's context is read, whose model a provider wait holds by the time it's sent, is refused by the call's own admission, and its batch held", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework, membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { onError: 'skip' } });
+    const internal = framework as unknown as {
+      recordProviderWait(agentName: string, model: string, error: Error): unknown;
+      previewActivation: (agentName: string) => Promise<unknown>;
+    };
+    const preview = internal.previewActivation.bind(framework);
+    let previews = 0;
+    internal.previewActivation = (agentName) => {
+      previews++;
+      internal.recordProviderWait('scout', 'claude-haiku-5-5', new MembraneError({ type: 'rate_limit', retryable: true, retryAfterMs: 600_000, message: 'slow down', rawError: { status: 429 } }));
+      return preview(agentName);
+    };
+    const original = console.error;
+    console.error = () => {};
+    try {
+      eventGate.evaluate(chat('is scout around?'));
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the batch refused at its call to be held');
+      assert.strictEqual(previews, 1, 'premise: the call was admitted before the context was read');
+      assert.strictEqual(membrane.calls.length, 0, 'no request reached the provider');
+      assert.deepStrictEqual(eventGate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 0, wait: 0, error: 0, refused: 1 });
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("under onError 'skip', a batch refused under the host's hold on the agent's calls is held while the hold lasts, and judged once it ends", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane, createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-hold-'));
+    const membrane = new MockMembrane();
+    let consulted = 0;
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      modules: [],
+      gate: { configPath: join(dir, 'gate.json'), config: JUDGED, judge: { onError: 'skip' } },
+      providerHold: () => (consulted++ === 0 ? { holdMs: 3_000, reason: 'quota spent' } : undefined),
+    });
+    t.after(async () => {
+      useRealClock();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    const internal = framework as unknown as { holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean };
+    let calledAt: number | undefined;
+    const complete = membrane.complete.bind(membrane);
+    membrane.complete = async (request) => { calledAt ??= Date.now(); return complete(request); };
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const quota = new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, message: 'quota', rawError: { status: 429 } });
+      assert.strictEqual(internal.holdProviderAcceleration(framework.getAgent('scout'), quota, undefined, true), true, 'premise: the agent is held');
+      const heldAt = Date.now();
+      eventGate.evaluate(chat('lol'));
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the refused batch to be held');
+      assert.ok(eventGate.getStatus().errors.some((e) => e.startsWith('Rule "ambient"\'s reply judge call was refused until ')) && !JSON.stringify(eventGate.getStatus()).includes('quota spent'), JSON.stringify(eventGate.getStatus().errors));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      await lastMillisecond(refusalEnd(eventGate), () => {
+        assert.strictEqual(eventGate.getStatus().policies[0]!.judgeState!.verdicts.refused, 1, 'not asked again a millisecond before the hold ends');
+        assert.strictEqual(eventGate.getStatus().policies[0]!.judgeState!.heldCount, 1, 'still held, not taken into a judge call, a millisecond before the hold ends');
+        assert.strictEqual(calledAt, undefined);
+      });
+      await byThisMillisecond(() => calledAt !== undefined, "the judge called at the hold's end");
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the batch judged once the hold ends');
+      assert.ok(calledAt !== undefined && calledAt - heldAt >= 3_000, `the judge's call was made ${calledAt === undefined ? 'never' : `${calledAt - heldAt} ms after the hold began`}`);
+      assert.deepStrictEqual(membrane.calls.map((c) => c.assistantParticipant), ['reply-judge']);
+      assert.deepStrictEqual(eventGate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 0, wait: 1, error: 0, refused: 1 });
+      assert.strictEqual(eventGate.getStatus().errors.some((e) => e.includes('reply judge call was refused')), false, 'the refusal is over');
+    } finally {
+      console.error = original;
+    }
+  });
+
+  async function heldFramework(t: { after: (fn: () => Promise<void> | void) => void }, holds: number[]) {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-held-'));
+    const membrane = new MockMembrane();
+    let consulted = 0;
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      modules: [],
+      gate: { configPath: join(dir, 'gate.json'), config: JUDGED, judge: { onError: 'skip' } },
+      providerHold: () => {
+        const holdMs = holds[consulted++];
+        return holdMs === undefined ? undefined : { holdMs, reason: 'quota spent' };
+      },
+    });
+    const original = console.error;
+    console.error = () => {};
+    t.after(async () => {
+      console.error = original;
+      useRealClock();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    const internal = framework as unknown as {
+      holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean;
+      providerAccelerationCooldowns: Map<string, { until: number }>;
+      providerWaits: { set(agent: string, model: string, retryAfterMs: unknown, reason: string): unknown };
+      pendingRequests: Array<Record<string, unknown>>;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    let calledAt: number | undefined;
+    const complete = membrane.complete.bind(membrane);
+    membrane.complete = async (request) => { calledAt ??= Date.now(); return complete(request); };
+    const hold = () => internal.holdProviderAcceleration(framework.getAgent('scout'), new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429, message: 'quota', rawError: { status: 429 },
+    }), undefined, true);
+    const judgeState = () => eventGate.getStatus().policies[0]!.judgeState!;
+    return { framework, membrane, eventGate, internal, hold, judgeState, calledAt: () => calledAt, consulted: () => consulted };
+  }
+
+  it("under onError 'skip', a call refused by a hold past its end, before the hold's timer has let it go, waits for that release, and is judged then", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { membrane, eventGate, internal, hold, judgeState, calledAt } = await heldFramework(t, [3_000]);
+    assert.strictEqual(hold(), true, 'premise: the agent is held');
+    const heldAt = Date.now();
+    internal.providerAccelerationCooldowns.get('scout')!.until = heldAt;
+    eventGate.evaluate(chat('lol'));
+    await until(() => judgeState().heldCount === 1, 'the refused batch to be held');
+    assert.ok(eventGate.getStatus().errors.includes("Rule \"ambient\"'s reply judge call was refused: 1 event held for the judge."), JSON.stringify(eventGate.getStatus().errors));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+    await lastMillisecond(heldAt + 3_000, () => {
+      assert.strictEqual(judgeState().verdicts.refused, 1, "not asked again before the hold's timer lets it go");
+      assert.strictEqual(judgeState().heldCount, 1, "still held, not taken into a judge call, before the hold's timer lets it go");
+      assert.strictEqual(calledAt(), undefined, "not called a millisecond before the hold's timer lets it go");
+    });
+    await byThisMillisecond(() => calledAt() !== undefined, "the judge called as the hold's timer lets it go");
+    await until(() => judgeState().verdicts.wait === 1, "the batch judged once the hold's timer lets it go");
+    assert.ok(calledAt() !== undefined && calledAt()! - heldAt >= 3_000, `the judge's call was made ${calledAt() === undefined ? 'never' : `${calledAt()! - heldAt} ms after the hold began`}`);
+    assert.deepStrictEqual(judgeState().verdicts, { reply: 0, wait: 1, error: 0, refused: 1 });
+  });
+
+  it("under onError 'skip', a batch refused under a hold its host extends at its end is held to the new end, and judged once the hold lets go", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { membrane, eventGate, hold, judgeState, calledAt, consulted } = await heldFramework(t, [3_000, 2_000]);
+    assert.strictEqual(hold(), true, 'premise: the agent is held');
+    const heldAt = Date.now();
+    eventGate.evaluate(chat('lol'));
+    await until(() => judgeState().heldCount === 1, 'the refused batch to be held');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+    await lastMillisecond(heldAt + 5_000, () => {
+      assert.strictEqual(judgeState().verdicts.wait, 0, 'not judged a millisecond before the extended hold lets go');
+      assert.strictEqual(judgeState().heldCount, 1, 'still held, not taken into a judge call, a millisecond before the extended hold lets go');
+      assert.strictEqual(calledAt(), undefined);
+    });
+    await byThisMillisecond(() => calledAt() !== undefined, 'the judge called as the extended hold lets go');
+    await until(() => judgeState().verdicts.wait === 1, 'the batch judged once the extended hold lets go');
+    assert.strictEqual(consulted(), 3, 'premise: the host extended the hold once, then let it go');
+    assert.ok(calledAt()! - heldAt >= 5_000, `the judge's call was made ${calledAt()! - heldAt} ms after the hold began`);
+    assert.deepStrictEqual(judgeState().verdicts, { reply: 0, wait: 1, error: 0, refused: 2 });
+  });
+
+  it("under onError 'skip', a batch refused under a surgery's hold on the store is judged once the surgery lets the store go", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { onError: 'skip' } });
+    const internal = framework as unknown as { reserveStoreForSurgery(verb: string, agentName: string): () => void };
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const release = internal.reserveStoreForSurgery('undo', 'scout');
+      eventGate.evaluate(chat('is scout around?'));
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the refused batch to be held');
+      assert.strictEqual(membrane.calls.length, 0, 'no judge call was made');
+      assert.ok(eventGate.getStatus().errors.includes('Rule "ambient"\'s reply judge call was refused: 1 event held for the judge.'), JSON.stringify(eventGate.getStatus().errors));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      release();
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the held batch judged once the surgery ends');
+      assert.deepStrictEqual(membrane.calls.map((c) => c.assistantParticipant), ['reply-judge']);
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("tells the judge the agent's last turn failed, and what runs it again as the wake list has it: nothing, a queued wake or a held turn", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane, createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    class FailingTurns extends MockMembrane {
+      failTurns = true;
+      override streamYielding(request: import('@animalabs/membrane').NormalizedRequest): import('@animalabs/membrane').YieldingStream {
+        if (!this.failTurns) return super.streamYielding(request);
+        this.calls.push(request);
+        const error = new MembraneError({ type: 'server', retryable: true, httpStatus: 500, message: 'Internal server error', rawError: { status: 500 } });
+        return {
+          isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+          provideToolResults() { throw new Error('not waiting'); },
+          cancel() {},
+          async *[Symbol.asyncIterator]() { yield { type: 'error', error }; },
+        } as unknown as import('@animalabs/membrane').YieldingStream;
+      }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-failed-'));
+    const membrane = new FailingTurns();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      modules: [],
+      gate: { configPath: join(dir, 'gate.json'), config: JUDGED },
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false as const }) },
+      exhaustedTurnRearmMs: false,
+    });
+    t.after(async () => {
+      useRealClock();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    const internal = framework as unknown as {
+      consecutiveInferenceFailures: Map<string, number>;
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+      holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown): boolean;
+    };
+    const judged = (n: number) => until(() => membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').length === n, `judge call ${n}`);
+    const question = () => {
+      const asked = membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').at(-1)!;
+      return (asked.messages.at(-1)!.content[0] as { text: string }).text;
+    };
+    const opening = /scout's last turn, \d+s ago, failed and may not have answered all of what woke it\./;
+    const original = console.error;
+    console.error = () => {};
+    try {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'REPLY: asked to check something' }]));
+      eventGate.evaluate(chat('@scout can you check X?'));
+      await judged(1);
+      await until(() => internal.pendingRequests.length > 0, 'the wake');
+      await idle(framework);
+      assert.strictEqual(internal.consecutiveInferenceFailures.get('scout'), 1, 'premise: the turn failed with its retries spent');
+      assert.strictEqual(internal.pendingRequests.length, 0, 'premise: nothing re-arms it');
+
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('lol'));
+      await judged(2);
+      assert.match(question(), opening);
+      assert.ok(question().includes('Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes scout.'), question());
+
+      internal.pendingRequests.push({ agentName: 'scout', reason: 'a queued wake', source: 'framework', timestamp: Date.now() });
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('and?'));
+      await judged(3);
+      assert.ok(question().includes('A wake for scout is already queued.'), question());
+      assert.ok(question().includes(': a wake already queued (a queued wake)'), question());
+
+      const wait = new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 180_000, message: 'slow down', rawError: { status: 429 } });
+      assert.strictEqual(internal.holdProviderAcceleration(framework.getAgent('scout'), wait, internal.pendingRequests.shift()), true, 'premise: the turn is held');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('hm'));
+      await judged(4);
+      assert.ok(question().includes('A wake for scout is held, due to be let go in 3 min.'), question());
+      assert.ok(question().includes(': a turn held by a provider cooldown, when it ends'), question());
+      assert.ok(!question().includes('already queued'), question());
+
+      membrane.failTurns = false;
+      framework.releaseProviderWait('scout', 'test-model');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Checked: X is fine.' }]));
+      await idle(framework);
+      assert.strictEqual(internal.consecutiveInferenceFailures.get('scout') ?? 0, 0, 'premise: a turn completed');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('thanks'));
+      await judged(5);
+      assert.doesNotMatch(question(), /last turn/);
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("tells the judge of a failed last turn only while no turn has started since, by the order of starts and failures, not the clock: a turn that failed in the millisecond it started is named, and a later turn started in the millisecond of a failure, then stopped, ends the line", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane, MockYieldingStream, createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    class StoppableStream extends MockYieldingStream {
+      private stop!: () => void;
+      private readonly stopped = new Promise<void>((resolve) => { this.stop = resolve; });
+      override cancel(): void { this.stop(); }
+      override async *[Symbol.asyncIterator](): AsyncGenerator<import('@animalabs/membrane').StreamEvent> {
+        await this.stopped;
+        yield { type: 'aborted', reason: 'user' } as import('@animalabs/membrane').StreamEvent;
+      }
+    }
+    class Turns extends MockMembrane {
+      mode: 'fail' | 'hang' = 'fail';
+      hung = 0;
+      override streamYielding(request: import('@animalabs/membrane').NormalizedRequest): import('@animalabs/membrane').YieldingStream {
+        this.calls.push(request);
+        if (this.mode === 'hang') {
+          this.hung++;
+          return new StoppableStream([]);
+        }
+        const error = new MembraneError({ type: 'server', retryable: true, httpStatus: 500, message: 'Internal server error', rawError: { status: 500 } });
+        return {
+          isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+          provideToolResults() { throw new Error('not waiting'); },
+          cancel() {},
+          async *[Symbol.asyncIterator]() { yield { type: 'error', error }; },
+        } as unknown as import('@animalabs/membrane').YieldingStream;
+      }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-stopped-'));
+    const membrane = new Turns();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      modules: [],
+      gate: { configPath: join(dir, 'gate.json'), config: JUDGED },
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false as const }) },
+      exhaustedTurnRearmMs: false,
+    });
+    t.after(async () => {
+      useRealClock();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    const internal = framework as unknown as {
+      consecutiveInferenceFailures: Map<string, number>;
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+      lastInferenceAt: Map<string, { startedAt?: number; failedAt?: number }>;
+    };
+    const judged = (n: number) => until(() => membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').length === n, `judge call ${n}`);
+    const question = () => {
+      const asked = membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').at(-1)!;
+      return (asked.messages.at(-1)!.content[0] as { text: string }).text;
+    };
+    const stillUntil = async (done: () => boolean, what: string, withinMs = 5_000): Promise<void> => {
+      const by = performance.now() + withinMs;
+      while (!done()) {
+        if (performance.now() >= by) assert.fail(`${what} didn't happen`);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+    const run = () => {
+      const state = { ended: false, failure: undefined as unknown };
+      void framework.runUntilIdle().then(() => { state.ended = true; }, (err: unknown) => { state.failure = err; state.ended = true; });
+      return state;
+    };
+    const ended = async (state: { ended: boolean; failure: unknown }, what: string): Promise<void> => {
+      await until(() => state.ended, what, 60_000);
+      if (state.failure !== undefined) throw state.failure;
+    };
+    const wake = (reason: string) => internal.pendingRequests.push({ agentName: 'scout', reason, source: 'framework', timestamp: Date.now() });
+    const failures = () => internal.consecutiveInferenceFailures.get('scout') ?? 0;
+    const sameMillisecond = () => internal.lastInferenceAt.get('scout')?.startedAt === internal.lastInferenceAt.get('scout')?.failedAt;
+    const original = console.error;
+    console.error = () => {};
+    try {
+      wake('a first wake');
+      const first = run();
+      await stillUntil(() => failures() === 1, 'the first turn to fail');
+      assert.ok(sameMillisecond(), 'premise: the turn started and failed in one millisecond');
+      await ended(first, 'the failed turn to end');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('lol'));
+      await judged(1);
+      assert.match(question(), /scout's last turn, \d+s ago, failed/);
+
+      wake('a second wake');
+      await idle(framework);
+      assert.strictEqual(failures(), 2, 'premise: the second turn failed');
+      const failedAt = internal.lastInferenceAt.get('scout')!.failedAt!;
+      membrane.mode = 'hang';
+      wake('a third wake');
+      mock.timers.setTime(failedAt);
+      const third = run();
+      await stillUntil(() => membrane.hung === 1, 'the third turn to start its stream');
+      assert.ok(sameMillisecond(), 'premise: the next turn started in the millisecond the last one failed');
+      assert.strictEqual(framework.abortInference('scout'), true, 'premise: the turn is stopped');
+      await ended(third, 'the stopped turn to end');
+      assert.strictEqual(failures(), 2, 'premise: no turn has completed since the failure');
+
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('ok'));
+      await judged(2);
+      assert.doesNotMatch(question(), /last turn/);
+    } finally {
+      console.error = original;
+    }
   });
 
   it("tells the judge the agent's pending skip_reply timer", async (t) => {
@@ -1437,29 +3036,32 @@ describe('the framework wires the reply judge', () => {
     assert.match(question, /scout is next woken by:\n- [^\n]*: a wake already queued \(a queued test wake\)\n/);
   });
 
-  it("lists a turn a provider wait holds only when the wait has an end", async (t) => {
-    const { MembraneError } = await import('@animalabs/membrane');
-    const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
-    const internal = framework as unknown as {
-      recordProviderWait(agentName: string, model: string, error: Error): unknown;
-      holdForProviderWait(agent: unknown, wait: unknown, requests: unknown[]): boolean;
-      upcomingWakesFor(agentName: string): Array<{ at?: number; what: string }>;
-      providerAccelerationCooldowns: Map<string, { until: number }>;
-      getAgent(name: string): unknown;
-    };
-    const holdFor = (retryAfterMs: number) => {
-      const wait = internal.recordProviderWait('scout', 'test-model', new MembraneError({
-        type: 'rate_limit', retryable: true, retryAfterMs, message: 'slow down', rawError: { status: 429 },
-      }));
-      assert.ok(internal.holdForProviderWait(internal.getAgent('scout'), wait, [{ agentName: 'scout', reason: 'held', source: 'test', timestamp: Date.now() }]));
-    };
-    holdFor(60_000);
-    const [held] = internal.upcomingWakesFor('scout');
-    assert.ok(held?.what.includes('a turn held by a provider cooldown'), held?.what);
-    assert.ok(Number.isFinite(held!.at));
-    holdFor(Number.POSITIVE_INFINITY);
-    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')!.until, Number.POSITIVE_INFINITY, 'premise: now held until released');
-    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
+  it("an operator's release of a provider wait releases batches held for a refusal, even when it finds no wait recorded", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { onError: 'skip' } });
+    const internal = framework as unknown as { surgeryHold: { verb: string; agentName: string } | null };
+    const original = console.error;
+    console.error = () => {};
+    try {
+      internal.surgeryHold = { verb: 'undo', agentName: 'scout' };
+      eventGate.evaluate(chat('is scout around?'));
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the refused batch to be held');
+      internal.surgeryHold = null;
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      assert.deepStrictEqual(framework.releaseProviderWait('scout'), [], 'premise: no wait was recorded');
+      await until(() => eventGate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the held batch judged on the release');
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("an agent's end tells the gate its rules' held batches may go back to the judge, which may now ask about another agent, whether or not the agent was held", async (t) => {
+    const { framework, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { onError: 'skip' } }, ['scout', 'aide']);
+    let released = 0;
+    const release = eventGate.judgeRefusalsMayHaveLifted.bind(eventGate);
+    eventGate.judgeRefusalsMayHaveLifted = () => { released++; release(); };
+    framework.stopAgent('aide');
+    assert.strictEqual(released, 1);
   });
 
   it('enabled: false leaves the judge unwired, and judge rules run as debounces', async (t) => {
@@ -1479,6 +3081,7 @@ describe('a mention rule ahead of a judge rule, end to end over an MCPL server',
   const GENERAL = 'discord:g1:general';
 
   it("wakes the agent without the judge once its message is stored; its turn stops the judge deciding the judge rule's earlier batch, which is judged after the turn, and one turn runs", async (t) => {
+    useRealClock();
     const { mkdtempSync, appendFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { AgentFramework } = await import('../src/index.js');
@@ -1527,6 +3130,7 @@ describe('a mention rule ahead of a judge rule, end to end over an MCPL server',
       modules: [],
     });
     t.after(async () => {
+      useRealClock();
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     });
@@ -1544,7 +3148,7 @@ describe('a mention rule ahead of a judge rule, end to end over an MCPL server',
     const gate = (framework as unknown as { eventGate: { getStatus(): { policies: Array<{ judgeState?: { verdicts: { wait: number } } }> } } }).eventGate;
     await until(() => gate.getStatus().policies[1]!.judgeState!.verdicts.wait === 1, 'the batch to be judged after the turn', 15_000);
     assert.strictEqual(judgeSignals.length, 2);
-    await framework.runUntilIdle();
+    await idle(framework);
     assert.strictEqual(membrane.calls.length, 1, 'one turn');
     assert.strictEqual((framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> }).providerAccelerationCooldowns.size, 0, 'the stopped call arms no hold');
   });
