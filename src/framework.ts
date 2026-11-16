@@ -36167,20 +36167,21 @@ export class AgentFramework {
       ...(answers ? {
         channelId: answers.channel.channelId,
         channelServerId: answers.channel.serverId,
-        [RETRY_RANK]: this.stillSent(agentName, answers.messageId) ? 'sent' as const : 'aside' as const,
+        [RETRY_RANK]: this.stillSent(agentName, answers) ? 'sent' as const : 'aside' as const,
         ...(answers.messageId ? { answersMessageId: answers.messageId } : {}),
       } : {}),
       ...this.wakeChannelsMark(routing),
     };
   }
 
-  private stillSent(agentName: string, messageId: string | undefined): boolean {
+  private stillSent(agentName: string, answers: { channel: ChannelRef; messageId?: string }): boolean {
     const agent = this.agents.get(agentName);
-    if (!agent || messageId === undefined) return false;
+    if (!agent || answers.messageId === undefined) return false;
     const cm = agent.getContextManager();
     return (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages()).some((m) => {
-      const id = (m.metadata as { messageId?: unknown } | undefined)?.messageId;
-      return id !== undefined && id !== null && String(id) === messageId;
+      const row = m.metadata as { messageId?: unknown; serverId?: unknown; channelId?: unknown } | undefined;
+      return row?.messageId !== undefined && row.messageId !== null && String(row.messageId) === answers.messageId
+        && row.serverId === answers.channel.serverId && row.channelId === answers.channel.channelId;
     });
   }
 
