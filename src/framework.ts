@@ -36156,7 +36156,7 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry', this.turnRouting.get(agent.name)));
+    this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry', this.answeredTurns.get(agent) ?? this.turnRouting.get(agent.name)));
   }
 
   private rewindRetry(agentName: string, reason: string, routing: TurnRouting | undefined): MarkedRequest {

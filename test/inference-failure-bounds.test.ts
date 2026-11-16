@@ -55,6 +55,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
   fw.turnRouting = new Map();
+  fw.answeredTurns = new WeakMap();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map<string, object>();
   fw.pendingRequests = [];
