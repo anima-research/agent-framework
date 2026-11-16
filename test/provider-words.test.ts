@@ -81,10 +81,6 @@ class Asker implements Module {
   }
 }
 
-/** Only a turn that got partway writes the note. So a resident's turn here
- *  first runs a tool round, and that call then fails with an error
- *  `retryAfterRound` retries: the turn's next call fails with the round
- *  already in its context. */
 const RETRIED = 'zz-retried-after-a-round';
 
 class ToolRoundThenRetried implements YieldingStream {
@@ -165,7 +161,6 @@ async function residentTurn(membrane: MockMembrane, errorPolicy: ErrorPolicy = n
   }, errorPolicy);
 }
 
-/** A resident's turn whose tool round runs before `then`'s first call fails it. */
 async function partwayTurn(then: MockMembrane): Promise<{ texts: string[]; markers: string[]; stderr: string[] }> {
   const turn = await residentTurn(new AfterARound(then), retryAfterRound);
   assert.ok(JSON.stringify(turn.rows).includes('zz-looked'), 'premise: the round ran, its result in the context');
