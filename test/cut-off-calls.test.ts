@@ -784,6 +784,32 @@ describe("the private think policy without a channel registry, across a restart,
     assert.ok(!afterCut(run).includes(HELD));
   });
 
+  // The sentence names the think policy as the cause, so it is written only
+  // where the words would otherwise have gone out (the fresh reader's find).
+  const UNNAMED_NORTH: Reply = { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+  for (const [label, settings, opts] of [
+    ["proseRouting: 'disabled'", { proseRouting: 'disabled' }, {}],
+    ["proseRouting: 'explicit'", { proseRouting: 'explicit' }, {}],
+    ['no channel registry', {}, { registry: false }],
+  ] as const) {
+    it(`says nothing of held words where they wouldn't have gone out anyway (${label})`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, ...settings }, opts);
+      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+      assert.ok(!afterCut(run).includes(HELD));
+    });
+  }
+
+  it("says nothing of held words beside a refused skip_reply named in the cut round", async () => {
+    const run = await turn('xml', [{ xml: 'A note to myself, not for the room.\n\n<function_calls>\n<invoke name="skip_reply">\n</invoke>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(!run.routed.some((t) => t.includes('A note to myself')));
+    assert.ok(!run.requests.slice(1).join('\n').includes(HELD));
+  });
+
+  it("says the held round's words weren't posted under hybrid routing too", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
   it("says nothing of held words under the public policy", async () => {
     const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }]);
     assert.ok(!afterCut(run).includes(HELD));
