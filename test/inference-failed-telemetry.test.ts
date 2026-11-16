@@ -82,26 +82,30 @@ const texts = (request: NormalizedRequest) =>
 
 async function resident(t: TestContext, membrane: ScriptedMembrane, dir = mkdtempSync(join(tmpdir(), 'af-979-'))) {
   const cwd = process.cwd();
+  const consoleError = console.error;
+  let opened: AgentFramework | undefined;
+  t.after(async () => {
+    try {
+      await opened?.stop();
+    } finally {
+      console.error = consoleError;
+      process.chdir(cwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   process.chdir(dir);
   const stderr: string[] = [];
-  const consoleError = console.error;
   console.error = (...a: unknown[]) => { stderr.push(a.map(String).join(' ')); };
-  const open = () => AgentFramework.create({
+  const open = async () => (opened = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
     agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     errorPolicy: noRetry, exhaustedTurnRearmMs: false,
-  });
+  }));
   let fw = await open();
   const traces: Array<{ type: string }> = [];
   const listen = () => fw.onTrace((e) => traces.push(e as unknown as { type: string }));
   listen();
-  t.after(async () => {
-    await fw.stop();
-    console.error = consoleError;
-    process.chdir(cwd);
-    rmSync(dir, { recursive: true, force: true });
-  });
   return {
     get fw() { return fw; },
     stderr, traces,
