@@ -32,7 +32,6 @@ type Internals = {
   isUnreadPlacement(placement: Placement, by?: 'consumed' | 'shown'): boolean;
   removePlacement(placement: Placement): boolean;
   rowDone(agent: Agent, readsRow: string, to: Destination | undefined): boolean;
-  isNewestIn(agent: Agent, entry: { eventType: string; serverId?: string; eventId?: string }): boolean;
   lastClockOf(agent: Agent): { newestRowAt: number | undefined; lastClockAt: number | undefined };
   draftsNamedInHistory(agent: Agent, ids: string[]): Map<string, string>;
   passNoticeToPrimary(speaker: string, metadata: MessageMetadata | undefined, written?: { participant: string; content: ContentBlock[] }): void;
@@ -393,42 +392,6 @@ describe('read marks once windows are presented (#291)', () => {
   });
 
   describe("the window's own order and audience, not the record's", () => {
-    const entry = { eventType: 'mcpl:push-event', serverId: 'discord', eventId: 'ev-1' };
-    const event = { serverId: 'discord', eventId: 'ev-1' } as unknown as MessageMetadata;
-
-    it('an entry stays newest when an own row presented at its write follows it in the record, and once it is presented after that row', async () => {
-      const h = await boot();
-      h.writeDown(h.mira, h.oren);
-      const cm = h.mira.getContextManager();
-      const arrived = h.store('the event', ['mira'], event);
-      const own = cm.addMessage('mira', text('a row of her own'), asOwnRow(undefined, 'mira'));
-      cm.presentRows([own]);
-      assert.equal(h.internals.isNewestIn(h.mira, entry), true, 'her next request holds her own row, then the entry, which her start presents');
-      cm.presentRows([arrived]);
-      assert.equal(h.internals.isNewestIn(h.mira, entry), true, 'presented after her row: still newest');
-    });
-
-    it("a co-resident's own round stored after the entry doesn't make it not newest", async () => {
-      const h = await boot();
-      h.writeDown(h.mira, h.oren);
-      h.store('the event', ['mira', 'oren'], event);
-      h.oren.getContextManager().addMessage('oren', text("oren's reply"), asOwnRow(undefined, 'oren'));
-      assert.equal(h.internals.isNewestIn(h.mira, entry), true, "oren's row isn't in mira's window");
-    });
-
-    // AF #844 bot review 4, finding 83: an observed co-resident's own round
-    // is an arrival for the observer (bearingOf), so her next request holds
-    // it after the entry, though its stamp names only its owner.
-    it("an observed co-resident's own round stored after the entry, not yet presented, makes it not newest", async () => {
-      const h = await boot({ miraObservesOren: true });
-      h.writeDown(h.mira, h.oren);
-      const arrived = h.store('the event', ['mira', 'oren'], event);
-      h.mira.getContextManager().presentRows([arrived]);
-      assert.equal(h.internals.isNewestIn(h.mira, entry), true, 'premise: the entry is newest in her window');
-      const round = h.oren.getContextManager().addMessage('oren', text("oren's reply"), asOwnRow(undefined, 'oren'));
-      assert.equal(h.mira.getContextManager().windowStatusOf(round), 'out', 'premise: not presented to her yet');
-      assert.equal(h.internals.isNewestIn(h.mira, entry), false, "oren's round, which she observes, follows it in her next request");
-    });
 
     it("a co-resident's clock row isn't this agent's last clock, nor a row not yet presented its newest", async () => {
       const h = await boot();

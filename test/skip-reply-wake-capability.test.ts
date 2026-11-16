@@ -9,6 +9,8 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { registerOpen, incoming, MENTION } from './helpers/admission.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
@@ -97,6 +99,25 @@ describe('skip_reply wake capability', () => {
     assert.match(present.description, /wake_in_seconds/);
     await noGate.stop();
     await withGate.stop();
+  });
+
+  it("refuses a skip_reply whose reason isn't a string, and the turn goes on in public", async () => {
+    const f = await fixture();
+    try {
+      await registerOpen(f, 'work');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'skip-number', name: 'skip_reply', input: { reason: 5 } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the turn went on' }] as ContentBlock[]));
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => f.published.some((p) => JSON.stringify(p.content).includes('the turn went on')), 'the next round posted');
+      const refused = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .some((m) => JSON.stringify(m.content).includes("Nothing changed: skip_reply's reason must be a string, and this call gave a number."));
+      assert.ok(refused, "the refusal is in the agent's context");
+    } finally { await f.close(); }
   });
 
   it('returns an error and does not end the turn when EventGate is absent', async () => {

@@ -37,6 +37,8 @@ const MAX_DESCRIPTION_CHARS = 32768;
 const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'workspace--read', 'toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close']);
 export const isPresentationTool = (name: string): boolean => name === 'set_tool_visibility' || name === 'set_tool_description';
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
+/** The catalogue's line layout, folded into its revision so a line reference saved under an earlier layout reads as stale. Raise it with any change to where the catalogue's lines fall. */
+const CATALOGUE_LAYOUT = 2;
 
 /**
  * A presentation or defaults file this host can't use. Each problem is a
@@ -62,9 +64,9 @@ const characters = (text: string): number => [...text].length;
 /** A text's first `n` characters, never splitting a code point. */
 const firstCharacters = (text: string, n: number): string => [...text].slice(0, n).join('');
 
-/** A name as a message quotes it: whole up to 60 characters, and past that cut, with its length, since a file can hold a key of any size. */
-function quoted(name: string): string {
-  return characters(name) <= 60 ? JSON.stringify(name) : `${JSON.stringify(firstCharacters(name, 57))}... (${count(characters(name))} characters)`;
+/** A text as a message quotes it: whole up to `limit` characters, and past that cut, with its length, since a file can hold a key, and a tool a description, of any size. */
+function quoted(name: string, limit = 60): string {
+  return characters(name) <= limit ? JSON.stringify(name) : `${JSON.stringify(firstCharacters(name, limit - 3))}... (${count(characters(name))} characters)`;
 }
 
 /** A file's problem as a message quotes it: its own clauses whole, and anything else bounded, since nobody wrote that text for its reader. */
@@ -247,7 +249,7 @@ export class ToolPresentation {
       return {name:tool.name,source:sources.get(tool.name) ?? 'Unattributed',visible:override?.visible ?? true,originalDescription:tool.description,description,descriptionSource,inputSchema:structuredClone(tool.inputSchema)};
     });
     const available = tools.map((tool,i) => ({...structuredClone(tool),description:entries[i].description}));
-    return {revision:hash(JSON.stringify({raw,entries,diagnostics})),source:this.config.path,cataloguePath:this.config.cataloguePath,diagnostics,available,
+    return {revision:hash(JSON.stringify({layout:CATALOGUE_LAYOUT,raw,entries,diagnostics})),source:this.config.path,cataloguePath:this.config.cataloguePath,diagnostics,available,
       advertised:available.filter((_,i)=>entries[i].visible),entries};
   }
   edit(tool: string, input: unknown, available: ToolDefinition[]): ToolResult {
@@ -337,7 +339,7 @@ export class ToolPresentation {
     const name = args.name as string;
     if (!available.some((t) => t.name === name)) {
       const near = closestNames(name, available.map((t) => t.name));
-      throw new PresentationRefusal(`Nothing was changed: no tool named ${quoted(name)} is available to you.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
+      throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
         + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`);
     }
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
@@ -346,6 +348,11 @@ export class ToolPresentation {
       throw new PresentationRefusal(`Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility, set_tool_description and the toolsets-- tools are how you read the catalogue, reach hidden tools and undo these changes. Calling this again won't change that.`);
     return name;
   }
+}
+const SUMMARY_CHARACTERS = 200;
+function summaryOf(description: string): string {
+  const first = description.split(/\r\n|[\n\v\f\r\x85\u2028\u2029]/).find(line => line.trim() !== '');
+  return first === undefined ? '' : `: ${quoted(first, SUMMARY_CHARACTERS)}`;
 }
 export function renderCatalogue(snapshot: PresentationSnapshot): string {
   const groups = new Map<string, PresentationSnapshot['entries']>();
@@ -361,12 +368,22 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
     'Visible = not hidden by you: in your tool list, unless the host keeps it in its "settings" toolset or a server\'s tab (toolsets--look shows those). Hidden = moved into the "settings" toolset, or its MCPL server\'s tab: toolsets--look shows it, toolsets--act calls it once that toolset is open.',
     'These are your visibility choices, not fixed primary/secondary rankings.',
     'Copy exact names from the index; similar-sounding names may not exist.',
+    'Index by source: line N.',
     'Show a hidden tool: set_tool_visibility {"name":"EXACT_NAME","visible":true}.',
     `Read details: workspace--read {"path":${JSON.stringify(snapshot.cataloguePath)},"offset":LINE,"limit":LINES}.`,
     'Line references below belong to this revision; reread the index after changes.', '',
   ];
+  const indexLineAt = lines.indexOf('Index by source: line N.');
   // One line each: a quoted parse error can hold the file's own line breaks.
   for (const diagnostic of snapshot.diagnostics) lines.push('Diagnostic: '+diagnostic.replace(/\r\n|\r|\n/g, '\\n'));
+  const hidden = snapshot.entries.filter(e => !e.visible);
+  const hiddenAt = new Map<string, number>();
+  if (hidden.length) {
+    lines.push(`## Hidden (${hidden.length})`, '');
+    for (const entry of hidden) {hiddenAt.set(entry.name, lines.length); lines.push('');}
+    lines.push('');
+  }
+  lines[indexLineAt] = `Index by source: line ${lines.length + 1}.`;
   lines.push('## Index by source', '');
   const index = new Map<string, number>();
   for (const [source, entries] of groups) {
@@ -387,7 +404,10 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
         appendAll(lines, entry.originalDescription.split('\n'));
       }
       lines.push('');
-      lines[index.get(entry.name)!] = `- [${entry.visible?'visible':'hidden'}] ${entry.name} — details: offset ${start}, limit ${lines.length-start+1}`;
+      const details = `details: offset ${start}, limit ${lines.length-start+1}`;
+      lines[index.get(entry.name)!] = `- [${entry.visible?'visible':'hidden'}] ${entry.name} — ${details}`;
+      const at = hiddenAt.get(entry.name);
+      if (at !== undefined) lines[at] = `- ${entry.name} (${entry.source})${summaryOf(entry.description)} — ${details}`;
     }
   }
   return lines.join('\n');

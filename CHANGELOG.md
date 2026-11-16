@@ -12,6 +12,322 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.34.0 — 2026-11-09
+
+### Breaking
+
+- **Hosts with a table or `switch` that must cover every `TraceEvent['type']` or `PresentationRetractReason`:** `TraceEvent` names 2 more types, `inference:held` and `inference:hold_ended`, and `PresentationRetractReason` one more, `unsent-injection` (under Added), so a `Record<…>` keyed on either, or a `switch` checked exhaustively with `never`, needs an entry for each.
+  - **Migration:** add an entry for each of the three.
+  - **Unchanged:** every other trace type and retract reason, and their fields. No sibling package needs a new version.
+
+- **Hosts that tell a failed ephemeral run apart by its rejection's
+  message:** `runEphemeralToCompletion` now rejects a failed turn with the
+  framework's words, such as "the model call failed (server, HTTP 529)",
+  where 0.33.0 rejected with the failure's own message. A host that looked
+  for a provider's words there, such as "overloaded", no longer finds them.
+  The failure's own message, and from a MembraneError its `type`,
+  `retryable`, `httpStatus`, `providerErrorCode` and `retryAfterMs`, are on
+  the rejection's `cause`.
+- **Hosts that recognize the rewind marker by its tag:** the marker opens
+  with `[turns-set-aside]` where it opened with `[refusal-rewind]`. Its
+  row's metadata still has `kind: 'refusal-rewind'`.
+
+### Added
+
+- `StartStreamResult.noteThinkingDropped`: tells the context manager which stored bodies' thinking the provider dropped from a call of the stream, naming the compile the stream was built from. Present only where `noteRequestSent` is.
+
+- Export `residentViewFilter(message, agentName)` and `subconsciousViewFilter(message, agentName)` from the package entry for hosts opening the same stores, plus the `isReasoningLoss(metadata)` building block. Use the composed predicates instead of copying the framework's view rules.
+
+- **Hosts:** the trace events `inference:held`, as a turn starts waiting for
+  compression, and `inference:hold_ended`, once, as the wait ends (#304,
+  under Fixed), with `outcome` `released`, `stopped` or `removed`, and
+  `waitedMs`. A turn that waits again has a new pair. `healthSnapshot().agents[].budgetHold`
+  gives a waiting turn's `since`, compression's `pending` work, the waiting
+  requests, and the refusal's type and figures, or `null`.
+  `presentation:retracted` gains the reason `unsent-injection`, for the
+  context injections no request carried, which leave the agent's window as
+  a turn starts waiting. `Agent` gains `unsentInjectionRows()`, the ids of
+  its stored injections no request has carried, and two methods marked
+  `@internal` for the framework's budget holds, `contextSettingsChanges()`
+  and `markUnsentPoint()`.
+- **Hosts and operators:** a waiting turn raises a `context-refusal` ops
+  alert, saying it waits for compression, once however often it waits
+  again: as it starts waiting, or, where a listener of `inference:held`
+  ended that hold first, as it next waits. Once that alert is raised, it
+  raises `context-refusal-clear` if it is stopped or removed while it
+  waits, so the waiting start doesn't run, worded for which. It's the
+  framework's first `-clear` kind. Both carry the wait's first start as
+  their webhook cooldown key, so each wait's pair reaches the webhook
+  within the 15-minute cooldown, and neither writes failures.log. The
+  clear's `waitedMs` and the note count from that first start too, while a
+  wait held again starts a new hold, whose `inference:held`,
+  `inference:hold_ended` and health snapshot give that hold's own start. A refusal after the
+  release waits again while compression is pending; with nothing pending
+  it goes to the error policy, and if the turn then exhausts, it raises its
+  own `context-refusal`, as an exhausted turn's did before.
+
+- `WakeProvenance.batchChannels`: the registered channels of a debounced batch in which no message addressed the agent, those the host resolved; before, nothing named them, and a batch whose events named no channel or author, only routes the host resolved, had no provenance at all, where it now has these.
+- `InferenceRequest.wakeChannels`: those channels on the gate wake for such a batch, those the framework names, set by the framework for hosts to read rather than set; a start merged from several requests carries every one's channels, or, when any of them comes from outside the framework, isn't a silent heartbeat tick and brought channels, only those requests' channels, and the framework's own wakes that continue a turn with no locus, unless its own wake named a channel that resolves to none, carry the channels the turn's starts gathered; before, no request carried them.
+- `GateEventInfo.folds`: set by the framework on a coalesced render it admits, which folds its batch's every occurrence while its `tags` are the latest's; the gate then never takes it as a `chat:system` notice.
+- `cameFrom` option on `ChannelRegistry`'s `deliverSpeech` and `routeSpeech`: the channels a turn with no locus came from, each with how the agent is shown it, which the failure's reason then names; the framework passes it for such a turn's plain speech and a sleep's announcement, and before, neither took it.
+- `byDesign` on the failure passed to `ChannelRegistry`'s `onRouteFailure` option: set when a turn's plain speech, or a sleep's announcement, had no channel and its batch named the channels it came from, which the failure's reason names; before, no failure was marked so.
+
+- Modern MCP servers over `http://` or `https://` can now be on a 2025
+  revision (`2025-11-25`, `2025-06-18` or `2025-03-26`) as well as
+  `2026-07-28`. The revision is negotiated at each connect, and
+  `listMcplServers()` shows it as `protocolVersion`, with the `family` still
+  `modern`. A modern stdio server stays pinned to `2026-07-28`.
+- **A 2025 session the server ends** gets a new one at once, whatever
+  `reconnect` says, with the server and its tools kept, and costs the calls
+  in flight: a call whose request met the server's 404 didn't run, and fails
+  as `error-response` with `data.httpStatus` 404; one whose stream was cut
+  may have run, and is `no-response`. A session that ends before it
+  answered a request, or an answered one that ends within
+  `reconnectIntervalMs` of starting when the last session restarted that
+  way hadn't lived that long, is a failed connect instead: it emits
+  `reconnect-failed`, follows `reconnect`, and counts toward the framework's
+  alert at the fifth attempt.
+- **`McplProtocolVersionError` over HTTP** names the revisions each side
+  speaks. It isn't retried. A handshake that failed any other way, such as
+  with a 503, is retried as any failed connect is.
+- **`McplProtocolVersionError`'s new `offeredRevisions`** lists every
+  revision this client offered, with `offered` still the first of them: the
+  legacy engine's one, a modern stdio connection's one, or a modern
+  connection's list over HTTP.
+
+- The `inference:exhausted` trace gains `shownReason`: the reason the `[inference-failed]` note may give, before the note's own 600-character cut, bounded as the trace's `error` is. It's present only when the failure's message holds no provider's text: a progress bound's cut, a stream's abort, or context-manager's refusal of a compile.
+- `InferenceLogEntry` and `InferenceLogSummary` gain `errorWords`: the entry's `error` in the framework's words, with no provider's text, which `health--snapshot` shows. Entries written before this release have none.
+- `ProviderWaitNotSleptError`'s constructor takes `ErrorOptions` as its third argument, as `Error`'s does, so one can carry a `cause`.
+
+- `FrameworkConfig.unpromptedChannel`: the channel for a turn the agent's own
+  timer starts, which no message prompted: the wake `skip_reply` schedules, or
+  the end of a `sleep`. Plain speech in locus or hybrid prose routing goes
+  there, and so does `channel_publish` naming no channel in any mode but
+  locked, which servers are told as the turn's default outgoing channel. An
+  all-except hold's channel still comes first while one is open. Without the
+  setting, such a turn takes the global fallback: the hold's channel, else
+  none under the default `speech.locus: 'delivery'`, or the latest inbound
+  message's channel under `'latest-inbound'`. A turn the framework opens to
+  continue such a turn that had no locus of its own, as in explicit or
+  disabled routing, takes it too: a `!` continuation, autoContinue's next
+  turn, or a bounced reply's wake. No other turn takes it: not one a message
+  prompted, from a channel, a module, a person at a console or another agent;
+  not a heartbeat's or a reminder's; not a conversation fork's or an ephemeral
+  run's; not a locked agent's, which speaks at its lock or holds its speech as
+  drafts; and not a start merged from a timer's wake and any other cause. One
+  value, for every agent on the framework. Set to `null`, it reads as not set.
+  On a framework with the setting and an event gate, `channel_publish`'s
+  description adds a default for such turns, the channel this host names for
+  them; on any other, the description is unchanged.
+
+### Changed
+
+- **agent-framework now depends on `@animalabs/context-manager` `^0.25.1`**, where it depended on `^0.25.0`, so a fresh install takes 0.25.1. It's the first release with `ContextManager.noteThinkingDropped`, which the framework now calls when the provider sets aside a stored reply's thinking under `thinkingBinding.dropBlock`. `create()` now refuses a context-manager without that method, as it refuses one without `presentRows`, and names `^0.25.1`. It also carries context-manager's fix to `AutobiographicalStrategy.reportRealInputTokens`, which now spends a compile's one calibration sample on a report whose total is 0, negative, NaN or infinite, and learns nothing from it, where before it left the sample to the next report. **Prompt cache:** where the context manager takes the framework's note of a set-aside reply, the next compile sends that reply without its thinking, so the cache may be written once from the earliest noted reply. context-manager 0.25.1 changes no request at the upgrade. Where the framework reports an unusable total, the grown sample after it is no longer learned from, so the window can be sized differently from 0.25.0's from then on.
+
+- A call whose report names a stored reply's signed thinking the provider dropped now tells the context manager which replies they were, through its `noteThinkingDropped`, with the compile the stream was built from. Once the context manager takes the note, it sends those replies without their thinking from the next compile on, so the provider drops none of them again and the calibration takes its sample. A drop for a changed organization or end user is noted too, so those replies stay without their thinking even if the request's organization or end user changes back. A note that throws is logged, naming the agent, and the stream goes on. Before, with `thinkingBinding.dropBlock`, a reply stored before its branch's thinking-binding record began kept being sent and dropped, with no calibration sample, until a change to what the request sends ahead of it.
+
+- The tool catalogue a resident reads with `workspace--read` now lists the
+  available tools hidden from it right after its header and any
+  diagnostics, before the index: one line each, with its source, the
+  first line with text of the description it would show (its own
+  override, else the configured default, else the installed one), quoted
+  as JSON and, past 200 characters, cut and followed by its length, and
+  the offset and limit of its full definition. A resident deciding whether
+  to show one again finds them all before the index, where it took a read
+  per hidden tool at its own offset, or a read through every visible
+  tool's description first. The header says which line the index starts
+  on. That header line is new, so every line reference in the catalogue
+  moves down by at least one, even with nothing hidden. The catalogue's
+  revision now covers its layout too, so every catalogue's revision
+  changes once at the upgrade, and a line reference saved before it
+  belongs to a revision the catalogue no longer shows. A hidden tool that
+  isn't available right now is still named only in the diagnostics. The
+  unknown-name refusal of `set_tool_visibility` and `set_tool_description`
+  now says the resident has no tool by that name right now, shown or
+  hidden, where it said none was "available to you", which can read as a
+  lack of access.
+
+- When a turn woken by a debounced gate batch in which no message addressed the agent, and by nothing else that names a channel, a turn whose own wake named no channel, when such a batch's wake joins it at a later start, beside any other wake, or a continuation or retry of such a turn (autoContinue's, a ` !` continuation's or a bounce's wake, a context-budget restart's or a tool-results re-inference's continuation, a rewind's, the inference-failure breaker's or the tool-result guard's retry, or an exhausted turn's re-arm), routes its plain speech, or a sleep's announcement, with no channel to go to, the agent's `[send-undeliverable]` notice now names the channels the host resolved for the batch's messages, one given without its server only if its id still names one registered channel when the wake is admitted (a `chat:system` notice names none, unless it's a coalesced render's latest occurrence), and says to send its reply to that channel, or one of them, explicitly. It gives that advice only for a channel that can take a send now: a channel the host no longer has registered, one its server declared inbound-only, and one whose server can't take a send each get their own reason in its place, and one whose server this host is connecting or reconnecting to is told to send there once it's back. It calls this a routing situation, not a routing/configuration one, and the reason logged and traced (`mcpl:speech-route-failed`) for it reads `turn has no locus (no channel was chosen for its batch's reply)`, where it read `turn has no locus (no home/trigger channel; nothing to deliver into)`. Before, it said the turn came from no channel, and to ask whoever runs the host. A turn keeps that notice when none of the batches it was woken by has such a channel: when the host resolved no channel for any of them, or each it resolved was given without its server and none of their ids still names one registered channel when its wake is admitted. An ephemeral run's turn gets no notice either way, since its plain speech with no channel of its own is its caller's result.
+
+- **On `2026-07-28` over HTTP**, a dropped stream's retries take the same
+  timing as on a 2025 revision: the first try waits the server's `retry`
+  hint, or the first step of the connection's backoff when it gave none or
+  a hint of 0, and a try after a failed one waits the longer of the hint
+  and the connection's backoff. They stop after two failed tries, the SDK's
+  default, on every stream: a listen stream that can't be resumed is
+  reopened, with a relist, and a call whose stream can't be resumed fails
+  then, as `no-response`, rather than at its deadline.
+- **A modern stdio server** whose discovery answer lists revisions without
+  `2026-07-28` is a `McplProtocolVersionError` (`rejected`) that isn't
+  retried, even when the SDK can't read the answer as a discovery result.
+  Such an answer the SDK couldn't read was an ordinary failed connect.
+- **Once the framework's `stop()` has begun**, a modern reconnect still
+  connecting is closed rather than adopted, and emits no `reconnect`.
+
+- **Hosts:** agent-framework accepts `@animalabs/membrane`
+  `^0.8.0 || ^0.9.0` (was `^0.8.0`), so agent-framework and the
+  context-manager it installs share one membrane, and a host's own membrane
+  0.8 or 0.9.0 is shared with them. A fresh install gets membrane 0.9.0
+  unless the host's own range holds it to 0.8, and a lockfile's 0.8.0 is
+  still admitted. membrane's changelog for 0.9.0 lists its changes. With
+  membrane 0.9.0 installed, two things the framework takes from membrane
+  read differently:
+  - When a model call fails because its connection does, and the error's
+    causes carry a code, membrane 0.9.0's message names the host it tried,
+    with its port when that isn't the scheme's default, and what happened,
+    such as "The request to 127.0.0.1:59999 failed: the connection was
+    refused (ECONNREFUSED)." On Node, membrane 0.8.0 said "Connection
+    error." through the Anthropic adapter and "fetch failed" through the
+    OpenRouter, OpenAI-compatible and OpenAI adapters. stderr,
+    `logs/failures.log` and traces give the failure's message, so they read
+    that way. An `[inference-failed]` note gives no reason for such a
+    failure.
+  - A retryable failure with no HTTP status and no deadline mark, of type
+    `network` or `timeout`, whose message holds `529` as a word or
+    `overloaded_error`, is no longer read as overloaded, so the error
+    policy gives it the base schedule rather than the overloaded one.
+
+- A failed turn no longer puts a provider's words in what an agent reads. The `[inference-failed]` note names membrane's type and the HTTP status when it has them, as before, and gives a reason only where the framework, membrane's progress bounds or context-manager wrote it: a progress bound's cut, a stream's abort or a compile's refusal. A deadline expiry membrane throws, whose own message it gave, now gets no reason. In 0.33.0 it gave the failure's message, cut to 600 characters, which a provider can fill with anything, the rejected request included. A safety failure's note names no type. The note's metadata keeps the message, as stderr, `logs/failures.log`, traces and alerts do.
+- `runEphemeralToCompletion`'s rejection for a failed turn says what failed in the framework's words, such as "the model call failed (invalid_request, HTTP 400)", "the model call timed out (HTTP 408)" or, for a safety failure, "the request couldn't be completed". A compile's refusal or a progress bound's cut reads its own message, as the `[inference-failed]` note gives it, and any other error that isn't a model call's reads "the turn failed". The rejection carries a bounded copy of the error that ended the turn as its `cause`: a plain `Error` with the error's `name`, its message cut to 2,000 characters and, from a MembraneError, its `type`, `retryable`, `httpStatus`, `providerErrorCode` and `retryAfterMs`. Read those fields by name, since `instanceof MembraneError` doesn't hold on the copy, and it carries no `rawError` or `rawRequest`. The copy's message and stack are the failure's own, a provider's words included, for classifying the failure and for logs, and aren't for showing to an agent. In 0.33.0 the rejection was a plain `Error` carrying the provider's words, cut to 2,000 characters, with no `cause`. A host that tells failures apart by the rejection's message, such as by "overloaded" in it, now reads the framework's words there, and finds the failure's own message and fields on the `cause`. `ProviderWaitNotSleptError`'s message keeps its stated-wait clause, after the same words. A script a failed turn stops no longer gives the provider's message as its reason.
+- The rewind marker reads the same whether a refusal or repeated failures set the turns aside: "The N most recent turn(s) were set aside because the requests that carried them couldn't be completed. Their content isn't shown here, and the originals remain in the raw record." It names no refusal, filter or category, and opens with `[turns-set-aside]` where it opened with `[refusal-rewind]`. Its metadata keeps `kind: 'refusal-rewind'` and the category. Supplied text opening with `[refusal-rewind]` is still marked, as text opening with one of the framework's tags is.
+- An `/unstick` that gives up tells its channel that the agent's requests still couldn't be completed after its rewinds. In 0.33.0 it said the model was "still refusing" and named the refusal's category, which a resident in that channel reads. The category goes to stderr.
+- `health--snapshot` lists each recent failed inference in the framework's words, from the inference log's new `errorWords`, such as "the model call failed (invalid_request, HTTP 400)". In 0.33.0 it gave the log's `error`, the failure's message cut to 400 characters. An entry written before this release shows `null`.
+- `gate_status` gives a failed reply judge's reason, as its rule's last verdict and in its note on a judge that keeps failing, in the framework's words, such as "the model call failed (server, HTTP 529)", or "the call failed" for an error the framework didn't write. The judge's own reasons, such as its timeout, read as before, except that an answer with no verdict reads "the judge's answer held no verdict", without the answer's stop reason or text, and a judge the gate times out reads as timed out even when it rejects as it's stopped. In 0.33.0 both gave the error's message. stderr still does, with the answer's stop reason and text.
+
+### Fixed
+
+- **Hosts with a persistent subconscious:** its last look at each tuned-out channel is now stored, and a start keeps it, also for a channel its server registers only after the host has started. So after a restart, its next cadence look at a channel the start resumes counts only the messages held there since its last one, as before the restart. Before, the store refused every write of the looks, whose keys held a NUL byte; the failure was only logged, and a restart forgot every look, so every held message counted as new (#917). A look is stamped when the subconscious's turn is asked for, not when the turn runs, and the turns asked for are kept in memory: if the host stops between the two, the stamp survives the restart and the turn doesn't, so no later look at that channel counts the messages that look counted. Before this change, the restart forgot the stamp too, and the next cadence look counted those messages again.
+
+- Omit legacy stored notices with both `metadata.kind: 'reasoning-loss'` and `metadata.system: true` from the agent's compiled context and compression inputs only (#938 stopped writing new notices). This deterministic exclusion happens before selection, chunking, thinking binding and cache-marker placement, and covers inheritance seeds, mid-turn injections, `previewActivation`, compiled context inspection and reply-judge previews. Stored history is unchanged: history tools (`extract`, `search` and around-message lookup) still return stored notices verbatim, so they can reappear as tool output. Text-only quotes are not excluded. Addresses #973; the issue remains open pending the summary limit below.
+- **Migration limit:** selection/chunk/cache layouts can change on upgrade; previously persisted summaries are not rewritten and can retain notice text. On context-manager releases up to at least 0.25.1, a hidden first source can place that summary after newer messages; a hidden first or last source makes it permanently unmergeable and absent from history overview until anima-research/context-manager#369 or equivalent lands. This release does not depend on anima-research/context-manager#369. Remove this migration limit and the migration test `todo` in the release that raises the context-manager dependency floor to a version containing that fix.
+
+- A turn whose compile is refused for budget while compression is pending
+  now waits, idle, and runs once compression has made room, instead of
+  ending (#304). The refusal comes before the start's own provider call,
+  for example after an immediate budget decrease. Before, the error policy retried it
+  into the same refusal within seconds and ended the turn, and once
+  compression had caught up nothing ran it again, so the agent stayed silent
+  until its next wake. A refusal with nothing pending, an ephemeral run, and
+  a framework that `start()` hasn't started fail as before.
+  - **While it waits** the agent is idle: a surgery, a branch switch, an
+    undo or a redo is admitted, a quiesce drains at once, and the wait holds
+    no place in the event gate. A puppet call is admitted while a first
+    start waits. While a turn under way waits, it's refused, naming
+    `abortInference()` as the way to end that turn. `getHostModeStatus()`'s
+    `gatedRequests` counts the waiting turn and the wakes that joined it.
+    Wakes that arrive join the wait. For a turn's first start, their
+    messages enter the agent's window as they arrive, and the released
+    start answers them all, as a retry a provider hold kept answers those
+    that joined it. For a budget restart's continuation or a tool-result
+    guard's retry, they stay out of its request and run as a turn of their
+    own after it.
+  - **When it runs:** while no surgery holds the store and the host isn't
+    quiesced, the waiting requests are queued again once something
+    the refused compile depends on has changed: compression has made
+    progress (a summary written since the refused compile started, or,
+    for a strategy with no progress snapshot, a call that landed),
+    compression has nothing left pending, a surgery's release or a
+    completed undo, the agent's budget or live context settings have
+    changed, or a quiesce has ended.
+    Their start's own compile is the check. Refused again while compression
+    is pending, they wait again, the note counting from the first wait's
+    start, and each such start traces its own `inference:started` and
+    `inference:failed`. A compression call that
+    fails releases nothing. The wait drives compression itself, ticking the
+    agent's context manager once, and again only while a strategy with no
+    progress snapshot lands a call each tick; with the maintenance timer off
+    it drives it again every 5 seconds. A compression
+    call that fails in a tick it drives is reported as one in a maintenance
+    pass is.
+  - **What no request carried:** for an agent whose window is presented,
+    its own stored context injections that no request has carried leave
+    the window as a turn starts waiting, whichever attempt stored them, an
+    earlier release's note included, and the released start stores them as
+    it would without the wait. A routing notice the refused start stored
+    stays, so its arrivals stay announced, and an undo of the released turn
+    leaves it, unless the turn was a budget restart's continuation or a
+    tool-result guard's retry, which store it after the turn's checkpoint.
+  - **No time limit:** a turn can wait as long as compression stays
+    pending.
+    A waiting turn lives in memory, so a restart drops it, and the agent
+    waits for its next wake, as after an exhausted turn before.
+  - **Hosts watching for failed turns:** a turn that waits doesn't end in
+    `inference:exhausted` or leave the `[inference-failed]` marker, as the
+    refused turn did before. `inference:held` and `inference:hold_ended`,
+    and `healthSnapshot()`'s `budgetHold`, show it waiting.
+  - **The note:** as the wait releases, it stores "[budget-hold] Your
+    context didn't fit its budget (100,201 tokens against 48,568) when a
+    turn came to start. That turn waited 7 min." in the agent's window, as
+    the agent's own stored context injection, counting from the first wait's
+    start to the release, entering the window at once or, while a turn of
+    the agent's is alive, at its next presentation point. The released start
+    reads it where it was stored,
+    so the next request starts with the same messages and a reply keeps its
+    thinking, and later requests read it as history, which the strategy
+    folds like any row. A failed write is logged, and the turn runs without
+    the note. An undo of the released turn leaves the note, unless the turn
+    was a budget restart's continuation or a tool-result guard's retry,
+    which present it after the turn's checkpoint, so the undo takes it with
+    the reply.
+  - **A surgery or an undo:** a waiting turn whose trigger's row a rollback,
+    suppression or branch switch removed, or an undo took out of the
+    agent's window, is dropped, as is a released one whose row left the
+    agent's window before its start began, whatever took it out, and so is
+    a turn under way whose opening
+    message, where its trigger read one, or own rows one removed, each
+    ending with `inference:aborted`. The wakes that joined a dropped turn go
+    back to the queue. An undo of the agent ends a waiting turn under way,
+    and that turn's end is traced after the undo's own. A waiting turn whose trigger
+    has no row of its own, such as console input, a heartbeat or a merged
+    wake whose messages read different rows, is checked only by the rows it
+    has written, and one with none yet can't be checked and runs on what the
+    surgery left, as a waiting wake does.
+  - **When it ends without running:** `abortInference()`, `stop()` and the
+    agent's end drop a waiting turn with `inference:aborted`. Once released,
+    a first start is a queued wake until its start begins, so an abort
+    leaves it to run, and the inference policy or a withdrawal decides it
+    as any queued wake; a continuation is a queued continuation, which an
+    abort ends. If compression has nothing left to do and the context still
+    doesn't fit, the released start's refusal takes the error policy's
+    path, with the note in place. A released start that is then dropped,
+    declined or withdrawn raises no `context-refusal-clear`, since its wait
+    ended at the release.
+- A closing conversation fork is no longer disposed while its closure wake
+  waits, either when a turn of its that was alive at its expiry ends or by
+  the fallback sweep, which also leaves it while a budget hold of its agent
+  exists: the closure turn runs, and the fork is disposed after it.
+
+- The channel tools (`channel_open`, `channel_decline`, `channel_close`,
+  `channel_publish`, `think`, `journal` and `skip_reply`) now refuse a call
+  that gives a parameter their schema declares a string as anything else,
+  such as a JSON number, before anything changes. The answer names the
+  parameter and what the call gave, and says to give it in quotes. A
+  parameter left out or given as `null` is read as before. In 0.33.0:
+  - An id the model wrote as a number past 2^53, as `channel_open`'s
+    `beforeMessageId` or `channel_decline`'s `messageId`, had usually lost
+    its last digits when the call was parsed, so it reached the MCPL server
+    as a different id, as a backscroll's anchor or as the message an
+    acknowledgment is for.
+  - `channel_publish`'s `channelId` was usually read as left out, so the
+    message was posted where a call naming no channel posts, such as the
+    channel of the turn that made the call.
+  - Other non-strings were taken as given, read as left out, or refused for
+    another reason.
+
+- A `chat:system` notice in a debounced gate batch, other than a coalesced render's latest occurrence, no longer decides the batch's route, its `addressed` flag or the channel its wake names, as 0.28.0 says no notice does, even one addressed by its place: a pin in a DM no longer takes the reply meant for a mention elsewhere in the same batch. With a message in the batch that names a channel or an author, the wake's author and time come from the batch's messages, not a newer notice. The wake of a batch in which only its notices name a channel or an author, and which has no `WakeProvenance.batchChannels`, carries only the author of its newest notice that has one, with that notice's time, as the same notice woken directly from `channels/incoming` does. A coalesced render, which carries only its latest occurrence's tags, is never taken as a notice at the gate, as its own wake isn't, so a message it folds keeps its channel when a notice came last.
+
+- A provider hold that keeps one of two equal requests now folds the other's marks into the one it keeps as the scheduler's merge does: the kept request keeps the carried state it holds as a turn's (an explicit send it made, a silence it kept), else takes the other's, else holds none, and stays re-armed only if both were. Before, a held turn's retry folded into an equal held wake lost that state, so the continued turn could post a text-only reply after a send it had already made, or speak after keeping silent; a retry folded into a re-armed wake could revive the state of the exhausted retry that wake was re-armed from; and the kept request stayed re-armed, or not, by which of the two was held first.
+
+- **Held wakes and judged events past what a call can take as arguments
+  no longer throw.** V8 throws a `RangeError` when a call passes more than
+  about 125,000 arguments, and the framework spread lists into calls such
+  as `push(...list)` and `Math.min(...list)`. A provider hold that held
+  that many wakes threw as it released them, and a judge rule's quiet
+  period that gathered that many events threw when its batch met one
+  already held for a running turn or one with the judge. Every call that
+  spread a list that can grow that long with what an agent holds or does
+  now passes it without a spread.
+
 ## 0.33.0 — 2026-11-07
 
 ### Breaking

@@ -1,1 +1,0 @@
-- Export `residentViewFilter(message, agentName)` and `subconsciousViewFilter(message, agentName)` from the package entry for hosts opening the same stores, plus the `isReasoningLoss(metadata)` building block. Use the composed predicates instead of copying the framework's view rules.

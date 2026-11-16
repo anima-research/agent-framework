@@ -54,6 +54,7 @@ test('-32022 with a supported list is a typed rejection naming the modern remedy
     assert.ok(err instanceof McplProtocolVersionError);
     assert.equal(err.kind, 'rejected');
     assert.equal(err.offered, '2024-11-05');
+    assert.deepEqual(err.offeredRevisions, ['2024-11-05']);
     assert.deepEqual(err.supported, ['2026-07-28']);
     assert.equal(err.code, -32022);
     assert.deepEqual(err.data, { supported: ['2026-07-28'], requested: '2024-11-05' });
