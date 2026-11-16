@@ -1,0 +1,1 @@
+- `inference:exhausted` traces carry `shownReason`, the reason the `[inference-failed]` note may give, where the failure's message is the house's own. A trace listener gets it bounded as it gets `error`.

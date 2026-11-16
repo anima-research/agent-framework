@@ -12,7 +12,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
-import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
+import { deadlineCut, isDeadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 // Not named imports from context-manager: 0.24.0 has neither, and a named
 // import of either would fail this package's load there before create()
@@ -3746,6 +3746,25 @@ function failureDescription(error: unknown): string {
 }
 
 const UNDESCRIBED_FAILURE = `[${NOTICE_TAG.undescribedFailure}]`;
+
+function compileRefusalType(err: Error): 'over_budget' | 'context_refusal' | undefined {
+  if (err instanceof OverBudgetError || err.name === 'OverBudgetError') return 'over_budget';
+  // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
+  // 2026-07-26): a compile REFUSES rather than shipping a context with
+  // silently-dropped messages. Recovery is identical to over_budget — kick
+  // the compression drain so summaries cover the un-represented span.
+  if (err instanceof UncoveredDropError || err.name === 'UncoveredDropError') return 'context_refusal';
+  return undefined;
+}
+
+function houseReason(err: Error): string | undefined {
+  return isDeadlineCut(err) || compileRefusalType(err) !== undefined ? String(err.message) : undefined;
+}
+
+function shownReasonOf(err: Error): { shownReason?: string } {
+  const own = houseReason(err);
+  return own === undefined ? {} : { shownReason: own };
+}
 
 /**
  * A bounded string describing a failure, for logs that would otherwise print
@@ -27941,6 +27960,7 @@ export class AgentFramework {
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
+          ...shownReasonOf(err),
           // Drives the poison-history breaker (shedMayHelp: an
           // `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
           // `context_length` at 413, suggests the provider refused the
@@ -29887,6 +29907,7 @@ export class AgentFramework {
                 type: 'inference:exhausted',
                 agentName: agent.name,
                 error: err.message,
+                ...shownReasonOf(err),
                 // Drives the poison-history breaker. `retryable` is kept for
                 // observability, but the breaker gates on
                 // shedMayHelp(errorType, httpStatus): only an `invalid_request`
@@ -29974,6 +29995,7 @@ export class AgentFramework {
                   type: 'inference:exhausted',
                   agentName: agent.name,
                   error: terminal,
+                  shownReason: terminal,
                 });
                 this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
@@ -30270,6 +30292,7 @@ export class AgentFramework {
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
+        ...shownReasonOf(err),
         ...this.classifyInferenceError(err),
       });
       this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
@@ -34534,6 +34557,7 @@ export class AgentFramework {
         {
           httpStatus: event.httpStatus as number | undefined,
           providerErrorCode: event.providerErrorCode as string | undefined,
+          shownReason: event.shownReason as string | undefined,
         },
       );
     } else if (event.type === 'inference:completed') {
@@ -34595,6 +34619,7 @@ export class AgentFramework {
     // the whole request.
     const bounded = traceEvent as unknown as Record<string, unknown>;
     if (typeof bounded.error === 'string') bounded.error = boundFailureText(bounded.error);
+    if (typeof bounded.shownReason === 'string') bounded.shownReason = boundFailureText(bounded.shownReason);
     if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
 
     if (this.earlyTraces) {
@@ -34996,17 +35021,8 @@ export class AgentFramework {
         ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
       };
     }
-    if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
-      return { errorType: 'over_budget' };
-    }
-    // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
-    // 2026-07-26): a compile REFUSES rather than shipping a context with
-    // silently-dropped messages. Recovery is identical to over_budget — kick
-    // the compression drain so summaries cover the un-represented span.
-    if (err instanceof UncoveredDropError || err.name === 'UncoveredDropError') {
-      return { errorType: 'context_refusal' };
-    }
-    return {};
+    const refused = compileRefusalType(err);
+    return refused === undefined ? {} : { errorType: refused };
   }
 
   /**
@@ -35025,7 +35041,7 @@ export class AgentFramework {
     rawReason: string,
     retryable?: boolean,
     rawErrorType?: string,
-    detail?: { httpStatus?: number; providerErrorCode?: string },
+    detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string },
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
@@ -35040,8 +35056,9 @@ export class AgentFramework {
     // [inference-failed] marker's metadata FAILURE_MARKER_REASON_MAX_CHARS, the
     // status's lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS,
     // and the rewind marker's metadata REWIND_MARKER_REASON_MAX_CHARS. The
-    // classification travels as structured fields beside the text. Neither
-    // marker's text quotes the reason.
+    // classification travels as structured fields beside the text. The
+    // [inference-failed] marker's text quotes only `shownReason`, which holds
+    // no provider's text, and the rewind marker's quotes no reason.
     //
     // A reason that isn't a string (the stream paths always pass a message)
     // is described rather than allowed to throw before anything is recorded.
@@ -35092,6 +35109,9 @@ export class AgentFramework {
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
       const cause = timedOut && causeParts.length === 1 ? '' : causeParts.join(', ');
+      const shownText = typeof detail?.shownReason === 'string'
+        ? suppliedValue(boundFailureText(detail.shownReason, FAILURE_MARKER_REASON_MAX_CHARS)) : undefined;
+      const shown = shownText !== undefined ? ` Reason: ${shownText}${/[.!?]$/.test(shownText) ? '' : '.'}` : '';
       try {
         storeOwnRow(
           agent,
@@ -35110,7 +35130,7 @@ export class AgentFramework {
                 : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
                   `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
                   `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''}`) +
-              ` ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
+              `${shown} ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
