@@ -7440,8 +7440,10 @@ export class AgentFramework {
       request.reason = REARM_REASON;
       delete request.counterparty;
     }
+    const answered = routing?.answers;
+    if (answered?.messageId && speaking && sameChannel(speaking, answered.channel)) request.answersMessageId = answered.messageId;
+    else delete request.answersMessageId;
     if (speaking) {
-      if (!sameChannel(speaking, routing?.triggerChannel)) delete request.answersMessageId;
       request.channelId = speaking.channelId;
       request.channelServerId = speaking.serverId;
       request.addressed = true;
