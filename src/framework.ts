@@ -4663,7 +4663,7 @@ export class AgentFramework {
   /** Each agent's kept `/unstick` answer, and the `unstick-outcome` requests
    *  that wait for its next one (see answerUnstick). */
   private unstickAnswers = new Map<string, UnstickAnswer>();
-  private unstickWaiters = new Map<string, Set<(answer: UnstickAnswer) => void>>();
+  private unstickWaiters = new Map<string, Set<(answer: UnstickAnswer | 'replaced') => void>>();
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
@@ -15351,7 +15351,9 @@ export class AgentFramework {
    *   once, at the next of the session's end or a turn that fails inside the
    *   session, which ends nothing. An end is kept for every request after it,
    *   until the agent's next `unstick`; a failed turn no request waited for
-   *   is kept for the first that comes. While it waits it holds back no
+   *   is kept for the first that comes, until a later answer replaces it or
+   *   the agent's next `unstick` drops it. A new `unstick` answers the
+   *   requests that still wait `ok: false`. While it waits it holds back no
    *   other command, and a stop answers it `host-stopped`.
    *
    *   quiesce — enter host maintenance mode (issue #122): park wakes, pause
@@ -15567,10 +15569,11 @@ export class AgentFramework {
       const session = this.forcedRewind.get(name);
       if (!session) return { ok: false, error: `unstick-outcome: ${name} has no /unstick to answer for` };
       // The wait holds back no other command, and ends when a stop begins.
-      let resolve!: (answer: UnstickAnswer) => void;
-      const next = new Promise<UnstickAnswer>((r) => { resolve = r; });
+      let resolve!: (answer: UnstickAnswer | 'replaced') => void;
+      const next = new Promise<UnstickAnswer | 'replaced'>((r) => { resolve = r; });
       this.unstickWaiters.set(name, (this.unstickWaiters.get(name) ?? new Set()).add(resolve));
       const answer = await this.untilStopBegins(next);
+      if (answer === 'replaced') return { ok: false, error: `unstick-outcome: a new /unstick of ${name} replaced the one this request waited on` };
       if (answer) return { ok: true, ...answer };
       this.unstickWaiters.get(name)?.delete(resolve);
       return { ok: true, outcome: 'host-stopped', rewinds: session.removed.length };
@@ -15603,6 +15606,9 @@ export class AgentFramework {
       }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
+      const left = this.unstickWaiters.get(agentName);
+      this.unstickWaiters.delete(agentName);
+      for (const resolve of left ?? []) resolve('replaced');
       this.unstickAnswers.delete(agentName);
       this.forcedRewind.set(agentName, {
         remaining: cap,
