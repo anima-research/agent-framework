@@ -821,15 +821,16 @@ describe('code_execution through the framework', () => {
     });
   });
 
-  for (const thrown of [false, true]) {
-    it(`a turn that ends on a provider's error${thrown ? ' thrown from its stream' : ''} tells its scripts what failed in the framework's words, not the provider's`, async () => {
+  for (const site of ['stream', 'thrown', 'start'] as const) {
+    it(`a turn that ends on a provider's error${site === 'thrown' ? ' thrown from its stream' : site === 'start' ? ' before its stream exists' : ''} tells its scripts what failed in the framework's words, not the provider's`, async () => {
       const SENTINEL = 'zz-provider-words-7f3a';
       const error = new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, message: `Bad request: ${SENTINEL}`, rawError: undefined });
       const membrane = new MockMembrane();
       membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
         membrane.calls.push(request);
+        if (site === 'start') throw error;
         const stream = new ProviderErrorStream(error);
-        if (thrown) stream[Symbol.asyncIterator] = async function* (): AsyncGenerator<StreamEvent> { throw error; };
+        if (site === 'thrown') stream[Symbol.asyncIterator] = async function* (): AsyncGenerator<StreamEvent> { throw error; };
         return stream;
       };
       const errorPolicy: ErrorPolicy = { maxRetries: 0, onInferenceError: (): ErrorAction => ({ retry: false }) };
