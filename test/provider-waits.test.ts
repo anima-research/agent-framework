@@ -762,9 +762,8 @@ test("a non-retryable failure worded as organization acceleration keeps its term
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      const markers = fw.getAgent('resident')!.getContextManager().queryMessages({}).messages
-        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
-      assert.equal(markers.length, 1, 'terminal: its marker is written');
+      assert.equal(log.lines.filter((l) => l.startsWith('[inference-failed] agent=resident consecutive=1 ')).length, 1,
+        'terminal: the turn ends exhausted');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0, 0, 'not retained for retry');
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1067,9 +1066,8 @@ test('a non-retryable failure with a stated wait keeps its terminal disposition;
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1);
-      const markers = () => fw.getAgent('resident')!.getContextManager().queryMessages({}).messages
-        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
-      assert.equal(markers().length, 1, 'the failure is terminal: its marker is written');
+      const exhausted = () => log.lines.filter((l) => l.startsWith('[inference-failed] agent=resident consecutive=')).length;
+      assert.equal(exhausted(), 1, 'the failure is terminal: the turn ends exhausted');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0, 0, 'the failed request is not retained for retry');
 
       // Real time passes the wait before the later wake, as on a loaded host.

@@ -411,6 +411,15 @@ export interface UpcomingWake {
   kind?: UpcomingWakeKind;
 }
 
+/**
+ * The agent's last turn, when it failed (it ended with an
+ * `inference:exhausted` trace, or its start threw before its stream) and no
+ * turn has started since: when it failed.
+ */
+export interface FailedLastTurn {
+  at: number;
+}
+
 /** What the gate asks the reply judge for one batch. */
 export interface JudgeRequest {
   /** The rule whose batch this is. */

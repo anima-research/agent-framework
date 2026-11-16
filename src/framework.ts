@@ -3154,8 +3154,6 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
-const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
-  '(e.g. drop an oversized attachment or an unsupported setting).';
 const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
 const MADE_AGAIN = 'The call was made again, and it timed out again.';
 const OVERLOADED_TURN_TRIES = 13;
@@ -4464,6 +4462,7 @@ export class AgentFramework {
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
+  private failedLastTurnAt = new WeakMap<Agent, number>();
   private processLoggingPersist: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
@@ -4609,7 +4608,6 @@ export class AgentFramework {
   private consecutiveInferenceFailures: Map<string, number> = new Map();
   private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
   private turnRearms: Map<string, number> = new Map();
-  private exhaustingRearms: Set<string> = new Set();
   private rearmDeadlineCuts: Set<string> = new Set();
   private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
@@ -5704,6 +5702,7 @@ export class AgentFramework {
         // timers: a wake already queued for it, and a turn a provider cooldown
         // holds until it ends.
         upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
+        failedLastTurn: (agentName) => framework.failedLastTurnFor(agentName),
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
@@ -6888,6 +6887,11 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new MaintenanceWithdrawnError(`provider admission closed while stopping (${agentName})`);
     }
+  }
+  private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
+    const agent = this.agents.get(agentName);
+    const at = agent && this.failedLastTurnAt.get(agent);
+    return at === undefined ? undefined : { at };
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
@@ -8357,7 +8361,7 @@ export class AgentFramework {
   private cancelProviderAdmission(): void {
     for (const cooldown of this.providerAccelerationCooldowns.values()) clearTimeout(cooldown.timer);
     this.providerAccelerationCooldowns.clear(); this.providerAccelerationRecoveries.clear();
-    this.turnRearms?.clear(); this.exhaustingRearms?.clear();
+    this.turnRearms?.clear();
     for (const gate of this.providerGates.values()) {
       gate.primaryDepth = 0; gate.primaryPending = false;
       for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -8936,10 +8940,8 @@ export class AgentFramework {
    * [turn-interrupted] marker, an attributable inference-log terminal, gate
    * release. Deliberately none of the failure accounting: inference:failed /
    * inference:exhausted feed the consecutive-failure streak, hard-down ops
-   * alerts, the poison-history breaker and the "[inference-failed]" marker —
-   * all of which told a resident, in the user's voice, that its turn failed
-   * and advised remediation for a failure that never happened — and
-   * errorPolicy would relaunch the very inference someone just stopped.
+   * alerts, the poison-history breaker and the "[inference-failed]" marker,
+   * and errorPolicy would relaunch the very inference someone just stopped.
    *
    * Only called while `agent` still owns stream `myStreamId`.
    */
@@ -8990,7 +8992,7 @@ export class AgentFramework {
       error: 'Stream cancelled',
     }, closes, stream);
     // Distinct trace type: emitTrace funnels every inference:exhausted into
-    // noteInferenceExhausted (streak, failures.log, marker); inference:aborted
+    // noteInferenceExhausted (streak, failures.log); inference:aborted
     // carries the honest cause without any of that.
     this.emitTrace({
       type: 'inference:aborted',
@@ -13399,7 +13401,6 @@ export class AgentFramework {
     // (endStatedWaitRun).
     this.turnRearms.delete(name);
     this.rearmDeadlineCuts.delete(name);
-    this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
     this.endStatedWaitRun(name);
     if (name === this.subconsciousAgentName) {
@@ -27658,6 +27659,7 @@ export class AgentFramework {
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
     } catch (error) {
+      this.failedLastTurnAt.set(agent, Date.now());
       // A throw outside the stream's own failure handling (the checkpoint,
       // locus resolution, the typing indicator) drops this start's trigger,
       // and nothing retries or holds it. The agent's open logical turn is the
@@ -28437,6 +28439,7 @@ export class AgentFramework {
       this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
+    this.failedLastTurnAt.delete(agent);
 
     // Typing indicator, started at TURN START. It says "attending", which is
     // true from the moment the turn is accepted — but it used to start inside
@@ -28839,7 +28842,6 @@ export class AgentFramework {
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
           cause: err,
         }, routing);
-        if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -30792,7 +30794,6 @@ export class AgentFramework {
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
                 cause: err,
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -30838,11 +30839,7 @@ export class AgentFramework {
             // the host's Stop button, an admin abort, a subagent reclaim.
             // That is a DELIBERATE cancellation, not a failure, and it must
             // not feed the consecutive-failure streak, ops alerts, or the
-            // "[inference-failed] the model call failed" marker — all of
-            // which told the agent, in the user's voice, that its turn
-            // failed and advised remediation for a failure that never
-            // happened. For a long-lived resident whose transcript is
-            // memory, those accumulate as false self-knowledge.
+            // [inference-failed] note.
             //
             // What 'user' does NOT say is WHO cancelled: the wire reason
             // names the call, not the actor. Framework-owned cancels record
@@ -31196,7 +31193,6 @@ export class AgentFramework {
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
         cause: err,
       }, streamRouting);
-      if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
@@ -35575,10 +35571,10 @@ export class AgentFramework {
    *
    *   1. stderr  — always, with the underlying API reason. The place an
    *      operator greps; previously empty in headless mode.
-   *   2. chronicle marker — a `[inference-failed]` message so the agent itself
-   *      learns its turn failed and why (otherwise it's an experiential blank,
-   *      indistinguishable from "not addressed"). addMessage does NOT request
-   *      inference, so this never causes a retry/wake loop.
+   *   2. chronicle marker — for a turn that got partway, a `[inference-failed]`
+   *      message so the agent itself learns its turn failed and why.
+   *      addMessage does NOT request inference, so this never causes a
+   *      retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
    *   4. breaker — when a failure at or past the hard-down threshold suggests
@@ -35982,7 +35978,6 @@ export class AgentFramework {
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
-    const rearmed = this.exhaustingRearms?.delete(agentName) === true;
     const madeAgain = this.freshCallsCut?.delete(agentName) === true;
     // The reason is the failure's own message, and a provider can echo the
     // whole rejected request in it: one household's [inference-failed]
@@ -36021,6 +36016,8 @@ export class AgentFramework {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
+    const agent = this.agents.get(agentName);
+    if (agent) this.failedLastTurnAt.set(agent, Date.now());
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     const labels = [
@@ -36053,8 +36050,7 @@ export class AgentFramework {
     }
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
-    const agent = this.agents.get(agentName);
-    if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+    if (agent && ended && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
@@ -36069,18 +36065,14 @@ export class AgentFramework {
           [{
             type: 'text',
             text:
-              (ended
-                ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
-                  `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
-                  `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
-                  `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
-                  `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
-                  `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
-                  `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}`
-                : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
-                  `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
-                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''}`) +
-              `${shown} ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
+              `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
+              `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
+              `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
+              `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
+              `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
+              `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
+              `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}` +
+              `${shown}${timedOut ? ` ${TIMEOUT_ADVICE}` : ''}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
