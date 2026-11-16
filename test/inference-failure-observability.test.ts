@@ -14,6 +14,7 @@ function makeHarness() {
   fw.exhaustionRewinds = new Map<string, number>();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map<string, object>(); // upstream last-inference tracking; noteInferenceExhausted writes it
+  fw.failedLastTurnAt = new WeakMap();
   fw.exhaustedTurns = new Map<string, object>();
   fw.pendingRequests = [];
   // opsAlert plumbing (hard-down now routes through it): trace fan-out +

@@ -59,6 +59,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   fw.exhaustionRewinds = new Map<string, number>();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map<string, object>();
+  fw.failedLastTurnAt = new WeakMap();
   fw.pendingRequests = [];
   fw.overBudgetDrainInFlight = new Set<string>();
   fw.overBudgetDrains = new Set();

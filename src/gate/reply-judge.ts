@@ -196,17 +196,18 @@ function inWhile(at: number | undefined, now: number): string {
 }
 
 /**
- * What waiting would leave the agent with: what wakes it anyway, soonest
- * first, or that nothing the host knows of is scheduled. A server's own
- * timers (a heartbeat, a reminder) are listed only where the host was told
- * of them, so the empty case says so.
+ * What waiting would leave the agent with: whether its last turn failed, and
+ * what wakes it anyway, soonest first, or that nothing the host knows of is
+ * scheduled. A server's own timers (a heartbeat, a reminder) are listed only
+ * where the host was told of them, so the empty case says so.
  */
-export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number): string {
+export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now: number, failed?: FailedLastTurn): string {
   const sorted = [...wakes].sort((a, b) => (a.at ?? now) - (b.at ?? now));
   const lines = sorted.slice(0, 8).map((w) => `- ${inWhile(w.at, now)}${w.certain ? '' : ', maybe'}: ${w.what}`);
   const more = sorted.length > 8 ? [`- and ${sorted.length - 8} more`] : [];
   return [
     '<if_you_wait>',
+    ...(failed ? [`${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`] : []),
     ...(lines.length > 0
       ? [`If you answer WAIT and nothing new arrives, ${agentName} is next woken by:`, ...lines, ...more]
       : [`Nothing the host knows of is scheduled to wake ${agentName}: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).`]),
@@ -262,6 +263,7 @@ export function judgeSystemPrompt(agentName: string): string {
 /** The closing message: the batch, the agent's instructions, the question. */
 export function judgeQuestion(
   request: Pick<JudgeRequest, 'events' | 'instructions' | 'upcomingWakes'>, agentName: string, now: number, maxEventChars = Infinity,
+  failed?: FailedLastTurn,
 ): string {
   // Newest first into the listing's share, shown oldest first; the rest are
   // counted, so a long held batch can't crowd out the context.
@@ -285,7 +287,7 @@ export function judgeQuestion(
     ...lines,
     '</new_events>',
   ];
-  parts.push('', ifYouWait(request.upcomingWakes ?? [], agentName, now));
+  parts.push('', ifYouWait(request.upcomingWakes ?? [], agentName, now, failed));
   if (request.instructions && request.instructions.trim()) {
     parts.push('', `<instructions_from_${agentName.replace(/[^A-Za-z0-9_-]/g, '_')}>`, request.instructions.trim(), '</instructions_from_' + agentName.replace(/[^A-Za-z0-9_-]/g, '_') + '>');
   }
@@ -303,6 +305,7 @@ export class ReplyJudge {
   private readonly preview: ReplyJudgeDeps['preview'];
   private readonly recordUsage: ReplyJudgeDeps['recordUsage'];
   private readonly extraWakes: ReplyJudgeDeps['upcomingWakes'];
+  private readonly failedLastTurn: ReplyJudgeDeps['failedLastTurn'];
   /** Characters per token, corrected from each response's reported input. */
   private charsPerToken = INITIAL_CHARS_PER_TOKEN;
   private readonly anchors = new Map<string, Anchor>();
@@ -330,6 +333,7 @@ export class ReplyJudge {
     this.preview = deps.preview;
     this.recordUsage = deps.recordUsage;
     this.extraWakes = deps.upcomingWakes;
+    this.failedLastTurn = deps.failedLastTurn;
   }
 
   /** The gate's judge function. */
@@ -358,10 +362,16 @@ export class ReplyJudge {
       extra = [];
     }
     const upcoming = [...(request.upcomingWakes ?? []), ...extra];
+    let failed: FailedLastTurn | undefined;
+    try {
+      failed = this.failedLastTurn?.(agentName);
+    } catch {
+      failed = undefined;
+    }
 
     const system = judgeSystemPrompt(agentName);
     const question = judgeQuestion(
-      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken),
+      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken), failed,
     );
     const fixedChars = system.length + question.length;
 

@@ -4451,6 +4451,7 @@ export class AgentFramework {
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
+  private failedLastTurnAt = new WeakMap<Agent, number>();
   private processLoggingPersist: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
@@ -5688,6 +5689,7 @@ export class AgentFramework {
         // timers: a wake already queued for it, and a turn a provider cooldown
         // holds until it ends.
         upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
+        failedLastTurn: (agentName) => framework.failedLastTurnFor(agentName),
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
@@ -6872,6 +6874,11 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new MaintenanceWithdrawnError(`provider admission closed while stopping (${agentName})`);
     }
+  }
+  private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
+    const agent = this.agents.get(agentName);
+    const at = agent && this.failedLastTurnAt.get(agent);
+    return at === undefined ? undefined : { at };
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
@@ -27579,6 +27586,7 @@ export class AgentFramework {
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
     } catch (error) {
+      this.failedLastTurnAt.set(agent, Date.now());
       // A throw outside the stream's own failure handling (the checkpoint,
       // locus resolution, the typing indicator) drops this start's trigger,
       // and nothing retries or holds it. The agent's open logical turn is the
@@ -28358,6 +28366,7 @@ export class AgentFramework {
       this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
+    this.failedLastTurnAt.delete(agent);
 
     // Typing indicator, started at TURN START. It says "attending", which is
     // true from the moment the turn is accepted — but it used to start inside
@@ -35934,6 +35943,8 @@ export class AgentFramework {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
+    const agent = this.agents.get(agentName);
+    if (agent) this.failedLastTurnAt.set(agent, Date.now());
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     const labels = [
@@ -35953,7 +35964,6 @@ export class AgentFramework {
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
-    const agent = this.agents.get(agentName);
     if (agent && ended && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]

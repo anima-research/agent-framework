@@ -18,7 +18,14 @@
     setting)." A timed-out turn's note keeps "If a reply is still owed from
     that turn, you can give it now."
   - The reply judge reads the agent's context, so it no longer sees an
-    `[inference-failed]` note for a turn that did nothing.
+    `[inference-failed]` note for a turn that did nothing. Its request tells
+    it instead: while the agent's last turn has failed and no turn has
+    started since, its `<if_you_wait>` part opens with "`X`'s last turn, `N`
+    ago, failed and may not have answered all of what woke it." That holds
+    whether the turn got partway or not, and for a start that threw before
+    its stream, such as at its turn checkpoint. The framework gives the
+    judge this through `ReplyJudgeDeps.failedLastTurn`, which is new and
+    optional and returns the new `FailedLastTurn` type (`{ at }`).
   - `SUPPRESS_INFERENCE_FAILED_MARKER=1` now leaves out only that note, since
     no other is written.
   - Notes already in a store stay as they are.
