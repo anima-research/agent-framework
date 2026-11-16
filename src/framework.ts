@@ -4816,6 +4816,7 @@ export class AgentFramework {
   /** Structured calls executed in the current logical turn. Unlike the
    * per-stream local this survives framework retries and budget restarts. */
   private logicalTurnToolCalls: WeakMap<Agent, { turnToken: number; count: number }> = new WeakMap();
+  private answeredTurns = new WeakMap<Agent, TurnRouting>();
   private nextTurnToken = 1;
 
   // Undo/redo state
@@ -15542,7 +15543,7 @@ export class AgentFramework {
         channelId: params.channelId ?? '',
       });
       this.refusalRewinds.set(agentName, 0);
-      this.pendingRequests.push(this.rewindRetry(agentName, 'unstick', this.turnRouting.get(agentName)));
+      this.pendingRequests.push(this.rewindRetry(agentName, 'unstick', this.answeredTurns.get(agent) ?? this.turnRouting.get(agentName)));
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -28266,6 +28267,7 @@ export class AgentFramework {
       noteTurnChannel(routing, routing.triggerChannel);
       if (routing.triggerChannel && this.usedEphemeralAgentNames.get(agent.name) !== 'run') {
         routing.answers = { channel: routing.triggerChannel, ...(trigger?.answersMessageId ? { messageId: trigger.answersMessageId } : {}) };
+        this.answeredTurns.set(agent, routing);
       }
       const unresolvedTrigger = !!trigger?.channelId && routing.triggerChannel === undefined;
       if (unresolvedTrigger) routing.noChannel = true;
