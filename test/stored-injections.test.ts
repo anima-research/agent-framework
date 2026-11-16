@@ -62,7 +62,6 @@ type Internals = {
   planInjectionStores(agent: Agent, injections: ContextInjection[] | undefined): { rows: unknown[]; leftAt: number[] } | undefined;
   quiesced: boolean;
   activeTurnTokens: Map<string, unknown>;
-  isNewestIn(agent: Agent, entry: { eventType: string; serverId?: string; channelId?: string; messageId?: string }): boolean;
   shedNewestTurn(agent: Agent): { removedIds: string[] } | null;
   isUnreadStoredMessage(agent: Agent, messageId: string): boolean;
   pendingRequests: Array<Record<string, unknown>>;
@@ -664,18 +663,6 @@ test("a row whose mark isn't whole is no stored injection: every view keeps it",
   assert.ok(compiled.messages.map(textOf).includes('PARTIAL'));
 });
 
-test('a channel message followed only by a stored injection is still the newest entry, so its wake needs no line of its own', async () => {
-  const x = await make();
-  const agent = x.framework.getAgent('prime')!;
-  const cm = agent.getContextManager();
-  cm.addMessage('user', [text('hi there')], { serverId: 'srv', channelId: 'c1', messageId: 'm1' } as never);
-  const entry = { eventType: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'c1', messageId: 'm1' };
-  internals(x.framework).storeInjections(agent, [injection('A', 'x'), injection('B', 'y')]);
-  assert.equal(internals(x.framework).isNewestIn(agent, entry), true);
-  cm.addMessage('user', [text('later')]);
-  assert.equal(internals(x.framework).isNewestIn(agent, entry), false, 'the premise: an ordinary row after it makes it not the newest');
-});
-
 test("a refusal's rewind sheds the newest exchange, not a stored injection after it", async () => {
   const x = await make();
   const agent = x.framework.getAgent('prime')!;
@@ -886,14 +873,6 @@ test("while another reader of the shared slot has a turn alive, a preview shows 
   } finally {
     internals(x.framework).activeTurnTokens.delete('helper');
   }
-});
-
-test("a channel message followed by another resident's stored injection is still the newest entry", async () => {
-  const x = await make({ agents: ['prime', 'helper'] });
-  const prime = x.framework.getAgent('prime')!;
-  prime.getContextManager().addMessage('user', [text('hi there')], { serverId: 'srv', channelId: 'c1', messageId: 'm1' } as never);
-  internals(x.framework).storeInjections(x.framework.getAgent('helper')!, [injection('HELPER')]);
-  assert.equal(internals(x.framework).isNewestIn(prime, { eventType: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'c1', messageId: 'm1' }), true);
 });
 
 test('where another resident spoke last, a stored injection after that message ends the request, with no [Continue]', async () => {

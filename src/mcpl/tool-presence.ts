@@ -27,6 +27,7 @@
  */
 import { objectSignature, renderToolLines, toolDigest, type HintedTool, type Shown } from './tool-signature.js';
 import { nameToTypeBack, quotedValue, suppliedValue } from '../supplied-text.js';
+import { appendAll } from '../append-all.js';
 
 export interface ToolsetDecl {
   title?: string;
@@ -632,7 +633,7 @@ export class ToolPresence {
         continue;
       }
       const title = (c.opened || c.retitled) && !bare ? c.title : undefined;
-      if (showsBlock(c)) lines.push(...this.toolBlock(c.key, c.now, { headed: !bare, title, seen, describeAll: opts.describeAll }));
+      if (showsBlock(c)) appendAll(lines, this.toolBlock(c.key, c.now, { headed: !bare, title, seen, describeAll: opts.describeAll }));
       else if (title) lines.push(`${this.label(c.key)} ${suppliedValue(title)}`);
       if (c.gone.length) lines.push(`now unavailable: ${c.gone.map(suppliedValue).join(', ')}`);
       if (c.opened && !bare) {
@@ -641,7 +642,8 @@ export class ToolPresence {
       }
     }
     for (const s of cs.suggest) lines.push(this.renderSuggestion(s));
-    lines.push(...this.untoldNotes(cs), ...cs.notes);
+    appendAll(lines, this.untoldNotes(cs));
+    appendAll(lines, cs.notes);
     return lines.join('\n');
   }
 
@@ -663,7 +665,7 @@ export class ToolPresence {
     if (!v.size) return null;
     const lines: string[] = [];
     for (const [key, e] of v) {
-      lines.push(...this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title }));
+      appendAll(lines, this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title }));
       const close = this.closeHint(key);
       if (close) lines.push(`  ${close} closes it.`);
     }
@@ -679,7 +681,7 @@ export class ToolPresence {
     const v = this.view();
     if (v.size) {
       for (const [key, e] of v) {
-        lines.push(...this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title, seen: opts.mark === false ? new Set<string>() : undefined }).map((l) => `  ${l}`));
+        appendAll(lines, this.toolBlock(key, [...e.tools.values()], { describeAll: true, title: e.title, seen: opts.mark === false ? new Set<string>() : undefined }).map((l) => `  ${l}`));
         const close = this.closeHint(key);
         if (close) lines.push(`    ${close} closes it.`);
       }
@@ -700,7 +702,10 @@ export class ToolPresence {
       const names = this.allTools.filter((t) => this.toolsetOf(t.name) === g).map((t) => t.name);
       openable.push(`  ${nameToTypeBack(g)}: ${names.map(nameToTypeBack).join(', ')}`);
     }
-    if (openable.length) lines.push(`can open — ${this.names.open} {server:"${this.server}", toolset, instance?, options?}:`, ...openable);
+    if (openable.length) {
+      lines.push(`can open — ${this.names.open} {server:"${this.server}", toolset, instance?, options?}:`);
+      appendAll(lines, openable);
+    }
     return lines.join('\n');
   }
 

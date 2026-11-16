@@ -191,18 +191,23 @@ export interface FrameworkConfig {
    * (architecture channel, 2026-10-06: the §3 carve-out accepted by the
    * residents).
    *
-   * - `'delivery'` (default): the locus comes only from the delivery that
-   *   woke the turn, a conversation fork's home channel, or a channel the
-   *   agent opened during the turn. Incoming traffic never moves it — not
-   *   between turns, not mid-turn. A turn with no such locus keeps its
-   *   prose private, and says so in a `[routing]` notice.
+   * - `'delivery'` (default): the locus comes from the delivery that woke
+   *   the turn, a conversation fork's home channel, or a channel the agent
+   *   opened during the turn, and past those only from an open all-except
+   *   hold's channel or `unpromptedChannel` (below), each for the turns that
+   *   take it. Incoming traffic never moves it — not between turns, not
+   *   mid-turn. A turn with no such locus keeps its prose private, and says
+   *   so in a `[routing]` notice.
    * - `'latest-inbound'`: the previous rule. The most recent delivered
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
    *
-   * Held traffic never moves the locus under either rule. Neither rule
-   * applies to an agent under locked prose routing (AgentConfig.proseRouting
-   * 'locked'): its turns speak at its lock, whatever arrives.
+   * Held traffic never moves the locus under either rule. Under either, a
+   * turn the agent's own timer starts takes `unpromptedChannel` where it's
+   * set, after an all-except hold's channel and before both rules' own
+   * fallbacks. Neither rule applies to an agent under locked prose routing
+   * (AgentConfig.proseRouting 'locked'): its turns speak at its lock,
+   * whatever arrives.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';
@@ -502,6 +507,35 @@ export interface FrameworkConfig {
    */
   inferenceRouting?: InferenceRoutingPolicy;
 
+  /**
+   * The channel for a turn the agent's own timer starts, which no message
+   * prompted: the wake `skip_reply` schedules, or the end of a `sleep`. Plain
+   * speech in locus or hybrid prose routing goes there, and so does
+   * `channel_publish` naming no channel in any prose routing mode but locked,
+   * which servers are told as the turn's default outgoing channel. An
+   * all-except hold's channel still comes first while one is open, and without
+   * the setting such a turn follows `speech.locus`. A turn the framework opens
+   * to continue such a turn that had no locus of its own, as in explicit or
+   * disabled routing, takes it too: a `!` continuation, autoContinue's next
+   * turn, or a bounced reply's wake. No other turn takes it: not one a message
+   * prompted, from a channel, a module, a person at a console or another agent;
+   * not a heartbeat's or a reminder's (its plain speech is held as drafts); not
+   * a conversation fork's or an ephemeral run's; not a locked agent's, which
+   * speaks at its lock or holds its speech as drafts; and not a start merged
+   * from a timer's wake and any other cause. One value, for every agent on the
+   * framework. A registered channel's id, e.g. `discord:{guildId}:{channelId}`,
+   * or, to pick one server's where two register that id,
+   * `{serverId}:{channelId}`. `create()` refuses a value that is neither a
+   * string nor null, or is blank; null reads as not set. A value that names no
+   * registered channel, several, or one its server declared inbound-only, when
+   * a turn would take it, is logged, and logged again only after a turn has
+   * used it since; the turn takes what it would without the setting.
+   * `channel_publish`'s description adds a default for such turns only on a
+   * framework with an event gate, the only one with such turns; on any other
+   * the description is as it is without the setting.
+   */
+  unpromptedChannel?: string | null;
+
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;
   /**
@@ -636,7 +670,21 @@ export interface ErrorPolicy {
  * Action to take after an error.
  */
 export type ErrorAction =
-  | { retry: true; delayMs: number }
+  | {
+      retry: true;
+      delayMs: number;
+      /** What the policy retries the failure as, such as `overloaded` or
+       *  `rate_limited` (DefaultErrorPolicy says membrane's class). Shown,
+       *  not acted on: the wait reports it in `healthSnapshot()` and on
+       *  `inference:waiting`, a longer one than 128 characters as its start
+       *  and end around a note of how much was left out. A policy that leaves
+       *  it out is shown without it. */
+      retryClass?: string;
+      /** The most tries that class allows the turn, counted as the wait's
+       *  `nextTry` counts them, the first included, and shown beside it when
+       *  it is a positive whole number. Left out for no bound. */
+      maxTries?: number;
+    }
   | { retry: false; emit?: ProcessEvent };
 
 /**
@@ -677,6 +725,8 @@ export interface InferenceLogEntry {
   success: boolean;
   /** Why it didn't succeed: the failure's message, or what stopped it */
   error?: string;
+  /** `error` in the framework's words, with no provider's text: what an agent may be shown of it */
+  errorWords?: string;
   /** Request data or blob ID if large. A stream the framework ended at a
    *  tool boundary (stopReason 'turn_ended', 'context_budget' or
    *  'physical_window') records a note in place of the body. */

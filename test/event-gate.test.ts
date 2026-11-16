@@ -2,8 +2,13 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { EventGate, wakeLineText } from '../src/gate/event-gate.js';
-import type { GateConfig, GateEntryRef, GateEventInfo, WakeLine } from '../src/gate/types.js';
+import * as gateModule from '../src/gate/event-gate.js';
+import { EventGate, wakeProvenance, type WakeWrite, type WritePlacement } from '../src/gate/event-gate.js';
+
+/** The gate's internal mark of the rows a batched wake's line can name, read
+ *  loosely so this file still runs, red, against a gate without it. */
+const BATCH_LINE_ROWS: symbol = (gateModule as unknown as { BATCH_LINE_ROWS?: symbol }).BATCH_LINE_ROWS ?? Symbol('no line rows');
+import type { GateConfig, GateEventInfo } from '../src/gate/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -30,24 +35,26 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: {
   initialConfig?: GateConfig;
   resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
-  channelShown?: (channel: { serverId: string; channelId: string }) => string;
   privilegedUsersPath?: string;
-  isNewestEntry?: (entry: GateEntryRef) => boolean;
+  isAnswered?: (after: WritePlacement) => boolean;
   agentNames?: string[];
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; line?: WakeLine }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; batchChannels?: Array<{ channelId: string; serverId?: string }>; writes?: WakeWrite[] }> = [];
 
   const gate = new EventGate({
     configPath,
     initialConfig: opts?.initialConfig,
     ...(opts?.resolveRouteChannel ? { resolveRouteChannel: opts.resolveRouteChannel } : {}),
-    ...(opts?.channelShown ? { channelShown: opts.channelShown } : {}),
     ...(opts?.privilegedUsersPath ? { privilegedUsersPath: opts.privilegedUsersPath } : {}),
-    ...(opts?.isNewestEntry ? { isNewestEntry: opts.isNewestEntry } : {}),
+    ...(opts?.isAnswered ? { isAnswered: opts.isAnswered } : {}),
     emitTrace: (e) => traces.push(e as TraceEntry),
-    addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
+    addMessage: (p, c, m, _forAgent, placement) => {
+      messages.push({ participant: p, content: c, metadata: m });
+      if (placement) Object.assign(placement, { agent: 'agent', messageId: `line-${messages.length}` });
+      return '';
+    },
     requestInference: (a, r, s, p) => inferenceRequests.push({ agentName: a, reason: r, source: s, ...(p ?? {}) }),
     getAgentNames: () => opts?.agentNames ?? ['agent'],
   });
@@ -63,6 +70,16 @@ function event(overrides?: Partial<GateEventInfo>): GateEventInfo {
     channelId: '',
     ...overrides,
   };
+}
+
+function arriving(at: number, evaluate: () => void): void {
+  const realNow = Date.now;
+  Date.now = () => at;
+  try {
+    evaluate();
+  } finally {
+    Date.now = realNow;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,104 +386,14 @@ describe('debounce', () => {
     gate.evaluate(event({ content: 'edit 3' }));
 
     // Should not have delivered yet
-    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(inferenceRequests.length, 0);
 
     // Wait for debounce to fire
     t.mock.timers.tick(200);
 
-    assert.strictEqual(messages.length, 1);
-    const text = (messages[0].content as Array<{ text: string }>)[0].text;
-    assert.ok(text.includes('3 event'));
-    // MCPL events (push-event / channel-incoming) are stored in the context
-    // window AT ARRIVAL by the framework, so the batched wake references them
-    // instead of re-quoting — a re-quote minutes later reads as fresh, stale
-    // duplicate input (observed live: Sol's "step was a bit too small" echo).
-    assert.ok(text.includes('already shown above'));
-    assert.ok(!text.includes('edit 1'), 'must not re-quote in-context event content');
+    assert.strictEqual(messages.length, 0, 'events stored at arrival get no line');
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].agentName, 'agent');
-  });
-
-  it('a batched wake names a channel whose channelName already starts with # with one #', () => {
-    // #406: a channel's name may carry its own `#`; the line adds one only
-    // where the name lacks it, as the other places that add a `#` do.
-    const path = writeConfig('debounce-hash-name.json', {
-      policies: [
-        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
-      ],
-      default: 'skip',
-    });
-    const { gate, messages } = makeGate(path);
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'zulip', channelId: 'zulip:design', content: 'a',
-      metadata: { channelName: '#design' } }));
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:portables', content: 'b',
-      metadata: { channelName: 'portables' } }));
-    // Fire the batch now rather than after a delay, so the verdict doesn't
-    // depend on how loaded the machine is.
-    const batch = gate as unknown as {
-      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
-      fireDebounce(policyName: string): void;
-    };
-    clearTimeout(batch.debounceTimers.get('chat')!.timer);
-    batch.fireDebounce('chat');
-
-    assert.strictEqual(messages.length, 1);
-    const text = (messages[0].content as Array<{ text: string }>)[0].text;
-    assert.match(text, /1 message in #design \(zulip:design\)/);
-    assert.match(text, /1 message in #portables \(discord:g:portables\)/);
-    assert.doesNotMatch(text, /##/);
-  });
-
-  it("a batched wake names two servers' channels with one id apart, each with its own count", () => {
-    // Channel ids are unique only within one server's connection.
-    const path = writeConfig('debounce-shared-id.json', {
-      policies: [
-        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
-      ],
-      default: 'skip',
-    });
-    const { gate, messages } = makeGate(path, { channelShown: (c) => `${c.serverId}:${c.channelId}` });
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'a', channelId: 'general', content: 'one',
-      metadata: { channelName: 'general' } }));
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'b', channelId: 'general', content: 'two',
-      metadata: { channelName: 'general' } }));
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'b', channelId: 'general', content: 'three',
-      metadata: { channelName: 'general' } }));
-    const batch = gate as unknown as {
-      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
-      fireDebounce(policyName: string): void;
-    };
-    clearTimeout(batch.debounceTimers.get('chat')!.timer);
-    batch.fireDebounce('chat');
-
-    const text = (messages[0]!.content as Array<{ text: string }>)[0]!.text;
-    assert.match(text, /- 1 message in #general \(a:general\)/);
-    assert.match(text, /- 2 messages in #general \(b:general\)/);
-  });
-
-  it("a batched wake shows a push event's adapter id as it is, and only a registered channel as the registry names it", () => {
-    const path = writeConfig('debounce-raw-id.json', {
-      policies: [
-        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
-      ],
-      default: 'skip',
-    });
-    const { gate, messages } = makeGate(path, { channelShown: (c) => `shown ${c.serverId} ${c.channelId}` });
-    // A push event carries the adapter's raw id, which no route maps to a
-    // registered channel here; a channel message names its registered one.
-    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm' }));
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi' }));
-    const batch = gate as unknown as {
-      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
-      fireDebounce(policyName: string): void;
-    };
-    clearTimeout(batch.debounceTimers.get('chat')!.timer);
-    batch.fireDebounce('chat');
-
-    const text = (messages[0]!.content as Array<{ text: string }>)[0]!.text;
-    assert.match(text, /- 1 message in 1548\b/);
-    assert.match(text, /- 1 message in shown discord discord:g:room\b/);
-    assert.doesNotMatch(text, /shown discord 1548/, "an adapter's raw id isn't named as a registered channel");
   });
 
   it('a quoted event\'s content is cut where no surrogate pair is halved', (t) => {
@@ -568,7 +495,7 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].addressed, true);
   });
 
-  it('an addressed batch names its registered route channel; ambient-only batches name none', async (t) => {
+  it('an addressed batch names its registered route channel; an ambient batch names none, and names the channel it came from', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route.json', {
       policies: [
@@ -579,7 +506,7 @@ describe('debounce', () => {
     // The host maps a push origin to its registered composite id.
     const resolveRouteChannel = (info: GateEventInfo) =>
       info.eventType === 'mcpl:push-event' ? `discord:dm:${String(info.metadata?.channelId)}` : info.channelId;
-    const { gate, inferenceRequests, messages } = makeGate(path, { resolveRouteChannel });
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
 
     // DM (addressed, raw id) then newer ambient chatter elsewhere.
     gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm',
@@ -592,11 +519,9 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].routeServerId, 'discord', "and the route's server, since ids are unique only per server");
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42', 'route and author come from the same event');
     assert.strictEqual(inferenceRequests[0].channelId, undefined, 'telemetry channel unchanged for push events');
-    // The batched-wake line names the registered id, not the raw snowflake.
-    const text = JSON.stringify(messages.at(-1)?.content);
-    assert.ok(text.includes('discord:dm:1548'), 'gate line shows the registered channel id');
 
-    // Ambient-only batch: telemetry provenance, no route.
+    // Ambient-only batch: telemetry provenance, no route, and the channel it
+    // came from, for the notice its reply gets.
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'x',
       metadata: { authorId: '8' } }));
     t.mock.timers.tick(150);
@@ -604,6 +529,8 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
     assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, 'ambient chatter never sets a route');
     assert.strictEqual(inferenceRequests[1].routeServerId, undefined, 'nor its server');
+    assert.deepStrictEqual(inferenceRequests[1].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }],
+      'it names the channel it came from');
   });
 
   it('the default resolver routes an addressed channel-incoming event; a push event needs the host resolver', async (t) => {
@@ -686,7 +613,148 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].channelId, 'surface:room:general', 'telemetry keeps the attributable event');
     assert.strictEqual(inferenceRequests[0].counterparty, 'surface:user:7');
-    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'ambient batches never route');
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'an ambient batch from two channels has no route');
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [
+      { channelId: 'surface:room:general', serverId: 'surface' },
+      { channelId: 'surface:room:feed', serverId: 'surface' },
+    ], 'and names both channels, for the notice its reply gets');
+  });
+
+  it('a batch with an addressed event names no channels, even when that event names none', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-addressed-nowhere.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : info.channelId || undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'surface', channelId: 'surface:room:general',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'for you', tags: ['chat:addressed'] }));
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, "the addressed message's reply isn't sent into the chatter's channel");
+    assert.strictEqual(inferenceRequests[0].batchChannels, undefined, "nor is it told the chatter's channel was where it came from");
+  });
+
+  it('an addressed chat:system notice takes no part in its batch\'s provenance, but for its author when nothing else names one', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-route-dm-notice.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: (info) => info.channelId || undefined });
+    const pin = () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:dm:5',
+      content: '[pinned a message]', tags: ['chat:dm', 'chat:addressed', 'chat:system'], metadata: { authorId: '5' } }));
+    arriving(100, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: '@agent hi', tags: ['chat:mention', 'chat:addressed'], metadata: { authorId: '1' } })));
+    arriving(200, pin);
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:g:room', "the mention's channel: a pin in a DM is still a notice");
+    assert.strictEqual(inferenceRequests[0].addressed, true, 'addressed by the mention');
+    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:room');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:1');
+    assert.strictEqual(inferenceRequests[0].at, 100, "the mention's arrival, not the newer pin's");
+
+    arriving(400, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'chatter', metadata: { authorId: '7' } })));
+    arriving(500, pin);
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 2);
+    assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, "an addressed notice takes no route, and makes no batch addressed");
+    assert.strictEqual(inferenceRequests[1].addressed, undefined);
+    assert.deepStrictEqual(inferenceRequests[1].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }]);
+    assert.strictEqual(inferenceRequests[1].at, 400, "the chatter's arrival, not the newer pin's");
+    assert.strictEqual(inferenceRequests[1].counterparty, 'discord:user:7', "the chatter's author, not the pin's");
+    assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
+
+    arriving(1_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'pat joined', tags: ['chat:system'], metadata: { authorId: '6' } })));
+    arriving(2_000, pin);
+    arriving(3_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'the weather turned', tags: ['chat:system'] })));
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 3);
+    const alone = inferenceRequests[2];
+    assert.deepStrictEqual(
+      [alone.channelId, alone.routeChannelId, alone.addressed, alone.batchChannels, alone.counterparty, alone.at],
+      [undefined, undefined, undefined, undefined, 'discord:user:5', 2_000],
+      "notices alone give the newest author among them, and that notice's arrival time, and nothing else",
+    );
+  });
+
+  it("a push the host can't place is passed over when a batch names its channels", async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-route-unplaced.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      info.eventType === 'mcpl:channel-incoming' ? info.channelId || undefined : undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'status',
+      metadata: { channelId: '1548' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    const batch = (gate as unknown as { debounceTimers: Map<string, { events: unknown[] }> }).debounceTimers.get('chat');
+    assert.strictEqual(batch?.events.length, 2, 'premise: the push is in the batch');
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }]);
+  });
+
+  it("a batch of notices alone gives its newest authored notice's author and time", () => {
+    const notice = (timestamp: number, authorId?: string) => ({ policyName: 'chat', content: 'x', eventType: 'mcpl:channel-incoming',
+      timestamp, addressed: false, systemNotice: true, serverId: 'discord', channelId: 'discord:g:room', routeChannelId: 'discord:g:room',
+      ...(authorId ? { authorId } : {}) });
+    const provenance = wakeProvenance([notice(10, '5'), notice(20)] as Parameters<typeof wakeProvenance>[0]);
+    assert.deepStrictEqual(provenance, { counterparty: 'discord:user:5', at: 10 });
+  });
+
+  it("a batch lists a channel once with its server and once without, since only the host can tell they're one", async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-server-and-none.json', {
+      policies: [{ name: 'push', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } }],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: () => 'discord:g:room' });
+    for (const serverId of ['discord', '', 'discord', '']) {
+      gate.evaluate(event({ eventType: 'mcpl:push-event', serverId, content: 'status' }));
+    }
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }, { channelId: 'discord:g:room' }]);
+  });
+
+  it('an ambient batch of pushes that name only their registered channel names that channel', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-route-only-pushes.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    for (const content of ['status ping', 'status pong']) {
+      gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content, metadata: { mcplChannelId: 'surface:room:feed' } }));
+    }
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'surface:room:feed', serverId: 'surface' }]);
+    assert.strictEqual(inferenceRequests[0].counterparty, undefined, 'no author to name');
+    assert.strictEqual(inferenceRequests[0].at, undefined, 'no chosen event, so no time');
   });
 
   it('a throwing route resolver never breaks gating', async (t) => {
@@ -749,7 +817,7 @@ describe('debounce', () => {
       ],
       default: 'skip',
     });
-    const { gate, messages } = makeGate(path);
+    const { gate, inferenceRequests } = makeGate(path);
 
     gate.evaluate(event({ content: 'edit 1' }));
     t.mock.timers.tick(80);
@@ -757,11 +825,11 @@ describe('debounce', () => {
     gate.evaluate(event({ content: 'edit 2' }));
     t.mock.timers.tick(80);
     // Still within debounce window of second event
-    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(inferenceRequests.length, 0);
 
     t.mock.timers.tick(100);
     // Now it should have fired
-    assert.strictEqual(messages.length, 1);
+    assert.strictEqual(inferenceRequests.length, 1);
   });
 });
 
@@ -820,18 +888,18 @@ describe('inference buffering', () => {
     const { gate, messages } = makeGate(path);
     gate.onInferenceStarted('agent');
 
-    const flood = (batches: number) => {
-      for (let batch = 0; batch < batches; batch++) {
+    const flood = (first: number, batches: number) => {
+      for (let batch = first; batch < first + batches; batch++) {
         for (let i = 0; i < 20; i++) {
-          gate.evaluate(event({ content: `batch${batch}-msg${i}` }));
+          gate.evaluate(event({ eventType: 'module:custom', content: `batch${batch}-msg${i}` }));
         }
         t.mock.timers.tick(1_000);
       }
     };
-    flood(6);
+    flood(0, 6);
     const afterSix = gate.inferenceDiagnostics().bufferedEvents;
     assert.ok(afterSix > 0, 'Expected buffer to have events');
-    flood(6);
+    flood(6, 6);
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, afterSix, 'the backlog stops growing');
 
     // End inference → flush
@@ -839,9 +907,10 @@ describe('inference buffering', () => {
     await new Promise((r) => setImmediate(r));
 
     assert.strictEqual(messages.length, 1);
-    const keptFromSecond = Math.floor((12 * 20 - afterSix) / 20);
     const text = (messages[0]!.content as Array<{ text: string }>)[0]!.text;
-    assert.ok(text.includes(`(oldest ~${12 - keptFromSecond}s ago)`), `the oldest events are the ones dropped: ${text}`);
+    const quoted = text.split('\n').filter((row) => row.startsWith('- [')).map((row) => row.slice(row.lastIndexOf(': ') + 2));
+    const sent = Array.from({ length: 12 * 20 }, (_, n) => `batch${Math.floor(n / 20)}-msg${n % 20}`);
+    assert.deepStrictEqual(quoted, sent.slice(-afterSix), 'the line quotes the newest events the backlog kept: the oldest are the ones dropped');
     gate.dispose();
   });
 
@@ -853,7 +922,7 @@ describe('inference buffering', () => {
       ],
       default: 'skip',
     });
-    const { gate, messages } = makeGate(path);
+    const { gate, inferenceRequests } = makeGate(path);
 
     gate.evaluate(event({ content: 'msg 1' }));
     gate.evaluate(event({ content: 'msg 2' }));
@@ -865,7 +934,7 @@ describe('inference buffering', () => {
     t.mock.timers.tick(200);
 
     // Should be buffered, not delivered (inference is active)
-    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(inferenceRequests.length, 0);
 
     // End inference → flush
     gate.onInferenceEnded('agent');
@@ -873,7 +942,7 @@ describe('inference buffering', () => {
     // queueMicrotask defers delivery
     await new Promise((r) => setImmediate(r));
 
-    assert.strictEqual(messages.length, 1);
+    assert.strictEqual(inferenceRequests.length, 1);
   });
 });
 
@@ -1055,13 +1124,13 @@ describe('dispose', () => {
       policies: [{ name: 'debounced', match: {}, behavior: { debounce: 10000 } }],
       default: 'skip',
     });
-    const { gate, messages } = makeGate(path);
+    const { gate, inferenceRequests } = makeGate(path);
     gate.evaluate(event());
     gate.dispose();
     t.mock.timers.tick(10_000);
 
     // No delivery should happen
-    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(inferenceRequests.length, 0);
   });
 });
 
@@ -1191,8 +1260,7 @@ describe('quiesce suppression', () => {
 
     gate.setQuiesced(false);
     await new Promise((r) => setImmediate(r)); // flush is deferred a microtask
-    assert.strictEqual(messages.length, 1, 'buffered events compose one delivery');
-    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests.length, 1, 'buffered events compose one delivery');
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 0);
   });
 
@@ -1204,7 +1272,7 @@ describe('quiesce suppression', () => {
       ],
       default: 'skip',
     });
-    const { gate, messages } = makeGate(path);
+    const { gate, inferenceRequests } = makeGate(path);
 
     gate.setQuiesced(true);
     gate.onInferenceStarted('agent');
@@ -1212,7 +1280,7 @@ describe('quiesce suppression', () => {
     t.mock.timers.tick(250);
     gate.onInferenceEnded('agent'); // drain completes mid-quiesce
     await new Promise((r) => setImmediate(r));
-    assert.strictEqual(messages.length, 0, 'buffer holds until resume, not turn end');
+    assert.strictEqual(inferenceRequests.length, 0, 'buffer holds until resume, not turn end');
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1);
   });
 });
@@ -1288,15 +1356,7 @@ describe('EventGate: channel patterns and channelId keys through the route resol
   });
 });
 
-/**
- * A batched wake's `[Gate: …]` line says which messages a wake is for. For
- * one message still the newest entry in the window the line would go to, it
- * says nothing the message right above doesn't when the batch fires (the
- * framework answers isNewestEntry), so the gate hands the line to the wake
- * instead of writing it, for a fresh start of the wake's turn to decide
- * (WakeLine). Anything else keeps the line now.
- */
-describe('a batched wake writes its line only when it says something', () => {
+describe('a batched wake writes no line for events with a message of their own', () => {
   const fire = (gate: EventGate, policyName: string): void => {
     const batch = gate as unknown as {
       debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
@@ -1306,104 +1366,103 @@ describe('a batched wake writes its line only when it says something', () => {
     batch.fireDebounce(policyName);
   };
   const config = (name: string): string => writeConfig(name, {
-    policies: [{ name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event', 'workspace:file-changed'] }, behavior: { debounce: 60_000 } }],
+    policies: [{ name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event', 'workspace:file-changed', 'clock:reminder'] }, behavior: { debounce: 60_000 } }],
     default: 'skip',
   });
+  const message = (messageId: string, tags: string[] = ['chat:addressed']) => event({ eventType: 'mcpl:channel-incoming', serverId: 'discord',
+    channelId: 'discord:g:room', content: `text of ${messageId}`, metadata: { messageId }, tags });
 
-  it('one batch waking two agents: both wakes carry the same line object, which the framework writes once by its identity', () => {
-    const { gate, inferenceRequests } = makeGate(config('quiet-two-agents.json'), { isNewestEntry: () => true, agentNames: ['scout', 'mira'] });
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi',
-      metadata: { messageId: 'm1' }, tags: ['chat:addressed'] }));
-    fire(gate, 'chat');
-    assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['scout', 'mira']);
-    assert.ok(inferenceRequests[0].line, 'premise: the line is handed on');
-    assert.strictEqual(inferenceRequests[1].line, inferenceRequests[0].line, 'not a copy per agent');
-  });
-
-  it('one channel message, still newest: no line written, the wake runs carrying it, and the framework is asked about that message', async () => {
-    const asked: GateEntryRef[] = [];
-    const { gate, messages, inferenceRequests, traces } = makeGate(config('quiet-one.json'), {
-      isNewestEntry: (entry) => { asked.push(entry); return true; },
-    });
-    const realNow = Date.now;
-    Date.now = () => 1_000_000;
-    try {
-      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi',
-        metadata: { messageId: 'm1', channelName: 'room' }, tags: ['chat:addressed'] }));
-    } finally {
-      Date.now = realNow;
-    }
+  it('messages stored at arrival: no line, and every agent\'s wake carries the same writes, each with the channel a reply is owed in', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('in-window.json'), { agentNames: ['scout', 'mira'] });
+    const addressed = { agent: 'scout', messageId: 'row-1' };
+    const ambient = { agent: 'scout', messageId: 'row-2' };
+    gate.evaluate(message('m1'), addressed);
+    gate.evaluate(message('m2', ['chat:ambient']), ambient);
     fire(gate, 'chat');
     assert.strictEqual(messages.length, 0, 'no [Gate: …] line');
-    assert.strictEqual(inferenceRequests.length, 1, 'the wake runs');
-    assert.deepStrictEqual(asked, [{ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', messageId: 'm1' }]);
-    const line = inferenceRequests[0].line;
-    assert.ok(line, 'the wake carries the line');
-    assert.strictEqual(line.shown, '#room (discord:g:room)', 'the channel as the line names it, its label with its id');
-    assert.strictEqual(line.at, 1_000_000, 'its time is the message\'s arrival, not the fire');
-    assert.match(wakeLineText(line, line.at + 30_000), /^\[Gate: 1 event matched\]\n\n- 1 message in #room \(discord:g:room\) \(oldest ~30s ago\) — already shown above at arrival/);
-    assert.deepStrictEqual(line.entry, asked[0]);
-    assert.deepStrictEqual(line.policyNames, ['chat']);
-    assert.strictEqual(line.channelId, 'discord:g:room');
-    assert.ok(!traces.some((t) => t.type === 'gate:wake-line-omitted'), 'whether it is left out is the turn start\'s to say');
-    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:room', 'its provenance stays');
-    assert.strictEqual(inferenceRequests[0].addressed, true);
-    assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:g:room');
+    assert.deepStrictEqual(inferenceRequests.map((r) => r.agentName), ['scout', 'mira']);
+    const writes = inferenceRequests[0].writes!;
+    assert.strictEqual(inferenceRequests[1].writes, writes, 'one list for every agent');
+    assert.strictEqual(writes.length, 2);
+    assert.strictEqual(writes[0]!.after, addressed, 'the write as the host gave it, which it may fill in later');
+    assert.deepStrictEqual(writes[0]!.replyTo, { serverId: 'discord', channelId: 'discord:g:room' });
+    assert.strictEqual(writes[1]!.after, ambient);
+    assert.strictEqual(writes[1]!.replyTo, undefined, 'an ambient message owes no reply');
   });
 
-  it('one push event, still newest: no line written, the wake carries it, asked by its event id', () => {
-    const asked: GateEntryRef[] = [];
-    const { gate, messages, inferenceRequests } = makeGate(config('quiet-push.json'), {
-      isNewestEntry: (entry) => { asked.push(entry); return true; },
-    });
-    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm',
-      metadata: { eventId: 'ev-1' } }));
+  it('a folded render given a placement takes no write, so it carries no reply evidence', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('folded-render.json'));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: 'discord:g:room', content: 'render',
+      metadata: { eventId: 'ev-1', channelId: 'discord:g:room' }, tags: ['chat:system'], folds: true }), { agent: 'scout', messageId: 'row-1' });
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 0, 'premise: a push counts as in the window, so no line');
+    assert.strictEqual(inferenceRequests.length, 1, 'premise: it woke');
+    assert.strictEqual(inferenceRequests[0].writes, undefined);
+  });
+
+  it('a push event stored at arrival: no line', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('push-in-window.json'));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm', metadata: { eventId: 'ev-1' } }),
+      { agent: 'agent', messageId: 'row-1' });
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(inferenceRequests[0].writes?.length, 1);
+  });
+
+  it('a module event given its write counts as in the window: no line, and its write is carried', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('module-written.json'));
+    const write = { agent: 'agent', messageId: 'row-1' };
+    gate.evaluate(event({ eventType: 'clock:reminder', content: 'water the plants' }), write);
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(inferenceRequests[0].writes?.[0]?.after, write);
+  });
+
+  it('an event with no message of its own keeps a line naming it alone, and the wake reads that line beside the other writes', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('mixed.json'));
+    gate.evaluate(message('m1'), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(event({ eventType: 'workspace:file-changed', content: 'notes.md changed' }));
+    gate.evaluate(message('m2'), { agent: 'agent', messageId: 'row-2' });
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 1);
+    assert.strictEqual((messages[0]!.content as Array<{ text: string }>)[0]!.text,
+      '[Gate: 1 event matched]\n\n- [chat] (workspace:file-changed): notes.md changed');
+    assert.deepStrictEqual(inferenceRequests[0].writes?.map((w) => w.after.messageId), ['line-1', 'row-1', 'row-2']);
+  });
+
+  it('a message the host gave no write: the wake carries no writes, and still no line', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('unwritten.json'));
+    gate.evaluate(message('m1'), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(message('m2'));
     fire(gate, 'chat');
     assert.strictEqual(messages.length, 0);
     assert.strictEqual(inferenceRequests.length, 1);
-    assert.strictEqual(asked[0].eventId, 'ev-1');
-    assert.deepStrictEqual(inferenceRequests[0].line?.entry, asked[0]);
+    assert.strictEqual(inferenceRequests[0].writes, undefined);
   });
 
-  it('one message with something after it: the line stays', () => {
-    const { gate, messages, inferenceRequests } = makeGate(config('quiet-not-newest.json'), { isNewestEntry: () => false });
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
+  it("a placed message beside a push the host gave no write: the wake carries no writes, but its line rows still name the placed message", () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('line-rows-unplaced.json'));
+    const placed = { agent: 'agent', messageId: 'row-1' };
+    gate.evaluate(message('m1'), placed);
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'a coalesced push', metadata: { eventId: 'ev-1' } }));
     fire(gate, 'chat');
-    assert.strictEqual(messages.length, 1);
-    assert.match((messages[0].content as Array<{ text: string }>)[0].text, /already shown above/);
-    assert.strictEqual(inferenceRequests.length, 1);
-    assert.strictEqual(inferenceRequests[0].line, undefined, 'written now, so not handed on');
+    assert.strictEqual(messages.length, 0, 'premise: no line at delivery');
+    assert.strictEqual(inferenceRequests[0]!.writes, undefined, 'premise: nothing to drop the wake by');
+    assert.deepStrictEqual((inferenceRequests[0] as Record<symbol, unknown>)[BATCH_LINE_ROWS], [placed]);
   });
 
-  it('several messages: the line stays, and the framework is not asked', () => {
-    let asked = 0;
-    const { gate, messages } = makeGate(config('quiet-several.json'), { isNewestEntry: () => { asked++; return true; } });
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a', metadata: { messageId: 'm1' } }));
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'b', metadata: { messageId: 'm2' } }));
-    fire(gate, 'chat');
-    assert.strictEqual(messages.length, 1);
-    assert.match((messages[0].content as Array<{ text: string }>)[0].text, /2 messages in/);
-    assert.strictEqual(asked, 0);
+  it('what the judge is told: a debounced batch whose every event has a write placed for the agent only may wake it', () => {
+    const { gate } = makeGate(config('upcoming.json'), { agentNames: ['agent', 'other'] });
+    gate.evaluate(message('m1'), { agent: 'agent', messageId: 'row-1' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false]);
+    assert.deepStrictEqual(gate.upcomingWakes(['other']).map((w) => w.certain), [true], 'a write placed for another agent drops no wake of this one');
+    gate.evaluate(event({ eventType: 'workspace:file-changed', content: 'notes.md changed' }));
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [true], 'a quoted event\'s line is written when the batch is delivered, so no answer before its delivery covers it');
   });
 
-  it('an event whose content the line quotes (not stored at arrival): the line stays, and the framework is not asked', () => {
-    let asked = 0;
-    const { gate, messages } = makeGate(config('quiet-quoted.json'), { isNewestEntry: () => { asked++; return true; } });
-    gate.evaluate(event({ eventType: 'workspace:file-changed', serverId: '', channelId: '', content: 'notes.md changed' }));
-    fire(gate, 'chat');
-    assert.strictEqual(messages.length, 1);
-    assert.match((messages[0].content as Array<{ text: string }>)[0].text, /notes\.md changed/);
-    assert.strictEqual(asked, 0);
-  });
-
-  it('a callback that throws keeps the line; without one, every wake writes it, as before', () => {
-    const throwing = makeGate(config('quiet-throws.json'), { isNewestEntry: () => { throw new Error('boom'); } });
-    throwing.gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
-    fire(throwing.gate, 'chat');
-    assert.strictEqual(throwing.messages.length, 1);
-    const plain = makeGate(config('quiet-none.json'));
-    plain.gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
-    fire(plain.gate, 'chat');
-    assert.strictEqual(plain.messages.length, 1);
+  it('what the judge is told: a write with no stored id drops no wake', () => {
+    const { gate } = makeGate(config('upcoming-no-id.json'));
+    gate.evaluate(message('m1'), { agent: 'agent' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [true]);
   });
 });

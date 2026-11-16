@@ -89,6 +89,7 @@ import {
   sameIdentity,
   stageContained,
 } from './direct-write.js';
+import { appendAll } from '../../append-all.js';
 
 /** Default for how long the after-batch scan may hold the agent's next inference. */
 const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
@@ -4549,7 +4550,7 @@ export class WorkspaceModule implements Module {
             });
             continue;
           }
-          notes.push(...lookedIn);
+          appendAll(notes, lookedIn);
           const plan = planTargetEdits(tool, target, stored.bytes, hints, maxSize, counts, problems);
           if (plan === null) continue;
           plans.push({
@@ -5670,8 +5671,8 @@ export class WorkspaceModule implements Module {
       const found = mount.direct
         ? await this.textsFromDisk(mount, relativePath, root, start, kept, (text) => searched(text)())
         : await this.textsFromStore(mount, relativePath, start, kept, searched);
-      skipped.push(...found.skipped);
-      incomplete.push(...found.incomplete);
+      appendAll(skipped, found.skipped);
+      appendAll(incomplete, found.incomplete);
     }
 
     const answer: GrepAnswer = {

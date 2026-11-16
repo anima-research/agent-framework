@@ -19,7 +19,7 @@
  *   (heldFromResidents), what a suppress rule hid (suppressedRow), and the
  *   other residents' stored context injections (isAnotherAgentsInjection):
  *   their context, which they share the slot with it but never its
- *   conversation.
+ *   conversation. Both views also omit legacy reasoning-loss notices.
  * - The subconscious keeps its rows in a slot of its own,
  *   `subconscious/<serves>`, and reads the residents' slot beside it
  *   (`auxiliaryMessageViews: [{}]`), held traffic included, which is what it
@@ -27,7 +27,7 @@
  *   window by its observe edge's rule, and the merged slot is still the
  *   record its window is presented from. Its view leaves out only the
  *   residents' stored context injections and what a suppress rule hid,
- *   which renders for no reader, this one included. Its strategy is a windowed
+ *   in this shared view, along with legacy notices. Its strategy is a windowed
  *   passthrough, anchored at the oldest active tune-out's start, or at an
  *   earlier start kept in force: a cancelled tune-out's, kept while another
  *   stays active and across a restart, until the next enter sets the oldest
@@ -37,6 +37,7 @@
  * a strategy keeps state for the manager it is opened with.
  */
 import { WindowedPassthroughStrategy, type ContextManagerConfig, type StoredMessage } from '@animalabs/context-manager';
+import { isReasoningLoss } from './reasoning-loss.js';
 import { heldFromResidents, suppressedRow } from './dendrite/audience.js';
 import { persistentReaderName } from './tune-out/tools.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
@@ -44,17 +45,26 @@ import { isAnotherAgentsInjection } from './stored-injections.js';
 /** ContextManager.open's options over a store the caller gives: everything but the store. */
 export type ContextManagerOpenOptions = Omit<Extract<ContextManagerConfig, { store: unknown }>, 'store'>;
 
-/** What a resident's view leaves out: held traffic, suppressed rows, and another agent's stored context injections. */
-export function residentViewFilter(name: string): (message: StoredMessage) => boolean {
+/** A resident's view: no held traffic, suppressed rows, foreign injections or legacy notices.
+ * Supports both a reusable named predicate and a direct metadata-only probe. */
+export function residentViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
+export function residentViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;
+export function residentViewFilter(messageOrName: Pick<StoredMessage, 'metadata'> | string, name?: string): boolean | ((message: Pick<StoredMessage, 'metadata'>) => boolean) {
+  if (typeof messageOrName !== 'string') return residentViewFilter(name!)(messageOrName);
   return (message) => !heldFromResidents(message.metadata as Record<string, unknown> | undefined)
     && !suppressedRow(message.metadata as Record<string, unknown> | undefined)
-    && !isAnotherAgentsInjection(message.metadata, name);
+    && !isAnotherAgentsInjection(message.metadata, messageOrName)
+    && !isReasoningLoss(message.metadata);
 }
 
-/** What the subconscious's view leaves out: the residents' stored context injections and suppressed rows, and nothing it reads for. */
-export function subconsciousViewFilter(name: string): (message: StoredMessage) => boolean {
+/** The subconscious includes held traffic, but not suppressed rows, foreign injections or legacy notices. */
+export function subconsciousViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
+export function subconsciousViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;
+export function subconsciousViewFilter(messageOrName: Pick<StoredMessage, 'metadata'> | string, name?: string): boolean | ((message: Pick<StoredMessage, 'metadata'>) => boolean) {
+  if (typeof messageOrName !== 'string') return subconsciousViewFilter(name!)(messageOrName);
   return (message) => !suppressedRow(message.metadata as Record<string, unknown> | undefined)
-    && !isAnotherAgentsInjection(message.metadata, name);
+    && !isAnotherAgentsInjection(message.metadata, messageOrName)
+    && !isReasoningLoss(message.metadata);
 }
 
 /** The options a resident named `agentName` is opened with: the residents' slot, through its view. The caller gives its strategy. */

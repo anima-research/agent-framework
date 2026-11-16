@@ -48,6 +48,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { onlyDeviceDiffers, sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 import { OUTSIDE_STEP, UNFOLLOWED_STEP, errnoClause, errnoCode, systemWords } from './answers.js';
+import { appendAll } from '../../append-all.js';
 
 export interface MountView {
   /**
@@ -2391,7 +2392,7 @@ export async function walkScope(
     for (const d of subdirs) walk.dirs.add(d);
     for (const [p, why] of others) walk.others.set(p, why);
     for (const p of otherFiles) walk.otherFiles.add(p);
-    walk.incomplete.push(...regions);
+    appendAll(walk.incomplete, regions);
     walk.complete.add(rel);
     const listing = { leaves, subdirs, ...dir.identity() };
     listings.set(rel, listing);

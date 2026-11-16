@@ -63,6 +63,7 @@
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import { continuesBody, MessageStore, type ContextManager, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
+import { isReasoningLoss } from './reasoning-loss.js';
 import { audienceOf, heldFromResidents, observedRowFor, suppressedRow } from './dendrite/audience.js';
 import { sameSlot, type AgentRegistry } from './dendrite/registry.js';
 import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
@@ -228,7 +229,8 @@ export type RowSlot = 'own' | MessageSlotRef;
  * a ref sameSlot as its `ownSlot`), else a slot it may observe. undefined,
  * a slot its caller couldn't name, is elsewhere.
  *
- * A row a suppress rule hid (suppressedRow) is elsewhere to every reader,
+ * A legacy reasoning-loss notice or a row a suppress rule hid
+ * (suppressedRow) is elsewhere to every reader,
  * in any slot: no view the framework sets renders it.
  *
  * In its own slot, with `stamp = audienceOf(metadata)`:
@@ -263,7 +265,7 @@ export function bearingOf(
 ): Bearing {
   const metadata = row.metadata as Record<string, unknown> | undefined;
   if (slot === undefined) return 'elsewhere';
-  if (suppressedRow(metadata)) return 'elsewhere';
+  if (isReasoningLoss(metadata) || suppressedRow(metadata)) return 'elsewhere';
   if (slot !== 'own' && !sameSlot(slot, reader.ownSlot)) {
     const shown = reader.observed.some((seen) => sameSlot(seen.slot, slot)
       && observedRowFor(seen.edge, row, { observer: reader.name, owners: seen.owners }));

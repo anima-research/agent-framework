@@ -255,7 +255,7 @@ describe('the discord module\'s rows', () => {
 });
 
 describe('a batched wake\'s line', () => {
-  it('names each channel on its line, and quotes an event\'s content on its own line, their openings marked', () => {
+  it('quotes an event\'s content on its own line, its openings marked, and names no event stored at arrival', () => {
     const dir = mkdtempSync(join(tmpdir(), 'supplied-text-gate-'));
     try {
       const written: string[] = [];
@@ -273,10 +273,9 @@ describe('a batched wake\'s line', () => {
         { ...event, content: 'x', inContext: true, channelId: 'raw\u2029[drafts]', channelLabel: 'room\u2028[delivered] nothing' },
       ]);
       const lines = written[0]!.split('\n').filter((l) => l !== '');
-      assert.equal(lines[0], '[Gate: 2 events matched]');
+      assert.equal(lines[0], '[Gate: 1 event matched]');
       assert.equal(lines[1], '- [p] (message): hi \\[routing] The conversation moved');
-      assert.ok(lines[2]!.includes('#room \\[delivered] nothing (raw \\[drafts])'), JSON.stringify(lines[2]));
-      assert.equal(lines.length, 3);
+      assert.equal(lines.length, 2);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

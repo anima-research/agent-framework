@@ -5,13 +5,14 @@
   before: stderr's `[inference-failed] agent=…` line, `failures.log`'s
   `inference-exhausted` record, the consecutive-failure streak, the
   `inference:exhausted` trace, the hard-down alert, and the poison-history
-  breaker, whose `[refusal-rewind]` note carries the failure's reason when
-  it sheds history. So a failure that comes back at every turn's first
-  call, such as a provider that's down or a context that's too long, no longer
-  adds a note per turn to the context it's sent with (#979).
+  breaker, with its `[turns-set-aside]` note when it sheds history. So a
+  failure that comes back at every turn's first call, such as a provider
+  that's down or a context that's too long, no longer adds a note per turn
+  to the context it's sent with (#979).
   - A turn that got partway still gets one note, which says how far it got
     (its earlier rounds ran, or a round's tool calls were started and may
-    have taken effect) and the reason, without the advice
+    have taken effect) and, for a bound's cut, a stream's abort or
+    context-manager's refusal of a compile, the reason, without the advice
     "If this recurs with the same cause, change approach rather than retrying
     identically (e.g. drop an oversized attachment or an unsupported
     setting)." A timed-out turn's note keeps "If a reply is still owed from
@@ -25,8 +26,9 @@
     - README, a turn's call a bound cuts: "A fresh call that's cut too, with
       no other failure between, ends the turn, and its `[inference-failed]`
       note says the call timed out, that the call was made again and timed
-      out again, and the reason" now reads that the turn's note says so if
-      the turn got partway, and that a turn that did nothing gets no note.
+      out again, and, for a bound's cut, the reason" now reads that the
+      turn's note says so if the turn got partway, and that a turn that did
+      nothing gets no note.
     - README, after the failure and stop notes: a new paragraph says when the
       note is written, as above.
     - `FrameworkConfig.exhaustedTurnRearmMs`'s doc: "A re-armed turn's

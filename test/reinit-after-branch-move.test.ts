@@ -698,6 +698,38 @@ describe('after a branch move, every agent on the store compiles without a resta
     }
   });
 
+  it("a write kept for an agent whose manager refuses its work is stored ahead of a write the recovering move's hold keeps for another agent", async () => {
+    const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    const initialize = strategy.initialize.bind(strategy);
+    let failNext = true;
+    strategy.initialize = async (...args: unknown[]) => {
+      if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+      return initialize(...args);
+    };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+      assert.deepEqual(reinitAlerts().map((alert) => alert.agentName), ['b'], 'setup: b refuses its work');
+      const kept = 'for b, while it refuses its work';
+      assert.equal(courier.addMessage('courier', text(kept), undefined, { forAgent: 'b' }), '', 'setup: kept in memory');
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      const held = 'for a, during the move that recovers b';
+      holdFor('a', held);
+      pass.open();
+      await pass.switched;
+      const sequenceOf = (name: string, words: string) => cmOf(name).getAllMessages()
+        .find((m) => m.content.some((block) => block.type === 'text' && block.text === words))?.sequence;
+      const keptAt = sequenceOf('b', kept);
+      const heldAt = sequenceOf('a', held);
+      assert.ok(keptAt !== undefined && heldAt !== undefined, `both stored: ${keptAt}, ${heldAt}`);
+      assert.ok(keptAt < heldAt, `the kept write first: ${keptAt} < ${heldAt}`);
+    } finally {
+      console.error = quiet;
+    }
+  });
+
   // AF #844 bot review 2, finding 53.
   it("stop() names a write an alert's listener makes for an agent whose manager refuses its work, after the writes it named", async () => {
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };

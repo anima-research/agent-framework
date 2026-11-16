@@ -50,7 +50,7 @@ test('exhausted inference of a turn that did nothing: a stderr line with the rea
   assert.deepEqual(markers, []);
 });
 
-test('exhausted inference of a turn that got partway: one [inference-failed] chronicle marker with the reason', () => {
+test('exhausted inference of a turn that got partway: one [inference-failed] chronicle marker, with the reason in its metadata only', () => {
   const { fw, markers, errs, restore } = makeHarness();
   fw.exhaustedTurns.set('cairn', { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false });
   try {
@@ -61,7 +61,8 @@ test('exhausted inference of a turn that got partway: one [inference-failed] chr
     'should log the failure + reason to stderr');
   assert.equal(markers.length, 1);
   assert.match(markers[0].text, /\[inference-failed\]/);
-  assert.match(markers[0].text, /image exceeds 5 MB/);
+  assert.doesNotMatch(markers[0].text, /image exceeds 5 MB/);
+  assert.equal(markers[0].meta.reason, '400 image exceeds 5 MB');
   assert.equal(markers[0].meta.kind, 'inference-failed');
   assert.equal(markers[0].meta.consecutive, 1);
 });

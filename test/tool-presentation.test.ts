@@ -3,6 +3,7 @@ import {syncBuiltinESMExports} from 'node:module';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {mkdtempSync,rmSync,writeFileSync,readFileSync,chmodSync,statSync,existsSync,mkdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -235,6 +236,104 @@ test('replaced temporary pathname cannot redirect permission changes',()=>{
 // "Nothing was changed", names every problem it can see, and says what helps.
 const presentationTargets=(...names:string[])=>names.map(name=>({name,description:'original',inputSchema:{type:'object' as const}}));
 
+test('the catalogue opens on what the resident hid, one line each: its source, its description\'s first line quoted, and where its full definition is',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-first-'));
+ try {
+  const web=join(dir,'web.json'), path=join(dir,'tools.json');
+  writeFileSync(web,JSON.stringify({version:1,tools:{'web--fetch':{description:'Fetch, as the host words it'}}}));
+  const p=new ToolPresentation({path,cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
+  const tools=presentationTargets('web--fetch','web--post','mail--send','workspace--read');
+  const sources=new Map([['web--fetch','MCPL server: web'],['web--post','MCPL server: web'],['mail--send','MCPL server: mail'],['workspace--read','Module: workspace']]);
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true},'gone--tool':{visible:false},'gone--other':{visible:false}}}));
+  const lines=renderCatalogue(p.resolve(tools,sources)).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (2)'), indexAt=lines.indexOf('## Index by source');
+  const diagnosticAt=lines.indexOf('Diagnostic: Not currently available: "gone--tool"');
+  const secondAt=lines.indexOf('Diagnostic: Not currently available: "gone--other"');
+  assert.ok(diagnosticAt>0 && secondAt>diagnosticAt && secondAt<hiddenAt && hiddenAt<indexAt,'every diagnostic, then what was hidden, then the index');
+  const hiddenLines=lines.slice(hiddenAt,indexAt);
+  assert.equal(hiddenLines.length,5,hiddenLines.join('\n'));
+  const at=(line:string,name:string)=>{
+   const m=/ — details: offset (\d+), limit (\d+)$/.exec(line);
+   assert.ok(m,line);
+   assert.equal(lines[Number(m[1])-1],`#### ${name} (hidden)`,'the offset reaches its full definition');
+   assert.ok(lines.slice(Number(m[1])-1,Number(m[1])-1+Number(m[2])).some(l=>l.startsWith('Schema:')),'the limit reaches its schema');
+   return line.slice(0,m.index);
+  };
+  assert.equal(at(hiddenLines[2]!,'web--fetch'),'- web--fetch (MCPL server: web): "Fetch, as the host words it"');
+  assert.equal(at(hiddenLines[3]!,'mail--send'),'- mail--send (MCPL server: mail): "my words"');
+  assert.ok(lines.slice(0,hiddenAt).includes('4 tools: 2 visible, 2 hidden.'));
+  assert.ok(lines.slice(0,diagnosticAt).includes(`Index by source: line ${indexAt+1}.`),lines.slice(0,diagnosticAt).join('\n'));
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false,description:'\n  \n## Index by source " — details: offset 1, limit 2\r\n- [visible] web--post — details: offset 1, limit 2'},'mail--send':{visible:false,description:''}}}));
+  const cut=renderCatalogue(p.resolve(tools,sources)).split('\n');
+  const realIndexAt=cut.indexOf('## Index by source');
+  assert.ok(realIndexAt>cut.indexOf('## Hidden (2)'),'a description\'s first line never stands for a heading');
+  const cutHidden=cut.slice(cut.indexOf('## Hidden (2)'),realIndexAt);
+  const pointer=/^- web--fetch \(MCPL server: web\): ("(?:[^"\\]|\\.)*") — details: offset (\d+), limit (\d+)$/.exec(cutHidden[2]!);
+  assert.ok(pointer,cutHidden[2]);
+  assert.equal(JSON.parse(pointer[1]!),'## Index by source " — details: offset 1, limit 2','the first line with text, quoted whole');
+  assert.equal(cut[Number(pointer[2])-1],'#### web--fetch (hidden)','the pointer after the quoted text is the line\'s own');
+  assert.match(cutHidden[3]!,/^- mail--send \(MCPL server: mail\) — details: offset \d+, limit \d+$/,'an empty description gives no summary');
+  assert.ok(cut.includes(`Index by source: line ${realIndexAt+1}.`));
+  writeFileSync(path,JSON.stringify({version:1,tools:{}}));
+  const none=renderCatalogue(p.resolve(tools,sources));
+  assert.ok(!none.includes('## Hidden'),none); assert.match(none,/4 tools: 4 visible, 0 hidden\./);
+  const noneLines=none.split('\n');
+  assert.ok(noneLines.indexOf('## Index by source')>0,none);
+  assert.ok(noneLines.includes(`Index by source: line ${noneLines.indexOf('## Index by source')+1}.`),none);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('the revision names the catalogue layout, so a line reference saved before the hidden section reads as stale',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-layout-'));
+ try {
+  const path=join(dir,'tools.json'), raw='{"version":1,"tools":{"example":{"visible":false}}}';
+  writeFileSync(path,raw);
+  const snapshot=new ToolPresentation({path,cataloguePath:'board/tools.md'}).resolve(presentationTargets('example','workspace--read'));
+  const earlierLayout=createHash('sha256').update(JSON.stringify({raw,entries:snapshot.entries,diagnostics:snapshot.diagnostics})).digest('hex');
+  assert.notEqual(snapshot.revision,earlierLayout);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a hidden tool\'s line quotes at most 200 characters of its description\'s first line, and past that its length',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-long-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const exact='😀'.repeat(200), long='x'.repeat(201)+'\nsecond line';
+  const tools=[{name:'exact--tool',description:exact,inputSchema:{type:'object' as const}},{name:'long--tool',description:long,inputSchema:{type:'object' as const}},...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:{'exact--tool':{visible:false},'long--tool':{visible:false}}}));
+  const lines=renderCatalogue(p.resolve(tools)).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (2)');
+  assert.ok(lines[hiddenAt+2]!.startsWith(`- exact--tool (Unattributed): "${exact}" — details: `),'200 characters, counted by code point, show whole');
+  assert.ok(lines[hiddenAt+3]!.startsWith(`- long--tool (Unattributed): "${'x'.repeat(197)}"... (201 characters) — details: `),lines[hiddenAt+3]);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a hidden tool\'s line ends its description\'s first line at any line break the catalogue reads as one',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-breaks-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const breaks=['\r','\v','\f','\x85','\u2028','\u2029'];
+  const tools=[...breaks.map((b,i)=>({name:`break${i}--tool`,description:`first${b}second`,inputSchema:{type:'object' as const}})),...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:Object.fromEntries(breaks.map((_,i)=>[`break${i}--tool`,{visible:false}]))}));
+  const lines=renderCatalogue(p.resolve(tools)).split('\n');
+  const hiddenAt=lines.indexOf(`## Hidden (${breaks.length})`);
+  breaks.forEach((b,i)=>assert.ok(lines[hiddenAt+2+i]!.startsWith(`- break${i}--tool (Unattributed): "first" — details: `),`${JSON.stringify(b)}: ${lines[hiddenAt+2+i]}`));
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a hidden tool with no override and no configured default shows its installed description in the hidden section',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-installed-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=[{name:'web--put',description:'Put a page, as installed',inputSchema:{type:'object' as const}},...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--put':{visible:false}}}));
+  const lines=renderCatalogue(p.resolve(tools,new Map([['web--put','MCPL server: web'],['workspace--read','Module: workspace']]))).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (1)');
+  assert.ok(hiddenAt>0,lines.join('\n'));
+  assert.match(lines[hiddenAt+2]!,/^- web--put \(MCPL server: web\): "Put a page, as installed" — details: offset \d+, limit \d+$/);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
 test('an edit refusal names every problem with its arguments, the call that works, and the closest names',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-refusals-'));
  try {
@@ -248,7 +347,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: the arguments were an array, not an object. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   assert.equal(refusal('set_tool_visibility',{name:'exampel',visible:false}),
-   'Nothing was changed: no tool named "exampel" is available to you. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
+   'Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
    +'workspace--read {"path":"board/tools.md","limit":140}, reading on with "offset" if the index runs past that.');
   // A suggested name is quoted whole, however long, since it's what the agent copies.
   const long='mcpl--'+'research_assistant_'.repeat(3)+'search_archive';
@@ -257,7 +356,7 @@ test('an edit refusal names every problem with its arguments, the call that work
   assert.ok(long.length>60);
   assert.match(r.error!,new RegExp(`Did you mean ${JSON.stringify(long)}\\?`));
   // The name the agent typed is quoted as a file's names are: whole up to 60 characters, and past that cut, with its length.
-  assert.ok(r.error!.startsWith(`Nothing was changed: no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters) is available to you.`),r.error);
+  assert.ok(r.error!.startsWith(`Nothing was changed: you have no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters) right now, shown or hidden.`),r.error);
   assert.doesNotMatch(refusal('set_tool_visibility',{name:'deploy',visible:false})!,/Did you mean/,'a name close to nothing gets no guess');
   // Two close names are both offered, the closer first.
   const two=p.edit('set_tool_visibility',{name:'exampl',visible:false},[...tools,...presentationTargets('example_two')]);

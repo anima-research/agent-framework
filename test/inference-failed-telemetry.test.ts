@@ -178,13 +178,13 @@ test('seventeen failures leave each next request as it would be without them: wh
   assert.equal(texts(membrane.sends[17]!).filter((text) => text.startsWith('zz-hello')).length, 18);
 });
 
-test('a turn that got partway leaves one note, saying how far it got and why, with no advice', async (t) => {
+test('a turn that got partway leaves one note, saying how far it got and what failed, with no advice', async (t) => {
   const membrane = new ScriptedMembrane(() => 'tool round, then fails');
   const r = await resident(t, membrane);
   await r.say('zz-hello');
   assert.deepEqual(r.notes(), [
     '[inference-failed] Your previous turn did not complete: it failed (server, HTTP 502). ' +
-    'Its earlier rounds ran, and their tool calls ran as their results show. Reason: zz server failure.',
+    'Its earlier rounds ran, and their tool calls ran as their results show.',
   ]);
   assert.equal(r.failures().filter((f) => f.kind === 'inference-exhausted').length, 1);
 });
@@ -195,7 +195,7 @@ test('a turn that got partway and timed out keeps its note telling the resident 
   await r.say('zz-hello');
   const notes = r.notes();
   assert.equal(notes.length, 1, notes.join('\n'));
-  assert.match(notes[0]!, /^\[inference-failed\] Your previous turn did not complete: its last call timed out\. Its earlier rounds ran, and their tool calls ran as their results show\. Reason: zz call timed out\. If a reply is still owed from that turn, you can give it now\.$/);
+  assert.match(notes[0]!, /^\[inference-failed\] Your previous turn did not complete: its last call timed out\. Its earlier rounds ran, and their tool calls ran as their results show\. If a reply is still owed from that turn, you can give it now\.$/);
 });
 
 test('SUPPRESS_INFERENCE_FAILED_MARKER=1 leaves out the note for a turn that got partway', async (t) => {

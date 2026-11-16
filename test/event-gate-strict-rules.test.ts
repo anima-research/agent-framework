@@ -2290,6 +2290,26 @@ test('rules that share a name keep their state through a write that leaves them 
   assert.deepEqual(wakes, ['agent', 'agent'], 'the batch is sent once the rules swap behaviors');
 });
 
+test("a batch whose line quoting an event can't be written is named in the log and dropped, and wakes no one", (t) => {
+  const dir = tempDir(t);
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const configPath = join(dir, 'gate.json');
+  writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [{ name: 'quiet', match: {}, behavior: { debounce: 1000 } }] }));
+  const wakes: string[] = [];
+  const gate = new EventGate({
+    configPath, getAgentNames: () => ['agent'], emitTrace: () => {},
+    addMessage: () => { throw new Error('store unavailable'); },
+    requestInference: (agent) => { wakes.push(agent); },
+  });
+  t.after(() => gate.dispose());
+  assert.equal(gate.evaluate(event([], 'clock:reminder')).trigger, false, 'premise: the event waits in the debounce batch');
+  t.mock.timers.tick(1000);
+  assert.deepEqual(logged, ['[gate] Rule "quiet": its pending batch of 1 event couldn\'t be delivered (store unavailable), so the batch is dropped']);
+  assert.deepEqual(wakes, []);
+});
+
 test("a batch whose delivery throws is named in the log and dropped, whether its timer sends it or it was held for an agent's turn", async (t) => {
   const dir = tempDir(t);
   const logged: string[] = [];
@@ -2305,8 +2325,8 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
   const gate = new EventGate({
     configPath, getAgentNames: () => ['agent'],
     emitTrace: (e) => { if (e.type === 'gate:debounce-delivered') delivered.push(String(e.policyName)); },
-    addMessage: () => { attempts++; if (fails) throw new Error('no agent to deliver to'); return ''; },
-    requestInference: (agent) => { wakes.push(agent); },
+    addMessage: () => '',
+    requestInference: (agent) => { attempts++; if (fails) throw new Error('no agent to deliver to'); wakes.push(agent); },
   });
   t.after(() => gate.dispose());
 
@@ -2462,11 +2482,11 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   // Whether limited's bucket is still there as each batch is sent.
   const bucketAtDelivery: boolean[] = [];
   const gate: EventGate = new EventGate({
-    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: (agent) => { wakes.push(agent); },
-    addMessage: () => {
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], addMessage: () => '',
+    requestInference: (agent) => {
       bucketAtDelivery.push((gate as unknown as { rateLimitBuckets: Map<string, unknown> }).rateLimitBuckets.has('limited'));
       if (++deliveries === 1) throw new Error('no agent to deliver to');
-      return '';
+      wakes.push(agent);
     },
   });
   t.after(() => gate.dispose());
@@ -2500,8 +2520,8 @@ test("a reload whose pending batch can't be delivered still puts the new rules i
   const quiet = { name: 'quiet', match: { tagsAny: ['chat:mention'] }, behavior: { debounce: 60000 } };
   writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [quiet] }));
   const gate = new EventGate({
-    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], requestInference: () => {},
-    addMessage: () => { throw new Error('no agent to deliver to'); },
+    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'], addMessage: () => '',
+    requestInference: () => { throw new Error('no agent to deliver to'); },
   });
   t.after(() => gate.dispose());
   assert.equal(gate.evaluate(MENTION).trigger, false, "the mention waits in quiet's batch");

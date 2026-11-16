@@ -5,9 +5,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
-import type { Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
+import { NOTICE_TAG } from '../src/notice-tags.js';
+
+const REWIND_TAG = `[${NOTICE_TAG.refusalRewind}]`;
 
 /**
  * The refusal auto-rewind sheds the newest turn (in sequence, newest first,
@@ -205,8 +208,46 @@ const refused = (partial?: string) => createMockResponse(partial ? [text(partial
 const markerOf = (request: NormalizedRequest) => {
   const last = request.messages.at(-1)!;
   const said = JSON.stringify(last.content);
-  return said.includes('[refusal-rewind]') ? said : undefined;
+  return said.includes(REWIND_TAG) ? said : undefined;
 };
+
+test("a refusal's rewind tells the agent its turns couldn't be completed, naming no refusal, filter or category, and the record keeps the category", async () => {
+  const SENTINEL = 'zz-provider-category-7f3a';
+  const refusal = { ...refused(), raw: { request: {}, response: { stop_details: { category: SENTINEL } } } } as unknown as NormalizedResponse;
+  const rig = await rewindRig([[], [refusal]], { autoRewind: true, maxRewinds: 3 });
+  try {
+    await rig.say('first question', 1);
+    await rig.say('second question', 3);
+    assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
+    const retry = rig.requests[2]!;
+    const marker = markerOf(retry) ?? '';
+    assert.ok(marker.includes('[turns-set-aside] The 1 most recent turn(s)'), `the marker opens with its documented tag: ${marker}`);
+    assert.ok(marker.includes(
+      `${REWIND_TAG} The 1 most recent turn(s) were set aside because the requests that carried them couldn't be completed. ` +
+      "Their content isn't shown here, and the originals remain in the raw record. You are clear to continue",
+    ), marker);
+    assert.doesNotMatch(marker, /refus|filter|categor/i);
+    assert.ok(!rig.texts(retry).some((t) => t.includes(SENTINEL)), 'the retry carries none of the category');
+    const row = rig.stored().find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
+    assert.equal((row?.metadata as { category?: string } | undefined)?.category, SENTINEL, 'the record keeps it');
+  } finally { await rig.close(); }
+});
+
+test("an unstick that gives up tells its channel its requests couldn't be completed, and only stderr names the category", () => {
+  const SENTINEL = 'zz-provider-category-7f3a';
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.forcedRewind = new Map([['scout', { remaining: 0, removed: [{ descriptor: 'an incoming message from simulect (7 chars)' }], serverId: 'srv', channelId: 'room' }]]);
+  const posted: string[] = [];
+  fw.postToChannel = async (_serverId: string, _channelId: string, content: string) => { posted.push(content); };
+  const errs: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => { errs.push(args.map(String).join(' ')); };
+  try {
+    fw.finishUnstick('scout', false, SENTINEL);
+  } finally { console.error = orig; }
+  assert.deepEqual(posted, ["⚠️ Couldn't unstick **scout** — its requests still couldn't be completed after 1 rewind(s).\n• an incoming message from simulect (7 chars)"]);
+  assert.ok(errs.some((line) => line.startsWith('[unstick] agent=scout gave up') && line.includes(SENTINEL)), errs.join('\n'));
+});
 
 for (const partial of [undefined, 'Here is the start of an answer']) {
   const kind = partial ? ', with partial text on the refused reply' : '';
@@ -220,7 +261,7 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
       const retry = rig.requests[2]!;
       assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the retry leaves the refused message out');
       if (partial) assert.ok(!rig.texts(retry).some((t) => t.includes(partial)), "and the refused attempt's text");
-      assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes('[refusal-rewind]')), 'what came before stays');
+      assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes(REWIND_TAG)), 'what came before stays');
       assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
     } finally { await rig.close(); }
   });
@@ -234,7 +275,7 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
       const retry = rig.requests[3]!;
       assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
       assert.ok(!rig.texts(retry).some((t) => t.includes('reply 1')), 'and the reply before it');
-      assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes('[refusal-rewind]')), 'what came before stays');
+      assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes(REWIND_TAG)), 'what came before stays');
       assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
     } finally { await rig.close(); }
   });
@@ -268,6 +309,25 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
     } finally { await rig.close(); }
   });
 }
+
+test("a refused turn its batch gave no channel is retried with the batch's channels", async () => {
+  const channels = [{ serverId: 'discord', channelId: 'discord:g:room' }];
+  let retried: InferenceRequest | undefined;
+  const rig = await rewindRig([[], [refused()]], { autoRewind: true, maxRewinds: 3 }, {
+    onRequest: (count, framework) => { if (count === 3) retried = framework.getActiveTurnTrigger('scout'); },
+  });
+  try {
+    await rig.say('first question', 1);
+    rig.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'second question', metadata: {}, triggerInference: false } as never);
+    await rig.framework.runUntilIdle();
+    (rig.framework as unknown as { pendingRequests: InferenceRequest[] }).pendingRequests.push(
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: channels });
+    for (let i = 0; i < 200 && rig.requests.length < 3; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
+    assert.equal(retried?.reason, 'refusal-rewind-retry');
+    assert.deepEqual(retried?.wakeChannels, channels);
+  } finally { await rig.close(); }
+});
 
 test('a message injected into the refused round is the newest turn it carried, and is shed first', async () => {
   const call = { type: 'tool_use', id: 'look-1', name: 'surface--look', input: {} } as ContentBlock;
@@ -343,7 +403,7 @@ test('a message stored after the refused request was sent is neither removed nor
     // Read onto #291: the message stored while the refused request streamed
     // enters the window as that turn ends, after the marker the rewind
     // stored, so the marker is the retry's last message but one.
-    const markerAt = rig.texts(retry).findIndex((t) => t.includes('[refusal-rewind]'));
+    const markerAt = rig.texts(retry).findIndex((t) => t.includes(REWIND_TAG));
     assert.match(rig.texts(retry)[markerAt] ?? '', /The 1 most recent turn\(s\) were set aside/);
     assert.ok(rig.texts(retry).slice(markerAt + 1).some((t) => t.includes('while it streams')), 'the message stored meanwhile follows the marker');
   } finally { await rig.close(); }
@@ -369,7 +429,7 @@ test("when the rewind gives up at its cap, no later request carries the refused 
   try {
     await rig.say('first question', 1);
     await rig.say('second question', 3);
-    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes('[refusal-rewind]')), 'the premise: one rewind ran, and its retry was refused');
+    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes(REWIND_TAG)), 'the premise: one rewind ran, and its retry was refused');
     await rig.say('a new question', 4);
     assert.equal(rig.requests.length, 4, 'the turn, the refused request, its refused retry, and the next turn');
     assert.ok(!rig.texts(rig.requests[3]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");

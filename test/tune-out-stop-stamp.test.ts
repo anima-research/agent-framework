@@ -1388,6 +1388,56 @@ test("review 2 #42: a branch move writes this run's marker on the branch moved t
   } finally { h.stopAll(); }
 }));
 
+test("after a branch move, a look reads the last looks of the branch moved to, so that branch keeps its own stamps and takes none of the other's", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    const LOOKS = 'tune-out/scout/last-looks';
+    const look = (c: TuneOutCoordinator, epochId: string, channelId: string): void =>
+      (c as unknown as { markLook(epochId: string, serverId: string, channelId: string): void }).markLook(epochId, 'editor', channelId);
+    const noisy = JSON.stringify(['editor', 'noisy']);
+    const quietChannel = JSON.stringify(['editor', 'quiet']);
+    const loud = JSON.stringify(['editor', 'loud']);
+    const e = h.hold();
+    const q = h.hold('quiet');
+    h.fork('other');
+    h.switchTo('other');
+    h.states.set(LOOKS, { [q]: { [quietChannel]: 7 } });
+    h.switchTo('main');
+    h.states.set(LOOKS, { [e]: { [noisy]: 5, [loud]: 4 } });
+    const c = h.boot();
+    look(c, e, 'noisy');
+    assert.deepEqual(h.states.get(LOOKS), { [e]: { [noisy]: h.state.seq, [loud]: 4 } }, "premise: the look is stored on main, beside main's other look");
+    h.switchTo('other');
+    c.branchMoved();
+    look(c, e, 'noisy');
+    assert.deepEqual(h.states.get(LOOKS), { [q]: { [quietChannel]: 7 }, [e]: { [noisy]: h.state.seq } },
+      "the look joins the branch's own record: its look at quiet is kept, and main's look at loud isn't brought over");
+  } finally { h.stopAll(); }
+}));
+
+test("a recovery onto the branch the store was on keeps a look a refused write of the last looks held only in memory", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    const LOOKS = 'tune-out/scout/last-looks';
+    const look = (c: TuneOutCoordinator, epochId: string, channelId: string): void =>
+      (c as unknown as { markLook(epochId: string, serverId: string, channelId: string): void }).markLook(epochId, 'editor', channelId);
+    const noisy = JSON.stringify(['editor', 'noisy']);
+    const loud = JSON.stringify(['editor', 'loud']);
+    const e = h.hold();
+    h.states.set(LOOKS, { [e]: { [noisy]: 5 } });
+    const c = h.boot();
+    h.refuse.add(LOOKS);
+    look(c, e, 'noisy');
+    const refused = h.state.seq;
+    assert.deepEqual(h.states.get(LOOKS), { [e]: { [noisy]: 5 } }, 'premise: the write was refused, so the look is in memory alone');
+    h.refuse.delete(LOOKS);
+    (c as unknown as { branchMoved(sameBranch?: boolean): void }).branchMoved(true);
+    look(c, e, 'loud');
+    assert.deepEqual(h.states.get(LOOKS), { [e]: { [noisy]: refused, [loud]: h.state.seq } },
+      'the next write carries the look the refused one held');
+  } finally { h.stopAll(); }
+}));
+
 test("review 2 #43: after a branch move, the loss record written there keeps the notices that branch kept", () => quiet(() => {
   const h = stampSetup();
   try {

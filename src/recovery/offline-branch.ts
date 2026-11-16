@@ -16,6 +16,7 @@ import {
   type DiscordAwarenessRef,
   type DiscordMessageMetadataCarrier,
 } from './discord-awareness-outbox.js';
+import { appendAll } from '../append-all.js';
 
 export interface OfflineRecoveryBranchOptions {
   storePath: string;
@@ -877,7 +878,7 @@ function buildSuppressionPlan(
   const intervals: SuppressionInterval[] = [...stamped];
   for (const id of messageIds) {
     const location = locations.get(id)!;
-    intervals.push(...location.runs.map((run) => ({ ...run })));
+    appendAll(intervals, location.runs.map((run) => ({ ...run })));
   }
   for (const range of ranges) {
     const from = locations.get(range.fromMessageId)!;
@@ -896,7 +897,7 @@ function buildSuppressionPlan(
       fromId: earlier.firstId,
       toId: later.firstId,
     });
-    for (const end of [from, to]) intervals.push(...end.runs.map((run) => ({ ...run })));
+    for (const end of [from, to]) appendAll(intervals, end.runs.map((run) => ({ ...run })));
   }
 
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -916,7 +917,7 @@ function buildSuppressionPlan(
   const carriers: DiscordMessageMetadataCarrier[] = [];
   const ids = new Set<string>();
   for (const interval of merged) {
-    carriers.push(...collectDiscordCarriers(contextManager, interval.start, interval.end + 1, ids));
+    appendAll(carriers, collectDiscordCarriers(contextManager, interval.start, interval.end + 1, ids));
   }
   return {
     intervals: merged,
@@ -946,7 +947,7 @@ function collectDiscordCarriers(
       Math.min(RECOVERY_SCAN_WINDOW, end - offset),
       { resolveBlobs: false },
     ).messages;
-    carriers.push(...messages.map(addressingOnly));
+    appendAll(carriers, messages.map(addressingOnly));
     if (ids) for (const message of messages) ids.add(String(message.id));
   }
   return carriers;
