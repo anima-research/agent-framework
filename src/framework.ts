@@ -4660,8 +4660,6 @@ export class AgentFramework {
     serverId: string;
     channelId: string;
   }> = new Map();
-  /** Each agent's kept `/unstick` answer, and the `unstick-outcome` requests
-   *  that wait for its next one (see answerUnstick). */
   private unstickAnswers = new Map<string, UnstickAnswer>();
   private unstickWaiters = new Map<string, Set<(answer: UnstickAnswer | 'replaced') => void>>();
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
@@ -15250,10 +15248,6 @@ export class AgentFramework {
       : { outcome: 'gave-up', rewinds: n, ...(category !== undefined ? { cause: { kind: 'refusal' as const, category } } : {}) });
   }
 
-  /** Answer the agent's waiting `unstick-outcome` requests. A session's end
-   *  is kept for every request after it, until the agent's next `/unstick`;
-   *  a `turn-failed` is kept only when no request waits, until one takes it.
-   *  Either replaces what was kept. */
   private answerUnstick(agentName: string, answer: UnstickAnswer): void {
     const waiters = this.unstickWaiters.get(agentName);
     this.unstickWaiters.delete(agentName);
@@ -15554,8 +15548,6 @@ export class AgentFramework {
         `(server=${serverId}): ${released.length} wait(s) lifted`);
       return { ok: true, released };
     }
-    // unstick-outcome names its agent, as the unstick acknowledgement does,
-    // and is answered for an agent that has since ended.
     if (params.command === 'unstick-outcome') {
       const name = params.agentName;
       if (typeof name !== 'string' || name === '') {
@@ -15568,7 +15560,6 @@ export class AgentFramework {
       }
       const session = this.forcedRewind.get(name);
       if (!session) return { ok: false, error: `unstick-outcome: ${name} has no /unstick to answer for` };
-      // The wait holds back no other command, and ends when a stop begins.
       let resolve!: (answer: UnstickAnswer | 'replaced') => void;
       const next = new Promise<UnstickAnswer | 'replaced'>((r) => { resolve = r; });
       this.unstickWaiters.set(name, (this.unstickWaiters.get(name) ?? new Set()).add(resolve));
@@ -36048,8 +36039,6 @@ export class AgentFramework {
     // classification fields are additive.
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
-    // (1c) A turn that fails inside an `/unstick` session answers its waiting
-    // `unstick-outcome` with the labels, and ends nothing.
     const unstick = this.forcedRewind?.get(agentName);
     if (unstick) {
       this.answerUnstick(agentName, {

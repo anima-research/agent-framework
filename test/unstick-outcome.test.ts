@@ -1,14 +1,3 @@
-/**
- * `unstick-outcome`: an `/unstick`'s acknowledgement says the
- * host can answer for its outcome and names the agent, and a later
- * `host/command` `unstick-outcome` for that agent is answered once: at the
- * session's end, at a turn that fails inside the session, which ends
- * nothing, or `ok: false` when a new `/unstick` replaces the session it
- * waits on. The answer carries labels (a refusal's category, a failed turn's
- * type and HTTP status), never a provider's sentence, and the framework
- * stores no row and sends no request for it. A waiting request holds back
- * no other command on its server's connection, and no stop.
- */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -38,7 +27,6 @@ class Surface implements Module {
   }
 }
 
-/** A stream that fails as a provider's error does. */
 class ErrorStream implements YieldingStream {
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
@@ -58,24 +46,20 @@ const failure = (type: string, httpStatus?: number) => () => new MembraneError({
   ...(httpStatus !== undefined ? { httpStatus } : {}),
 } as never);
 
-/** A turn's retries run out at its first failure, and nothing re-arms it. */
 const noRetries: ErrorPolicy = { maxRetries: 0, onInferenceError: () => ({ retry: false }) };
 
-/** `work`, or a failure naming `what` after 5 s, so a wait this change should end can't hold the run. */
 const within = <T>(work: Promise<T>, what: string): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<never>((_, no) => { timer = setTimeout(() => no(new Error(`${what}: not settled within 5 s`)), 5000); });
   return Promise.race([work, late]).finally(() => clearTimeout(timer));
 };
 
-/** `done()` holding, polled, or a failure naming `what` after 5 s. */
 const until = async (done: () => boolean, what: string): Promise<void> => {
   for (const start = Date.now(); !done(); await new Promise((r) => setTimeout(r, 10))) {
     if (Date.now() - start > 5000) throw new Error(`${what}: not within 5 s`);
   }
 };
 
-/** A transport that hands each line its connection writes to `onLine`. */
 class LineTransport extends McplTransport {
   readonly kind = 'stdio' as const;
   constructor(private readonly onLine: (line: string) => void) { super(); }
@@ -105,7 +89,6 @@ async function unstickRig(script: Step[], agents: string[] = ['scout']) {
     agents: agents.map((name) => ({ name, model: 'test-model', systemPrompt: name })),
     modules: [new Surface(order)], errorPolicy: noRetries, exhaustedTurnRearmMs: false,
   } as never);
-  // The report goes to the channel through a server's send_message; keep it here.
   const posted: string[] = [];
   (framework as unknown as { postToChannel: (s: string, c: string, content: string) => Promise<void> })
     .postToChannel = async (_serverId, _channelId, content) => { posted.push(content); };
@@ -120,7 +103,6 @@ async function unstickRig(script: Step[], agents: string[] = ['scout']) {
     framework.pushEvent({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true } as never);
     await drive(until);
   };
-  /** A server's connection, with its own dispatch: each request is a line it reads, and each answer is kept by its request's id. */
   const answers = new Map<number, Answer>();
   const transport = new LineTransport((line) => {
     const message = JSON.parse(line) as { id?: unknown; result?: Answer; error?: Answer };
@@ -138,9 +120,7 @@ async function unstickRig(script: Step[], agents: string[] = ['scout']) {
   const texts = (request: NormalizedRequest) => request.messages.map((m) => JSON.stringify(m.content));
   const storedContent = (name = 'scout') => framework.getAgent(name)!.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
   const live = (name = 'scout') => (framework as unknown as { forcedRewind: Map<string, unknown> }).forcedRewind.has(name);
-  /** The unstick-outcome requests that wait in the host for the agent's next answer. */
   const waiting = (name = 'scout') => (framework as unknown as { unstickWaiters: Map<string, Set<unknown>> }).unstickWaiters.get(name)?.size ?? 0;
-  /** An unstick-outcome this test expects answered: bounded, so a wait the change should end fails rather than holds. */
   const ask = (agentName = 'scout') => within(host({ command: 'unstick-outcome', agentName }), `unstick-outcome for ${agentName}`);
   let stopped = false;
   return {
