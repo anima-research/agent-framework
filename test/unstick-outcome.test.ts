@@ -1,5 +1,5 @@
 /**
- * `unstick-outcome` (acorn-2751): an `/unstick`'s acknowledgement says the
+ * `unstick-outcome`: an `/unstick`'s acknowledgement says the
  * host can answer for its outcome and names the agent, and a later
  * `host/command` `unstick-outcome` for that agent is answered once: at the
  * session's end, or at a turn that fails inside the session, which ends

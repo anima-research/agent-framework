@@ -36043,8 +36043,8 @@ export class AgentFramework {
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
     // (1c) A turn that fails inside an `/unstick` session answers its waiting
-    // `unstick-outcome` with the labels, and ends nothing (acorn-2751).
-    const unstick = this.forcedRewind.get(agentName);
+    // `unstick-outcome` with the labels, and ends nothing.
+    const unstick = this.forcedRewind?.get(agentName);
     if (unstick) {
       this.answerUnstick(agentName, {
         outcome: 'turn-failed',
