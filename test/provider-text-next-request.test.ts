@@ -112,6 +112,13 @@ async function withRig(script: Outcome[], strategy: (() => unknown) | undefined,
   }
 }
 
+function assertCarries(request: NormalizedRequest, text: string, what: string): void {
+  assert.ok(JSON.stringify(request).includes(text), `the premise: the request carries ${what}`);
+}
+
+const REWIND_MARKER = 'most recent turn(s) were set aside';
+const FAILED_TURN_NOTE = '[inference-failed] Your previous turn did not complete';
+
 function assertHoldsNoProviderText(request: NormalizedRequest): void {
   const whole = JSON.stringify(request);
   for (const sentinel of [CATEGORY, EXPLANATION, MESSAGE]) {
@@ -133,6 +140,7 @@ for (const [label, strategy] of STRATEGIES) {
       assert.equal(rig.requests.length, 4, "the turn, the refused turn, the unstick's refused run, and its retry");
       assert.ok(rig.stored().some((m) => m.metadata?.kind === 'refusal-rewind' && m.metadata.category === CATEGORY),
         'the premise: the unstick rewound on a refusal with that category');
+      assertCarries(rig.requests[3]!, REWIND_MARKER, 'the rewind marker');
       assertHoldsNoProviderText(rig.requests[3]!);
     });
   });
@@ -143,6 +151,7 @@ for (const [label, strategy] of STRATEGIES) {
       await rig.until(4);
       assert.equal(rig.requests.length, 4, 'three failed turns, and the retry on the rewound history');
       assert.ok(rig.errs.some((line) => line.startsWith('[inference-rewind] agent=scout auto-quarantined')), 'the premise: the third failure shed a turn');
+      assertCarries(rig.requests[3]!, REWIND_MARKER, 'the rewind marker');
       assertHoldsNoProviderText(rig.requests[3]!);
     });
   });
@@ -154,6 +163,7 @@ for (const [label, strategy] of STRATEGIES) {
         "the premise: the failed turn's row was written, and its record keeps the message");
       await rig.say('hello 1', 2);
       assert.equal(rig.requests.length, 2, 'the failed turn and the next');
+      assertCarries(rig.requests[1]!, FAILED_TURN_NOTE, "the failed turn's note");
       assertHoldsNoProviderText(rig.requests[1]!);
     });
   });

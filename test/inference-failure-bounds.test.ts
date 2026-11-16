@@ -163,6 +163,7 @@ test('the marker for a safety failure names neither its type nor its status, nor
     'so nothing was sent. If this recurs with the same cause, change approach rather than retrying identically ' +
     '(e.g. drop an oversized attachment or an unsupported setting).');
   assert.equal(markers[0].meta.errorType, 'safety', 'its metadata keeps the type');
+  assert.equal(markers[0].meta.httpStatus, 400, 'the status');
   assert.equal(markers[0].meta.reason, 'Output blocked: zz-safety', 'and the reason');
 });
 

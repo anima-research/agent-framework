@@ -34640,7 +34640,7 @@ export class AgentFramework {
    *   1. stderr  — always, with the underlying API reason. The place an
    *      operator greps; previously empty in headless mode.
    *   2. chronicle marker — a `[inference-failed]` message so the agent itself
-   *      learns its turn failed and why (otherwise it's an experiential blank,
+   *      learns its turn failed (otherwise it's an experiential blank,
    *      indistinguishable from "not addressed"). addMessage does NOT request
    *      inference, so this never causes a retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
