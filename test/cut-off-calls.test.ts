@@ -78,6 +78,7 @@ interface Run {
   boundaryLines: string[];
   failedTraces: Array<{ callId?: string; tool?: string; error?: string }>;
   audit: Array<Record<string, any>>;
+  drafts: Array<{ text: string; reason: string }>;
 }
 
 async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}): Promise<Run> {
@@ -164,6 +165,8 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       boundaryLines: lines.filter((line) => line.startsWith('[tool-boundary]')),
       failedTraces,
       audit: settings.toolResultGuard ? framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, any>> : [],
+      drafts: (framework as unknown as { proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> } })
+        .proseDrafts.open('resident').map((d) => ({ text: d.text, reason: d.reason })),
     };
   } finally {
     console.error = error;
@@ -279,6 +282,7 @@ describe('native tools: a response that ends at the output limit with calls in i
     assert.deepEqual(run.routed, [NEXT]);
     const texts = run.rows.flatMap((row) => row.content.filter((block) => block.type === 'text').map((block) => block.text as string));
     assert.ok(texts.some((t) => t.startsWith('[delivered]') && /held as drafts? d-/.test(t)), texts.filter((t) => t.startsWith('[')).join(' | '));
+    assert.deepEqual(run.drafts, [{ text: 'A note for the room.', reason: 'skip-reply' }], 'the cut-off text, whole, as a skip_reply draft');
   });
 
   it('keeps a cut-off skip_reply\'s round private after an earlier round published its words', async () => {

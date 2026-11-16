@@ -17,6 +17,8 @@ import { AgentFramework } from '../src/index.js';
 import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import { jsonLines } from './helpers/json-lines.js';
@@ -5037,7 +5039,7 @@ describe('sameRoundSkipReplyTextPolicy', () => {
     }
   });
 
-  it("a script's skip_reply is never refused, and its round's text is a draft named in the receipt", async () => {
+  it("the guard never refuses a script's skip_reply, and its round's text is a draft named in the receipt", async () => {
     const h = await harness({ ...asking(), codeExecution: true });
     const ended = endings(h);
     try {
@@ -5118,6 +5120,85 @@ describe('sameRoundSkipReplyTextPolicy', () => {
       }
     } finally {
       await h.close();
+    }
+  });
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode} mode: in a drafts round, an aside the drafts rule keeps is kept, not held, and the skip_reply runs`, async () => {
+      const h = await harness(asking({ proseRouting: mode }));
+      const ended = endings(h);
+      try {
+        await h.turn([createMockResponse([text('earlier words'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+        const [draft] = h.drafts();
+        const before = ended();
+        await h.turn([
+          createMockResponse([text('a postscript'), drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM }), call('k1', 'skip_reply', {})], 'tool_use'),
+          createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+        ]);
+        assert.deepEqual(h.drafts().map((d) => d.text), [], 'the postscript is not held');
+        assert.ok(!roundTaken(h, 'k2'), 'the first skip_reply ran: no second round');
+        assert.equal(ended(), before + 1, 'and ended the turn');
+      } finally {
+        await h.close();
+      }
+    });
+
+    it(`${mode} mode: in a drafts round whose resend went elsewhere, an aside that would have been posted is held, and the skip_reply asks`, async () => {
+      const h = await harness(asking({ proseRouting: mode }));
+      try {
+        await h.turn([createMockResponse([text('earlier words'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+        const [draft] = h.drafts();
+        await h.turn([
+          createMockResponse([text('a postscript'), drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: GENERAL }), call('k1', 'skip_reply', {})], 'tool_use'),
+          createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+        ]);
+        assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['a postscript', 'skip-reply']]);
+        assert.ok(roundTaken(h, 'k2'), 'the first skip_reply was refused: the turn went on');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('the refused call reports nothing to a tool-lifecycle observer, and a skip_reply that runs reports started and completed', async () => {
+    const h = await harness(asking());
+    const sent: ToolLifecycleParams[] = [];
+    const observer = {
+      id: 'observer', grant: new CapabilityGrant(new Set(['toolLifecycle.observe']), []), toolObserveFilter: null, transportEpoch: 0,
+      sendToolLifecycle: (p: ToolLifecycleParams) => { sent.push(p); },
+    };
+    (h.framework as unknown as { toolLifecycleEmitter: ToolLifecycleEmitter }).toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => [observer as never], configFor: () => undefined, describe: () => ({ class: [] }),
+    });
+    try {
+      await h.turn([
+        createMockResponse([text(WORDS), call('k1', 'skip_reply', {})], 'tool_use'),
+        createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+      ]);
+      assert.ok(h.toolResults()[0]!.startsWith(opening(h.drafts()[0]!.id)), 'premise: k1 was refused');
+      const phases = (id: string) => sent.filter((p) => p.toolCallId.split('~')[0] === id).map((p) => p.phase);
+      assert.deepEqual(phases('k1'), [], 'the refused call reports nothing');
+      assert.deepEqual(phases('k2'), ['started', 'completed'], 'the one that ran reports its run');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("refuses a value other than 'private' or 'ask', naming both", async () => {
+    for (const value of ['Ask', 'public', 1]) {
+      const dir = mkdtempSync(join(tmpdir(), 'skip-reply-policy-value-'));
+      try {
+        await assert.rejects(
+          AgentFramework.create({
+            storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+            agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sameRoundSkipReplyTextPolicy: value }],
+            modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+          } as never),
+          /Agent "scout" sameRoundSkipReplyTextPolicy must be 'private' or 'ask', not (another string|a number)/,
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   });
 

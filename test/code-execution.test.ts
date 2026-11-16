@@ -16,6 +16,8 @@ import type { ErrorAction, ErrorPolicy, EventResponse, Module, ModuleContext, Pr
 import { AgentFramework } from '../src/index.js';
 import { storableToolResult } from '../src/module-registry.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
@@ -2550,6 +2552,14 @@ describe('a round whose run or wait call watches a script that can change its ro
         { type: 'tool_use', id: 'k1', name: 'skip_reply', input: { wake_in_seconds: 1 } },
       ] as ContentBlock[], 'tool_use'),
     ], { sameRoundSkipReplyTextPolicy: 'ask' }, { gate: true });
+    const lifecycle: ToolLifecycleParams[] = [];
+    const observer = {
+      id: 'observer', grant: new CapabilityGrant(new Set(['toolLifecycle.observe']), []), toolObserveFilter: null, transportEpoch: 0,
+      sendToolLifecycle: (p: ToolLifecycleParams) => { lifecycle.push(p); },
+    };
+    (h.framework as unknown as { toolLifecycleEmitter: ToolLifecycleEmitter }).toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => [observer as never], configFor: () => undefined, describe: () => ({ class: [] }),
+    });
     let stream: { cancel(): void } | undefined;
     let agent: { state: { stream?: { cancel(): void } }; reset(): void } | undefined;
     try {
@@ -2574,6 +2584,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       assert.ok(!h.log.includes('tool:skip_reply'), "the held skip_reply didn't run");
       assert.deepStrictEqual(skipAnswers, [], 'and was neither answered nor refused');
       assert.equal(elapsedWakes(h.framework), 0, 'so no self-wake fired');
+      assert.deepStrictEqual(lifecycle.filter((p) => p.tool === 'skip_reply').map((p) => p.phase), [], 'and a tool-lifecycle observer heard nothing of it');
     } finally {
       stream?.cancel();
       (h.framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.delete('assistant');
@@ -2621,6 +2632,66 @@ describe('a round whose run or wait call watches a script that can change its ro
       stream?.cancel();
       (h.framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.delete('assistant');
       agent?.reset();
+      await h.done();
+    }
+  });
+
+  it("under sameRoundSkipReplyTextPolicy 'ask', a skip_reply held for its round's text gets no answer of the guard's once its stream has completed", async () => {
+    const h = await scriptRound('locus', [], { sameRoundSkipReplyTextPolicy: 'ask' }, { gate: true });
+    const first = createMockResponse([
+      { type: 'text', text: 'Back soon.' },
+      { type: 'tool_use', id: 's1', name: 'test--send_message', input: {} },
+      { type: 'tool_use', id: 'k1', name: 'skip_reply', input: { wake_in_seconds: 1 } },
+    ] as ContentBlock[], 'tool_use');
+    // A stream that completes right after its tool calls, while the framework
+    // still waits on them: the 'complete' handler then gives each an error
+    // result of its own.
+    class CompletesWhileWaiting extends MockYieldingStream {
+      constructor() { super([first]); }
+      override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+        const inner = super[Symbol.asyncIterator]();
+        for (let next = await inner.next(); !next.done; next = await inner.next()) {
+          yield next.value;
+          if (next.value.type === 'tool-calls') {
+            yield { type: 'complete', response: first } as StreamEvent;
+            return;
+          }
+        }
+      }
+    }
+    const membrane = (h.framework as unknown as { membrane: { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream } }).membrane;
+    let served = false;
+    const streamYielding = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request, opts) => {
+      if (served) return streamYielding(request, opts);
+      served = true;
+      return new CompletesWhileWaiting();
+    };
+    h.module.holdSend = true;
+    const lines: string[] = [];
+    const error = console.error;
+    const warn = console.warn;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); error(...args); };
+    console.warn = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); warn(...args); };
+    const skipAnswers: string[] = [];
+    h.framework.onTrace((event) => {
+      if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'skip_reply') {
+        skipAnswers.push(String((event as { error?: unknown }).error ?? event.type));
+      }
+    });
+    try {
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      void h.framework.runUntilIdle().catch(() => {});
+      await soon(() => lines.some((l) => l.includes("'complete' event fired while agent 'assistant' is still waiting_for_tools")));
+      assert.ok(lines.some((l) => l.includes("'complete' event fired while agent 'assistant' is still waiting_for_tools")), 'premise: the stream completed while its tools waited');
+      await new Promise((r) => setTimeout(r, 1_500));
+      assert.ok(!skipAnswers.some((a) => a.includes('Where should it go')), `no guard refusal after the stream completed: ${JSON.stringify(skipAnswers)}`);
+      assert.ok(!h.log.includes('tool:skip_reply'), "the held skip_reply didn't run");
+      assert.equal(elapsedWakes(h.framework), 0, 'so no self-wake fired');
+    } finally {
+      console.error = error;
+      console.warn = warn;
+      h.module.releaseGate();
       await h.done();
     }
   });
