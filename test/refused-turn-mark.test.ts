@@ -450,6 +450,22 @@ describe('a refused turn is marked on the message it answers, and its failure na
     assert.equal(r.records[0]!.locus, ROOM);
   });
 
+  it('a turn that opens another channel before it is refused still marks the message it answers, and names that message\'s channel', async (t) => {
+    const r = await rig(t);
+    const open = { type: 'tool_use', id: 'open-1', name: 'channel_open', input: { channelId: ADMIN } } as ContentBlock;
+    r.streams.push(() => new MockYieldingStream([
+      createMockResponse([{ type: 'text', text: 'opening admin' }, open], 'tool_use'),
+      { ...createMockResponse([{ type: 'text', text: 'opening admin' }, open, { type: 'tool_result', toolUseId: 'open-1', content: 'opened' } as ContentBlock], 'refusal'), toolCalls: [] },
+    ]));
+    await r.incoming(ROOM, 'm-2');
+    await eventually(() => r.records.length === 1, 'the turn, refused');
+    const routing = (r.f.framework as unknown as { turnRouting: Map<string, { triggerChannel?: { channelId: string } }> }).turnRouting;
+    assert.equal(routing.get('agent')?.triggerChannel?.channelId, ADMIN, "premise: the open moved the turn's trigger channel to admin");
+    await r.markSent();
+    assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-2']]);
+    assert.equal(r.records[0]!.locus, ROOM);
+  });
+
   it('control: an addressed message in an open channel, refused, is marked on itself', async (t) => {
     const r = await rig(t);
     r.streams.push(() => new MockYieldingStream([refusal()]));
