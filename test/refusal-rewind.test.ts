@@ -237,6 +237,8 @@ test("an unstick that gives up tells its channel its requests couldn't be comple
   const SENTINEL = 'zz-provider-category-7f3a';
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.forcedRewind = new Map([['scout', { remaining: 0, removed: [{ descriptor: 'an incoming message from simulect (7 chars)' }], serverId: 'srv', channelId: 'room' }]]);
+  fw.unstickAnswers = new Map();
+  fw.unstickWaiters = new Map();
   const posted: string[] = [];
   fw.postToChannel = async (_serverId: string, _channelId: string, content: string) => { posted.push(content); };
   const errs: string[] = [];
