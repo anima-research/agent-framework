@@ -17,8 +17,9 @@ export interface CutOffRound {
    * In XML tool mode, what the tag the cut came inside says of a call that
    * might have followed: `may` where it could still have become `think`'s
    * head (`<invoke name="thi`, or a name read whole before its tag closed),
-   * `not` where it can't (`<invoke name="robo`), `none` where the cut came
-   * between tags. Native responses are always `none`.
+   * `not` where it can't (`<invoke name="robo`), `none` where no call had
+   * begun: the cut came between tags or inside the block's own opener.
+   * Native responses are always `none`.
    */
   nextCall: 'may' | 'not' | 'none';
 }

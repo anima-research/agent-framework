@@ -1541,6 +1541,12 @@ interface TurnRouting {
   unpostedSpeech?: true;
   /** A flushed round's words stayed private (privateRoundBlocks): the notice says so, when there is one. */
   privateSpeechKept?: true;
+  /**
+   * A round of the turn came on membrane's XML tool path. Kept on the turn,
+   * not its stream, so a restart's or retry's first response reads it too
+   * (#640 R3-2).
+   */
+  xmlPathSeen?: true;
   privateEnd?: true;
   silent?: true;
   liveSpeech?: true;
@@ -28407,10 +28413,6 @@ export class AgentFramework {
     // historical whole-turn routing so fallback-mode prose is still
     // delivered exactly once, at turn end.
     let liveProseRouting = false;
-    // A round of this stream came on membrane's XML tool path, which declares
-    // it can't carry injected messages: from then on a response cut inside a
-    // tool block's opener can be told from prose (#640 R2-3).
-    let xmlRoundSeen = false;
     // What the turn's first request had read, taken at its round: on the
     // fallback path the prose routed at the turn's end is the whole turn's,
     // so it's credited with this, which every round's words come after.
@@ -28783,7 +28785,7 @@ export class AgentFramework {
             // results: true on membrane's native path and false on its XML
             // prefill path. The tool boundary reads it from the agent's state.
             const carriesInjected = (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages;
-            if (carriesInjected === false) xmlRoundSeen = true;
+            if (carriesInjected === false) streamRouting.xmlPathSeen = true;
             agent.enterWaitingForTools(calls, stream, carriesInjected);
 
             // Speak-while-acting: route THIS round's prose to the locus NOW
@@ -28852,15 +28854,18 @@ export class AgentFramework {
               ? roundSegments.map((seg) => this.admitProse(seg, streamRouting))
               : [];
             const routeRound = (calls: readonly RoundCall[]): void => {
-              if (!this.channelRegistry) return;
               const toolNames = calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
                 toolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
+              // Marked before the registry's return: a framework with no
+              // channels still keeps a private round's words out of the
+              // notice that asks for unposted words again (#640 R3-1).
               if (hasSameRoundPrivateThink) {
                 privateThinkRounds.add(toolRound);
                 this.privateRoundBlocks.add(assistantBlocks);
               }
+              if (!this.channelRegistry) return;
               // A refused skip_reply, called directly or from the round's
               // script, keeps its own round private and silences nothing
               // after it (roundCallOf): the silence before it, and the
@@ -29296,7 +29301,11 @@ export class AgentFramework {
             }
 
             const cut = waitedAtComplete ? undefined : cutOffRound(response, {
-              partialOpener: xmlRoundSeen && requestSnapshot.sameRoundThinkTextPolicy === 'private',
+              // Once a round of the turn came on membrane's XML path, a cut
+              // inside an opener's name may be a tool block's, so under the
+              // private policy it is held (#640 R2-3, across streams R3-2).
+              // Prose that ends in `<f` or `<a` is held too, failing closed.
+              partialOpener: !!streamRouting.xmlPathSeen && requestSnapshot.sameRoundThinkTextPolicy === 'private',
             });
             if (cut) response = { ...response, content: cut.content };
             const cutIds = new Set(cut?.calls.map((call) => call.id));
@@ -29314,6 +29323,14 @@ export class AgentFramework {
             // are kept back by their place here (the XML fallback only: native
             // calls carry their whole name from their start).
             const heldUndecided = cutThinkPrivate && !!cut?.unnamed && !liveProseRouting;
+            // Words held only because the cut left the next call undecided
+            // (not a think the round named) may have been meant to go out, so
+            // the agent is told they weren't posted (#640 R3-3).
+            const heldUnsaid = cutThinkPrivate && !liveProseRouting && !cut!.calls.some((call) => call.name === 'think')
+              && cut!.content.slice(cut!.start).some((b) => b.type === 'text' && !!(b as { text?: string }).text?.trim());
+            const HELD_UNSAID = 'What you wrote before it wasn\'t posted either: under your same-round think policy it\'s kept back ' +
+              'in case it was written beside think, and nothing keeps it for you to send later. If that call wasn\'t think, ' +
+              'send what should go out again.';
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
             if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
               generationLost = true;
@@ -29411,13 +29428,19 @@ export class AgentFramework {
               agent.toolResultGuard.storeResults(cutResults.blocks, cutResults.wire, cutResults.completed,
                 this.silentTurnRowMetadata(agent.name), cutResults.keptCap);
               agent.toolResultGuard.settleTurnEnded();
+              if (heldUnsaid) {
+                storeOwnRow(agent, 'user', [{
+                  type: 'text',
+                  text: `[${NOTICE_TAG.toolBoundary}] Your response was cut off at the output limit while a call after these was being written. ${HELD_UNSAID}`,
+                }], { system: true, kind: 'cut-off-held-words', ...this.silentTurnRowMetadata(agent.name) });
+              }
             } else if (cut?.unnamed) {
               // The agent's own row, as the contained-wrapper notice above is
               // (#291's audience stamp): presented to it as it is stored.
               storeOwnRow(agent, 'user', [{
                 type: 'text',
                 text: `[${NOTICE_TAG.toolBoundary}] Your response was cut off at the output limit inside a tool-call block, before any call in it ` +
-                  'was named, so nothing ran. To make a call, send less in one response.',
+                  'was named, so nothing ran. To make a call, send less in one response.' + (heldUnsaid ? ` ${HELD_UNSAID}` : ''),
               }], { system: true, kind: 'cut-off-tool-block', ...this.silentTurnRowMetadata(agent.name) });
             }
 
