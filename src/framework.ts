@@ -15120,8 +15120,9 @@ export class AgentFramework {
     const isBarrier = (m: StoredMessage) => hasBlock(m, 'system_change') || isRewindMarker(m);
     // The call body the result body `start..end` is paired with, if any.
     //
-    // Right before it (no row between): that body, whatever the IDs say.
-    // This is the rule from before #737, kept as it was: stored rows whose
+    // Right before it (no row between): an eligible, barrier-free call body,
+    // whatever the IDs say.
+    // This preserves the pre-#737 ID/proximity rule: stored rows whose
     // IDs are wrong or missing (corrupt or legacy) still leave as one
     // exchange, which the exhaustion breaker's shed relies on.
     //
@@ -15133,9 +15134,14 @@ export class AgentFramework {
     // notices), a system_change or a rewind marker ends the walk unpaired,
     // and call and result are then shed one at a time, as every
     // call and result across a gap were before #737.
+    // A result shard may be stored but uncarried; that exception does not
+    // make a separate hidden notice shard traversable in the same body.
+    const hiddenNotice = (m: StoredMessage) => m.metadata?.system
+      && !isReasoningLoss(m.metadata) && !this.agentSees(agent, m.metadata)
+      && !hasBlock(m, 'tool_result');
     const pairedCall = (start: number, end: number) => {
       const body = all.slice(start, end + 1);
-      if (body.some(isBarrier) || !body.some((m) => hasBlock(m, 'tool_result'))) return undefined;
+      if (body.some((m) => isBarrier(m) || hiddenNotice(m)) || !body.some((m) => hasBlock(m, 'tool_result'))) return undefined;
       // null once a result in the interval has no usable ID.
       let resultIds: Set<string> | null = new Set<string>();
       const collectResults = (from: number, to: number) => {
@@ -15153,7 +15159,7 @@ export class AgentFramework {
         const turn = bodyRangeIn(all, i);
         const rows = all.slice(turn.from, turn.to + 1);
         // Barriers apply to every body, including mixed call/result bodies.
-        if (rows.some(isBarrier)) return undefined;
+        if (rows.some((m) => isBarrier(m) || hiddenNotice(m))) return undefined;
         if (rows.some((m) => hasBlock(m, 'tool_use'))) {
           // A visible narration shard cannot make a hidden tool call visible.
           // Removal still takes the whole body, not just its visible shards.
@@ -15177,10 +15183,14 @@ export class AgentFramework {
     for (let i = all.length - 1; i >= 0;) {
       const { from: start, to: bodyEnd } = bodyRangeIn(all, i);
       const body = all.slice(start, bodyEnd + 1);
-      // Visit each body once, not each passed-over shard. A body is the
-      // unit of pairing AND removal, even with heterogeneous metadata.
+      // Visit each candidate body once, not each passed-over shard.
+      // Pairing still repeats backward walks across distinct candidates.
+      // A body is the unit of pairing AND removal, even with heterogeneous metadata.
       i = start - 1;
       if (body.some(isBarrier)) continue;
+      // The carried-call exception admits stored results, not a new call
+      // in an uncarried mixed result/call body. Do not split that body.
+      if (body.some((m) => hasBlock(m, 'tool_use')) && !wasCarried(start, bodyEnd)) continue;
       const call = pairedCall(start, bodyEnd);
       const resultOfCarriedCall = call !== undefined && wasCarried(call.from, call.to);
       // Visibility gates selection, not each member of a paired exchange:

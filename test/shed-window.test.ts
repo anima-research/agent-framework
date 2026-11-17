@@ -214,12 +214,23 @@ for (const gap of [false, true]) {
     const result = h.internals.addMessage('user', [
       { type: 'tool_result', toolUseId: 'exchange-call', content: 'exchange-result' } as ContentBlock,
     ]);
-    const other = await h.compiled('oren');
-    h.internals.shedNewestTurn(h.agent('mira'));
     h.framework.start();
+    h.framework.pushEvent(input('before-question', ['mira']));
+    await until(() => h.membrane.callsFor('mira').length === 1, 'before-shed request');
+    await h.framework.runUntilIdle();
+    const beforeWire = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+    for (const witness of ['exchange-call', 'exchange-result', 'exchange-signature', 'exchange-narration']) {
+      assert.ok(beforeWire.includes(witness), `before-wire carries ${witness}`);
+    }
+    const other = await h.compiled('oren');
+    // The completed reply and its input are newer; shed both first.
+    h.internals.shedNewestTurn(h.agent('mira'));
+    h.internals.shedNewestTurn(h.agent('mira'));
+    const shed = h.internals.shedNewestTurn(h.agent('mira'));
+    assert.ok(shed?.removedIds.includes(call) && shed.removedIds.includes(result));
     h.framework.pushEvent(input('next-question', ['mira']));
-    await until(() => h.membrane.callsFor('mira').length === 1, 'next request');
-    const sent = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+    await until(() => h.membrane.callsFor('mira').length === 2, 'next request');
+    const sent = JSON.stringify(h.membrane.callsFor('mira')[1]!.messages);
     assert.doesNotMatch(sent, /exchange-call|exchange-result|exchange-signature|exchange-narration/);
     assert.match(sent, /keep-before/);
     assert.match(sent, /next-question/);
@@ -765,3 +776,73 @@ it('raw legacy reasoning-loss notices omitted by compile do not orphan signed ca
   assert.ok(cm.getMessage(prefix));
   assert.equal(cm.windowMode(), 'legacy');
 });
+
+for (const mode of ['windowed', 'raw'] as const) {
+  for (const carriedMixed of [false, true]) {
+    it(`uncarried mixed result/call body is not a stored-result exception (${mode}, carried: ${carriedMixed})`, async () => {
+      const h = await boot({ failWriteDown: mode === 'raw' });
+      const call = h.internals.addMessage('mira', [{ type: 'tool_use', id: 'old-a', name: 'shell', input: {} } as ContentBlock]);
+      const mixed = h.internals.addMessage('user', [
+        { type: 'tool_result', toolUseId: 'old-a', content: 'old result' } as ContentBlock,
+        { type: 'tool_use', id: 'new-b', name: 'shell', input: {} } as ContentBlock,
+      ]);
+      const latest = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'new-b', content: 'new result' } as ContentBlock]);
+      assert.deepEqual(h.cm('mira').getMessage(mixed)!.content.map((b) => b.type), ['tool_result', 'tool_use']);
+      const record = h.internals.shedNewestTurn(h.agent('mira'), new Set([call, ...(carriedMixed ? [mixed] : [])]));
+      assert.deepEqual(record?.removedIds, carriedMixed ? [latest, mixed] : [call]);
+      if (!carriedMixed) for (const id of [mixed, latest]) {
+        assert.ok(h.cm('mira').getMessage(id));
+        if (mode === 'windowed') assert.equal(h.cm('mira').windowStatusOf(id), 'in');
+      }
+    });
+  }
+
+  for (const hidden of [false, true]) {
+    it(`notice-only shard inside a sibling result body is a visibility barrier (${mode}, hidden: ${hidden})`, async () => {
+      const h = await boot({ failWriteDown: mode === 'raw' });
+      const cm = h.cm('mira');
+      const call = h.internals.addMessage('mira', [{ type: 'tool_use', id: 'notice-a', name: 'shell', input: {} } as ContentBlock]);
+      const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: MessageId } } }).messageStore;
+      // CM validates/readbacks this heterogeneous body; normal chunking repeats metadata.
+      const sibling = store.append('user', [{ type: 'tool_result', toolUseId: 'notice-a', content: 'sibling' }], {}, undefined,
+        { bodyGroupId: 'notice-shards', shardIndex: 0 }).id;
+      const notice = store.append('user', [text('notice-shard')], { system: true, ...(hidden ? { tuneOut: { epochId: 'held' } } : {}) }, undefined,
+        { bodyGroupId: 'notice-shards', shardIndex: 1 }).id;
+      if (mode === 'windowed') cm.presentRows([sibling]);
+      const latest = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'notice-a', content: 'latest' } as ContentBlock]);
+      assert.equal(cm.getMessage(notice)!.metadata!.system, true);
+      assert.deepEqual(cm.getAllMessages().filter((m) => [sibling, notice].includes(m.id)).map((m) => m.bodyGroupId), ['notice-shards', 'notice-shards']);
+      assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'), new Set([call, latest]))?.removedIds,
+        hidden ? [latest] : [latest, notice, sibling, call]);
+      if (hidden) for (const id of [call, sibling, notice]) {
+        assert.ok(cm.getMessage(id));
+        if (mode === 'windowed') assert.equal(cm.windowStatusOf(id), 'in');
+      }
+    });
+  }
+
+  for (const component of ['utf8', 'call', 'signature', 'escaping', 'image'] as const) {
+    it(`stored exchange descriptor distinguishes ${component} bytes (${mode})`, async () => {
+      const h = await boot({ failWriteDown: mode === 'raw' });
+      const payload = component === 'utf8' ? '界'.repeat(4096) : component === 'escaping' ? '\n"\\'.repeat(4096) : 'x'.repeat(12 * 1024);
+      const callContent: ContentBlock[] = [
+        { type: 'thinking', thinking: '', signature: component === 'signature' ? payload : 'sig' } as ContentBlock,
+        { type: 'tool_use', id: 'size-a', name: 'shell', input: { value: component === 'call' ? payload : '' } } as ContentBlock,
+      ];
+      const call = h.internals.addMessage('mira', callContent);
+      const noticeContent = component === 'image'
+        ? [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: payload } } as ContentBlock]
+        : [text(component === 'utf8' || component === 'escaping' ? payload : 'notice')];
+      const notice = h.internals.addMessage('user', noticeContent, { system: true });
+      const result = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'size-a', content: 'tiny' } as ContentBlock]);
+      const rows = [call, notice, result].map((id) => h.cm('mira').getMessage(id)!);
+      const bytes = rows.reduce((n, m) => n + Buffer.byteLength(JSON.stringify(m.content)), 0);
+      assert.ok(bytes > 12 * 1024, 'non-result component dominates, not tiny result');
+      if (component === 'utf8') assert.ok(bytes > rows.reduce((n, m) => n + JSON.stringify(m.content).length, 0) * 2);
+      if (component === 'escaping') assert.ok(bytes > payload.length * 1.5);
+      const record = h.internals.shedNewestTurn(h.agent('mira'));
+      assert.deepEqual(record?.removedIds, [result, notice, call]);
+      assert.equal(record?.descriptor, `a tool exchange (~${Math.round(bytes / 1024)}KB${component === 'image' ? ', 1 image(s)' : ''})`);
+    });
+  }
+}
