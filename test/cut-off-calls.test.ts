@@ -855,6 +855,16 @@ describe("the private think policy without a channel registry, across a restart,
     assert.ok(afterCut(run).includes(HELD));
   });
 
+  // A `>>>skip_reply !` hold ends with its response: the continuation's
+  // plain words route (the public twin shows it), so held ones are told.
+  it("says the held round's words weren't posted in a continuation after a response that ended on >>>skip_reply !", async () => {
+    const pub = await turn('xml', [{ xml: '>>>skip_reply ! Just a note to myself.', stop: 'end_turn' }, { xml: 'Now north, everyone.', stop: 'end_turn' }], { proseRouting: 'hybrid' });
+    assert.deepEqual(pub.routed, ['Now north, everyone.', NEXT], "premise: the continuation's words route");
+    const run = await turn('xml', [{ xml: '>>>skip_reply ! Just a note to myself.', stop: 'end_turn' }, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the continuation was cut, and told so');
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
   it("says the held round's words weren't posted when the earlier >>>skip_reply sat beside a private think (its text routes nothing)", async () => {
     const thinkRound: Reply = { xml: '>>>skip_reply Mumbling.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n', stop: 'stop_sequence' };
     const run = await turn('xml', [thinkRound, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' }, { thinkContinues: true });
