@@ -640,7 +640,7 @@ const admission = (fw: AgentFramework): Admission => (fw.healthSnapshot() as { a
 async function framework(path: string, membrane: WaitingMembrane) {
   const fw = await AgentFramework.create({
     storePath: path, membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system', primaryWaitsForAuxiliary: true }],
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
   return { fw, internal: fw as unknown as Internal };

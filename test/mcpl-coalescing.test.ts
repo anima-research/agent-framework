@@ -1284,8 +1284,8 @@ type TurnInternals = {
 };
 
 const TWO_RESIDENTS = [
-  { name: 'agent', model: 'test', systemPrompt: 'test' },
-  { name: 'other', model: 'test', systemPrompt: 'test' },
+  { name: 'agent', model: 'test', systemPrompt: 'test', primaryWaitsForAuxiliary: true },
+  { name: 'other', model: 'test', systemPrompt: 'test', primaryWaitsForAuxiliary: true },
 ];
 
 /** A trigger filter under which a push whose text says 'quiet' triggers no inference. */

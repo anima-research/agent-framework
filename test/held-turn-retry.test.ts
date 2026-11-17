@@ -102,7 +102,7 @@ type Internal = {
 async function framework(path: string, membrane: ScriptedMembrane, extra: Record<string, unknown> = {}) {
   const fw = await AgentFramework.create({
     storePath: path, membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system', primaryWaitsForAuxiliary: true }],
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     ...extra,
   });
@@ -589,7 +589,7 @@ for (const site of ['after-compile', 'throw'] as const) test(`an agent that a li
       : new ScriptedMembrane(new Set(), () => new Error('unused'));
     // 'lead' owns default delivery, so 'resident' can be stopped.
     const { fw, internal } = await framework(path, membrane, {
-      agents: [{ name: 'lead', model: 'zz-model', systemPrompt: 'system' }, { name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+      agents: [{ name: 'lead', model: 'zz-model', systemPrompt: 'system' }, { name: 'resident', model: 'zz-model', systemPrompt: 'system', primaryWaitsForAuxiliary: true }],
       ...(site === 'throw' ? { providerHold: () => ({ holdMs: 60_000, reason: 'zz-host-hold' }) } : {}),
     });
     let stopped = false;

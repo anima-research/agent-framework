@@ -1397,7 +1397,7 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
 
     await framework.resume();
     await waitFor('requeued wake to run after resume', () => membrane.calls.length === 1);
-  });
+  }, { primaryWaitsForAuxiliary: true });
 });
 
 test('quiesce survives a historical rollback + restart (host mode lives outside branch history)', async () => {

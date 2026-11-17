@@ -76,6 +76,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   let ticks = 0;
   fw.agents = new Map([['cairn', {
     name: 'cairn',
+    primaryWaitsForAuxiliary: true,
     refusalHandling: { maxRewinds: 3 },
     getContextManager: () => ({
       addMessage: opts?.addMessage ?? ((_p: string, content: any[], meta: any) => { markers.push({ text: content[0].text, meta }); }),

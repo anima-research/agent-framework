@@ -27518,7 +27518,7 @@ export class AgentFramework {
     if (ownsProviderGate && !providerGateAlreadyHeld) {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
-      if (gate.auxiliaryInFlight > 0) {
+      if (agent.primaryWaitsForAuxiliary && gate.auxiliaryInFlight > 0) {
         // Do not await inside processInferenceRequests: one slow auxiliary call for
         // this resident must not block events or other residents. Admission stays
         // owned and the continuation receives it after the in-flight call settles.
