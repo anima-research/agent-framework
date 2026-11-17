@@ -908,6 +908,16 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(await breakerAfterTimerTurns(r), undefined, "m-1's turn completed, so no retry continues it");
   });
 
+  it('the poison-history breaker\'s retry, after a channel message\'s turn ended by a tool and three timer turns failed, has no channel: nothing is published', async (t) => {
+    const r = await rig(t, { framework: { gate: QUIET_AMBIENT } as never });
+    r.streams.push(() => new MockYieldingStream([createMockResponse([{ type: 'tool_use', id: 'skip-1', name: 'skip_reply', input: { reason: 'nothing to add' } } as ContentBlock])]));
+    await r.incoming(ROOM, 'm-1');
+    await eventually(() => r.f.membrane.calls.length === 1, "premise: m-1's turn ran");
+    await r.f.framework.runUntilIdle();
+    assert.equal(r.f.published.length, 0, "premise: m-1's turn ended at its skip_reply, and published nothing");
+    assert.equal(await breakerAfterTimerTurns(r), undefined, "m-1's turn ended, so no retry continues it");
+  });
+
   it('the poison-history breaker\'s retry, after an operator stopped a channel message\'s turn and three timer turns failed, has no channel: nothing is published', async (t) => {
     const r = await rig(t, { framework: { gate: QUIET_AMBIENT } as never });
     r.streams.push(() => new RunsUntilStopped());
