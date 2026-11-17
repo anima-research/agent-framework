@@ -27518,7 +27518,7 @@ export class AgentFramework {
     if (ownsProviderGate && !providerGateAlreadyHeld) {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
-      if (gate.auxiliaryInFlight > 0) {
+      if (agent.primaryWaitsForAuxiliary && gate.auxiliaryInFlight > 0) {
         // Do not await inside processInferenceRequests: one slow auxiliary call for
         // this resident must not block events or other residents. Admission stays
         // owned and the continuation receives it after the in-flight call settles.
@@ -27599,7 +27599,9 @@ export class AgentFramework {
     // The last admission boundary before this primary call. With the gate
     // held and no auxiliary call in flight, no new provider wait can be
     // recorded for this agent before the call (auxiliary admission waits on
-    // the gate). But one may have been recorded since the scheduler's check:
+    // the gate). A resident that starts beside an auxiliary call in flight
+    // (primaryWaitsForAuxiliary off) is checked again after its compile, as
+    // a conversation agent is. But one may have been recorded since the scheduler's check:
     // an auxiliary call this wake parked behind can fail with a stated wait
     // on the primary model. That wait binds this wake too: hold it, don't call.
     // A conversation agent's waits are recorded and held as a resident's are
@@ -28633,9 +28635,13 @@ export class AgentFramework {
       }
       // A conversation agent takes no provider gate, so its own compression
       // can record a wait while this turn compiles, after the last boundary
-      // checked. Check its waits again here, where nothing has been sent, and
-      // hold the turn as the boundary would rather than send it into the wait.
-      if (this.registry.homeChannel(agent.name) !== undefined) {
+      // checked. So can a resident's whose turn starts beside an auxiliary
+      // call in flight (primaryWaitsForAuxiliary off): that call can fail
+      // with a stated wait during the compile. Check the waits again here,
+      // where nothing has been sent, and hold the turn as the boundary would
+      // rather than send it into the wait. A resident's gate goes back at the
+      // start's end (startAgentStream's finally).
+      if (this.registry.homeChannel(agent.name) !== undefined || (ownsProviderGate && !agent.primaryWaitsForAuxiliary)) {
         const wait = this.providerWaits?.active(agent.name, agent.model);
         // The turn has begun (inference:started), so the hold keeps its retry.
         if (wait && this.holdForProviderWait(agent, wait, trigger ? [this.turnRetryOf(withTurnCarry(trigger, carry), routing)] : [], false, () => {

@@ -399,6 +399,20 @@ export interface AgentConfig {
   toolWrapperProseGuard?: boolean;
 
   /**
+   * Whether a turn waits for this agent's auxiliary call (context-manager
+   * compression through provider admission) already in flight to end before
+   * its own call starts. Default false: the turn starts beside it, and can
+   * compile before that call's summary lands. A new auxiliary call waits
+   * while a turn holds admission either way. Turn it
+   * on for an agent whose provider limits how fast input tokens per minute
+   * may grow, where a compression call in flight can cost the larger primary
+   * call its admission (#114). It applies to an agent that owns its provider
+   * scheduling, a resident: a conversation agent takes neither side of the
+   * gate, so the setting does nothing for it.
+   */
+  primaryWaitsForAuxiliary?: boolean;
+
+  /**
    * Continue on the agent's own turn ending (off when left out): a turn the
    * model ends itself (stop reason `end_turn` or `stop_sequence`), whether
    * its last response is prose or empty, is followed by another turn,

@@ -44,7 +44,7 @@ describe('Turn trigger provenance', () => {
     return AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', primaryWaitsForAuxiliary: true }],
       modules: [],
     });
   }

@@ -196,7 +196,7 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `toolWrapperProseGuard`, `primaryWaitsForAuxiliary`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
@@ -243,6 +243,12 @@ export function assertAgentSwitches(config: AgentConfig): void {
     config.toolWrapperProseGuard,
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
+  );
+  assertBooleanSetting(
+    `${agent} primaryWaitsForAuxiliary`,
+    config.primaryWaitsForAuxiliary,
+    'true holds a turn\'s start until the agent\'s compression call in flight ends, ' +
+      'and false or leaving it out starts the turn beside it',
   );
   assertBooleanSetting(
     `${agent} turnInputsPin`,
@@ -359,6 +365,9 @@ export class Agent {
   readonly proseLock: string | undefined;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** A turn's start waits for an auxiliary call in flight (see
+   *  AgentConfig.primaryWaitsForAuxiliary). Default off. */
+  readonly primaryWaitsForAuxiliary: boolean;
   /** Continuation after a turn the model ends itself (see
    *  AgentConfig.autoContinue); undefined when off. */
   readonly autoContinue: { maxConsecutive: number } | undefined;
@@ -504,6 +513,7 @@ export class Agent {
     this.proseRouting = config.proseRouting ?? 'locus';
     this.proseLock = typeof config.proseLock === 'string' && config.proseLock.trim() ? config.proseLock.trim() : undefined;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.primaryWaitsForAuxiliary = config.primaryWaitsForAuxiliary === true;
     this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
