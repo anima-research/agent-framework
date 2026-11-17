@@ -80,7 +80,7 @@ interface Run {
   audit: Array<Record<string, any>>;
 }
 
-async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: { registry?: boolean; targets?: string[] } = {}): Promise<Run> {
+async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: { registry?: boolean; targets?: string[]; thinkContinues?: boolean } = {}): Promise<Run> {
   const requests: string[] = [];
   const queue = [...replies];
   const server: Server = createServer((req, res) => {
@@ -139,7 +139,9 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
     getChannelTools: () => [],
     channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
     nameShown: (channel: { channelId: string }) => channel.channelId,
-    handleChannelToolCall: async () => {
+    handleChannelToolCall: async (name: string) => {
+      // A think that answers and lets the turn go on, where a row needs one.
+      if (opts.thinkContinues && name === 'think') return { success: true, data: { noted: true } };
       skipReplies++;
       return { success: true, endTurn: true, data: { skipped: true } };
     },
@@ -850,6 +852,19 @@ describe("the private think policy without a channel registry, across a restart,
 
   it("says the held round's words weren't posted when the cut round's own >>> target lifts an earlier >>>skip_reply", async () => {
     const run = await turn('xml', [XML_PRIVATE_EAST, { xml: '>>>world:commons Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when the earlier >>>skip_reply sat beside a private think (its text routes nothing)", async () => {
+    const thinkRound: Reply = { xml: '>>>skip_reply Mumbling.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [thinkRound, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' }, { thinkContinues: true });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when a malformed >>> after an earlier >>>skip_reply lifted the hold", async () => {
+    const malformed: Reply = { xml: '>>>skip_reply Just a note to myself.\n>>>\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [malformed, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
     assert.ok(afterCut(run).includes(HELD));
   });
 
