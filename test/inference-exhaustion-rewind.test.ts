@@ -120,7 +120,9 @@ test("the breaker's retry of a turn that answered a message and gathered a batch
   const { fw, restore } = makeHarness();
   const room = { serverId: 'discord', channelId: 'discord:g:room' };
   const channels = [room, { serverId: 'discord', channelId: 'discord:g:side' }];
-  fw.turnRouting = new Map([['cairn', { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels }]]);
+  const routing = { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels };
+  fw.turnRouting = new Map([['cairn', routing]]);
+  fw.answeredTurns.set(fw.agents.get('cairn'), routing);
   try {
     for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
   } finally { restore(); }
@@ -128,6 +130,20 @@ test("the breaker's retry of a turn that answered a message and gathered a batch
   const retry = fw.pendingRequests[0];
   assert.equal(retry.reason, 'inference-failure-rewind-retry');
   assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], ['discord:g:room', 'discord', 'm-7'], 'the answered message and its channel');
+  assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
+});
+
+test("the breaker's retry, where the latest turn's message is no longer the agent's unfinished turn, answers no message and keeps the turn's wake channels", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const channels = [room, { serverId: 'discord', channelId: 'discord:g:side' }];
+  fw.turnRouting = new Map([['cairn', { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], [undefined, undefined, undefined], 'no channel and no message');
   assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
 });
 
