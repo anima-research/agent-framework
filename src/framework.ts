@@ -8966,6 +8966,7 @@ export class AgentFramework {
     const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before } = args;
     const stream = args.stream ?? closes;
     const durationMs = Date.now() - startTime;
+    if (closes && this.answeredTurns.get(agent) === closes) this.answeredTurns.delete(agent);
     if (stream) this.abandonAgentScripts(agent.name, 'stream cancelled', stream);
     agent.reset();
     // A stopped turn hands its tool-result batch to no successor, so abandon
@@ -28955,7 +28956,10 @@ export class AgentFramework {
       } catch (error) {
         console.error(`[usage] agent=${agent.name} could not record a stream's usage at its end: ${describeFailureWithFrames(error)}`);
       }
-      if (turnEnded) this.endRefusalEpisode(agent.name);
+      if (turnEnded) {
+        this.endRefusalEpisode(agent.name);
+        if (this.answeredTurns.get(agent) === streamRouting) this.answeredTurns.delete(agent);
+      }
     });
     // Membrane usage events are cumulative across the native/XML tool loop.
     // Keep the previous cumulative sample so consumers that operate at the
@@ -30313,6 +30317,7 @@ export class AgentFramework {
               }
             } else {
               this.endRefusalEpisode(agent.name);
+              if (this.answeredTurns.get(agent) === streamRouting) this.answeredTurns.delete(agent);
             }
 
             // Dispatch speech (and thoughts if any)
@@ -36185,7 +36190,7 @@ export class AgentFramework {
     return (this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages()).some((m) => {
       const row = m.metadata as { messageId?: unknown; serverId?: unknown; channelId?: unknown } | undefined;
       return isConversationalInjection(m.metadata) && row?.messageId !== undefined && row.messageId !== null && String(row.messageId) === answers.messageId
-        && row.serverId === answers.channel.serverId && row.channelId === answers.channel.channelId;
+        && row.serverId === answers.channel.serverId && row.channelId === answers.channel.channelId && this.agentSees(agent, m.metadata);
     });
   }
 
