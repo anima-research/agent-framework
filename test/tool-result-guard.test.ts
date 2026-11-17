@@ -1333,7 +1333,7 @@ class OmitToolExchange extends PassthroughStrategy {
   }
 }
 
-test('a staged batch omitted by compilation does not claim the refusal; autoRewind proceeds', async () => {
+test('a staged batch omitted by compilation settles without claiming refusal; unsettled recovery declines', async () => {
   const h = await harness([[calls('one')], [refused()], [answer()]], {
     toolResultGuard: true, maxStreamTokens: 1, strategy: new OmitToolExchange(),
     refusalHandling: { autoRewind: true },
@@ -1344,9 +1344,14 @@ test('a staged batch omitted by compilation does not claim the refusal; autoRewi
     assert.equal(guard.hasPending, false, 'unsubmitted batch must be settled, not stranded');
     assert.equal(guard.recovering, false);
     assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
-    assert.equal(h.membrane.requests.length, 3, 'ordinary refusal rewind retry must run');
+    assert.equal(h.membrane.requests.length, 2, 'no automatic recovery retry while guard settlement is not idle');
     const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
-    assert.ok(JSON.stringify(messages).includes(`[${NOTICE_TAG.refusalRewind}]`));
+    assert.ok(!JSON.stringify(messages).includes(`[${NOTICE_TAG.refusalRewind}]`), 'no marker or claimed successful step');
+    const cm = h.framework.getAgent('assistant')!.getContextManager();
+    for (const m of messages.filter((m) => m.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result'))) {
+      assert.equal(cm.windowStatusOf(m.id), 'in', 'guard settlement never permits one-endpoint recovery');
+    }
+    assert.equal((h.framework as any).pendingRequests.length, 0);
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     assert.ok(audit.some((r) => r.type === 'withheld' && r.reason === 'unsubmitted'));
   } finally { await h.framework.stop(); }

@@ -8,8 +8,8 @@
  * refused the request's content or size (shedMayHelp: an invalid_request at
  * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
  * breaker auto-quarantines: sheds the newest complete exchange (the same
- * shedNewestTurn primitive the refusal auto-rewind and /unstick use; an
- * unpaired result across a barrier is shed alone), drops ONE marker, and
+ * planning/removal contract the refusal auto-rewind and /unstick use;
+ * unsupported exchanges decline unchanged), drops ONE marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
  * never eat the whole history.
  */
@@ -28,6 +28,8 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const added: Array<{ content: any[]; meta: any }> = [];
   const cm = {
     getAllMessages: () => messages,
+    currentBranch: () => ({ name: 'main' }),
+    getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
     removeMessage: (id: string) => {
       removed.push(id);
       const i = messages.findIndex((m) => m.id === id);
@@ -53,6 +55,8 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   };
 
   const fw = Object.create(AgentFramework.prototype) as any;
+  fw.registry = { get: () => ({ relationships: { observes: [] } }), ownSlotOf: () => ({ namespace: null }) };
+  fw.pendingAssistantBlocks = new Map();
   fw.storeSees = new WeakMap(); // No view filter on this synthetic raw manager.
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
@@ -63,7 +67,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
   fw.agents = new Map([['cairn', {
-    name: 'cairn',
+    name: 'cairn', state: { status: 'idle' }, toolResultGuard: { hasPending: false, idle: true },
     refusalHandling: { maxRewinds: opts?.maxRewinds ?? 3 },
     getContextManager: () => cm,
   }]]);
@@ -94,7 +98,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
 
   const marker = added.find(isRewindMarker);
   assert.ok(marker, 'rewind marker added');
-  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 most recent turn\(s\) were set aside because the requests that carried them couldn't be completed\. Their content isn't shown here, and the originals remain in the raw record\. You are clear to continue/);
+  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 most recent turn\(s\) were set aside because the requests that carried them couldn't be completed\. Their content isn't shown here, and the originals were removed from the raw record\. You are clear to continue/);
   assert.doesNotMatch(marker!.content[0].text, /tool_use ids|refus|filter|rejecting the conversation/i, "the marker carries none of the provider's words");
   assert.ok(String(marker!.meta.category).includes('tool_use ids must have a corresponding tool_result'), 'the record keeps them');
 
@@ -222,7 +226,7 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   } finally { restore(); }
   assert.equal(removed.length, 0);
   assert.equal(fw.pendingRequests.length, 0, 'no retry queued when nothing was repaired');
-  assert.ok(errs.some((e) => e.includes('nothing left to shed')));
+  assert.ok(errs.some((e) => e.includes('nothing eligible to shed')));
 });
 
 // Anarchid's review of membrane #56 (M3): from #56 (in membrane 0.5.87, below

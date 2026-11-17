@@ -1,0 +1,1 @@
+- Refuse standalone recovery and `/unstick` while a logical turn is alive, including asynchronous starts and queued, parked or held continuations, before opening a forced session or queuing a probe. Current terminal refusal and exhaustion recovery remain supported.

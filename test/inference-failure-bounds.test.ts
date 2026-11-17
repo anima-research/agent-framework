@@ -80,6 +80,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
     getContextManager: () => ({
       addMessage: opts?.addMessage ?? ((_p: string, content: any[], meta: any) => { markers.push({ text: content[0].text, meta }); }),
       tick: async () => { ticks++; await opts?.tick?.(); },
+      currentBranch: () => ({ name: 'main' }),
     }),
   }]]);
   const errs: string[] = [];
@@ -236,7 +237,8 @@ test('every cut of failure text keeps surrogate pairs whole and states the whole
         const exhausted = makeHarness({ partway: true });
         exhausted.fw.inferenceFailureEscalationThreshold = 1;
         const rewound: string[] = [];
-        exhausted.fw.shedNewestTurn = () => ({ descriptor: 'zz-turn' });
+        exhausted.fw.planNewestTurn = () => ({ kind: 'ready', branch: 'main' });
+        exhausted.fw.applyShed = () => ({ kind: 'applied', record: { descriptor: 'zz-turn', removedIds: ['zz'] } });
         exhausted.fw.updateRewindMarker = (_agent: unknown, category: string) => { rewound.push(category); return 1; };
         try {
           exhausted.fw.noteInferenceExhausted('cairn', text, false, 'invalid_request');

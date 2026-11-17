@@ -946,7 +946,7 @@ describe('live operator surgery', () => {
   });
 
   // The call body right before the result body, and, for #737, with a system
-  // notice between them, which goes with the exchange.
+  // notice between them, which Option B retains separately from the exchange.
   for (const gap of [false, true]) it(`a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one retract (notice between: ${gap})`, async () => {
     // As context-manager's chunker stores them: the tool_use block on the
     // turn's first shard, text after it; then the result, also a body.
@@ -980,17 +980,18 @@ describe('live operator surgery', () => {
       const record = internals.shedNewestTurn(framework.getAgent('scout'));
       assert.ok(record);
       assert.equal(record.descriptor, 'a tool exchange (~1KB)');
-      assert.deepEqual(record.removedIds, [result[1], result[0], ...notice, turn[1], turn[0]]);
+      assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
       // Ported for #291 (AF-7): on a presented window the exchange leaves
       // the window in one call, each body by its first shard, as an undone
       // turn's; the record keeps it.
-      assert.deepEqual(retracts, [[[turn[0], ...notice, result[0]], { undone: true }]], "one retract, the turn's body and the result's");
+      assert.deepEqual(retracts, [[[turn[0], result[0]], { undone: true }]], "one retract, the turn's body and the result's");
       assert.deepEqual(ranges, [], 'nothing removed from the record');
     } finally {
       c.removeMessages = original;
       c.retractRows = originalRetract;
     }
-    for (const id of [...turn, ...notice, ...result]) assert.equal(cm().windowStatusOf(id as never), 'undone');
+    for (const id of [...turn, ...result]) assert.equal(cm().windowStatusOf(id as never), 'undone');
+    for (const id of notice) assert.equal(cm().windowStatusOf(id as never), 'in', 'separate notice survives recovery');
     assert.equal(cm().getMessageCount(), 9 + notice.length, 'the record keeps the exchange');
   });
 

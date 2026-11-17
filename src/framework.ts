@@ -3368,6 +3368,12 @@ interface RewindRecord {
   removedIds: MessageId[];
 }
 
+type ShedPlan = { kind: 'empty' } | { kind: 'unsupported'; reason: string } | {
+  kind: 'ready'; rows: StoredMessage[]; heads: MessageId[]; windowed: boolean;
+  branch: string; cleanup: StoredMessage[]; record: RewindRecord;
+};
+type ShedOutcome = { kind: 'applied'; record: RewindRecord } | { kind: 'stopped'; reason: string; record?: RewindRecord };
+
 /** How an agent's `/unstick` came out, as `unstick-outcome` answers it: at the
  *  session's end, or at a turn that fails inside the session, which ends
  *  nothing (`turn-failed`). Labels only: a refusal's category, a failed
@@ -15032,246 +15038,177 @@ export class AgentFramework {
     }
   }
 
-  /**
-   * Shed the newest turn: take the newest message that isn't a system
-   * message, and that reached a request, out of what the agent is sent,
-   * whoever wrote it, with the rest of its exchange (the tool_use turn
-   * paired with a tool result, and the whole of a body stored in shards).
-   *
-   * A tool result is paired with the call body right before it, whatever
-   * their IDs. With system notices or other result bodies of the same call
-   * between them (#737) it is paired by ID instead: with the nearest call
-   * body back across those rows, when that body holds every result ID in
-   * between. The exchange then goes as one interval, and the notices
-   * inside it go with it: a notice is never shed for itself, these leave
-   * the agent's window, or the record on a window that is still the
-   * record. A rewind marker is never taken that way: it ends the walk, as
-   * a system_change does and any row that is neither a system notice nor
-   * a result body (one the agent is not sent included). Hidden notices
-   * (except obsolete reasoning-loss notices, which no request renders) and hidden calls, including calls in a partly visible body,
-   * also end the walk; matching stored results may go
-   * with their carried call even when the request did not carry them.
-   * An exchange that is not paired is not taken as one: its rows are shed one at a time,
-   * newest that counts first, as before #737, which is the result where
-   * it counts, its call staying until a later shed, and the call where
-   * the result is passed over.
-   *
-   * With `carried` (the stored bodies a refused request's compile carried,
-   * by each body's first message id), only a message that request carried
-   * counts, or the stored result of a call it carried, which goes with that
-   * call as one exchange; a row that carries nothing a request sends
-   * (asNextRequestCarries) is passed over and left in place. It adds no
-   * marker; the caller keeps one consolidated marker for the episode
-   * (updateRewindMarker). The returned record's descriptor says what was
-   * set aside and its size, never the content. Returns null when nothing
-   * that counts is left.
-   *
-   * On a presented window (#291) the shed is the window's: the newest rows
-   * of the agent's own window, in its order, leave it as an undone turn's
-   * do (retractRows with `undone`), so no presentation point brings them
-   * back, and the record keeps them, as the marker says. No other agent's
-   * window, nor its cache prefix or signed thinking, changes. A row the
-   * agent is never sent is passed over for selection: a system_change row, a row a
-   * tune-out holds from residents (for an agent whose window leaves them
-   * out), and another agent's stored context injection. On a window that is
-   * still the record, the rows are removed from it, as before the index,
-   * and leave every other window that held them.
-   *
-   * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
-   * the shed after inference exhaustion (quarantinePoisonedHistory).
-   */
-  private shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): RewindRecord | null {
-    const cm = agent.getContextManager();
-    const windowed = this.presents(agent);
-    const all = windowed ? cm.getPresentedMessages() : cm.getAllMessages();
-    const typeOf = (b: unknown) => (b as { type?: string }).type;
-    const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
-      Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
-    // In either path, the rows the agent is sent: a held row is in a
-    // resident's written-down window and left out by its view, as another
-    // agent's injection is (agentSees, the one rule main's #853 asks
-    // everywhere), and a system_change row is the host's.
-    const passedOver = (m: StoredMessage): boolean => {
-      const meta = (m.metadata ?? {}) as Record<string, unknown>;
-      if (meta.system) return true;
-      return hasBlock(m, 'system_change') || !this.agentSees(agent, m.metadata);
-    };
-
-    // We shed strictly newest-first, in sequence (in window order on a
-    // presented window) — INCLUDING the agent's own turns (poison lives in
-    // tool_use/narration turns too), because newest-first reaches whatever is
-    // poisoning the context if allowed to run deep enough. The one invariant:
-    // shed COMPLETE exchanges. Shedding a `tool_result` also sheds its paired
-    // `tool_use` assistant turn, so a paired exchange never leaves an
-    // orphaned tool_use / signed `thinking` block — which the API rejects
-    // with a 400 ("thinking blocks in the latest assistant message cannot be
-    // modified"). A result pairedCall finds no call for is the exception:
-    // the two are shed one at a time, newest that counts first, so a call
-    // can stay until a later shed. We do NOT add a marker here; the caller
-    // keeps one consolidated marker (updateRewindMarker).
-    const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
-    // A rewind marker (updateRewindMarker stores every one with this kind):
-    // the episode's consolidated one, or an earlier episode's, which is its
-    // durable record. Never part of a rewound interval: the caller edits
-    // the episode's in place right after this shed, and the raw fallback's
-    // range removal would delete it.
-    const isRewindMarker = (m: StoredMessage) =>
-      (m.metadata as { kind?: unknown } | undefined)?.kind === 'refusal-rewind';
-    const isBarrier = (m: StoredMessage) => hasBlock(m, 'system_change') || isRewindMarker(m);
-    // The call body the result body `start..end` is paired with, if any.
-    //
-    // Right before it (no row between): an eligible, barrier-free call body,
-    // whatever the IDs say.
-    // This preserves the pre-#737 ID/proximity rule: stored rows whose
-    // IDs are wrong or missing (corrupt or legacy) still leave as one
-    // exchange, which the exhaustion breaker's shed relies on.
-    //
-    // Across a gap, proximity proves nothing, so IDs decide. The walk goes
-    // back over system notices and sibling result bodies only, to the
-    // nearest call body, and pairs when every result ID in the interval is
-    // a non-empty string that body holds. Any other row (one the agent is
-    // not sent included, except matching results and obsolete reasoning-loss
-    // notices), a system_change or a rewind marker ends the walk unpaired,
-    // and call and result are then shed one at a time, as every
-    // call and result across a gap were before #737.
-    // A result shard may be stored but uncarried; that exception does not
-    // make a separate hidden notice shard traversable in the same body.
-    const hiddenNotice = (m: StoredMessage) => m.metadata?.system
-      && !isReasoningLoss(m.metadata) && !this.agentSees(agent, m.metadata)
-      && !hasBlock(m, 'tool_result');
-    const pairedCall = (start: number, end: number) => {
-      const body = all.slice(start, end + 1);
-      if (body.some((m) => isBarrier(m) || hiddenNotice(m)) || !body.some((m) => hasBlock(m, 'tool_result'))) return undefined;
-      // null once a result in the interval has no usable ID.
-      let resultIds: Set<string> | null = new Set<string>();
-      const collectResults = (from: number, to: number) => {
-        for (const m of all.slice(from, to + 1)) {
-          for (const b of Array.isArray(m.content) ? m.content : []) {
-            if (b.type !== 'tool_result') continue;
-            const id = (b as { toolUseId?: unknown }).toolUseId;
-            if (typeof id === 'string' && id) resultIds?.add(id);
-            else resultIds = null;
+  /** Read-only, bounded whole-body recovery. Unsupported is not empty: never
+   * remove one endpoint and hope that another budget step repairs the other.
+   * Standalone planning requires no logical turn ownership, including queued,
+   * parked and held continuations. Terminal callers may recover their own
+   * completed/failed turn before its token is released; guard work still blocks.
+   * This snapshot does not fence arbitrary future writers. */
+  private planNewestTurn(
+    agent: Agent, carried?: ReadonlySet<MessageId>, refusedReplyId?: MessageId,
+    boundary: 'standalone' | 'terminal-refusal' | 'terminal-exhaustion' = 'standalone',
+  ): ShedPlan {
+    const unsupported = (reason: string): ShedPlan => ({ kind: 'unsupported', reason });
+    try {
+      if (agent.toolResultGuard.hasPending || !agent.toolResultGuard.idle
+        || this.pendingAssistantBlocks.has(agent.name) || agent.state.status === 'waiting_for_tools') {
+        return unsupported('unsettled tool round');
+      }
+      if (boundary === 'standalone' && this.logicalTurnAlive(agent)) return unsupported('live assistant round');
+      if (boundary !== 'terminal-refusal' && agent.state.status !== 'idle') return unsupported('live assistant round');
+      const cm = agent.getContextManager();
+      const windowed = this.presents(agent);
+      const raw = cm.getAllMessages();
+      const source = windowed ? cm.getPresentedMessages() : raw;
+      const blocks = (m: StoredMessage) => Array.isArray(m.content) ? m.content : [];
+      const has = (m: StoredMessage, t: string) => blocks(m).some((b) => b.type === t);
+      const barrier = (m: StoredMessage) => has(m, 'system_change') || m.metadata?.kind === 'refusal-rewind';
+      const reader = readerFacts(this.registry, agent.name);
+      const intended = (m: StoredMessage) => bearingOf(m, { ...reader, hidesHeld: false }, 'own') !== 'elsewhere';
+      const visible = (m: StoredMessage) => intended(m) && this.agentSees(agent, m.metadata);
+      const bodies = (rows: StoredMessage[]) => {
+        const out: StoredMessage[][] = [];
+        for (let i = 0; i < rows.length;) {
+          const range = bodyRangeIn(rows, i);
+          out.push(rows.slice(range.from, range.to + 1));
+          i = range.to + 1;
+        }
+        return out;
+      };
+      let cleanup: StoredMessage[] = [];
+      if (refusedReplyId !== undefined) {
+        cleanup = bodies(raw).find((body) => body.some((m) => m.id === refusedReplyId)) ?? [];
+        if (!cleanup.length || cleanup.some((m) => barrier(m) || m.metadata?.system || !visible(m)
+          || has(m, 'tool_use') || has(m, 'tool_result'))) return unsupported('unsafe refused reply body');
+      }
+      const excluded = new Set(cleanup.map((m) => m.id));
+      // Exclusion is body-aligned, verified above; no writes before planning.
+      const sourceRuns = bodies(source);
+      if (sourceRuns.some((b) => b.some((m) => excluded.has(m.id)) && b.some((m) => !excluded.has(m.id)))) {
+        return unsupported('inconsistent refused reply body');
+      }
+      const runs = sourceRuns.filter((b) => !b.some((m) => excluded.has(m.id)));
+      const rawRuns = bodies(raw);
+      const calls = (body: StoredMessage[]) => body.flatMap((m) => blocks(m).filter((b) => b.type === 'tool_use'));
+      const results = (body: StoredMessage[]) => body.flatMap((m) => blocks(m).filter((b) => b.type === 'tool_result'));
+      const carriedBody = (body: StoredMessage[]) => !carried || body.some((m) => carried.has(m.id));
+      const notice = (body: StoredMessage[]) => body.every((m) => !barrier(m) && m.metadata?.system
+        && (visible(m) || isReasoningLoss(m.metadata)) && !has(m, 'tool_use') && !has(m, 'tool_result'));
+      const witness = (body: StoredMessage[]) => body.some((m) => !barrier(m) && !m.metadata?.system && visible(m)
+        && asNextRequestCarries(blocks(m)) !== null);
+      const callId = (b: ContentBlock) => (b as { id?: unknown }).id;
+      const resultId = (b: ContentBlock) => (b as { toolUseId?: unknown }).toolUseId;
+      const valid = (id: unknown): id is string => typeof id === 'string' && id.trim().length > 0;
+      const carriedCalls = new Set(runs.filter(carriedBody).flatMap(calls).map(callId).filter(valid));
+      let selected: StoredMessage[][] | undefined;
+      let tool = false;
+      for (let i = runs.length - 1; i >= 0; i--) {
+        const body = runs[i];
+        const cs = calls(body), rs = results(body);
+        // Stored result-only bodies may answer a carried call even when they
+        // were not on the refused wire. Mixed bodies never lend eligibility.
+        const answersCarried = !cs.length && rs.some((r) => {
+          const id = resultId(r);
+          return valid(id) && carriedCalls.has(id);
+        });
+        if (!(carriedBody(body) && witness(body)) && !answersCarried) continue;
+        if (!cs.length && !rs.length) { selected = [body]; break; }
+        tool = true;
+        if (cs.length && rs.length) return unsupported('mixed call/result body');
+        const ids = (cs.length ? cs.map(callId) : rs.map(resultId));
+        if (!ids.every(valid) || new Set(ids).size !== ids.length) return unsupported('invalid or ambiguous tool IDs');
+        // Check the entire stored snapshot for the selected IDs, including
+        // newer skipped/held bodies. No proximity exception or recursive graph.
+        const callBodies = rawRuns.filter((b) => calls(b).some((c) => ids.some((id) => id === callId(c))));
+        if (callBodies.length !== 1) return unsupported('missing or ambiguous call body');
+        const call = callBodies[0];
+        const callIds = calls(call).map(callId);
+        if (!callIds.every(valid) || new Set(callIds).size !== callIds.length || results(call).length) {
+          return unsupported('invalid or mixed call body');
+        }
+        if (!carriedBody(call)) return unsupported('call not carried');
+        if (rawRuns.some((b) => b !== call && calls(b).some((c) => callIds.some((id) => id === callId(c))))) {
+          return unsupported('reused call IDs');
+        }
+        const answers = rawRuns.filter((b) => results(b).some((r) => callIds.some((id) => id === resultId(r))));
+        const answerIds = answers.flatMap((b) => results(b).map(resultId));
+        if (answerIds.length !== callIds.length || new Set(answerIds).size !== callIds.length
+          || !answerIds.every((id) => valid(id) && callIds.includes(id))) return unsupported('incomplete or ambiguous results');
+        selected = [call, ...answers];
+        const positions = selected.map((b) => runs.findIndex((r) => r.length === b.length && r.every((m, k) => m.id === b[k].id)));
+        if (positions.some((p) => p < 0) || positions.slice(1).some((p) => p <= positions[0])) return unsupported('endpoint outside ordered window');
+        for (const b of positions.map((p) => runs[p])) {
+          if (calls(b).length && results(b).length) return unsupported('mixed call/result body');
+          if (b.some((m) => barrier(m) || m.metadata?.system || !intended(m) || (!visible(m)
+            && (m.metadata?.contextInjection || !has(m, 'tool_result') || blocks(m).some((b) => b.type !== 'tool_result'))))) {
+            return unsupported('hidden content or marker in tool body');
           }
         }
-      };
-      collectResults(start, end);
-      for (let i = start - 1; i >= 0;) {
-        const turn = bodyRangeIn(all, i);
-        const rows = all.slice(turn.from, turn.to + 1);
-        // Barriers apply to every body, including mixed call/result bodies.
-        if (rows.some((m) => isBarrier(m) || hiddenNotice(m))) return undefined;
-        if (rows.some((m) => hasBlock(m, 'tool_use'))) {
-          // A visible narration shard cannot make a hidden tool call visible.
-          // Removal still takes the whole body, not just its visible shards.
-          if (rows.some((m) => hasBlock(m, 'tool_use') && passedOver(m))) return undefined;
-          if (turn.to === start - 1) return turn;
-          // Across a gap, results in a mixed call/result body belong to
-          // the interval too. Keep the legacy adjacent rule above unchanged.
-          collectResults(turn.from, turn.to);
-          const calls = new Set(rows.flatMap((m) => Array.isArray(m.content)
-            ? m.content.filter((b) => b.type === 'tool_use').map((b) => (b as { id: string }).id) : []));
-          return resultIds !== null && [...resultIds].every((id) => calls.has(id)) ? turn : undefined;
+        const chosen = new Set(positions);
+        for (let p = positions[0]; p <= Math.max(...positions); p++) {
+          if (!chosen.has(p) && !notice(runs[p])) return unsupported('barrier between tool endpoints');
         }
-        if (rows.some((m) => hasBlock(m, 'tool_result'))) collectResults(turn.from, turn.to);
-        else if (!rows.every((m) => m.metadata?.system
-          && (isReasoningLoss(m.metadata) || this.agentSees(agent, m.metadata)))) return undefined;
-        i = turn.from - 1;
+        // Use window order, not raw storage order, for trace and accounting.
+        selected = positions.sort((a, b) => a - b).map((p) => runs[p]);
+        break;
       }
-      return undefined;
-    };
-    let idx = -1;
-    for (let i = all.length - 1; i >= 0;) {
-      const { from: start, to: bodyEnd } = bodyRangeIn(all, i);
-      const body = all.slice(start, bodyEnd + 1);
-      // Visit each candidate body once, not each passed-over shard.
-      // Pairing still repeats backward walks across distinct candidates.
-      // A body is the unit of pairing AND removal, even with heterogeneous metadata.
-      i = start - 1;
-      if (body.some(isBarrier)) continue;
-      // The carried-call exception admits stored results, not a new call
-      // in an uncarried mixed result/call body. Do not split that body.
-      if (body.some((m) => hasBlock(m, 'tool_use')) && !wasCarried(start, bodyEnd)) continue;
-      const call = pairedCall(start, bodyEnd);
-      const resultOfCarriedCall = call !== undefined && wasCarried(call.from, call.to);
-      // Visibility gates selection, not each member of a paired exchange:
-      // a stored result not itself carried still goes with its carried call.
-      if (!body.some((m) => !passedOver(m)) && !resultOfCarriedCall) continue;
-      // Visibility and request content must have the same shard witness;
-      // a held nonempty shard cannot lend content to visible whitespace.
-      if (body.some((m) => (!passedOver(m) || resultOfCarriedCall)
-        && Array.isArray(m.content) && asNextRequestCarries(m.content) !== null)
-        && (wasCarried(start, bodyEnd) || resultOfCarriedCall)) {
-        idx = bodyEnd; break;
+      if (!selected) return { kind: 'empty' };
+      const rows = selected.flat();
+      // No whole-body removal may absorb hidden/foreign siblings, or notices.
+      if (!tool && rows.some((m) => barrier(m) || m.metadata?.system || !visible(m))) return unsupported('heterogeneous body');
+      const rawPositions = rows.map((m) => raw.findIndex((r) => r.id === m.id));
+      if (!windowed && rawPositions.some((p, i) => i > 0 && p !== rawPositions[i - 1] + 1)) {
+        return unsupported('legacy removal is not contiguous');
       }
-    }
-    if (idx < 0) return null;
-    // The newest message can be the last shard of a body (a document stored
-    // in shards). context-manager removes, and takes out of a window, a
-    // shard only with the rest of its body, so the rewind takes the whole
-    // body.
-    const first = bodyRangeIn(all, idx).from;
-    const members = all.slice(first, idx + 1);
-    const msg = all[idx];
-    const md = (msg.metadata ?? {}) as {
-      messageId?: unknown; system?: unknown;
-    };
+      const content = rows.flatMap(blocks);
+      const images = content.filter((b) => b.type === 'image').length;
+      const chars = content.filter((b) => b.type === 'text').reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
+      const bytes = rows.reduce((n, m) => n + Buffer.byteLength(JSON.stringify(m.content) ?? ''), 0);
+      const last = rows[rows.length - 1];
+      const descriptor = tool ? `a tool exchange (~${Math.max(1, Math.round(bytes / 1024))}KB${images ? `, ${images} image(s)` : ''})`
+        : `${last.metadata?.messageId ? 'an incoming message from' : 'a'} ${last.participant}${last.metadata?.messageId ? '' : ' turn'} (${chars} chars${images ? `, ${images} image(s)` : ''})`;
+      return { kind: 'ready', rows, heads: selected.map((b) => b[0].id), windowed,
+        branch: cm.currentBranch().name, cleanup, record: { descriptor, removedIds: rows.map((m) => m.id).reverse() } };
+    } catch { return unsupported('snapshot unavailable'); }
+  }
 
-    const content = members.flatMap((m) => (Array.isArray(m.content) ? m.content : []));
-    const toolBlocks = content.filter((b) => typeOf(b) === 'tool_result');
-    const images = content.filter((b) => typeOf(b) === 'image').length;
-    const textLen = content
-      .filter((b) => typeOf(b) === 'text')
-      .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
-
-    // Determine the complete exchange to shed, newest first.
-    const removedIds: MessageId[] = members.map((m) => m.id).reverse();
-    // Where the exchange starts: this body, or the tool_use turn paired with it.
-    let from = first;
-    // Each body by its first shard, which names it to retractRows.
-    const heads: MessageId[] = [all[first]!.id];
-    let descriptor: string;
-    if (toolBlocks.length > 0) {
-      // The whole body, as the selection above read it.
-      const turn = pairedCall(first, bodyRangeIn(all, idx).to);
-      if (turn) {
-        from = turn.from;
-        // Include intervening notices in the rewound interval (none when
-        // the call is right before the result). This is also the raw
-        // fallback's single atomic range removal; report every row it
-        // removes, and use the same interval in a presented window.
-        removedIds.length = 0;
-        appendAll(removedIds, all.slice(from, idx + 1).map((m) => m.id).reverse());
-        heads.length = 0;
-        for (let i = from; i <= idx;) {
-          heads.push(all[i]!.id);
-          i = bodyRangeIn(all, i).to + 1;
+  /** No replay after a throwing write. Readback distinguishes not-applied
+   * from committed, but a post-commit exception still stops the caller: the
+   * notifications/cleanup/marker are NOT part of the CM batch transaction. */
+  private applyShed(agent: Agent, plan: Extract<ShedPlan, { kind: 'ready' }>): ShedOutcome {
+    const cm = agent.getContextManager();
+    try {
+      if (cm.currentBranch().name !== plan.branch) return { kind: 'stopped', reason: 'branch changed' };
+      if (plan.windowed) cm.retractRows(plan.heads, { undone: true });
+      else removeStoredMessages(cm, plan.rows[0], plan.rows[plan.rows.length - 1]);
+      if (cm.currentBranch().name !== plan.branch) return { kind: 'stopped', reason: 'branch changed after removal', record: plan.record };
+    } catch {
+      let reason = 'removal outcome unknown';
+      let record: RewindRecord | undefined;
+      try {
+        if (cm.currentBranch().name === plan.branch) {
+          const states = plan.rows.map((m) => plan.windowed
+            ? cm.windowStatusOf(m.id) === 'undone' && cm.ordinalOf(m.id) === undefined
+            : cm.getMessage(m.id) === null);
+          if (states.every(Boolean)) { reason = 'removal committed but notification outcome uncertain'; record = plan.record; }
+          else if (states.every((x) => !x)) reason = 'removal not confirmed';
         }
-      }
-      // Approximate stored content bytes for the interval actually removed,
-      // not just the newest result: sibling results, call and notices count.
-      const exchange = all.slice(from, idx + 1);
-      const sz = exchange.reduce((n, m) => n + Buffer.byteLength(JSON.stringify(m.content) ?? ''), 0);
-      const exchangeImages = exchange.reduce((n, m) => n + (Array.isArray(m.content)
-        ? m.content.filter((b) => typeOf(b) === 'image').length : 0), 0);
-      descriptor = `a tool exchange (~${Math.max(1, Math.round(sz / 1024))}KB` +
-        `${exchangeImages ? `, ${exchangeImages} image(s)` : ''})`;
-    } else if (md.messageId) {
-      descriptor = `an incoming message from ${msg.participant} ` +
-        `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
-    } else {
-      descriptor = `a ${msg.participant} turn ` +
-        `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
+      } catch { /* unknown: never replay */ }
+      return { kind: 'stopped', reason, record };
     }
-    if (windowed) {
-      // One call for the whole exchange, so it is never half applied.
-      cm.retractRows(heads, { undone: true });
-      this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...removedIds].reverse(), reason: 'shed' });
-      return { descriptor, removedIds };
-    }
-    // One removal for the whole exchange, so it is never half applied.
-    removeStoredMessages(cm, all[from], msg);
-    this.retractRemovedElsewhere(cm, removedIds, 'rewind');
-    return { descriptor, removedIds };
+    try {
+      if (plan.windowed) this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...plan.record.removedIds].reverse(), reason: 'shed' });
+      else this.retractRemovedElsewhere(cm, plan.record.removedIds, 'rewind');
+    } catch { return { kind: 'stopped', reason: 'removal applied; notification failed', record: plan.record }; }
+    return { kind: 'applied', record: plan.record };
+  }
+
+  /** Direct internal seam; callers needing a decline reason use plan/apply. */
+  private shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): RewindRecord | null {
+    const plan = this.planNewestTurn(agent, carried);
+    if (plan.kind !== 'ready') return null;
+    const outcome = this.applyShed(agent, plan);
+    return outcome.kind === 'applied' ? outcome.record : null;
   }
 
   /**
@@ -15293,7 +15230,8 @@ export class AgentFramework {
     const text =
       `[${NOTICE_TAG.refusalRewind}] The ${count} most recent turn(s) were set aside because ` +
       `the requests that carried them couldn't be completed. Their content isn't shown here, ` +
-      `and the originals remain in the raw record. You are clear to continue — if you ` +
+      (this.presents(agent) ? `and the originals remain in the raw record. ` : `and the originals were removed from the raw record. `) +
+      `You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
@@ -15699,6 +15637,10 @@ export class AgentFramework {
       if (agent.state.status !== 'idle') {
         return { ok: false, error: `Cannot unstick while agent is ${agent.state.status}` };
       }
+      const preflight = this.planNewestTurn(agent);
+      if (preflight.kind !== 'ready') return {
+        ok: false, error: `Cannot unstick: ${preflight.kind === 'unsupported' ? preflight.reason : 'nothing eligible to shed'}`,
+      };
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
       const left = this.unstickWaiters.get(agentName);
@@ -30396,18 +30338,36 @@ export class AgentFramework {
                 onStep: (count: number) => void,
                 onGiveUp: () => void,
               ): void => {
-                const cm = agent.getContextManager();
-                // The refused reply leaves the record, and every other window
-                // that held it with it (#291's removal propagation).
-                if (refusedReplyId !== undefined && cm.getMessage(refusedReplyId)) {
-                  this.retractRemovedElsewhere(cm, removeStoredMessage(cm, refusedReplyId), 'rewind');
-                }
                 if (!budgetLeft) { onGiveUp(); return; }
-                const rec = this.shedNewestTurn(agent, this.streamCarried.get(stream));
-                if (!rec) { onGiveUp(); return; }
-                const count = this.updateRewindMarker(agent, category);
-                onStep(count);
-                if (forced) forced.removed.push(rec);
+                const plan = this.planNewestTurn(agent, this.streamCarried.get(stream), refusedReplyId, 'terminal-refusal');
+                if (plan.kind !== 'ready') {
+                  console.error(`[refusal-rewind] agent=${agent.name} stopped: ${plan.kind === 'unsupported' ? `unsupported: ${plan.reason}` : 'nothing eligible to shed'}`);
+                  onGiveUp(); return;
+                }
+                const outcome = this.applyShed(agent, plan);
+                // Account for confirmed removal even if a subsequent write
+                // fails. Never claim a cleared session or retry uncertainty.
+                if (outcome.record) {
+                  onStep((this.rewindEpisode.get(agent.name)?.count ?? 0) + 1);
+                  if (forced) forced.removed.push(outcome.record);
+                }
+                if (outcome.kind !== 'applied') {
+                  console.error(`[refusal-rewind] agent=${agent.name} stopped: ${outcome.reason}`);
+                  onGiveUp(); return;
+                }
+                const cm = agent.getContextManager();
+                try {
+                  if (cm.currentBranch().name !== plan.branch) throw new Error('branch changed');
+                  if (plan.cleanup.length) {
+                    removeStoredMessages(cm, plan.cleanup[0], plan.cleanup[plan.cleanup.length - 1]);
+                    this.retractRemovedElsewhere(cm, plan.cleanup.map((m) => m.id), 'rewind');
+                  }
+                  if (cm.currentBranch().name !== plan.branch) throw new Error('branch changed');
+                  this.updateRewindMarker(agent, category);
+                } catch {
+                  console.error(`[refusal-rewind] agent=${agent.name} removal applied; cleanup/marker outcome uncertain — stopped`);
+                  onGiveUp(); return;
+                }
                 this.pendingRequests.push({
                   agentName: agent.name,
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
@@ -30445,10 +30405,11 @@ export class AgentFramework {
                   () => {
                     console.error(
                       `[refusal-rewind] agent=${agent.name} gave up: ` +
-                        `${used >= cap ? `cap ${cap} reached` : 'nothing left to shed'}`,
+                        `${used >= cap ? `cap ${cap} reached` : 'recovery stopped (see disposition above)'}`,
                     );
-                    this.refusalRewinds.set(agent.name, 0);
-                    this.rewindEpisode.delete(agent.name);
+                    // Preserve confirmed step accounting and the existing
+                    // marker on decline/cap/failure. A non-refusal completion
+                    // ends the episode; declining is not a fresh budget.
                   },
                 );
               }
@@ -36296,18 +36257,29 @@ export class AgentFramework {
       return;
     }
 
-    const rec = this.shedNewestTurn(agent);
-    if (!rec) {
-      console.error(
-        `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
-        `history holds only system markers and rows a request leaves empty. Manual repair needed.`,
-      );
+    // The exhaustion handler owns this terminal failure, whose token may
+    // still be installed until teardown. This is not standalone admission.
+    const plan = this.planNewestTurn(agent, undefined, undefined, 'terminal-exhaustion');
+    if (plan.kind !== 'ready') {
+      console.error(`[inference-rewind] agent=${agent.name} stopped: ${plan.kind === 'unsupported' ? `unsupported: ${plan.reason}` : 'nothing eligible to shed'}. Manual repair needed.`);
       return;
     }
-
-    this.exhaustionRewinds.set(agent.name, used + 1);
-    const count = this.updateRewindMarker(
-      agent, boundFailureText(wholeReason, REWIND_MARKER_REASON_MAX_CHARS), 'inference-failure');
+    const outcome = this.applyShed(agent, plan);
+    if (outcome.record) this.exhaustionRewinds.set(agent.name, used + 1);
+    if (outcome.kind !== 'applied') {
+      console.error(`[inference-rewind] agent=${agent.name} stopped: ${outcome.reason}. Manual repair needed.`);
+      return;
+    }
+    const rec = outcome.record;
+    let count: number;
+    try {
+      if (agent.getContextManager().currentBranch().name !== plan.branch) throw new Error('branch changed');
+      count = this.updateRewindMarker(
+        agent, boundFailureText(wholeReason, REWIND_MARKER_REASON_MAX_CHARS), 'inference-failure');
+    } catch {
+      console.error(`[inference-rewind] agent=${agent.name} removal applied; marker outcome uncertain — stopped. Manual repair needed.`);
+      return;
+    }
     console.error(
       `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
       `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +

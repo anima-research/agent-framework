@@ -16,7 +16,7 @@ const REWIND_TAG = `[${NOTICE_TAG.refusalRewind}]`;
  * The refusal auto-rewind sheds the newest turn (in sequence, newest first,
  * INCLUDING the agent's own turns) as a COMPLETE exchange — a tool_result is
  * removed together with its paired tool_use turn and signed thinking. An
- * unpaired result across a barrier is shed alone. It maintains ONE consolidated
+ * unsupported exchange declines unchanged. It maintains ONE consolidated
  * marker per episode.
  */
 function makeAgentHarness(messages: any[]) {
@@ -25,6 +25,8 @@ function makeAgentHarness(messages: any[]) {
   const edited: Array<{ id: string; content: any[] }> = [];
   const cm = {
     getAllMessages: () => messages,
+    currentBranch: () => ({ name: 'main' }),
+    getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
     removeMessage: (id: string) => {
       removed.push(id);
       const i = messages.findIndex((m) => m.id === id);
@@ -50,9 +52,13 @@ function makeAgentHarness(messages: any[]) {
     },
   };
   const fw = Object.create(AgentFramework.prototype) as any;
+  fw.registry = { get: () => ({ relationships: { observes: [] } }), ownSlotOf: () => ({ namespace: null }) };
+  fw.pendingAssistantBlocks = new Map();
+  fw.activeTurnTokens = new Map();
+  fw.activeStreams = new Map();
   fw.storeSees = new WeakMap(); // No view filter on this synthetic raw manager.
   fw.rewindEpisode = new Map();
-  const agent = { name: 'labclaude', getContextManager: () => cm };
+  const agent = { name: 'labclaude', state: { status: 'idle' }, toolResultGuard: { hasPending: false, idle: true }, getContextManager: () => cm };
   return { fw, agent, removed, added, edited, messages };
 }
 
@@ -353,23 +359,35 @@ test('a message injected into the refused round is the newest turn it carried, a
   } finally { await rig.close(); }
 });
 
-test('an exchange the refused request carried only by its call is shed whole', async () => {
-  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });
+// Compatibility disposition: an uncarried resident result is supported (the
+// real-store positive lives in shed-window); an UNPRESENTED result cannot join
+// one atomic retractRows batch. Preserve this old setup as a decline witness.
+test('a carried call with a stored unpresented result declines without creating a reverse orphan', async () => {
+  const partial = 'unsupported-refusal-retained';
+  const rig = await rewindRig([[], [refused()], [refused(partial)]], { autoRewind: true, maxRewinds: 3 });
   try {
     await rig.say('first question', 1);
     const cm = rig.framework.getAgent('scout')!.getContextManager();
-    cm.addMessage('scout', [text('let me look'), { type: 'tool_use', id: 'look-9', name: 'surface--look', input: {} } as ContentBlock]);
-    cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'look-9', content: 'what the tool saw' } as ContentBlock], { tuneOut: { epochId: 'held' } } as never);
-    await rig.say('second question', 4);
+    const call = cm.addMessage('scout', [text('let me look'), { type: 'tool_use', id: 'look-9', name: 'surface--look', input: {} } as ContentBlock]);
+    const result = cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'look-9', content: 'what the tool saw' } as ContentBlock], { tuneOut: { epochId: 'held' } } as never);
+    await rig.say('second question', 3);
     const refusedRequest = JSON.stringify(rig.requests[1]!.messages);
-    assert.ok(refusedRequest.includes('look-9') && !refusedRequest.includes('what the tool saw'), 'the premise: the refused request carried the call and not its stored result');
-    const retry = rig.requests[3]!;
-    assert.ok(!JSON.stringify(retry.messages).includes('look-9'), 'the call is gone');
-    // Read onto #291: a shed is the window's (the record keeps what it sets
-    // aside), so the result goes with its call out of the agent's window.
-    const result = rig.stored().find((m) => JSON.stringify(m.content).includes('what the tool saw'))!;
-    assert.notEqual(cm.windowStatusOf(result.id), 'in', 'and so is its result, from the window');
-    assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+    assert.ok(refusedRequest.includes('look-9') && !refusedRequest.includes('what the tool saw'), 'old premise: request carried call but not its stored result');
+    assert.equal(rig.requests.length, 3, 'first rewind sheds second question; next refusal declines with no immediate retry');
+    assert.equal(cm.windowStatusOf(call), 'in', 'no call-only removal / future reverse orphan');
+    assert.equal(cm.windowStatusOf(result), 'out', 'no forced presentation of the absent result');
+    assert.ok(cm.getMessage(call) && cm.getMessage(result), 'both raw endpoints remain');
+    assert.ok(rig.stored().some((m) => JSON.stringify(m.content).includes(partial)), 'no reply-only cleanup on decline');
+    const marker = rig.stored().filter((m) => m.metadata?.kind === 'refusal-rewind');
+    assert.equal(marker.length, 1);
+    assert.match(JSON.stringify(marker[0]!.content), /The 1 most recent turn/);
+    assert.equal((rig.framework as any).refusalRewinds.get('scout'), 1, 'decline preserves actual step accounting, not a fresh cap');
+    assert.equal((rig.framework as any).rewindEpisode.get('scout').count, 1);
+    assert.equal((rig.framework as any).pendingRequests.length, 0);
+    await rig.framework.runUntilIdle();
+    assert.equal(cm.windowStatusOf(call), 'in');
+    assert.equal(cm.windowStatusOf(result), 'out', 'later rest does not accidentally present the held result');
+    assert.match(JSON.stringify((await cm.compile(undefined, undefined, { dryRun: true })).messages), /look-9/, 'the call stays available if its result is delivered later');
   } finally { await rig.close(); }
 });
 
@@ -413,7 +431,7 @@ test('a message stored after the refused request was sent is neither removed nor
   } finally { await rig.close(); }
 });
 
-test('when no turn the refused request carried is left, the rewind removes only the refused reply, and no later request carries it', async () => {
+test('with no eligible target, recovery stops without endpoint-only refused-reply cleanup', async () => {
   const partial = 'Here is the start of an answer';
   const rig = await rewindRig([[refused()], [refused(partial)]], { autoRewind: true, maxRewinds: 3 });
   try {
@@ -423,11 +441,11 @@ test('when no turn the refused request carried is left, the rewind removes only 
     assert.ok(!rig.texts(rig.requests[1]!).some((t) => t.includes('the only question')), 'the premise: the retry carried no turn but the marker');
     await rig.say('a new question', 3);
     assert.equal(rig.requests.length, 3, 'the refused request, its refused retry, and the next turn');
-    assert.ok(!rig.texts(rig.requests[2]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+    assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes(partial)), 'no target removal means no reply-only cleanup');
   } finally { await rig.close(); }
 });
 
-test("when the rewind gives up at its cap, no later request carries the refused reply's text", async () => {
+test("at the rewind cap, no endpoint-only refused-reply cleanup is attempted", async () => {
   const partial = 'Here is the start of an answer';
   const rig = await rewindRig([[], [refused()], [refused(partial)]], { autoRewind: true, maxRewinds: 1 });
   try {
@@ -436,7 +454,7 @@ test("when the rewind gives up at its cap, no later request carries the refused 
     assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes(REWIND_TAG)), 'the premise: one rewind ran, and its retry was refused');
     await rig.say('a new question', 4);
     assert.equal(rig.requests.length, 4, 'the turn, the refused request, its refused retry, and the next turn');
-    assert.ok(!rig.texts(rig.requests[3]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+    assert.ok(rig.texts(rig.requests[3]!).some((t) => t.includes(partial)), 'at cap, no reply-only cleanup');
     assert.ok(rig.texts(rig.requests[3]!).some((t) => t.includes('reply 1')), 'and still carries the history before the shed turn');
   } finally { await rig.close(); }
 });
@@ -495,7 +513,7 @@ test("/unstick after a refusal whose reply had text sheds that reply first, sinc
   } finally { await rig.close(); }
 });
 
-test("when /unstick gives up at its cap, no later request carries the refused reply's text", async () => {
+test("at the /unstick cap, no endpoint-only refused-reply cleanup is attempted", async () => {
   const partial = 'Here is the start of an answer';
   const rig = await rewindRig([[], [refused()], [refused()], [refused(partial)]], {});
   try {
@@ -511,7 +529,7 @@ test("when /unstick gives up at its cap, no later request carries the refused re
     assert.ok(markerOf(rig.requests[3]!), 'the premise: the retry followed a rewind');
     await rig.say('a new question', 5);
     assert.equal(rig.requests.length, 5, 'the unstick gave up, and the next turn ran');
-    assert.ok(!rig.texts(rig.requests[4]!).some((t) => t.includes(partial)), "the next request doesn't carry the refused reply");
+    assert.ok(rig.texts(rig.requests[4]!).some((t) => t.includes(partial)), 'at cap, no reply-only cleanup');
     assert.ok(rig.texts(rig.requests[4]!).some((t) => t.includes('reply 1')), 'and still carries the history before the shed turn');
   } finally { await rig.close(); }
 });
