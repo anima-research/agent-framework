@@ -832,6 +832,8 @@ describe("the private think policy without a channel registry, across a restart,
   // that hold, and the sentence comes back.
   const XML_PRIVATE_EAST: Reply = { xml: '>>>skip_reply Just a note to myself.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
   it("says nothing of held words after a hybrid >>>skip_reply earlier in the response", async () => {
+    const pub = await turn('xml', [XML_PRIVATE_EAST, { xml: 'Now north, everyone.', stop: 'end_turn' }], { proseRouting: 'hybrid' });
+    assert.ok(!pub.routed.some((t) => t.includes('Now north')), `premise: the hold keeps them private: ${pub.routed.join(' | ')}`);
     const run = await turn('xml', [XML_PRIVATE_EAST, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
     assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
     assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
@@ -876,6 +878,24 @@ describe("the private think policy without a channel registry, across a restart,
     const malformed: Reply = { xml: '>>>skip_reply Just a note to myself.\n>>>\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
     const run = await turn('xml', [malformed, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
     assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // The fresh reader's R4 finds: explicit routing sends a `>>` destination's
+  // words, and a destination with no words after it sends nothing.
+  it("says the held round's words weren't posted under explicit routing when they had a >> destination", async () => {
+    const cutTo: Reply = { xml: '>>world:commons Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const pub = await turn('xml', [XML_EAST_ROUND, cutTo], { proseRouting: 'explicit' }, { targets: ['world:commons'] });
+    assert.ok(pub.routed.includes('Now north, everyone.'), `premise: the destination routes them: ${pub.routed.join(' | ')}`);
+    const run = await turn('xml', [XML_EAST_ROUND, cutTo], { ...PRIVATE, proseRouting: 'explicit' }, { targets: ['world:commons'] });
+    assert.ok(!run.routed.some((t) => t.includes('Now north')));
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words when a hybrid cut held only a >>> destination with no words", async () => {
+    const headerOnly: Reply = { xml: '>>>world:commons\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const run = await turn('xml', [XML_EAST_ROUND, headerOnly], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
   });
 
   it("says nothing of held words under the public policy", async () => {
