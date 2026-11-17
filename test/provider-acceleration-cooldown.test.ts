@@ -239,10 +239,20 @@ test('a turn starts beside an auxiliary call in flight when the agent leaves pri
   const auxiliary = internal.withAuxiliaryAdmission('resident', () => new Promise<void>((resolve) => {
     finish = resolve;
   }));
+  // The turn's call is answered, not only its stream made: a start held after
+  // its compile makes a stream too, and cancels it unsent.
+  let completed = 0;
+  framework.onTrace((event) => {
+    if (event.type === 'inference:completed' && (event as { agentName?: string }).agentName === 'resident') completed++;
+  });
   try {
     await internal.startAgentStream(framework.getAgent('resident')!);
-    await sleep(20);
-    assert.equal(membrane.calls.length, 1, 'the turn reaches the provider while the auxiliary call is still in flight');
+    const deadline = performance.now() + LONGER_THAN_ANY_START_MS;
+    while (completed === 0) {
+      assert.ok(performance.now() < deadline, 'the turn completes while the auxiliary call is still in flight');
+      await sleep(10);
+    }
+    assert.equal(membrane.calls.length, 1, 'one call, made beside the auxiliary call');
   } finally {
     finish();
     await auxiliary;

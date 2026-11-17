@@ -896,7 +896,7 @@ test("a start parked behind an auxiliary call whose failure arms a host's hold m
   });
 });
 
-test("holdRequest's merge rule, pinned in a state no public path reaches (a host's hold an auxiliary call armed, with nothing held, beside a turn whose call is in flight): a duplicate of the turn's wake that the hold keeps is marked when the turn fails into the hold, so the turn stays alive", async () => {
+test("holdRequest's merge rule, pinned in a state set up directly, which a turn that starts beside an auxiliary call reaches (a host's hold an auxiliary call armed, with nothing held, beside a turn whose call is in flight): a duplicate of the turn's wake that the hold keeps is marked when the turn fails into the hold, so the turn stays alive", async () => {
   await withStoreDir(async (path) => {
     const log = silence();
     let open!: () => void;

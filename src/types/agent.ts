@@ -405,7 +405,9 @@ export interface AgentConfig {
    * auxiliary calls wait behind a pending or running turn either way. Turn it
    * on for an agent whose provider limits how fast input tokens per minute
    * may grow, where a compression call in flight can cost the larger primary
-   * call its admission (#114).
+   * call its admission (#114). It applies to an agent that owns its provider
+   * scheduling, a resident: a conversation agent takes neither side of the
+   * gate, so the setting does nothing for it.
    */
   primaryWaitsForAuxiliary?: boolean;
 
