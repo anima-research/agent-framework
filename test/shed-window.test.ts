@@ -46,6 +46,8 @@ const input = (t: string, ask: string[]): ProcessEvent =>
 type Internals = {
   addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId;
   shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): { descriptor: string; removedIds: MessageId[] } | null;
+  updateRewindMarker(agent: Agent, category: string): number;
+  rewindEpisode: Map<string, { markerId: MessageId; count: number; category: string }>;
 };
 
 const dirs: string[] = [];
@@ -207,6 +209,15 @@ for (const gap of [false, true]) {
   });
 }
 
+// `unknown` and `barrier` end with the call still sent after its result was
+// shed alone. That is a limit of the scope, not a goal: across a gap nothing
+// but a matching ID says which call a result belongs to, and the shed does
+// not repair a history it cannot read. The call goes on a later shed (the
+// next, or after the ordinary turn's in `barrier`), as before #737.
+// (`unrelated-carried` is the other order: the held result is
+// passed over and the call is shed on its own.) `raw` forces the record fallback by patching `presents` on a
+// host that is presenting: it shows the one range removal on the real
+// ContextManager, not a host whose write-down failed.
 for (const scenario of ['multiple', 'unknown', 'barrier', 'carried', 'unrelated-carried', 'raw'] as const) {
   it(`ID pairing control on the next request: ${scenario}`, async () => {
     const h = await boot();
@@ -261,5 +272,225 @@ for (const scenario of ['multiple', 'unknown', 'barrier', 'carried', 'unrelated-
     else assert.match(sent, /control-a/, 'unmatched results must not remove an unrelated assistant body');
     assert.doesNotMatch(sent, /last-result|first-result/);
     if (scenario === 'barrier') assert.match(sent, /ordinary-turn/);
+  });
+}
+
+// Stored rows whose result IDs are wrong or missing (corrupt or legacy):
+// right after the call body they still leave with it, as before #737, so the
+// exhaustion breaker's one shed clears a corrupted pairing. Across a notice
+// only a matching ID pairs them; there the result is shed alone and the call
+// is still sent, the scope limit described above.
+for (const layout of ['adjacent', 'gap'] as const) {
+  for (const ids of ['mismatch', 'missing', 'mixed'] as const) {
+    it(`a result whose IDs do not match its call, on the next request (${layout}, ${ids})`, async () => {
+      const h = await boot();
+      h.internals.addMessage('user', [text('keep-before')]);
+      const call = h.internals.addMessage('mira', [
+        { type: 'thinking', thinking: '', signature: 'legacy-signature' } as ContentBlock,
+        text('legacy-narration'),
+        { type: 'tool_use', id: 'legacy-a', name: 'shell', input: {} } as ContentBlock,
+        { type: 'tool_use', id: 'legacy-b', name: 'shell', input: {} } as ContentBlock,
+      ]);
+      const notice = layout === 'gap' ? h.internals.addMessage('user', [text('legacy-notice')], { system: true }) : undefined;
+      const resultBlock = (toolUseId: string | undefined, content: string) =>
+        ({ type: 'tool_result', ...(toolUseId === undefined ? {} : { toolUseId }), content }) as ContentBlock;
+      const result = h.internals.addMessage('user', {
+        mismatch: [resultBlock('legacy-x', 'legacy-result')],
+        missing: [resultBlock(undefined, 'legacy-result')],
+        mixed: [resultBlock('legacy-a', 'legacy-result'), resultBlock('legacy-x', 'legacy-result')],
+      }[ids]);
+      const cm = h.cm('mira');
+      const retractions: MessageId[][] = [];
+      const retract = cm.retractRows.bind(cm);
+      cm.retractRows = (rows, opts) => { retractions.push([...rows]); return retract(rows, opts); };
+      const other = await h.compiled('oren');
+      const record = h.internals.shedNewestTurn(h.agent('mira'));
+      assert.ok(record);
+      if (layout === 'adjacent') {
+        assert.deepEqual(record.removedIds, [result, call]);
+        assert.deepEqual(retractions, [[call, result]], 'one retraction, the call body and the result');
+      } else {
+        assert.deepEqual(record.removedIds, [result]);
+        assert.deepEqual(retractions, [[result]]);
+        assert.equal(cm.windowStatusOf(notice!), 'in', 'the notice stays');
+      }
+      h.framework.start();
+      h.framework.pushEvent(input('next-question', ['mira']));
+      await until(() => h.membrane.callsFor('mira').length === 1, 'next request');
+      const sent = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+      assert.match(sent, /keep-before/);
+      assert.match(sent, /next-question/);
+      assert.doesNotMatch(sent, /legacy-result/);
+      if (layout === 'adjacent') assert.doesNotMatch(sent, /legacy-a|legacy-b|legacy-signature|legacy-narration/);
+      else assert.match(sent, /legacy-signature/, 'not paired across the gap');
+      assert.equal(await h.compiled('oren'), other);
+      assert.ok(cm.getMessage(call) && cm.getMessage(result), 'the record keeps both');
+    });
+  }
+}
+
+// The adjacent rule on a window that is still the record (`presents`
+// patched, as the `raw` control above): one range removal, call to result.
+it('a result whose ID does not match the call right before it leaves the record with it (raw)', async () => {
+  const h = await boot();
+  h.internals.addMessage('user', [text('keep-before')]);
+  const call = h.internals.addMessage('mira', [
+    { type: 'thinking', thinking: '', signature: 'legacy-raw-signature' } as ContentBlock,
+    { type: 'tool_use', id: 'legacy-raw-a', name: 'shell', input: {} } as ContentBlock,
+  ]);
+  const result = h.internals.addMessage('user', [
+    { type: 'tool_result', toolUseId: 'legacy-raw-x', content: 'legacy-raw-result' } as ContentBlock,
+  ]);
+  (h.framework as unknown as { presents: () => boolean }).presents = () => false;
+  const cm = h.cm('mira');
+  const removals: MessageId[][] = [];
+  const remove = cm.removeMessages.bind(cm);
+  cm.removeMessages = (a, b) => { removals.push([a, b]); return remove(a, b); };
+  assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result, call]);
+  assert.deepEqual(removals, [[call, result]]);
+  h.framework.start();
+  h.framework.pushEvent(input('next-question', ['mira']));
+  await until(() => h.membrane.callsFor('mira').length === 1, 'next request');
+  const sent = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+  assert.match(sent, /keep-before/);
+  assert.doesNotMatch(sent, /legacy-raw-a|legacy-raw-signature|legacy-raw-result/);
+});
+
+// A rewind marker between a call and its result is never taken with them:
+// the caller edits the episode's marker in place right after the shed, and
+// an earlier episode's is its durable record. It ends the walk, so the
+// result is shed alone and the call is still sent until the next shed, as
+// before #737 (a scope limit; no path here is known to store a marker
+// there). The marker has been edited once already, so it is known by the
+// kind its row keeps. `raw` patches `presents` as the control above does: without the
+// barrier the range removal deleted the marker and the marker update threw.
+for (const mode of ['windowed', 'raw', 'earlier-episode'] as const) {
+  it(`a rewind marker between a call and its result stays, on the next request (${mode})`, async () => {
+    const h = await boot();
+    h.internals.addMessage('user', [text('keep-before')]);
+    const call = h.internals.addMessage('mira', [
+      { type: 'thinking', thinking: '', signature: 'marked-signature' } as ContentBlock,
+      { type: 'tool_use', id: 'marked-call', name: 'shell', input: {} } as ContentBlock,
+    ]);
+    assert.equal(h.internals.updateRewindMarker(h.agent('mira'), 'zz-category'), 1);
+    assert.equal(h.internals.updateRewindMarker(h.agent('mira'), 'zz-category'), 2);
+    const marker = h.internals.rewindEpisode.get('mira')!.markerId;
+    // The episode ended; its marker is no longer the tracked one.
+    if (mode === 'earlier-episode') h.internals.rewindEpisode.delete('mira');
+    const result = h.internals.addMessage('user', [
+      { type: 'tool_result', toolUseId: 'marked-call', content: 'marked-result' } as ContentBlock,
+    ]);
+    if (mode === 'raw') (h.framework as unknown as { presents: () => boolean }).presents = () => false;
+    const cm = h.cm('mira');
+    const record = h.internals.shedNewestTurn(h.agent('mira'));
+    assert.ok(record);
+    assert.deepEqual(record.removedIds, [result], 'the result alone');
+    assert.ok(cm.getMessage(marker), 'the marker is still stored');
+    assert.ok(cm.getMessage(call));
+    if (mode !== 'raw') assert.equal(cm.windowStatusOf(marker), 'in', "and still in mira's window");
+    if (mode !== 'earlier-episode') {
+      assert.equal(h.internals.updateRewindMarker(h.agent('mira'), 'zz-category'), 3);
+      assert.equal(h.internals.rewindEpisode.get('mira')!.markerId, marker, 'one marker, edited in place');
+    }
+    h.framework.start();
+    h.framework.pushEvent(input('next-question', ['mira']));
+    await until(() => h.membrane.callsFor('mira').length === 1, 'next request');
+    const sent = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+    assert.match(sent, /keep-before/);
+    assert.match(sent, mode === 'earlier-episode' ? /The 2 most recent turn\(s\) were set aside/ : /The 3 most recent turn\(s\) were set aside/);
+    assert.doesNotMatch(sent, /marked-result/);
+    assert.match(sent, /marked-signature/, 'not paired across the marker');
+  });
+}
+
+// Every result ID between the call and the newest result counts, an earlier
+// result body's too: with one there that the call does not hold, or that has
+// none, the newest result is shed alone. The earlier result is then right
+// after the call, and the next shed takes the two together.
+for (const sibling of ['unknown', 'missing'] as const) {
+  it(`an earlier result body's ID the call does not hold leaves the newest result unpaired (${sibling})`, async () => {
+    const h = await boot();
+    h.internals.addMessage('user', [text('keep-before')]);
+    const call = h.internals.addMessage('mira', [
+      { type: 'thinking', thinking: '', signature: 'sibling-signature' } as ContentBlock,
+      { type: 'tool_use', id: 'sibling-a', name: 'shell', input: {} } as ContentBlock,
+      { type: 'tool_use', id: 'sibling-b', name: 'shell', input: {} } as ContentBlock,
+    ]);
+    const earlier = h.internals.addMessage('user', [
+      { type: 'tool_result', ...(sibling === 'unknown' ? { toolUseId: 'sibling-x' } : {}), content: 'earlier-result' } as ContentBlock,
+    ]);
+    const notice = h.internals.addMessage('user', [text('sibling-notice')], { system: true });
+    const newest = h.internals.addMessage('user', [
+      { type: 'tool_result', toolUseId: 'sibling-b', content: 'newest-result' } as ContentBlock,
+    ]);
+    const cm = h.cm('mira');
+    assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [newest], 'the newest result alone');
+    assert.deepEqual([call, earlier, notice].map((id) => cm.windowStatusOf(id)), ['in', 'in', 'in']);
+    assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [earlier, call], 'then the call and the result right after it');
+    assert.equal(cm.windowStatusOf(notice), 'in');
+    h.framework.start();
+    h.framework.pushEvent(input('next-question', ['mira']));
+    await until(() => h.membrane.callsFor('mira').length === 1, 'next request');
+    const sent = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+    assert.match(sent, /keep-before/);
+    assert.doesNotMatch(sent, /sibling-a|sibling-b|sibling-signature|earlier-result|newest-result/);
+  });
+}
+
+// A result body in shards that the shed passes over (held from mira's
+// request by a tune-out; a system row on a window that is still the record),
+// across a notice from its call, its second shard's ID one the call does not
+// hold. The body is paired or not as a whole: its first shard's ID alone
+// must not pair it, which took part of a body (a range the record refuses,
+// in the raw fallback). Unpaired, the call is shed on its own, as before
+// #737. The shards are appended as operator-surgery.test.ts appends them.
+// `mixed` holds only the second shard, which context-manager's chunker
+// never stores (every shard has its body's metadata): the shed then lands
+// inside the body, and still reads it whole, so the call and the notice
+// stay.
+it('a result body with only its newer shard passed over is not paired by its first shard alone (mixed)', async () => {
+  const h = await boot();
+  h.internals.addMessage('user', [text('keep-before')]);
+  const call = h.internals.addMessage('mira', [
+    { type: 'tool_use', id: 'mixed-a', name: 'shell', input: {} } as ContentBlock,
+    { type: 'tool_use', id: 'mixed-b', name: 'shell', input: {} } as ContentBlock,
+  ]);
+  const notice = h.internals.addMessage('user', [text('mixed-notice')], { system: true });
+  const cm = h.cm('mira');
+  const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: MessageId } } }).messageStore;
+  const shards = [['mixed-a', {}], ['mixed-x', { tuneOut: { epochId: 'held' } }]].map(([toolUseId, metadata], shardIndex) =>
+    store.append('user', [{ type: 'tool_result', toolUseId, content: `mixed-result-${shardIndex}` }], metadata, undefined, { bodyGroupId: 'g-mixed-result', shardIndex }).id);
+  cm.presentRows([shards[0]!]);
+  const record = h.internals.shedNewestTurn(h.agent('mira'));
+  assert.ok(record);
+  assert.ok(!record.removedIds.includes(call) && !record.removedIds.includes(notice), 'neither the call nor the notice');
+  assert.deepEqual([call, notice].map((id) => cm.windowStatusOf(id)), ['in', 'in']);
+});
+
+for (const mode of ['windowed', 'raw'] as const) {
+  it(`a passed-over result body is not paired by its first shard alone (${mode})`, async () => {
+    const h = await boot();
+    h.internals.addMessage('user', [text('keep-before')]);
+    const call = h.internals.addMessage('mira', [
+      { type: 'tool_use', id: 'shard-a', name: 'shell', input: {} } as ContentBlock,
+      { type: 'tool_use', id: 'shard-b', name: 'shell', input: {} } as ContentBlock,
+    ]);
+    const notice = h.internals.addMessage('user', [text('shard-notice')], { system: true });
+    const cm = h.cm('mira');
+    const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: MessageId } } }).messageStore;
+    const metadata = mode === 'raw' ? { system: true } : { tuneOut: { epochId: 'held' } };
+    const shards = ['shard-a', 'shard-x'].map((toolUseId, shardIndex) =>
+      store.append('user', [{ type: 'tool_result', toolUseId, content: `shard-result-${shardIndex}` }], metadata, undefined, { bodyGroupId: 'g-held-result', shardIndex }).id);
+    if (mode === 'raw') (h.framework as unknown as { presents: () => boolean }).presents = () => false;
+    else cm.presentRows([shards[0]!]);
+    const record = h.internals.shedNewestTurn(h.agent('mira'), mode === 'raw' ? undefined : new Set([call]));
+    assert.ok(record);
+    assert.deepEqual(record.removedIds, [call], 'the call on its own');
+    for (const id of [notice, ...shards]) assert.ok(cm.getMessage(id), 'the notice and the whole result body are still stored');
+    if (mode === 'windowed') {
+      assert.deepEqual([call, notice, ...shards].map((id) => cm.windowStatusOf(id)), ['undone', 'in', 'in', 'in']);
+    } else {
+      assert.equal(cm.getMessage(call), null, 'removed from the record');
+    }
   });
 }

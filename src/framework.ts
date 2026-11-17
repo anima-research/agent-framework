@@ -15037,6 +15037,22 @@ export class AgentFramework {
    * message, and that reached a request, out of what the agent is sent,
    * whoever wrote it, with the rest of its exchange (the tool_use turn
    * paired with a tool result, and the whole of a body stored in shards).
+   *
+   * A tool result is paired with the call body right before it, whatever
+   * their IDs. With system notices or other result bodies of the same call
+   * between them (#737) it is paired by ID instead: with the nearest call
+   * body back across those rows, when that body holds every result ID in
+   * between. The exchange then goes as one interval, and the notices
+   * inside it go with it: a notice is never shed for itself, these leave
+   * the agent's window, or the record on a window that is still the
+   * record. A rewind marker is never taken that way: it ends the walk, as
+   * a system_change does and any row that is neither a system notice nor
+   * a result body (one the agent is not sent included). An exchange that
+   * is not paired is not taken as one: its rows are shed one at a time,
+   * newest that counts first, as before #737, which is the result where
+   * it counts, its call staying until a later shed, and the call where
+   * the result is passed over.
+   *
    * With `carried` (the stored bodies a refused request's compile carried,
    * by each body's first message id), only a message that request carried
    * counts, or the stored result of a call it carried, which goes with that
@@ -15084,50 +15100,72 @@ export class AgentFramework {
     // tool_use/narration turns too), because newest-first reaches whatever is
     // poisoning the context if allowed to run deep enough. The one invariant:
     // shed COMPLETE exchanges. Shedding a `tool_result` also sheds its paired
-    // `tool_use` assistant turn, so we never leave an orphaned tool_use /
-    // signed `thinking` block — which the API rejects with a 400 ("thinking
-    // blocks in the latest assistant message cannot be modified"). We do NOT
-    // add a marker here; the caller keeps one consolidated marker
-    // (updateRewindMarker).
+    // `tool_use` assistant turn, so a paired exchange never leaves an
+    // orphaned tool_use / signed `thinking` block — which the API rejects
+    // with a 400 ("thinking blocks in the latest assistant message cannot be
+    // modified"). A result pairedCall finds no call for is the exception:
+    // the two are shed one at a time, newest that counts first, so a call
+    // can stay until a later shed. We do NOT add a marker here; the caller
+    // keeps one consolidated marker (updateRewindMarker).
     const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
-    // A local exchange may contain notices and several result bodies. Do
-    // not search past another ordinary turn or pair by mere proximity: every
-    // result ID in the interval must belong to the same assistant body.
+    // A rewind marker (updateRewindMarker stores every one with this kind):
+    // the episode's consolidated one, or an earlier episode's, which is its
+    // durable record. Never part of a rewound interval: the caller edits
+    // the episode's in place right after this shed, and the raw fallback's
+    // range removal would delete it.
+    const isRewindMarker = (m: StoredMessage) =>
+      (m.metadata as { kind?: unknown } | undefined)?.kind === 'refusal-rewind';
+    // The call body the result body `start..end` is paired with, if any.
+    //
+    // Right before it (no row between): that body, whatever the IDs say.
+    // This is the rule from before #737, kept as it was: stored rows whose
+    // IDs are wrong or missing (corrupt or legacy) still leave as one
+    // exchange, which the exhaustion breaker's shed relies on.
+    //
+    // Across a gap, proximity proves nothing, so IDs decide. The walk goes
+    // back over system notices and sibling result bodies only, to the
+    // nearest call body, and pairs when every result ID in the interval is
+    // a non-empty string that body holds. Any other row (one the agent is
+    // not sent included), a system_change or a rewind marker ends the walk
+    // unpaired, and call and result are then shed one at a time, as every
+    // call and result across a gap were before #737.
     const pairedCall = (start: number, end: number) => {
-      const resultIds = new Set<string>();
+      if (!all.slice(start, end + 1).some((m) => hasBlock(m, 'tool_result'))) return undefined;
+      // null once a result in the interval has no usable ID.
+      let resultIds: Set<string> | null = new Set<string>();
       const collectResults = (from: number, to: number) => {
         for (const m of all.slice(from, to + 1)) {
           for (const b of Array.isArray(m.content) ? m.content : []) {
-            if (b.type === 'tool_result') {
-              const id = (b as { toolUseId?: unknown }).toolUseId;
-              if (typeof id !== 'string' || !id) return false;
-              resultIds.add(id);
-            }
+            if (b.type !== 'tool_result') continue;
+            const id = (b as { toolUseId?: unknown }).toolUseId;
+            if (typeof id === 'string' && id) resultIds?.add(id);
+            else resultIds = null;
           }
         }
-        return true;
       };
-      if (!collectResults(start, end) || resultIds.size === 0) return undefined;
+      collectResults(start, end);
       for (let i = start - 1; i >= 0;) {
         const turn = bodyRangeIn(all, i);
         const rows = all.slice(turn.from, turn.to + 1);
-        const calls = new Set(rows.flatMap((m) => Array.isArray(m.content)
-          ? m.content.filter((b) => b.type === 'tool_use').map((b) => (b as { id: string }).id) : []));
-        if (calls.size) return [...resultIds].every((id) => calls.has(id)) ? turn : undefined;
-        if (rows.some((m) => hasBlock(m, 'tool_result'))) {
-          if (!collectResults(turn.from, turn.to)) return undefined;
-        } else if (!rows.every((m) => m.metadata?.system && !hasBlock(m, 'system_change'))) {
-          return undefined;
+        if (rows.some((m) => hasBlock(m, 'tool_use'))) {
+          if (turn.to === start - 1) return turn;
+          const calls = new Set(rows.flatMap((m) => Array.isArray(m.content)
+            ? m.content.filter((b) => b.type === 'tool_use').map((b) => (b as { id: string }).id) : []));
+          return resultIds !== null && [...resultIds].every((id) => calls.has(id)) ? turn : undefined;
         }
+        if (rows.some((m) => hasBlock(m, 'tool_result'))) collectResults(turn.from, turn.to);
+        else if (!rows.every((m) => m.metadata?.system && !hasBlock(m, 'system_change') && !isRewindMarker(m))) return undefined;
         i = turn.from - 1;
       }
       return undefined;
     };
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
-      const { from: start } = bodyRangeIn(all, i);
+      const { from: start, to: bodyEnd } = bodyRangeIn(all, i);
       const body = all.slice(start, i + 1);
-      const call = pairedCall(start, i);
+      // Paired as the whole body, also when a passed-over newer shard left
+      // `i` inside it: part of a body's result IDs must not pair it.
+      const call = pairedCall(start, bodyEnd);
       const resultOfCarriedCall = call !== undefined && wasCarried(call.from, call.to);
       // A row the agent is never sent is passed over, unless it is the
       // stored result of a call the request carried: the exchange goes whole.
@@ -15165,12 +15203,14 @@ export class AgentFramework {
     const heads: MessageId[] = [all[first]!.id];
     let descriptor: string;
     if (toolBlocks.length > 0) {
-      const turn = pairedCall(first, idx);
+      // The whole body, as the selection above read it.
+      const turn = pairedCall(first, bodyRangeIn(all, idx).to);
       if (turn) {
         from = turn.from;
-        // Include intervening notices in the rewound interval. This is also
-        // the raw fallback's single atomic range removal; report every row
-        // it removes, and use the same interval in a presented window.
+        // Include intervening notices in the rewound interval (none when
+        // the call is right before the result). This is also the raw
+        // fallback's single atomic range removal; report every row it
+        // removes, and use the same interval in a presented window.
         removedIds.length = 0;
         appendAll(removedIds, all.slice(from, idx + 1).map((m) => m.id).reverse());
         heads.length = 0;
@@ -35617,7 +35657,8 @@ export class AgentFramework {
    *      event would wake the agent onto that same history. At the hard-down
    *      threshold, automatically quarantine: shed the newest complete
    *      exchange (the same forced-rewind primitive `/unstick` uses —
-   *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
+   *      shedNewestTurn takes a tool result with its paired
+   *      tool_use/thinking turn) and retry,
    *      bounded by the same rewind cap so the breaker can never eat the
    *      whole history.
    */
