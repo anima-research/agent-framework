@@ -36168,7 +36168,6 @@ export class AgentFramework {
     this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry', answered, answered ?? this.turnRouting.get(agent.name)));
   }
 
-  /** A retry that answers `answering`'s message, if it has one, and takes `wakes`'s wake channels. */
   private rewindRetry(agentName: string, reason: string, answering: TurnRouting | undefined, wakes: TurnRouting | undefined): MarkedRequest {
     const answers = answering?.answers;
     return {
