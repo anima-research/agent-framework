@@ -15546,7 +15546,8 @@ export class AgentFramework {
         channelId: params.channelId ?? '',
       });
       this.refusalRewinds.set(agentName, 0);
-      this.pendingRequests.push(this.rewindRetry(agentName, 'unstick', this.answeredTurns.get(agent) ?? this.turnRouting.get(agentName)));
+      const answered = this.answeredTurns.get(agent);
+      this.pendingRequests.push(this.rewindRetry(agentName, 'unstick', answered, answered ?? this.turnRouting.get(agentName)));
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -30266,7 +30267,7 @@ export class AgentFramework {
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
                 if (forced) forced.removed.push(rec);
-                this.pendingRequests.push(this.rewindRetry(agent.name, forced ? 'unstick-retry' : 'refusal-rewind-retry', streamRouting));
+                this.pendingRequests.push(this.rewindRetry(agent.name, forced ? 'unstick-retry' : 'refusal-rewind-retry', streamRouting, streamRouting));
                 handledByRewind = true;
               };
 
@@ -36163,11 +36164,13 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry', this.answeredTurns.get(agent) ?? this.turnRouting.get(agent.name)));
+    const answered = this.answeredTurns.get(agent);
+    this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry', answered, answered ?? this.turnRouting.get(agent.name)));
   }
 
-  private rewindRetry(agentName: string, reason: string, routing: TurnRouting | undefined): MarkedRequest {
-    const answers = routing?.answers;
+  /** A retry that answers `answering`'s message, if it has one, and takes `wakes`'s wake channels. */
+  private rewindRetry(agentName: string, reason: string, answering: TurnRouting | undefined, wakes: TurnRouting | undefined): MarkedRequest {
+    const answers = answering?.answers;
     return {
       agentName,
       reason,
@@ -36179,7 +36182,7 @@ export class AgentFramework {
         [RETRY_RANK]: this.stillSent(agentName, answers) ? 'sent' as const : 'aside' as const,
         ...(answers.messageId ? { answersMessageId: answers.messageId } : {}),
       } : {}),
-      ...this.wakeChannelsMark(routing),
+      ...this.wakeChannelsMark(wakes),
     };
   }
 
