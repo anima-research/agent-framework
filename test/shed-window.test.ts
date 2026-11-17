@@ -45,7 +45,7 @@ const input = (t: string, ask: string[]): ProcessEvent =>
 
 type Internals = {
   addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId;
-  shedNewestTurn(agent: Agent): { descriptor: string; removedIds: MessageId[] } | null;
+  shedNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>): { descriptor: string; removedIds: MessageId[] } | null;
 };
 
 const dirs: string[] = [];
@@ -178,3 +178,88 @@ describe('a shed on a presented window (#291, AF-7)', () => {
     assert.ok(again.cm('mira').getMessage(poison), 'the record still holds it');
   });
 });
+
+for (const gap of [false, true]) {
+  it(`rewinds the complete ID-matched exchange on the next wire request (notice gap: ${gap})`, async () => {
+    const h = await boot();
+    h.internals.addMessage('user', [text('keep-before')]);
+    const call = h.internals.addMessage('mira', [
+      { type: 'thinking', thinking: '', signature: 'exchange-signature' } as ContentBlock,
+      text('exchange-narration'),
+      { type: 'tool_use', id: 'exchange-call', name: 'shell', input: {} } as ContentBlock,
+    ]);
+    if (gap) h.internals.addMessage('user', [text('intervening-notice')], { system: true });
+    const result = h.internals.addMessage('user', [
+      { type: 'tool_result', toolUseId: 'exchange-call', content: 'exchange-result' } as ContentBlock,
+    ]);
+    const other = await h.compiled('oren');
+    h.internals.shedNewestTurn(h.agent('mira'));
+    h.framework.start();
+    h.framework.pushEvent(input('next-question', ['mira']));
+    await until(() => h.membrane.callsFor('mira').length === 1, 'next request');
+    const sent = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+    assert.doesNotMatch(sent, /exchange-call|exchange-result|exchange-signature|exchange-narration/);
+    assert.match(sent, /keep-before/);
+    assert.match(sent, /next-question/);
+    assert.equal(await h.compiled('oren'), other);
+    assert.ok(h.cm('mira').getMessage(call));
+    assert.ok(h.cm('mira').getMessage(result));
+  });
+}
+
+for (const scenario of ['multiple', 'unknown', 'barrier', 'carried', 'unrelated-carried', 'raw'] as const) {
+  it(`ID pairing control on the next request: ${scenario}`, async () => {
+    const h = await boot();
+    h.internals.addMessage('user', [text('keep-before')]);
+    const call = h.internals.addMessage('mira', [
+      { type: 'thinking', thinking: '', signature: 'control-signature' } as ContentBlock,
+      { type: 'tool_use', id: 'control-a', name: 'shell', input: {} } as ContentBlock,
+      { type: 'tool_use', id: 'control-b', name: 'shell', input: {} } as ContentBlock,
+    ]);
+    const notices: MessageId[] = [];
+    if (scenario === 'multiple') {
+      h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'control-a', content: 'first-result' } as ContentBlock]);
+    }
+    notices.push(h.internals.addMessage('user', [text('control-notice')], { system: true }));
+    if (scenario === 'barrier') h.internals.addMessage('user', [text('ordinary-turn')]);
+    const unknown = scenario === 'unknown' || scenario === 'unrelated-carried';
+    const held = scenario === 'carried' || scenario === 'unrelated-carried';
+    const result = h.internals.addMessage('user', [
+      { type: 'tool_result', toolUseId: unknown ? 'unknown-id' : 'control-b', content: 'last-result' } as ContentBlock,
+    ], held ? { tuneOut: { epochId: 'held' } } as MessageMetadata : undefined);
+    // Explicit raw-record fallback; the real CM still performs its atomic
+    // range removal and the framework retracts removed rows elsewhere.
+    if (scenario === 'raw') (h.framework as unknown as { presents: () => boolean }).presents = () => false;
+    const cm = h.cm('mira');
+    // A held row can be in the window (e.g. initial registration) while
+    // the request view filters it out. Exercise that supported case.
+    if (held) cm.presentRows([result]);
+    const retractions: MessageId[][] = [];
+    const removals: MessageId[][] = [];
+    const retract = cm.retractRows.bind(cm);
+    const remove = cm.removeMessages.bind(cm);
+    cm.retractRows = (ids, opts) => { retractions.push([...ids]); return retract(ids, opts); };
+    cm.removeMessages = (a, b) => { removals.push([a, b]); return remove(a, b); };
+    h.internals.shedNewestTurn(h.agent('mira'), held ? new Set([call]) : undefined);
+    const pairs = !unknown && scenario !== 'barrier';
+    if (pairs) {
+      if (scenario === 'raw') assert.deepEqual(removals, [[call, result]]);
+      else {
+        assert.equal(retractions.length, 1, 'one atomic retraction');
+        assert.ok(retractions[0]!.includes(call) && retractions[0]!.includes(result));
+      }
+    }
+    if (scenario === 'unrelated-carried') {
+      assert.equal(cm.windowStatusOf(result), 'in', 'an unrelated held result is not mistaken for a carried call result');
+    }
+    h.framework.start();
+    h.framework.pushEvent(input('next-question', ['mira']));
+    await until(() => h.membrane.callsFor('mira').length === 1, 'next request');
+    const sent = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+    assert.match(sent, /keep-before/);
+    if (pairs || scenario === 'unrelated-carried') assert.doesNotMatch(sent, /control-a|control-b|control-signature/);
+    else assert.match(sent, /control-a/, 'unmatched results must not remove an unrelated assistant body');
+    assert.doesNotMatch(sent, /last-result|first-result/);
+    if (scenario === 'barrier') assert.match(sent, /ordinary-turn/);
+  });
+}

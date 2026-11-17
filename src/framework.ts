@@ -15090,16 +15090,45 @@ export class AgentFramework {
     // add a marker here; the caller keeps one consolidated marker
     // (updateRewindMarker).
     const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
-    const callCarried = (start: number) => {
-      if (start <= 0) return false;
-      const turn = bodyRangeIn(all, start - 1);
-      return all.slice(turn.from, turn.to + 1).some((m) => hasBlock(m, 'tool_use')) && wasCarried(turn.from, turn.to);
+    // A local exchange may contain notices and several result bodies. Do
+    // not search past another ordinary turn or pair by mere proximity: every
+    // result ID in the interval must belong to the same assistant body.
+    const pairedCall = (start: number, end: number) => {
+      const resultIds = new Set<string>();
+      const collectResults = (from: number, to: number) => {
+        for (const m of all.slice(from, to + 1)) {
+          for (const b of Array.isArray(m.content) ? m.content : []) {
+            if (b.type === 'tool_result') {
+              const id = (b as { toolUseId?: unknown }).toolUseId;
+              if (typeof id !== 'string' || !id) return false;
+              resultIds.add(id);
+            }
+          }
+        }
+        return true;
+      };
+      if (!collectResults(start, end) || resultIds.size === 0) return undefined;
+      for (let i = start - 1; i >= 0;) {
+        const turn = bodyRangeIn(all, i);
+        const rows = all.slice(turn.from, turn.to + 1);
+        const calls = new Set(rows.flatMap((m) => Array.isArray(m.content)
+          ? m.content.filter((b) => b.type === 'tool_use').map((b) => (b as { id: string }).id) : []));
+        if (calls.size) return [...resultIds].every((id) => calls.has(id)) ? turn : undefined;
+        if (rows.some((m) => hasBlock(m, 'tool_result'))) {
+          if (!collectResults(turn.from, turn.to)) return undefined;
+        } else if (!rows.every((m) => m.metadata?.system && !hasBlock(m, 'system_change'))) {
+          return undefined;
+        }
+        i = turn.from - 1;
+      }
+      return undefined;
     };
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       const { from: start } = bodyRangeIn(all, i);
       const body = all.slice(start, i + 1);
-      const resultOfCarriedCall = body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start);
+      const call = pairedCall(start, i);
+      const resultOfCarriedCall = call !== undefined && wasCarried(call.from, call.to);
       // A row the agent is never sent is passed over, unless it is the
       // stored result of a call the request carried: the exchange goes whole.
       if (passedOver(all[i]!) && !resultOfCarriedCall) continue;
@@ -15136,16 +15165,18 @@ export class AgentFramework {
     const heads: MessageId[] = [all[first]!.id];
     let descriptor: string;
     if (toolBlocks.length > 0) {
-      // Pair the tool_result with the tool_use assistant turn right before
-      // it, the whole of it: a turn stored as a body carries its tool_use on
-      // its first shard, not its last.
-      if (first - 1 >= 0) {
-        const turn = bodyRangeIn(all, first - 1);
-        const turnMembers = all.slice(turn.from, turn.to + 1);
-        if (turnMembers.some((m) => hasBlock(m, 'tool_use'))) {
-          from = turn.from;
-          appendAll(removedIds, turnMembers.map((m) => m.id).reverse());
-          heads.unshift(all[turn.from]!.id);
+      const turn = pairedCall(first, idx);
+      if (turn) {
+        from = turn.from;
+        // Include intervening notices in the rewound interval. This is also
+        // the raw fallback's single atomic range removal; report every row
+        // it removes, and use the same interval in a presented window.
+        removedIds.length = 0;
+        appendAll(removedIds, all.slice(from, idx + 1).map((m) => m.id).reverse());
+        heads.length = 0;
+        for (let i = from; i <= idx;) {
+          heads.push(all[i]!.id);
+          i = bodyRangeIn(all, i).to + 1;
         }
       }
       const sz = toolBlocks.reduce(

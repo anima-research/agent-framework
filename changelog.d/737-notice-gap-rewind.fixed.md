@@ -1,0 +1,1 @@
+- Rewind complete tool exchanges across intervening system notices using tool-use IDs, including split result bodies and whole sharded assistant bodies. Rewinds remain local to the presented agent window; the atomic rewound interval includes its intervening notices.

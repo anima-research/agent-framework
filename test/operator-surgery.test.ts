@@ -953,11 +953,13 @@ describe('live operator surgery', () => {
       store.append('assistant', [{ type: 'tool_use', id: 't9', name: 'shell', input: {} }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 0 }).id,
       store.append('assistant', [{ type: 'text', text: 'narration' }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 1 }).id,
     ];
+    const notice = cm().addMessage('user', [{ type: 'text', text: 'system notice' }], { system: true });
     const result = [
       store.append('user', [{ type: 'tool_result', toolUseId: 't9', content: 'r0' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 0 }).id,
       store.append('user', [{ type: 'text', text: 'r1' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 1 }).id,
     ];
     cm().presentRows([turn[0] as never]);
+    cm().presentRows([notice]);
     cm().presentRows([result[0] as never]);
     const c = cm() as unknown as {
       removeMessages: (a: string, b: string) => void;
@@ -976,18 +978,18 @@ describe('live operator surgery', () => {
       const record = internals.shedNewestTurn(framework.getAgent('scout'));
       assert.ok(record);
       assert.equal(record.descriptor, 'a tool exchange (~1KB)');
-      assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
+      assert.deepEqual(record.removedIds, [result[1], result[0], notice, turn[1], turn[0]]);
       // Ported for #291 (AF-7): on a presented window the exchange leaves
       // the window in one call, each body by its first shard, as an undone
       // turn's; the record keeps it.
-      assert.deepEqual(retracts, [[[turn[0], result[0]], { undone: true }]], "one retract, the turn's body and the result's");
+      assert.deepEqual(retracts, [[[turn[0], notice, result[0]], { undone: true }]], "one retract, the turn's body and the result's");
       assert.deepEqual(ranges, [], 'nothing removed from the record');
     } finally {
       c.removeMessages = original;
       c.retractRows = originalRetract;
     }
     for (const id of [...turn, ...result]) assert.equal(cm().windowStatusOf(id as never), 'undone');
-    assert.equal(cm().getMessageCount(), 9, 'the record keeps the exchange');
+    assert.equal(cm().getMessageCount(), 10, 'the record keeps the exchange');
   });
 
   // --- failure path ----------------------------------------------------------
