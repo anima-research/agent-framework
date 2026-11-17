@@ -15047,8 +15047,10 @@ export class AgentFramework {
    * the agent's window, or the record on a window that is still the
    * record. A rewind marker is never taken that way: it ends the walk, as
    * a system_change does and any row that is neither a system notice nor
-   * a result body (one the agent is not sent included). An exchange that
-   * is not paired is not taken as one: its rows are shed one at a time,
+   * a result body (one the agent is not sent included). Hidden notices and
+   * hidden call bodies also end the walk; matching stored results may go
+   * with their carried call even when the request did not carry them.
+   * An exchange that is not paired is not taken as one: its rows are shed one at a time,
    * newest that counts first, as before #737, which is the result where
    * it counts, its call staying until a later shed, and the call where
    * the result is passed over.
@@ -15068,7 +15070,7 @@ export class AgentFramework {
    * do (retractRows with `undone`), so no presentation point brings them
    * back, and the record keeps them, as the marker says. No other agent's
    * window, nor its cache prefix or signed thinking, changes. A row the
-   * agent is never sent is passed over: a system_change row, a row a
+   * agent is never sent is passed over for selection: a system_change row, a row a
    * tune-out holds from residents (for an agent whose window leaves them
    * out), and another agent's stored context injection. On a window that is
    * still the record, the rows are removed from it, as before the index,
@@ -15084,14 +15086,13 @@ export class AgentFramework {
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
-    // In the window, the rows the agent is sent: a held row is in a
+    // In either path, the rows the agent is sent: a held row is in a
     // resident's written-down window and left out by its view, as another
     // agent's injection is (agentSees, the one rule main's #853 asks
     // everywhere), and a system_change row is the host's.
     const passedOver = (m: StoredMessage): boolean => {
       const meta = (m.metadata ?? {}) as Record<string, unknown>;
       if (meta.system) return true;
-      if (!windowed) return false;
       return hasBlock(m, 'system_change') || !this.agentSees(agent, m.metadata);
     };
 
@@ -15115,6 +15116,7 @@ export class AgentFramework {
     // range removal would delete it.
     const isRewindMarker = (m: StoredMessage) =>
       (m.metadata as { kind?: unknown } | undefined)?.kind === 'refusal-rewind';
+    const isBarrier = (m: StoredMessage) => hasBlock(m, 'system_change') || isRewindMarker(m);
     // The call body the result body `start..end` is paired with, if any.
     //
     // Right before it (no row between): that body, whatever the IDs say.
@@ -15126,11 +15128,13 @@ export class AgentFramework {
     // back over system notices and sibling result bodies only, to the
     // nearest call body, and pairs when every result ID in the interval is
     // a non-empty string that body holds. Any other row (one the agent is
-    // not sent included), a system_change or a rewind marker ends the walk
+    // not sent included, except matching results), a system_change or a
+    // rewind marker ends the walk
     // unpaired, and call and result are then shed one at a time, as every
     // call and result across a gap were before #737.
     const pairedCall = (start: number, end: number) => {
-      if (!all.slice(start, end + 1).some((m) => hasBlock(m, 'tool_result'))) return undefined;
+      const body = all.slice(start, end + 1);
+      if (body.some(isBarrier) || !body.some((m) => hasBlock(m, 'tool_result'))) return undefined;
       // null once a result in the interval has no usable ID.
       let resultIds: Set<string> | null = new Set<string>();
       const collectResults = (from: number, to: number) => {
@@ -15147,34 +15151,38 @@ export class AgentFramework {
       for (let i = start - 1; i >= 0;) {
         const turn = bodyRangeIn(all, i);
         const rows = all.slice(turn.from, turn.to + 1);
+        // Barriers apply to every body, including mixed call/result bodies.
+        if (rows.some(isBarrier)) return undefined;
         if (rows.some((m) => hasBlock(m, 'tool_use'))) {
+          if (!rows.some((m) => !passedOver(m))) return undefined;
           if (turn.to === start - 1) return turn;
           const calls = new Set(rows.flatMap((m) => Array.isArray(m.content)
             ? m.content.filter((b) => b.type === 'tool_use').map((b) => (b as { id: string }).id) : []));
           return resultIds !== null && [...resultIds].every((id) => calls.has(id)) ? turn : undefined;
         }
         if (rows.some((m) => hasBlock(m, 'tool_result'))) collectResults(turn.from, turn.to);
-        else if (!rows.every((m) => m.metadata?.system && !hasBlock(m, 'system_change') && !isRewindMarker(m))) return undefined;
+        else if (!rows.every((m) => m.metadata?.system && this.agentSees(agent, m.metadata))) return undefined;
         i = turn.from - 1;
       }
       return undefined;
     };
     let idx = -1;
-    for (let i = all.length - 1; i >= 0; i--) {
+    for (let i = all.length - 1; i >= 0;) {
       const { from: start, to: bodyEnd } = bodyRangeIn(all, i);
-      const body = all.slice(start, i + 1);
-      // Paired as the whole body, also when a passed-over newer shard left
-      // `i` inside it: part of a body's result IDs must not pair it.
+      const body = all.slice(start, bodyEnd + 1);
+      // Visit each body once, not each passed-over shard. A body is the
+      // unit of pairing AND removal, even with heterogeneous metadata.
+      i = start - 1;
+      if (body.some(isBarrier)) continue;
       const call = pairedCall(start, bodyEnd);
       const resultOfCarriedCall = call !== undefined && wasCarried(call.from, call.to);
-      // A row the agent is never sent is passed over, unless it is the
-      // stored result of a call the request carried: the exchange goes whole.
-      if (passedOver(all[i]!) && !resultOfCarriedCall) continue;
-      if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
-        && (wasCarried(start, i) || resultOfCarriedCall)) {
-        idx = i; break;
+      // Visibility gates selection, not each member of a paired exchange:
+      // a stored result not itself carried still goes with its carried call.
+      if (!body.some((m) => !passedOver(m)) && !resultOfCarriedCall) continue;
+      if (body.some((m) => Array.isArray(m.content) && asNextRequestCarries(m.content) !== null)
+        && (wasCarried(start, bodyEnd) || resultOfCarriedCall)) {
+        idx = bodyEnd; break;
       }
-      i = start;
     }
     if (idx < 0) return null;
     // The newest message can be the last shard of a body (a document stored
@@ -15219,10 +15227,14 @@ export class AgentFramework {
           i = bodyRangeIn(all, i).to + 1;
         }
       }
-      const sz = toolBlocks.reduce(
-        (n, b) => n + String((b as { content?: unknown }).content ?? '').length, 0);
+      // Approximate stored content bytes for the interval actually removed,
+      // not just the newest result: sibling results, call and notices count.
+      const exchange = all.slice(from, idx + 1);
+      const sz = exchange.reduce((n, m) => n + Buffer.byteLength(JSON.stringify(m.content) ?? ''), 0);
+      const exchangeImages = exchange.reduce((n, m) => n + (Array.isArray(m.content)
+        ? m.content.filter((b) => typeOf(b) === 'image').length : 0), 0);
       descriptor = `a tool exchange (~${Math.max(1, Math.round(sz / 1024))}KB` +
-        `${images ? `, ${images} image(s)` : ''})`;
+        `${exchangeImages ? `, ${exchangeImages} image(s)` : ''})`;
     } else if (md.messageId) {
       descriptor = `an incoming message from ${msg.participant} ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;

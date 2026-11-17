@@ -15,8 +15,8 @@ const REWIND_TAG = `[${NOTICE_TAG.refusalRewind}]`;
 /**
  * The refusal auto-rewind sheds the newest turn (in sequence, newest first,
  * INCLUDING the agent's own turns) as a COMPLETE exchange — a tool_result is
- * removed together with its paired tool_use turn, so no orphaned tool_use /
- * signed thinking block is left behind. It maintains exactly ONE consolidated
+ * removed together with its paired tool_use turn and signed thinking. An
+ * unpaired result across a barrier is shed alone. It maintains ONE consolidated
  * marker per episode.
  */
 function makeAgentHarness(messages: any[]) {
@@ -50,6 +50,7 @@ function makeAgentHarness(messages: any[]) {
     },
   };
   const fw = Object.create(AgentFramework.prototype) as any;
+  fw.storeSees = new WeakMap(); // No view filter on this synthetic raw manager.
   fw.rewindEpisode = new Map();
   const agent = { name: 'labclaude', getContextManager: () => cm };
   return { fw, agent, removed, added, edited, messages };
@@ -236,6 +237,7 @@ test("a refusal's rewind tells the agent its turns couldn't be completed, naming
 test("an unstick that gives up tells its channel its requests couldn't be completed, and only stderr names the category", () => {
   const SENTINEL = 'zz-provider-category-7f3a';
   const fw = Object.create(AgentFramework.prototype) as any;
+  fw.storeSees = new WeakMap(); // No view filter on this synthetic raw manager.
   fw.forcedRewind = new Map([['scout', { remaining: 0, removed: [{ descriptor: 'an incoming message from simulect (7 chars)' }], serverId: 'srv', channelId: 'room' }]]);
   fw.unstickAnswers = new Map();
   fw.unstickWaiters = new Map();

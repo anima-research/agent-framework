@@ -8,8 +8,8 @@
  * refused the request's content or size (shedMayHelp: an invalid_request at
  * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
  * breaker auto-quarantines: sheds the newest complete exchange (the same
- * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
- * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
+ * shedNewestTurn primitive the refusal auto-rewind and /unstick use; an
+ * unpaired result across a barrier is shed alone), drops ONE marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
  * never eat the whole history.
  */
@@ -53,6 +53,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   };
 
   const fw = Object.create(AgentFramework.prototype) as any;
+  fw.storeSees = new WeakMap(); // No view filter on this synthetic raw manager.
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
   fw.rewindEpisode = new Map();

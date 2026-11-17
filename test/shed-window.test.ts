@@ -57,7 +57,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(opts: { residents?: string[]; dir?: string; seed?: (cm: ContextManager) => void } = {}) {
+async function boot(opts: { residents?: string[]; dir?: string; failWriteDown?: boolean; seed?: (cm: ContextManager) => void } = {}) {
   const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'af-shed-window-'));
   if (!opts.dir) dirs.push(dir);
   const storePath = join(dir, 'store.chronicle');
@@ -72,14 +72,34 @@ async function boot(opts: { residents?: string[]; dir?: string; seed?: (cm: Cont
   }
   const membrane = new WireMembrane();
   const residents = opts.residents ?? ['mira', 'oren'];
-  const framework = await AgentFramework.create({
-    storePath,
-    membrane: membrane.asMembrane(),
-    agents: residents.map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', proseRouting: 'disabled' })),
-    modules: [new SurfaceModule()],
-    syncIntervalMs: 0,
-    maintenanceIntervalMs: 0,
-  } as never);
+  // Fail before the first registration writes an index; other residents adopt normally.
+  const presentRows = ContextManager.prototype.presentRows;
+  let failed = false;
+  if (opts.failWriteDown) ContextManager.prototype.presentRows = function (...args) {
+    if (!failed && this.windowMode() === 'legacy') {
+      failed = true;
+      throw new Error('synthetic initial write-down failure');
+    }
+    return presentRows.apply(this, args);
+  };
+  let framework: AgentFramework;
+  try {
+    framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: residents.map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', proseRouting: 'disabled' })),
+      modules: [new SurfaceModule()],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    } as never);
+  } finally {
+    ContextManager.prototype.presentRows = presentRows;
+  }
+  if (opts.failWriteDown) {
+    assert.equal(failed, true);
+    assert.equal(framework.getAgent('mira')!.getContextManager().windowMode(), 'legacy');
+    assert.equal(framework.getAgent('oren')!.getContextManager().windowMode(), 'presented');
+  }
   frameworks.push(framework);
   const traces: TraceEvent[] = [];
   framework.onTrace((event) => { traces.push(event); });
@@ -494,3 +514,155 @@ for (const mode of ['windowed', 'raw'] as const) {
     }
   });
 }
+
+// Actual failed initial write-down, not a patched presents predicate.
+it('raw legacy selection passes over host changes, held rows and foreign injections', async () => {
+  const h = await boot({ failWriteDown: true });
+  const before = h.internals.addMessage('user', [text('eligible-before')]);
+  const held = h.cm('mira').addMessage('user', [text('held')], { tuneOut: { epochId: 'held' } } as MessageMetadata);
+  const foreign = h.cm('mira').addMessage('user', [text('foreign')], {
+    contextInjection: { agent: 'oren', namespace: 'test', contentHash: 'test', part: 0, parts: 1 },
+  } as MessageMetadata);
+  const change = h.cm('mira').addMessage('host', [{ type: 'system_change', addSystem: ['metric'] } as unknown as ContentBlock]);
+  assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [before]);
+  for (const id of [held, foreign, change]) assert.ok(h.cm('mira').getMessage(id));
+  assert.equal(h.cm('mira').windowMode(), 'legacy');
+});
+
+it('a raw gap removal after failed write-down accounts for and retracts the whole interval elsewhere', async () => {
+  const h = await boot({ failWriteDown: true });
+  const before = h.internals.addMessage('user', [text('keep-before')]);
+  const call = h.internals.addMessage('mira', [
+    { type: 'thinking', thinking: '', signature: 'raw-signature' } as ContentBlock,
+    { type: 'tool_use', id: 'raw-a', name: 'shell', input: {} } as ContentBlock,
+    { type: 'tool_use', id: 'raw-b', name: 'shell', input: {} } as ContentBlock,
+  ]);
+  const earlier = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'raw-a', content: 'x'.repeat(100 * 1024) } as ContentBlock]);
+  const notice = h.internals.addMessage('user', [text('raw-notice')], { system: true });
+  const newest = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'raw-b', content: 'y'.repeat(1024) } as ContentBlock]);
+  const interval = [call, earlier, notice, newest];
+  for (const id of interval) assert.notEqual(h.cm('oren').ordinalOf(id), undefined, 'control: oren held every row');
+  const record = h.internals.shedNewestTurn(h.agent('mira'));
+  assert.deepEqual(record?.removedIds, [...interval].reverse());
+  assert.equal(record?.descriptor, 'a tool exchange (~101KB)');
+  for (const id of interval) {
+    assert.equal(h.cm('mira').getMessage(id), null);
+    assert.equal(h.cm('oren').ordinalOf(id), undefined, 'no stale other-window entry');
+  }
+  assert.notEqual(h.cm('oren').ordinalOf(before), undefined, 'unrelated prefix remains');
+  const sent = await h.compiled('mira');
+  assert.match(sent, /keep-before/);
+  assert.doesNotMatch(sent, /raw-signature|raw-a|raw-b|raw-notice/);
+  h.framework.start();
+  h.framework.pushEvent(input('next-raw-question', ['mira']));
+  await until(() => h.membrane.callsFor('mira').length === 1, 'legacy next request');
+  const wire = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+  assert.match(wire, /keep-before/);
+  assert.match(wire, /next-raw-question/);
+  assert.doesNotMatch(wire, /raw-signature|raw-a|raw-b|raw-notice/);
+  assert.equal(h.cm('mira').windowMode(), 'legacy');
+});
+
+for (const hidden of ['call', 'notice', 'sibling'] as const) {
+  it(`exchange visibility contract: hidden ${hidden}`, async () => {
+    const h = await boot();
+    const call = h.internals.addMessage('mira', [
+      { type: 'tool_use', id: 'visibility-a', name: 'shell', input: {} } as ContentBlock,
+      { type: 'tool_use', id: 'visibility-b', name: 'shell', input: {} } as ContentBlock,
+    ], hidden === 'call' ? { tuneOut: { epochId: 'held' } } as MessageMetadata : undefined);
+    if (h.cm('mira').ordinalOf(call) === undefined) h.cm('mira').presentRows([call]);
+    const sibling = h.internals.addMessage('user', [
+      { type: 'tool_result', toolUseId: 'visibility-a', content: 'earlier' } as ContentBlock,
+    ], hidden === 'sibling' ? { tuneOut: { epochId: 'held' } } as MessageMetadata : undefined);
+    if (h.cm('mira').ordinalOf(sibling) === undefined) h.cm('mira').presentRows([sibling]);
+    const notice = h.internals.addMessage('user', [text('visibility-notice')], {
+      system: true, ...(hidden === 'notice' ? { tuneOut: { epochId: 'held' } } : {}),
+    } as MessageMetadata);
+    if (h.cm('mira').ordinalOf(notice) === undefined) h.cm('mira').presentRows([notice]);
+    const result = h.internals.addMessage('user', [
+      { type: 'tool_result', toolUseId: 'visibility-b', content: 'newest' } as ContentBlock,
+    ]);
+    const other = await h.compiled('oren');
+    const record = h.internals.shedNewestTurn(h.agent('mira'), new Set(hidden === 'call' ? [result] : [call, result]));
+    assert.deepEqual(record?.removedIds, hidden === 'sibling' ? [result, notice, sibling, call] : [result]);
+    assert.equal(h.cm('mira').windowStatusOf(call), hidden === 'sibling' ? 'undone' : 'in');
+    assert.equal(await h.compiled('oren'), other);
+  });
+}
+
+for (const mode of ['windowed', 'raw'] as const) {
+  for (const matching of [false, true]) {
+    it(`complete heterogeneous-shard removal/accounting (${mode}, matching: ${matching})`, async () => {
+      const h = await boot();
+      const call = h.internals.addMessage('mira', [{ type: 'tool_use', id: 'hetero-a', name: 'shell', input: {} } as ContentBlock]);
+      const notice = h.internals.addMessage('user', [text('hetero-notice')], { system: true });
+      const cm = h.cm('mira');
+      const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: MessageId } } }).messageStore;
+      // No normal writer established: CM's chunker repeats one metadata object.
+      const shards = ['hetero-a', matching ? 'hetero-a' : 'hetero-x'].map((toolUseId, shardIndex) =>
+        store.append('user', [{ type: 'tool_result', toolUseId, content: 'shard' }], shardIndex ? { tuneOut: { epochId: 'held' } } : {}, undefined,
+          { bodyGroupId: 'hetero', shardIndex }).id);
+      cm.presentRows([shards[0]!]);
+      h.cm('oren').presentRows([shards[0]!]);
+      if (mode === 'raw') (h.framework as unknown as { presents: () => boolean }).presents = () => false;
+      const record = h.internals.shedNewestTurn(h.agent('mira'), new Set([shards[0]!]));
+      const removed = matching ? [call, notice, ...shards] : shards;
+      assert.deepEqual(record?.removedIds, [...removed].reverse());
+      if (mode === 'windowed') {
+        for (const id of removed) assert.equal(cm.windowStatusOf(id), 'undone');
+        const trace = h.traces.filter((t) => t.type === 'presentation:retracted').at(-1) as { messageIds: MessageId[] };
+        assert.deepEqual(trace.messageIds, removed);
+      } else {
+        for (const id of removed) {
+          assert.equal(cm.getMessage(id), null);
+          assert.equal(h.cm('oren').ordinalOf(id), undefined);
+        }
+      }
+    });
+  }
+}
+
+// Mixed system-change bodies are rejected by CM on write: simulate loaded
+// malformed content at the snapshot boundary; marker bodies use real metadata.
+for (const mixed of ['call-change', 'result-change', 'call-marker', 'result-marker'] as const) {
+  it(`mixed-body barrier applies before pairing (${mixed})`, async () => {
+    const h = await boot();
+    const cm = h.cm('mira');
+    const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown) => { id: MessageId } } }).messageStore;
+    const callBody = mixed.startsWith('call');
+    const barrierContent = mixed.endsWith('change') ? [{ type: 'system_change', addSystem: ['metric'] }] : [];
+    const barrierMetadata = mixed.endsWith('marker') ? { kind: 'refusal-rewind', system: true } : {};
+    const call = store.append('mira', [{ type: 'tool_use', id: 'mixed-barrier', name: 'shell', input: {} }], callBody ? barrierMetadata : {}).id;
+    const middle = store.append('user', [{ type: 'tool_result', toolUseId: 'mixed-barrier', content: 'middle' }], !callBody ? barrierMetadata : {}).id;
+    const notice = h.internals.addMessage('user', [text('mixed-gap')], { system: true });
+    const newest = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'mixed-barrier', content: 'newest' } as ContentBlock]);
+    const snapshot = cm.getPresentedMessages().map((row) => ({ ...row,
+      content: row.id === (callBody ? call : middle) ? [...row.content, ...barrierContent] as ContentBlock[] : row.content,
+    }));
+    cm.getPresentedMessages = () => snapshot;
+    const record = h.internals.shedNewestTurn(h.agent('mira'));
+    assert.deepEqual(record?.removedIds, [newest]);
+    for (const id of [call, middle, notice]) assert.equal(cm.windowStatusOf(id), 'in');
+  });
+}
+
+it('a passed-over sharded result scans its notice gap once, not once per shard', async () => {
+  const h = await boot();
+  const before = h.internals.addMessage('user', [text('keep-before')]);
+  const notices = Array.from({ length: 30 }, (_, i) => h.internals.addMessage('user', [text(`notice-${i}`)], { system: true }));
+  const cm = h.cm('mira');
+  const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: MessageId } } }).messageStore;
+  const shards = Array.from({ length: 40 }, (_, shardIndex) => store.append('user', [
+    { type: 'tool_result', toolUseId: 'unmatched', content: 'held' },
+  ], { tuneOut: { epochId: 'held' } }, undefined, { bodyGroupId: 'scan-result', shardIndex }).id);
+  cm.presentRows([shards[0]!]);
+  const snapshot = cm.getPresentedMessages();
+  let noticeReads = 0;
+  for (const row of snapshot) if (notices.includes(row.id)) {
+    const content = row.content;
+    Object.defineProperty(row, 'content', { get: () => { noticeReads++; return content; } });
+  }
+  cm.getPresentedMessages = () => snapshot;
+  assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [before]);
+  assert.ok(noticeReads < notices.length * 16, `bounded gap reads: ${noticeReads}`);
+});
