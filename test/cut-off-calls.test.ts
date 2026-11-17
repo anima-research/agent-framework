@@ -891,6 +891,17 @@ describe("the private think policy without a channel registry, across a restart,
     assert.ok(afterCut(run).includes(HELD));
   });
 
+  for (const [label, xml] of [
+    ['a >> destination with no words', '>>world:commons\n\n<function_calls>\n<invoke name="'],
+    ['a >>skip_reply aside', '>>skip_reply Just a note to myself.\n\n<function_calls>\n<invoke name="'],
+  ] as const) {
+    it(`says nothing of held words under explicit routing when the cut held only ${label}`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, { xml, stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'explicit' }, { targets: ['world:commons'] });
+      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+      assert.ok(!afterCut(run).includes(HELD));
+    });
+  }
+
   it("says nothing of held words when a hybrid cut held only a >>> destination with no words", async () => {
     const headerOnly: Reply = { xml: '>>>world:commons\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
     const run = await turn('xml', [XML_EAST_ROUND, headerOnly], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
