@@ -2,6 +2,7 @@ import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
+import { ContextManager as StoreWindow } from '@animalabs/context-manager';
 import { createMockResponse, HeldStream, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, ok, TS } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
@@ -37,6 +38,22 @@ class FailedCall implements YieldingStream {
         ? new MembraneError({ type: 'server', retryable: true, httpStatus: 502, message: 'bad gateway', rawError: undefined } as never)
         : new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, message: 'the provider could not process the request', rawError: { status: 400 } }),
     } as StreamEvent;
+  }
+}
+
+/** A stream that runs until it is cancelled, then ends as a stop does. */
+class RunsUntilStopped implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  private stopped!: () => void;
+  private readonly stop = new Promise<void>((resolve) => { this.stopped = resolve; });
+  provideToolResults(): void {}
+  cancel(): void { this.isCancelled = true; this.stopped(); }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    await this.stop;
+    yield { type: 'aborted', reason: 'user' } as StreamEvent;
   }
 }
 
@@ -864,4 +881,104 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     const post = r.f.published.find((p) => JSON.stringify(p).includes('the answer after the breaker'));
     assert.equal(post?.channelId, ROOM);
   });
+
+  const timerTurn = (r: Awaited<ReturnType<typeof rig>>) => (r.f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+    agentName: 'agent', reason: 'timer', source: 'test', timestamp: Date.now(),
+  });
+  const breakerAfterTimerTurns = async (r: Awaited<ReturnType<typeof rig>>) => {
+    r.streams.push(() => new FailedCall(), () => new FailedCall(), () => new FailedCall(),
+      () => new MockYieldingStream([answer('the answer after the breaker')]));
+    const before = r.f.membrane.calls.length;
+    for (let i = 1; i <= 3; i++) {
+      const at = r.f.membrane.calls.length;
+      timerTurn(r);
+      await eventually(() => r.f.membrane.calls.length === at + 1, `the failed timer turn ${i}`);
+      await r.f.framework.runUntilIdle();
+    }
+    await r.f.framework.runUntilIdle();
+    assert.equal(r.f.membrane.calls.length, before + 4, "premise: the third failure tripped the breaker, and its retry made one call");
+    assert.ok(r.f.context().includes('[turns-set-aside]'), 'premise: the breaker set turns aside');
+    return r.f.published.find((p) => JSON.stringify(p).includes('the answer after the breaker'));
+  };
+
+  it('the poison-history breaker\'s retry, after a channel message\'s turn completed and three timer turns failed, has no channel: nothing is published', async (t) => {
+    const r = await rig(t, { framework: { gate: QUIET_AMBIENT } as never });
+    await r.answered(ROOM, 'm-1');
+    await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('answer to m-1')), "premise: m-1's answer published");
+    assert.equal(await breakerAfterTimerTurns(r), undefined, "m-1's turn completed, so no retry continues it");
+  });
+
+  it('the poison-history breaker\'s retry, after an operator stopped a channel message\'s turn and three timer turns failed, has no channel: nothing is published', async (t) => {
+    const r = await rig(t, { framework: { gate: QUIET_AMBIENT } as never });
+    r.streams.push(() => new RunsUntilStopped());
+    await r.incoming(ROOM, 'm-1');
+    await eventually(() => r.f.membrane.calls.length === 1, "premise: m-1's turn is running");
+    assert.equal(r.f.framework.abortInference('agent', 'operator stop'), true, 'premise: the stop was taken');
+    await r.f.framework.runUntilIdle();
+    assert.equal(r.f.published.length, 0, "premise: m-1's stopped turn published nothing");
+    assert.equal(await breakerAfterTimerTurns(r), undefined, "m-1's turn was stopped, so no retry continues it");
+  });
+
+  it('an /unstick after a channel message\'s turn completed and a heartbeat turn was refused: its run answers no message, and its retry has no channel', async (t) => {
+    const r = await rig(t, manual);
+    const fw = r.f.framework as unknown as { pendingRequests: unknown[]; rewindRetry(...args: unknown[]): Record<string, unknown> };
+    const rewindRetry = fw.rewindRetry.bind(fw);
+    const made: Array<Record<string, unknown>> = [];
+    t.mock.method(fw, 'rewindRetry', (...args: unknown[]) => { const retry = rewindRetry(...args); made.push(retry); return retry; });
+    await r.answered(ROOM, 'm-1');
+    await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('answer to m-1')), "premise: m-1's answer published");
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    fw.pendingRequests.push({ agentName: 'agent', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now() });
+    await eventually(() => r.records.length === 1, 'the heartbeat turn refused');
+    await r.f.framework.runUntilIdle();
+    const before = r.f.membrane.calls.length;
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the unstick')]));
+    assert.equal((await unstick(r)).ok, true, 'premise: the unstick started');
+    await eventually(() => r.f.membrane.calls.length === before + 2, "the unstick's run and its retry");
+    await r.f.framework.runUntilIdle();
+    assert.deepEqual(made.map((x) => [x.reason, x.channelId, x.answersMessageId]), [['unstick', undefined, undefined], ['unstick-retry', undefined, undefined]],
+      "m-1's turn completed, so neither the unstick's run nor its retry answers m-1");
+    assert.equal(r.f.published.find((p) => JSON.stringify(p).includes('the answer after the unstick')), undefined, 'and nothing is published');
+  });
+});
+
+describe('a retry ranks with addressed wakes only while the agent is sent its message', () => {
+  const rewinding = { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', refusalHandling: { retries: 0, autoRewind: true, maxRewinds: 1 } }], framework: { gate: QUIET_AMBIENT } as never };
+  /** A rig whose agent's window wasn't written down at registration (the write-down refused), so the window is the record. */
+  const legacyRig = async (t: TestContext) => {
+    const presentRows = StoreWindow.prototype.presentRows;
+    StoreWindow.prototype.presentRows = function (this: StoreWindow, ids: Parameters<typeof presentRows>[0], ...rest: unknown[]) {
+      if (ids.length === 0) throw new Error('the write-down is refused (test)');
+      return (presentRows as (...a: unknown[]) => ReturnType<typeof presentRows>).call(this, ids, ...rest);
+    } as typeof presentRows;
+    try {
+      return await rig(t, rewinding);
+    } finally {
+      StoreWindow.prototype.presentRows = presentRows;
+    }
+  };
+  for (const [what, flag] of [['held from residents', { tuneOut: true }], ['suppressed', { suppressed: { rule: 'test', eventType: 'channels/incoming' } }]] as const) {
+    it(`a refused first round's retry in a window that is the record, where the only row with its message's server, channel and id is ${what}: the agent isn't sent it, so the turn speaks in the other message's channel`, async (t) => {
+      const r = await legacyRig(t);
+      assert.equal(r.f.framework.getAgent('agent')!.getContextManager().windowMode(), 'legacy', "premise: the agent's window is the record");
+      const fw = r.f.framework as unknown as { rewindRetry(...args: unknown[]): Record<string, unknown>; pendingRequests: Array<Record<string, unknown>> };
+      const rewindRetry = fw.rewindRetry.bind(fw);
+      t.mock.method(fw, 'rewindRetry', (...args: unknown[]) => {
+        r.f.framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: `m-a again, ${what}` }], { serverId: 'editor', channelId: ROOM, messageId: 'm-a', ...flag });
+        return rewindRetry(...args);
+      });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      r.streams.push(() => new HeldStream(released, [refusal()]), () => new MockYieldingStream([answer('the answer after the rewind')]));
+      await r.incoming(ROOM, 'm-a');
+      await eventually(() => r.f.membrane.calls.length === 1, 'the turn for m-a, held');
+      await r.incoming(GENERAL, 'm-b');
+      await eventually(() => r.stored('m-b') && fw.pendingRequests.some((q) => q.channelId === GENERAL && q.addressed === true), "premise: m-b stored and its addressed wake queued");
+      release();
+      await eventually(() => r.f.published.some((p) => JSON.stringify(p).includes('the answer after the rewind')), "the retry's answer published");
+      const sent = JSON.stringify(r.f.membrane.calls[1]!.messages);
+      assert.ok(!sent.includes('message m-a') && !sent.includes(`m-a again, ${what}`) && sent.includes('message m-b'), "premise: the retry's request shows m-b, and neither m-a nor the row with its id");
+      assert.equal(r.f.published.find((p) => JSON.stringify(p).includes('the answer after the rewind'))?.channelId, GENERAL);
+    });
+  }
 });
