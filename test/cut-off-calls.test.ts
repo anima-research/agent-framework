@@ -80,7 +80,7 @@ interface Run {
   audit: Array<Record<string, any>>;
 }
 
-async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: { registry?: boolean } = {}): Promise<Run> {
+async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: { registry?: boolean; targets?: string[] } = {}): Promise<Run> {
   const requests: string[] = [];
   const queue = [...replies];
   const server: Server = createServer((req, res) => {
@@ -128,7 +128,9 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       await deliver(agent, text, locus);
       return { delivered: true, serverId: 'stub', channelId: locus?.channelId ?? 'world:commons' };
     },
-    resolveProseTarget: (spec: string) => ({ error: `no channel matches "${spec}"` }),
+    resolveProseTarget: (spec: string) => opts.targets?.includes(spec)
+      ? { serverId: 'stub', channelId: spec }
+      : { error: `no channel matches "${spec}"` },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
     resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }),
     getDefaultPublishChannel: () => null,
@@ -807,6 +809,47 @@ describe("the private think policy without a channel registry, across a restart,
 
   it("says the held round's words weren't posted under hybrid routing too", async () => {
     const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // R4-1: a locked turn's words go to its lock (or are held as drafts with
+  // no lock) as a locus turn's go to its locus, so it is told too.
+  it("says the held round's words weren't posted under locked routing", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'locked', proseLock: 'world:commons' }, { targets: ['world:commons'] });
+    assert.ok(run.routed.includes('First I step east.'), `premise: the lock routes the turn's words: ${run.routed.join(' | ')}`);
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted under locked routing with no lock (held as drafts)", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'locked' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // R4-2: after a hybrid `>>>skip_reply` the rest of the turn stays private,
+  // so held words wouldn't have gone out anyway; a later `>>>` target lifts
+  // that hold, and the sentence comes back.
+  const XML_PRIVATE_EAST: Reply = { xml: '>>>skip_reply Just a note to myself.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  it("says nothing of held words after a hybrid >>>skip_reply earlier in the response", async () => {
+    const run = await turn('xml', [XML_PRIVATE_EAST, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words when the cut round's own words open with >>>skip_reply", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '>>>skip_reply Now north, privately.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when a later >>> target lifted an earlier >>>skip_reply", async () => {
+    const lifted: Reply = { xml: '>>>skip_reply Just a note to myself.\n>>>world:commons Hello, all.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [lifted, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when the cut round's own >>> target lifts an earlier >>>skip_reply", async () => {
+    const run = await turn('xml', [XML_PRIVATE_EAST, { xml: '>>>world:commons Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
     assert.ok(afterCut(run).includes(HELD));
   });
 
