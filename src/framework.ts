@@ -15047,8 +15047,9 @@ export class AgentFramework {
    * the agent's window, or the record on a window that is still the
    * record. A rewind marker is never taken that way: it ends the walk, as
    * a system_change does and any row that is neither a system notice nor
-   * a result body (one the agent is not sent included). Hidden notices and
-   * hidden call bodies also end the walk; matching stored results may go
+   * a result body (one the agent is not sent included). Hidden notices
+   * (except obsolete reasoning-loss notices, which no request renders) and hidden calls, including calls in a partly visible body,
+   * also end the walk; matching stored results may go
    * with their carried call even when the request did not carry them.
    * An exchange that is not paired is not taken as one: its rows are shed one at a time,
    * newest that counts first, as before #737, which is the result where
@@ -15128,9 +15129,9 @@ export class AgentFramework {
     // back over system notices and sibling result bodies only, to the
     // nearest call body, and pairs when every result ID in the interval is
     // a non-empty string that body holds. Any other row (one the agent is
-    // not sent included, except matching results), a system_change or a
-    // rewind marker ends the walk
-    // unpaired, and call and result are then shed one at a time, as every
+    // not sent included, except matching results and obsolete reasoning-loss
+    // notices), a system_change or a rewind marker ends the walk unpaired,
+    // and call and result are then shed one at a time, as every
     // call and result across a gap were before #737.
     const pairedCall = (start: number, end: number) => {
       const body = all.slice(start, end + 1);
@@ -15154,14 +15155,20 @@ export class AgentFramework {
         // Barriers apply to every body, including mixed call/result bodies.
         if (rows.some(isBarrier)) return undefined;
         if (rows.some((m) => hasBlock(m, 'tool_use'))) {
-          if (!rows.some((m) => !passedOver(m))) return undefined;
+          // A visible narration shard cannot make a hidden tool call visible.
+          // Removal still takes the whole body, not just its visible shards.
+          if (rows.some((m) => hasBlock(m, 'tool_use') && passedOver(m))) return undefined;
           if (turn.to === start - 1) return turn;
+          // Across a gap, results in a mixed call/result body belong to
+          // the interval too. Keep the legacy adjacent rule above unchanged.
+          collectResults(turn.from, turn.to);
           const calls = new Set(rows.flatMap((m) => Array.isArray(m.content)
             ? m.content.filter((b) => b.type === 'tool_use').map((b) => (b as { id: string }).id) : []));
           return resultIds !== null && [...resultIds].every((id) => calls.has(id)) ? turn : undefined;
         }
         if (rows.some((m) => hasBlock(m, 'tool_result'))) collectResults(turn.from, turn.to);
-        else if (!rows.every((m) => m.metadata?.system && this.agentSees(agent, m.metadata))) return undefined;
+        else if (!rows.every((m) => m.metadata?.system
+          && (isReasoningLoss(m.metadata) || this.agentSees(agent, m.metadata)))) return undefined;
         i = turn.from - 1;
       }
       return undefined;
@@ -15179,7 +15186,10 @@ export class AgentFramework {
       // Visibility gates selection, not each member of a paired exchange:
       // a stored result not itself carried still goes with its carried call.
       if (!body.some((m) => !passedOver(m)) && !resultOfCarriedCall) continue;
-      if (body.some((m) => Array.isArray(m.content) && asNextRequestCarries(m.content) !== null)
+      // Visibility and request content must have the same shard witness;
+      // a held nonempty shard cannot lend content to visible whitespace.
+      if (body.some((m) => (!passedOver(m) || resultOfCarriedCall)
+        && Array.isArray(m.content) && asNextRequestCarries(m.content) !== null)
         && (wasCarried(start, bodyEnd) || resultOfCarriedCall)) {
         idx = bodyEnd; break;
       }

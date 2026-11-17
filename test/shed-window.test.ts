@@ -657,6 +657,8 @@ it('a passed-over sharded result scans its notice gap once, not once per shard',
   ], { tuneOut: { epochId: 'held' } }, undefined, { bodyGroupId: 'scan-result', shardIndex }).id);
   cm.presentRows([shards[0]!]);
   const snapshot = cm.getPresentedMessages();
+  assert.equal(snapshot.filter((row) => notices.includes(row.id)).length, notices.length, 'all gap notices are in the snapshot');
+  assert.equal(snapshot.filter((row) => shards.includes(row.id)).length, shards.length, 'the complete held body is present');
   let noticeReads = 0;
   for (const row of snapshot) if (notices.includes(row.id)) {
     const content = row.content;
@@ -664,5 +666,102 @@ it('a passed-over sharded result scans its notice gap once, not once per shard',
   }
   cm.getPresentedMessages = () => snapshot;
   assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [before]);
+  // Selecting past the notices without walking the gap costs six reads
+  // per notice here (three hasBlock probes, each reading content twice).
+  // Require additional reads so skipping the held result's walk fails too.
+  assert.ok(noticeReads > notices.length * 6, `gap traversal ran: ${noticeReads}`);
   assert.ok(noticeReads < notices.length * 16, `bounded gap reads: ${noticeReads}`);
+});
+
+// Defensive heterogeneous stored bodies: the normal chunker repeats metadata.
+// Use the real store/read path (including CM validation), not a patched snapshot.
+for (const mode of ['windowed', 'raw'] as const) {
+  for (const hidden of ['held', 'foreign'] as const) {
+    for (const gap of [false, true]) {
+      it(`hidden tool-call shard cannot borrow narration visibility (${mode}, ${hidden}, gap: ${gap})`, async () => {
+        const h = await boot({ failWriteDown: mode === 'raw' });
+        const cm = h.cm('mira');
+        const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: MessageId } } }).messageStore;
+        const hiddenMetadata = hidden === 'held' ? { tuneOut: { epochId: 'held' } }
+          : { contextInjection: { agent: 'oren', namespace: 'test', contentHash: 'test', part: 0, parts: 1 } };
+        const narration = store.append('mira', [text('visible narration')], {}, undefined, { bodyGroupId: 'hidden-call', shardIndex: 0 }).id;
+        const call = store.append('mira', [{ type: 'tool_use', id: 'hidden-a', name: 'shell', input: {} }], hiddenMetadata, undefined,
+          { bodyGroupId: 'hidden-call', shardIndex: 1 }).id;
+        if (mode === 'windowed') cm.presentRows([narration]);
+        const notice = gap ? h.internals.addMessage('user', [text('hidden-call-gap')], { system: true }) : undefined;
+        const result = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'hidden-a', content: 'visible result' } as ContentBlock]);
+        assert.match(await h.compiled('mira'), /visible narration/);
+        assert.doesNotMatch(await h.compiled('mira'), /tool_use/);
+        assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result]);
+        for (const id of [narration, call, ...(notice ? [notice] : [])]) {
+          assert.ok(cm.getMessage(id), 'the complete call body and notice remain');
+          if (mode === 'windowed') assert.equal(cm.windowStatusOf(id), 'in');
+        }
+      });
+    }
+  }
+
+  for (const matching of [false, true]) {
+    for (const gap of [false, true]) {
+      it(`mixed call-body result IDs count across a gap only (${mode}, matching: ${matching}, gap: ${gap})`, async () => {
+        const h = await boot({ failWriteDown: mode === 'raw' });
+        const cm = h.cm('mira');
+        // Accepted by CM's real addMessage validation; no ordinary AF writer
+        // of this top-level mixed shape has been established.
+        const call = h.internals.addMessage('mira', [
+          { type: 'tool_use', id: 'mixed-a', name: 'shell', input: {} } as ContentBlock,
+          { type: 'tool_result', toolUseId: matching ? 'mixed-a' : 'mixed-x', content: 'mixed body result' } as ContentBlock,
+        ]);
+        const notice = gap ? h.internals.addMessage('user', [text('mixed-body-gap')], { system: true }) : undefined;
+        const result = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'mixed-a', content: 'latest result' } as ContentBlock]);
+        assert.equal(cm.getMessage(call)!.content.length, 2, 'CM preserves the mixed shape');
+        const paired = !gap || matching;
+        const ids = [call, ...(notice ? [notice] : []), result];
+        assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, paired ? ids.reverse() : [result]);
+        if (!paired) {
+          assert.ok(cm.getMessage(call));
+          assert.ok(cm.getMessage(notice!));
+        }
+      });
+    }
+  }
+
+  it(`visible whitespace cannot borrow hidden shard content (${mode})`, async () => {
+    const h = await boot({ failWriteDown: mode === 'raw' });
+    const before = h.internals.addMessage('user', [text('eligible prefix')]);
+    const cm = h.cm('mira');
+    const store = (cm as unknown as { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: MessageId } } }).messageStore;
+    const first = store.append('user', [text('   ')], {}, undefined, { bodyGroupId: 'empty-visible', shardIndex: 0 }).id;
+    const last = store.append('user', [text('held nonempty')], { tuneOut: { epochId: 'held' } }, undefined,
+      { bodyGroupId: 'empty-visible', shardIndex: 1 }).id;
+    if (mode === 'windowed') cm.presentRows([first]);
+    assert.doesNotMatch(await h.compiled('mira'), /held nonempty/);
+    assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [before]);
+    for (const id of [first, last]) {
+      assert.ok(cm.getMessage(id));
+      if (mode === 'windowed') assert.equal(cm.windowStatusOf(id), 'in');
+    }
+  });
+}
+
+it('raw legacy reasoning-loss notices omitted by compile do not orphan signed calls', async () => {
+  const h = await boot({ failWriteDown: true });
+  const cm = h.cm('mira');
+  const prefix = h.internals.addMessage('user', [text('legacy prefix')]);
+  const call = h.internals.addMessage('mira', [
+    { type: 'thinking', thinking: '', signature: 'legacy-loss-signature' } as ContentBlock,
+    { type: 'tool_use', id: 'legacy-loss-a', name: 'shell', input: {} } as ContentBlock,
+  ]);
+  const notice = h.internals.addMessage('user', [text('obsolete loss notice')], { system: true, kind: 'reasoning-loss' });
+  const result = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'legacy-loss-a', content: 'legacy loss result' } as ContentBlock]);
+  const sent = await h.compiled('mira');
+  assert.match(sent, /legacy-loss-signature/);
+  assert.match(sent, /legacy loss result/);
+  assert.doesNotMatch(sent, /obsolete loss notice/);
+  assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result, notice, call]);
+  const after = await h.compiled('mira');
+  assert.match(after, /legacy prefix/);
+  assert.doesNotMatch(after, /legacy-loss-signature|legacy-loss-a|legacy loss result/);
+  assert.ok(cm.getMessage(prefix));
+  assert.equal(cm.windowMode(), 'legacy');
 });
