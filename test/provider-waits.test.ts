@@ -2186,6 +2186,43 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
   });
 });
 
+test("a resident's turn that starts beside an auxiliary call in flight is held, sending nothing, when that call's wait is recorded while the turn compiles", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; });
+    const fw = await AgentFramework.create({
+      storePath: path, membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    const internal = fw as unknown as Internal & {
+      withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>, model?: string): Promise<T>;
+      providerGate(name: string): { primaryDepth: number };
+    };
+    // The auxiliary call in flight fails with a stated wait on the primary model while the turn compiles.
+    let fail!: (error: Error) => void;
+    const auxiliary = internal.withAuxiliaryAdmission('resident', () => new Promise<void>((_, reject) => { fail = reject; }), 'zz-model').catch(() => {});
+    record = () => internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the turn compiled');
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      assert.ok(log.lines.some((line) => /binds after the compile/.test(line)), 'held after the compile');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
+      assert.equal(internal.providerGate('resident').primaryDepth, 0, 'the held start gave its admission back');
+      fail(new Error('zz the auxiliary call ended'));
+      await auxiliary;
+
+      clock.pass(wait);
+      await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
+      assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
+    } finally { fail(new Error('zz the auxiliary call ended')); await auxiliary; await fw.stop(); log.restore(); }
+  });
+});
+
 test("a conversation agent's turn is held after its compile all the same when its stream's cancel throws", async (t) => {
   await withStoreDir(async (path) => {
     holdClock(t);

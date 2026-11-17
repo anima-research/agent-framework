@@ -10,6 +10,11 @@
   - **Migration:** set `primaryWaitsForAuxiliary: true` in that agent's
     config. Its turns then wait as before.
   - **Unchanged:** new compression calls still wait behind a pending or
-    running turn, a provider's stated wait still binds both kinds of call,
-    and an organization-acceleration cooldown still holds them, whatever
-    the setting.
+    running turn, whatever the setting. A provider's stated wait still
+    binds both kinds of call: a turn that starts beside a compression call
+    checks the waits again after its compile, so one that call's failure
+    records meanwhile holds the turn before anything is sent. An
+    organization-acceleration cooldown or a host's hold still holds the
+    turns and compression calls that start after it; one that a compression
+    call's failure arms while a turn beside it compiles doesn't stop that
+    turn's call, whose own failure is then held as before.
