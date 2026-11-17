@@ -813,6 +813,37 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.deepEqual(r.records.map((x) => x?.locus), [ROOM, ROOM, ROOM], 'and every refusal names that channel');
   });
 
+  it('an /unstick while a refused channel turn is unfinished and a later timer turn is the latest: its run answers the refused message, with that turn\'s wake channels', async (t) => {
+    const r = await rig(t, manual);
+    const fw = r.f.framework as unknown as {
+      pendingRequests: unknown[]; rewindRetry(...args: unknown[]): Record<string, unknown>;
+      turnRouting: Map<string, { answers?: unknown; wakeChannels?: unknown }>; answeredTurns: WeakMap<object, { answers?: unknown; wakeChannels?: unknown }>;
+    };
+    const rewindRetry = fw.rewindRetry.bind(fw);
+    const runs: Array<Record<string, unknown>> = [];
+    t.mock.method(fw, 'rewindRetry', (...args: unknown[]) => { const retry = rewindRetry(...args); if (retry.reason === 'unstick') runs.push(retry); return retry; });
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-1');
+    await eventually(() => r.records.length === 1, 'm-1 refused');
+    await r.f.framework.runUntilIdle();
+    const record = fw.answeredTurns.get(r.f.framework.getAgent('agent')!);
+    r.streams.push(() => new MockYieldingStream([answer('the timer turn')]));
+    fw.pendingRequests.push({ agentName: 'agent', reason: 'timer', source: 'test', timestamp: Date.now(), wakeChannels: [{ serverId: 'editor', channelId: GENERAL }] });
+    await eventually(() => r.f.membrane.calls.length >= 2, 'the timer turn');
+    await r.f.framework.runUntilIdle();
+    const latest = fw.turnRouting.get('agent');
+    assert.ok(record?.answers && latest && latest !== record && !latest.answers, "premise: m-1's turn is recorded, and the timer turn, which answers nothing, is the latest");
+    assert.notDeepEqual(latest.wakeChannels, record.wakeChannels, 'premise: the two turns have different wake channels');
+    const before = r.f.membrane.calls.length;
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the unstick')]));
+    assert.equal((await unstick(r)).ok, true, 'premise: the unstick started');
+    await eventually(() => r.f.membrane.calls.length === before + 2, "the unstick's run and its retry");
+    await r.f.framework.runUntilIdle();
+    assert.equal(runs.length, 1, "premise: the unstick's run was made once");
+    assert.deepEqual([runs[0]!.channelId, runs[0]!.answersMessageId], [ROOM, 'm-1'], "the unstick's run answers the refused message");
+    assert.deepEqual(runs[0]!.wakeChannels, record.wakeChannels, "with the refused turn's wake channels, not the timer turn's");
+  });
+
   it('an /unstick whose agent has answered no message: its run has no channel, and takes the agent\'s latest turn\'s wake channels', async (t) => {
     const r = await rig(t, manual);
     const fw = r.f.framework as unknown as { pendingRequests: unknown[]; rewindRetry(...args: unknown[]): Record<string, unknown> };

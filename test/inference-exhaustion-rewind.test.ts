@@ -133,6 +133,22 @@ test("the breaker's retry of a turn that answered a message and gathered a batch
   assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
 });
 
+test("the breaker's retry, while a channel turn is unfinished and a later turn with other wake channels is the latest, answers that turn's message with that turn's wake channels", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const side = { serverId: 'discord', channelId: 'discord:g:side' };
+  const unfinished = { answers: { channel: room, messageId: 'm-A' }, wakeChannels: [room] };
+  fw.answeredTurns.set(fw.agents.get('cairn'), unfinished);
+  fw.turnRouting = new Map([['cairn', { wakeChannels: [side] }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], ['discord:g:room', 'discord', 'm-A'], "the unfinished turn's message and its channel");
+  assert.deepEqual(retry.wakeChannels, [room], "and that turn's wake channels, not the latest turn's");
+});
+
 test("the breaker's retry, where the latest turn's message is no longer the agent's unfinished turn, answers no message and keeps the turn's wake channels", () => {
   const { fw, restore } = makeHarness();
   const room = { serverId: 'discord', channelId: 'discord:g:room' };
