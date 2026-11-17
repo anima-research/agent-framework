@@ -41,7 +41,6 @@ class FailedCall implements YieldingStream {
   }
 }
 
-/** A stream that runs until it is cancelled, then ends as a stop does. */
 class RunsUntilStopped implements YieldingStream {
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
@@ -972,7 +971,6 @@ describe('the retry a rewind queues answers the message the shed turn answered',
 
 describe('a retry ranks with addressed wakes only while the agent is sent its message', () => {
   const rewinding = { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', refusalHandling: { retries: 0, autoRewind: true, maxRewinds: 1 } }], framework: { gate: QUIET_AMBIENT } as never };
-  /** A rig whose agent's window wasn't written down at registration (the write-down refused), so the window is the record. */
   const legacyRig = async (t: TestContext) => {
     const presentRows = StoreWindow.prototype.presentRows;
     StoreWindow.prototype.presentRows = function (this: StoreWindow, ids: Parameters<typeof presentRows>[0], ...rest: unknown[]) {
