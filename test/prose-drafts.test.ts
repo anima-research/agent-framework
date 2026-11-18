@@ -4953,6 +4953,85 @@ describe('sameRoundSkipReplyTextPolicy', () => {
     }
   });
 
+  describe("text that would only have been held is held and named, and the skip_reply runs (review R1-1)", () => {
+    const ranOnce = async (h: Awaited<ReturnType<typeof harness>>, ended: () => number): Promise<string> => {
+      assert.equal(ended(), 1, 'the skip_reply ended the turn');
+      assert.ok(!roundTaken(h, 'k2'), 'the skip_reply ran: no second round');
+      const held = h.drafts().filter((d) => d.reason === 'skip-reply');
+      assert.equal(held.length, 1, 'its text is held as a skip-reply draft');
+      const id = held[0]!.id;
+      assert.ok(!h.toolResults().some((r) => r.startsWith(opening(id))), 'nothing asked where it goes');
+      assert.ok(h.texts().some((t) => (t.startsWith('[drafts]') || t.startsWith('[delivered]')) && t.includes(id)), 'the draft is named');
+      return id;
+    };
+    const skipped = (blocks: ContentBlock[]) => [
+      createMockResponse([...blocks, call('k1', 'skip_reply', {})], 'tool_use'),
+      createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+    ];
+
+    it("a heartbeat turn's text, which has no destination", async () => {
+      const h = await harness(asking());
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(WORDS)]), 'scout', 'heartbeat');
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes(), []);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('text beside a send that reached the locus', async () => {
+      const h = await harness(asking());
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(WORDS), explicitSend('s1')]));
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the send posted');
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('hybrid mode: a run under a send that reached its target', async () => {
+      const h = await harness(asking({ proseRouting: 'hybrid' }));
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(`>>>${GENERAL} Goodnight.`), call('s1', 'channel_publish', { channelId: GENERAL, content: 'an explicit note' })]));
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[GENERAL, 'an explicit note']]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('hybrid mode: one run that would have gone out is enough for the refusal, and it names each draft of the round', async () => {
+      const h = await harness(asking({ proseRouting: 'hybrid' }));
+      try {
+        await h.turn(skipped([text(`>>>${GENERAL} Goodnight.\n>>>${ROOM} See you.`), call('s1', 'channel_publish', { channelId: GENERAL, content: 'an explicit note' })]));
+        assert.ok(roundTaken(h, 'k2'), 'refused: the turn went on');
+        const held = h.drafts().filter((d) => d.reason === 'skip-reply');
+        assert.deepEqual(held.map((d) => d.text).sort(), ['Goodnight.', 'See you.']);
+        const result = h.toolResults().find((r) => r.startsWith('[drafts]')) ?? '';
+        assert.ok(held.every((d) => result.includes(d.id)), h.toolResults().join('\n'));
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("explicit mode: a drafts round's unprefixed text with no destination", async () => {
+      const h = await harness(asking({ proseRouting: 'explicit' }));
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text('A thought for later.'), drafts('d1', { action: 'list' })]));
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes(), []);
+      } finally {
+        await h.close();
+      }
+    });
+  });
+
   it('a round with skip_reply alone is never refused', async () => {
     const h = await harness(asking());
     const ended = endings(h);
