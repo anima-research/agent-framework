@@ -1059,16 +1059,15 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   assert.equal(errs.some((e) => e.includes('drain kicked')), false);
   assertNoObjectPrinted(rawArgs);
 
-  // Classification still reaches the hard-down gate, but an active stream
-  // has no exact failed-request witness for post-teardown quarantine.
+  // This widens the published pre-stream-only behavior: a clean terminal
+  // iterator now carries its failed compile through settlement to quarantine.
   const shed = await runFailingTurn('stream error event', () => foreignMembraneError(quoted), { turns: 3 });
-  assert.ok(shed.errs.some((e) => e.includes('stopped: active stream; failed request boundary unavailable')));
-  assert.equal(shed.errs.some((e) => e.includes('auto-quarantined')), false);
+  assert.equal(shed.errs.filter((e) => e.includes('auto-quarantined')).length, 3, 'the always-failing provider consumes only the step cap');
   const textsOf = (rows: typeof shed.messages) => rows.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
     .map((m) => (m.content[0] as { text: string }).text);
-  assert.deepEqual(textsOf(shed.window), ['hello 0', 'hello 1', 'hello 2']);
-  assert.ok(textsOf(shed.messages).includes('hello 2'));
-  assert.equal(shed.messages.some((m) => m.metadata?.kind === 'refusal-rewind'), false);
+  assert.deepEqual(textsOf(shed.window), [], 'a step cap preserves no minimum eligible history');
+  assert.ok(textsOf(shed.messages).includes('hello 2'), 'presented quarantine retains raw history');
+  assert.equal(shed.messages.some((m) => m.metadata?.kind === 'refusal-rewind'), true);
 
   // Its type is bounded like a provider code, in every sink it reaches.
   const odd = await runFailingTurn('stream throws', () => foreignMembraneError('Bad request: zz-short', `zz${'T'.repeat(MEGA)}`), { errorPolicy: noRetry });
@@ -1125,7 +1124,7 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
   }
 });
 
-test('the breaker reads real failure status but active-stream recovery declines without a request witness', async () => {
+test('the breaker reads real failure status and recovers only qualifying settled streams', async () => {
   // Through classifyInferenceError, the inference:exhausted trace and
   // noteInferenceExhausted to the gate, three failed turns each: the
   // escalation threshold. A shed is read from its own line, since the cap's
@@ -1148,14 +1147,14 @@ test('the breaker reads real failure status but active-stream recovery declines 
     const shed = errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
     const kept = window.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
       .map((m) => (m.content[0] as { text: string }).text);
-    assert.equal(shed.length, 0, `${label}: active-stream history is not shed`);
-    assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2']);
-    assert.equal(errs.some((e) => e.includes('stopped: active stream; failed request boundary unavailable')), sheds,
-      'only eligible error classifications reach the conservative decline');
+    assert.equal(shed.length, sheds ? 3 : 0, `${label}: only qualifying failures reach bounded quarantine`);
+    assert.deepEqual(kept, sheds ? [] : ['hello 0', 'hello 1', 'hello 2']);
+    assert.equal(messages.some((m) => m.metadata?.kind === 'refusal-rewind'), sheds);
+    assert.equal(errs.some((e) => e.includes('rewind cap 3 reached')), sheds);
     assert.deepEqual(markers, []);
     const records = failuresLog.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
       .filter((record) => record.kind === 'inference-exhausted');
-    assert.deepEqual(records.map((record) => record.httpStatus), [status, status, status]);
+    assert.deepEqual(records.map((record) => record.httpStatus), Array(sheds ? 6 : 3).fill(status));
   }
 });
 

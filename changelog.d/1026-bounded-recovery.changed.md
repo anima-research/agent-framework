@@ -9,9 +9,9 @@
 - Automatic refusal rewind gets a fresh budget after giving up, for a later
   independent wake; giving up itself does not enqueue a retry. Existing markers
   remain, and removed/branched-away markers are replaced on the next supported
-  step. Active-stream exhaustion stops immediately for manual repair; it does
-  not defer quarantine until teardown. Without an active stream, quarantine
-  still requires logical quiescence and settled guard work. Without a served
+  step. Exhaustion quarantine requires logical quiescence and settled guard
+  work; registered-stream failures now retain their compile witness and may
+  recover only after iterator completion, queued delivery and terminal teardown. Without a served
   request set, only visible, reader-eligible calls lend result eligibility.
   Visible results matching only hidden/foreign calls also stop recovery without
   removing unrelated older history or queuing a retry.
@@ -21,8 +21,8 @@
   removal to other residents; automatic retry remains stopped. `/unstick`
   preflight now distinguishes wait-for-settlement from inspect/repair guidance.
 
-- Exhaustion requires full logical quiescence; active-stream failures decline
-  for manual repair rather than deferring a plan to a different request/branch.
+- Exhaustion requires full logical quiescence; genuinely live streams still
+  decline. A settled terminal may recover only its own failed request/branch.
 - Rewind notices are reused only at the presented tail. Give-up ends the episode;
   hidden, missing or non-tail notices start a fresh count without editing prefixes.
 - Published repair guidance requires exclusive offline maintenance, not normal

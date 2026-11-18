@@ -7,14 +7,11 @@
  * Now, at the hard-down threshold, when the failure suggests the provider
  * refused the request's content or size (shedMayHelp: an invalid_request at
  * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
- * breaker can auto-quarantine ONLY before a stream exists and after logical
- * quiescence and guard settlement. Active-stream terminal errors instead stop
- * unchanged for manual repair, with no retry. A supported quiescent plan sheds
- * the newest complete exchange (the same
- * planning/removal contract the refusal auto-rewind and /unstick use;
- * unsupported exchanges decline unchanged), writes a tail-consolidated marker, and
- * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
- * never eat the whole history.
+ * breaker can auto-quarantine after the failed attempt settles, with its
+ * compile witness and terminal ownership intact. Live/unsettled streams still
+ * decline. A supported quiescent plan sheds the newest complete exchange,
+ * writes a tail-consolidated marker and queues a retry. The cap limits steps,
+ * not the amount of history preserved: one step can remove all eligible history.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,7 +19,7 @@ import { errorFromProviderStatus } from '@animalabs/membrane';
 import { AgentFramework, shedMayHelp } from '../src/framework.js';
 
 // Synthetic quiescent unit harness; live start/provider failures are exercised
-// in shed-window.test.ts, separately from active-stream refusal controls.
+// in shed-window.test.ts, alongside registered terminal-stream and still-live decline controls.
 function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const messages: any[] = opts?.messages ?? [
     { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
@@ -147,7 +144,7 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
 });
 
-test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
+test('server / unclassified failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {
     for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', '529 overloaded', true, 'server', undefined, fw.compiledHistory());
@@ -431,4 +428,21 @@ for (const witness of ['missing', 'other-branch', 'unreadable-branch', 'empty'] 
   const reason = witness === 'missing' ? 'failed compile history unavailable'
     : witness.endsWith('branch') ? 'failed compile branch changed or unavailable' : 'nothing eligible to shed';
   assert.ok(errs.some((line) => line.includes(`stopped: ${reason}`)));
+});
+
+test('qualifying 400 recovery ignores retryability classification and the cap preserves no minimum history', () => {
+  for (const retryable of [true, false, undefined]) {
+    const { fw, messages, removed, added, errs, restore } = makeHarness({ messages: [
+      { id: 'only', participant: 'human', content: [{ type: 'text', text: 'only eligible body' }] },
+    ] });
+    try {
+      for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, retryable, 'invalid_request', { httpStatus: 400 }, fw.compiledHistory());
+    } finally { restore(); }
+    assert.deepEqual(removed, ['only']);
+    assert.equal(messages.filter((m) => !m.metadata?.system).length, 0, 'a step cap is not a history floor');
+    assert.equal(added.filter(isRewindMarker).length, 1);
+    assert.equal(fw.pendingRequests.length, 1);
+    assert.ok(errs.some((line) => line.includes('after qualifying inference failures')));
+    assert.ok(errs.every((line) => !line.includes('after non-retryable')));
+  }
 });

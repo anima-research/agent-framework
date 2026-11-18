@@ -3221,7 +3221,7 @@ const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
  * terminal event. `for await` doesn't close an iterator whose `next()`
  * rejected.
  */
-async function* turnStreamEvents(stream: YieldingStream, agentName: string): AsyncGenerator<StreamEvent> {
+async function* turnStreamEvents(stream: YieldingStream, agentName: string, onFinished?: () => void): AsyncGenerator<StreamEvent> {
   const cancelThrown = (): void => {
     try {
       stream.cancel();
@@ -3244,6 +3244,9 @@ async function* turnStreamEvents(stream: YieldingStream, agentName: string): Asy
       if (event.type === 'complete' || event.type === 'error' || event.type === 'aborted') decidedBy = event.type;
       yield event;
     }
+    // Only a clean iterator end establishes that no provider work remains.
+    // A throw/cancel or extra event after a terminal does not prove settlement.
+    onFinished?.();
   } catch (error) {
     if (decidedBy !== undefined) {
       console.error(`[stream] ${agentName}: the stream threw after its ${decidedBy} event, which decided its turn; the throw decides nothing: ${describeFailureWithFrames(error)}`);
@@ -4665,6 +4668,7 @@ export class AgentFramework {
     channelId: string;
   }> = new Map();
   private unstickAnswers = new Map<string, UnstickAnswer>();
+  private recoveryApplying = new WeakSet<Agent>();
   private unstickWaiters = new Map<string, Set<(answer: UnstickAnswer | 'replaced') => void>>();
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
@@ -15050,6 +15054,7 @@ export class AgentFramework {
   ): ShedPlan {
     const unsupported = (reason: string): ShedPlan => ({ kind: 'unsupported', reason });
     try {
+      if (this.recoveryApplying?.has(agent)) return unsupported('recovery in progress');
       if (agent.toolResultGuard.hasPending || !agent.toolResultGuard.idle
         || this.pendingAssistantBlocks.has(agent.name) || agent.state.status === 'waiting_for_tools') {
         return unsupported('unsettled tool round');
@@ -15068,7 +15073,14 @@ export class AgentFramework {
       const has = (m: StoredMessage, t: string) => blocks(m).some((b) => b.type === t);
       const barrier = (m: StoredMessage) => has(m, 'system_change') || m.metadata?.kind === 'refusal-rewind';
       const reader = readerFacts(this.registry, agent.name);
-      const intended = (m: StoredMessage) => bearingOf(m, { ...reader, hidesHeld: false }, 'own') !== 'elsewhere';
+      const intended = (m: StoredMessage) => {
+        if (bearingOf(m, { ...reader, hidesHeld: false }, 'own') === 'elsewhere') return false;
+        // An observed resident is an arrival, not an own native tool round.
+        // In transcript mode its IDs are prose and must not reserve our IDs.
+        const owner = audienceOf(m.metadata)?.ownRowOf;
+        return !windowed || this.foreignRoundsConfigured?.get(agent) !== 'transcript'
+          || owner === undefined || owner === agent.name;
+      };
       // The source supplies window membership; use the compile's recorded
       // view for visibility, not presentation admission/ownership. In legacy
       // mode an ordinary co-resident own-row is still sent without an observe
@@ -15243,35 +15255,43 @@ export class AgentFramework {
    * from committed, but a post-commit exception still stops the caller: the
    * notifications/cleanup/marker are NOT part of the CM batch transaction. */
   private applyShed(agent: Agent, plan: Extract<ShedPlan, { kind: 'ready' }>): ShedOutcome {
-    const cm = agent.getContextManager();
+    (this.recoveryApplying ??= new WeakSet()).add(agent);
     try {
-      if (cm.currentBranch().name !== plan.branch) return { kind: 'stopped', reason: 'branch changed' };
-      if (plan.windowed) cm.retractRows(plan.heads, { undone: true });
-      else removeStoredMessages(cm, plan.rows[0], plan.rows[plan.rows.length - 1]);
-      if (cm.currentBranch().name !== plan.branch) return { kind: 'stopped', reason: 'branch changed after removal', record: plan.record };
-    } catch {
-      let reason = 'removal outcome unknown';
-      let record: RewindRecord | undefined;
+      const cm = agent.getContextManager();
+      let branchChanged = false;
       try {
-        if (cm.currentBranch().name === plan.branch) {
-          const states = plan.rows.map((m) => plan.windowed
-            ? cm.windowStatusOf(m.id) === 'undone' && cm.ordinalOf(m.id) === undefined
-            : cm.getMessage(m.id) === null);
-          if (states.every(Boolean)) { reason = 'removal committed but notification outcome uncertain'; record = plan.record; }
-          else if (states.every((x) => !x)) reason = 'removal not confirmed';
+        if (cm.currentBranch().name !== plan.branch) return { kind: 'stopped', reason: 'branch changed' };
+        if (plan.windowed) cm.retractRows(plan.heads, { undone: true });
+        else removeStoredMessages(cm, plan.rows[0], plan.rows[plan.rows.length - 1]);
+        branchChanged = cm.currentBranch().name !== plan.branch;
+      } catch {
+        let reason = 'removal outcome unknown';
+        let record: RewindRecord | undefined;
+        try {
+          if (cm.currentBranch().name === plan.branch) {
+            const states = plan.rows.map((m) => plan.windowed
+              ? cm.windowStatusOf(m.id) === 'undone' && cm.ordinalOf(m.id) === undefined
+              : cm.getMessage(m.id) === null);
+            if (states.every(Boolean)) { reason = 'removal committed but notification outcome uncertain'; record = plan.record; }
+            else if (states.every((x) => !x)) reason = 'removal not confirmed';
+          }
+        } catch { /* unknown: never replay */ }
+        if (record && !plan.windowed) {
+          try { this.retractRemovedElsewhere(cm, record.removedIds, 'rewind'); }
+          catch { /* still stopped; confirmed removal must not be replayed */ }
         }
-      } catch { /* unknown: never replay */ }
-      if (record && !plan.windowed) {
-        try { this.retractRemovedElsewhere(cm, record.removedIds, 'rewind'); }
-        catch { /* still stopped; confirmed removal must not be replayed */ }
+        return { kind: 'stopped', reason, record };
       }
-      return { kind: 'stopped', reason, record };
+      try {
+        if (plan.windowed) this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...plan.record.removedIds].reverse(), reason: 'shed' });
+        else this.retractRemovedElsewhere(cm, plan.record.removedIds, 'rewind');
+      } catch { return { kind: 'stopped', reason: 'removal applied; notification failed', record: plan.record }; }
+      return branchChanged
+        ? { kind: 'stopped', reason: 'branch changed after removal', record: plan.record }
+        : { kind: 'applied', record: plan.record };
+    } finally {
+      this.recoveryApplying.delete(agent);
     }
-    try {
-      if (plan.windowed) this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...plan.record.removedIds].reverse(), reason: 'shed' });
-      else this.retractRemovedElsewhere(cm, plan.record.removedIds, 'rewind');
-    } catch { return { kind: 'stopped', reason: 'removal applied; notification failed', record: plan.record }; }
-    return { kind: 'applied', record: plan.record };
   }
 
   /** Direct internal seam; callers needing a decline reason use plan/apply. */
@@ -15717,15 +15737,18 @@ export class AgentFramework {
         const reason = preflight.kind === 'unsupported' ? preflight.reason : 'nothing eligible to shed';
         const guidance = preflight.kind === 'empty'
           ? 'No eligible request content; no recovery session was opened.'
-          : ['live assistant round', 'unsettled tool round'].includes(reason)
+          : ['live assistant round', 'unsettled tool round', 'recovery in progress'].includes(reason)
             ? 'Wait for the active turn and tool work to settle, then retry.'
             : reason === 'snapshot unavailable'
               ? 'Investigate the snapshot/read failure in the host log; retry after reads recover.'
               : 'Inspect and repair history first; see docs/recovery-b.md.';
         return { ok: false, error: `Cannot unstick: ${reason}. ${guidance}` };
       }
-      const cap = Math.max(1, Math.min(10,
-        Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
+      const requestedCap = params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3;
+      if (typeof requestedCap !== 'number' || !Number.isFinite(requestedCap)) {
+        return { ok: false, error: 'maxRewinds must be a finite number' };
+      }
+      const cap = Math.max(1, Math.min(10, Math.floor(requestedCap)));
       const left = this.unstickWaiters.get(agentName);
       this.unstickWaiters.delete(agentName);
       for (const resolve of left ?? []) resolve('replaced');
@@ -28835,6 +28858,7 @@ export class AgentFramework {
             }
           : undefined,
         streamCarry,
+        compiledHistory,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -29020,11 +29044,13 @@ export class AgentFramework {
      *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
     thinkingDrops?: StreamThinkingDrops,
     carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
+    compiledHistory?: CompiledHistory,
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
+    const myForcedRewind = this.forcedRewind?.get(agent.name);
     // Membrane's usage events are cumulative across the stream's tool loop,
     // so the latest is everything the stream has been billed for so far:
     // the measure of a stream that ends without a final response.
@@ -29402,6 +29428,13 @@ export class AgentFramework {
     // Set by the complete / aborted / error cases: the stream SAID how it
     // ended. An iterator that just closes says nothing (see after the loop).
     let streamTerminal = false;
+    let streamFinished = false;
+    // A recovery-eligible terminal error is not yet a settled stream: iterator return,
+    // speech delivery and teardown may still write. Report exhaustion only
+    // after those finish, retaining this attempt's witness, never a fresh view.
+    // Resolve terminal waiters in that same settled callback: an ephemeral
+    // caller may dispose its agent as soon as the waiter resolves.
+    let exhaustedAtEnd: ((history?: CompiledHistory) => void) | undefined;
     let preserveEventGateForSuccessor = false;
     this.hookOrchestrator?.emitLifecycle({
       inferenceId: outgoingInferenceId,
@@ -29525,7 +29558,7 @@ export class AgentFramework {
     // finally, which sends it, and a stop() can send it sooner.
     this.pendingOutgoingCompletes.add(completeOutgoing);
     try {
-      for await (const event of turnStreamEvents(stream, agent.name)) {
+      for await (const event of turnStreamEvents(stream, agent.name, () => { streamFinished = true; })) {
         // Ignore every late event from an Agent generation that no longer owns
         // this name (ephemeral watchdog/disposal, conversation replacement).
         if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
@@ -30952,31 +30985,32 @@ export class AgentFramework {
               }
             } else {
               this.noteFailedTurnEnd(agent, streamRouting);
-              this.settleAgent(agent.name, {
-                stopReason: 'exhausted',
-                speech: '',
-                ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
-                cause: err,
-              }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              this.emitTrace({
-                type: 'inference:exhausted',
-                agentName: agent.name,
-                error: err.message,
-                ...shownReasonOf(err),
-                // Drives the poison-history breaker. `retryable` is kept for
-                // observability, but the breaker gates on
-                // shedMayHelp(errorType, httpStatus): only an `invalid_request`
-                // at HTTP 400, 413 or 422 or with no status, or a
-                // `context_length` at 413, suggests the provider refused the
-                // request's content or size, which a shed of the newest
-                // exchange may fix.
-                ...this.classifyInferenceError(err),
-              });
-              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
-              if (action.emit) {
-                this.pushEvent(action.emit);
+              exhaustedAtEnd = (history) => {
+                this.settleAgent(agent.name, {
+                  stopReason: 'exhausted',
+                  speech: '',
+                  ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
+                  cause: err,
+                }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
+                this.emitTrace({
+                  type: 'inference:exhausted',
+                  agentName: agent.name,
+                  error: err.message,
+                  ...shownReasonOf(err),
+                  // The existing shedMayHelp classification, not arbitrary 400s.
+                  ...this.classifyInferenceError(err),
+                }, history);
+                if (action.emit) this.pushEvent(action.emit);
+                this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
+              };
+              // Only recovery-eligible failures need a settled-request boundary.
+              // Outages keep their ordinary failure timing, even if an outgoing
+              // delivery is hung; they cannot quarantine history in any case.
+              const classification = this.classifyInferenceError(err);
+              if (!shedMayHelp(classification.errorType, classification.httpStatus)) {
+                exhaustedAtEnd();
+                exhaustedAtEnd = undefined;
               }
-              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
             }
             break;
           }
@@ -31351,20 +31385,28 @@ export class AgentFramework {
         return;
       }
       this.noteFailedTurnEnd(agent, streamRouting);
-      this.settleAgent(agent.name, {
-        stopReason: 'exhausted',
-        speech: '',
-        ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
-        cause: err,
-      }, streamRouting);
-      this.emitTrace({
-        type: 'inference:exhausted',
-        agentName: agent.name,
-        error: err.message,
-        ...shownReasonOf(err),
-        ...this.classifyInferenceError(err),
-      });
-      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
+      exhaustedAtEnd = (history) => {
+        this.settleAgent(agent.name, {
+          stopReason: 'exhausted',
+          speech: '',
+          ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
+          cause: err,
+        }, streamRouting);
+        this.emitTrace({
+          type: 'inference:exhausted',
+          agentName: agent.name,
+          error: err.message,
+          ...shownReasonOf(err),
+          ...this.classifyInferenceError(err),
+        }, history);
+        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
+      };
+      const classification = this.classifyInferenceError(err);
+      if (!shedMayHelp(classification.errorType, classification.httpStatus)) {
+        exhaustedAtEnd();
+        exhaustedAtEnd = undefined;
+      }
+
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
@@ -31421,6 +31463,13 @@ export class AgentFramework {
             strategy.reportKvUnifiedFailed?.(submissionId);
           }
         } catch { /* receipt cleanup must not mask inference teardown */ }
+      }
+      // Keep the stream registered while its queued deliveries can still write.
+      let settled = streamFinished;
+      if (exhaustedAtEnd) {
+        this.decideWaitingRound(agent, myStreamId, 'its stream ended');
+        try { await turnSpeechChain; completeOutgoing(); }
+        catch { settled = false; } // no recovery witness after uncertain delivery
       }
       // A framework retry/budget restart can overlap physical streams on the
       // same Agent object. Name + Agent identity is not enough: only the
@@ -31546,6 +31595,19 @@ export class AgentFramework {
           this.settleTurnDrafts(agent, streamRouting);
         } catch (err) {
           console.error('[drafts] turn-end settlement failed:', err);
+        }
+      }
+
+      if (exhaustedAtEnd) {
+        // Delivery/notification listeners may have started a successor while
+        // this frame settled. A stale attempt must never recover its history
+        // or answer a replacement forced session.
+        if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId
+          && !this.activeTurnTokens.has(agent.name)
+          && this.forcedRewind?.get(agent.name) === myForcedRewind) {
+          exhaustedAtEnd(settled ? compiledHistory : undefined);
+        } else {
+          console.error(`[inference-rewind] agent=${agent.name} stopped: terminal ownership changed while stream settled.`);
         }
       }
 
@@ -35755,8 +35817,8 @@ export class AgentFramework {
    *      planNewestTurn validates a tool result with its paired
    *      tool_use/thinking turn) and retry when planning supports it; otherwise
    *      stop for manual repair,
-   *      bounded by the same rewind cap so the breaker can never eat the
-   *      whole history.
+   *      bounded by the same step cap. This is not a guarantee that any
+   *      minimum amount of eligible history will remain.
    */
   /**
    * Live health snapshot for /healthz and doctor tooling: gate state, queued
@@ -36145,6 +36207,7 @@ export class AgentFramework {
     detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string },
     history?: CompiledHistory,
   ): void {
+    const unstick = this.forcedRewind?.get(agentName);
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
     const madeAgain = this.freshCallsCut?.delete(agentName) === true;
@@ -36319,10 +36382,12 @@ export class AgentFramework {
       // `retryable` is kept only for the trace.
       void retryable;
       if (agent && shedMayHelp(errorType, httpStatus)) {
-        if (this.activeStreams.has(agent.name)) {
-          // No exact failed-request/branch witness survives teardown here.
-          // Decline rather than planning against later arrivals or a successor.
-          console.error(`[inference-rewind] agent=${agent.name} stopped: active stream; failed request boundary unavailable. Manual repair needed.`);
+        if (this.forcedRewind?.get(agentName) !== unstick) {
+          console.error(`[inference-rewind] agent=${agent.name} stopped: forced session changed while failure was reported.`);
+        } else if (this.activeStreams.has(agent.name)) {
+          // Genuinely live/unsettled work still blocks history mutation.
+          // Settled stream failures are reported after teardown with a witness.
+          console.error(`[inference-rewind] agent=${agent.name} stopped: active stream. Wait for stream and tool work to settle, then retry.`);
         } else if (!history) {
           console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile history unavailable. Manual repair needed.`);
         } else {
@@ -36336,8 +36401,7 @@ export class AgentFramework {
       }
     }
     // Answer after synchronous quarantine so confirmed removals are included.
-    const unstick = this.forcedRewind?.get(agentName);
-    if (unstick) {
+    if (unstick && this.forcedRewind?.get(agentName) === unstick) {
       this.answerUnstick(agentName, {
         outcome: 'turn-failed',
         rewinds: unstick.removed.length,
@@ -36351,15 +36415,15 @@ export class AgentFramework {
   }
 
   /**
-   * Quiescent pre-stream poison-history quarantine (the actual "breaker").
-   * Active-stream exhaustion refuses before reaching this planner. Sheds the
+   * Quiescent poison-history quarantine (the actual "breaker").
+   * Registered-stream failures reach it only after terminal teardown. Sheds the
    * newest complete exchange carried by the failed compile — reusing the same
    * primitives as the refusal auto-rewind / `/unstick` (planNewestTurn/applyShed +
    * a tail-consolidated marker) — and queues a retry so the
    * rewound history is verified immediately instead of waiting for the next
    * push event to wake the agent onto the same context.
    *
-   * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
+   * Step-bounded (not a minimum-history guarantee): at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
    * sheds per failure episode; the budget resets when a turn completes.
    * Unsupported plans stop without mutation or retry, for manual repair.
    * At the cap (or with nothing left to shed) it stops — the agent stays up
@@ -36376,7 +36440,7 @@ export class AgentFramework {
     if (used >= cap) {
       console.error(
         `[inference-rewind] agent=${agent.name} rewind cap ${cap} reached — ` +
-        `not shedding further history. Manual repair (/unstick or /undo) needed.`,
+        `not shedding further history. Inspect history before further recovery; see docs/recovery-b.md for exclusive offline repair of interrupted calls.`,
       );
       return;
     }
@@ -36388,7 +36452,9 @@ export class AgentFramework {
     // Exhaustion has no ownership exception: queued/held turns also block.
     const plan = this.planNewestTurn(agent, carried, undefined, 'terminal-exhaustion');
     if (plan.kind !== 'ready') {
-      console.error(`[inference-rewind] agent=${agent.name} stopped: ${plan.kind === 'unsupported' ? `unsupported: ${plan.reason}` : 'nothing eligible to shed'}. Manual repair needed.`);
+      const guidance = plan.kind === 'unsupported' && ['live assistant round', 'unsettled tool round', 'recovery in progress'].includes(plan.reason)
+        ? 'Wait for stream and tool work to settle, then retry.' : 'Inspect history; see docs/recovery-b.md for repair guidance.';
+      console.error(`[inference-rewind] agent=${agent.name} stopped: ${plan.kind === 'unsupported' ? `unsupported: ${plan.reason}` : 'nothing eligible to shed'}. ${guidance}`);
       return;
     }
     const outcome = this.applyShed(agent, plan);
@@ -36414,7 +36480,7 @@ export class AgentFramework {
     }
     console.error(
       `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
-      `(${used + 1} turn(s) shed this failure episode, cap ${cap}) after non-retryable ` +
+      `(${used + 1} turn(s) shed this failure episode, cap ${cap}) after qualifying ` +
       `inference failures — retrying on the rewound history.`,
     );
 

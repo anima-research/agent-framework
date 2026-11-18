@@ -2,8 +2,9 @@
   quarantine:** Safe B now declines incomplete/mismatched/mixed tool exchanges,
   unpresented endpoints, noncontiguous legacy removals and busy logical turns
   instead of shedding a single endpoint. Empty `/unstick` no longer opens a
-  session; active-stream exhaustion stops for manual repair, without quarantine
-  or retry. Migrate by handling explicit declines, waiting for known work to
+  session. Registered-stream exhaustion may now quarantine only after settlement
+  and terminal teardown, using the same failed attempt's compile witness; live
+  streams still decline. Migrate by handling explicit declines, waiting for known work to
   settle and using the exclusive offline repair procedure in
   `docs/recovery-b.md` for interrupted or uncertain history. Do not repeatedly
   wake an uncertain store. Complete, unambiguous settled exchanges still support

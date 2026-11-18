@@ -769,7 +769,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
   });
 
   for (const reusedIds of [false, true]) {
-    it(`turns that each fail after an answered call reach hard-down: ${reusedIds ? 'reused IDs' : 'unique IDs'} decline without a failed-request boundary`, async () => {
+    it(`turns that each fail after an answered call reach hard-down: ${reusedIds ? 'reused IDs' : 'unique IDs'} recover after the failed stream settles`, async () => {
       // Each turn's first call answers (its round's usage arrives) and the
       // call after its tool result is refused as the provider can't take it,
       // which shedMayHelp matches.
@@ -780,8 +780,9 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
           message: 'zz the provider could not process the tool result', rawError: { status: 400 },
         }),
       }) as StreamEvent;
-      // Both ID layouts stop at the active-stream boundary before planning;
-      // this is not evidence of an ID-ambiguity decline.
+      // Both ID layouts are complete. Unlike the published pre-stream-only
+      // behavior, the finished terminal can now recover its compiled history.
+      // The just-produced tool round is outside that witness and stays intact.
       const r = await resident([1, 2, 3].map((n) => () =>
         new RoundThenEnd(firstUsage, refused(), 'aborted', `echo-${reusedIds ? 1 : n}`)));
       const internal = r.framework as unknown as {
@@ -819,12 +820,10 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         const rows = cm.windowMode() === 'presented' ? cm.getPresentedMessages() : cm.getAllMessages();
         const calls = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_use'));
         const results = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_result'));
-        assert.ok(lines.some((line) => line.includes('stopped: active stream; failed request boundary unavailable')),
-          'declines before teardown rather than snapshotting later history');
-        assert.equal(shed, false);
+        assert.equal(shed, true, 'quarantine runs only after terminal settlement with the failed compile');
         assert.equal(internal.exhaustionRewinds.get('resident') ?? 0, 0);
-        assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), false);
-        assert.equal(r.membrane.calls.length, 3, 'no retry was run');
+        assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), true);
+        assert.equal(r.membrane.calls.length, 4, 'one repaired retry was run');
         assert.equal(internal.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false);
         assert.equal(calls.length, 3, 'all call endpoints retained');
         assert.equal(results.length, 3, 'all result endpoints retained');

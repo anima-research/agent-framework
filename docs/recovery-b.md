@@ -44,19 +44,26 @@ storage/annotation work, and no pending assistant round may remain. A standalone
 attempt also needs the agent's idle boundary: no live turn token, stream, or
 queued, parked, provider-held or budget-held continuation, even when status
 already reads `idle`. Only terminal refusal can recover its own ending turn before token release.
-Pre-stream exhaustion carries the failed compile's raw-body set into planning;
+Exhaustion carries the failed compile's raw-body set into planning;
 every selected body head, including all tool-closure endpoints, must belong to
 that set. If a late result completes a carried call, the whole plan declines
 without removing either endpoint, selecting older history, consuming a step,
 adding a marker or queuing a rewind retry. Missing provenance
 or a changed/unreadable compile branch declines without quarantine or a rewind
 retry. This witness is attempt-local, not a durable fence against future writers.
-Exhaustion requires full logical quiescence and declines while a stream is
-active: a terminal 400 on an active stream stops immediately for manual repair,
-without mutation or retry. It does not wait for teardown or defer quarantine;
-no exact failed-request branch and carried-set witness survives there. Both
-require settled guard work. This is a known-writer boundary,
-not a promise that arbitrary future modules cannot append a result. Dendrite
+This follow-up **widens the supported path** compared with the published
+“active-stream terminal failure stops unchanged” behavior. A registered stream's
+qualifying exhausted provider failure (for example `invalid_request` HTTP 400,
+not every HTTP 400) now keeps its compile witness through iterator completion,
+queued speech delivery and terminal teardown. Only then can quarantine run,
+with full logical quiescence, settled guard work and the same terminal owner,
+branch and carried bodies. A genuinely live or unsettled stream still blocks
+recovery; a successor turn or stream invalidates the old terminal's ownership.
+Pre-stream failures retain the same witness requirements. Failure accounting
+may append an `inference-failed` notice even when quarantine declines; an
+unchanged quarantine means no history shedding or rewind retry, not an
+unchanged store. This is a known-writer boundary, not a promise that arbitrary
+future modules cannot append a result. Dendrite
 held result mail is not itself a stored `tool_result` endpoint.
 
 A refused reply is excluded from planning only after its whole body is verified
@@ -71,7 +78,7 @@ is cleared. A missing, hidden, branched-away or non-tail marker also starts a
 fresh count instead of editing an old prefix. `/unstick` preflight declines before opening a session or
 queuing its initial probe. Supported probes re-plan at actual refusal. Later
 unsupported forced recovery ends as `gave-up`, with the logged bounded reason;
-it does not claim `cleared`. The exhaustion caller requests manual repair.
+it does not claim `cleared`. Exhaustion logs distinguish waiting for known work to settle from inspecting history for repair.
 
 Markers consolidate only while the current marker remains at the visible tail.
 A retained notice after it starts another marker/count, even within one recovery
@@ -99,7 +106,9 @@ malformed-history repair, storage format or CM API is part of this change.
 
 ## Synchronous whole-history cost (not window-bounded)
 
-The rewind **step count** is bounded; snapshot time and memory are not. Every
+The rewind **step count** is bounded; snapshot time and memory are not.
+The cap does not preserve a minimum history: even one step can remove all
+eligible conversational content when only one eligible body remains. Every
 plan, including `/unstick` preflight and a plan that ultimately declines, calls
 `getAllMessages()` and examines raw bodies, including held/unpresented endpoints.
 This can inflate every historical image/blob even for a tiny presented window.
@@ -111,7 +120,7 @@ text row, took **34.0–37.3 ms synchronously**, allocating **32.8–32.9 MiB he
 and **80.4–80.6 MiB RSS** across three fresh-process cold plans. The fixture
 uses real CM/blob storage and the production planner with idle host state;
 it excludes process startup, store opening, provider calls and mutation.
-Reproduce after building with
+Reproduce **from a source checkout** (the published package does not ship the probe), after building, with
 `node --expose-gc scripts/recovery-plan-cost.mjs` (optional row-count and
 KiB-per-row arguments). These are fixture observations, not bounds or a
 production latency guarantee. Larger histories can stall the event loop or
@@ -190,7 +199,9 @@ result, replay a possibly side-effecting tool, or delete just one endpoint.
 Marker limits: the consolidated count advances when the marker write succeeds,
 not at the removal commit, so a later marker can understate prior removals after
 a cleanup/marker failure. A marker also describes the current window mode; it
-is not a per-step raw-retention audit if modes change mid-episode. Consult the
+is not a per-step raw-retention audit if modes change mid-episode. Its metadata
+records the initial count/category/cause; consolidation edits only the text,
+so metadata is not a current aggregate either. Consult the
 backed-up store and failure logs for repair, not the marker alone. Forced-session
 failure summaries report a stopped, unverified recovery and confirmed removals;
 the bounded stop reason is in the host log.

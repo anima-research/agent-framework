@@ -64,7 +64,7 @@ export interface ActivationRequestOptions {
   /** The framework's inferenceBounds, resolved: the stream gets their phase
    *  bounds and flat bound. None when left out. */
   inferenceBounds?: InferenceBounds | null;
-  /** Capture this start's history before membrane creation, which can throw
+  /** Capture this attempt's history before membrane creation, which can throw
    * synchronously. Not called without compile provenance; the caller must
    * then decline failed-request recovery rather than read current history. */
   onCompiledHistory?: (history: CompiledHistory) => void;
