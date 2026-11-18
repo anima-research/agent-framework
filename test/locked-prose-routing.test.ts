@@ -342,7 +342,7 @@ describe('locked prose routing', () => {
     assert.deepEqual(routed, [], 'nothing was posted');
     const texts = windowTexts(framework);
     assert.ok(texts.some((t) => t.startsWith('[prose-routing] Locked routing: your plain speech is held as drafts')), 'the primer says so');
-    assert.ok(texts.some((t) => /^\[delivered\] nothing — 1 plain-speech segment\(s\) held as draft d-/.test(t)), 'the receipt names the draft');
+    assert.ok(texts.some((t) => /^\[delivered\] nothing — 1 plain-speech segment\(s\) held as draft d-\S+ \(no destination\) \(not sent — drafts can resend them unchanged, or dismiss them\)$/.test(t)), `the receipt names the draft, and why: ${texts.filter((t) => t.startsWith('[delivered]')).join(' | ')}`);
     await framework.stop();
   });
 
