@@ -44,8 +44,10 @@ A refused reply is excluded from planning only after its whole body is verified
 tool-free. Unsupported, empty, or cap-exhausted attempts do not remove that
 reply, remove either endpoint, add a marker, count a successful step or enqueue
 a rewind retry. Existing confirmed step counts and marker state are left
-unchanged on decline/cap/failure, not reset into a fresh automatic budget; a
-non-refusal completion ends the episode. `/unstick` preflight declines before opening a session or
+unchanged on exhaustion decline/cap/failure. Automatic refusal rewind instead
+ends its attempt on give-up and resets its budget for a later independent wake,
+without queuing a retry; its marker/count remain until a non-refusal completion
+ends the episode. `/unstick` preflight declines before opening a session or
 queuing its initial probe. Supported probes re-plan at actual refusal. Later
 unsupported forced recovery ends as `gave-up`, with the logged bounded reason;
 it does not claim `cleared`. The exhaustion caller requests manual repair.
@@ -90,3 +92,46 @@ resident-before witnesses, retained clock and one-shot notices, including
 notices arriving after compile. Defensive malformed/heterogeneous bodies use
 CM's internal append or snapshot injection where normal CM writers reject them;
 those tests do not claim normal writers produce such shapes.
+
+## Safe manual repair for interrupted calls
+
+An interrupted call body with no stored result is intentionally unsupported on
+all rewind paths. Repeating `/unstick` cannot repair it. Do not fabricate a
+result, replay a possibly side-effecting tool, or delete just one endpoint.
+
+1. Stop writers: **every process that can write the store**, not merely an
+   idle host. Take a **fresh, coherent copy** of the complete store after writers
+   have stopped, and note the affected branch, resident and body IDs before
+   changing anything. Keep writers stopped throughout inspection and repair.
+   Reconcile unfinished or unknown dispatches first: establish whether each
+   tool ran and what external effects it produced before undoing history.
+   If dispatch outcomes cannot be established, keep the store stopped and
+   escalate to the maintainer rather than assuming the tools did not run.
+2. Inspect raw history **and** the resident's presented window. Identify the
+   complete assistant body (all shards, thinking and calls), every call ID and
+   any stored matching results, including held/unpresented rows and other
+   branches. If IDs, ownership or closure are uncertain, keep the backup and
+   ask the maintainer to repair the snapshot; do not guess.
+3. For a verified trailing call-only body with nothing after it, use the host's
+   normal whole-turn `/undo` while inference is disabled, then inspect the
+   window before resuming. **Whole-turn undo does not roll back external tool
+   effects**; reconcile those separately before resuming. If the host cannot
+   expose a settled whole-turn undo,
+   keep it stopped and have a maintainer use CM's whole-body `retractRows` on
+   the affected presented window. For legacy raw history, only a verified exact
+   contiguous whole-body interval may be removed with CM's removal API, with
+   all resident windows reconciled. Never hand-edit Chronicle files.
+4. Verify that the next compiled request contains neither the removed calls
+   nor orphan results, that unrelated notices and other residents are intact,
+   then restart from the repaired snapshot. If verification fails, keep writers
+   stopped and restore only the fresh, coherent backup, ensuring restoration
+   does not overwrite later writes. If any later writes occurred, preserve them
+   and have a maintainer reconcile them before restoring; do not blindly replace
+   the store. This is operator repair, not an automatic recovery exception.
+
+Marker limits: the consolidated count advances when the marker write succeeds,
+not at the removal commit, so a later marker can understate prior removals after
+a cleanup/marker failure. A marker also describes the current window mode; it
+is not a per-step raw-retention audit if modes change mid-episode. Consult the
+backed-up store and failure logs for repair, not the marker alone. Forced-session
+failure summaries are generic; the bounded stop reason is in the host log.

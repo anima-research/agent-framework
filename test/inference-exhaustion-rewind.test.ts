@@ -57,6 +57,8 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.registry = { get: () => ({ relationships: { observes: [] } }), ownSlotOf: () => ({ namespace: null }) };
   fw.pendingAssistantBlocks = new Map();
+  fw.activeStreams = new Map();
+  fw.deferredQuarantines = new Map();
   fw.storeSees = new WeakMap(); // No view filter on this synthetic raw manager.
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();

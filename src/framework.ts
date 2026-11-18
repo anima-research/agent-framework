@@ -4633,7 +4633,7 @@ export class AgentFramework {
    *  loop — this one drives ops alerting. */
   private refusalStreak: Map<string, number> = new Map();
   /** Per-agent count of consecutive refusal-driven rewinds in the current turn
-   *  chain (reset when a turn completes without a refusal). Bounds the auto
+   *  chain (reset on give-up or non-refusal completion). Bounds the auto
    *  rewind loop — see refusalHandling + shedNewestTurn. */
   private refusalRewinds: Map<string, number> = new Map();
   /** Per-agent count of poison-history rewinds performed by the hard-down
@@ -4642,6 +4642,7 @@ export class AgentFramework {
    *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
    *  the refusal loop, so the breaker can never shed the whole history. */
   private exhaustionRewinds: Map<string, number> = new Map();
+  private deferredQuarantines = new Map<Agent, { streamId: number; reason: string }>();
   /** Agents with an OverBudget drain kick currently in flight. The breaker in
    *  noteInferenceExhausted fires on EVERY matching failure and the scenario it
    *  exists for is "every activation fails, repeatedly" — without this guard,
@@ -15099,7 +15100,14 @@ export class AgentFramework {
       const callId = (b: ContentBlock) => (b as { id?: unknown }).id;
       const resultId = (b: ContentBlock) => (b as { toolUseId?: unknown }).toolUseId;
       const valid = (id: unknown): id is string => typeof id === 'string' && id.trim().length > 0;
-      const carriedCalls = new Set(runs.filter(carriedBody).flatMap(calls).map(callId).filter(valid));
+      const carriedCalls = new Set(runs.filter(carriedBody).flatMap((body) => calls(carried ? body : body.filter(visible))).map(callId).filter(valid));
+      // Only a stored hidden/foreign call proves that its result can be
+      // passed over without a carried set. Absence of an eligible call is not
+      // proof: visible orphan results must reach closure validation and stop.
+      const hiddenCalls = new Set(raw.filter((m) => !visible(m)).flatMap((m) => calls([m])).map(callId).filter(valid));
+      for (const id of raw.filter(visible).flatMap((m) => calls([m])).map(callId)) {
+        if (valid(id)) hiddenCalls.delete(id);
+      }
       let selected: StoredMessage[][] | undefined;
       let tool = false;
       for (let i = runs.length - 1; i >= 0; i--) {
@@ -15111,6 +15119,10 @@ export class AgentFramework {
           const id = resultId(r);
           return valid(id) && carriedCalls.has(id);
         });
+        if (!carried && !cs.length && rs.length && rs.every((r) => {
+          const id = resultId(r);
+          return valid(id) && hiddenCalls.has(id);
+        })) continue;
         if (!(carriedBody(body) && witness(body)) && !answersCarried) continue;
         if (!cs.length && !rs.length) { selected = [body]; break; }
         tool = true;
@@ -15194,6 +15206,10 @@ export class AgentFramework {
           else if (states.every((x) => !x)) reason = 'removal not confirmed';
         }
       } catch { /* unknown: never replay */ }
+      if (record && !plan.windowed) {
+        try { this.retractRemovedElsewhere(cm, record.removedIds, 'rewind'); }
+        catch { /* still stopped; confirmed removal must not be replayed */ }
+      }
       return { kind: 'stopped', reason, record };
     }
     try {
@@ -15235,7 +15251,8 @@ export class AgentFramework {
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
-    if (ep) {
+    const marker = ep && cm.getAllMessages().find((m) => m.id === ep.markerId);
+    if (ep && marker?.metadata?.kind === 'refusal-rewind') {
       cm.editMessage(ep.markerId, blocks);
       this.rewindEpisode.set(agent.name, { markerId: ep.markerId, count, category });
     } else {
@@ -15639,7 +15656,7 @@ export class AgentFramework {
       }
       const preflight = this.planNewestTurn(agent);
       if (preflight.kind !== 'ready') return {
-        ok: false, error: `Cannot unstick: ${preflight.kind === 'unsupported' ? preflight.reason : 'nothing eligible to shed'}`,
+        ok: false, error: `Cannot unstick: ${preflight.kind === 'unsupported' ? preflight.reason : 'nothing eligible to shed'}. ${preflight.kind === 'unsupported' && ['live assistant round', 'unsettled tool round'].includes(preflight.reason) ? 'Wait for the active turn and tool work to settle, then retry.' : 'Inspect and repair history first; see docs/recovery-b.md.'}`,
       };
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
@@ -30407,9 +30424,9 @@ export class AgentFramework {
                       `[refusal-rewind] agent=${agent.name} gave up: ` +
                         `${used >= cap ? `cap ${cap} reached` : 'recovery stopped (see disposition above)'}`,
                     );
-                    // Preserve confirmed step accounting and the existing
-                    // marker on decline/cap/failure. A non-refusal completion
-                    // ends the episode; declining is not a fresh budget.
+                    // End this automatic attempt. A later independent wake
+                    // gets a fresh budget; keep the durable marker/count.
+                    this.refusalRewinds.delete(agent.name);
                   },
                 );
               }
@@ -31460,6 +31477,17 @@ export class AgentFramework {
       if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)
         && !this.pendingContinuationAgents().has(agent.name) && !this.closureWaits(agent.name)) {
         this.disposeConversationAgent(agent.name, 'idle-ttl');
+      }
+
+      const quarantine = this.deferredQuarantines.get(agent);
+      if (quarantine?.streamId === myStreamId) {
+        this.deferredQuarantines.delete(agent);
+        if (ownsPhysicalStream && frameReachedTerminal) {
+          await agent.toolResultGuard.whenAnnotated();
+          if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+            this.quarantinePoisonedHistory(agent, quarantine.reason);
+          }
+        }
       }
     }
   }
@@ -35651,7 +35679,8 @@ export class AgentFramework {
    *      threshold, automatically quarantine: shed the newest complete
    *      exchange (the same forced-rewind primitive `/unstick` uses —
    *      shedNewestTurn takes a tool result with its paired
-   *      tool_use/thinking turn) and retry,
+   *      tool_use/thinking turn) and retry when planning supports it; otherwise
+   *      stop for manual repair,
    *      bounded by the same rewind cap so the breaker can never eat the
    *      whole history.
    */
@@ -36228,7 +36257,11 @@ export class AgentFramework {
       // `retryable` is kept only for the trace.
       void retryable;
       if (agent && shedMayHelp(errorType, httpStatus)) {
-        this.quarantinePoisonedHistory(agent, wholeReason);
+        if (this.activeStreams.has(agent.name)) {
+          // The ending stream still owns its submitted guard batch and
+          // pending assistant round. Recover only after its own teardown.
+          this.deferredQuarantines.set(agent, { streamId: agent.streamId, reason: wholeReason });
+        } else this.quarantinePoisonedHistory(agent, wholeReason);
       }
     }
   }
@@ -36243,6 +36276,7 @@ export class AgentFramework {
    *
    * Bounded: at most `refusalHandling.maxRewinds` (default 3, hard cap 10)
    * sheds per failure episode; the budget resets when a turn completes.
+   * Unsupported plans stop without mutation or retry, for manual repair.
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */

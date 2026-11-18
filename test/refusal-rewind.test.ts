@@ -381,7 +381,7 @@ test('a carried call with a stored unpresented result declines without creating 
     const marker = rig.stored().filter((m) => m.metadata?.kind === 'refusal-rewind');
     assert.equal(marker.length, 1);
     assert.match(JSON.stringify(marker[0]!.content), /The 1 most recent turn/);
-    assert.equal((rig.framework as any).refusalRewinds.get('scout'), 1, 'decline preserves actual step accounting, not a fresh cap');
+    assert.equal((rig.framework as any).refusalRewinds.get('scout'), undefined, 'give-up ends the automatic attempt; later independent wakes get a fresh budget');
     assert.equal((rig.framework as any).rewindEpisode.get('scout').count, 1);
     assert.equal((rig.framework as any).pendingRequests.length, 0);
     await rig.framework.runUntilIdle();

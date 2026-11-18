@@ -331,6 +331,7 @@ class RoundThenEnd implements YieldingStream {
     private readonly usage: DetailedUsage,
     private readonly ending: StreamEvent | Error | 'close',
     private readonly cancelledAs: 'aborted' | 'error' | 'close' = 'aborted',
+    private readonly callId = 'echo-1',
   ) {}
   provideToolResults(): void {
     this.isWaitingForTools = false;
@@ -344,7 +345,7 @@ class RoundThenEnd implements YieldingStream {
   }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     yield { type: 'usage', usage: this.usage } as StreamEvent;
-    const call = { type: 'tool_use' as const, id: 'echo-1', name: 'test--echo', input: {} };
+    const call = { type: 'tool_use' as const, id: this.callId, name: 'test--echo', input: {} };
     this.isWaitingForTools = true;
     this.pendingToolCallIds = [call.id];
     yield {
@@ -767,52 +768,82 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
     }
   });
 
-  it('turns that each fail after an answered call reach the hard-down threshold and run the breaker: an answered call is not a completed turn', async () => {
-    // Each turn's first call answers (its round's usage arrives) and the
-    // call after its tool result is refused as the provider can't take it,
-    // which shedMayHelp matches.
-    const refused = (): StreamEvent => ({
-      type: 'error',
-      error: new MembraneError({
-        type: 'invalid_request', retryable: false, httpStatus: 400,
-        message: 'zz the provider could not process the tool result', rawError: { status: 400 },
-      }),
-    }) as StreamEvent;
-    const r = await resident([1, 2, 3].map(() => () => new RoundThenEnd(firstUsage, refused())));
-    const internal = r.framework as unknown as { consecutiveInferenceFailures: Map<string, number> };
-    const streaks: number[] = [];
-    const answeredBefore: number[] = [];
-    let answered = 0;
-    // emitTrace counts the failure before listeners hear it.
-    r.framework.onTrace((event) => {
-      if (event.type === 'inference:usage') answered++;
-      if (event.type === 'inference:exhausted') {
-        streaks.push(internal.consecutiveInferenceFailures.get('resident') ?? 0);
-        answeredBefore.push(answered);
+  for (const reusedIds of [false, true]) {
+    it(`turns that each fail after an answered call reach hard-down: ${reusedIds ? 'ambiguous reused IDs decline without a shed or retry' : 'unique IDs shed the newest closed exchange and retry'}`, async () => {
+      // Each turn's first call answers (its round's usage arrives) and the
+      // call after its tool result is refused as the provider can't take it,
+      // which shedMayHelp matches.
+      const refused = (): StreamEvent => ({
+        type: 'error',
+        error: new MembraneError({
+          type: 'invalid_request', retryable: false, httpStatus: 400,
+          message: 'zz the provider could not process the tool result', rawError: { status: 400 },
+        }),
+      }) as StreamEvent;
+      // The old fixture reused echo-1 for every turn. Safe B must decline
+      // that ambiguous history, not pick the nearest matching endpoint.
+      const r = await resident([1, 2, 3].map((n) => () =>
+        new RoundThenEnd(firstUsage, refused(), 'aborted', `echo-${reusedIds ? 1 : n}`)));
+      const internal = r.framework as unknown as {
+        consecutiveInferenceFailures: Map<string, number>;
+        exhaustionRewinds: Map<string, number>;
+        pendingRequests: Array<{ reason: string }>;
+      };
+      const streaks: number[] = [];
+      const answeredBefore: number[] = [];
+      let answered = 0;
+      // emitTrace counts the failure before listeners hear it.
+      r.framework.onTrace((event) => {
+        if (event.type === 'inference:usage') answered++;
+        if (event.type === 'inference:exhausted') {
+          streaks.push(internal.consecutiveInferenceFailures.get('resident') ?? 0);
+          answeredBefore.push(answered);
+        }
+      });
+      const lines: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      r.framework.start();
+      try {
+        for (const [turn, text] of ['first', 'second', 'third'].entries()) {
+          r.framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
+          await r.framework.runUntilIdle();
+          assert.ok(await pollUntil(() => streaks.length === turn + 1), `turn ${turn + 1} failed`);
+        }
+        assert.deepEqual(answeredBefore, [1, 2, 3], 'each failed turn had a call that answered');
+        assert.deepEqual(streaks, [1, 2, 3], 'an answered call leaves the streak standing');
+        const alerts = r.traces.filter((e) => e.type === 'ops:alert' && (e as { kind?: string }).kind === 'hard-down');
+        assert.equal(alerts.length, 1, 'the third failed turn raises the hard-down alert');
+        const shed = lines.some((line) => /^\[inference-rewind\] agent=resident auto-quarantined /.test(line));
+        const cm = r.framework.getAgent('resident')!.getContextManager();
+        const rows = cm.windowMode() === 'presented' ? cm.getPresentedMessages() : cm.getAllMessages();
+        const calls = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_use'));
+        const results = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_result'));
+        if (reusedIds) {
+          assert.ok(lines.some((line) => line.includes('stopped: unsupported: missing or ambiguous call body')),
+            'Safe B explicitly declines the ambiguous exchange');
+          assert.equal(shed, false, 'no false successful shed');
+          assert.equal(internal.exhaustionRewinds.get('resident') ?? 0, 0, 'no rewind budget consumed');
+          assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), false, 'no success marker');
+          assert.equal(r.membrane.calls.length, 3, 'no retry was run');
+          assert.equal(internal.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false,
+            'no retry left queued');
+          assert.equal(calls.length, 3, 'all ambiguous call endpoints retained');
+          assert.equal(results.length, 3, 'all ambiguous result endpoints retained');
+        } else {
+          assert.equal(shed, true, 'the breaker sheds a closed unambiguous exchange');
+          assert.equal(r.membrane.calls.length, 4, 'retries once on repaired history');
+          assert.deepEqual(calls.map((b) => b.type === 'tool_use' && b.id), ['echo-1', 'echo-2']);
+          assert.equal(results.length, 2, 'the newest result is shed with its call');
+          assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), true);
+        }
+      } finally {
+        console.error = original;
+        await r.framework.stop();
+        rmSync(r.dir, { recursive: true, force: true });
       }
     });
-    const lines: string[] = [];
-    const original = console.error;
-    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
-    r.framework.start();
-    try {
-      for (const [turn, text] of ['first', 'second', 'third'].entries()) {
-        r.framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
-        await r.framework.runUntilIdle();
-        assert.ok(await pollUntil(() => streaks.length === turn + 1), `turn ${turn + 1} failed`);
-      }
-      assert.deepEqual(answeredBefore, [1, 2, 3], 'each failed turn had a call that answered');
-      assert.deepEqual(streaks, [1, 2, 3], 'an answered call leaves the streak standing');
-      const alerts = r.traces.filter((e) => e.type === 'ops:alert' && (e as { kind?: string }).kind === 'hard-down');
-      assert.equal(alerts.length, 1, 'the third failed turn raises the hard-down alert');
-      assert.ok(lines.some((line) => /^\[inference-rewind\] agent=resident auto-quarantined /.test(line)),
-        'and the poison-history breaker sheds the newest exchange');
-    } finally {
-      console.error = original;
-      await r.framework.stop();
-      rmSync(r.dir, { recursive: true, force: true });
-    }
-  });
+  }
 });
 
 /** A completion the stream would yield next; these tests end it before it's handled. */

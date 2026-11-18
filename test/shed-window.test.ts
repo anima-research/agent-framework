@@ -12,7 +12,7 @@
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -278,7 +278,7 @@ for (const legacy of [false, true]) {
       if (shape === 'reused') h.internals.addMessage('mira', [callBlock('a')]);
       if (shape === 'ordinary') h.internals.addMessage('user', [text('barrier')]);
       if (shape === 'marker') h.internals.updateRewindMarker(h.agent('mira'), 'test');
-      const change = shape === 'change' ? h.internals.addMessage('user', [text('loaded change placeholder')]) : undefined;
+      const change = shape === 'change' ? h.internals.addMessage('user', [text('loaded change placeholder')], { system: true }) : undefined;
       if (shape === 'hidden-notice') {
         const id = h.internals.addMessage('user', [text('held notice')], { system: true, tuneOut: { epochId: 'held' } } as MessageMetadata);
         if (!legacy) h.cm('mira').presentRows([id]);
@@ -304,6 +304,7 @@ for (const legacy of [false, true]) {
       const before = snapshot(h);
       const plan = h.internals.planNewestTurn(h.agent('mira'), carried ? new Set([call, ...(shape === 'mixed' ? [result] : [])]) : undefined);
       assert.equal(plan.kind, 'unsupported');
+      if (shape === 'change') assert.equal(plan.reason, 'barrier between tool endpoints');
       assert.equal(h.internals.shedNewestTurn(h.agent('mira'), carried ? new Set([call]) : undefined), null);
       assert.equal(snapshot(h), before);
       // The quarantine caller must not count or retry even at maxRewinds=1.
@@ -357,7 +358,7 @@ for (const legacy of [false, true]) {
     const store = (cm as any).messageStore;
     const result = store.append('user', [resultBlock('a')], {}, undefined, { bodyGroupId: 'hidden-result', shardIndex: 0 }).id;
     const metadata = hidden === 'foreign' ? { contextInjection: { agent: 'oren', namespace: 'test', contentHash: 'x', part: 0, parts: 1 } }
-      : hidden === 'held' ? { tuneOut: { epochId: 'held' } } : { system: true, ...(hidden === 'marker' ? { kind: 'refusal-rewind' } : {}) };
+      : hidden === 'held' ? { tuneOut: { epochId: 'held' } } : hidden === 'marker' ? { kind: 'refusal-rewind' } : { system: true };
     store.append('user', [text('non-tool-sibling')], metadata, undefined, { bodyGroupId: 'hidden-result', shardIndex: 1 });
     if (!legacy) cm.presentRows([result]);
     assertDecline(h, new Set([call]));
@@ -672,11 +673,11 @@ it('forced recovery re-plans after a successful preflight and gives up on a newl
   assert.ok(h.cm('mira').getAllMessages().some((m) => textOf(m) === 'changed-history-refused-reply'));
 });
 
-for (const legacy of [false, true]) it(`native audience and context ownership cannot be borrowed (legacy:${legacy})`, async () => {
+for (const legacy of [false, true]) for (const owned of [false, true]) it(`native audience and context ownership cannot be borrowed (legacy:${legacy}, owned:${owned})`, async () => {
   const h = await boot({ failWriteDown: legacy });
   const cm = h.cm('mira');
   const call = h.internals.addMessage('mira', [callBlock('a')]);
-  const result = cm.addMessage('user', [resultBlock('a')], { audience: ['oren'], ownRowOf: 'oren' } as MessageMetadata);
+  const result = cm.addMessage('user', [resultBlock('a')], { audience: ['oren'], ...(owned ? { ownRowOf: 'oren' } : {}) } as MessageMetadata);
   if (!legacy) cm.presentRows([result]); // a loaded/write-down body, not a normal arrival
   assertDecline(h, new Set([call]));
 });
@@ -784,3 +785,175 @@ for (const location of ['queued', 'parked', 'pass', 'provider-held', 'budget-hel
     }
   });
 }
+
+for (const hidden of ['foreign', 'held', 'audience'] as const) it(`legacy unstated carried set skips ${hidden} calls and their results`, async () => {
+  const h = await boot({ failWriteDown: true });
+  const eligible = h.internals.addMessage('user', [text('eligible-before-hidden-call')]);
+  const metadata = hidden === 'foreign' ? { ownRowOf: 'oren', audience: ['oren'] }
+    : hidden === 'audience' ? { audience: ['oren'] } : { tuneOut: { epochId: 'held' } };
+  h.cm('mira').addMessage('mira', [callBlock('foreign')], metadata as MessageMetadata);
+  h.cm('mira').addMessage('user', [resultBlock('foreign')]);
+  const plan = h.internals.planNewestTurn(h.agent('mira'));
+  assert.equal(plan.kind, 'ready');
+  assert.deepEqual(plan.record.removedIds, [eligible]);
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'bad history');
+  assert.equal(h.cm('mira').getMessage(eligible), null);
+  assert.equal(h.internals.exhaustionRewinds.get('mira'), 1);
+});
+
+for (const missing of ['removed', 'branched-away'] as const) it(`replaces a ${missing} episode marker without losing its confirmed count`, async () => {
+  const h = await boot();
+  const anchor = h.internals.addMessage('user', [text('before marker')]);
+  h.internals.updateRewindMarker(h.agent('mira'), 'first');
+  const old = h.internals.rewindEpisode.get('mira')!.markerId;
+  if (missing === 'removed') h.cm('mira').removeMessage(old);
+  else {
+    const cm = h.cm('mira');
+    await cm.switchBranch(cm.branchAt(anchor, 'before-rewind-marker'));
+    assert.equal(cm.getMessage(old), null, 'real branch excludes the old marker');
+  }
+  h.internals.addMessage('user', [text('later supported turn')]);
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'bad history');
+  const ep = h.internals.rewindEpisode.get('mira')!;
+  assert.notEqual(ep.markerId, old);
+  assert.equal(ep.count, 2);
+  assert.match(textOf(h.cm('mira').getMessage(ep.markerId)!), /The 2 most recent/);
+  assert.equal(h.internals.pendingRequests.length, 1);
+});
+
+it('automatic refusal gets a fresh budget after cap give-up on an independent wake', async () => {
+  const h = await boot({ autoRewind: true });
+  const refusal = () => { const r = final([text('refused')]); r.stopReason = 'refusal'; return r; };
+  h.membrane.script('mira', refusal());
+  h.membrane.script('mira', refusal());
+  h.framework.start();
+  h.framework.pushEvent(input('first poison', ['mira']));
+  await h.framework.runUntilIdle();
+  assert.equal(h.membrane.callsFor('mira').length, 2);
+  assert.equal((h.framework as any).refusalRewinds.has('mira'), false);
+  h.membrane.script('mira', refusal());
+  h.membrane.script('mira', final([text('recovered')]));
+  h.framework.pushEvent(input('second poison', ['mira']));
+  await h.framework.runUntilIdle();
+  assert.equal(h.membrane.callsFor('mira').length, 4);
+  assert.equal(h.cm('mira').windowStatusOf(h.rowWith('mira', 'second poison')!.id), 'undone');
+});
+
+it('unsupported exhaustion preserves prior confirmed budget and marker', async () => {
+  const h = await boot();
+  (h.agent('mira').refusalHandling as any).maxRewinds = 3;
+  h.internals.addMessage('user', [text('first shed')]);
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'first');
+  h.internals.pendingRequests.length = 0;
+  const ep = { ...h.internals.rewindEpisode.get('mira')! };
+  h.internals.addMessage('mira', [callBlock('unfinished')]);
+  const before = snapshot(h);
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'second');
+  assert.equal(snapshot(h), before);
+  assert.equal(h.internals.exhaustionRewinds.get('mira'), 1);
+  assert.deepEqual(h.internals.rewindEpisode.get('mira'), ep);
+  assert.equal(h.internals.pendingRequests.length, 0);
+});
+
+it('terminal exhaustion plans only after submitted guard and pending-round teardown', async () => {
+  const h = await boot();
+  const guard = h.agent('mira').toolResultGuard;
+  guard.setOverride(true);
+  (h.framework as any).consecutiveInferenceFailures.set('mira', 2);
+  const call = h.internals.addMessage('mira', [callBlock('ending')]);
+  const wire = [{ toolUseId: 'ending', content: 'guard result' }];
+  const result = guard.storeResults([resultBlock('ending')], wire as any, [], undefined, undefined);
+  guard.submissionResults(wire as any);
+  assert.equal(guard.hasSubmittedPending, true);
+  const original = h.membrane.streamYielding.bind(h.membrane);
+  let requests = 0;
+  h.membrane.streamYielding = (request, options) => {
+    if (requests++ > 0) return original(request, options);
+    (h.framework as any).pendingAssistantBlocks.set('mira', [callBlock('ending')]);
+    const error = new MembraneError({ type: 'invalid_request', message: 'poison 400', retryable: false, httpStatus: 400 } as never);
+    return { isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+      provideToolResults() {}, cancel() {},
+      async *[Symbol.asyncIterator]() { yield { type: 'error', error } as StreamEvent; },
+    } as any;
+  };
+  let endingObserved = false;
+  h.framework.onTrace((event) => {
+    if (event.type !== 'inference:exhausted') return;
+    endingObserved = true;
+    assert.equal(guard.hasSubmittedPending, true, 'exhausted trace precedes batch teardown');
+    assert.equal((h.framework as any).pendingAssistantBlocks.has('mira'), true);
+    assert.equal(h.cm('mira').windowStatusOf(call), 'in', 'no mutation at the early trace');
+  });
+  h.framework.start();
+  await h.internals.handleHostCommand('test', { command: 'nudge', agentName: 'mira' });
+  await h.framework.runUntilIdle();
+  assert.equal(endingObserved, true);
+  assert.equal(guard.hasPending, false);
+  assert.equal(requests, 2, 'settled quarantine queues exactly one retry');
+  for (const id of [call, result]) assert.equal(h.cm('mira').windowStatusOf(id), 'undone');
+});
+
+
+it('737 release note describes Safe B rather than retired endpoint fallbacks', () => {
+  const note = readFileSync(new URL('../../changelog.d/737-notice-gap-rewind.fixed.md', import.meta.url), 'utf8');
+  assert.match(note, /whole, complete tool exchanges/);
+  assert.match(note, /exact contiguous interval or declines unchanged/);
+  assert.match(note, /never falling back to one endpoint/);
+  assert.doesNotMatch(note, /whatever the IDs|notices inside the exchange go with it|quadratic|removed interval|shed one at a time/);
+});
+
+it('confirmed throwing legacy removal still retracts other resident windows', async () => {
+  const h = await boot({ failWriteDown: true });
+  const id = h.internals.addMessage('user', [text('legacy commit then throw')]);
+  const cm = h.cm('mira');
+  const remove = cm.removeMessage.bind(cm);
+  cm.removeMessage = (...args) => { remove(...args); throw new Error('post commit'); };
+  const plan = h.internals.planNewestTurn(h.agent('mira'));
+  assert.equal(plan.kind, 'ready');
+  const outcome = h.internals.applyShed(h.agent('mira'), plan);
+  assert.equal(outcome.kind, 'stopped');
+  assert.deepEqual(outcome.record.removedIds, [id]);
+  assert.equal(h.cm('oren').ordinalOf(id), undefined);
+  assert.equal(h.internals.pendingRequests.length, 0);
+});
+
+
+it('unstick preflight distinguishes waiting from manual repair', async () => {
+  const h = await boot();
+  const fw = h.framework as any;
+  h.internals.addMessage('mira', [callBlock('interrupted')]);
+  const repair = await h.internals.handleHostCommand('test', { command: 'unstick', agentName: 'mira' });
+  assert.equal(repair.ok, false);
+  assert.match(repair.error, /Inspect and repair history first; see docs\/recovery-b.md/);
+  fw.pendingAssistantBlocks.set('mira', [callBlock('interrupted')]);
+  const wait = await h.internals.handleHostCommand('test', { command: 'unstick', agentName: 'mira' });
+  assert.equal(wait.ok, false);
+  assert.match(wait.error, /Wait for the active turn and tool work to settle/);
+  fw.pendingAssistantBlocks.delete('mira');
+  assert.equal(fw.forcedRewind.size, 0);
+  assert.equal(h.internals.pendingRequests.length, 0);
+});
+
+// Independent review's orphan-wire reproduction: an unmatched visible result
+// must stop recovery, not make it walk back to unrelated older history.
+for (const legacy of [false, true]) it(`visible orphan result stops quarantine without shedding older history (legacy:${legacy})`, async () => {
+  const h = await boot({ failWriteDown: legacy });
+  const older = h.internals.addMessage('user', [text('unrelated older message')]);
+  const orphan = h.internals.addMessage('user', [resultBlock('missing-call')]);
+  assert.match(await h.compiled('mira'), /missing-call/, 'the orphan really reaches the next wire request');
+  const rawBefore = JSON.stringify(h.cm('mira').getAllMessages());
+  const windowBefore = JSON.stringify(h.cm('mira').getPresentedMessages());
+  const wireBefore = await h.compiled('mira');
+  const plan = h.internals.planNewestTurn(h.agent('mira'));
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'orphan result');
+  assert.equal(plan.kind, 'unsupported');
+  assert.equal(plan.reason, 'missing or ambiguous call body');
+  assert.equal(JSON.stringify(h.cm('mira').getAllMessages()), rawBefore);
+  assert.equal(JSON.stringify(h.cm('mira').getPresentedMessages()), windowBefore);
+  assert.equal(await h.compiled('mira'), wireBefore);
+  assert.ok(h.cm('mira').getMessage(older));
+  assert.ok(h.cm('mira').getMessage(orphan));
+  assert.equal(h.internals.exhaustionRewinds.get('mira') ?? 0, 0);
+  assert.equal(h.internals.rewindEpisode.size, 0);
+  assert.equal(h.internals.pendingRequests.length, 0);
+});
