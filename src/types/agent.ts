@@ -280,12 +280,13 @@ export interface AgentConfig {
   /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).
    * When `autoRewind` is on, a refused turn triggers an automatic rewind: the
-   * framework redacts the triggering turn (the tool result or message that
+   * framework plans removal of a complete eligible turn (the tool result or message that
    * tripped the classifier), injects a metadata-only marker in its place (which
    * carries none of the offending content, so it cannot itself re-trip), and
-   * re-runs — up to `maxRewinds` times before giving up. This keeps the agent
+   * re-runs only when the plan is supported — up to `maxRewinds` times before giving up. This keeps the agent
    * on its own model (no fallback-model substitution) while self-healing around
-   * a poison turn. Default: off (a refusal just surfaces a marker + reaction).
+   * a poison turn. Unsupported or cap-exhausted attempts stop unchanged without
+   * retry, for manual repair. Default: off (a refusal just surfaces a marker + reaction).
    */
   refusalHandling?: {
     /**

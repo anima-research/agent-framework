@@ -4642,7 +4642,6 @@ export class AgentFramework {
    *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
    *  the refusal loop, so the breaker can never shed the whole history. */
   private exhaustionRewinds: Map<string, number> = new Map();
-  private deferredQuarantines = new Map<Agent, { streamId: number; reason: string }>();
   /** Agents with an OverBudget drain kick currently in flight. The breaker in
    *  noteInferenceExhausted fires on EVERY matching failure and the scenario it
    *  exists for is "every activation fails, repeatedly" — without this guard,
@@ -15042,8 +15041,8 @@ export class AgentFramework {
   /** Read-only, bounded whole-body recovery. Unsupported is not empty: never
    * remove one endpoint and hope that another budget step repairs the other.
    * Standalone planning requires no logical turn ownership, including queued,
-   * parked and held continuations. Terminal callers may recover their own
-   * completed/failed turn before its token is released; guard work still blocks.
+   * parked and held continuations. Terminal refusal may recover its own ending
+   * turn; exhaustion needs full logical quiescence. Guard work always blocks.
    * This snapshot does not fence arbitrary future writers. */
   private planNewestTurn(
     agent: Agent, carried?: ReadonlySet<MessageId>, refusedReplyId?: MessageId,
@@ -15055,7 +15054,8 @@ export class AgentFramework {
         || this.pendingAssistantBlocks.has(agent.name) || agent.state.status === 'waiting_for_tools') {
         return unsupported('unsettled tool round');
       }
-      if (boundary === 'standalone' && this.logicalTurnAlive(agent)) return unsupported('live assistant round');
+      if (this.pendingContinuationAgents().has(agent.name) || this.heldContinuation(agent.name)) return unsupported('live assistant round');
+      if (boundary !== 'terminal-refusal' && this.logicalTurnAlive(agent)) return unsupported('live assistant round');
       if (boundary !== 'terminal-refusal' && agent.state.status !== 'idle') return unsupported('live assistant round');
       const cm = agent.getContextManager();
       const windowed = this.presents(agent);
@@ -15100,14 +15100,45 @@ export class AgentFramework {
       const callId = (b: ContentBlock) => (b as { id?: unknown }).id;
       const resultId = (b: ContentBlock) => (b as { toolUseId?: unknown }).toolUseId;
       const valid = (id: unknown): id is string => typeof id === 'string' && id.trim().length > 0;
-      const carriedCalls = new Set(runs.filter(carriedBody).flatMap((body) => calls(carried ? body : body.filter(visible))).map(callId).filter(valid));
-      // Only a stored hidden/foreign call proves that its result can be
-      // passed over without a carried set. Absence of an eligible call is not
-      // proof: visible orphan results must reach closure validation and stop.
-      const hiddenCalls = new Set(raw.filter((m) => !visible(m)).flatMap((m) => calls([m])).map(callId).filter(valid));
-      for (const id of raw.filter(visible).flatMap((m) => calls([m])).map(callId)) {
-        if (valid(id)) hiddenCalls.delete(id);
+      // IDs are provider-local, not store-global. Walk each reader-owned
+      // live round in storage order: a completed ID may be used again, but
+      // a second call before exactly one result is ambiguous. Keep held/out
+      // endpoints in the walk so absence from the wire cannot hide an orphan.
+      const latestCall = new Map<string, StoredMessage[]>();
+      const roundAnswers = new Map<StoredMessage[], Set<StoredMessage[]>>();
+      const resultCalls = new Map<MessageId, Set<StoredMessage[]>>();
+      const ambiguous = new Set<StoredMessage[]>();
+      for (const body of rawRuns) {
+        const cs = calls(body), rs = results(body);
+        if (!cs.length && !rs.length) continue;
+        if (body.every((m) => !intended(m) || (windowed && cm.windowStatusOf(m.id) === 'undone'))) continue;
+        for (const c of cs) {
+          const id = callId(c);
+          if (!valid(id)) continue;
+          const prior = latestCall.get(id);
+          if (prior) {
+            const priorIds = calls(prior).map(callId);
+            const answered = [...(roundAnswers.get(prior) ?? [])].flatMap(results).map(resultId);
+            const complete = !results(prior).length && priorIds.every(valid)
+              && new Set(priorIds).size === priorIds.length && answered.length === priorIds.length
+              && new Set(answered).size === priorIds.length && answered.every((id) => valid(id) && priorIds.includes(id));
+            if (!complete) { ambiguous.add(prior); ambiguous.add(body); }
+          }
+          latestCall.set(id, body);
+        }
+        for (const r of rs) {
+          const id = resultId(r);
+          const call = valid(id) ? latestCall.get(id) : undefined;
+          if (!call) continue;
+          const answers = roundAnswers.get(call) ?? new Set<StoredMessage[]>();
+          answers.add(body);
+          roundAnswers.set(call, answers);
+          const owners = resultCalls.get(body[0].id) ?? new Set<StoredMessage[]>();
+          owners.add(call);
+          resultCalls.set(body[0].id, owners);
+        }
       }
+      const carriedCalls = new Set(runs.filter(carriedBody).flatMap((body) => calls(carried ? body : body.filter(visible))).map(callId).filter(valid));
       let selected: StoredMessage[][] | undefined;
       let tool = false;
       for (let i = runs.length - 1; i >= 0; i--) {
@@ -15117,32 +15148,28 @@ export class AgentFramework {
         // were not on the refused wire. Mixed bodies never lend eligibility.
         const answersCarried = !cs.length && rs.some((r) => {
           const id = resultId(r);
-          return valid(id) && carriedCalls.has(id);
+          return valid(id) && carriedCalls.has(id)
+            && [...(resultCalls.get(body[0].id) ?? [])].some((call) =>
+              carriedBody(call) && calls(call).some((c) => callId(c) === id));
         });
-        if (!carried && !cs.length && rs.length && rs.every((r) => {
-          const id = resultId(r);
-          return valid(id) && hiddenCalls.has(id);
-        })) continue;
         if (!(carriedBody(body) && witness(body)) && !answersCarried) continue;
         if (!cs.length && !rs.length) { selected = [body]; break; }
         tool = true;
         if (cs.length && rs.length) return unsupported('mixed call/result body');
         const ids = (cs.length ? cs.map(callId) : rs.map(resultId));
         if (!ids.every(valid) || new Set(ids).size !== ids.length) return unsupported('invalid or ambiguous tool IDs');
-        // Check the entire stored snapshot for the selected IDs, including
-        // newer skipped/held bodies. No proximity exception or recursive graph.
-        const callBodies = rawRuns.filter((b) => calls(b).some((c) => ids.some((id) => id === callId(c))));
+        const callBodies = cs.length
+          ? rawRuns.filter((b) => b[0].id === body[0].id)
+          : [...(resultCalls.get(body[0].id) ?? [])];
         if (callBodies.length !== 1) return unsupported('missing or ambiguous call body');
         const call = callBodies[0];
+        if (ambiguous.has(call)) return unsupported('reused unresolved call IDs');
         const callIds = calls(call).map(callId);
         if (!callIds.every(valid) || new Set(callIds).size !== callIds.length || results(call).length) {
           return unsupported('invalid or mixed call body');
         }
         if (!carriedBody(call)) return unsupported('call not carried');
-        if (rawRuns.some((b) => b !== call && calls(b).some((c) => callIds.some((id) => id === callId(c))))) {
-          return unsupported('reused call IDs');
-        }
-        const answers = rawRuns.filter((b) => results(b).some((r) => callIds.some((id) => id === resultId(r))));
+        const answers = [...(roundAnswers.get(call) ?? [])];
         const answerIds = answers.flatMap((b) => results(b).map(resultId));
         if (answerIds.length !== callIds.length || new Set(answerIds).size !== callIds.length
           || !answerIds.every((id) => valid(id) && callIds.includes(id))) return unsupported('incomplete or ambiguous results');
@@ -15181,7 +15208,10 @@ export class AgentFramework {
         : `${last.metadata?.messageId ? 'an incoming message from' : 'a'} ${last.participant}${last.metadata?.messageId ? '' : ' turn'} (${chars} chars${images ? `, ${images} image(s)` : ''})`;
       return { kind: 'ready', rows, heads: selected.map((b) => b[0].id), windowed,
         branch: cm.currentBranch().name, cleanup, record: { descriptor, removedIds: rows.map((m) => m.id).reverse() } };
-    } catch { return unsupported('snapshot unavailable'); }
+    } catch (err) {
+      console.error('[recovery-plan] snapshot/validation failed:', err);
+      return unsupported('snapshot unavailable');
+    }
   }
 
   /** No replay after a throwing write. Readback distinguishes not-applied
@@ -15242,7 +15272,11 @@ export class AgentFramework {
   ): number {
     const cm = agent.getContextManager();
     const ep = this.rewindEpisode.get(agent.name);
-    const count = (ep?.count ?? 0) + 1;
+    // Only a still-present tail marker can describe consecutive omissions.
+    const rows = this.presents(agent) ? cm.getPresentedMessages() : cm.getAllMessages();
+    const marker = ep && rows.at(-1);
+    const reuse = ep && marker?.id === ep.markerId && marker.metadata?.kind === 'refusal-rewind';
+    const count = (reuse ? ep.count : 0) + 1;
     const text =
       `[${NOTICE_TAG.refusalRewind}] The ${count} most recent turn(s) were set aside because ` +
       `the requests that carried them couldn't be completed. Their content isn't shown here, ` +
@@ -15251,8 +15285,7 @@ export class AgentFramework {
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
-    const marker = ep && cm.getAllMessages().find((m) => m.id === ep.markerId);
-    if (ep && marker?.metadata?.kind === 'refusal-rewind') {
+    if (reuse) {
       cm.editMessage(ep.markerId, blocks);
       this.rewindEpisode.set(agent.name, { markerId: ep.markerId, count, category });
     } else {
@@ -15290,13 +15323,14 @@ export class AgentFramework {
     const s = this.forcedRewind.get(agentName);
     if (!s) return;
     this.forcedRewind.delete(agentName);
+    if (!success) this.rewindEpisode.delete(agentName);
     const n = s.removed.length;
     const list = n
       ? '\n' + s.removed.map((r) => `• ${r.descriptor}`).join('\n')
       : '';
     const content = success
       ? `🔧 Unstuck **${agentName}** — shed ${n} turn(s); the model responded.${list}`
-      : `⚠️ Couldn't unstick **${agentName}** — its requests still couldn't be completed after ${n} rewind(s).${list}`;
+      : `⚠️ Couldn't unstick **${agentName}** — recovery stopped after ${n} confirmed removal(s); recovery is not verified. See the host log for the stop reason.${list}`;
     console.error(
       `[unstick] agent=${agentName} ${success ? 'succeeded' : 'gave up'} after ${n} rewind(s)` +
         `${category ? ` category=${logValue(category)}` : ''}`,
@@ -30376,7 +30410,16 @@ export class AgentFramework {
                 try {
                   if (cm.currentBranch().name !== plan.branch) throw new Error('branch changed');
                   if (plan.cleanup.length) {
-                    removeStoredMessages(cm, plan.cleanup[0], plan.cleanup[plan.cleanup.length - 1]);
+                    try {
+                      removeStoredMessages(cm, plan.cleanup[0], plan.cleanup[plan.cleanup.length - 1]);
+                    } catch (err) {
+                      // As with the shed, reconcile a confirmed committed deletion,
+                      // but never retry after a throwing write.
+                      if (cm.currentBranch().name === plan.branch && plan.cleanup.every((m) => cm.getMessage(m.id) === null)) {
+                        this.retractRemovedElsewhere(cm, plan.cleanup.map((m) => m.id), 'rewind');
+                      }
+                      throw err;
+                    }
                     this.retractRemovedElsewhere(cm, plan.cleanup.map((m) => m.id), 'rewind');
                   }
                   if (cm.currentBranch().name !== plan.branch) throw new Error('branch changed');
@@ -30425,8 +30468,9 @@ export class AgentFramework {
                         `${used >= cap ? `cap ${cap} reached` : 'recovery stopped (see disposition above)'}`,
                     );
                     // End this automatic attempt. A later independent wake
-                    // gets a fresh budget; keep the durable marker/count.
+                    // gets a fresh budget and episode; retain only the durable notice.
                     this.refusalRewinds.delete(agent.name);
+                    this.rewindEpisode.delete(agent.name);
                   },
                 );
               }
@@ -31477,17 +31521,6 @@ export class AgentFramework {
       if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)
         && !this.pendingContinuationAgents().has(agent.name) && !this.closureWaits(agent.name)) {
         this.disposeConversationAgent(agent.name, 'idle-ttl');
-      }
-
-      const quarantine = this.deferredQuarantines.get(agent);
-      if (quarantine?.streamId === myStreamId) {
-        this.deferredQuarantines.delete(agent);
-        if (ownsPhysicalStream && frameReachedTerminal) {
-          await agent.toolResultGuard.whenAnnotated();
-          if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
-            this.quarantinePoisonedHistory(agent, quarantine.reason);
-          }
-        }
       }
     }
   }
@@ -35678,7 +35711,7 @@ export class AgentFramework {
    *      event would wake the agent onto that same history. At the hard-down
    *      threshold, automatically quarantine: shed the newest complete
    *      exchange (the same forced-rewind primitive `/unstick` uses —
-   *      shedNewestTurn takes a tool result with its paired
+   *      planNewestTurn validates a tool result with its paired
    *      tool_use/thinking turn) and retry when planning supports it; otherwise
    *      stop for manual repair,
    *      bounded by the same rewind cap so the breaker can never eat the
@@ -36258,9 +36291,9 @@ export class AgentFramework {
       void retryable;
       if (agent && shedMayHelp(errorType, httpStatus)) {
         if (this.activeStreams.has(agent.name)) {
-          // The ending stream still owns its submitted guard batch and
-          // pending assistant round. Recover only after its own teardown.
-          this.deferredQuarantines.set(agent, { streamId: agent.streamId, reason: wholeReason });
+          // No exact failed-request/branch witness survives teardown here.
+          // Decline rather than planning against later arrivals or a successor.
+          console.error(`[inference-rewind] agent=${agent.name} stopped: active stream; failed request boundary unavailable. Manual repair needed.`);
         } else this.quarantinePoisonedHistory(agent, wholeReason);
       }
     }
@@ -36269,7 +36302,7 @@ export class AgentFramework {
   /**
    * Automatic poison-history quarantine (the actual "breaker"). Sheds the
    * newest complete exchange from the agent's history — reusing the same
-   * primitives as the refusal auto-rewind / `/unstick` (shedNewestTurn +
+   * primitives as the refusal auto-rewind / `/unstick` (planNewestTurn/applyShed +
    * the single consolidated episode marker) — and queues a retry so the
    * rewound history is verified immediately instead of waiting for the next
    * push event to wake the agent onto the same context.
@@ -36291,8 +36324,7 @@ export class AgentFramework {
       return;
     }
 
-    // The exhaustion handler owns this terminal failure, whose token may
-    // still be installed until teardown. This is not standalone admission.
+    // Exhaustion has no ownership exception: queued/held turns also block.
     const plan = this.planNewestTurn(agent, undefined, undefined, 'terminal-exhaustion');
     if (plan.kind !== 'ready') {
       console.error(`[inference-rewind] agent=${agent.name} stopped: ${plan.kind === 'unsupported' ? `unsupported: ${plan.reason}` : 'nothing eligible to shed'}. Manual repair needed.`);

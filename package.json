@@ -18,7 +18,8 @@
   },
   "files": [
     "dist/src",
-    "src"
+    "src",
+    "docs/recovery-b.md"
   ],
   "bin": {
     "agent-framework-mcp": "dist/src/api/mcp-server.js",

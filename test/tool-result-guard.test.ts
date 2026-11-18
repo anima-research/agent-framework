@@ -1338,8 +1338,19 @@ test('a staged batch omitted by compilation settles without claiming refusal; un
     toolResultGuard: true, maxStreamTokens: 1, strategy: new OmitToolExchange(),
     refusalHandling: { autoRewind: true },
   });
+  const fw = h.framework as any;
+  const plan = fw.planNewestTurn.bind(fw);
+  const observations: Array<{ idle: boolean; pending: boolean; kind: string; reason?: string }> = [];
+  fw.planNewestTurn = (...args: any[]) => {
+    const guard = h.framework.getAgent('assistant')!.toolResultGuard;
+    const result = plan(...args);
+    observations.push({ idle: guard.idle, pending: guard.hasPending, kind: result.kind, reason: result.reason });
+    return result;
+  };
   try {
     await h.run();
+    assert.ok(observations.some((o) => (!o.idle || o.pending) && o.kind === 'unsupported' && o.reason === 'unsettled tool round'),
+      'ordinary recovery was attempted and declined at the unsettled guard boundary');
     const guard = h.framework.getAgent('assistant')!.toolResultGuard;
     assert.equal(guard.hasPending, false, 'unsubmitted batch must be settled, not stranded');
     assert.equal(guard.recovering, false);

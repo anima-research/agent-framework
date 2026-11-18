@@ -240,10 +240,11 @@ test("a refusal's rewind tells the agent its turns couldn't be completed, naming
   } finally { await rig.close(); }
 });
 
-test("an unstick that gives up tells its channel its requests couldn't be completed, and only stderr names the category", () => {
+test("an unstick that gives up reports stopped unverified recovery, and only stderr names the category", () => {
   const SENTINEL = 'zz-provider-category-7f3a';
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.storeSees = new WeakMap(); // No view filter on this synthetic raw manager.
+  fw.rewindEpisode = new Map();
   fw.forcedRewind = new Map([['scout', { remaining: 0, removed: [{ descriptor: 'an incoming message from simulect (7 chars)' }], serverId: 'srv', channelId: 'room' }]]);
   fw.unstickAnswers = new Map();
   fw.unstickWaiters = new Map();
@@ -255,7 +256,7 @@ test("an unstick that gives up tells its channel its requests couldn't be comple
   try {
     fw.finishUnstick('scout', false, SENTINEL);
   } finally { console.error = orig; }
-  assert.deepEqual(posted, ["⚠️ Couldn't unstick **scout** — its requests still couldn't be completed after 1 rewind(s).\n• an incoming message from simulect (7 chars)"]);
+  assert.deepEqual(posted, ["⚠️ Couldn't unstick **scout** — recovery stopped after 1 confirmed removal(s); recovery is not verified. See the host log for the stop reason.\n• an incoming message from simulect (7 chars)"]);
   assert.ok(errs.some((line) => line.startsWith('[unstick] agent=scout gave up') && line.includes(SENTINEL)), errs.join('\n'));
 });
 
@@ -382,7 +383,7 @@ test('a carried call with a stored unpresented result declines without creating 
     assert.equal(marker.length, 1);
     assert.match(JSON.stringify(marker[0]!.content), /The 1 most recent turn/);
     assert.equal((rig.framework as any).refusalRewinds.get('scout'), undefined, 'give-up ends the automatic attempt; later independent wakes get a fresh budget');
-    assert.equal((rig.framework as any).rewindEpisode.get('scout').count, 1);
+    assert.equal((rig.framework as any).rewindEpisode.has('scout'), false, 'give-up closes the episode while retaining its durable notice');
     assert.equal((rig.framework as any).pendingRequests.length, 0);
     await rig.framework.runUntilIdle();
     assert.equal(cm.windowStatusOf(call), 'in');

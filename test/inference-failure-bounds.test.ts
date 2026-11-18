@@ -59,7 +59,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   fw.exhaustionRewinds = new Map<string, number>();
   fw.rewindEpisode = new Map();
   fw.activeStreams = new Map();
-  fw.deferredQuarantines = new Map();
+  fw.activeTurnTokens = new Map();
   fw.lastInferenceAt = new Map<string, object>();
   fw.failedLastTurnAt = new WeakMap();
   fw.pendingRequests = [];
@@ -1057,25 +1057,16 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   assert.equal(errs.some((e) => e.includes('drain kicked')), false);
   assertNoObjectPrinted(rawArgs);
 
-  // Classified, it gets the poisoned-history quarantine at the hard-down
-  // threshold, as the framework's own copy does: the third failure sheds the
-  // newest exchange, counted in the one rewind marker. Each shed queues a
-  // retry on the rewound history, which may fail and shed again before the
-  // run is stopped, so only the first shed is asserted.
+  // Classification still reaches the hard-down gate, but an active stream
+  // has no exact failed-request witness for post-teardown quarantine.
   const shed = await runFailingTurn('stream error event', () => foreignMembraneError(quoted), { turns: 3 });
-  const quarantined = shed.errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
-  assert.ok(quarantined.length > 0, 'the third failure sheds');
-  assert.match(quarantined[0], /\(1 turn\(s\) shed this episode, cap 3\)/);
-  // Ported for #291 (AF-7): the shed is the window's, and the record keeps
-  // the exchange, as the marker says.
+  assert.ok(shed.errs.some((e) => e.includes('stopped: active stream; failed request boundary unavailable')));
+  assert.equal(shed.errs.some((e) => e.includes('auto-quarantined')), false);
   const textsOf = (rows: typeof shed.messages) => rows.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
     .map((m) => (m.content[0] as { text: string }).text);
-  const kept = textsOf(shed.window);
-  assert.ok(!kept.includes('hello 2'), 'the newest exchange is shed');
-  assert.ok(textsOf(shed.messages).includes('hello 2'), 'and the record keeps it');
-  const rewind = shed.messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
-  assert.equal(rewind.length, 1, 'one consolidated rewind marker');
-  assert.match((rewind[0].content[0] as { text: string }).text, new RegExp(`^\\[${NOTICE_TAG.refusalRewind}\\] The \\d+ most recent turn\\(s\\) were set aside`));
+  assert.deepEqual(textsOf(shed.window), ['hello 0', 'hello 1', 'hello 2']);
+  assert.ok(textsOf(shed.messages).includes('hello 2'));
+  assert.equal(shed.messages.some((m) => m.metadata?.kind === 'refusal-rewind'), false);
 
   // Its type is bounded like a provider code, in every sink it reaches.
   const odd = await runFailingTurn('stream throws', () => foreignMembraneError('Bad request: zz-short', `zz${'T'.repeat(MEGA)}`), { errorPolicy: noRetry });
@@ -1132,7 +1123,7 @@ test("the default error policy reads either copy's retryable and retryAfterMs", 
   }
 });
 
-test('the breaker reads the status a real failure carries: a 404 never sheds; a 400, a 413 under either label and no status do', async () => {
+test('the breaker reads real failure status but active-stream recovery declines without a request witness', async () => {
   // Through classifyInferenceError, the inference:exhausted trace and
   // noteInferenceExhausted to the gate, three failed turns each: the
   // escalation threshold. A shed is read from its own line, since the cap's
@@ -1153,23 +1144,16 @@ test('the breaker reads the status a real failure carries: a 404 never sheds; a 
     assert.ok(exhausted.every((t) => t.httpStatus === status), `${label} reached the trace as it was`);
     assert.ok(errs.some((e) => e.startsWith('[inference-hard-down] agent=resident')), `${label} is reported hard-down`);
     const shed = errs.filter((e) => e.startsWith('[inference-rewind] agent=resident auto-quarantined'));
-    // Ported for #291 (AF-7): what a shed takes is out of the agent's
-    // window, and the record keeps it.
     const kept = window.filter((m) => !(m.metadata as { system?: unknown } | undefined)?.system)
       .map((m) => (m.content[0] as { text: string }).text);
-    if (sheds) {
-      assert.ok(shed.length > 0, `${label} sheds`);
-      assert.ok(!kept.includes('hello 2'), `${label}: the newest exchange is shed`);
-      assert.ok(messages.some((m) => (m.content[0] as { text?: string }).text === 'hello 2'), `${label}: the record keeps it`);
-    } else {
-      assert.equal(shed.length, 0, `${label} sheds nothing`);
-      assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2'], `${label}: the history still holds every exchange`);
-      // Only the shed is gated: each failure is still logged.
-      assert.deepEqual(markers, [], `${label}: no [inference-failed] marker`);
-      const records = failuresLog.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
-        .filter((record) => record.kind === 'inference-exhausted');
-      assert.deepEqual(records.map((record) => record.httpStatus), [404, 404, 404], `${label}: a failures.log record per failure`);
-    }
+    assert.equal(shed.length, 0, `${label}: active-stream history is not shed`);
+    assert.deepEqual(kept, ['hello 0', 'hello 1', 'hello 2']);
+    assert.equal(errs.some((e) => e.includes('stopped: active stream; failed request boundary unavailable')), sheds,
+      'only eligible error classifications reach the conservative decline');
+    assert.deepEqual(markers, []);
+    const records = failuresLog.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      .filter((record) => record.kind === 'inference-exhausted');
+    assert.deepEqual(records.map((record) => record.httpStatus), [status, status, status]);
   }
 });
 

@@ -10,7 +10,9 @@ content-free descriptor. Accounting is UTF-8 JSON stored-content bytes and
 selected top-level images. One exchange costs one normal bounded rewind step.
 
 On a presented window this is one `retractRows(heads, {undone:true})`, leaving
-raw history and other residents' windows untouched. Legacy recovery uses one
+raw history and other residents' windows untouched for the selected exchange.
+The separate refused-reply cleanup removes that reply globally and reconciles
+other windows; that reply is not covered by this retention guarantee. Legacy recovery uses one
 body-aligned contiguous raw removal, with the existing cross-window removal
 semantics. A retained notice creates a hole: legacy recovery declines with no
 writes, even after a failed initial write-down. It never forces conversion to
@@ -18,25 +20,31 @@ presented mode.
 
 ## Unsupported is not empty or repaired
 
-Recovery deliberately declines corrupt/missing/duplicate/reused IDs,
-incomplete rounds, mixed call/result bodies, intervening ordinary rows,
+Recovery deliberately declines corrupt/missing/duplicate IDs, reuse before a
+round completes, incomplete rounds, mixed call/result bodies, intervening ordinary rows,
 rewind markers, system changes, hidden non-tool shards, embedded system
 notices, foreign context ownership and bodies not belonging to this reader's
 native audience. A stored result absent the current presented window also
 declines: CM 0.27 cannot retract it in the same atomic batch. **Uncarried**
 means absent the served request; **unpresented** means absent the CM window.
 Uncarried result bodies already resident in that window can be supported;
-there is no present-first write, raw fallback, or new CM layer. It checks selected IDs in the full stored snapshot,
-including newer skipped/held results, in both directions. It does not repair
+there is no present-first write, raw fallback, or new CM layer. ID matching follows
+reader-owned live rounds in stored order: reuse after completion, by another
+resident, or in an undone older round does not create ambiguity. Within that
+scope, stored endpoints including newer skipped/held results are checked in both
+directions; unpresented endpoints are not ignored. It does not repair
 unrelated malformed history or recursively close mixed chains.
 
 The tool-result guard must have neither a pending batch **nor** queued
 storage/annotation work, and no pending assistant round may remain. A standalone
 attempt also needs the agent's idle boundary: no live turn token, stream, or
 queued, parked, provider-held or budget-held continuation, even when status
-already reads `idle`. Current terminal refusal/exhaustion handlers can recover
-their own ending turn before its token is released; they still require settled
-guard work. This is a known-writer boundary,
+already reads `idle`. Only terminal refusal can recover its own ending turn before token release.
+Exhaustion requires full logical quiescence and declines while a stream is
+active: a terminal 400 on an active stream stops immediately for manual repair,
+without mutation or retry. It does not wait for teardown or defer quarantine;
+no exact failed-request branch and carried-set witness survives there. Both
+require settled guard work. This is a known-writer boundary,
 not a promise that arbitrary future modules cannot append a result. Dendrite
 held result mail is not itself a stored `tool_result` endpoint.
 
@@ -46,8 +54,9 @@ reply, remove either endpoint, add a marker, count a successful step or enqueue
 a rewind retry. Existing confirmed step counts and marker state are left
 unchanged on exhaustion decline/cap/failure. Automatic refusal rewind instead
 ends its attempt on give-up and resets its budget for a later independent wake,
-without queuing a retry; its marker/count remain until a non-refusal completion
-ends the episode. `/unstick` preflight declines before opening a session or
+without queuing a retry; the durable marker remains, but the episode count
+is cleared. A missing, hidden, branched-away or non-tail marker also starts a
+fresh count instead of editing an old prefix. `/unstick` preflight declines before opening a session or
 queuing its initial probe. Supported probes re-plan at actual refusal. Later
 unsupported forced recovery ends as `gave-up`, with the logged bounded reason;
 it does not claim `cleared`. The exhaustion caller requests manual repair.
@@ -102,7 +111,10 @@ result, replay a possibly side-effecting tool, or delete just one endpoint.
 1. Stop writers: **every process that can write the store**, not merely an
    idle host. Take a **fresh, coherent copy** of the complete store after writers
    have stopped, and note the affected branch, resident and body IDs before
-   changing anything. Keep writers stopped throughout inspection and repair.
+   changing anything. Keep all normal writers stopped throughout inspection and repair.
+   Repair must use a single exclusive offline maintenance process with
+   inference, event ingestion, timers and background writers disabled; if the
+   host cannot provide that mode, do not restart it for repair.
    Reconcile unfinished or unknown dispatches first: establish whether each
    tool ran and what external effects it produced before undoing history.
    If dispatch outcomes cannot be established, keep the store stopped and
@@ -112,15 +124,15 @@ result, replay a possibly side-effecting tool, or delete just one endpoint.
    any stored matching results, including held/unpresented rows and other
    branches. If IDs, ownership or closure are uncertain, keep the backup and
    ask the maintainer to repair the snapshot; do not guess.
-3. For a verified trailing call-only body with nothing after it, use the host's
-   normal whole-turn `/undo` while inference is disabled, then inspect the
-   window before resuming. **Whole-turn undo does not roll back external tool
-   effects**; reconcile those separately before resuming. If the host cannot
-   expose a settled whole-turn undo,
-   keep it stopped and have a maintainer use CM's whole-body `retractRows` on
-   the affected presented window. For legacy raw history, only a verified exact
-   contiguous whole-body interval may be removed with CM's removal API, with
-   all resident windows reconciled. Never hand-edit Chronicle files.
+3. For a verified trailing call-only body with nothing after it, have the
+   exclusive maintenance process use CM's whole-body `retractRows` on the
+   affected presented window. Do not use normal whole-turn `/undo`: it requires
+   a presented window and can retract earlier exchanges and notices as well.
+   For legacy raw history, only a verified exact contiguous whole-body interval
+   may be removed with CM's removal API, with all resident windows reconciled.
+   Retraction does not roll back external tool effects; reconcile those
+   separately. If exclusive offline maintenance is unavailable, leave the
+   store stopped and escalate for snapshot repair. Never hand-edit Chronicle files.
 4. Verify that the next compiled request contains neither the removed calls
    nor orphan results, that unrelated notices and other residents are intact,
    then restart from the repaired snapshot. If verification fails, keep writers
@@ -134,4 +146,5 @@ not at the removal commit, so a later marker can understate prior removals after
 a cleanup/marker failure. A marker also describes the current window mode; it
 is not a per-step raw-retention audit if modes change mid-episode. Consult the
 backed-up store and failure logs for repair, not the marker alone. Forced-session
-failure summaries are generic; the bounded stop reason is in the host log.
+failure summaries report a stopped, unverified recovery and confirmed removals;
+the bounded stop reason is in the host log.

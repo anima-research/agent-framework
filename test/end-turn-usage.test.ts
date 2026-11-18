@@ -769,7 +769,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
   });
 
   for (const reusedIds of [false, true]) {
-    it(`turns that each fail after an answered call reach hard-down: ${reusedIds ? 'ambiguous reused IDs decline without a shed or retry' : 'unique IDs shed the newest closed exchange and retry'}`, async () => {
+    it(`turns that each fail after an answered call reach hard-down: ${reusedIds ? 'reused IDs' : 'unique IDs'} decline without a failed-request boundary`, async () => {
       // Each turn's first call answers (its round's usage arrives) and the
       // call after its tool result is refused as the provider can't take it,
       // which shedMayHelp matches.
@@ -808,7 +808,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         for (const [turn, text] of ['first', 'second', 'third'].entries()) {
           r.framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
           await r.framework.runUntilIdle();
-          assert.ok(await pollUntil(() => streaks.length === turn + 1), `turn ${turn + 1} failed`);
+          assert.ok(await pollUntil(() => streaks.length === turn + 1 && !(r.framework as any).logicalTurnAlive(r.framework.getAgent('resident'))), `turn ${turn + 1} tore down`);
         }
         assert.deepEqual(answeredBefore, [1, 2, 3], 'each failed turn had a call that answered');
         assert.deepEqual(streaks, [1, 2, 3], 'an answered call leaves the streak standing');
@@ -819,24 +819,15 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         const rows = cm.windowMode() === 'presented' ? cm.getPresentedMessages() : cm.getAllMessages();
         const calls = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_use'));
         const results = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_result'));
-        if (reusedIds) {
-          assert.ok(lines.some((line) => line.includes('stopped: unsupported: missing or ambiguous call body')),
-            'Safe B explicitly declines the ambiguous exchange');
-          assert.equal(shed, false, 'no false successful shed');
-          assert.equal(internal.exhaustionRewinds.get('resident') ?? 0, 0, 'no rewind budget consumed');
-          assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), false, 'no success marker');
-          assert.equal(r.membrane.calls.length, 3, 'no retry was run');
-          assert.equal(internal.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false,
-            'no retry left queued');
-          assert.equal(calls.length, 3, 'all ambiguous call endpoints retained');
-          assert.equal(results.length, 3, 'all ambiguous result endpoints retained');
-        } else {
-          assert.equal(shed, true, 'the breaker sheds a closed unambiguous exchange');
-          assert.equal(r.membrane.calls.length, 4, 'retries once on repaired history');
-          assert.deepEqual(calls.map((b) => b.type === 'tool_use' && b.id), ['echo-1', 'echo-2']);
-          assert.equal(results.length, 2, 'the newest result is shed with its call');
-          assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), true);
-        }
+        assert.ok(lines.some((line) => line.includes('stopped: active stream; failed request boundary unavailable')),
+          'declines before teardown rather than snapshotting later history');
+        assert.equal(shed, false);
+        assert.equal(internal.exhaustionRewinds.get('resident') ?? 0, 0);
+        assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), false);
+        assert.equal(r.membrane.calls.length, 3, 'no retry was run');
+        assert.equal(internal.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false);
+        assert.equal(calls.length, 3, 'all call endpoints retained');
+        assert.equal(results.length, 3, 'all result endpoints retained');
       } finally {
         console.error = original;
         await r.framework.stop();
