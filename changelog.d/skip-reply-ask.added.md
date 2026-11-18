@@ -29,3 +29,6 @@
     held.
   - A derived agent and the subconscious don't take the policy from the agent.
   - No tool's description or schema changes.
+  - After a rollback to a framework from before this release, a held
+    `'skip-reply'` draft still lists, resends and dismisses, but its cause
+    reads `undefined`.

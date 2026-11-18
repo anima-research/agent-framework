@@ -201,8 +201,9 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
  * or whose `autoContinue` resolveAutoContinue refuses, or whose `observes`
- * is anything but a list of names, or whose `foreignRounds` is neither of
- * its modes (assertOneOfSetting). The constructor runs it
+ * is anything but a list of names, or whose `foreignRounds` or
+ * `sameRoundSkipReplyTextPolicy` is neither of its values
+ * (assertOneOfSetting). The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
  * for each of its agents before anything opens, and `createEphemeralAgent`
  * before it reserves the name, so a refusal there leaves nothing behind.

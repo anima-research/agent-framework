@@ -23542,13 +23542,13 @@ export class AgentFramework {
     let heldAny = false;
     for (const { hold: sendHold, target, parts } of runs) {
       const at = target ? { target } : {};
-      const kept = sendHold === 'skip' && !!keptBy && !!sendHoldAt(keptBy, target);
+      const keptAside = sendHold === 'skip' && !!keptBy && !!sendHoldAt(keptBy, target);
       const held = sendHold === 'skip'
-        ? this.holdProseDrafts(agent, kept ? parts.filter((p) => p.deliberate) : parts, 'skip-reply', { ...round, ...at })
+        ? this.holdProseDrafts(agent, keptAside ? parts.filter((p) => p.deliberate) : parts, 'skip-reply', { ...round, ...at })
         : draftsCause
           ? this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because: this.sendHoldText(sendHold, target, when), ...at })
           : this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because: this.sendHoldText(sendHold, target, when), ...at });
-      if (draftsCause || kept) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
+      if (draftsCause || keptAside) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
       heldAny = held.length > 0 || heldAny;
     }
     // The turn's receipt names them by their state at turn end; each was
