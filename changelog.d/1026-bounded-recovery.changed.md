@@ -32,3 +32,12 @@
 - Tool IDs are matched within reader-owned live rounds, allowing reuse after
   completion, by another resident, or after undo. Unresolved reuse and duplicate
   results still decline; held/unpresented endpoints still participate in validation.
+
+- Legacy selection now uses the compile's recorded visibility, including ordinary
+  co-resident own-row text; foreign tool closure still declines. Recovery's
+  synchronous raw-history inflation is not window-bounded: a cold one-row plan
+  over 32 MiB of historical image base64 measured 34–37 ms and about 33 MiB
+  additional heap (about 81 MiB RSS). See `docs/recovery-b.md` for fixture scope,
+  reproduction and the large-store/OOM risk.
+- Forced-session summaries and budgets count confirmed exhaustion removals too;
+  caller logs use their own confirmed-removal counts, not shared marker counts.

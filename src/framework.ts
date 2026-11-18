@@ -105,7 +105,7 @@ import { deferredWritesRefusal, isToolBlockEntry, readPersistedDeferredWrites, t
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
+import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, branchKey, type CompiledHistory, type RenderStats } from './agent.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -4651,9 +4651,9 @@ export class AgentFramework {
   private overBudgetDrainInFlight: Set<string> = new Set();
   /** The over-budget drain kicks running, which a branch move waits for as it waits for a maintenance pass. */
   private overBudgetDrains = new Set<Promise<void>>();
-  /** Per-agent current rewind episode: the single consolidated marker's id and
-   *  how many turns have been shed so far. One marker per episode, updated in
-   *  place (see updateRewindMarker); cleared when the episode ends. */
+  /** Current tail-consolidation marker and its consecutive-omission count.
+   *  A non-tail marker starts a fresh count, even within the same episode;
+   *  caller budgets are separate (see updateRewindMarker). */
   private rewindEpisode: Map<string, { markerId: MessageId; count: number; category: string }> = new Map();
   /** Active `/unstick` sessions: an admin-forced rewind-until-clean loop that
    *  runs even when the agent's autoRewind toggle is off. Tracks the remaining
@@ -15038,8 +15038,8 @@ export class AgentFramework {
     }
   }
 
-  /** Read-only, bounded whole-body recovery. Unsupported is not empty: never
-   * remove one endpoint and hope that another budget step repairs the other.
+  /** Read-only whole-body recovery with bounded mutation (not snapshot cost).
+   * Unsupported is not empty: never remove one endpoint and hope that another budget step repairs the other.
    * Standalone planning requires no logical turn ownership, including queued,
    * parked and held continuations. Terminal refusal may recover its own ending
    * turn; exhaustion needs full logical quiescence. Guard work always blocks.
@@ -15059,6 +15059,9 @@ export class AgentFramework {
       if (boundary !== 'terminal-refusal' && agent.state.status !== 'idle') return unsupported('live assistant round');
       const cm = agent.getContextManager();
       const windowed = this.presents(agent);
+      // Whole-history inflation is synchronous and not window-bounded. It
+      // validates hidden/unpresented endpoints too; see docs/recovery-b.md
+      // for measured cost and operator limits.
       const raw = cm.getAllMessages();
       const source = windowed ? cm.getPresentedMessages() : raw;
       const blocks = (m: StoredMessage) => Array.isArray(m.content) ? m.content : [];
@@ -15066,7 +15069,11 @@ export class AgentFramework {
       const barrier = (m: StoredMessage) => has(m, 'system_change') || m.metadata?.kind === 'refusal-rewind';
       const reader = readerFacts(this.registry, agent.name);
       const intended = (m: StoredMessage) => bearingOf(m, { ...reader, hidesHeld: false }, 'own') !== 'elsewhere';
-      const visible = (m: StoredMessage) => intended(m) && this.agentSees(agent, m.metadata);
+      // The source supplies window membership; use the compile's recorded
+      // view for visibility, not presentation admission/ownership. In legacy
+      // mode an ordinary co-resident own-row is still sent without an observe
+      // edge. Ownership remains a separate tool-closure safety constraint.
+      const visible = (m: StoredMessage) => this.agentSees(agent, m.metadata);
       const bodies = (rows: StoredMessage[]) => {
         const out: StoredMessage[][] = [];
         for (let i = 0; i < rows.length;) {
@@ -15076,20 +15083,22 @@ export class AgentFramework {
         }
         return out;
       };
+      const rawRuns = bodies(raw);
       let cleanup: StoredMessage[] = [];
       if (refusedReplyId !== undefined) {
-        cleanup = bodies(raw).find((body) => body.some((m) => m.id === refusedReplyId)) ?? [];
+        cleanup = rawRuns.find((body) => body.some((m) => m.id === refusedReplyId)) ?? [];
         if (!cleanup.length || cleanup.some((m) => barrier(m) || m.metadata?.system || !visible(m)
           || has(m, 'tool_use') || has(m, 'tool_result'))) return unsupported('unsafe refused reply body');
       }
       const excluded = new Set(cleanup.map((m) => m.id));
       // Exclusion is body-aligned, verified above; no writes before planning.
-      const sourceRuns = bodies(source);
+      const sourceRuns = windowed ? bodies(source) : rawRuns;
       if (sourceRuns.some((b) => b.some((m) => excluded.has(m.id)) && b.some((m) => !excluded.has(m.id)))) {
         return unsupported('inconsistent refused reply body');
       }
       const runs = sourceRuns.filter((b) => !b.some((m) => excluded.has(m.id)));
-      const rawRuns = bodies(raw);
+      const runPosition = new Map(runs.map((body, i) => [body[0].id, i]));
+      const rawBody = new Map(rawRuns.map((body) => [body[0].id, body]));
       const calls = (body: StoredMessage[]) => body.flatMap((m) => blocks(m).filter((b) => b.type === 'tool_use'));
       const results = (body: StoredMessage[]) => body.flatMap((m) => blocks(m).filter((b) => b.type === 'tool_result'));
       const carriedBody = (body: StoredMessage[]) => !carried || body.some((m) => carried.has(m.id));
@@ -15159,7 +15168,7 @@ export class AgentFramework {
         const ids = (cs.length ? cs.map(callId) : rs.map(resultId));
         if (!ids.every(valid) || new Set(ids).size !== ids.length) return unsupported('invalid or ambiguous tool IDs');
         const callBodies = cs.length
-          ? rawRuns.filter((b) => b[0].id === body[0].id)
+          ? (rawBody.has(body[0].id) ? [rawBody.get(body[0].id)!] : [])
           : [...(resultCalls.get(body[0].id) ?? [])];
         if (callBodies.length !== 1) return unsupported('missing or ambiguous call body');
         const call = callBodies[0];
@@ -15174,7 +15183,11 @@ export class AgentFramework {
         if (answerIds.length !== callIds.length || new Set(answerIds).size !== callIds.length
           || !answerIds.every((id) => valid(id) && callIds.includes(id))) return unsupported('incomplete or ambiguous results');
         selected = [call, ...answers];
-        const positions = selected.map((b) => runs.findIndex((r) => r.length === b.length && r.every((m, k) => m.id === b[k].id)));
+        const positions = selected.map((b) => {
+          const p = runPosition.get(b[0].id);
+          const r = p === undefined ? undefined : runs[p];
+          return r && r.length === b.length && r.every((m, k) => m.id === b[k].id) ? p! : -1;
+        });
         if (positions.some((p) => p < 0) || positions.slice(1).some((p) => p <= positions[0])) return unsupported('endpoint outside ordered window');
         for (const b of positions.map((p) => runs[p])) {
           if (calls(b).length && results(b).length) return unsupported('mixed call/result body');
@@ -15184,7 +15197,8 @@ export class AgentFramework {
           }
         }
         const chosen = new Set(positions);
-        for (let p = positions[0]; p <= Math.max(...positions); p++) {
+        const lastPosition = positions.reduce((last, p) => Math.max(last, p), positions[0]);
+        for (let p = positions[0]; p <= lastPosition; p++) {
           if (!chosen.has(p) && !notice(runs[p])) return unsupported('barrier between tool endpoints');
         }
         // Use window order, not raw storage order, for trace and accounting.
@@ -15192,12 +15206,23 @@ export class AgentFramework {
         break;
       }
       if (!selected) return { kind: 'empty' };
+      // Refusal compatibility may close a carried call over resident, uncarried
+      // results. Exhaustion may not: every selected body (including closure
+      // endpoints) must be named by this failed compile's raw-body witness.
+      // Decline the whole plan, rather than splitting it or choosing older history.
+      if (boundary === 'terminal-exhaustion'
+        && selected.some((body) => !carried?.has(body[0].id))) {
+        return unsupported('endpoint not carried by failed compile');
+      }
       const rows = selected.flat();
       // No whole-body removal may absorb hidden/foreign siblings, or notices.
       if (!tool && rows.some((m) => barrier(m) || m.metadata?.system || !visible(m))) return unsupported('heterogeneous body');
-      const rawPositions = rows.map((m) => raw.findIndex((r) => r.id === m.id));
-      if (!windowed && rawPositions.some((p, i) => i > 0 && p !== rawPositions[i - 1] + 1)) {
-        return unsupported('legacy removal is not contiguous');
+      if (!windowed) {
+        const rawPosition = new Map(raw.map((m, i) => [m.id, i]));
+        const positions = rows.map((m) => rawPosition.get(m.id));
+        if (positions.some((p, i) => p === undefined || (i > 0 && p !== positions[i - 1]! + 1))) {
+          return unsupported('legacy removal is not contiguous');
+        }
       }
       const content = rows.flatMap(blocks);
       const images = content.filter((b) => b.type === 'image').length;
@@ -15258,12 +15283,11 @@ export class AgentFramework {
   }
 
   /**
-   * Maintain exactly ONE consolidated marker for the current rewind episode,
-   * updated in place as more turns are shed. Six rewinds ⇒ one message that
-   * says "the 6 most recent turns were set aside", not six separate notes — so
-   * the context converges (shed N, add 1) instead of growing, and the marker
-   * sits at the tail giving the model something actionable to answer once the
-   * refusal clears. Returns the running count.
+   * Consolidate consecutive omissions while the episode's marker is still
+   * the visible tail. A retained notice after it starts another marker/count:
+   * never edit an earlier prefix to claim omissions happened at that position.
+   * This is not a one-marker-per-episode guarantee. Returns the marker count,
+   * which is distinct from each caller's confirmed-removal budget.
    */
   private updateRewindMarker(
     agent: Agent,
@@ -15689,9 +15713,17 @@ export class AgentFramework {
         return { ok: false, error: `Cannot unstick while agent is ${agent.state.status}` };
       }
       const preflight = this.planNewestTurn(agent);
-      if (preflight.kind !== 'ready') return {
-        ok: false, error: `Cannot unstick: ${preflight.kind === 'unsupported' ? preflight.reason : 'nothing eligible to shed'}. ${preflight.kind === 'unsupported' && ['live assistant round', 'unsettled tool round'].includes(preflight.reason) ? 'Wait for the active turn and tool work to settle, then retry.' : 'Inspect and repair history first; see docs/recovery-b.md.'}`,
-      };
+      if (preflight.kind !== 'ready') {
+        const reason = preflight.kind === 'unsupported' ? preflight.reason : 'nothing eligible to shed';
+        const guidance = preflight.kind === 'empty'
+          ? 'No eligible request content; no recovery session was opened.'
+          : ['live assistant round', 'unsettled tool round'].includes(reason)
+            ? 'Wait for the active turn and tool work to settle, then retry.'
+            : reason === 'snapshot unavailable'
+              ? 'Investigate the snapshot/read failure in the host log; retry after reads recover.'
+              : 'Inspect and repair history first; see docs/recovery-b.md.';
+        return { ok: false, error: `Cannot unstick: ${reason}. ${guidance}` };
+      }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
       const left = this.unstickWaiters.get(agentName);
@@ -28294,6 +28326,9 @@ export class AgentFramework {
     // Record turn checkpoint before inference (only on first attempt, not retries)
     let checkpoint: RecordedTurnCheckpoint | undefined;
     let compileBaseline: BudgetHoldBaseline | undefined;
+    // Attempt-local: never inherit a previous start's witness when compile
+    // fails before returning provenance. Membrane creation itself can throw.
+    let compiledHistory: CompiledHistory | undefined;
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
       checkpoint = this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
@@ -28680,6 +28715,7 @@ export class AgentFramework {
         // membrane's inside each attempt.
         membraneRetries: false,
         inferenceBounds: this.inferenceBounds,
+        onCompiledHistory: (history) => { compiledHistory = history; },
       });
       if (trigger) delete (trigger as MarkedRequest)[BUDGET_WAIT];
       // Each later round this stream sends is noted as it goes (noteRoundSent).
@@ -28823,9 +28859,9 @@ export class AgentFramework {
       // failure is reported, with this start's window still open, is kept
       // the same way. Either ends the turn here, as at that check, before a
       // hold parks the turn, a retry waits or the failure exhausts it. (The
-      // hooks fail open, and nothing after the compile throws here, so this
-      // catch never holds a compiled request.) As at the checks after the
-      // hooks and after the compile, a replaced agent or a stopping framework
+      // hooks fail open; membrane creation can throw after the compile has
+      // supplied its history witness, but before a stream exists.) As at the
+      // checks after hooks and compile, a replaced agent or a stopping framework
       // comes first: the turn is dropped as theirs, and the stop goes with
       // it. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
@@ -28953,7 +28989,7 @@ export class AgentFramework {
           // the site that sees it, since compile runs before the stream
           // exists). `retryable` is kept for observability.
           ...this.classifyInferenceError(err),
-        });
+        }, compiledHistory);
         this.eventGate?.onInferenceEnded(agent.name);
         if (action.emit) {
           this.pushEvent(action.emit);
@@ -30386,10 +30422,13 @@ export class AgentFramework {
               // enabled), then the reaction.
               const doRewind = (
                 budgetLeft: boolean,
-                onStep: (count: number) => void,
+                onStep: () => void,
                 onGiveUp: () => void,
               ): void => {
-                if (!budgetLeft) { onGiveUp(); return; }
+                if (!budgetLeft) {
+                  console.error(`[refusal-rewind] agent=${agent.name} stopped: rewind cap reached`);
+                  onGiveUp(); return;
+                }
                 const plan = this.planNewestTurn(agent, this.streamCarried.get(stream), refusedReplyId, 'terminal-refusal');
                 if (plan.kind !== 'ready') {
                   console.error(`[refusal-rewind] agent=${agent.name} stopped: ${plan.kind === 'unsupported' ? `unsupported: ${plan.reason}` : 'nothing eligible to shed'}`);
@@ -30399,8 +30438,8 @@ export class AgentFramework {
                 // Account for confirmed removal even if a subsequent write
                 // fails. Never claim a cleared session or retry uncertainty.
                 if (outcome.record) {
-                  onStep((this.rewindEpisode.get(agent.name)?.count ?? 0) + 1);
                   if (forced) forced.removed.push(outcome.record);
+                  onStep();
                 }
                 if (outcome.kind !== 'applied') {
                   console.error(`[refusal-rewind] agent=${agent.name} stopped: ${outcome.reason}`);
@@ -30441,10 +30480,10 @@ export class AgentFramework {
               if (forced) {
                 doRewind(
                   forced.remaining > 0,
-                  (count) => {
+                  () => {
                     forced.remaining -= 1;
                     console.error(
-                      `[unstick] agent=${agent.name} shed ${count} turn(s) ` +
+                      `[unstick] agent=${agent.name} shed ${forced.removed.length} turn(s) this session ` +
                         `(remaining ${forced.remaining})`,
                     );
                   },
@@ -30455,10 +30494,10 @@ export class AgentFramework {
                 const used = this.refusalRewinds.get(agent.name) ?? 0;
                 doRewind(
                   used < cap,
-                  (count) => {
+                  () => {
                     this.refusalRewinds.set(agent.name, used + 1);
                     console.error(
-                      `[refusal-rewind] agent=${agent.name} shed ${count} turn(s) so far ` +
+                      `[refusal-rewind] agent=${agent.name} shed ${used + 1} turn(s) this attempt ` +
                         `(cap ${cap})`,
                     );
                   },
@@ -35572,7 +35611,7 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: TraceEventInput): void {
+  private emitTrace(event: TraceEventInput, exhaustedHistory?: CompiledHistory): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -35591,6 +35630,7 @@ export class AgentFramework {
           providerErrorCode: event.providerErrorCode as string | undefined,
           shownReason: event.shownReason as string | undefined,
         },
+        exhaustedHistory,
       );
     } else if (event.type === 'inference:completed') {
       // A completed turn, a tool-ended one included, shows the agent can
@@ -35709,7 +35749,8 @@ export class AgentFramework {
    *      tool_use/tool_result pairing or an oversized attachment), retrying
    *      the same context is likely to fail the same way, and every new push
    *      event would wake the agent onto that same history. At the hard-down
-   *      threshold, automatically quarantine: shed the newest complete
+   *      threshold, quarantine only without an active stream and after full
+   *      logical quiescence: shed the newest complete
    *      exchange (the same forced-rewind primitive `/unstick` uses —
    *      planNewestTurn validates a tool result with its paired
    *      tool_use/thinking turn) and retry when planning supports it; otherwise
@@ -36102,6 +36143,7 @@ export class AgentFramework {
     retryable?: boolean,
     rawErrorType?: string,
     detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string },
+    history?: CompiledHistory,
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
@@ -36162,19 +36204,6 @@ export class AgentFramework {
     // what connectome-doctor reads. Legacy fields kept; `kind` and the
     // classification fields are additive.
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
-
-    const unstick = this.forcedRewind?.get(agentName);
-    if (unstick) {
-      this.answerUnstick(agentName, {
-        outcome: 'turn-failed',
-        rewinds: unstick.removed.length,
-        cause: {
-          kind: 'failure',
-          ...(errorType !== undefined ? { type: errorType } : {}),
-          ...(httpStatus !== undefined ? { status: httpStatus } : {}),
-        },
-      });
-    }
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     if (agent && ended && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
@@ -36294,16 +36323,39 @@ export class AgentFramework {
           // No exact failed-request/branch witness survives teardown here.
           // Decline rather than planning against later arrivals or a successor.
           console.error(`[inference-rewind] agent=${agent.name} stopped: active stream; failed request boundary unavailable. Manual repair needed.`);
-        } else this.quarantinePoisonedHistory(agent, wholeReason);
+        } else if (!history) {
+          console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile history unavailable. Manual repair needed.`);
+        } else {
+          let sameBranch = false;
+          try { sameBranch = branchKey(agent.getContextManager().currentBranchRef()) === history.branch; }
+          catch { /* An unreadable branch is not a failed-request witness. */ }
+          if (!sameBranch) {
+            console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile branch changed or unavailable. Manual repair needed.`);
+          } else this.quarantinePoisonedHistory(agent, wholeReason, history.carriedBodies);
+        }
       }
+    }
+    // Answer after synchronous quarantine so confirmed removals are included.
+    const unstick = this.forcedRewind?.get(agentName);
+    if (unstick) {
+      this.answerUnstick(agentName, {
+        outcome: 'turn-failed',
+        rewinds: unstick.removed.length,
+        cause: {
+          kind: 'failure',
+          ...(errorType !== undefined ? { type: errorType } : {}),
+          ...(httpStatus !== undefined ? { status: httpStatus } : {}),
+        },
+      });
     }
   }
 
   /**
-   * Automatic poison-history quarantine (the actual "breaker"). Sheds the
-   * newest complete exchange from the agent's history — reusing the same
+   * Quiescent pre-stream poison-history quarantine (the actual "breaker").
+   * Active-stream exhaustion refuses before reaching this planner. Sheds the
+   * newest complete exchange carried by the failed compile — reusing the same
    * primitives as the refusal auto-rewind / `/unstick` (planNewestTurn/applyShed +
-   * the single consolidated episode marker) — and queues a retry so the
+   * a tail-consolidated marker) — and queues a retry so the
    * rewound history is verified immediately instead of waiting for the next
    * push event to wake the agent onto the same context.
    *
@@ -36313,9 +36365,14 @@ export class AgentFramework {
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
-  private quarantinePoisonedHistory(agent: Agent, wholeReason: string): void {
+  private quarantinePoisonedHistory(agent: Agent, wholeReason: string, carried: ReadonlySet<MessageId>): void {
     const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
     const used = this.exhaustionRewinds.get(agent.name) ?? 0;
+    const forced = this.forcedRewind?.get(agent.name);
+    if (forced && forced.remaining <= 0) {
+      console.error(`[inference-rewind] agent=${agent.name} stopped: forced rewind cap reached. Manual repair needed.`);
+      return;
+    }
     if (used >= cap) {
       console.error(
         `[inference-rewind] agent=${agent.name} rewind cap ${cap} reached — ` +
@@ -36324,23 +36381,32 @@ export class AgentFramework {
       return;
     }
 
+    if (!carried) {
+      console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile history unavailable. Manual repair needed.`);
+      return;
+    }
     // Exhaustion has no ownership exception: queued/held turns also block.
-    const plan = this.planNewestTurn(agent, undefined, undefined, 'terminal-exhaustion');
+    const plan = this.planNewestTurn(agent, carried, undefined, 'terminal-exhaustion');
     if (plan.kind !== 'ready') {
       console.error(`[inference-rewind] agent=${agent.name} stopped: ${plan.kind === 'unsupported' ? `unsupported: ${plan.reason}` : 'nothing eligible to shed'}. Manual repair needed.`);
       return;
     }
     const outcome = this.applyShed(agent, plan);
-    if (outcome.record) this.exhaustionRewinds.set(agent.name, used + 1);
+    if (outcome.record) {
+      this.exhaustionRewinds.set(agent.name, used + 1);
+      if (forced) {
+        forced.removed.push(outcome.record);
+        forced.remaining = Math.max(0, forced.remaining - 1);
+      }
+    }
     if (outcome.kind !== 'applied') {
       console.error(`[inference-rewind] agent=${agent.name} stopped: ${outcome.reason}. Manual repair needed.`);
       return;
     }
     const rec = outcome.record;
-    let count: number;
     try {
       if (agent.getContextManager().currentBranch().name !== plan.branch) throw new Error('branch changed');
-      count = this.updateRewindMarker(
+      this.updateRewindMarker(
         agent, boundFailureText(wholeReason, REWIND_MARKER_REASON_MAX_CHARS), 'inference-failure');
     } catch {
       console.error(`[inference-rewind] agent=${agent.name} removal applied; marker outcome uncertain — stopped. Manual repair needed.`);
@@ -36348,7 +36414,7 @@ export class AgentFramework {
     }
     console.error(
       `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
-      `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +
+      `(${used + 1} turn(s) shed this failure episode, cap ${cap}) after non-retryable ` +
       `inference failures — retrying on the rewound history.`,
     );
 

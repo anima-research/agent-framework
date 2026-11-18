@@ -22,6 +22,7 @@ import { AgentFramework, residentContextOptions, storeOwnRow } from '../src/inde
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { until } from './helpers/dendrite.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
+import { branchKey } from '../src/agent.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const textOf = (row: { content: ContentBlock[] }) => row.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
@@ -47,7 +48,7 @@ type Internals = {
   addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId;
   planNewestTurn(agent: Agent, carried?: ReadonlySet<MessageId>, refused?: MessageId, boundary?: 'terminal-refusal'): any;
   applyShed(agent: Agent, plan: any): any;
-  quarantinePoisonedHistory(agent: Agent, reason: string): void;
+  quarantinePoisonedHistory(agent: Agent, reason: string, carried: ReadonlySet<MessageId>): void;
   handleHostCommand(server: string, params: any): Promise<any>;
   pendingRequests: any[];
   exhaustionRewinds: Map<string, number>;
@@ -55,6 +56,9 @@ type Internals = {
   updateRewindMarker(agent: Agent, category: string): number;
   rewindEpisode: Map<string, { markerId: MessageId; count: number; category: string }>;
 };
+
+// Synthetic planner controls supply an explicit stand-in for compile provenance.
+const snapshotCarried = (agent: Agent) => new Set(agent.getContextManager().getAllMessages().map((m) => m.id));
 
 const dirs: string[] = [];
 const frameworks: AgentFramework[] = [];
@@ -209,6 +213,26 @@ describe('a shed on a presented window (#291, AF-7)', () => {
   });
 });
 
+it('legacy refusal recovery removes the newest own-row actually sent by compile, not an older owned row', async () => {
+  const h = await boot({ failWriteDown: true, autoRewind: true });
+  const older = storeOwnRow(h.agent('mira'), 'user', [text('legacy-older-keep')]);
+  const poison = storeOwnRow(h.agent('oren'), 'oren', [text('legacy-newer-poison')]);
+  const refusal = final([text('legacy-refused-reply')]); refusal.stopReason = 'refusal';
+  h.membrane.script('mira', refusal);
+  h.framework.start();
+  assert.equal(h.framework.nudgeAgent('mira').ok, true);
+  await until(() => h.membrane.callsFor('mira').length === 2
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'legacy refusal and repaired retry complete');
+  const [failed, retry] = h.membrane.callsFor('mira').map((r) => JSON.stringify(r.messages));
+  assert.match(failed!, /legacy-older-keep/);
+  assert.match(failed!, /legacy-newer-poison/, 'legacy compile really sends the co-resident own-row without an observe edge');
+  assert.match(retry!, /legacy-older-keep/, 'do not sacrifice older history while poison survives');
+  assert.doesNotMatch(retry!, /legacy-newer-poison|legacy-refused-reply/);
+  assert.ok(h.cm('mira').getMessage(older));
+  assert.equal(h.cm('mira').getMessage(poison), null);
+  assert.equal(h.cm('mira').windowMode(), 'legacy', 'no conversion to presented mode');
+});
+
 for (const gap of [false, true]) {
   it(`rewinds the complete ID-matched exchange on the next wire request (notice gap: ${gap})`, async () => {
     const h = await boot();
@@ -224,8 +248,8 @@ for (const gap of [false, true]) {
     ]);
     h.framework.start();
     h.framework.pushEvent(input('before-question', ['mira']));
-    await until(() => h.membrane.callsFor('mira').length === 1, 'before-shed request');
-    await h.framework.runUntilIdle();
+    await until(() => h.membrane.callsFor('mira').length === 1
+      && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'before-shed turn complete');
     const beforeWire = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
     for (const witness of ['exchange-call', 'exchange-result', 'exchange-signature', 'exchange-narration']) {
       assert.ok(beforeWire.includes(witness), `before-wire carries ${witness}`);
@@ -238,7 +262,8 @@ for (const gap of [false, true]) {
     const shed = h.internals.shedNewestTurn(h.agent('mira'));
     assert.ok(shed?.removedIds.includes(call) && shed.removedIds.includes(result));
     h.framework.pushEvent(input('next-question', ['mira']));
-    await until(() => h.membrane.callsFor('mira').length === 2, 'next request');
+    await until(() => h.membrane.callsFor('mira').length === 2
+      && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'next turn complete');
     const sent = JSON.stringify(h.membrane.callsFor('mira')[1]!.messages);
     assert.doesNotMatch(sent, /exchange-call|exchange-result|exchange-signature|exchange-narration/);
     assert.match(sent, /keep-before/);
@@ -305,7 +330,7 @@ for (const legacy of [false, true]) {
       assert.equal(h.internals.shedNewestTurn(h.agent('mira'), carried ? new Set([call]) : undefined), null);
       assert.equal(snapshot(h), before);
       // The quarantine caller must not count or retry even at maxRewinds=1.
-      h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request');
+      h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request', snapshotCarried(h.agent('mira')));
       assert.equal(snapshot(h), before);
       assert.equal(h.internals.pendingRequests.length, 0);
       assert.equal(h.internals.exhaustionRewinds.size, 0);
@@ -420,7 +445,7 @@ for (const fault of ['pre', 'post', 'unknown', 'marker'] as const) it(`quarantin
   };
   if (fault === 'unknown') cm.windowStatusOf = () => { throw new Error('unreadable'); };
   if (fault === 'marker') h.internals.updateRewindMarker = () => { throw new Error('marker'); };
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request', snapshotCarried(h.agent('mira')));
   assert.equal(writes, 1, 'no blind replay');
   assert.equal(h.internals.pendingRequests.length, 0);
   assert.equal(h.internals.rewindEpisode.size, 0);
@@ -429,7 +454,9 @@ for (const fault of ['pre', 'post', 'unknown', 'marker'] as const) it(`quarantin
 });
 
 for (const caller of ['auto', 'forced', 'exhaustion'] as const) {
-  for (const supported of [false, true]) it(`actual ${caller} caller, notice retention and retry disposition (supported:${supported})`, async () => {
+  for (const supported of [false, true]) it(`live ${caller} caller, notice retention and retry disposition (supported:${supported})`, async (t) => {
+    const lines: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
     const h = await boot({ autoRewind: caller === 'auto' });
     h.internals.addMessage('user', [text('keep-prefix')]);
     const call = h.internals.addMessage('mira', [
@@ -458,11 +485,29 @@ for (const caller of ['auto', 'forced', 'exhaustion'] as const) {
         if (name === 'mira' && lateNotice === undefined) lateNotice = h.internals.addMessage('user', [text('after-compile-notice')], { system: true });
       };
     }
+    const failedRequests: string[] = [];
+    if (caller === 'exhaustion') {
+      const original = h.membrane.streamYielding.bind(h.membrane);
+      h.membrane.streamYielding = (request, options) => {
+        if (failedRequests.length >= 3) return original(request, options);
+        failedRequests.push(JSON.stringify(request.messages));
+        throw new MembraneError({ type: 'invalid_request', message: 'pre-stream invalid request', retryable: false, httpStatus: 400 } as never);
+      };
+    }
     h.framework.start();
     if (caller === 'exhaustion') {
-      // Production exhaustion entry point, not the shedding primitive.
-      for (let i = 0; i < 3; i++) (h.framework as any).emitTrace({ type: 'inference:exhausted', agentName: 'mira',
-        error: 'invalid request', errorType: 'invalid_request', httpStatus: 400, retryable: false });
+      // Real start/compile/provider failure: the terminal start must release
+      // its logical token before the production exhaustion breaker can plan.
+      for (let i = 0; i < 3; i++) {
+        assert.equal(h.framework.nudgeAgent('mira').ok, true);
+        await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === i + 1
+          && !(h.framework as any).logicalTurnAlive(h.agent('mira')),
+        'pre-stream failure, recovery decision and token release');
+      }
+      assert.equal(failedRequests.length, 3);
+      for (const request of failedRequests) assert.match(request, /caller-signature.*caller-narration/);
+      assert.ok(lines.some((line) => line.includes(supported ? 'auto-quarantined' : 'unsupported: missing or ambiguous call body')),
+        'witness the actual breaker disposition, not just unchanged rows');
     } else {
       const command = await h.internals.handleHostCommand('test', { command: caller === 'forced' ? 'unstick' : 'nudge', agentName: 'mira', maxRewinds: 1 });
       assert.equal(command.ok, caller === 'forced' ? supported : true);
@@ -501,7 +546,9 @@ for (const caller of ['auto', 'forced', 'exhaustion'] as const) {
   });
 }
 
-for (const supported of [false, true]) it(`real terminal error stream reaches exhaustion breaker (supported:${supported})`, async () => {
+for (const supported of [false, true]) it(`real terminal error stream declines before planning regardless of ID closure (supported:${supported})`, async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const h = await boot();
   const call = h.internals.addMessage('mira', [callBlock('a')]);
   const notice = h.internals.addMessage('user', [text('error-stream-one-shot')], { system: true });
@@ -525,6 +572,7 @@ for (const supported of [false, true]) it(`real terminal error stream reaches ex
     await h.framework.runUntilIdle();
     await until(() => requests.length >= i + 1 && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'error frame teardown');
   }
+  assert.ok(lines.some((line) => line.includes('stopped: active stream; failed request boundary unavailable')), 'breaker was invoked and declined before the planner');
   assert.equal(requests.length, 3, 'active-stream exhaustion declines even a complete exchange');
   for (const request of requests.slice(0, 3)) assert.match(request, /tool_use.*a/);
   for (const id of [call, result]) assert.equal(h.cm('mira').windowStatusOf(id), 'in');
@@ -544,7 +592,8 @@ it('refused-reply cleanup failure accounts for removal but stops before marker/r
   h.framework.start();
   const ack = await h.internals.handleHostCommand('test', { command: 'unstick', agentName: 'mira', maxRewinds: 1 });
   assert.equal(ack.ok, true);
-  await h.framework.runUntilIdle();
+  await until(() => h.membrane.callsFor('mira').length === 1
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'cleanup failure and give-up complete');
   assert.equal(h.membrane.callsFor('mira').length, 1);
   assert.equal(h.internals.rewindEpisode.size, 0);
   for (const id of [call, result]) assert.equal(cm.windowStatusOf(id), 'undone');
@@ -618,7 +667,9 @@ for (const mode of ['windowed', 'raw'] as const) {
   });
 }
 
-for (const caller of ['auto', 'forced', 'exhaustion'] as const) it(`legacy notice-gap ${caller} caller is zero-write and never forces conversion`, async () => {
+for (const caller of ['auto', 'forced', 'exhaustion'] as const) it(`legacy notice-gap ${caller} caller is zero-write and never forces conversion`, async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const h = await boot({ failWriteDown: true, autoRewind: caller === 'auto' });
   const call = h.internals.addMessage('mira', [callBlock('a')]);
   const notice = h.internals.addMessage('user', [text('legacy-one-shot')], { system: true });
@@ -630,13 +681,18 @@ for (const caller of ['auto', 'forced', 'exhaustion'] as const) it(`legacy notic
   }
   h.framework.start();
   if (caller === 'exhaustion') {
+    // Synthetic terminal control with explicit compile-history stand-in.
+    const history = { carriedBodies: new Set([call, result]), branch: branchKey(h.cm('mira').currentBranchRef()) };
     for (let i = 0; i < 3; i++) (h.framework as any).emitTrace({ type: 'inference:exhausted', agentName: 'mira',
-      error: 'invalid request', errorType: 'invalid_request', httpStatus: 400 });
+      error: 'invalid request', errorType: 'invalid_request', httpStatus: 400 }, history);
   } else {
     const ack = await h.internals.handleHostCommand('test', { command: caller === 'auto' ? 'nudge' : 'unstick', agentName: 'mira' });
     assert.equal(ack.ok, caller === 'auto');
+    if (caller === 'forced') assert.match(ack.error, /legacy removal is not contiguous/);
   }
-  await h.framework.runUntilIdle();
+  await until(() => h.membrane.callsFor('mira').length === (caller === 'auto' ? 1 : 0)
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'legacy decline complete');
+  if (caller !== 'forced') assert.ok(lines.some((line) => line.includes('legacy removal is not contiguous')), 'actual planner decline, not an uninvoked breaker');
   assert.equal(h.membrane.callsFor('mira').length, caller === 'auto' ? 1 : 0);
   assert.equal(h.cm('mira').windowMode(), 'legacy');
   assert.equal(h.internals.rewindEpisode.size, 0);
@@ -656,7 +712,8 @@ it('forced recovery re-plans after a successful preflight and gives up on a newl
   h.framework.start();
   const ack = await h.internals.handleHostCommand('test', { command: 'unstick', agentName: 'mira' });
   assert.equal(ack.ok, true, 'initial supported preflight');
-  await h.framework.runUntilIdle();
+  await until(() => h.membrane.callsFor('mira').length === 1
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 're-plan decline and forced give-up complete');
   assert.equal(h.membrane.callsFor('mira').length, 1, 'no unchanged immediate retry');
   const outcome = await h.internals.handleHostCommand('test', { command: 'unstick-outcome', agentName: 'mira' });
   assert.equal(outcome.outcome, 'gave-up');
@@ -674,13 +731,28 @@ for (const legacy of [false, true]) for (const owned of [false, true]) it(`nativ
   assertDecline(h, new Set([call]));
 });
 
-it('legacy adjacent quarantine is one raw removal without forced write-down, with a truthful marker', async () => {
+it('live pre-stream legacy quarantine is one raw removal without forced write-down, with a truthful marker', async () => {
   const h = await boot({ failWriteDown: true });
   const call = h.internals.addMessage('mira', [callBlock('a')]);
   const result = h.internals.addMessage('user', [resultBlock('a')]);
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request');
-  assert.equal(h.internals.exhaustionRewinds.get('mira'), 1);
-  assert.equal(h.internals.pendingRequests.length, 1);
+  const original = h.membrane.streamYielding.bind(h.membrane);
+  let failures = 0;
+  h.membrane.streamYielding = (request, options) => {
+    if (failures++ >= 3) return original(request, options);
+    throw new MembraneError({ type: 'invalid_request', message: 'pre-stream legacy invalid request', retryable: false, httpStatus: 400 } as never);
+  };
+  h.framework.start();
+  for (let i = 0; i < 3; i++) {
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === i + 1
+      && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'legacy pre-stream failure and recovery');
+  }
+  await until(() => h.membrane.callsFor('mira').length === 1
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'legacy repaired retry completes');
+  const retry = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+  assert.doesNotMatch(retry, /tool_use|result-payload/);
+  assert.match(retry, /The 1 most recent/);
+
   assert.equal(h.cm('mira').windowMode(), 'legacy');
   for (const id of [call, result]) {
     assert.equal(h.cm('mira').getMessage(id), null);
@@ -691,7 +763,7 @@ it('legacy adjacent quarantine is one raw removal without forced write-down, wit
 });
 
 // Known framework ownership is busy even before/after Agent.status changes.
-// Keep refusal/exhaustion positives above: those terminal owners must still shed.
+// Refusal may recover its terminal owner; pre-stream exhaustion must first release it.
 function recoveryState(h: Awaited<ReturnType<typeof boot>>) {
   const fw = h.framework as any;
   return {
@@ -771,7 +843,7 @@ for (const location of ['queued', 'parked', 'pass', 'provider-held', 'budget-hel
       assert.deepEqual(h.internals.planNewestTurn(h.agent('mira'), undefined, undefined, 'terminal-refusal'),
         { kind: 'unsupported', reason: 'live assistant round' }, 'refusal cannot borrow ownership from another queued/held turn');
       const before = recoveryState(h);
-      h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request');
+      h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request', snapshotCarried(h.agent('mira')));
       assert.deepEqual(recoveryState(h), before, 'terminal exhaustion also respects queued/held ownership');
     }
     finally {
@@ -795,7 +867,7 @@ for (const hidden of ['foreign', 'held', 'audience'] as const) it(`legacy visibl
   const plan = h.internals.planNewestTurn(h.agent('mira'));
   assert.equal(plan.kind, 'unsupported');
   const before = snapshot(h);
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'bad history');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'bad history', snapshotCarried(h.agent('mira')));
   assert.equal(snapshot(h), before);
   assert.ok(h.cm('mira').getMessage(eligible));
   assert.equal(h.internals.exhaustionRewinds.size, 0);
@@ -814,7 +886,7 @@ for (const missing of ['removed', 'branched-away', 'undone'] as const) it(`repla
     assert.equal(cm.getMessage(old), null, 'real branch excludes the old marker');
   }
   h.internals.addMessage('user', [text('later supported turn')]);
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'bad history');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'bad history', snapshotCarried(h.agent('mira')));
   const ep = h.internals.rewindEpisode.get('mira')!;
   assert.notEqual(ep.markerId, old);
   assert.equal(ep.count, 1);
@@ -846,12 +918,12 @@ it('unsupported exhaustion preserves prior confirmed budget and marker', async (
   const h = await boot();
   (h.agent('mira').refusalHandling as any).maxRewinds = 3;
   h.internals.addMessage('user', [text('first shed')]);
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'first');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'first', snapshotCarried(h.agent('mira')));
   h.internals.pendingRequests.length = 0;
   const ep = { ...h.internals.rewindEpisode.get('mira')! };
   h.internals.addMessage('mira', [callBlock('unfinished')]);
   const before = snapshot(h);
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'second');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'second', snapshotCarried(h.agent('mira')));
   assert.equal(snapshot(h), before);
   assert.equal(h.internals.exhaustionRewinds.get('mira'), 1);
   assert.deepEqual(h.internals.rewindEpisode.get('mira'), ep);
@@ -949,7 +1021,7 @@ for (const legacy of [false, true]) it(`visible orphan result stops quarantine w
   const windowBefore = JSON.stringify(h.cm('mira').getPresentedMessages());
   const wireBefore = await h.compiled('mira');
   const plan = h.internals.planNewestTurn(h.agent('mira'));
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'orphan result');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'orphan result', snapshotCarried(h.agent('mira')));
   assert.equal(plan.kind, 'unsupported');
   assert.equal(plan.reason, 'missing or ambiguous call body');
   assert.equal(JSON.stringify(h.cm('mira').getAllMessages()), rawBefore);
@@ -968,7 +1040,7 @@ it('non-tail marker starts a fresh notice instead of editing a cached prefix', a
   const old = h.internals.rewindEpisode.get('mira')!.markerId;
   h.internals.addMessage('user', [text('retained intervening turn')]);
   h.internals.addMessage('user', [text('new poison')]);
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'second');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'second', snapshotCarried(h.agent('mira')));
   const ep = h.internals.rewindEpisode.get('mira')!;
   assert.notEqual(ep.markerId, old);
   assert.equal(ep.count, 1);
@@ -1080,7 +1152,7 @@ it('legacy recovery removes only the newest completed round when IDs repeat', as
   const oldResult = h.internals.addMessage('user', [resultBlock('reused')]);
   const call = h.internals.addMessage('mira', [callBlock('reused')]);
   const result = h.internals.addMessage('user', [resultBlock('reused')]);
-  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request');
+  h.internals.quarantinePoisonedHistory(h.agent('mira'), 'invalid request', snapshotCarried(h.agent('mira')));
   assert.ok(h.cm('mira').getMessage(oldCall));
   assert.ok(h.cm('mira').getMessage(oldResult));
   assert.equal(h.cm('mira').getMessage(call), null);
@@ -1111,10 +1183,245 @@ for (const legacy of [false, true]) it(`a newer foreign round reusing an ID cann
   const foreignResult = storeOwnRow(h.agent('oren'), 'user', [resultBlock('shared')]);
   for (const carried of [undefined, new Set([call])]) {
     const plan = h.internals.planNewestTurn(h.agent('mira'), carried);
-    assert.equal(plan.kind, 'ready', plan.reason);
-    assert.deepEqual(plan.rows.map((m: StoredMessage) => m.id), [call, result]);
+    if (legacy && !carried) {
+      // The legacy compile includes this ordinary co-resident round. It is
+      // visible but not reader-owned: decline, don't sacrifice older history.
+      assert.match(await h.compiled('mira'), /tool_use/);
+      assert.equal(plan.kind, 'unsupported');
+      assert.equal(plan.reason, 'missing or ambiguous call body');
+    } else {
+      assert.equal(plan.kind, 'ready', plan.reason);
+      assert.deepEqual(plan.rows.map((m: StoredMessage) => m.id), [call, result]);
+    }
   }
-  assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result, call]);
+  assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'), new Set([call]))?.removedIds, [result, call]);
   assert.ok(h.cm('oren').getMessage(foreignCall));
   assert.ok(h.cm('oren').getMessage(foreignResult));
+});
+
+for (const postCommit of [false, true]) it(`live pre-stream exhaustion accounts for a forced session removal (post-commit throw:${postCommit})`, async () => {
+  const h = await boot();
+  h.internals.addMessage('user', [text('forced-keep-prefix')]);
+  const call = h.internals.addMessage('mira', [callBlock('forced-exhaustion')]);
+  const result = h.internals.addMessage('user', [resultBlock('forced-exhaustion')]);
+  const fw = h.framework as any;
+  const answers: any[] = [];
+  const answer = fw.answerUnstick.bind(fw);
+  fw.answerUnstick = (name: string, value: any) => { answers.push(value); answer(name, value); };
+  const original = h.membrane.streamYielding.bind(h.membrane);
+  let failures = 0;
+  h.membrane.streamYielding = (request, options) => {
+    if (failures++ >= 3) return original(request, options);
+    throw new MembraneError({ type: 'invalid_request', message: 'forced pre-stream invalid request', retryable: false, httpStatus: 400 } as never);
+  };
+  h.framework.start();
+  for (let i = 0; i < 2; i++) {
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === i + 1
+      && !fw.logicalTurnAlive(h.agent('mira')), 'prior live failures complete');
+  }
+  if (postCommit) {
+    const retract = h.cm('mira').retractRows.bind(h.cm('mira'));
+    h.cm('mira').retractRows = (...args) => { retract(...args); throw new Error('committed notification failure'); };
+  }
+  const ack = await h.internals.handleHostCommand('test', { command: 'unstick', agentName: 'mira', maxRewinds: 1 });
+  assert.equal(ack.ok, true);
+  await until(() => answers.some((a) => a.outcome === 'turn-failed')
+    && !fw.logicalTurnAlive(h.agent('mira')), 'failure answer includes synchronous quarantine');
+  assert.equal(answers.find((a) => a.outcome === 'turn-failed').rewinds, 1);
+  for (const id of [call, result]) assert.equal(h.cm('mira').windowStatusOf(id), 'undone');
+  if (postCommit) {
+    assert.equal(fw.forcedRewind.get('mira').remaining, 0, 'confirmed removal consumes forced budget too');
+    assert.equal(fw.forcedRewind.get('mira').removed.length, 1);
+    assert.equal(h.membrane.callsFor('mira').length, 0, 'uncertain notification never automatically retries');
+    // Even with a larger exhaustion cap, the forced cap cannot be bypassed.
+    (h.agent('mira').refusalHandling as any).maxRewinds = 3;
+    const before = snapshot(h);
+    h.internals.quarantinePoisonedHistory(h.agent('mira'), 'later independent failure', snapshotCarried(h.agent('mira')));
+    assert.equal(snapshot(h), before);
+    assert.equal(fw.forcedRewind.get('mira').removed.length, 1);
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+  }
+  await until(() => answers.some((a) => a.outcome === 'cleared')
+    && !fw.logicalTurnAlive(h.agent('mira')), 'eventual forced completion');
+  assert.equal(answers.find((a) => a.outcome === 'cleared').rewinds, 1);
+  assert.equal(h.membrane.callsFor('mira').length, 1);
+  assert.doesNotMatch(JSON.stringify(h.membrane.callsFor('mira')[0]!.messages), /forced-exhaustion/);
+});
+
+// Independent review's public-start ordering: the provider sees the compile,
+// then a microtask stores an own row before the rejected start reaches recovery.
+for (const legacy of [false, true]) it(`pre-stream exhaustion carries the failed compile, not a later arrival (legacy:${legacy})`, async () => {
+  const h = await boot({ failWriteDown: legacy });
+  const poison = storeOwnRow(h.agent('mira'), 'user', [text('original-carried-poison')]);
+  const original = h.membrane.streamYielding.bind(h.membrane);
+  const failedRequests: string[] = [];
+  let late: MessageId | undefined;
+  h.membrane.streamYielding = (request, options) => {
+    if (failedRequests.length >= 3) return original(request, options);
+    failedRequests.push(JSON.stringify(request.messages));
+    if (failedRequests.length === 3) queueMicrotask(() => {
+      late = storeOwnRow(h.agent('mira'), 'user', [text('arrival-after-failed-compile')]);
+    });
+    throw new MembraneError({ type: 'invalid_request', message: 'pre-stream ordering', retryable: false, httpStatus: 400 } as never);
+  };
+  h.framework.start();
+  for (let i = 0; i < 3; i++) {
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === i + 1
+      && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'failure and breaker complete');
+  }
+  assert.match(failedRequests[2], /original-carried-poison/);
+  assert.doesNotMatch(failedRequests[2], /arrival-after-failed-compile/);
+  assert.ok(late);
+  await until(() => h.membrane.callsFor('mira').length === 1
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'repaired retry completes');
+  const retry = JSON.stringify(h.membrane.callsFor('mira')[0]!.messages);
+  assert.match(retry, /arrival-after-failed-compile/);
+  assert.doesNotMatch(retry, /original-carried-poison/);
+  assert.match(retry, /The 1 most recent/);
+  if (legacy) {
+    assert.ok(h.cm('mira').getMessage(late));
+    assert.equal(h.cm('mira').getMessage(poison), null);
+  } else {
+    assert.equal(h.cm('mira').windowStatusOf(late), 'in');
+    assert.equal(h.cm('mira').windowStatusOf(poison), 'undone');
+  }
+});
+
+it('refusal retains an arrival absent from the refused compile (ordering control)', async () => {
+  const h = await boot({ autoRewind: true });
+  const poison = storeOwnRow(h.agent('mira'), 'user', [text('original-carried-poison')]);
+  const refusal = final([text('refused')]); refusal.stopReason = 'refusal';
+  h.membrane.script('mira', refusal);
+  let late: MessageId | undefined;
+  h.membrane.onRequest = (name) => {
+    if (name === 'mira' && late === undefined)
+      late = storeOwnRow(h.agent('mira'), 'user', [text('arrival-after-failed-compile')]);
+  };
+  h.framework.start();
+  assert.equal(h.framework.nudgeAgent('mira').ok, true);
+  await until(() => h.membrane.callsFor('mira').length === 2
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'refusal retry completes');
+  const [failed, retry] = h.membrane.callsFor('mira').map((r) => JSON.stringify(r.messages));
+  assert.match(failed, /original-carried-poison/);
+  assert.doesNotMatch(failed, /arrival-after-failed-compile/);
+  assert.match(retry, /arrival-after-failed-compile/);
+  assert.doesNotMatch(retry, /original-carried-poison/);
+  assert.ok(late);
+  assert.equal(h.cm('mira').windowStatusOf(late), 'in');
+  assert.equal(h.cm('mira').windowStatusOf(poison), 'undone');
+});
+
+for (const compileThrows of [false, true]) it(`pre-stream exhaustion without provenance declines rather than reusing an earlier compile (compile throws:${compileThrows})`, async () => {
+  const h = await boot();
+  const poison = storeOwnRow(h.agent('mira'), 'user', [text('unwitnessed-poison')]);
+  const cm = h.cm('mira');
+  const compile = cm.compile.bind(cm);
+  let compiles = 0;
+  let late: MessageId | undefined;
+  cm.compile = async (...args) => {
+    const compiled = await compile(...args);
+    if (++compiles !== 3) return compiled;
+    queueMicrotask(() => {
+      late = storeOwnRow(h.agent('mira'), 'user', [text('unwitnessed-late-arrival')]);
+    });
+    if (compileThrows) throw new MembraneError({ type: 'invalid_request', message: 'compile failed before returning provenance', retryable: false, httpStatus: 400 } as never);
+    return { ...compiled, provenance: undefined };
+  };
+  const failedRequests: string[] = [];
+  h.membrane.streamYielding = (request) => {
+    failedRequests.push(JSON.stringify(request.messages));
+    throw new MembraneError({ type: 'invalid_request', message: 'no compile witness', retryable: false, httpStatus: 400 } as never);
+  };
+  const log = console.error, lines: string[] = [];
+  console.error = (...args) => { lines.push(args.map(String).join(' ')); };
+  try {
+    h.framework.start();
+    for (let i = 0; i < 3; i++) {
+      assert.equal(h.framework.nudgeAgent('mira').ok, true);
+      await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === i + 1
+        && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'unwitnessed failure settles');
+    }
+    await h.framework.runUntilIdle();
+    assert.ok(lines.some((line) => line.includes('stopped: failed compile history unavailable')));
+    assert.equal(compiles, 3, 'no repaired retry without provenance');
+    assert.equal(failedRequests.length, compileThrows ? 2 : 3);
+    assert.doesNotMatch(failedRequests.at(-1)!, /unwitnessed-late-arrival/);
+    assert.ok(late);
+    for (const id of [poison, late]) assert.equal(cm.windowStatusOf(id), 'in');
+    assert.equal(h.internals.exhaustionRewinds.size, 0);
+    assert.equal(h.internals.rewindEpisode.size, 0);
+  } finally { console.error = log; }
+});
+
+// A late result closes a carried call in storage, but must not expand the
+// failed compile's exhaustion witness. Exercise only public start/nudge/store.
+for (const legacy of [false, true]) it(`pre-stream exhaustion declines closure over a late uncarried result (legacy:${legacy})`, async () => {
+  const h = await boot({ failWriteDown: legacy });
+  const prefix = storeOwnRow(h.agent('mira'), 'user', [text('older-carried-prefix')]);
+  let call: MessageId | undefined;
+  let late: MessageId | undefined;
+  const failedRequests: string[] = [];
+  const original = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request, options) => {
+    if (failedRequests.length >= 3) return original(request, options);
+    failedRequests.push(JSON.stringify(request.messages));
+    if (failedRequests.length === 3) queueMicrotask(() => {
+      late = storeOwnRow(h.agent('mira'), 'user', [resultBlock('late-result-call')]);
+    });
+    throw new MembraneError({ type: 'invalid_request', message: 'late result ordering', retryable: false, httpStatus: 400 } as never);
+  };
+  const log = console.error, lines: string[] = [];
+  console.error = (...args) => { lines.push(args.map(String).join(' ')); };
+  try {
+    h.framework.start();
+    for (let i = 0; i < 3; i++) {
+      if (i === 2) call = storeOwnRow(h.agent('mira'), 'mira', [callBlock('late-result-call')]);
+      assert.equal(h.framework.nudgeAgent('mira').ok, true);
+      await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === i + 1
+        && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'late-result failure settles');
+    }
+    const failed = JSON.parse(failedRequests[2]) as { content: ContentBlock[] }[];
+    assert.ok(failed.some((m) => m.content.some((b) => b.type === 'tool_use' && b.id === 'late-result-call')),
+      'the failed request really carries the call');
+    assert.doesNotMatch(failedRequests[2], /result-payload/);
+    assert.ok(call);
+    assert.ok(late);
+    await h.framework.runUntilIdle();
+    for (const id of [prefix, call, late]) {
+      assert.ok(h.cm('mira').getMessage(id), 'no raw endpoint or older fallback removed');
+      if (!legacy) assert.equal(h.cm('mira').windowStatusOf(id), 'in');
+    }
+    assert.ok(lines.some((line) => line.includes('unsupported: endpoint not carried by failed compile')));
+    assert.equal(h.membrane.callsFor('mira').length, 0, 'decline queues no repaired retry');
+    assert.equal(failedRequests.length, 3);
+    assert.equal(h.internals.exhaustionRewinds.size, 0, 'decline consumes no step');
+    assert.equal(h.internals.rewindEpisode.size, 0, 'decline adds no marker');
+  } finally { console.error = log; }
+});
+
+for (const legacy of [false, true]) it(`refusal still closes over a resident result absent from its compile (legacy:${legacy})`, async () => {
+  const h = await boot({ failWriteDown: legacy, autoRewind: true });
+  const call = storeOwnRow(h.agent('mira'), 'mira', [callBlock('refusal-late-result')]);
+  let late: MessageId | undefined;
+  const refusal = final([text('refused')]); refusal.stopReason = 'refusal';
+  h.membrane.script('mira', refusal);
+  h.membrane.onRequest = (name) => {
+    if (name === 'mira' && late === undefined)
+      late = storeOwnRow(h.agent('mira'), 'user', [resultBlock('refusal-late-result')]);
+  };
+  h.framework.start();
+  assert.equal(h.framework.nudgeAgent('mira').ok, true);
+  await until(() => h.membrane.callsFor('mira').length === 2
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'refusal closure retry completes');
+  const [failed, retry] = h.membrane.callsFor('mira').map((r) => JSON.stringify(r.messages));
+  assert.match(failed, /refusal-late-result/);
+  assert.doesNotMatch(failed, /result-payload/);
+  assert.doesNotMatch(retry, /refusal-late-result|result-payload/);
+  assert.ok(late);
+  for (const id of [call, late]) {
+    if (legacy) assert.equal(h.cm('mira').getMessage(id), null);
+    else assert.equal(h.cm('mira').windowStatusOf(id), 'undone');
+  }
 });

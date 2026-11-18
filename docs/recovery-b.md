@@ -24,10 +24,14 @@ Recovery deliberately declines corrupt/missing/duplicate IDs, reuse before a
 round completes, incomplete rounds, mixed call/result bodies, intervening ordinary rows,
 rewind markers, system changes, hidden non-tool shards, embedded system
 notices, foreign context ownership and bodies not belonging to this reader's
-native audience. A stored result absent the current presented window also
+native audience. Ordinary legacy own-row text selection follows the compile's
+recorded visibility, not presentation ownership: a visible co-resident text body
+is eligible; a visible foreign tool round declines rather than sacrificing an
+older owned round. A stored result absent the current presented window also
 declines: CM 0.27 cannot retract it in the same atomic batch. **Uncarried**
 means absent the served request; **unpresented** means absent the CM window.
-Uncarried result bodies already resident in that window can be supported;
+Refusal and standalone recovery can support uncarried result bodies already
+resident in that window; exhaustion requires every selected body to be carried;
 there is no present-first write, raw fallback, or new CM layer. ID matching follows
 reader-owned live rounds in stored order: reuse after completion, by another
 resident, or in an undone older round does not create ambiguity. Within that
@@ -40,6 +44,13 @@ storage/annotation work, and no pending assistant round may remain. A standalone
 attempt also needs the agent's idle boundary: no live turn token, stream, or
 queued, parked, provider-held or budget-held continuation, even when status
 already reads `idle`. Only terminal refusal can recover its own ending turn before token release.
+Pre-stream exhaustion carries the failed compile's raw-body set into planning;
+every selected body head, including all tool-closure endpoints, must belong to
+that set. If a late result completes a carried call, the whole plan declines
+without removing either endpoint, selecting older history, consuming a step,
+adding a marker or queuing a rewind retry. Missing provenance
+or a changed/unreadable compile branch declines without quarantine or a rewind
+retry. This witness is attempt-local, not a durable fence against future writers.
 Exhaustion requires full logical quiescence and declines while a stream is
 active: a terminal 400 on an active stream stops immediately for manual repair,
 without mutation or retry. It does not wait for teardown or defer quarantine;
@@ -51,8 +62,9 @@ held result mail is not itself a stored `tool_result` endpoint.
 A refused reply is excluded from planning only after its whole body is verified
 tool-free. Unsupported, empty, or cap-exhausted attempts do not remove that
 reply, remove either endpoint, add a marker, count a successful step or enqueue
-a rewind retry. Existing confirmed step counts and marker state are left
-unchanged on exhaustion decline/cap/failure. Automatic refusal rewind instead
+a rewind retry. Exhaustion decline or a cap stop before mutation leaves counts and markers
+unchanged. Any confirmed removal consumes a step, even if notification,
+cleanup or marker writing subsequently fails; no retry follows that failure. Automatic refusal rewind instead
 ends its attempt on give-up and resets its budget for a later independent wake,
 without queuing a retry; the durable marker remains, but the episode count
 is cleared. A missing, hidden, branched-away or non-tail marker also starts a
@@ -60,6 +72,14 @@ fresh count instead of editing an old prefix. `/unstick` preflight declines befo
 queuing its initial probe. Supported probes re-plan at actual refusal. Later
 unsupported forced recovery ends as `gave-up`, with the logged bounded reason;
 it does not claim `cleared`. The exhaustion caller requests manual repair.
+
+Markers consolidate only while the current marker remains at the visible tail.
+A retained notice after it starts another marker/count, even within one recovery
+episode: there is no one-marker-per-episode or shed-N/add-one convergence guarantee.
+Marker counts describe consecutive omissions at that position, not a caller's
+budget. Forced-session, automatic-refusal and exhaustion logs use their own
+confirmed-removal counts; changing callers does not turn the marker into a
+shared budget.
 
 ## Failure and transaction boundary
 
@@ -71,8 +91,34 @@ also stop. A forced outcome still reports a confirmed removal if cleanup then
 fails. Legacy markers truthfully say that originals were removed from raw history. No crash-atomic cross-write counter/marker guarantee is made.
 
 No durable wake fence is added: an independently triggered later wake can
-resubmit unchanged unsupported history. No cap bypass, provider changes,
+resubmit unchanged unsupported history or plan and mutate again after an
+unknown/partial write outcome. The no-replay guarantee covers only the current
+attempt. Stop normal writers and inspect the store before allowing another wake
+after uncertainty; the framework does not enforce that operator boundary. No cap bypass, provider changes,
 malformed-history repair, storage format or CM API is part of this change.
+
+## Synchronous whole-history cost (not window-bounded)
+
+The rewind **step count** is bounded; snapshot time and memory are not. Every
+plan, including `/unstick` preflight and a plan that ultimately declines, calls
+`getAllMessages()` and examines raw bodies, including held/unpresented endpoints.
+This can inflate every historical image/blob even for a tiny presented window.
+CM caches may make a warm read cheap; they do not impose a recovery memory cap.
+
+Offline measurement with Node 22.23.3, CM 0.27.0 and Chronicle 0.6.0:
+128 distinct raw images containing 32 MiB of base64, with only one presented
+text row, took **34.0–37.3 ms synchronously**, allocating **32.8–32.9 MiB heap**
+and **80.4–80.6 MiB RSS** across three fresh-process cold plans. The fixture
+uses real CM/blob storage and the production planner with idle host state;
+it excludes process startup, store opening, provider calls and mutation.
+Reproduce after building with
+`node --expose-gc scripts/recovery-plan-cost.mjs` (optional row-count and
+KiB-per-row arguments). These are fixture observations, not bounds or a
+production latency guarantee. Larger histories can stall the event loop or
+exhaust memory before a decline is returned. For large/image-heavy stores,
+provision memory for raw history and perform inspected, exclusive offline
+maintenance before invoking recovery; a small context window is not protection.
+No bounded metadata-only snapshot API or background planner is introduced here.
 
 ## Intentional test / compatibility dispositions
 
@@ -87,7 +133,7 @@ best-effort corruption breaker. Adjacency cannot prove either-direction closure.
 | Hidden/heterogeneous sibling or embedded system notice removed with result | Decline the whole attempt; no borrowed visibility |
 | Raw notice-gap removal deletes notices and other-window rows | Genuine failed-write-down gap declines byte-identically; adjacent complete raw round still succeeds and propagates |
 | Descriptor includes intervening notice bytes/image | Counts only selected bodies; multiple selected images and dominant signature/input/UTF-8 payload are tested |
-| Gap scan requires implementation-specific content getter read counts | Retired with the backward pairing walk; bounded snapshot body scan replaces it |
+| Gap scan requires implementation-specific content getter read counts | Retired with the backward pairing walk; whole-history snapshot body scan replaces it (see cost below) |
 | Empty/cap-exhausted rewind cleans refused reply alone | No mutation without a ready target and budget; later independent requests can still carry the reply |
 | Carried call with stored but unpresented held result was shed by call alone | Original setup retained as a no-removal/no-cleanup/no-new-step/no-retry decline witness, with resident uncarried-result positive counterpart |
 | Staged omitted guard batch permits rewind before asynchronous settlement becomes idle | Guard still settles normally, but recovery declines without a marker, endpoint removal or retry |

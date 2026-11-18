@@ -83,6 +83,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
       addMessage: opts?.addMessage ?? ((_p: string, content: any[], meta: any) => { markers.push({ text: content[0].text, meta }); }),
       tick: async () => { ticks++; await opts?.tick?.(); },
       currentBranch: () => ({ name: 'main' }),
+      currentBranchRef: () => ({ id: 'main', created: 0 }),
     }),
   }]]);
   const errs: string[] = [];
@@ -243,7 +244,8 @@ test('every cut of failure text keeps surrogate pairs whole and states the whole
         exhausted.fw.applyShed = () => ({ kind: 'applied', record: { descriptor: 'zz-turn', removedIds: ['zz'] } });
         exhausted.fw.updateRewindMarker = (_agent: unknown, category: string) => { rewound.push(category); return 1; };
         try {
-          exhausted.fw.noteInferenceExhausted('cairn', text, false, 'invalid_request');
+          exhausted.fw.noteInferenceExhausted('cairn', text, false, 'invalid_request', undefined,
+            { carriedBodies: new Set(['zz']), branch: 'main\u00000' });
         } finally { exhausted.restore(); }
         assertCut(text, exhausted.markers[0].meta.reason, 600, where('[inference-failed] marker'));
         assertCut(text, exhausted.logged[0].reason as string, 2_000, where('failures.log'));

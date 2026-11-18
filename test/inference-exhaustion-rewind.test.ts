@@ -7,9 +7,12 @@
  * Now, at the hard-down threshold, when the failure suggests the provider
  * refused the request's content or size (shedMayHelp: an invalid_request at
  * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
- * breaker auto-quarantines: sheds the newest complete exchange (the same
+ * breaker can auto-quarantine ONLY before a stream exists and after logical
+ * quiescence and guard settlement. Active-stream terminal errors instead stop
+ * unchanged for manual repair, with no retry. A supported quiescent plan sheds
+ * the newest complete exchange (the same
  * planning/removal contract the refusal auto-rewind and /unstick use;
- * unsupported exchanges decline unchanged), drops ONE marker, and
+ * unsupported exchanges decline unchanged), writes a tail-consolidated marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
  * never eat the whole history.
  */
@@ -18,6 +21,8 @@ import assert from 'node:assert/strict';
 import { errorFromProviderStatus } from '@animalabs/membrane';
 import { AgentFramework, shedMayHelp } from '../src/framework.js';
 
+// Synthetic quiescent unit harness; live start/provider failures are exercised
+// in shed-window.test.ts, separately from active-stream refusal controls.
 function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const messages: any[] = opts?.messages ?? [
     { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
@@ -29,6 +34,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const cm = {
     getAllMessages: () => messages,
     currentBranch: () => ({ name: 'main' }),
+    currentBranchRef: () => ({ id: 'main', created: 0 }),
     getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
     removeMessage: (id: string) => {
       removed.push(id);
@@ -74,6 +80,9 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
     getContextManager: () => cm,
   }]]);
 
+  // Unit controls model a new successful compile before each synthetic failure.
+  fw.compiledHistory = () => ({ carriedBodies: new Set(messages.map((m) => m.id)), branch: 'main\u00000' });
+
   const errs: string[] = [];
   const orig = console.error;
   console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
@@ -88,11 +97,11 @@ const isRewindMarker = (m: { meta?: { kind?: string } }) => m.meta?.kind === 're
 test('at the threshold, an invalid_request with no status (shedMayHelp) triggers an automatic rewind + retry', () => {
   const { fw, removed, added, errs, restore } = makeHarness();
   try {
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 1
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 2
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory()); // 1
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory()); // 2
     assert.equal(removed.length, 0, 'no rewind before the threshold');
 
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 3 → breaker trips
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory()); // 3 → breaker trips
   } finally { restore(); }
 
   // The poisoned tool exchange was shed as a COMPLETE pair (no orphans).
@@ -115,7 +124,7 @@ test("the breaker's retry of a turn its batch gave no channel keeps the batch's 
   const channels = [{ serverId: 'discord', channelId: 'discord:g:room' }];
   fw.turnRouting = new Map([['cairn', { wakeChannels: channels }]]);
   try {
-    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
   } finally { restore(); }
   assert.equal(fw.pendingRequests.length, 1);
   assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
@@ -130,7 +139,7 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
     { id: 'a1', participant: 'agent', content: [] },
   ] });
   try {
-    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
   } finally { restore(); }
   assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
     'the newest message is gone, and the empty row after it stays with what came before');
@@ -141,8 +150,8 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {
-    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', '529 overloaded', true, 'server');
-    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', 'weird transport error', undefined, undefined);
+    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', '529 overloaded', true, 'server', undefined, fw.compiledHistory());
+    for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', 'weird transport error', undefined, undefined, undefined, fw.compiledHistory());
   } finally { restore(); }
   assert.equal(removed.length, 0, 'transient failures must not consume history');
   assert.equal(fw.pendingRequests.length, 0);
@@ -160,7 +169,7 @@ test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER sh
     const { fw, removed, added, restore } = makeHarness();
     try {
       // Well past the hard-down threshold, all with retryable === false.
-      for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', `non-retryable ${errorType}`, false, errorType);
+      for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', `non-retryable ${errorType}`, false, errorType, undefined, fw.compiledHistory());
     } finally { restore(); }
     assert.equal(removed.length, 0, `${errorType}: history must not be shed`);
     assert.equal(fw.pendingRequests.length, 0, `${errorType}: no rewind-retry queued`);
@@ -185,7 +194,7 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', () 
   try {
     // 10 consecutive non-retryable failures: the breaker fires from streak 3 on,
     // but only sheds up to the cap (2), then holds.
-    for (let i = 0; i < 10; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    for (let i = 0; i < 10; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
   } finally { restore(); }
 
   assert.equal(removed.length, 2, `cap of 2 respected, shed: ${removed.join(', ')}`);
@@ -205,14 +214,14 @@ test('a successful inference resets both the streak and the rewind budget', () =
     ],
   });
   try {
-    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
     assert.deepEqual([...removed].sort(), ['a2', 'r2']);
 
     fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
     assert.equal(removed.length, 2, 'a fresh streak: two failures shed nothing');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
     assert.deepEqual([...removed].sort(), ['a1', 'a2', 'r1', 'r2'], 'a fresh budget: the third sheds again');
   } finally { restore(); }
 });
@@ -224,7 +233,7 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
     ],
   });
   try {
-    for (let i = 0; i < 5; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    for (let i = 0; i < 5; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, fw.compiledHistory());
   } finally { restore(); }
   assert.equal(removed.length, 0);
   assert.equal(fw.pendingRequests.length, 0, 'no retry queued when nothing was repaired');
@@ -247,7 +256,7 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
   try {
     for (let i = 0; i < 5; i++) {
       missingModel.fw.noteInferenceExhausted('cairn', '404 model: claude-typo not found', false, 'invalid_request',
-        { httpStatus: 404, providerErrorCode: 'not_found_error' });
+        { httpStatus: 404, providerErrorCode: 'not_found_error' }, missingModel.fw.compiledHistory());
     }
   } finally { missingModel.restore(); }
   assert.deepEqual(missingModel.removed, [], 'past the threshold, and nothing was shed');
@@ -260,7 +269,7 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
   try {
     for (let i = 0; i < 3; i++) {
       rejected.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request',
-        { httpStatus: 400, providerErrorCode: 'invalid_request_error' });
+        { httpStatus: 400, providerErrorCode: 'invalid_request_error' }, rejected.fw.compiledHistory());
     }
   } finally { rejected.restore(); }
   assert.deepEqual([...rejected.removed].sort(), ['a1', 'r1'], 'a 400 at the threshold sheds, as before');
@@ -271,7 +280,7 @@ test('the current failure decides the shed, whatever failed before it in the str
   const ending404 = makeHarness();
   try {
     for (const httpStatus of [400, 400, 404]) {
-      ending404.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus });
+      ending404.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus }, ending404.fw.compiledHistory());
     }
   } finally { ending404.restore(); }
   assert.deepEqual(ending404.removed, [], '400, 400, 404: nothing is shed at the third failure');
@@ -281,7 +290,7 @@ test('the current failure decides the shed, whatever failed before it in the str
   const ending400 = makeHarness();
   try {
     for (const httpStatus of [404, 404, 400]) {
-      ending400.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus });
+      ending400.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus }, ending400.fw.compiledHistory());
     }
   } finally { ending400.restore(); }
   assert.deepEqual([...ending400.removed].sort(), ['a1', 'r1'], '404, 404, 400: the 400 sheds at the third failure');
@@ -294,7 +303,7 @@ test('a 413 sheds under either label it arrives with, and a context_length at 40
     const tooLarge = makeHarness();
     try {
       for (let i = 0; i < 3; i++) {
-        tooLarge.fw.noteInferenceExhausted('cairn', '413 request too large', false, errorType, { httpStatus: 413 });
+        tooLarge.fw.noteInferenceExhausted('cairn', '413 request too large', false, errorType, { httpStatus: 413 }, tooLarge.fw.compiledHistory());
       }
     } finally { tooLarge.restore(); }
     assert.deepEqual([...tooLarge.removed].sort(), ['a1', 'r1'], `${errorType} at 413 sheds at the threshold`);
@@ -305,7 +314,7 @@ test('a 413 sheds under either label it arrives with, and a context_length at 40
     const overflow = makeHarness();
     try {
       for (let i = 0; i < 5; i++) {
-        overflow.fw.noteInferenceExhausted('cairn', 'prompt is too long', false, 'context_length', { httpStatus });
+        overflow.fw.noteInferenceExhausted('cairn', 'prompt is too long', false, 'context_length', { httpStatus }, overflow.fw.compiledHistory());
       }
     } finally { overflow.restore(); }
     assert.deepEqual(overflow.removed, [], `context_length at ${httpStatus} keeps the history`);
@@ -338,7 +347,7 @@ test("a membrane error's type and status reach the gate through the exhausted tr
       const fields = (h.fw as unknown as { classifyInferenceError(err: Error): Record<string, unknown> }).classifyInferenceError(error);
       assert.equal(fields.httpStatus, status, `${name}: the status is on the trace`);
       for (let i = 0; i < 3; i++) {
-        h.fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error: error.message, ...fields });
+        h.fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error: error.message, ...fields }, h.fw.compiledHistory());
       }
     } finally { h.restore(); }
     assert.equal(h.removed.length > 0, sheds, `${name}: ${sheds ? 'sheds' : 'keeps the history'}`);
@@ -407,3 +416,19 @@ test("provider answers, as this package's membrane floor types them, shed only w
   }
 });
 
+for (const witness of ['missing', 'other-branch', 'unreadable-branch', 'empty'] as const) test(`exhaustion with ${witness} compile provenance does not shed current history`, () => {
+  const { fw, removed, errs, restore } = makeHarness();
+  if (witness === 'unreadable-branch') fw.agents.get('cairn').getContextManager().currentBranchRef = () => { throw new Error('branch unavailable'); };
+  const history = witness === 'missing' ? undefined : witness === 'other-branch'
+    ? { ...fw.compiledHistory(), branch: 'other-branch' }
+    : witness === 'empty' ? { ...fw.compiledHistory(), carriedBodies: new Set() } : fw.compiledHistory();
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', undefined, history);
+  } finally { restore(); }
+  assert.deepEqual(removed, []);
+  assert.equal(fw.pendingRequests.length, 0);
+  assert.equal(fw.exhaustionRewinds.size, 0);
+  const reason = witness === 'missing' ? 'failed compile history unavailable'
+    : witness.endsWith('branch') ? 'failed compile branch changed or unavailable' : 'nothing eligible to shed';
+  assert.ok(errs.some((line) => line.includes(`stopped: ${reason}`)));
+});

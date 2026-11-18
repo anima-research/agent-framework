@@ -780,8 +780,8 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
           message: 'zz the provider could not process the tool result', rawError: { status: 400 },
         }),
       }) as StreamEvent;
-      // The old fixture reused echo-1 for every turn. Safe B must decline
-      // that ambiguous history, not pick the nearest matching endpoint.
+      // Both ID layouts stop at the active-stream boundary before planning;
+      // this is not evidence of an ID-ambiguity decline.
       const r = await resident([1, 2, 3].map((n) => () =>
         new RoundThenEnd(firstUsage, refused(), 'aborted', `echo-${reusedIds ? 1 : n}`)));
       const internal = r.framework as unknown as {

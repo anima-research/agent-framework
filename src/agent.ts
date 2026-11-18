@@ -37,6 +37,12 @@ import {
 } from './tool-result-history.js';
 import { appendAll } from './append-all.js';
 
+/** The stored bodies and branch a real start's compile actually presented. */
+export interface CompiledHistory {
+  carriedBodies: ReadonlySet<MessageId>;
+  branch: string;
+}
+
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
   silentHeartbeat?: SilentHeartbeatTick;
@@ -58,6 +64,10 @@ export interface ActivationRequestOptions {
   /** The framework's inferenceBounds, resolved: the stream gets their phase
    *  bounds and flat bound. None when left out. */
   inferenceBounds?: InferenceBounds | null;
+  /** Capture this start's history before membrane creation, which can throw
+   * synchronously. Not called without compile provenance; the caller must
+   * then decline failed-request recovery rather than read current history. */
+  onCompiledHistory?: (history: CompiledHistory) => void;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -2500,6 +2510,12 @@ export class Agent {
       };
     }
 
+    const history: CompiledHistory | undefined = compiled.provenance ? {
+      carriedBodies: new Set(compiled.provenance.messages.flatMap((m) => m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : [])),
+      branch: branchKey(compiled.provenance.branch),
+    } : undefined;
+    if (history) options.onCompiledHistory?.(history);
+
     const agent = this;
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
@@ -2534,9 +2550,7 @@ export class Agent {
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
       ...this.requestNotes(binding, compiled),
-      ...(compiled.provenance
-        ? { carriedBodies: new Set(compiled.provenance.messages.flatMap((m) => m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : [])) }
-        : {}),
+      ...(history ? { carriedBodies: history.carriedBodies } : {}),
       ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
       ...(compiled.provenance ? { thinkingBranch: branchKey(compiled.provenance.branch) } : {}),
       ...(kvEnabled

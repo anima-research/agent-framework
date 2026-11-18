@@ -8,6 +8,7 @@ import { AgentFramework } from '../src/framework.js';
 import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
+import { until as waitUntil } from './helpers/dendrite.js';
 import { NOTICE_TAG } from '../src/notice-tags.js';
 
 const REWIND_TAG = `[${NOTICE_TAG.refusalRewind}]`;
@@ -17,7 +18,7 @@ const REWIND_TAG = `[${NOTICE_TAG.refusalRewind}]`;
  * INCLUDING the agent's own turns) as a COMPLETE exchange — a tool_result is
  * removed together with its paired tool_use turn and signed thinking. An
  * unsupported exchange declines unchanged. It maintains ONE consolidated
- * marker per episode.
+ * marker while it remains at the tail; retained intervening notices start a new marker.
  */
 function makeAgentHarness(messages: any[]) {
   const removed: string[] = [];
@@ -198,10 +199,10 @@ async function rewindRig(
     modules: [surface],
   } as never);
   surface.framework = framework;
+  framework.start();
   const say = async (content: string, until: number) => {
     framework.pushEvent({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true } as never);
-    for (let i = 0; i < 200 && requests.length < until; i++) { await framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
-    await framework.runUntilIdle();
+    await waitUntil(() => requests.length >= until && !(framework as any).logicalTurnAlive(framework.getAgent('scout')), 'requested turns and recovery decisions complete');
   };
   const texts = (request: NormalizedRequest) => request.messages.map((m) => JSON.stringify(m.content));
   const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
@@ -333,7 +334,8 @@ test("a refused turn its batch gave no channel is retried with the batch's chann
     await rig.framework.runUntilIdle();
     (rig.framework as unknown as { pendingRequests: InferenceRequest[] }).pendingRequests.push(
       { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: channels });
-    for (let i = 0; i < 200 && rig.requests.length < 3; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    await waitUntil(() => rig.requests.length === 3
+      && !(rig.framework as any).logicalTurnAlive(rig.framework.getAgent('scout')), 'retry and recovery decision complete');
     assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
     assert.equal(retried?.reason, 'refusal-rewind-retry');
     assert.deepEqual(retried?.wakeChannels, channels);
@@ -371,8 +373,13 @@ test('a carried call with a stored unpresented result declines without creating 
     const cm = rig.framework.getAgent('scout')!.getContextManager();
     const call = cm.addMessage('scout', [text('let me look'), { type: 'tool_use', id: 'look-9', name: 'surface--look', input: {} } as ContentBlock]);
     const result = cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'look-9', content: 'what the tool saw' } as ContentBlock], { tuneOut: { epochId: 'held' } } as never);
+    const decisions: any[] = [];
+    const fw = rig.framework as any;
+    const plan = fw.planNewestTurn.bind(fw);
+    fw.planNewestTurn = (...args: any[]) => { const decision = plan(...args); decisions.push(decision); return decision; };
     await rig.say('second question', 3);
-    const refusedRequest = JSON.stringify(rig.requests[1]!.messages);
+    assert.ok(decisions.some((p) => p.kind === 'unsupported' && p.reason === 'endpoint outside ordered window'), 'planner explicitly declines the unpresented endpoint');
+    const refusedRequest = JSON.stringify(rig.requests[2]!.messages);
     assert.ok(refusedRequest.includes('look-9') && !refusedRequest.includes('what the tool saw'), 'old premise: request carried call but not its stored result');
     assert.equal(rig.requests.length, 3, 'first rewind sheds second question; next refusal declines with no immediate retry');
     assert.equal(cm.windowStatusOf(call), 'in', 'no call-only removal / future reverse orphan');
@@ -503,8 +510,8 @@ test("/unstick after a refusal whose reply had text sheds that reply first, sinc
       handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; started?: boolean }>;
     }).handleHostCommand('test-server', { command: 'unstick', agentName: 'scout' });
     assert.equal(started.started, true);
-    for (let i = 0; i < 200 && rig.requests.length < 4; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
-    await rig.framework.runUntilIdle();
+    await waitUntil(() => rig.requests.length === 4
+      && !(rig.framework as any).logicalTurnAlive(rig.framework.getAgent('scout')), 'forced outcome and final turn complete');
     assert.equal(rig.requests.length, 4, "the unstick's run, refused, and its retry");
     assert.ok(rig.texts(rig.requests[2]!).some((t) => t.includes(partial)), "the premise: the unstick's request carried the earlier refused reply");
     const retry = rig.requests[3]!;
@@ -524,8 +531,8 @@ test("at the /unstick cap, no endpoint-only refused-reply cleanup is attempted",
       handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; started?: boolean }>;
     }).handleHostCommand('test-server', { command: 'unstick', agentName: 'scout', maxRewinds: 1 });
     assert.equal(started.started, true);
-    for (let i = 0; i < 200 && rig.requests.length < 4; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
-    await rig.framework.runUntilIdle();
+    await waitUntil(() => rig.requests.length === 4
+      && !(rig.framework as any).logicalTurnAlive(rig.framework.getAgent('scout')), 'forced outcome and final turn complete');
     assert.equal(rig.requests.length, 4, "the premise: the unstick's run, refused, and its one retry, refused with text");
     assert.ok(markerOf(rig.requests[3]!), 'the premise: the retry followed a rewind');
     await rig.say('a new question', 5);
@@ -545,8 +552,8 @@ test('/unstick after a refusal sheds the refused message, not the refused reply,
       handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; started?: boolean }>;
     }).handleHostCommand('test-server', { command: 'unstick', agentName: 'scout' });
     assert.equal(started.started, true);
-    for (let i = 0; i < 200 && rig.requests.length < 4; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
-    await rig.framework.runUntilIdle();
+    await waitUntil(() => rig.requests.length === 4
+      && !(rig.framework as any).logicalTurnAlive(rig.framework.getAgent('scout')), 'forced outcome and final turn complete');
     assert.equal(rig.requests.length, 4, "the unstick's run, refused, and its retry");
     const retry = rig.requests[3]!;
     assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
