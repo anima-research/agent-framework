@@ -160,10 +160,12 @@ export interface AgentConfig {
   /**
    * What becomes of ordinary text in a round that calls `skip_reply`.
    * Omitted or 'private': it stays private and isn't held. 'ask': text that
-   * only the `skip_reply` keeps back is held as a draft, and the first
-   * `skip_reply` of a turn whose round holds one, called by the model in a
-   * round with verbatim content, is refused once with a result that names the
-   * draft and asks where it should go. It acts only on rounds with verbatim
+   * only the `skip_reply` keeps back is held as a draft. Where some of a
+   * round's text would have been posted or bounced without the `skip_reply`,
+   * the first such `skip_reply` of a turn, called by the model in a round
+   * with verbatim content, is refused once with a result that names the
+   * round's drafts and asks where they should go. Where the text would only
+   * have been held, the `skip_reply` runs. It acts only on rounds with verbatim
    * content (membrane's `roundContent`). On the XML tool path nothing is
    * refused and nothing is held, and the heartbeat notice still drops its
    * clause, so a resident there is told its words are held when a

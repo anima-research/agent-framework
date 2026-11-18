@@ -1721,7 +1721,7 @@ function turnInputs(
  */
 type SpeechPublished = (to: PublishDestination, text: string, messageId: string | undefined) => void;
 
-type SkipHeld = { held: Draft[]; target?: ChannelRef };
+type SkipHeld = { held: Draft[]; target?: ChannelRef; wouldHold: boolean };
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
@@ -1738,6 +1738,7 @@ interface ProseRound {
   notice: 'now' | 'later';
   keepPrivate?: boolean;
   skipHold?: SkipHeld[];
+  skipWouldHold?: boolean;
   draftsRound?: boolean;
   /** The outgoing stream of the stream that queued the round. */
   onPublished?: SpeechPublished;
@@ -23451,6 +23452,7 @@ export class AgentFramework {
     locus: ChannelRef | null,
     when: number | 'end' | 'turn',
     keptBy?: SendsReached,
+    heldUnder?: (to: ChannelRef | null) => boolean,
   ): Promise<boolean> {
     if (segments.length === 0) return false;
     const routing = round.routing;
@@ -23467,12 +23469,13 @@ export class AgentFramework {
     const holdAt = (to: ChannelRef | null): SendHold | 'skip' | undefined => (sends === 'skip' ? 'skip' : sendHoldAt(sends, to));
     let privateCount = 0;
     type Part = { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean };
-    const runs: Array<{ hold: SendHold | 'skip'; target: ChannelRef | null; parts: Part[] }> = [];
-    const hold = (sendHold: SendHold | 'skip', target: ChannelRef | null, part: Part): void => {
+    const runs: Array<{ hold: SendHold | 'skip'; target: ChannelRef | null; wouldHold: boolean; parts: Part[] }> = [];
+    const hold = (sendHold: SendHold | 'skip', target: ChannelRef | null, part: Part, wouldHold = false): void => {
       const last = runs.at(-1);
-      if (last && sameChannel(last.target, target)) last.parts.push(part);
-      else runs.push({ hold: sendHold, target, parts: [part] });
+      if (last && sameChannel(last.target, target) && last.wouldHold === wouldHold) last.parts.push(part);
+      else runs.push({ hold: sendHold, target, wouldHold, parts: [part] });
     };
+    const holdsAnyway = (to: ChannelRef | null): boolean => !!heldUnder?.(to);
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
     for (const segment of segments) {
@@ -23513,7 +23516,7 @@ export class AgentFramework {
               note: `written for >>>${parsed.target}`,
               ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
               deliberate: true,
-            });
+            }, holdsAnyway(to));
           }
         } else if (envelope.startsWith('>>>')) {
           // Malformed: an attempted destination that names none.
@@ -23524,7 +23527,7 @@ export class AgentFramework {
           }
           delete routing.pin;
           routing.hybridHold = 'failed';
-          hold(sendHold, null, { text: envelope, deliberate: true });
+          hold(sendHold, null, { text: envelope, deliberate: true }, holdsAnyway(null));
         } else if (routing.hybridHold === 'private') {
           privateCount++;
         } else {
@@ -23534,17 +23537,18 @@ export class AgentFramework {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, round);
             continue;
           }
-          hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}) });
+          const noDestination = routing.hybridHold === 'failed' || (!routing.pin && locus === null && !!routing.heartbeat);
+          hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}) }, holdsAnyway(target) || noDestination);
         }
       }
     }
     routing.keptPrivate += privateCount;
     let heldAny = false;
-    for (const { hold: sendHold, target, parts } of runs) {
+    for (const { hold: sendHold, target, wouldHold, parts } of runs) {
       const at = target ? { target } : {};
       const keptAside = sendHold === 'skip' && !!keptBy && !!sendHoldAt(keptBy, target);
       const held = sendHold === 'skip'
-        ? this.holdProseDrafts(agent, keptAside ? parts.filter((p) => p.deliberate) : parts, 'skip-reply', { ...round, ...at })
+        ? this.holdProseDrafts(agent, keptAside ? parts.filter((p) => p.deliberate) : parts, 'skip-reply', { ...round, ...at, skipWouldHold: wouldHold })
         : draftsCause
           ? this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because: this.sendHoldText(sendHold, target, when), ...at })
           : this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because: this.sendHoldText(sendHold, target, when), ...at });
@@ -23600,7 +23604,7 @@ export class AgentFramework {
     agent: Agent,
     texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
-    opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later'; because?: string; target?: ChannelRef; skipHold?: SkipHeld[] },
+    opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later'; because?: string; target?: ChannelRef; skipHold?: SkipHeld[]; skipWouldHold?: boolean },
   ): Draft[] {
     const segments = texts
       .map((t) => (typeof t === 'string'
@@ -23624,7 +23628,7 @@ export class AgentFramework {
     }
     if (held.length === 0) return held;
     appendAll(logical.drafts, held);
-    if (reason === 'skip-reply') opts.skipHold?.push({ held, ...(opts.target ? { target: opts.target } : {}) });
+    if (reason === 'skip-reply') opts.skipHold?.push({ held, ...(opts.target ? { target: opts.target } : {}), wouldHold: !!opts.skipWouldHold });
     console.error(`[drafts] ${agent.name}: held ${held.length} segment(s) as ${held.map((d) => d.id).join(', ')} (${reason})`);
     this.emitTrace({
       type: 'prose:drafts-held',
@@ -23633,35 +23637,42 @@ export class AgentFramework {
       draftIds: held.map((d) => d.id),
       textLen: held.reduce((n, d) => n + d.text.length, 0),
     });
-    if (opts.notice === 'now') {
-      const target = this.noticeTargetFor(agent.name, 'held-draft') ? this.agents.get(agent.name) : undefined;
-      try {
-        // Written while its turn is alive, it waits out of the window
-        // (present false) for the turn's next point, as the write for the
-        // agent it replaces did: the tool boundary whose stream hears it, or
-        // the turn's end. The other readers of its slot that are idle (an
-        // agent that observes it, the persistent subconscious) are presented
-        // it now, as addMessage presents a write mid-turn to them
-        // (afterStore passes over a reader whose turn is alive, its writer
-        // included). With no turn alive it is presented now, as any own row
-        // written at rest.
-        if (target) {
-          const atRest = !this.logicalTurnAlive(target);
-          const id = storeOwnRow(
-            target,
-            'user',
-            [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
-            { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
-            undefined,
-            atRest,
-          );
-          if (!atRest) this.presentation?.afterStore(target, [id]);
-        }
-      } catch (err) {
-        console.error('[drafts] held-draft notice failed:', err);
-      }
-    }
+    if (opts.notice === 'now') this.noteHeldDrafts(agent.name, held, reason, opts);
     return held;
+  }
+
+  private noteHeldDrafts(
+    agentName: string,
+    held: Draft[],
+    reason: DraftReason,
+    opts: { routing: TurnRouting; because?: string; target?: ChannelRef },
+  ): void {
+    const target = this.noticeTargetFor(agentName, 'held-draft') ? this.agents.get(agentName) : undefined;
+    try {
+      // Written while its turn is alive, it waits out of the window
+      // (present false) for the turn's next point, as the write for the
+      // agent it replaces did: the tool boundary whose stream hears it, or
+      // the turn's end. The other readers of its slot that are idle (an
+      // agent that observes it, the persistent subconscious) are presented
+      // it now, as addMessage presents a write mid-turn to them
+      // (afterStore passes over a reader whose turn is alive, its writer
+      // included). With no turn alive it is presented now, as any own row
+      // written at rest.
+      if (target) {
+        const atRest = !this.logicalTurnAlive(target);
+        const id = storeOwnRow(
+          target,
+          'user',
+          [{ type: 'text', text: this.draftsHeldNotice(agentName, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
+          { system: true, kind: 'prose-drafts', draftOwner: agentName, draftIds: held.map((d) => d.id) } as MessageMetadata,
+          undefined,
+          atRest,
+        );
+        if (!atRest) this.presentation?.afterStore(target, [id]);
+      }
+    } catch (err) {
+      console.error('[drafts] held-draft notice failed:', err);
+    }
   }
 
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
@@ -27106,7 +27117,7 @@ export class AgentFramework {
         // the earlier one, so it bounces too.
         if (res.refusedChannelId) delete routing.pin;
         if (round.skipHold) {
-          this.holdSkippedEnvelope(agent, parsed.body, round, undefined, `written for >>${parsed.target}`);
+          this.holdSkippedEnvelope(agent, parsed.body, round, undefined, `written for >>${parsed.target}`, false);
           return;
         }
         this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', round);
@@ -27117,13 +27128,13 @@ export class AgentFramework {
       routing.pin = targetChannel;
       body = parsed.body;
       if (round.skipHold) {
-        this.holdSkippedEnvelope(agent, body, round, targetChannel, `written for >>${parsed.target}`);
+        this.holdSkippedEnvelope(agent, body, round, targetChannel, `written for >>${parsed.target}`, false);
         return;
       }
     } else {
       const sticky = routing.pin;
       if (round.skipHold) {
-        this.holdSkippedEnvelope(agent, rawText, round, sticky, sticky ? `written for ${this.channelShown(sticky)}` : undefined);
+        this.holdSkippedEnvelope(agent, rawText, round, sticky, sticky ? `written for ${this.channelShown(sticky)}` : undefined, !sticky && !!round.draftsRound);
         return;
       }
       if (!sticky) {
@@ -27191,14 +27202,14 @@ export class AgentFramework {
     }
   }
 
-  private holdSkippedEnvelope(agent: Agent, text: string, round: ProseRound, target: ChannelRef | undefined, note: string | undefined): void {
+  private holdSkippedEnvelope(agent: Agent, text: string, round: ProseRound, target: ChannelRef | undefined, note: string | undefined, wouldHold: boolean): void {
     const words = this.unsentWords(agent, text);
     if ('draft' in words) return;
     this.holdProseDrafts(agent, [{
       text: words.text,
       ...(note ? { note } : {}),
       ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
-    }], 'skip-reply', { ...round, ...(target ? { target } : {}) });
+    }], 'skip-reply', { ...round, ...(target ? { target } : {}), skipWouldHold: wouldHold });
   }
 
   /** Cap on consecutive bounce-triggered wakes (notices still append after).
@@ -29602,11 +29613,16 @@ export class AgentFramework {
               if (!answer) return;
               answerAsk = undefined;
               if (!waits()) return;
-              if (held.length > 0) {
+              if (held.some((h) => !h.wouldHold)) {
                 streamRouting.skipReplyAsked = true;
                 silenceBeforeRefusal = askedSilence;
+                answer(held);
+                return;
               }
-              answer(held);
+              if (holdOpts.notice === 'now') {
+                for (const h of held) this.noteHeldDrafts(agent.name, h.held, 'skip-reply', { routing: holdOpts.routing, ...(h.target ? { target: h.target } : {}) });
+              }
+              answer([]);
             };
             const routeRound = (calls: readonly RoundCall[]): void => {
               if (!this.channelRegistry) return;
@@ -29638,11 +29654,16 @@ export class AgentFramework {
               const draftsCause = draftsRound
                 && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
-              const unskipped = draftsCause ? mergeSilence(before, roundSilenceOf(calls.filter((c) => c.cause !== 'private'), toolRound)) : null;
-              const keptBy = unskipped && unskipped !== 'private' ? unskipped : undefined;
+              const withoutSkip = mergeSilence(before, roundSilenceOf(calls.filter((c) => c.cause !== 'private'), toolRound));
+              const heldUnder = (to: ChannelRef | null): boolean => withoutSkip === 'private' || (!!withoutSkip && !!sendHoldAt(withoutSkip, to));
+              const keptBy = draftsCause && withoutSkip && withoutSkip !== 'private' ? withoutSkip : undefined;
               const keptAtLocus = !!keptBy && turnProseRouting !== 'hybrid' && turnProseRouting !== 'explicit' && !!sendHoldAt(keptBy, roundLocus);
               const skipHeld = skipAsks && !hasSameRoundPrivateThink && !keptAtLocus && calls.some((c) => c.cause === 'private') ? [] as SkipHeld[] : undefined;
-              const skipFields = skipHeld ? { skipHold: skipHeld, ...(askingCall ? { notice: 'later' as const } : {}) } : {};
+              const locusHolds = heldUnder(roundLocus) || !!streamRouting.heldForMove
+                || (roundLocus === null && !!(streamRouting.heartbeat || streamRouting.locked));
+              const skipFields = skipHeld
+                ? { skipHold: skipHeld, skipWouldHold: locusHolds, ...(askingCall ? { notice: 'later' as const } : {}) }
+                : {};
               if (roundSegments.length === 0 || !skipHeld) settleAsk([]);
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
@@ -29655,7 +29676,7 @@ export class AgentFramework {
                   chainSpeech(
                     routingSpeech(async () => {
                       try {
-                        await this.routeSilencedHybrid(agent, roundRuns, 'skip', false, { ...holdOpts, ...skipFields }, roundLocus, toolRound, keptBy);
+                        await this.routeSilencedHybrid(agent, roundRuns, 'skip', false, { ...holdOpts, ...skipFields }, roundLocus, toolRound, keptBy, heldUnder);
                       } finally {
                         settleAsk(skipHeld);
                       }
